@@ -71,7 +71,17 @@ if [[ "$TARGET" == *windows* ]]; then
   ARCHIVE="$OUT_DIR/$PKG_BASENAME.zip"
   (
     cd "$STAGE_DIR"
-    zip -q "$ARCHIVE" "$(basename "$BIN_ARCHIVE_PATH")"
+    if command -v zip >/dev/null 2>&1; then
+      zip -q "$ARCHIVE" "$(basename "$BIN_ARCHIVE_PATH")"
+    elif command -v 7z >/dev/null 2>&1; then
+      7z a -tzip "$ARCHIVE" "$(basename "$BIN_ARCHIVE_PATH")" >/dev/null
+    elif command -v powershell >/dev/null 2>&1; then
+      powershell -NoProfile -Command \
+        "Compress-Archive -Path '$(basename "$BIN_ARCHIVE_PATH")' -DestinationPath '$ARCHIVE' -Force"
+    else
+      echo "No zip tool found (zip/7z/powershell Compress-Archive)." >&2
+      exit 1
+    fi
   )
 else
   ARCHIVE="$OUT_DIR/$PKG_BASENAME.tar.gz"
