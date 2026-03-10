@@ -1,0 +1,117 @@
+#![allow(dead_code)]
+
+use std::path::Path;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Policy {
+    Public,
+    Forbidden,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GmapPath {
+    pub pack: Option<String>,
+    pub flow: Option<String>,
+    pub node: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GmapRule {
+    pub path: GmapPath,
+    pub policy: Policy,
+    pub line: usize,
+}
+
+pub fn parse_file(path: &Path) -> anyhow::Result<Vec<GmapRule>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let contents = std::fs::read_to_string(path)?;
+    parse_str(&contents)
+}
+
+pub fn parse_str(contents: &str) -> anyhow::Result<Vec<GmapRule>> {
+    let mut rules = Vec::new();
+    for (idx, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let rule = parse_rule_line(line, idx + 1)?;
+        rules.push(rule);
+    }
+    Ok(rules)
+}
+
+pub fn parse_rule_line(line: &str, line_number: usize) -> anyhow::Result<GmapRule> {
+    let mut parts = line.splitn(2, '=');
+    let raw_path = parts
+        .next()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Invalid rule line {}: missing path", line_number))?;
+    let raw_policy = parts
+        .next()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Invalid rule line {}: missing policy", line_number))?;
+
+    let path = parse_path(raw_path, line_number)?;
+    let policy = parse_policy(raw_policy, line_number)?;
+    Ok(GmapRule {
+        path,
+        policy,
+        line: line_number,
+    })
+}
+
+pub fn parse_path(raw: &str, line_number: usize) -> anyhow::Result<GmapPath> {
+    if raw == "_" {
+        return Ok(GmapPath {
+            pack: None,
+            flow: None,
+            node: None,
+        });
+    }
+    let segments: Vec<&str> = raw.split('/').filter(|seg| !seg.is_empty()).collect();
+    if segments.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Invalid path on line {}: empty path",
+            line_number
+        ));
+    }
+    if segments.len() > 3 {
+        return Err(anyhow::anyhow!(
+            "Invalid path on line {}: too many segments",
+            line_number
+        ));
+    }
+    let pack = Some(segments[0].to_string());
+    let flow = segments.get(1).map(|seg| seg.to_string());
+    let node = segments.get(2).map(|seg| seg.to_string());
+    Ok(GmapPath { pack, flow, node })
+}
+
+pub fn parse_policy(raw: &str, line_number: usize) -> anyhow::Result<Policy> {
+    match raw {
+        "public" => Ok(Policy::Public),
+        "forbidden" => Ok(Policy::Forbidden),
+        other => Err(anyhow::anyhow!(
+            "Invalid policy on line {}: {}",
+            line_number,
+            other
+        )),
+    }
+}
+
+impl std::fmt::Display for GmapPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.pack, &self.flow, &self.node) {
+            (None, None, None) => write!(formatter, "_"),
+            (Some(pack), None, None) => write!(formatter, "{pack}"),
+            (Some(pack), Some(flow), None) => write!(formatter, "{pack}/{flow}"),
+            (Some(pack), Some(flow), Some(node)) => write!(formatter, "{pack}/{flow}/{node}"),
+            _ => write!(formatter, "_"),
+        }
+    }
+}

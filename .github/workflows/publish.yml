@@ -1,0 +1,141 @@
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate tag/version
+        id: version
+        run: |
+          python - <<'PY'
+          import os, sys, tomllib
+          with open("Cargo.toml", "rb") as f:
+              data = tomllib.load(f)
+          version = data["package"]["version"]
+          ref_name = os.environ.get("GITHUB_REF_NAME", "")
+          if ref_name and ref_name.startswith("v") and ref_name != f"v{version}":
+              print(f"Tag/version mismatch: tag={ref_name} Cargo.toml={version}", file=sys.stderr)
+              sys.exit(1)
+          tag = f"v{version}"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"version={version}\n")
+              out.write(f"tag={tag}\n")
+          PY
+
+  verify:
+    runs-on: ubuntu-latest
+    needs: [version]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Run local check
+        run: bash ci/local_check.sh
+
+  publish-crates:
+    runs-on: ubuntu-latest
+    needs: [version, verify]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Dry run before publish
+        run: cargo publish --dry-run -p greentic-start
+      - name: Publish to crates.io (retry)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if cargo publish -p greentic-start --token "$CARGO_REGISTRY_TOKEN"; then
+              exit 0
+            fi
+            if [[ "$attempt" -lt 3 ]]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          echo "cargo publish failed after retries" >&2
+          exit 1
+
+  binstall-artifacts:
+    runs-on: ${{ matrix.os }}
+    needs: [version, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            use_cross: true
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        if: ${{ matrix.use_cross == true }}
+        with:
+          tool: cross
+      - name: Build and package
+        env:
+          USE_CROSS: ${{ matrix.use_cross == true && '1' || '0' }}
+        run: |
+          mkdir -p dist
+          bash ci/package_binstall.sh \
+            --target "${{ matrix.target }}" \
+            --out dist \
+            --version "${{ needs.version.outputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: greentic-start-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [version, publish-crates, binstall-artifacts]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
+          artifacts: dist/*
+          allowUpdates: true
+          generateReleaseNotes: true
