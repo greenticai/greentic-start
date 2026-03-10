@@ -74,7 +74,7 @@ pub fn ensure_desired_subscriptions(
             }),
             expiration_target_unix_ms: None,
         };
-        let provider_id = provider_id_for_pack(&pack, &entry.provider);
+        let provider_id = provider_id_for_pack(pack, &entry.provider);
         let _ = team_ref;
         scheduler.ensure_once(&provider_id, &request)?;
     }

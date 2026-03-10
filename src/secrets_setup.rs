@@ -27,7 +27,6 @@ use greentic_secrets_lib::core::Error as SecretError;
 use greentic_secrets_lib::{
     ApplyOptions, DevStore, SecretFormat, SecretsStore, SeedDoc, SeedEntry, SeedValue, apply_seed,
 };
-use serde_yaml_bw;
 use tracing::{debug, info};
 
 use crate::{

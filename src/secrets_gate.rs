@@ -15,7 +15,6 @@ use greentic_secrets_lib::env::EnvSecretsManager;
 use greentic_secrets_lib::{Result as SecretResult, SecretError, SecretsManager};
 use serde::Deserialize;
 use serde_cbor::value::Value as CborValue;
-use serde_json;
 use tokio::runtime::Builder;
 use tracing::info;
 use zip::{ZipArchive, result::ZipError};

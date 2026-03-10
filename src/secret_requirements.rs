@@ -3,7 +3,6 @@ use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_cbor::value::Value as CborValue;
-use serde_json;
 use zip::{ZipArchive, result::ZipError};
 
 type CborMap = BTreeMap<CborValue, CborValue>;
