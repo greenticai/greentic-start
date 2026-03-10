@@ -36,6 +36,15 @@ if [[ -z "$TARGET" || -z "$OUT_DIR" || -z "$VERSION" ]]; then
 fi
 
 mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HOST_TARGET="$(rustc -vV | awk '/^host:/ {print $2}')"
+pushd "$ROOT_DIR" >/dev/null
+
+if [[ "$TARGET" != "$HOST_TARGET" ]]; then
+  rustup target add "$TARGET"
+fi
 
 BUILD_CMD=(cargo build --release --target "$TARGET" --bin "$BIN_NAME")
 if [[ "${USE_CROSS:-0}" == "1" ]]; then
@@ -82,3 +91,4 @@ else
 fi
 
 rm -rf "$STAGE_DIR"
+popd >/dev/null

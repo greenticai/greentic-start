@@ -137,12 +137,20 @@ jobs:
         run: |
           cd "${{ steps.prep.outputs.workspace }}"
           cargo publish --dry-run -p greentic-start
+      - name: Skip crates.io publish on non-tag pushes
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: echo "Skipping crates.io publish because this is not a version tag."
       - name: Publish to crates.io (retry)
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
           cd "${{ steps.prep.outputs.workspace }}"
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "CARGO_REGISTRY_TOKEN is not configured." >&2
+            exit 1
+          fi
           for attempt in 1 2 3; do
             if cargo publish -p greentic-start --token "$CARGO_REGISTRY_TOKEN"; then
               exit 0
@@ -210,6 +218,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     needs: [version, publish-crates, binstall-artifacts]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -228,6 +237,7 @@ jobs:
   binstall-verify:
     runs-on: ubuntu-latest
     needs: [version, release, publish-crates]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     steps:
       - uses: dtolnay/rust-toolchain@stable
         with:
