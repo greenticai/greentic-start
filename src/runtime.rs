@@ -865,85 +865,118 @@ pub fn demo_up_services(
         "events provider packs run in-process; external events components are disabled",
     );
 
-    if should_restart(restart, "gateway") {
-        let _ = supervisor::stop_pidfile(&paths.pid_path("gateway"), 2_000);
-    }
-    let gateway_spec = build_service_spec(
-        config_dir,
-        "gateway",
-        &config.services.gateway.binary,
-        &config.services.gateway.args,
-        &build_env(
-            tenant,
-            team,
-            nats_url.as_deref(),
-            public_base_url.as_deref(),
-        ),
-    )?;
-    if let Some(handle) = spawn_if_needed(&paths, &gateway_spec, restart, None)? {
-        service_tracker.record_with_log("gateway", "gateway", Some(&handle.log_path))?;
-    }
-
-    if should_restart(restart, "egress") {
-        let _ = supervisor::stop_pidfile(&paths.pid_path("egress"), 2_000);
-    }
-    let egress_spec = build_service_spec(
-        config_dir,
-        "egress",
-        &config.services.egress.binary,
-        &config.services.egress.args,
-        &build_env(
-            tenant,
-            team,
-            nats_url.as_deref(),
-            public_base_url.as_deref(),
-        ),
-    )?;
-    if let Some(handle) = spawn_if_needed(&paths, &egress_spec, restart, None)? {
-        service_tracker.record_with_log("egress", "egress", Some(&handle.log_path))?;
-    }
-
-    match config.services.subscriptions.mode {
-        DemoSubscriptionsMode::LegacyGsm => {
-            if config.services.subscriptions.msgraph.enabled {
-                if should_restart(restart, "subscriptions") || should_restart(restart, "msgraph") {
-                    let _ = supervisor::stop_pidfile(&paths.pid_path("subscriptions"), 2_000);
-                }
-                let mut args = config.services.subscriptions.msgraph.args.clone();
-                if !config.services.subscriptions.msgraph.mode.is_empty() {
-                    args.insert(0, config.services.subscriptions.msgraph.mode.clone());
-                }
-                let spec = build_service_spec(
-                    config_dir,
-                    "subscriptions",
-                    &config.services.subscriptions.msgraph.binary,
-                    &args,
-                    &build_env(
-                        tenant,
-                        team,
-                        nats_url.as_deref(),
-                        public_base_url.as_deref(),
-                    ),
-                )?;
-                if let Some(handle) = spawn_if_needed(&paths, &spec, restart, None)? {
-                    service_tracker.record_with_log(
-                        "subscriptions",
-                        "subscriptions",
-                        Some(&handle.log_path),
-                    )?;
-                }
-            }
+    let run_gsm_services = config.services.nats.enabled;
+    if run_gsm_services {
+        if should_restart(restart, "gateway") {
+            let _ = supervisor::stop_pidfile(&paths.pid_path("gateway"), 2_000);
         }
-        DemoSubscriptionsMode::UniversalOps => {
-            spawn_universal_subscriptions_service(
-                config_dir,
-                config,
+        let gateway_spec = build_service_spec(
+            config_dir,
+            "gateway",
+            &config.services.gateway.binary,
+            &config.services.gateway.args,
+            &build_env(
                 tenant,
                 team,
-                &mut service_tracker,
-                log_dir,
-                debug_enabled,
-            )?;
+                nats_url.as_deref(),
+                public_base_url.as_deref(),
+            ),
+        )?;
+        if let Some(handle) = spawn_if_needed(&paths, &gateway_spec, restart, None)? {
+            service_tracker.record_with_log("gateway", "gateway", Some(&handle.log_path))?;
+        }
+
+        if should_restart(restart, "egress") {
+            let _ = supervisor::stop_pidfile(&paths.pid_path("egress"), 2_000);
+        }
+        let egress_spec = build_service_spec(
+            config_dir,
+            "egress",
+            &config.services.egress.binary,
+            &config.services.egress.args,
+            &build_env(
+                tenant,
+                team,
+                nats_url.as_deref(),
+                public_base_url.as_deref(),
+            ),
+        )?;
+        if let Some(handle) = spawn_if_needed(&paths, &egress_spec, restart, None)? {
+            service_tracker.record_with_log("egress", "egress", Some(&handle.log_path))?;
+        }
+
+        match config.services.subscriptions.mode {
+            DemoSubscriptionsMode::LegacyGsm => {
+                if config.services.subscriptions.msgraph.enabled {
+                    if should_restart(restart, "subscriptions")
+                        || should_restart(restart, "msgraph")
+                    {
+                        let _ = supervisor::stop_pidfile(&paths.pid_path("subscriptions"), 2_000);
+                    }
+                    let mut args = config.services.subscriptions.msgraph.args.clone();
+                    if !config.services.subscriptions.msgraph.mode.is_empty() {
+                        args.insert(0, config.services.subscriptions.msgraph.mode.clone());
+                    }
+                    let spec = build_service_spec(
+                        config_dir,
+                        "subscriptions",
+                        &config.services.subscriptions.msgraph.binary,
+                        &args,
+                        &build_env(
+                            tenant,
+                            team,
+                            nats_url.as_deref(),
+                            public_base_url.as_deref(),
+                        ),
+                    )?;
+                    if let Some(handle) = spawn_if_needed(&paths, &spec, restart, None)? {
+                        service_tracker.record_with_log(
+                            "subscriptions",
+                            "subscriptions",
+                            Some(&handle.log_path),
+                        )?;
+                    }
+                }
+            }
+            DemoSubscriptionsMode::UniversalOps => {
+                spawn_universal_subscriptions_service(
+                    config_dir,
+                    config,
+                    tenant,
+                    team,
+                    &mut service_tracker,
+                    log_dir,
+                    debug_enabled,
+                )?;
+            }
+        }
+    } else {
+        println!(
+            "{}",
+            crate::operator_i18n::tr(
+                "demo.runtime.messaging_embedded",
+                "messaging: running embedded runner (no gsm gateway/egress)"
+            )
+        );
+        println!(
+            "{}",
+            crate::operator_i18n::tr(
+                "demo.runtime.events_in_process",
+                "events: handled in-process (HTTP ingress + timer scheduler)"
+            )
+        );
+        operator_log::info(
+            module_path!(),
+            "demo running in embedded runner mode; gateway/egress disabled",
+        );
+        if debug_enabled {
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[demo dev] embedded runner mode only tenant={} team={} (gateway/egress/subscriptions skipped)",
+                    tenant, team
+                ),
+            );
         }
     }
 

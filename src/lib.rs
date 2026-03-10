@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
@@ -162,25 +163,45 @@ pub fn run_from_env() -> anyhow::Result<()> {
 
 fn normalize_args(raw_tail: Vec<String>) -> Vec<String> {
     let mut out = vec!["greentic-start".to_string()];
-    let mut removed_demo = false;
-    let mut idx = 0usize;
-    while idx < raw_tail.len() {
-        let arg = &raw_tail[idx];
-        if !removed_demo && !arg.starts_with('-') && arg == "demo" {
-            removed_demo = true;
-            idx += 1;
+    let mut stripped_demo_prefix = false;
+    let mut skip_next_value = false;
+    for arg in raw_tail {
+        if skip_next_value {
+            skip_next_value = false;
+            out.push(arg);
             continue;
         }
-        out.push(arg.clone());
-        idx += 1;
+        if arg_takes_value(&arg) {
+            skip_next_value = true;
+            out.push(arg);
+            continue;
+        }
+        if !stripped_demo_prefix && !arg.starts_with('-') {
+            stripped_demo_prefix = true;
+            if arg == "demo" {
+                continue;
+            }
+        }
+        out.push(arg);
     }
 
     let known = ["start", "up", "stop", "restart"];
-    let first_pos = out
-        .iter()
-        .skip(1)
-        .find(|arg| !arg.starts_with('-'))
-        .cloned();
+    let mut first_pos = None;
+    let mut skip_next_value = false;
+    for arg in out.iter().skip(1) {
+        if skip_next_value {
+            skip_next_value = false;
+            continue;
+        }
+        if arg_takes_value(arg) {
+            skip_next_value = true;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            first_pos = Some(arg.clone());
+            break;
+        }
+    }
     let should_insert_start = match first_pos {
         Some(cmd) => !known.contains(&cmd.as_str()),
         None => true,
@@ -189,6 +210,25 @@ fn normalize_args(raw_tail: Vec<String>) -> Vec<String> {
         out.insert(1, "start".to_string());
     }
     out
+}
+
+fn arg_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--locale"
+            | "--tenant"
+            | "--team"
+            | "--nats"
+            | "--nats-url"
+            | "--config"
+            | "--cloudflared"
+            | "--cloudflared-binary"
+            | "--ngrok"
+            | "--ngrok-binary"
+            | "--restart"
+            | "--log-dir"
+            | "--state-dir"
+    )
 }
 
 fn run_start(args: StartArgs) -> anyhow::Result<()> {
@@ -211,7 +251,8 @@ fn run_start(args: StartArgs) -> anyhow::Result<()> {
         log_level,
     )?;
 
-    let demo_config = config::load_demo_config(&config_path)?;
+    let mut demo_config = config::load_demo_config(&config_path)?;
+    apply_nats_overrides(&mut demo_config, &args);
     let tenant = demo_config.tenant.clone();
     let team = demo_config.team.clone();
 
@@ -276,6 +317,33 @@ fn run_start(args: StartArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn apply_nats_overrides(config: &mut config::DemoConfig, args: &StartArgs) {
+    let nats_mode = if args.no_nats {
+        NatsModeArg::Off
+    } else {
+        args.nats
+    };
+
+    if let Some(nats_url) = args.nats_url.as_ref() {
+        config.services.nats.url = nats_url.clone();
+    }
+
+    match nats_mode {
+        NatsModeArg::Off => {
+            config.services.nats.enabled = false;
+            config.services.nats.spawn.enabled = false;
+        }
+        NatsModeArg::On => {
+            config.services.nats.enabled = true;
+            config.services.nats.spawn.enabled = true;
+        }
+        NatsModeArg::External => {
+            config.services.nats.enabled = true;
+            config.services.nats.spawn.enabled = false;
+        }
+    }
+}
+
 fn run_stop(args: StopArgs) -> anyhow::Result<()> {
     let state_dir = resolve_state_dir(args.state_dir);
     runtime::demo_down_runtime(&state_dir, &args.tenant, &args.team, false)
@@ -310,10 +378,31 @@ fn wait_for_ctrlc() -> anyhow::Result<()> {
     let runtime =
         tokio::runtime::Runtime::new().context("failed to spawn runtime for Ctrl+C listener")?;
     runtime.block_on(async {
-        tokio::signal::ctrl_c()
-            .await
-            .map_err(|err| anyhow!("failed to wait for Ctrl+C: {err}"))
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.map_err(|err| anyhow!("failed to wait for Ctrl+C: {err}"))
+            }
+            result = tokio::task::spawn_blocking(wait_for_stdin_shutdown_signal) => {
+                result
+                    .map_err(|err| anyhow!("failed to join stdin shutdown watcher: {err}"))?
+            }
+        }
     })
+}
+
+fn wait_for_stdin_shutdown_signal() -> anyhow::Result<()> {
+    let mut stdin = std::io::stdin().lock();
+    let mut buf = [0u8; 1];
+    loop {
+        let read = stdin.read(&mut buf)?;
+        if read == 0 || stdin_byte_requests_shutdown(buf[0]) {
+            return Ok(());
+        }
+    }
+}
+
+fn stdin_byte_requests_shutdown(byte: u8) -> bool {
+    matches!(byte, 0x03 | 0x04)
 }
 
 fn restart_name(target: &RestartTarget) -> String {
@@ -361,5 +450,81 @@ mod tests {
         assert_eq!(args[0], "greentic-start");
         assert_eq!(args[1], "stop");
         assert_eq!(args[2], "--tenant");
+        assert_eq!(args[3], "demo");
+    }
+
+    #[test]
+    fn normalize_args_strips_only_leading_demo_prefix() {
+        let args = normalize_args(vec![
+            "--locale".into(),
+            "en".into(),
+            "demo".into(),
+            "start".into(),
+            "--tenant".into(),
+            "demo".into(),
+        ]);
+        assert_eq!(args[0], "greentic-start");
+        assert_eq!(args[1], "--locale");
+        assert_eq!(args[2], "en");
+        assert_eq!(args[3], "start");
+        assert_eq!(args[4], "--tenant");
+        assert_eq!(args[5], "demo");
+    }
+
+    #[test]
+    fn apply_nats_overrides_disables_nats_for_flag() {
+        let mut config = config::DemoConfig::default();
+        let args = StartArgs {
+            tenant: None,
+            team: None,
+            no_nats: false,
+            nats: NatsModeArg::Off,
+            nats_url: None,
+            config: None,
+            cloudflared: CloudflaredModeArg::Off,
+            cloudflared_binary: None,
+            ngrok: NgrokModeArg::Off,
+            ngrok_binary: None,
+            restart: Vec::new(),
+            log_dir: None,
+            verbose: false,
+            quiet: false,
+        };
+        apply_nats_overrides(&mut config, &args);
+        assert!(!config.services.nats.enabled);
+        assert!(!config.services.nats.spawn.enabled);
+    }
+
+    #[test]
+    fn apply_nats_overrides_uses_external_url_without_spawn() {
+        let mut config = config::DemoConfig::default();
+        let args = StartArgs {
+            tenant: None,
+            team: None,
+            no_nats: false,
+            nats: NatsModeArg::External,
+            nats_url: Some("nats://127.0.0.1:5555".into()),
+            config: None,
+            cloudflared: CloudflaredModeArg::Off,
+            cloudflared_binary: None,
+            ngrok: NgrokModeArg::Off,
+            ngrok_binary: None,
+            restart: Vec::new(),
+            log_dir: None,
+            verbose: false,
+            quiet: false,
+        };
+        apply_nats_overrides(&mut config, &args);
+        assert!(config.services.nats.enabled);
+        assert!(!config.services.nats.spawn.enabled);
+        assert_eq!(config.services.nats.url, "nats://127.0.0.1:5555");
+    }
+
+    #[test]
+    fn stdin_shutdown_signal_matches_ctrl_c_and_eof_chars() {
+        assert!(stdin_byte_requests_shutdown(0x03));
+        assert!(stdin_byte_requests_shutdown(0x04));
+        assert!(!stdin_byte_requests_shutdown(b'\n'));
+        assert!(!stdin_byte_requests_shutdown(b'a'));
     }
 }
