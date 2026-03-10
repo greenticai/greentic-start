@@ -20,6 +20,7 @@ pub enum BundleSourceKind {
 
 #[derive(Clone, Debug)]
 pub struct ResolvedBundle {
+    #[allow(dead_code)]
     pub source_ref: String,
     pub bundle_dir: PathBuf,
 }
