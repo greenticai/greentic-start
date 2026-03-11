@@ -18,6 +18,7 @@ pub fn build_runner(
     bundle: &Path,
     tenant: &str,
     team: Option<String>,
+    runner_binary: Option<PathBuf>,
 ) -> Result<(DemoRunnerHost, OperatorContext)> {
     let discovery =
         discovery::discover_with_options(bundle, discovery::DiscoveryOptions { cbor_only: true })?;
@@ -25,7 +26,7 @@ pub fn build_runner(
     let runner_host = DemoRunnerHost::new(
         bundle.to_path_buf(),
         &discovery,
-        None,
+        runner_binary,
         secrets_handle,
         false,
     )?;

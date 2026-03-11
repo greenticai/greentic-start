@@ -241,11 +241,13 @@ fn spawn_embedded_messaging(
     Ok(summary)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_universal_subscriptions_service(
     bundle_root: &Path,
     config: &DemoConfig,
     tenant: &str,
     team: &str,
+    runner_binary: Option<PathBuf>,
     tracker: &mut ServiceTracker,
     log_dir: &Path,
     debug_enabled: bool,
@@ -260,7 +262,8 @@ fn spawn_universal_subscriptions_service(
     tracker.record_with_log("subscriptions-universal", "subscriptions", Some(&log_path))?;
 
     let desired = &config.services.subscriptions.universal.desired;
-    let (runner_host, context) = build_runner(bundle_root, tenant, team_override.clone())?;
+    let (runner_host, context) =
+        build_runner(bundle_root, tenant, team_override.clone(), runner_binary)?;
     let store = SubscriptionStore::new(state_root(bundle_root));
     let scheduler = Scheduler::new(SubscriptionService::new(runner_host, context), store);
 
@@ -680,6 +683,7 @@ pub fn demo_up_services(
     cloudflared: Option<CloudflaredConfig>,
     ngrok: Option<NgrokConfig>,
     restart: &BTreeSet<String>,
+    runner_binary: Option<PathBuf>,
     log_dir: &Path,
     debug_enabled: bool,
 ) -> anyhow::Result<()> {
@@ -944,6 +948,7 @@ pub fn demo_up_services(
                     config,
                     tenant,
                     team,
+                    runner_binary.clone(),
                     &mut service_tracker,
                     log_dir,
                     debug_enabled,

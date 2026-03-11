@@ -84,6 +84,8 @@ struct StartArgs {
     ngrok: NgrokModeArg,
     #[arg(long)]
     ngrok_binary: Option<PathBuf>,
+    #[arg(long)]
+    runner_binary: Option<PathBuf>,
     #[arg(long, value_enum, value_delimiter = ',')]
     restart: Vec<RestartTarget>,
     #[arg(long, value_name = "DIR")]
@@ -106,8 +108,8 @@ struct StopArgs {
     team: String,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum NatsModeArg {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum NatsModeArg {
     Off,
     On,
     External,
@@ -123,20 +125,20 @@ impl From<NatsModeArg> for NatsMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum CloudflaredModeArg {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CloudflaredModeArg {
     On,
     Off,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum NgrokModeArg {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum NgrokModeArg {
     On,
     Off,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum RestartTarget {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum RestartTarget {
     All,
     Cloudflared,
     Ngrok,
@@ -144,6 +146,50 @@ enum RestartTarget {
     Gateway,
     Egress,
     Subscriptions,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartRequest {
+    pub bundle: Option<String>,
+    pub tenant: Option<String>,
+    pub team: Option<String>,
+    pub no_nats: bool,
+    pub nats: NatsModeArg,
+    pub nats_url: Option<String>,
+    pub config: Option<PathBuf>,
+    pub cloudflared: CloudflaredModeArg,
+    pub cloudflared_binary: Option<PathBuf>,
+    pub ngrok: NgrokModeArg,
+    pub ngrok_binary: Option<PathBuf>,
+    pub runner_binary: Option<PathBuf>,
+    pub restart: Vec<RestartTarget>,
+    pub log_dir: Option<PathBuf>,
+    pub verbose: bool,
+    pub quiet: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StopRequest {
+    pub bundle: Option<String>,
+    pub state_dir: Option<PathBuf>,
+    pub tenant: String,
+    pub team: String,
+}
+
+pub fn run_start_request(request: StartRequest) -> anyhow::Result<()> {
+    run_start(request)
+}
+
+pub fn run_restart_request(mut request: StartRequest) -> anyhow::Result<()> {
+    if request.restart.is_empty() {
+        request.restart.push(RestartTarget::All);
+    }
+    run_start(request)
+}
+
+pub fn run_stop_request(request: StopRequest) -> anyhow::Result<()> {
+    let state_dir = resolve_state_dir(request.state_dir, request.bundle.as_deref())?;
+    runtime::demo_down_runtime(&state_dir, &request.tenant, &request.team, false)
 }
 
 pub fn run_from_env() -> anyhow::Result<()> {
@@ -155,14 +201,11 @@ pub fn run_from_env() -> anyhow::Result<()> {
     }
 
     match cli.command {
-        Command::Start(args) | Command::Up(args) => run_start(args),
-        Command::Restart(mut args) => {
-            if args.restart.is_empty() {
-                args.restart.push(RestartTarget::All);
-            }
-            run_start(args)
+        Command::Start(args) | Command::Up(args) => {
+            run_start_request(start_request_from_args(args))
         }
-        Command::Stop(args) => run_stop(args),
+        Command::Restart(args) => run_restart_request(start_request_from_args(args)),
+        Command::Stop(args) => run_stop_request(stop_request_from_args(args)),
     }
 }
 
@@ -231,42 +274,44 @@ fn arg_takes_value(arg: &str) -> bool {
             | "--cloudflared-binary"
             | "--ngrok"
             | "--ngrok-binary"
+            | "--runner-binary"
             | "--restart"
             | "--log-dir"
             | "--state-dir"
     )
 }
 
-fn run_start(args: StartArgs) -> anyhow::Result<()> {
-    let restart: BTreeSet<String> = args.restart.iter().map(restart_name).collect();
-    let log_level = if args.quiet {
+fn run_start(request: StartRequest) -> anyhow::Result<()> {
+    let restart: BTreeSet<String> = request.restart.iter().map(restart_name).collect();
+    let log_level = if request.quiet {
         operator_log::Level::Warn
-    } else if args.verbose {
+    } else if request.verbose {
         operator_log::Level::Debug
     } else {
         operator_log::Level::Info
     };
 
-    let demo_paths = resolve_demo_paths(args.config.clone(), args.bundle.as_deref())?;
+    let demo_paths = resolve_demo_paths(request.config.clone(), request.bundle.as_deref())?;
     let config_path = demo_paths.config_path;
     let config_dir = demo_paths.root_dir;
     let state_dir = demo_paths.state_dir;
     let log_dir = operator_log::init(
-        args.log_dir
+        request
+            .log_dir
             .clone()
             .unwrap_or_else(|| config_dir.join("logs")),
         log_level,
     )?;
 
     let mut demo_config = config::load_demo_config(&config_path)?;
-    apply_nats_overrides(&mut demo_config, &args);
+    apply_nats_overrides(&mut demo_config, &request);
     let tenant = demo_config.tenant.clone();
     let team = demo_config.team.clone();
 
-    let cloudflared = match args.cloudflared {
+    let cloudflared = match request.cloudflared {
         CloudflaredModeArg::Off => None,
         CloudflaredModeArg::On => {
-            let explicit = args.cloudflared_binary.clone();
+            let explicit = request.cloudflared_binary.clone();
             let binary = bin_resolver::resolve_binary(
                 "cloudflared",
                 &bin_resolver::ResolveCtx {
@@ -283,10 +328,10 @@ fn run_start(args: StartArgs) -> anyhow::Result<()> {
         }
     };
 
-    let ngrok = match args.ngrok {
+    let ngrok = match request.ngrok {
         NgrokModeArg::Off => None,
         NgrokModeArg::On => {
-            let explicit = args.ngrok_binary.clone();
+            let explicit = request.ngrok_binary.clone();
             let binary = bin_resolver::resolve_binary(
                 "ngrok",
                 &bin_resolver::ResolveCtx {
@@ -309,8 +354,9 @@ fn run_start(args: StartArgs) -> anyhow::Result<()> {
         cloudflared,
         ngrok,
         &restart,
+        request.runner_binary.clone(),
         &log_dir,
-        args.verbose,
+        request.verbose,
     )?;
 
     println!(
@@ -324,7 +370,7 @@ fn run_start(args: StartArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn apply_nats_overrides(config: &mut config::DemoConfig, args: &StartArgs) {
+fn apply_nats_overrides(config: &mut config::DemoConfig, args: &StartRequest) {
     let nats_mode = if args.no_nats {
         NatsModeArg::Off
     } else {
@@ -351,9 +397,34 @@ fn apply_nats_overrides(config: &mut config::DemoConfig, args: &StartArgs) {
     }
 }
 
-fn run_stop(args: StopArgs) -> anyhow::Result<()> {
-    let state_dir = resolve_state_dir(args.state_dir, args.bundle.as_deref())?;
-    runtime::demo_down_runtime(&state_dir, &args.tenant, &args.team, false)
+fn start_request_from_args(args: StartArgs) -> StartRequest {
+    StartRequest {
+        bundle: args.bundle,
+        tenant: args.tenant,
+        team: args.team,
+        no_nats: args.no_nats,
+        nats: args.nats,
+        nats_url: args.nats_url,
+        config: args.config,
+        cloudflared: args.cloudflared,
+        cloudflared_binary: args.cloudflared_binary,
+        ngrok: args.ngrok,
+        ngrok_binary: args.ngrok_binary,
+        runner_binary: args.runner_binary,
+        restart: args.restart,
+        log_dir: args.log_dir,
+        verbose: args.verbose,
+        quiet: args.quiet,
+    }
+}
+
+fn stop_request_from_args(args: StopArgs) -> StopRequest {
+    StopRequest {
+        bundle: args.bundle,
+        state_dir: args.state_dir,
+        tenant: args.tenant,
+        team: args.team,
+    }
 }
 
 struct DemoPaths {
@@ -535,9 +606,23 @@ mod tests {
     }
 
     #[test]
+    fn normalize_args_keeps_runner_binary_value_with_demo_prefix() {
+        let args = normalize_args(vec![
+            "demo".into(),
+            "start".into(),
+            "--runner-binary".into(),
+            "/tmp/runner".into(),
+        ]);
+        assert_eq!(args[0], "greentic-start");
+        assert_eq!(args[1], "start");
+        assert_eq!(args[2], "--runner-binary");
+        assert_eq!(args[3], "/tmp/runner");
+    }
+
+    #[test]
     fn apply_nats_overrides_disables_nats_for_flag() {
         let mut config = config::DemoConfig::default();
-        let args = StartArgs {
+        let args = StartRequest {
             bundle: None,
             tenant: None,
             team: None,
@@ -549,6 +634,7 @@ mod tests {
             cloudflared_binary: None,
             ngrok: NgrokModeArg::Off,
             ngrok_binary: None,
+            runner_binary: None,
             restart: Vec::new(),
             log_dir: None,
             verbose: false,
@@ -562,7 +648,7 @@ mod tests {
     #[test]
     fn apply_nats_overrides_uses_external_url_without_spawn() {
         let mut config = config::DemoConfig::default();
-        let args = StartArgs {
+        let args = StartRequest {
             bundle: None,
             tenant: None,
             team: None,
@@ -574,6 +660,7 @@ mod tests {
             cloudflared_binary: None,
             ngrok: NgrokModeArg::Off,
             ngrok_binary: None,
+            runner_binary: None,
             restart: Vec::new(),
             log_dir: None,
             verbose: false,
