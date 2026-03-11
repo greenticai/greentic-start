@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
@@ -512,31 +511,10 @@ fn wait_for_ctrlc() -> anyhow::Result<()> {
     let runtime =
         tokio::runtime::Runtime::new().context("failed to spawn runtime for Ctrl+C listener")?;
     runtime.block_on(async {
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                result.map_err(|err| anyhow!("failed to wait for Ctrl+C: {err}"))
-            }
-            result = tokio::task::spawn_blocking(wait_for_stdin_shutdown_signal) => {
-                result
-                    .map_err(|err| anyhow!("failed to join stdin shutdown watcher: {err}"))?
-            }
-        }
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|err| anyhow!("failed to wait for Ctrl+C: {err}"))
     })
-}
-
-fn wait_for_stdin_shutdown_signal() -> anyhow::Result<()> {
-    let mut stdin = std::io::stdin().lock();
-    let mut buf = [0u8; 1];
-    loop {
-        let read = stdin.read(&mut buf)?;
-        if read == 0 || stdin_byte_requests_shutdown(buf[0]) {
-            return Ok(());
-        }
-    }
-}
-
-fn stdin_byte_requests_shutdown(byte: u8) -> bool {
-    matches!(byte, 0x03 | 0x04)
 }
 
 fn restart_name(target: &RestartTarget) -> String {
@@ -670,14 +648,6 @@ mod tests {
         assert!(config.services.nats.enabled);
         assert!(!config.services.nats.spawn.enabled);
         assert_eq!(config.services.nats.url, "nats://127.0.0.1:5555");
-    }
-
-    #[test]
-    fn stdin_shutdown_signal_matches_ctrl_c_and_eof_chars() {
-        assert!(stdin_byte_requests_shutdown(0x03));
-        assert!(stdin_byte_requests_shutdown(0x04));
-        assert!(!stdin_byte_requests_shutdown(b'\n'));
-        assert!(!stdin_byte_requests_shutdown(b'a'));
     }
 
     #[test]
