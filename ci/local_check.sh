@@ -51,7 +51,7 @@ run_package_step "cargo package --allow-dirty --no-verify -p greentic-start" \
 run_package_step "cargo package --allow-dirty -p greentic-start" \
   cargo package --allow-dirty -p greentic-start
 
-echo "[local_check] cargo publish --dry-run"
+echo "[local_check] cargo publish --dry-run --allow-dirty"
 set +e
 if command -v timeout >/dev/null 2>&1; then
   timeout_cmd=(timeout "$PUBLISH_DRY_RUN_TIMEOUT_SEC")
@@ -60,7 +60,7 @@ elif command -v gtimeout >/dev/null 2>&1; then
 else
   timeout_cmd=()
 fi
-publish_output="$("${timeout_cmd[@]}" cargo publish --dry-run -p greentic-start 2>&1)"
+publish_output="$("${timeout_cmd[@]}" cargo publish --dry-run --allow-dirty -p greentic-start 2>&1)"
 publish_status=$?
 set -e
 if [[ -n "$publish_output" ]]; then

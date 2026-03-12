@@ -14,6 +14,9 @@ use crate::runtime_state::{
     write_json,
 };
 use crate::services;
+use crate::startup_contract::{
+    BundleStaticRoutesInspection, StartupContract, StartupContractInput,
+};
 use crate::supervisor;
 
 use crate::cloudflared::{self, CloudflaredConfig};
@@ -611,12 +614,10 @@ pub fn demo_up(
 
     let run_gsm_services = matches!(nats_mode, NatsMode::On);
     if messaging_enabled && run_gsm_services {
-        let env_map = build_env(
-            tenant,
-            team_id,
-            resolved_nats_url.as_deref(),
-            public_base_url.as_deref(),
-        );
+        let mut env_map = build_env(tenant, team_id, resolved_nats_url.as_deref(), None);
+        if let Some(url) = public_base_url.as_deref() {
+            env_map.insert("PUBLIC_BASE_URL".to_string(), url.to_string());
+        }
         if debug_enabled {
             operator_log::debug(
                 module_path!(),
@@ -680,6 +681,8 @@ pub fn demo_up(
 pub fn demo_up_services(
     config_path: &Path,
     config: &DemoConfig,
+    static_routes: &BundleStaticRoutesInspection,
+    configured_public_base_url: Option<String>,
     cloudflared: Option<CloudflaredConfig>,
     ngrok: Option<NgrokConfig>,
     restart: &BTreeSet<String>,
@@ -697,6 +700,12 @@ pub fn demo_up_services(
     let mut service_tracker = ServiceTracker::new(&paths, Some(log_dir))?;
     let discovery = crate::discovery::discover(config_dir)?;
     crate::discovery::persist(config_dir, tenant, &discovery)?;
+    let run_gsm_services = config.services.nats.enabled;
+    if static_routes.bundle_has_static_routes() && !run_gsm_services {
+        anyhow::bail!(
+            "bundle declares static routes but this launch mode does not expose public HTTP"
+        );
+    }
     operator_log::info(
         module_path!(),
         format!(
@@ -726,7 +735,7 @@ pub fn demo_up_services(
         let _ = supervisor::stop_pidfile(&paths.pid_path("ngrok"), 2_000);
     }
 
-    let public_base_url = if let Some(cfg) = cloudflared {
+    let tunnel_public_base_url = if let Some(cfg) = cloudflared {
         let cloudflared_log = operator_log::reserve_service_log(log_dir, "cloudflared")
             .with_context(|| "unable to open cloudflared.log")?;
         operator_log::info(
@@ -837,6 +846,14 @@ pub fn demo_up_services(
         None
     };
 
+    let public_base_url = configured_public_base_url.or(tunnel_public_base_url);
+    let startup_contract =
+        resolve_startup_contract(static_routes, run_gsm_services, public_base_url.clone())?;
+    write_json(
+        &paths.runtime_root().join("startup_contract.json"),
+        &startup_contract,
+    )?;
+
     if should_restart(restart, "nats") {
         let _ = supervisor::stop_pidfile(&paths.pid_path("nats"), 2_000);
     }
@@ -848,7 +865,7 @@ pub fn demo_up_services(
                 "nats",
                 &config.services.nats.spawn.binary,
                 &config.services.nats.spawn.args,
-                &build_env(tenant, team, None, public_base_url.as_deref()),
+                &build_env(tenant, team, None, Some(&startup_contract)),
             )?;
             log_service_spec_debug("nats", "nats", &spec, tenant, team, debug_enabled);
             let nats_log = operator_log::reserve_service_log(log_dir, "nats")
@@ -869,7 +886,6 @@ pub fn demo_up_services(
         "events provider packs run in-process; external events components are disabled",
     );
 
-    let run_gsm_services = config.services.nats.enabled;
     if run_gsm_services {
         if should_restart(restart, "gateway") {
             let _ = supervisor::stop_pidfile(&paths.pid_path("gateway"), 2_000);
@@ -879,12 +895,7 @@ pub fn demo_up_services(
             "gateway",
             &config.services.gateway.binary,
             &config.services.gateway.args,
-            &build_env(
-                tenant,
-                team,
-                nats_url.as_deref(),
-                public_base_url.as_deref(),
-            ),
+            &build_env(tenant, team, nats_url.as_deref(), Some(&startup_contract)),
         )?;
         if let Some(handle) = spawn_if_needed(&paths, &gateway_spec, restart, None)? {
             service_tracker.record_with_log("gateway", "gateway", Some(&handle.log_path))?;
@@ -898,12 +909,7 @@ pub fn demo_up_services(
             "egress",
             &config.services.egress.binary,
             &config.services.egress.args,
-            &build_env(
-                tenant,
-                team,
-                nats_url.as_deref(),
-                public_base_url.as_deref(),
-            ),
+            &build_env(tenant, team, nats_url.as_deref(), Some(&startup_contract)),
         )?;
         if let Some(handle) = spawn_if_needed(&paths, &egress_spec, restart, None)? {
             service_tracker.record_with_log("egress", "egress", Some(&handle.log_path))?;
@@ -926,12 +932,7 @@ pub fn demo_up_services(
                         "subscriptions",
                         &config.services.subscriptions.msgraph.binary,
                         &args,
-                        &build_env(
-                            tenant,
-                            team,
-                            nats_url.as_deref(),
-                            public_base_url.as_deref(),
-                        ),
+                        &build_env(tenant, team, nats_url.as_deref(), Some(&startup_contract)),
                     )?;
                     if let Some(handle) = spawn_if_needed(&paths, &spec, restart, None)? {
                         service_tracker.record_with_log(
@@ -988,7 +989,7 @@ pub fn demo_up_services(
     let endpoints = DemoEndpoints {
         tenant: tenant.to_string(),
         team: team.to_string(),
-        public_base_url,
+        public_base_url: startup_contract.public_base_url.clone(),
         nats_url,
         gateway_listen_addr: config.services.gateway.listen_addr.clone(),
         gateway_port: config.services.gateway.port,
@@ -1214,7 +1215,7 @@ fn build_env(
     tenant: &str,
     team: &str,
     nats_url: Option<&str>,
-    public_base_url: Option<&str>,
+    startup_contract: Option<&StartupContract>,
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("GREENTIC_TENANT".to_string(), tenant.to_string());
@@ -1222,10 +1223,23 @@ fn build_env(
     if let Some(url) = nats_url {
         env.insert("NATS_URL".to_string(), url.to_string());
     }
-    if let Some(url) = public_base_url {
-        env.insert("PUBLIC_BASE_URL".to_string(), url.to_string());
+    if let Some(contract) = startup_contract {
+        contract.apply_env(&mut env);
     }
     env
+}
+
+fn resolve_startup_contract(
+    static_routes: &BundleStaticRoutesInspection,
+    run_gsm_services: bool,
+    public_base_url: Option<String>,
+) -> anyhow::Result<StartupContract> {
+    crate::startup_contract::resolve(StartupContractInput {
+        bundle_has_static_routes: static_routes.bundle_has_static_routes(),
+        http_listener_enabled: run_gsm_services,
+        asset_serving_enabled: run_gsm_services,
+        public_base_url,
+    })
 }
 
 fn mark_nats_started(paths: &RuntimePaths) -> anyhow::Result<()> {

@@ -8,7 +8,7 @@ mod bundle_ref;
 mod capabilities;
 mod cards;
 mod cloudflared;
-mod config;
+pub mod config;
 mod demo_qa_bridge;
 mod dev_store_path;
 mod discovery;
@@ -22,8 +22,8 @@ mod qa_persist;
 mod runner_exec;
 mod runner_host;
 mod runner_integration;
-mod runtime;
-mod runtime_state;
+pub mod runtime;
+pub mod runtime_state;
 mod secret_name;
 mod secret_requirements;
 mod secret_value;
@@ -33,9 +33,10 @@ mod secrets_gate;
 mod secrets_manager;
 mod secrets_setup;
 mod services;
+mod startup_contract;
 mod state_layout;
 mod subscriptions_universal;
-mod supervisor;
+pub mod supervisor;
 
 use runtime::NatsMode;
 
@@ -304,6 +305,8 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
 
     let mut demo_config = config::load_demo_config(&config_path)?;
     apply_nats_overrides(&mut demo_config, &request);
+    let static_routes = startup_contract::inspect_bundle(&config_dir)?;
+    let configured_public_base_url = startup_contract::configured_public_base_url_from_env()?;
     let tenant = demo_config.tenant.clone();
     let team = demo_config.team.clone();
 
@@ -350,6 +353,8 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
     runtime::demo_up_services(
         &config_path,
         &demo_config,
+        &static_routes,
+        configured_public_base_url,
         cloudflared,
         ngrok,
         &restart,

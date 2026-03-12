@@ -1,0 +1,101 @@
+PR-ST-01 — Start launch-gating for static-route-capable bundles
+Title
+
+Add static-route capability detection and launch compatibility checks to greentic-start
+
+Goal
+
+Before booting runtime services, greentic-start should determine whether the selected bundle contains static routes and whether the chosen startup mode supports hosting them.
+
+Why
+
+start already owns:
+
+bundle resolution
+
+config resolution
+
+runtime mode selection
+
+tunnel/public URL resolution
+
+service launch
+
+So it should also own:
+
+launch compatibility for static hosting
+
+Scope
+Detect static-route declarations
+
+Extend startup inspection so it scans bundled pack manifests for:
+
+greentic.static-routes.v1
+
+Use the same direct pack-manifest inspection pattern already used for capabilities/offers.
+
+Compute startup compatibility
+
+Before launching runtime, determine:
+
+whether any selected pack declares static routes
+
+whether public HTTP is enabled in this launch mode
+
+whether asset serving is supported
+
+whether a resolved public_base_url exists when required
+
+Startup behavior
+
+if no static routes are declared: no behavior change
+
+if static routes are declared and runtime mode supports them: continue
+
+if static routes are declared but mode is incompatible: fail early with a clear message
+
+Resolved handoff
+
+Pass a small resolved startup contract into runtime/operator, for example through env and/or startup metadata:
+
+PUBLIC_HTTP_ENABLED
+
+STATIC_ROUTES_ENABLED
+
+ASSET_SERVING_ENABLED
+
+PUBLIC_BASE_URL
+
+maybe a summarized “bundle has static routes” flag
+
+Do not do here
+
+no route serving
+
+no full static-route schema validation
+
+no runtime collision detection
+
+no pack schema authorship
+
+Files likely touched
+
+startup capability inspection
+
+launch validation path
+
+runtime env handoff
+
+startup metadata persistence
+
+docs for startup mode compatibility
+
+Acceptance criteria
+
+start can detect bundles that declare static routes
+
+incompatible launch modes fail before runtime starts
+
+resolved launch contract is passed to operator/runtime
+
+no route-serving logic is added to start

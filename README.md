@@ -25,6 +25,18 @@ Primary runtime inputs:
 - `--nats`, `--cloudflared`, `--ngrok`
 - `--log-dir`, `--verbose`, `--quiet`
 
+## Startup Contract
+
+`greentic-start` performs startup-time launch gating for bundles that declare
+`greentic.static-routes.v1`.
+
+- Bundles with no static routes behave as before.
+- Bundles with static routes fail before service boot if launch mode cannot
+  expose public HTTP, cannot support hosted assets, or cannot resolve
+  `PUBLIC_BASE_URL`.
+- Resolved startup values are passed forward through child-process env vars and
+  persisted runtime metadata (`startup_contract.json`).
+
 ## Extension pack roles
 
 - Core platform packs: runtime-critical packs such as messaging, events, oauth, telemetry, secrets, and state integrations.
