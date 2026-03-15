@@ -268,6 +268,7 @@ pub fn apply_answers_via_component_qa(
     Ok(Some(config))
 }
 
+#[allow(dead_code)]
 pub fn persist_answers_artifacts(
     providers_root: &Path,
     provider_id: &str,

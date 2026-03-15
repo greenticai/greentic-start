@@ -3,20 +3,34 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::Deserialize;
 mod bin_resolver;
 mod bundle_ref;
 mod capabilities;
 mod cards;
 mod cloudflared;
+mod component_qa_ops;
 pub mod config;
 mod demo_qa_bridge;
 mod dev_store_path;
 mod discovery;
 mod domains;
+mod event_router;
 mod gmap;
+mod http_ingress;
+mod ingress;
+mod ingress_dispatch;
+mod ingress_types;
+mod messaging_app;
+mod messaging_dto;
+mod messaging_egress;
 mod ngrok;
+mod offers;
+mod onboard;
 mod operator_i18n;
 mod operator_log;
+mod post_ingress_hooks;
+mod project;
 mod provider_config_envelope;
 mod qa_persist;
 mod runner_exec;
@@ -33,6 +47,8 @@ mod secrets_gate;
 mod secrets_manager;
 mod secrets_setup;
 mod services;
+mod setup_input;
+mod setup_to_formspec;
 mod startup_contract;
 mod state_layout;
 mod subscriptions_universal;
@@ -292,9 +308,9 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
     };
 
     let demo_paths = resolve_demo_paths(request.config.clone(), request.bundle.as_deref())?;
-    let config_path = demo_paths.config_path;
-    let config_dir = demo_paths.root_dir;
-    let state_dir = demo_paths.state_dir;
+    let config_path = demo_paths.config_path.clone();
+    let config_dir = demo_paths.root_dir.clone();
+    let state_dir = demo_paths.state_dir.clone();
     let log_dir = operator_log::init(
         request
             .log_dir
@@ -303,7 +319,7 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
         log_level,
     )?;
 
-    let mut demo_config = config::load_demo_config(&config_path)?;
+    let mut demo_config = load_runtime_demo_config(&demo_paths, &request)?;
     apply_nats_overrides(&mut demo_config, &request);
     let static_routes = startup_contract::inspect_bundle(&config_dir)?;
     let configured_public_base_url = startup_contract::configured_public_base_url_from_env()?;
@@ -350,7 +366,7 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
         }
     };
 
-    runtime::demo_up_services(
+    let handles = runtime::demo_up_services(
         &config_path,
         &demo_config,
         &static_routes,
@@ -370,6 +386,7 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
         team
     );
     wait_for_ctrlc()?;
+    handles.stop()?;
     runtime::demo_down_runtime(&state_dir, &tenant, &team, false)?;
     Ok(())
 }
@@ -435,6 +452,13 @@ struct DemoPaths {
     config_path: PathBuf,
     root_dir: PathBuf,
     state_dir: PathBuf,
+    config_source: DemoConfigSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DemoConfigSource {
+    LegacyFile,
+    NormalizedBundle,
 }
 
 fn resolve_demo_paths(
@@ -443,20 +467,23 @@ fn resolve_demo_paths(
 ) -> anyhow::Result<DemoPaths> {
     if let Some(path) = explicit {
         let root_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let config_source = resolve_runtime_config_source(&root_dir, &path)?;
         return Ok(DemoPaths {
             state_dir: root_dir.join("state"),
             root_dir,
             config_path: path,
+            config_source,
         });
     }
     if let Some(bundle_ref) = bundle {
         let resolved = bundle_ref::resolve_bundle_ref(bundle_ref)?;
         let root_dir = resolved.bundle_dir;
-        let config_path = resolve_bundle_config_path(&root_dir)?;
+        let (config_path, config_source) = resolve_bundle_config_path(&root_dir)?;
         return Ok(DemoPaths {
             state_dir: root_dir.join("state"),
             root_dir,
             config_path,
+            config_source,
         });
     }
     let cwd = std::env::current_dir()?;
@@ -467,6 +494,7 @@ fn resolve_demo_paths(
             state_dir: root_dir.join("state"),
             root_dir,
             config_path: demo_path,
+            config_source: DemoConfigSource::LegacyFile,
         });
     }
     let fallback = cwd.join("greentic.operator.yaml");
@@ -475,6 +503,7 @@ fn resolve_demo_paths(
             state_dir: cwd.join("state"),
             root_dir: cwd,
             config_path: fallback,
+            config_source: DemoConfigSource::LegacyFile,
         });
     }
     Err(anyhow!(
@@ -482,23 +511,169 @@ fn resolve_demo_paths(
     ))
 }
 
-fn resolve_bundle_config_path(root_dir: &Path) -> anyhow::Result<PathBuf> {
+fn resolve_bundle_config_path(root_dir: &Path) -> anyhow::Result<(PathBuf, DemoConfigSource)> {
     let demo = root_dir.join("greentic.demo.yaml");
     if demo.exists() {
-        return Ok(demo);
+        return Ok((demo, DemoConfigSource::LegacyFile));
     }
     let fallback = root_dir.join("greentic.operator.yaml");
     if fallback.exists() {
-        return Ok(fallback);
+        return Ok((fallback, DemoConfigSource::LegacyFile));
     }
     let nested_demo = root_dir.join("demo").join("demo.yaml");
     if nested_demo.exists() {
-        return Ok(nested_demo);
+        return Ok((nested_demo, DemoConfigSource::LegacyFile));
+    }
+    let normalized = root_dir.join("bundle.yaml");
+    if normalized.exists() && normalized_bundle_has_runtime_payload(root_dir) {
+        return Ok((normalized, DemoConfigSource::NormalizedBundle));
     }
     Err(anyhow!(
-        "bundle config not found under {}; expected greentic.demo.yaml, greentic.operator.yaml, or demo/demo.yaml",
+        "bundle config not found under {}; expected greentic.demo.yaml, greentic.operator.yaml, demo/demo.yaml, or a normalized bundle rooted on bundle.yaml",
         root_dir.display()
     ))
+}
+
+fn resolve_runtime_config_source(root_dir: &Path, path: &Path) -> anyhow::Result<DemoConfigSource> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if matches!(
+        name,
+        "greentic.demo.yaml" | "greentic.operator.yaml" | "demo.yaml"
+    ) {
+        return Ok(DemoConfigSource::LegacyFile);
+    }
+    if name == "bundle.yaml" && normalized_bundle_has_runtime_payload(root_dir) {
+        return Ok(DemoConfigSource::NormalizedBundle);
+    }
+    Err(anyhow!(
+        "unsupported startup config {}; expected greentic.demo.yaml, greentic.operator.yaml, demo/demo.yaml, or bundle.yaml for a normalized bundle",
+        path.display()
+    ))
+}
+
+fn normalized_bundle_has_runtime_payload(root_dir: &Path) -> bool {
+    root_dir.join("bundle-manifest.json").exists() || root_dir.join("resolved").is_dir()
+}
+
+fn load_runtime_demo_config(
+    demo_paths: &DemoPaths,
+    request: &StartRequest,
+) -> anyhow::Result<config::DemoConfig> {
+    let mut demo_config = match demo_paths.config_source {
+        DemoConfigSource::LegacyFile => config::load_demo_config(&demo_paths.config_path)?,
+        DemoConfigSource::NormalizedBundle => {
+            let mut config = config::DemoConfig::default();
+            if let Some(target) = infer_normalized_bundle_target(&demo_paths.root_dir)? {
+                config.tenant = target.tenant;
+                if let Some(team) = target.team {
+                    config.team = team;
+                }
+            }
+            config
+        }
+    };
+    apply_target_overrides(&mut demo_config, request);
+    Ok(demo_config)
+}
+
+fn apply_target_overrides(config: &mut config::DemoConfig, request: &StartRequest) {
+    if let Some(tenant) = request.tenant.as_ref() {
+        config.tenant = tenant.clone();
+    }
+    if let Some(team) = request.team.as_ref() {
+        config.team = team.clone();
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BundleManifestSummary {
+    #[serde(default)]
+    resolved_targets: Vec<ResolvedTargetSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolvedTargetSummary {
+    tenant: String,
+    #[serde(default)]
+    team: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolvedManifestSummary {
+    tenant: String,
+    #[serde(default)]
+    team: Option<String>,
+}
+
+fn infer_normalized_bundle_target(
+    root_dir: &Path,
+) -> anyhow::Result<Option<ResolvedTargetSummary>> {
+    let manifest_path = root_dir.join("bundle-manifest.json");
+    if manifest_path.exists() {
+        let raw = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("read {}", manifest_path.display()))?;
+        let parsed: BundleManifestSummary = serde_json::from_str(&raw)
+            .with_context(|| format!("parse {}", manifest_path.display()))?;
+        if let Some(target) = parsed.resolved_targets.into_iter().next() {
+            return Ok(Some(target));
+        }
+    }
+
+    let resolved_dir = root_dir.join("resolved");
+    if !resolved_dir.is_dir() {
+        return Ok(None);
+    }
+
+    let mut entries = std::fs::read_dir(&resolved_dir)?
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("read {}", resolved_dir.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
+            continue;
+        }
+        if let Some(target) = infer_target_from_resolved_file(&path)? {
+            return Ok(Some(target));
+        }
+    }
+
+    Ok(None)
+}
+
+fn infer_target_from_resolved_file(path: &Path) -> anyhow::Result<Option<ResolvedTargetSummary>> {
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    if let Ok(parsed) = serde_yaml_bw::from_str::<ResolvedManifestSummary>(&raw) {
+        return Ok(Some(ResolvedTargetSummary {
+            tenant: parsed.tenant,
+            team: parsed.team,
+        }));
+    }
+
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if stem.is_empty() {
+        return Ok(None);
+    }
+    if let Some((tenant, team)) = stem.split_once('.') {
+        return Ok(Some(ResolvedTargetSummary {
+            tenant: tenant.to_string(),
+            team: Some(team.to_string()),
+        }));
+    }
+    Ok(Some(ResolvedTargetSummary {
+        tenant: stem.to_string(),
+        team: None,
+    }))
 }
 
 fn resolve_state_dir(state_dir: Option<PathBuf>, bundle: Option<&str>) -> anyhow::Result<PathBuf> {
@@ -670,6 +845,7 @@ mod tests {
         assert_eq!(paths.root_dir, bundle);
         assert_eq!(paths.config_path, bundle.join("greentic.demo.yaml"));
         assert_eq!(paths.state_dir, bundle.join("state"));
+        assert_eq!(paths.config_source, DemoConfigSource::LegacyFile);
     }
 
     #[test]
@@ -685,6 +861,102 @@ mod tests {
 
         let paths = resolve_demo_paths(None, Some(&file_ref)).expect("paths");
         assert_eq!(paths.config_path, bundle.join("greentic.demo.yaml"));
+    }
+
+    #[test]
+    fn resolve_demo_paths_accepts_normalized_bundle_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        std::fs::write(bundle.join("bundle.yaml"), "bundle_id: demo-bundle\n").expect("bundle");
+        std::fs::create_dir_all(bundle.join("resolved")).expect("resolved dir");
+        std::fs::write(bundle.join("resolved/default.yaml"), "tenant: default\n")
+            .expect("resolved output");
+
+        let paths =
+            resolve_demo_paths(None, Some(bundle.to_string_lossy().as_ref())).expect("paths");
+        assert_eq!(paths.config_path, bundle.join("bundle.yaml"));
+        assert_eq!(paths.config_source, DemoConfigSource::NormalizedBundle);
+    }
+
+    #[test]
+    fn load_runtime_demo_config_infers_normalized_bundle_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        std::fs::write(bundle.join("bundle.yaml"), "bundle_id: demo-bundle\n").expect("bundle");
+        std::fs::write(
+            bundle.join("bundle-manifest.json"),
+            r#"{"resolved_targets":[{"tenant":"default","team":null}]}"#,
+        )
+        .expect("manifest");
+        let request = StartRequest {
+            bundle: Some(bundle.display().to_string()),
+            tenant: None,
+            team: None,
+            no_nats: false,
+            nats: NatsModeArg::Off,
+            nats_url: None,
+            config: None,
+            cloudflared: CloudflaredModeArg::On,
+            cloudflared_binary: None,
+            ngrok: NgrokModeArg::Off,
+            ngrok_binary: None,
+            runner_binary: None,
+            restart: Vec::new(),
+            log_dir: None,
+            verbose: false,
+            quiet: false,
+        };
+        let paths = DemoPaths {
+            config_path: bundle.join("bundle.yaml"),
+            root_dir: bundle.to_path_buf(),
+            state_dir: bundle.join("state"),
+            config_source: DemoConfigSource::NormalizedBundle,
+        };
+
+        let config = load_runtime_demo_config(&paths, &request).expect("config");
+        assert_eq!(config.tenant, "default");
+        assert_eq!(config.team, DEMO_DEFAULT_TEAM);
+    }
+
+    #[test]
+    fn load_runtime_demo_config_applies_cli_target_overrides() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        std::fs::write(bundle.join("bundle.yaml"), "bundle_id: demo-bundle\n").expect("bundle");
+        std::fs::create_dir_all(bundle.join("resolved")).expect("resolved dir");
+        std::fs::write(
+            bundle.join("resolved/default.platform.yaml"),
+            "tenant: default\nteam: platform\n",
+        )
+        .expect("resolved output");
+        let request = StartRequest {
+            bundle: Some(bundle.display().to_string()),
+            tenant: Some("tenant-a".to_string()),
+            team: Some("team-b".to_string()),
+            no_nats: false,
+            nats: NatsModeArg::Off,
+            nats_url: None,
+            config: None,
+            cloudflared: CloudflaredModeArg::On,
+            cloudflared_binary: None,
+            ngrok: NgrokModeArg::Off,
+            ngrok_binary: None,
+            runner_binary: None,
+            restart: Vec::new(),
+            log_dir: None,
+            verbose: false,
+            quiet: false,
+        };
+        let paths = DemoPaths {
+            config_path: bundle.join("bundle.yaml"),
+            root_dir: bundle.to_path_buf(),
+            state_dir: bundle.join("state"),
+            config_source: DemoConfigSource::NormalizedBundle,
+        };
+
+        let config = load_runtime_demo_config(&paths, &request).expect("config");
+        assert_eq!(config.tenant, "tenant-a");
+        assert_eq!(config.team, "team-b");
     }
 
     #[test]

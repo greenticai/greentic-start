@@ -13,11 +13,11 @@ use crate::ingress::control_directive::{
     ControlDirective, DispatchTarget, IngressReply, try_parse_control_directive,
 };
 use crate::ingress_types::{IngressDispatchResult, IngressHttpResponse, IngressRequestV1};
-use crate::operator_log;
 use crate::offers::registry::{
     HOOK_CONTRACT_CONTROL_V1, HOOK_STAGE_POST_INGRESS, OfferRegistry, discover_gtpacks,
     load_pack_offers,
 };
+use crate::operator_log;
 use crate::runner_exec::{self, RunRequest};
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
 

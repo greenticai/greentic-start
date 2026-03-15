@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -8,11 +9,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 
+use crate::domains::Domain;
+use crate::http_ingress::{HttpIngressConfig, HttpIngressServer};
 use crate::operator_log;
+use crate::runner_host::DemoRunnerHost;
 use crate::runtime_state::{
     RuntimePaths, persist_service_manifest, read_service_manifest, remove_service_manifest,
     write_json,
 };
+use crate::secrets_gate;
 use crate::services;
 use crate::startup_contract::{
     BundleStaticRoutesInspection, StartupContract, StartupContractInput,
@@ -27,6 +32,20 @@ use crate::subscriptions_universal::{
     build_runner, ensure_desired_subscriptions, scheduler::Scheduler, service::SubscriptionService,
     state_root, store::SubscriptionStore,
 };
+
+#[derive(Default)]
+pub struct ForegroundRuntimeHandles {
+    pub ingress_server: Option<HttpIngressServer>,
+}
+
+impl ForegroundRuntimeHandles {
+    pub fn stop(mut self) -> anyhow::Result<()> {
+        if let Some(server) = self.ingress_server.take() {
+            server.stop()?;
+        }
+        Ok(())
+    }
+}
 
 struct ServiceSummary {
     id: String,
@@ -689,7 +708,7 @@ pub fn demo_up_services(
     runner_binary: Option<PathBuf>,
     log_dir: &Path,
     debug_enabled: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ForegroundRuntimeHandles> {
     let config_dir = config_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("config path has no parent directory"))?;
@@ -700,6 +719,17 @@ pub fn demo_up_services(
     let mut service_tracker = ServiceTracker::new(&paths, Some(log_dir))?;
     let discovery = crate::discovery::discover(config_dir)?;
     crate::discovery::persist(config_dir, tenant, &discovery)?;
+    let secrets_handle = secrets_gate::resolve_secrets_manager(config_dir, tenant, Some(team))?;
+    let runner_host = Arc::new(DemoRunnerHost::new(
+        config_dir.to_path_buf(),
+        &discovery,
+        runner_binary.clone(),
+        secrets_handle,
+        debug_enabled,
+    )?);
+    let ingress_domains = detect_http_ingress_domains(&discovery, runner_host.as_ref());
+    let ingress_server = start_http_ingress_server(config, &ingress_domains, runner_host)
+        .with_context(|| "failed to start local HTTP ingress server")?;
     let run_gsm_services = config.services.nats.enabled;
     if static_routes.bundle_has_static_routes() && !run_gsm_services {
         anyhow::bail!(
@@ -736,112 +766,132 @@ pub fn demo_up_services(
     }
 
     let tunnel_public_base_url = if let Some(cfg) = cloudflared {
-        let cloudflared_log = operator_log::reserve_service_log(log_dir, "cloudflared")
-            .with_context(|| "unable to open cloudflared.log")?;
-        operator_log::info(
-            module_path!(),
-            format!("starting cloudflared log={}", cloudflared_log.display()),
-        );
-        let handle = cloudflared::start_quick_tunnel(&paths, &cfg, &cloudflared_log)?;
-        let mut domain_labels = Vec::new();
-        if discovery.domains.messaging {
-            domain_labels.push("messaging");
-        }
-        if discovery.domains.events {
-            domain_labels.push("events");
-        }
-        if discovery.domains.oauth {
-            domain_labels.push("oauth");
-        }
-        let domain_list = if domain_labels.is_empty() {
-            "none".to_string()
+        if ingress_server.is_none() {
+            operator_log::warn(
+                module_path!(),
+                "cloudflared requested but no local HTTP ingress listener is enabled; skipping tunnel startup",
+            );
+            None
         } else {
-            domain_labels.join(",")
-        };
-        operator_log::info(
-            module_path!(),
-            format!(
-                "cloudflared ready domains={} url={} log={}",
-                domain_list,
-                handle.url,
-                handle.log_path.display()
-            ),
-        );
-        if debug_enabled {
-            operator_log::debug(
+            let cloudflared_log = operator_log::reserve_service_log(log_dir, "cloudflared")
+                .with_context(|| "unable to open cloudflared.log")?;
+            operator_log::info(
+                module_path!(),
+                format!("starting cloudflared log={}", cloudflared_log.display()),
+            );
+            let handle = cloudflared::start_quick_tunnel(&paths, &cfg, &cloudflared_log)?;
+            let mut domain_labels = Vec::new();
+            if discovery.domains.messaging {
+                domain_labels.push("messaging");
+            }
+            if discovery.domains.events {
+                domain_labels.push("events");
+            }
+            if discovery.domains.oauth {
+                domain_labels.push("oauth");
+            }
+            let domain_list = if domain_labels.is_empty() {
+                "none".to_string()
+            } else {
+                domain_labels.join(",")
+            };
+            operator_log::info(
                 module_path!(),
                 format!(
-                    "[demo dev] tenant={} team={} cloudflared domains={} url={} log={}",
-                    tenant,
-                    team,
+                    "cloudflared ready domains={} url={} log={}",
                     domain_list,
                     handle.url,
                     handle.log_path.display()
                 ),
             );
+            if debug_enabled {
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "[demo dev] tenant={} team={} cloudflared domains={} url={} log={}",
+                        tenant,
+                        team,
+                        domain_list,
+                        handle.url,
+                        handle.log_path.display()
+                    ),
+                );
+            }
+            println!(
+                "{}",
+                crate::operator_i18n::trf(
+                    "demo.runtime.public_url_cloudflared_domains",
+                    "Public URL (service=cloudflared domains={}): {}",
+                    &[&domain_list, &handle.url]
+                )
+            );
+            service_tracker.record_with_log(
+                "cloudflared",
+                "cloudflared",
+                Some(&handle.log_path),
+            )?;
+            Some(handle.url)
         }
-        println!(
-            "{}",
-            crate::operator_i18n::trf(
-                "demo.runtime.public_url_cloudflared_domains",
-                "Public URL (service=cloudflared domains={}): {}",
-                &[&domain_list, &handle.url]
-            )
-        );
-        service_tracker.record_with_log("cloudflared", "cloudflared", Some(&handle.log_path))?;
-        Some(handle.url)
     } else if let Some(cfg) = ngrok {
-        let ngrok_log = operator_log::reserve_service_log(log_dir, "ngrok")
-            .with_context(|| "unable to open ngrok.log")?;
-        operator_log::info(
-            module_path!(),
-            format!("starting ngrok log={}", ngrok_log.display()),
-        );
-        let handle = ngrok::start_tunnel(&paths, &cfg, &ngrok_log)?;
-        let mut domain_labels = Vec::new();
-        if discovery.domains.messaging {
-            domain_labels.push("messaging");
-        }
-        if discovery.domains.events {
-            domain_labels.push("events");
-        }
-        let domain_list = if domain_labels.is_empty() {
-            "none".to_string()
+        if ingress_server.is_none() {
+            operator_log::warn(
+                module_path!(),
+                "ngrok requested but no local HTTP ingress listener is enabled; skipping tunnel startup",
+            );
+            None
         } else {
-            domain_labels.join(",")
-        };
-        operator_log::info(
-            module_path!(),
-            format!(
-                "ngrok ready domains={} url={} log={}",
-                domain_list,
-                handle.url,
-                handle.log_path.display()
-            ),
-        );
-        if debug_enabled {
-            operator_log::debug(
+            let ngrok_log = operator_log::reserve_service_log(log_dir, "ngrok")
+                .with_context(|| "unable to open ngrok.log")?;
+            operator_log::info(
+                module_path!(),
+                format!("starting ngrok log={}", ngrok_log.display()),
+            );
+            let handle = ngrok::start_tunnel(&paths, &cfg, &ngrok_log)?;
+            let mut domain_labels = Vec::new();
+            if discovery.domains.messaging {
+                domain_labels.push("messaging");
+            }
+            if discovery.domains.events {
+                domain_labels.push("events");
+            }
+            let domain_list = if domain_labels.is_empty() {
+                "none".to_string()
+            } else {
+                domain_labels.join(",")
+            };
+            operator_log::info(
                 module_path!(),
                 format!(
-                    "[demo dev] tenant={} team={} ngrok domains={} url={} log={}",
-                    tenant,
-                    team,
+                    "ngrok ready domains={} url={} log={}",
                     domain_list,
                     handle.url,
                     handle.log_path.display()
                 ),
             );
+            if debug_enabled {
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "[demo dev] tenant={} team={} ngrok domains={} url={} log={}",
+                        tenant,
+                        team,
+                        domain_list,
+                        handle.url,
+                        handle.log_path.display()
+                    ),
+                );
+            }
+            println!(
+                "{}",
+                crate::operator_i18n::trf(
+                    "demo.runtime.public_url_ngrok_domains",
+                    "Public URL (service=ngrok domains={}): {}",
+                    &[&domain_list, &handle.url]
+                )
+            );
+            service_tracker.record_with_log("ngrok", "ngrok", Some(&handle.log_path))?;
+            Some(handle.url)
         }
-        println!(
-            "{}",
-            crate::operator_i18n::trf(
-                "demo.runtime.public_url_ngrok_domains",
-                "Public URL (service=ngrok domains={}): {}",
-                &[&domain_list, &handle.url]
-            )
-        );
-        service_tracker.record_with_log("ngrok", "ngrok", Some(&handle.log_path))?;
-        Some(handle.url)
     } else {
         None
     };
@@ -995,7 +1045,61 @@ pub fn demo_up_services(
         gateway_port: config.services.gateway.port,
     };
     write_json(&paths.runtime_root().join("endpoints.json"), &endpoints)?;
-    Ok(())
+    Ok(ForegroundRuntimeHandles { ingress_server })
+}
+
+fn detect_http_ingress_domains(
+    discovery: &crate::discovery::DiscoveryResult,
+    runner_host: &DemoRunnerHost,
+) -> Vec<Domain> {
+    let mut domains = Vec::new();
+    for domain in [Domain::Messaging, Domain::Events, Domain::OAuth] {
+        let supported = discovery.providers.iter().any(|provider| {
+            parse_domain_name(&provider.domain) == Some(domain)
+                && runner_host.supports_op(domain, &provider.provider_id, "ingest_http")
+        });
+        if supported {
+            domains.push(domain);
+        }
+    }
+    domains
+}
+
+fn parse_domain_name(value: &str) -> Option<Domain> {
+    match value {
+        "messaging" => Some(Domain::Messaging),
+        "events" => Some(Domain::Events),
+        "oauth" => Some(Domain::OAuth),
+        "secrets" => Some(Domain::Secrets),
+        _ => None,
+    }
+}
+
+fn start_http_ingress_server(
+    config: &DemoConfig,
+    domains: &[Domain],
+    runner_host: Arc<DemoRunnerHost>,
+) -> anyhow::Result<Option<HttpIngressServer>> {
+    if domains.is_empty() {
+        return Ok(None);
+    }
+    let addr = format!(
+        "{}:{}",
+        config.services.gateway.listen_addr, config.services.gateway.port
+    );
+    let bind_addr = addr
+        .parse()
+        .with_context(|| format!("invalid gateway listen address {addr}"))?;
+    let server = HttpIngressServer::start(HttpIngressConfig {
+        bind_addr,
+        domains: domains.to_vec(),
+        runner_host,
+    })?;
+    println!(
+        "HTTP ingress ready at http://{}:{}",
+        config.services.gateway.listen_addr, config.services.gateway.port
+    );
+    Ok(Some(server))
 }
 
 pub fn demo_status_runtime(

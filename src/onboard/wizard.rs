@@ -2,8 +2,8 @@ use crate::component_qa_ops::{self, QaMode};
 use hyper::StatusCode;
 use serde_json::{Value, json};
 
-use crate::domains::{self, Domain, ProviderPack};
 use crate::demo_qa_bridge;
+use crate::domains::{self, Domain, ProviderPack};
 use crate::gmap;
 use crate::operator_log;
 use crate::provider_config_envelope;
@@ -640,8 +640,8 @@ fn get_form_spec_from_pack(
     mode: QaMode,
 ) -> Option<qa_spec::FormSpec> {
     use super::provider_i18n;
-    use crate::runner_host::{DemoRunnerHost, OperatorContext};
     use crate::discovery::{self, DiscoveryOptions};
+    use crate::runner_host::{DemoRunnerHost, OperatorContext};
     use crate::secrets_gate;
 
     let cbor_only = bundle_root.join("greentic.demo.yaml").exists();
@@ -940,13 +940,12 @@ fn merge_existing_config(
     answers: &Value,
 ) -> Value {
     let providers_root = bundle_root.join(".providers");
-    let existing = match provider_config_envelope::read_provider_config_envelope(
-        &providers_root,
-        provider_id,
-    ) {
-        Ok(Some(envelope)) => envelope.config,
-        _ => return answers.clone(),
-    };
+    let existing =
+        match provider_config_envelope::read_provider_config_envelope(&providers_root, provider_id)
+        {
+            Ok(Some(envelope)) => envelope.config,
+            _ => return answers.clone(),
+        };
 
     let Some(existing_map) = existing.as_object() else {
         return answers.clone();

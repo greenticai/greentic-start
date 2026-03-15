@@ -151,14 +151,13 @@ pub fn deployment_status(state: &OnboardState) -> OnboardResult {
                     }
                 }
                 // Read metadata from config envelope
-                let envelope_config =
-                    provider_config_envelope::read_provider_config_envelope(
-                        &providers_dir,
-                        &provider_id,
-                    )
-                    .ok()
-                    .flatten()
-                    .map(|env| env.config);
+                let envelope_config = provider_config_envelope::read_provider_config_envelope(
+                    &providers_dir,
+                    &provider_id,
+                )
+                .ok()
+                .flatten()
+                .map(|env| env.config);
 
                 let mut entry_json = json!({
                     "provider_id": provider_id,
