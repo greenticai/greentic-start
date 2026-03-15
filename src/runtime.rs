@@ -1058,7 +1058,8 @@ fn detect_http_ingress_domains(
             parse_domain_name(&provider.domain) == Some(domain)
                 && runner_host.supports_op(domain, &provider.provider_id, "ingest_http")
         });
-        if supported {
+        let fallback_supported = matches!(domain, Domain::Events) && discovery.domains.events;
+        if supported || fallback_supported {
             domains.push(domain);
         }
     }
