@@ -44,6 +44,10 @@ use greentic_setup::{SetupEngine, SetupMode};
 
 use crate::operator_log;
 
+type AdminHttpResponse = Response<Full<Bytes>>;
+type AdminHttpError = Box<AdminHttpResponse>;
+type AdminHttpResult<T = AdminHttpResponse> = Result<T, AdminHttpError>;
+
 pub struct AdminServerConfig {
     pub tls_config: AdminTlsConfig,
     pub bundle_root: PathBuf,
@@ -311,13 +315,13 @@ fn check_client_allowed(allowed: &[String], cn: Option<&str>) -> bool {
 async fn handle_admin_request(
     req: Request<Incoming>,
     state: Arc<AdminState>,
-) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+) -> Result<AdminHttpResponse, std::convert::Infallible> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
     let response = match route_admin_request(method, &path, req, &state).await {
         Ok(resp) => resp,
-        Err(resp) => resp,
+        Err(resp) => *resp,
     };
     Ok(response)
 }
@@ -327,7 +331,7 @@ async fn route_admin_request(
     path: &str,
     req: Request<Incoming>,
     state: &AdminState,
-) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+) -> AdminHttpResult {
     match (method.clone(), path) {
         (Method::GET, "/admin/v1/health") => Ok(json_response(
             StatusCode::OK,
@@ -373,17 +377,17 @@ async fn route_admin_request(
                 let session_id = &path["/admin/v1/qa/session/".len()..];
                 return handle_qa_session_get(state, session_id).await;
             }
-            Err(json_response(
+            Err(Box::new(json_response(
                 StatusCode::NOT_FOUND,
                 json!(AdminResponse::<()>::err(format!(
                     "unknown endpoint: {path}"
                 ))),
-            ))
+            )))
         }
     }
 }
 
-fn handle_status(state: &AdminState) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+fn handle_status(state: &AdminState) -> AdminHttpResult {
     let bundle = &state.bundle_root;
 
     let provider_count = match discovery::discover(bundle) {
@@ -416,16 +420,13 @@ fn handle_status(state: &AdminState) -> Result<Response<Full<Bytes>>, Response<F
     ))
 }
 
-async fn handle_deploy(
-    _state: &AdminState,
-    body: JsonValue,
-) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+async fn handle_deploy(_state: &AdminState, body: JsonValue) -> AdminHttpResult {
     tokio::task::spawn_blocking(move || {
         let req: BundleDeployRequest = serde_json::from_value(body).map_err(|err| {
-            json_response(
+            Box::new(json_response(
                 StatusCode::BAD_REQUEST,
                 json!(AdminResponse::<()>::err(err.to_string())),
-            )
+            ))
         })?;
 
         let config = SetupConfig {
@@ -458,10 +459,10 @@ async fn handle_deploy(
         let plan = engine
             .plan(SetupMode::Create, &setup_request, req.dry_run)
             .map_err(|err| {
-                json_response(
+                Box::new(json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     json!(AdminResponse::<()>::err(err.to_string())),
-                )
+                ))
             })?;
 
         if req.dry_run {
@@ -476,10 +477,10 @@ async fn handle_deploy(
         }
 
         let report = engine.execute(&plan).map_err(|err| {
-            json_response(
+            Box::new(json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!(AdminResponse::<()>::err(err.to_string())),
-            )
+            ))
         })?;
 
         Ok(json_response(
@@ -492,25 +493,22 @@ async fn handle_deploy(
     })
     .await
     .map_err(|err| {
-        json_response(
+        Box::new(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!(AdminResponse::<()>::err(format!(
                 "deploy task failed: {err}"
             ))),
-        )
+        ))
     })?
 }
 
-async fn handle_remove(
-    _state: &AdminState,
-    body: JsonValue,
-) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+async fn handle_remove(_state: &AdminState, body: JsonValue) -> AdminHttpResult {
     tokio::task::spawn_blocking(move || {
         let req: BundleRemoveRequest = serde_json::from_value(body).map_err(|err| {
-            json_response(
+            Box::new(json_response(
                 StatusCode::BAD_REQUEST,
                 json!(AdminResponse::<()>::err(err.to_string())),
-            )
+            ))
         })?;
 
         let config = SetupConfig {
@@ -536,10 +534,10 @@ async fn handle_remove(
         let plan = engine
             .plan(SetupMode::Remove, &setup_request, req.dry_run)
             .map_err(|err| {
-                json_response(
+                Box::new(json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     json!(AdminResponse::<()>::err(err.to_string())),
-                )
+                ))
             })?;
 
         if req.dry_run {
@@ -554,10 +552,10 @@ async fn handle_remove(
         }
 
         engine.execute(&plan).map_err(|err| {
-            json_response(
+            Box::new(json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!(AdminResponse::<()>::err(err.to_string())),
-            )
+            ))
         })?;
 
         Ok(json_response(
@@ -569,19 +567,16 @@ async fn handle_remove(
     })
     .await
     .map_err(|err| {
-        json_response(
+        Box::new(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!(AdminResponse::<()>::err(format!(
                 "remove task failed: {err}"
             ))),
-        )
+        ))
     })?
 }
 
-async fn handle_setup(
-    state: &AdminState,
-    body: JsonValue,
-) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+async fn handle_setup(state: &AdminState, body: JsonValue) -> AdminHttpResult {
     let bundle_root = state.bundle_root.clone();
     tokio::task::spawn_blocking(move || {
         // Accept: { "tenant": "demo", "team": "default", "answers": { "provider-id": { ... } } }
@@ -624,10 +619,10 @@ async fn handle_setup(
         let plan = engine
             .plan(SetupMode::Create, &setup_request, dry_run)
             .map_err(|err| {
-                json_response(
+                Box::new(json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     json!(AdminResponse::<()>::err(err.to_string())),
-                )
+                ))
             })?;
 
         if dry_run {
@@ -642,10 +637,10 @@ async fn handle_setup(
         }
 
         engine.execute(&plan).map_err(|err| {
-            json_response(
+            Box::new(json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 json!(AdminResponse::<()>::err(err.to_string())),
-            )
+            ))
         })?;
 
         Ok(json_response(
@@ -657,12 +652,12 @@ async fn handle_setup(
     })
     .await
     .map_err(|err| {
-        json_response(
+        Box::new(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!(AdminResponse::<()>::err(format!(
                 "setup task failed: {err}"
             ))),
-        )
+        ))
     })?
 }
 
@@ -683,14 +678,11 @@ async fn handle_setup(
 ///   "answers": {}
 /// }
 /// ```
-async fn handle_qa_card(
-    state: &AdminState,
-    body: JsonValue,
-) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+async fn handle_qa_card(state: &AdminState, body: JsonValue) -> AdminHttpResult {
     let provider_id = body
         .get("provider_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| bad_request("missing provider_id"))?;
+        .ok_or_else(|| bad_request_err("missing provider_id"))?;
     let tenant = body
         .get("tenant")
         .and_then(|v| v.as_str())
@@ -709,17 +701,17 @@ async fn handle_qa_card(
         // Continue existing session
         let mut sessions = state.sessions.write().await;
         let session = sessions.get_mut(sid).ok_or_else(|| {
-            json_response(
+            Box::new(json_response(
                 StatusCode::NOT_FOUND,
                 json!(AdminResponse::<()>::err(format!("session {sid} not found"))),
-            )
+            ))
         })?;
         if session.is_expired() {
             sessions.remove(sid);
-            return Err(json_response(
+            return Err(Box::new(json_response(
                 StatusCode::GONE,
                 json!(AdminResponse::<()>::err("session expired")),
-            ));
+            )));
         }
         session.merge_answers(&new_answers);
         sid.to_string()
@@ -772,37 +764,34 @@ async fn handle_qa_card(
 ///   "answers": { "redis_url": "redis://localhost:6379", ... }
 /// }
 /// ```
-async fn handle_qa_submit(
-    state: &AdminState,
-    body: JsonValue,
-) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+async fn handle_qa_submit(state: &AdminState, body: JsonValue) -> AdminHttpResult {
     let session_id = body
         .get("session_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| bad_request("missing session_id"))?;
+        .ok_or_else(|| bad_request_err("missing session_id"))?;
     let new_answers = body.get("answers").cloned().unwrap_or(json!({}));
 
     // Update session answers
     let (provider_id, tenant, team, all_answers) = {
         let mut sessions = state.sessions.write().await;
         let session = sessions.get_mut(session_id).ok_or_else(|| {
-            json_response(
+            Box::new(json_response(
                 StatusCode::NOT_FOUND,
                 json!(AdminResponse::<()>::err(format!(
                     "session {session_id} not found"
                 ))),
-            )
+            ))
         })?;
         if session.is_expired() {
             let sid = session_id.to_string();
             sessions.remove(&sid);
-            return Err(json_response(
+            return Err(Box::new(json_response(
                 StatusCode::GONE,
                 json!(AdminResponse::<()>::err("session expired")),
-            ));
+            )));
         }
         if session.completed {
-            return Err(bad_request("session already completed"));
+            return Err(bad_request_err("session already completed"));
         }
         session.merge_answers(&new_answers);
         (
@@ -860,10 +849,10 @@ async fn handle_qa_submit(
     )
     .await
     .map_err(|err| {
-        json_response(
+        Box::new(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!(AdminResponse::<()>::err(format!("persist failed: {err}"))),
-        )
+        ))
     })?;
 
     // Mark session complete
@@ -896,19 +885,16 @@ async fn handle_qa_submit(
 ///   "answers": { "redis_url": "redis://localhost:6379" }
 /// }
 /// ```
-fn handle_qa_validate(
-    state: &AdminState,
-    body: JsonValue,
-) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+fn handle_qa_validate(state: &AdminState, body: JsonValue) -> AdminHttpResult {
     let provider_id = body
         .get("provider_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| bad_request("missing provider_id"))?;
+        .ok_or_else(|| bad_request_err("missing provider_id"))?;
     let answers = body.get("answers").cloned().unwrap_or(json!({}));
 
     let pack_path = find_provider_pack(&state.bundle_root, provider_id)?;
     let form_spec = setup_to_formspec::pack_to_form_spec(&pack_path, provider_id)
-        .ok_or_else(|| bad_request(format!("no QA spec found for {provider_id}")))?;
+        .ok_or_else(|| bad_request_err(format!("no QA spec found for {provider_id}")))?;
 
     let validation_error = validate_answers_against_form_spec(&form_spec, &answers)
         .err()
@@ -929,25 +915,22 @@ fn handle_qa_validate(
 /// GET /admin/v1/qa/session/:id
 ///
 /// Get the current state of a card setup session.
-async fn handle_qa_session_get(
-    state: &AdminState,
-    session_id: &str,
-) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+async fn handle_qa_session_get(state: &AdminState, session_id: &str) -> AdminHttpResult {
     let sessions = state.sessions.read().await;
     let session = sessions.get(session_id).ok_or_else(|| {
-        json_response(
+        Box::new(json_response(
             StatusCode::NOT_FOUND,
             json!(AdminResponse::<()>::err(format!(
                 "session {session_id} not found"
             ))),
-        )
+        ))
     })?;
 
     if session.is_expired() {
-        return Err(json_response(
+        return Err(Box::new(json_response(
             StatusCode::GONE,
             json!(AdminResponse::<()>::err("session expired")),
-        ));
+        )));
     }
 
     Ok(json_response(
@@ -966,15 +949,12 @@ async fn handle_qa_session_get(
 }
 
 /// Resolve a provider ID to its pack path via bundle discovery.
-fn find_provider_pack(
-    bundle_root: &Path,
-    provider_id: &str,
-) -> Result<PathBuf, Response<Full<Bytes>>> {
+fn find_provider_pack(bundle_root: &Path, provider_id: &str) -> AdminHttpResult<PathBuf> {
     let result = discovery::discover(bundle_root).map_err(|err| {
-        json_response(
+        Box::new(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             json!(AdminResponse::<()>::err(format!("discovery failed: {err}"))),
-        )
+        ))
     })?;
     result
         .providers
@@ -982,21 +962,25 @@ fn find_provider_pack(
         .find(|p| p.provider_id == provider_id)
         .map(|p| p.pack_path.clone())
         .ok_or_else(|| {
-            json_response(
+            Box::new(json_response(
                 StatusCode::NOT_FOUND,
                 json!(AdminResponse::<()>::err(format!(
                     "provider {provider_id} not found in bundle"
                 ))),
-            )
+            ))
         })
 }
 
 /// Shorthand for a 400 Bad Request response.
-fn bad_request(msg: impl Into<String>) -> Response<Full<Bytes>> {
+fn bad_request(msg: impl Into<String>) -> AdminHttpResponse {
     json_response(
         StatusCode::BAD_REQUEST,
         json!(AdminResponse::<()>::err(msg.into())),
     )
+}
+
+fn bad_request_err(msg: impl Into<String>) -> AdminHttpError {
+    Box::new(bad_request(msg))
 }
 
 fn count_bundle_packs(bundle_root: &Path) -> anyhow::Result<usize> {
@@ -1022,25 +1006,25 @@ fn count_bundle_packs(bundle_root: &Path) -> anyhow::Result<usize> {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-async fn read_json_body(req: Request<Incoming>) -> Result<JsonValue, Response<Full<Bytes>>> {
+async fn read_json_body(req: Request<Incoming>) -> AdminHttpResult<JsonValue> {
     let bytes = req
         .into_body()
         .collect()
         .await
         .map(|c| c.to_bytes())
         .map_err(|err| {
-            json_response(
+            Box::new(json_response(
                 StatusCode::BAD_REQUEST,
                 json!(AdminResponse::<()>::err(format!(
                     "failed to read body: {err}"
                 ))),
-            )
+            ))
         })?;
     serde_json::from_slice(&bytes).map_err(|err| {
-        json_response(
+        Box::new(json_response(
             StatusCode::BAD_REQUEST,
             json!(AdminResponse::<()>::err(format!("invalid JSON: {err}"))),
-        )
+        ))
     })
 }
 
