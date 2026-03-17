@@ -1,6 +1,6 @@
 [package]
 name = "greentic-start"
-version = "0.4.7"
+version = "0.4.8"
 edition = "2024"
 rust-version = "1.91"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -20,6 +20,7 @@ clap = { version = "4.5", features = ["derive"] }
 flate2 = "1"
 greentic-distributor-client = { version = "0.4", default-features = false, features = ["pack-fetch"] }
 greentic-i18n = "0.4"
+greentic-setup = "0.4"
 greentic-runner-desktop = { version = "0.4" }
 greentic-runner-host = { version = "0.4" }
 greentic-secrets-lib = { version = "0.4", features = ["providers-dev"] }
@@ -34,6 +35,8 @@ once_cell = "1.21"
 qa-spec = "0.4"
 rand = "0.10"
 rpassword = "7"
+rustls = "0.23"
+rustls-pemfile = "2"
 semver = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_cbor = "0.11"
@@ -43,6 +46,7 @@ sys-locale = "0.3"
 sysinfo = "0.38"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "sync", "net"] }
+tokio-rustls = "0.26"
 tar = "0.4"
 tracing = "0.1"
 unic-langid = "0.9"

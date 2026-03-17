@@ -265,6 +265,15 @@ fn run_provider_flow(
     }
 }
 
+fn applicable_verify_flows(domain: Domain, pack: &ProviderPack) -> Vec<String> {
+    domains::config(domain)
+        .verify_flows
+        .iter()
+        .filter(|flow| pack.entry_flows.iter().any(|entry| entry == **flow))
+        .map(|flow| (*flow).to_string())
+        .collect()
+}
+
 // ── Public URL meta injection ───────────────────────────────────────────────
 
 fn inject_public_url_meta(
@@ -513,7 +522,7 @@ pub fn submit_answers(state: &OnboardState, body: &Value) -> OnboardResult {
 
     // 5. Run setup flows from pack (skip for remove mode)
     let mut setup_flow_result: Option<Value> = None;
-    let mut verify_flow_result: Option<Value> = None;
+    let mut verify_flow_results: Vec<Value> = Vec::new();
     let webhook_result;
 
     // Inject runtime-detected public URL into config if not already set
@@ -554,27 +563,32 @@ pub fn submit_answers(state: &OnboardState, body: &Value) -> OnboardResult {
                 &ctx,
             ));
 
-            // Run verify_webhooks if available
-            if pack.entry_flows.iter().any(|f| f == "verify_webhooks") {
-                verify_flow_result = Some(run_provider_flow(
+            for verify_flow in applicable_verify_flows(params.domain, &pack) {
+                verify_flow_results.push(run_provider_flow(
                     state,
                     params.domain,
                     &params.provider_id,
-                    "verify_webhooks",
+                    &verify_flow,
                     &payload_bytes,
                     &ctx,
                 ));
             }
 
-            webhook_result = webhook_setup::try_provider_setup_webhook(
-                bundle_root,
-                params.domain,
-                &pack,
-                &params.provider_id,
-                params.tenant(),
-                params.team(),
-                &config,
-            );
+            webhook_result = setup_flow_result
+                .as_ref()
+                .and_then(|result| result.get("output"))
+                .and_then(|output| webhook_setup::webhook_result_from_flow_output(Some(output)))
+                .or_else(|| {
+                    webhook_setup::try_provider_setup_webhook(
+                        bundle_root,
+                        params.domain,
+                        &pack,
+                        &params.provider_id,
+                        params.tenant(),
+                        params.team(),
+                        &config,
+                    )
+                });
         } else {
             webhook_result = webhook_setup::try_provider_setup_webhook(
                 bundle_root,
@@ -619,7 +633,8 @@ pub fn submit_answers(state: &OnboardState, body: &Value) -> OnboardResult {
         "gmap_updated": true,
         "webhook_setup": webhook_result,
         "setup_flow": setup_flow_result,
-        "verify_flow": verify_flow_result,
+        "verify_flow": verify_flow_results.first().cloned(),
+        "verify_flows": verify_flow_results,
     }))
 }
 
@@ -1062,5 +1077,37 @@ fn resolve_gmap_path(
             .join(team)
             .join("team.gmap"),
         _ => bundle_root.join("tenants").join(tenant).join("tenant.gmap"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn pack_with_flows(flows: &[&str]) -> ProviderPack {
+        ProviderPack {
+            pack_id: "fixture-pack".to_string(),
+            display_name: None,
+            description: None,
+            tags: Vec::new(),
+            file_name: "fixture.gtpack".to_string(),
+            path: PathBuf::from("/tmp/fixture.gtpack"),
+            entry_flows: flows.iter().map(|value| (*value).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn applicable_verify_flows_uses_domain_verify_flows_for_messaging() {
+        let pack = pack_with_flows(&["setup_default", "verify_webhooks", "verify_subscriptions"]);
+        let flows = applicable_verify_flows(Domain::Messaging, &pack);
+        assert_eq!(flows, vec!["verify_webhooks".to_string()]);
+    }
+
+    #[test]
+    fn applicable_verify_flows_uses_domain_verify_flows_for_events() {
+        let pack = pack_with_flows(&["setup_default", "verify_webhooks", "verify_subscriptions"]);
+        let flows = applicable_verify_flows(Domain::Events, &pack);
+        assert_eq!(flows, vec!["verify_subscriptions".to_string()]);
     }
 }

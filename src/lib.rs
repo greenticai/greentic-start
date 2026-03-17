@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
+mod admin_server;
 mod bin_resolver;
 mod bundle_ref;
 mod capabilities;
@@ -110,6 +111,22 @@ struct StartArgs {
     verbose: bool,
     #[arg(long, conflicts_with = "verbose")]
     quiet: bool,
+    #[arg(long, help = "Enable mTLS admin API endpoint")]
+    admin: bool,
+    #[arg(long, default_value = "8443", help = "Port for the admin API endpoint")]
+    admin_port: u16,
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory containing admin TLS certs (server.crt, server.key, ca.crt)"
+    )]
+    admin_certs_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Comma-separated list of allowed client CNs (empty = allow all valid certs)"
+    )]
+    admin_allowed_clients: Vec<String>,
 }
 
 #[derive(Parser, Clone)]
@@ -182,6 +199,10 @@ pub struct StartRequest {
     pub log_dir: Option<PathBuf>,
     pub verbose: bool,
     pub quiet: bool,
+    pub admin: bool,
+    pub admin_port: u16,
+    pub admin_certs_dir: Option<PathBuf>,
+    pub admin_allowed_clients: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -294,6 +315,9 @@ fn arg_takes_value(arg: &str) -> bool {
             | "--restart"
             | "--log-dir"
             | "--state-dir"
+            | "--admin-port"
+            | "--admin-certs-dir"
+            | "--admin-allowed-clients"
     )
 }
 
@@ -379,6 +403,39 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
         request.verbose,
     )?;
 
+    let _admin_server = if request.admin {
+        let certs_dir = request
+            .admin_certs_dir
+            .clone()
+            .unwrap_or_else(|| config_dir.join(".greentic").join("admin").join("certs"));
+        let tls_config = greentic_setup::admin::AdminTlsConfig {
+            server_cert: certs_dir.join("server.crt"),
+            server_key: certs_dir.join("server.key"),
+            client_ca: certs_dir.join("ca.crt"),
+            allowed_clients: load_admin_allowed_clients(
+                &config_dir,
+                &request.admin_allowed_clients,
+            ),
+            port: request.admin_port,
+        };
+        let admin_config = admin_server::AdminServerConfig {
+            tls_config,
+            bundle_root: config_dir.clone(),
+        };
+        match admin_server::AdminServer::start(admin_config) {
+            Ok(server) => Some(server),
+            Err(err) => {
+                operator_log::error(
+                    module_path!(),
+                    format!("failed to start admin server: {err}"),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     println!(
         "demo start running (config={} tenant={} team={}); press Ctrl+C to stop",
         config_path.display(),
@@ -386,6 +443,9 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
         team
     );
     wait_for_ctrlc()?;
+    if let Some(server) = _admin_server {
+        let _ = server.stop();
+    }
     handles.stop()?;
     runtime::demo_down_runtime(&state_dir, &tenant, &team, false)?;
     Ok(())
@@ -436,7 +496,49 @@ fn start_request_from_args(args: StartArgs) -> StartRequest {
         log_dir: args.log_dir,
         verbose: args.verbose,
         quiet: args.quiet,
+        admin: args.admin,
+        admin_port: args.admin_port,
+        admin_certs_dir: args.admin_certs_dir,
+        admin_allowed_clients: args.admin_allowed_clients,
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AdminRegistryDocument {
+    #[serde(default)]
+    admins: Vec<AdminRegistryEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct AdminRegistryEntry {
+    client_cn: String,
+}
+
+fn load_admin_allowed_clients(bundle_root: &Path, explicit: &[String]) -> Vec<String> {
+    let mut allowed = explicit.to_vec();
+    let path = bundle_root
+        .join(".greentic")
+        .join("admin")
+        .join("admins.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        allowed.sort();
+        allowed.dedup();
+        return allowed;
+    };
+    let Ok(doc) = serde_json::from_str::<AdminRegistryDocument>(&raw) else {
+        allowed.sort();
+        allowed.dedup();
+        return allowed;
+    };
+    allowed.extend(
+        doc.admins
+            .into_iter()
+            .map(|entry| entry.client_cn)
+            .filter(|cn| !cn.trim().is_empty()),
+    );
+    allowed.sort();
+    allowed.dedup();
+    allowed
 }
 
 fn stop_request_from_args(args: StopArgs) -> StopRequest {
@@ -797,6 +899,10 @@ mod tests {
             log_dir: None,
             verbose: false,
             quiet: false,
+            admin: false,
+            admin_port: 9443,
+            admin_certs_dir: None,
+            admin_allowed_clients: Vec::new(),
         };
         apply_nats_overrides(&mut config, &args);
         assert!(!config.services.nats.enabled);
@@ -823,6 +929,10 @@ mod tests {
             log_dir: None,
             verbose: false,
             quiet: false,
+            admin: false,
+            admin_port: 9443,
+            admin_certs_dir: None,
+            admin_allowed_clients: Vec::new(),
         };
         apply_nats_overrides(&mut config, &args);
         assert!(config.services.nats.enabled);
@@ -905,6 +1015,10 @@ mod tests {
             log_dir: None,
             verbose: false,
             quiet: false,
+            admin: false,
+            admin_port: 9443,
+            admin_certs_dir: None,
+            admin_allowed_clients: Vec::new(),
         };
         let paths = DemoPaths {
             config_path: bundle.join("bundle.yaml"),
@@ -946,6 +1060,10 @@ mod tests {
             log_dir: None,
             verbose: false,
             quiet: false,
+            admin: false,
+            admin_port: 9443,
+            admin_certs_dir: None,
+            admin_allowed_clients: Vec::new(),
         };
         let paths = DemoPaths {
             config_path: bundle.join("bundle.yaml"),

@@ -28,18 +28,22 @@ pub fn list_providers(state: &OnboardState) -> OnboardResult {
 
         let domain_name = domains::domain_name(domain);
         for pack in &packs {
-            let display_name = pack
-                .pack_id
-                .strip_prefix("messaging-")
-                .or_else(|| pack.pack_id.strip_prefix("events-"))
-                .unwrap_or(&pack.pack_id);
-            let display_name = capitalize(display_name);
+            let display_name = pack.display_name.clone().unwrap_or_else(|| {
+                let value = pack
+                    .pack_id
+                    .strip_prefix("messaging-")
+                    .or_else(|| pack.pack_id.strip_prefix("events-"))
+                    .unwrap_or(&pack.pack_id);
+                capitalize(value)
+            });
 
             providers.push(json!({
                 "pack_id": pack.pack_id,
                 "domain": domain_name,
                 "file_name": pack.file_name,
                 "display_name": display_name,
+                "description": pack.description,
+                "tags": pack.tags,
                 "entry_flows": pack.entry_flows,
             }));
         }

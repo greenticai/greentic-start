@@ -348,6 +348,9 @@ fn offer_pack(path: PathBuf, pack_id: String) -> anyhow::Result<ProviderPack> {
         .to_string();
     Ok(ProviderPack {
         pack_id,
+        display_name: None,
+        description: None,
+        tags: Vec::new(),
         file_name,
         path,
         entry_flows: Vec::new(),

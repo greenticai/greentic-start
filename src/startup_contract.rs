@@ -8,6 +8,8 @@ use hyper::http::Uri;
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
+use crate::domains;
+
 pub const EXT_STATIC_ROUTES_V1: &str = "greentic.static-routes.v1";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -118,6 +120,7 @@ fn collect_bundle_packs(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
         }
         collect_gtpacks(&dir, &mut packs)?;
     }
+    packs.retain(|path| domains::supports_runtime_pack_loading(path));
     packs.sort();
     packs.dedup();
     Ok(packs)
@@ -211,6 +214,21 @@ mod tests {
         let dir = tempdir()?;
         let pack_path = dir.path().join("packs").join("default.gtpack");
         write_pack(&pack_path, true)?;
+        let inspection = inspect_bundle(dir.path())?;
+        assert!(inspection.bundle_has_static_routes());
+        assert_eq!(inspection.pack_paths, vec![pack_path]);
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_bundle_ignores_non_runtime_packs() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let pack_path = dir.path().join("packs").join("default.gtpack");
+        write_pack(&pack_path, true)?;
+        std::fs::write(
+            dir.path().join("packs").join("terraform.gtpack"),
+            b"not-a-zip",
+        )?;
         let inspection = inspect_bundle(dir.path())?;
         assert!(inspection.bundle_has_static_routes());
         assert_eq!(inspection.pack_paths, vec![pack_path]);

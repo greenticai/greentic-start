@@ -7,6 +7,8 @@ use serde_json::Value as JsonValue;
 use zip::ZipArchive;
 use zip::result::ZipError;
 
+use crate::domains;
+
 pub const HOOK_STAGE_POST_INGRESS: &str = "post_ingress";
 pub const HOOK_CONTRACT_CONTROL_V1: &str = "greentic.hook.control.v1";
 
@@ -221,6 +223,9 @@ pub fn discover_gtpacks(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
                 continue;
             }
             if path.extension().and_then(|ext| ext.to_str()) == Some("gtpack") {
+                if !domains::supports_runtime_pack_loading(&path) {
+                    continue;
+                }
                 files.push(path);
             }
         }
@@ -431,6 +436,26 @@ mod tests {
 
         let err = load_pack_offers(&pack_path).unwrap_err().to_string();
         assert!(err.contains("duplicate offer id"));
+    }
+
+    #[test]
+    fn discover_gtpacks_skips_non_runtime_packs() {
+        let tmp = tempdir().expect("tempdir");
+        let zip_pack = tmp.path().join("hook.gtpack");
+        let bad_pack = tmp.path().join("terraform.gtpack");
+        write_manifest_pack(
+            &zip_pack,
+            &json!({
+                "meta": { "pack_id": "pack-a" },
+                "offers": [
+                    { "id": "one", "kind": "capability", "provider": { "op": "op_a" } }
+                ]
+            }),
+        );
+        std::fs::write(&bad_pack, b"not-a-zip").expect("fake deployer pack");
+
+        let packs = discover_gtpacks(tmp.path()).expect("discover");
+        assert_eq!(packs, vec![zip_pack]);
     }
 
     #[test]

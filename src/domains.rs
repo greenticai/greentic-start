@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,12 @@ pub struct DomainConfig {
 #[derive(Clone, Debug, Serialize)]
 pub struct ProviderPack {
     pub pack_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub file_name: String,
     pub path: PathBuf,
     pub entry_flows: Vec<String>,
@@ -44,6 +51,31 @@ pub struct ProviderPack {
 pub struct PlannedRun {
     pub pack: ProviderPack,
     pub flow_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PackMetaCacheDocument {
+    version: u32,
+    entries: BTreeMap<String, PackMetaCacheEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PackMetaCacheEntry {
+    len: u64,
+    modified_epoch_s: u64,
+    format: PackManifestFormat,
+    pack_id: String,
+    display_name: Option<String>,
+    description: Option<String>,
+    tags: Vec<String>,
+    entry_flows: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PackManifestFormat {
+    Cbor,
+    Json,
 }
 
 pub fn config(domain: Domain) -> DomainConfig {
@@ -98,6 +130,9 @@ pub fn ensure_cbor_packs(root: &Path) -> anyhow::Result<()> {
     }
     for root in roots {
         for pack in collect_gtpacks(&root)? {
+            if !supports_runtime_pack_loading(&pack) {
+                continue;
+            }
             let file = std::fs::File::open(&pack)?;
             let mut archive = zip::ZipArchive::new(file)?;
             let manifest = read_manifest_cbor(&mut archive, &pack).map_err(|err| {
@@ -155,34 +190,45 @@ fn collect_gtpacks(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(packs)
 }
 
-fn append_packs_from_root<F>(
+pub(crate) fn supports_runtime_pack_loading(path: &Path) -> bool {
+    if path.is_dir() {
+        return true;
+    }
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    zip::ZipArchive::new(file).is_ok()
+}
+
+fn append_packs_from_root(
+    bundle_root: &Path,
     packs: &mut Vec<ProviderPack>,
     seen: &mut BTreeSet<PathBuf>,
     root: &Path,
-    read_manifest: F,
-) -> anyhow::Result<()>
-where
-    F: Fn(&Path) -> anyhow::Result<PackManifest>,
-{
+    cbor_only: bool,
+    cache: &mut PackMetaCacheDocument,
+) -> anyhow::Result<()> {
     if !root.exists() {
         return Ok(());
     }
     for path in collect_gtpacks(root)? {
-        append_pack(packs, seen, path, &read_manifest)?;
+        append_pack(bundle_root, packs, seen, path, cbor_only, cache)?;
     }
     Ok(())
 }
 
-fn append_pack<F>(
+fn append_pack(
+    bundle_root: &Path,
     packs: &mut Vec<ProviderPack>,
     seen: &mut BTreeSet<PathBuf>,
     path: PathBuf,
-    read_manifest: &F,
-) -> anyhow::Result<()>
-where
-    F: Fn(&Path) -> anyhow::Result<PackManifest>,
-{
+    cbor_only: bool,
+    cache: &mut PackMetaCacheDocument,
+) -> anyhow::Result<()> {
     if !seen.insert(path.clone()) {
+        return Ok(());
+    }
+    if path.starts_with(bundle_root.join("packs")) && !supports_runtime_pack_loading(&path) {
         return Ok(());
     }
     let file_name = path
@@ -190,12 +236,12 @@ where
         .and_then(|value| value.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid pack file name: {}", path.display()))?
         .to_string();
-    let manifest = read_manifest(&path)?;
-    let meta = manifest
-        .meta
-        .ok_or_else(|| anyhow::anyhow!("pack manifest missing meta in {}", path.display()))?;
+    let meta = read_pack_meta_cached(bundle_root, &path, cbor_only, cache)?;
     packs.push(ProviderPack {
         pack_id: meta.pack_id,
+        display_name: meta.display_name,
+        description: meta.description,
+        tags: meta.tags,
         file_name,
         path,
         entry_flows: meta.entry_flows,
@@ -209,9 +255,18 @@ pub fn discover_provider_packs(root: &Path, domain: Domain) -> anyhow::Result<Ve
     let packs_dir = root.join("packs");
     let mut packs = Vec::new();
     let mut seen = BTreeSet::new();
-    append_packs_from_root(&mut packs, &mut seen, &providers_dir, read_pack_manifest)?;
-    append_packs_from_root(&mut packs, &mut seen, &packs_dir, read_pack_manifest)?;
+    let mut cache = load_pack_meta_cache(root);
+    append_packs_from_root(
+        root,
+        &mut packs,
+        &mut seen,
+        &providers_dir,
+        false,
+        &mut cache,
+    )?;
+    append_packs_from_root(root, &mut packs, &mut seen, &packs_dir, false, &mut cache)?;
     packs.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    persist_pack_meta_cache(root, &cache)?;
     Ok(packs)
 }
 
@@ -224,19 +279,18 @@ pub fn discover_provider_packs_cbor_only(
     let packs_dir = root.join("packs");
     let mut packs = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut cache = load_pack_meta_cache(root);
     append_packs_from_root(
+        root,
         &mut packs,
         &mut seen,
         &providers_dir,
-        read_pack_manifest_cbor_only,
+        true,
+        &mut cache,
     )?;
-    append_packs_from_root(
-        &mut packs,
-        &mut seen,
-        &packs_dir,
-        read_pack_manifest_cbor_only,
-    )?;
+    append_packs_from_root(root, &mut packs, &mut seen, &packs_dir, true, &mut cache)?;
     packs.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    persist_pack_meta_cache(root, &cache)?;
     Ok(packs)
 }
 
@@ -308,6 +362,10 @@ pub(crate) struct PackManifestForDiscovery {
 #[derive(Debug, Deserialize)]
 struct PackManifest {
     #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
     meta: Option<PackMeta>,
     #[serde(default)]
     pack_id: Option<String>,
@@ -319,6 +377,12 @@ struct PackManifest {
 pub(crate) struct PackMeta {
     pub pack_id: String,
     #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
     pub entry_flows: Vec<String>,
 }
 
@@ -327,6 +391,8 @@ struct PackFlow {
     id: String,
     #[serde(default)]
     entrypoints: Vec<String>,
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 fn read_pack_manifest(path: &Path) -> anyhow::Result<PackManifest> {
@@ -336,6 +402,8 @@ fn read_pack_manifest(path: &Path) -> anyhow::Result<PackManifest> {
         .with_context(|| format!("failed to read pack manifest from {}", path.display()))?;
     let meta = build_pack_meta(&manifest, path);
     Ok(PackManifest {
+        name: manifest.name,
+        description: manifest.description,
         meta: Some(meta),
         pack_id: None,
         flows: Vec::new(),
@@ -353,6 +421,124 @@ pub(crate) fn read_pack_meta(path: &Path) -> anyhow::Result<PackMeta> {
         .ok_or_else(|| anyhow::anyhow!("pack manifest missing meta in {}", path.display()))
 }
 
+fn read_pack_meta_cached(
+    bundle_root: &Path,
+    path: &Path,
+    cbor_only: bool,
+    cache: &mut PackMetaCacheDocument,
+) -> anyhow::Result<PackMeta> {
+    let key = cache_key(bundle_root, path);
+    let fingerprint = file_fingerprint(path)?;
+    if let Some(entry) = cache.entries.get(&key)
+        && entry.len == fingerprint.0
+        && entry.modified_epoch_s == fingerprint.1
+        && (!cbor_only || entry.format == PackManifestFormat::Cbor)
+    {
+        return Ok(PackMeta {
+            pack_id: entry.pack_id.clone(),
+            display_name: entry.display_name.clone(),
+            description: entry.description.clone(),
+            tags: entry.tags.clone(),
+            entry_flows: entry.entry_flows.clone(),
+        });
+    }
+
+    let (meta, format) = read_pack_meta_with_format(path, cbor_only)?;
+    cache.entries.insert(
+        key,
+        PackMetaCacheEntry {
+            len: fingerprint.0,
+            modified_epoch_s: fingerprint.1,
+            format,
+            pack_id: meta.pack_id.clone(),
+            display_name: meta.display_name.clone(),
+            description: meta.description.clone(),
+            tags: meta.tags.clone(),
+            entry_flows: meta.entry_flows.clone(),
+        },
+    );
+    Ok(meta)
+}
+
+fn read_pack_meta_with_format(
+    path: &Path,
+    cbor_only: bool,
+) -> anyhow::Result<(PackMeta, PackManifestFormat)> {
+    let manifest = if cbor_only {
+        read_pack_manifest_cbor_only(path)?
+    } else {
+        read_pack_manifest(path)?
+    };
+    let format = detect_manifest_format(path, cbor_only)?;
+    let meta = manifest
+        .meta
+        .ok_or_else(|| anyhow::anyhow!("pack manifest missing meta in {}", path.display()))?;
+    Ok((meta, format))
+}
+
+fn detect_manifest_format(path: &Path, cbor_only: bool) -> anyhow::Result<PackManifestFormat> {
+    if path.is_dir() || cbor_only {
+        return Ok(PackManifestFormat::Cbor);
+    }
+    let file = std::fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    if archive.by_name("manifest.cbor").is_ok() {
+        return Ok(PackManifestFormat::Cbor);
+    }
+    Ok(PackManifestFormat::Json)
+}
+
+fn pack_meta_cache_path(bundle_root: &Path) -> PathBuf {
+    bundle_root
+        .join("state")
+        .join("cache")
+        .join("pack-meta-v1.json")
+}
+
+fn load_pack_meta_cache(bundle_root: &Path) -> PackMetaCacheDocument {
+    let path = pack_meta_cache_path(bundle_root);
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return PackMetaCacheDocument {
+            version: 1,
+            entries: BTreeMap::new(),
+        };
+    };
+    serde_json::from_str(&raw).unwrap_or(PackMetaCacheDocument {
+        version: 1,
+        entries: BTreeMap::new(),
+    })
+}
+
+fn persist_pack_meta_cache(
+    bundle_root: &Path,
+    cache: &PackMetaCacheDocument,
+) -> anyhow::Result<()> {
+    let path = pack_meta_cache_path(bundle_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_vec_pretty(cache)?)?;
+    Ok(())
+}
+
+fn cache_key(bundle_root: &Path, path: &Path) -> String {
+    path.strip_prefix(bundle_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn file_fingerprint(path: &Path) -> anyhow::Result<(u64, u64)> {
+    let metadata = fs::metadata(path)?;
+    let modified_epoch_s = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    Ok((metadata.len(), modified_epoch_s))
+}
+
 fn read_pack_manifest_cbor_only(path: &Path) -> anyhow::Result<PackManifest> {
     let file = std::fs::File::open(path)?;
     let mut archive = zip::ZipArchive::new(file)?;
@@ -367,6 +553,8 @@ fn read_pack_manifest_cbor_only(path: &Path) -> anyhow::Result<PackManifest> {
     };
     let meta = build_pack_meta(&manifest, path);
     Ok(PackManifest {
+        name: manifest.name,
+        description: manifest.description,
         meta: Some(meta),
         pack_id: None,
         flows: Vec::new(),
@@ -481,8 +669,29 @@ fn build_pack_meta(manifest: &PackManifest, path: &Path) -> PackMeta {
     if entry_flows.is_empty() {
         entry_flows.push(pack_id.clone());
     }
+    let display_name = manifest
+        .name
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| manifest.pack_id.clone())
+        .or_else(|| manifest.meta.as_ref().map(|meta| meta.pack_id.clone()));
+    let description = manifest
+        .description
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    let mut tags = BTreeSet::new();
+    for flow in &manifest.flows {
+        for tag in &flow.tags {
+            if !tag.trim().is_empty() {
+                tags.insert(tag.clone());
+            }
+        }
+    }
     PackMeta {
         pack_id,
+        display_name,
+        description,
+        tags: tags.into_iter().collect(),
         entry_flows,
     }
 }
@@ -616,6 +825,8 @@ fn decode_manifest_lenient(value: &CborValue) -> anyhow::Result<PackManifest> {
         return Err(anyhow::anyhow!("manifest is not a map"));
     };
     let symbols = symbols_map(map);
+    let name = resolve_string_symbol(map_get(map, "name"), symbols, "names")?;
+    let description = resolve_string_symbol(map_get(map, "description"), symbols, "descriptions")?;
 
     let (meta_pack_id, meta_entry_flows) = if let Some(meta) = map_get(map, "meta") {
         let CborValue::Map(meta_map) = meta else {
@@ -650,13 +861,23 @@ fn decode_manifest_lenient(value: &CborValue) -> anyhow::Result<PackManifest> {
                 .ok_or_else(|| anyhow::anyhow!("flows[{idx}].id missing"))?;
             let entrypoints =
                 resolve_string_array(map_get(flow, "entrypoints"), symbols, "entrypoints", None)?;
-            flows.push(PackFlow { id, entrypoints });
+            let tags = resolve_string_array(map_get(flow, "tags"), symbols, "tags", None)?;
+            flows.push(PackFlow {
+                id,
+                entrypoints,
+                tags,
+            });
         }
     }
 
     Ok(PackManifest {
+        name,
+        description,
         meta: Some(PackMeta {
             pack_id,
+            display_name: None,
+            description: None,
+            tags: Vec::new(),
             entry_flows: meta_entry_flows,
         }),
         pack_id: None,
@@ -751,5 +972,111 @@ pub(crate) fn domain_name(domain: Domain) -> &'static str {
         Domain::Events => "events",
         Domain::Secrets => "secrets",
         Domain::OAuth => "oauth",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::tempdir;
+    use zip::ZipWriter;
+    use zip::write::FileOptions;
+
+    #[test]
+    fn discover_provider_packs_persists_manifest_cache() {
+        let temp = tempdir().expect("tempdir");
+        let providers_dir = temp.path().join("providers").join("messaging");
+        fs::create_dir_all(&providers_dir).expect("providers dir");
+        let pack_path = providers_dir.join("messaging-webchat.gtpack");
+        write_test_gtpack(&pack_path, "messaging-webchat", &["setup_default"]);
+
+        let packs = discover_provider_packs(temp.path(), Domain::Messaging).expect("discover");
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].pack_id, "messaging-webchat");
+        assert_eq!(packs[0].display_name.as_deref(), Some("messaging-webchat"));
+        assert_eq!(packs[0].description.as_deref(), Some("fixture description"));
+        assert_eq!(packs[0].tags, vec!["default".to_string()]);
+
+        let cache_raw =
+            fs::read_to_string(temp.path().join("state/cache/pack-meta-v1.json")).expect("cache");
+        assert!(cache_raw.contains("messaging-webchat.gtpack"));
+        assert!(cache_raw.contains("\"pack_id\": \"messaging-webchat\""));
+        assert!(cache_raw.contains("\"display_name\": \"messaging-webchat\""));
+        assert!(cache_raw.contains("\"description\": \"fixture description\""));
+        assert!(cache_raw.contains("\"default\""));
+    }
+
+    #[test]
+    fn discover_provider_packs_skips_non_runtime_packs_in_bundle_packs_dir() {
+        let temp = tempdir().expect("tempdir");
+        let providers_dir = temp.path().join("providers").join("messaging");
+        let packs_dir = temp.path().join("packs");
+        fs::create_dir_all(&providers_dir).expect("providers dir");
+        fs::create_dir_all(&packs_dir).expect("packs dir");
+        let pack_path = providers_dir.join("messaging-webchat.gtpack");
+        write_test_gtpack(&pack_path, "messaging-webchat", &["setup_default"]);
+        fs::write(packs_dir.join("terraform.gtpack"), b"not-a-zip").expect("fake deployer pack");
+
+        let packs = discover_provider_packs(temp.path(), Domain::Messaging).expect("discover");
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].pack_id, "messaging-webchat");
+    }
+
+    fn write_test_gtpack(path: &Path, pack_id: &str, entry_flows: &[&str]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        let file = fs::File::create(path).expect("create gtpack");
+        let mut zip = ZipWriter::new(file);
+        let manifest = serde_cbor::to_vec(&CborValue::Map(
+            [
+                (
+                    CborValue::Text("name".to_string()),
+                    CborValue::Text(pack_id.to_string()),
+                ),
+                (
+                    CborValue::Text("description".to_string()),
+                    CborValue::Text("fixture description".to_string()),
+                ),
+                (
+                    CborValue::Text("pack_id".to_string()),
+                    CborValue::Text(pack_id.to_string()),
+                ),
+                (
+                    CborValue::Text("flows".to_string()),
+                    CborValue::Array(vec![CborValue::Map(
+                        [
+                            (
+                                CborValue::Text("id".to_string()),
+                                CborValue::Text(entry_flows[0].to_string()),
+                            ),
+                            (
+                                CborValue::Text("entrypoints".to_string()),
+                                CborValue::Array(
+                                    entry_flows
+                                        .iter()
+                                        .map(|value| CborValue::Text((*value).to_string()))
+                                        .collect(),
+                                ),
+                            ),
+                            (
+                                CborValue::Text("tags".to_string()),
+                                CborValue::Array(vec![CborValue::Text("default".to_string())]),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ))
+        .expect("manifest");
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .expect("start manifest");
+        zip.write_all(&manifest).expect("write manifest");
+        zip.finish().expect("finish");
     }
 }

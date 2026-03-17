@@ -148,6 +148,9 @@ pub fn run_provider_setup(
                     Some(&config.team),
                     &crate::domains::ProviderPack {
                         pack_id: provider.clone(),
+                        display_name: None,
+                        description: None,
+                        tags: Vec::new(),
                         file_name: pack_path
                             .file_name()
                             .and_then(|value| value.to_str())
