@@ -255,6 +255,13 @@ impl DemoRunnerHost {
                 if provider_type != pack.pack_id {
                     catalog.insert((domain, pack.pack_id.clone()), pack.clone());
                 }
+                // Add short aliases for packs with long pack_ids (e.g., "greentic.events.webhook" → "webhook")
+                let aliases = extract_provider_short_aliases(&pack.pack_id, domain);
+                for alias in aliases {
+                    if alias != provider_type && alias != pack.pack_id {
+                        catalog.entry((domain, alias)).or_insert_with(|| pack.clone());
+                    }
+                }
             }
         }
         let capability_registry = CapabilityRegistry::build_from_pack_index(&pack_index)?;
@@ -1341,6 +1348,40 @@ fn pack_supports_provider_op(pack_path: &Path, op_id: &str) -> anyhow::Result<bo
         .providers
         .iter()
         .any(|provider| provider.ops.iter().any(|op| op == op_id)))
+}
+
+/// Extract short aliases from a pack_id for catalog registration.
+///
+/// Automatically generates progressive aliases by splitting on dots and hyphens:
+/// - "greentic.events.email.sendgrid" → ["sendgrid", "email.sendgrid", "events.email.sendgrid"]
+/// - "greentic.events.webhook" → ["webhook", "events.webhook"]
+/// - "messaging-telegram" → ["telegram"]
+/// - "state-memory" → ["memory"]
+fn extract_provider_short_aliases(pack_id: &str, _domain: Domain) -> Vec<String> {
+    let mut aliases = Vec::new();
+
+    // Handle dot-separated pack_ids (e.g., "greentic.events.email.sendgrid")
+    // Generate progressive aliases from right to left
+    let parts: Vec<&str> = pack_id.split('.').collect();
+    if parts.len() > 1 {
+        for i in (1..parts.len()).rev() {
+            let alias = parts[i..].join(".");
+            if !alias.is_empty() && alias != pack_id && !aliases.contains(&alias) {
+                aliases.push(alias);
+            }
+        }
+    }
+
+    // Handle hyphenated pack_ids (e.g., "messaging-telegram", "state-memory")
+    // Extract everything after the first hyphen
+    if let Some(pos) = pack_id.find('-') {
+        let after_hyphen = &pack_id[pos + 1..];
+        if !after_hyphen.is_empty() && !aliases.contains(&after_hyphen.to_string()) {
+            aliases.push(after_hyphen.to_string());
+        }
+    }
+
+    aliases
 }
 
 #[cfg(unix)]
