@@ -4,7 +4,18 @@ FROM rust:1.91-bookworm AS build
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    musl-tools \
+    build-essential \
+    cmake \
+    perl \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN rustup target add x86_64-unknown-linux-musl
+
+ENV CC_x86_64_unknown_linux_musl=musl-gcc
+ENV CXX_x86_64_unknown_linux_musl=g++
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
