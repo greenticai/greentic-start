@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
@@ -404,10 +405,8 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
     )?;
 
     let _admin_server = if request.admin {
-        let certs_dir = request
-            .admin_certs_dir
-            .clone()
-            .unwrap_or_else(|| config_dir.join(".greentic").join("admin").join("certs"));
+        let certs_dir =
+            resolve_admin_certs_dir(&config_dir, &state_dir, request.admin_certs_dir.as_deref())?;
         let tls_config = greentic_setup::admin::AdminTlsConfig {
             server_cert: certs_dir.join("server.crt"),
             server_key: certs_dir.join("server.key"),
@@ -516,6 +515,14 @@ struct AdminRegistryEntry {
 
 fn load_admin_allowed_clients(bundle_root: &Path, explicit: &[String]) -> Vec<String> {
     let mut allowed = explicit.to_vec();
+    if let Ok(raw) = std::env::var("GREENTIC_ADMIN_ALLOWED_CLIENTS") {
+        allowed.extend(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+        );
+    }
     let path = bundle_root
         .join(".greentic")
         .join("admin")
@@ -539,6 +546,65 @@ fn load_admin_allowed_clients(bundle_root: &Path, explicit: &[String]) -> Vec<St
     allowed.sort();
     allowed.dedup();
     allowed
+}
+
+fn resolve_admin_certs_dir(
+    bundle_root: &Path,
+    state_dir: &Path,
+    explicit: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+
+    let bundle_local = bundle_root.join(".greentic").join("admin").join("certs");
+    if has_admin_cert_files(&bundle_local) {
+        return Ok(bundle_local);
+    }
+
+    let generated = maybe_materialize_admin_certs_from_env(state_dir)?;
+    if let Some(path) = generated {
+        return Ok(path);
+    }
+
+    Ok(bundle_local)
+}
+
+fn has_admin_cert_files(dir: &Path) -> bool {
+    ["ca.crt", "server.crt", "server.key"]
+        .into_iter()
+        .all(|name| dir.join(name).exists())
+}
+
+fn maybe_materialize_admin_certs_from_env(state_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let ca_pem = std::env::var("GREENTIC_ADMIN_CA_PEM").ok();
+    let cert_pem = std::env::var("GREENTIC_ADMIN_SERVER_CERT_PEM").ok();
+    let key_pem = std::env::var("GREENTIC_ADMIN_SERVER_KEY_PEM").ok();
+
+    let Some(ca_pem) = ca_pem else {
+        return Ok(None);
+    };
+    let Some(cert_pem) = cert_pem else {
+        return Ok(None);
+    };
+    let Some(key_pem) = key_pem else {
+        return Ok(None);
+    };
+
+    let cert_dir = state_dir.join("admin").join("certs");
+    fs::create_dir_all(&cert_dir).with_context(|| {
+        format!(
+            "failed to create generated admin cert directory {}",
+            cert_dir.display()
+        )
+    })?;
+    fs::write(cert_dir.join("ca.crt"), ca_pem)
+        .with_context(|| format!("failed to write {}", cert_dir.join("ca.crt").display()))?;
+    fs::write(cert_dir.join("server.crt"), cert_pem)
+        .with_context(|| format!("failed to write {}", cert_dir.join("server.crt").display()))?;
+    fs::write(cert_dir.join("server.key"), key_pem)
+        .with_context(|| format!("failed to write {}", cert_dir.join("server.key").display()))?;
+    Ok(Some(cert_dir))
 }
 
 fn stop_request_from_args(args: StopArgs) -> StopRequest {
@@ -1084,5 +1150,85 @@ mod tests {
         let state_dir =
             resolve_state_dir(None, Some(bundle.to_string_lossy().as_ref())).expect("state dir");
         assert_eq!(state_dir, bundle.join("state"));
+    }
+
+    #[test]
+    fn resolve_admin_certs_dir_prefers_bundle_local_certs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        let certs = bundle.join(".greentic").join("admin").join("certs");
+        std::fs::create_dir_all(&certs).expect("cert dir");
+        std::fs::write(certs.join("ca.crt"), "ca").expect("ca");
+        std::fs::write(certs.join("server.crt"), "cert").expect("cert");
+        std::fs::write(certs.join("server.key"), "key").expect("key");
+
+        let resolved = resolve_admin_certs_dir(bundle, &bundle.join("state"), None).expect("dir");
+        assert_eq!(resolved, certs);
+    }
+
+    #[test]
+    fn resolve_admin_certs_dir_materializes_env_pems_into_state_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        let state_dir = bundle.join("state");
+
+        unsafe {
+            std::env::set_var("GREENTIC_ADMIN_CA_PEM", "ca-pem");
+            std::env::set_var("GREENTIC_ADMIN_SERVER_CERT_PEM", "cert-pem");
+            std::env::set_var("GREENTIC_ADMIN_SERVER_KEY_PEM", "key-pem");
+        }
+
+        let resolved = resolve_admin_certs_dir(bundle, &state_dir, None).expect("dir");
+        assert_eq!(resolved, state_dir.join("admin").join("certs"));
+        assert_eq!(
+            std::fs::read_to_string(resolved.join("ca.crt")).expect("read ca"),
+            "ca-pem"
+        );
+        assert_eq!(
+            std::fs::read_to_string(resolved.join("server.crt")).expect("read cert"),
+            "cert-pem"
+        );
+        assert_eq!(
+            std::fs::read_to_string(resolved.join("server.key")).expect("read key"),
+            "key-pem"
+        );
+
+        unsafe {
+            std::env::remove_var("GREENTIC_ADMIN_CA_PEM");
+            std::env::remove_var("GREENTIC_ADMIN_SERVER_CERT_PEM");
+            std::env::remove_var("GREENTIC_ADMIN_SERVER_KEY_PEM");
+        }
+    }
+
+    #[test]
+    fn load_admin_allowed_clients_merges_env_and_registry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        let admin_dir = bundle.join(".greentic").join("admin");
+        std::fs::create_dir_all(&admin_dir).expect("admin dir");
+        std::fs::write(
+            admin_dir.join("admins.json"),
+            r#"{"admins":[{"client_cn":"bundle-admin"}]}"#,
+        )
+        .expect("admins");
+
+        unsafe {
+            std::env::set_var("GREENTIC_ADMIN_ALLOWED_CLIENTS", "env-a, env-b");
+        }
+
+        let allowed = load_admin_allowed_clients(bundle, &["explicit-a".to_string()]);
+        assert_eq!(
+            allowed,
+            vec![
+                "bundle-admin".to_string(),
+                "env-a".to_string(),
+                "env-b".to_string(),
+                "explicit-a".to_string()
+            ]
+        );
+
+        unsafe {
+            std::env::remove_var("GREENTIC_ADMIN_ALLOWED_CLIENTS");
+        }
     }
 }

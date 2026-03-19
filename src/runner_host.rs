@@ -259,7 +259,9 @@ impl DemoRunnerHost {
                 let aliases = extract_provider_short_aliases(&pack.pack_id, domain);
                 for alias in aliases {
                     if alias != provider_type && alias != pack.pack_id {
-                        catalog.entry((domain, alias)).or_insert_with(|| pack.clone());
+                        catalog
+                            .entry((domain, alias))
+                            .or_insert_with(|| pack.clone());
                     }
                 }
             }

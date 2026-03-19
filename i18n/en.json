@@ -1,7 +1,7 @@
 {
   "cli.start.lifecycle.owner": "greentic-start owns lifecycle execution for start/restart/stop of app and extension packs.",
   "cli.start.lifecycle.operator_passthrough": "greentic-operator and Wizard are passthrough UX layers that trigger greentic-start lifecycle actions.",
-  "cli.start.lifecycle.bundle_sources": "Supported bundle refs: path, file://, oci://, repo://, store://.",
+  "cli.start.lifecycle.bundle_sources": "Supported bundle refs: path, file://, http(s)://, oci://, repo://, store://.",
   "cli.start.lifecycle.version_line": "Current supported line: 0.4.x",
   "cli.start.bundle.resolve": "Bundle refs resolve through local paths or distributor-backed OCI mappings before runtime starts.",
   "cli.start.extension_roles": "Platform runtime packs are classified separately from optional extension packs so lifecycle boot can reason about core services."
