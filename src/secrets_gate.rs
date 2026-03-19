@@ -892,6 +892,7 @@ mod tests {
         assert_eq!(report.ok, 1);
         let env_guard = crate::test_env_lock().lock().unwrap();
         unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
             env::set_var("GREENTIC_DEV_SECRETS_PATH", store_path.clone());
         }
         let handle = resolve_secrets_manager(dir.path(), "demo", Some("default"))?;
@@ -913,7 +914,12 @@ mod tests {
     #[test]
     fn dev_store_selection_uses_secrets_client() -> anyhow::Result<()> {
         let bundle_root = tempdir()?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+        }
         let handle = resolve_secrets_manager(bundle_root.path(), "demo", Some("default"))?;
+        drop(env_guard);
         assert!(handle.dev_store_path.is_some());
         assert!(!handle.using_env_fallback);
         Ok(())
@@ -922,7 +928,12 @@ mod tests {
     #[test]
     fn resolve_secrets_manager_defaults_to_devstore_when_no_pack() -> anyhow::Result<()> {
         let bundle_root = tempdir()?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+        }
         let handle = resolve_secrets_manager(bundle_root.path(), "demo", Some("default"))?;
+        drop(env_guard);
         assert!(handle.selection.pack_path.is_none());
         assert!(handle.dev_store_path.is_some());
         assert!(!handle.using_env_fallback);
@@ -937,7 +948,12 @@ mod tests {
         let pack_dir = secrets_pack_dir(bundle_root.path(), tenant, team);
         let pack_path =
             write_secrets_pack(&pack_dir, "env-backend.gtpack", r#"{"backend":"env"}"#)?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+        }
         let handle = resolve_secrets_manager(bundle_root.path(), tenant, Some(team))?;
+        drop(env_guard);
         assert_eq!(
             handle.selection.pack_path.as_deref(),
             Some(pack_path.as_path())
