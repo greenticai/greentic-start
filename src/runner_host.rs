@@ -1351,60 +1351,33 @@ fn pack_supports_provider_op(pack_path: &Path, op_id: &str) -> anyhow::Result<bo
 }
 
 /// Extract short aliases from a pack_id for catalog registration.
-/// For example:
-/// - "greentic.events.webhook" with Events domain → ["events.webhook", "webhook"]
-/// - "messaging-telegram" with Messaging domain → [] (already short)
-fn extract_provider_short_aliases(pack_id: &str, domain: Domain) -> Vec<String> {
+///
+/// Automatically generates progressive aliases by splitting on dots and hyphens:
+/// - "greentic.events.email.sendgrid" → ["sendgrid", "email.sendgrid", "events.email.sendgrid"]
+/// - "greentic.events.webhook" → ["webhook", "events.webhook"]
+/// - "messaging-telegram" → ["telegram"]
+/// - "state-memory" → ["memory"]
+fn extract_provider_short_aliases(pack_id: &str, _domain: Domain) -> Vec<String> {
     let mut aliases = Vec::new();
-    let domain_prefix = match domain {
-        Domain::Messaging => "messaging",
-        Domain::Events => "events",
-        Domain::Secrets => "secrets",
-        Domain::OAuth => "oauth",
-    };
 
-    // Remove "greentic." prefix if present
-    let without_greentic = pack_id.strip_prefix("greentic.").unwrap_or(pack_id);
-    if without_greentic != pack_id {
-        aliases.push(without_greentic.to_string());
-    }
-
-    // Remove domain prefix (e.g., "events." from "events.webhook")
-    let domain_dot = format!("{}.", domain_prefix);
-    let without_domain = without_greentic
-        .strip_prefix(&domain_dot)
-        .unwrap_or(without_greentic);
-    if without_domain != without_greentic && !without_domain.is_empty() {
-        aliases.push(without_domain.to_string());
-    }
-
-    // Also try extracting from full pack_id (e.g., "greentic.events.webhook" → "webhook")
-    let full_prefix = format!("greentic.{}.", domain_prefix);
-    if let Some(short) = pack_id.strip_prefix(&full_prefix) {
-        if !short.is_empty() && !aliases.contains(&short.to_string()) {
-            aliases.push(short.to_string());
+    // Handle dot-separated pack_ids (e.g., "greentic.events.email.sendgrid")
+    // Generate progressive aliases from right to left
+    let parts: Vec<&str> = pack_id.split('.').collect();
+    if parts.len() > 1 {
+        for i in (1..parts.len()).rev() {
+            let alias = parts[i..].join(".");
+            if !alias.is_empty() && alias != pack_id && !aliases.contains(&alias) {
+                aliases.push(alias);
+            }
         }
     }
 
-    // Handle hyphenated pack IDs (e.g., "messaging-telegram" → "telegram")
-    let hyphen_prefix = format!("{}-", domain_prefix);
-    if let Some(short) = pack_id.strip_prefix(&hyphen_prefix) {
-        if !short.is_empty() && !aliases.contains(&short.to_string()) {
-            aliases.push(short.to_string());
-        }
-    }
-
-    // Handle state- prefix (state packs often have "state-memory", "state-redis")
-    if let Some(short) = pack_id.strip_prefix("state-") {
-        if !short.is_empty() && !aliases.contains(&short.to_string()) {
-            aliases.push(short.to_string());
-        }
-    }
-
-    // Handle events- prefix (events packs often have "events-webhook", "events-timer")
-    if let Some(short) = pack_id.strip_prefix("events-") {
-        if !short.is_empty() && !aliases.contains(&short.to_string()) {
-            aliases.push(short.to_string());
+    // Handle hyphenated pack_ids (e.g., "messaging-telegram", "state-memory")
+    // Extract everything after the first hyphen
+    if let Some(pos) = pack_id.find('-') {
+        let after_hyphen = &pack_id[pos + 1..];
+        if !after_hyphen.is_empty() && !aliases.contains(&after_hyphen.to_string()) {
+            aliases.push(after_hyphen.to_string());
         }
     }
 
