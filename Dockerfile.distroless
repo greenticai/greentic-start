@@ -16,6 +16,7 @@ RUN rustup target add x86_64-unknown-linux-musl
 
 ENV CC_x86_64_unknown_linux_musl=musl-gcc
 ENV CXX_x86_64_unknown_linux_musl=g++
+ENV CARGO_TARGET_DIR=/tmp/target
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -23,12 +24,14 @@ COPY i18n ./i18n
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
-    cargo build --release --target x86_64-unknown-linux-musl --bin greentic-start
+    --mount=type=cache,target=/tmp/target \
+    cargo build --release --target x86_64-unknown-linux-musl --bin greentic-start \
+    && mkdir -p /out \
+    && cp /tmp/target/x86_64-unknown-linux-musl/release/greentic-start /out/greentic-start
 
 FROM cgr.dev/chainguard/static:latest
 
-COPY --from=build /app/target/x86_64-unknown-linux-musl/release/greentic-start /greentic-start
+COPY --from=build /out/greentic-start /greentic-start
 
 USER 65532:65532
 ENTRYPOINT ["/greentic-start"]
