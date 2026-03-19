@@ -1341,13 +1341,29 @@ fn pack_supports_provider_op(pack_path: &Path, op_id: &str) -> anyhow::Result<bo
     manifest_entry.read_to_end(&mut bytes)?;
     let manifest = decode_pack_manifest(&bytes)
         .context("failed to decode pack manifest for op support introspection")?;
-    let Some(provider_ext) = manifest.provider_extension_inline() else {
-        return Ok(false);
-    };
-    Ok(provider_ext
-        .providers
-        .iter()
-        .any(|provider| provider.ops.iter().any(|op| op == op_id)))
+
+    // Check explicit ops list in provider extension
+    if let Some(provider_ext) = manifest.provider_extension_inline() {
+        if provider_ext
+            .providers
+            .iter()
+            .any(|provider| provider.ops.iter().any(|op| op == op_id))
+        {
+            return Ok(true);
+        }
+    }
+
+    // For ingest_http, also check if messaging.provider_ingress.v1 extension exists
+    // This extension declares HTTP ingress capability even if not in ops list
+    if op_id == "ingest_http" {
+        if let Some(extensions) = &manifest.extensions {
+            if extensions.contains_key("messaging.provider_ingress.v1") {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 /// Extract short aliases from a pack_id for catalog registration.
