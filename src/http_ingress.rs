@@ -7,7 +7,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Bytes, Incoming},
-    header::{CONTENT_TYPE, HeaderName, HeaderValue},
+    header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue},
     server::conn::http1::Builder as Http1Builder,
     service::service_fn,
 };
@@ -24,12 +24,18 @@ use crate::messaging_egress as egress;
 use crate::onboard::api;
 use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
+use crate::static_routes::{
+    ActiveRouteTable, ReservedRouteSet, StaticRouteDescriptor, StaticRouteMatch,
+    cache_control_value, content_type_for_path, discover_from_bundle, fallback_asset_path,
+    normalize_relative_asset_path, read_pack_asset_bytes, resolve_asset_path,
+};
 
 #[derive(Clone)]
 pub struct HttpIngressConfig {
     pub bind_addr: SocketAddr,
     pub domains: Vec<Domain>,
     pub runner_host: Arc<DemoRunnerHost>,
+    pub enable_static_routes: bool,
 }
 
 pub struct HttpIngressServer {
@@ -42,9 +48,43 @@ impl HttpIngressServer {
         let debug_enabled = config.runner_host.debug_enabled();
         let domains = config.domains;
         let runner_host = config.runner_host;
+
+        // Discover static routes if enabled
+        let active_route_table = if config.enable_static_routes {
+            let static_route_plan = discover_from_bundle(
+                runner_host.bundle_root(),
+                &ReservedRouteSet::operator_defaults(),
+            )
+            .context("discover static routes from active bundle")?;
+            if !static_route_plan.blocking_failures.is_empty() {
+                anyhow::bail!(
+                    "static route validation failed: {}",
+                    static_route_plan.blocking_failures.join("; ")
+                );
+            }
+            for warning in &static_route_plan.warnings {
+                operator_log::warn(module_path!(), format!("static route warning: {warning}"));
+            }
+            let table = ActiveRouteTable::from_plan(&static_route_plan);
+            if !table.is_empty() {
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "discovered {} static route(s): {}",
+                        table.routes().len(),
+                        table.routes().iter().map(|r| r.public_path.as_str()).collect::<Vec<_>>().join(", ")
+                    ),
+                );
+            }
+            table
+        } else {
+            ActiveRouteTable::default()
+        };
+
         let state = Arc::new(HttpIngressState {
             runner_host,
             domains,
+            active_route_table,
         });
         let (tx, rx) = oneshot::channel();
         let addr = config.bind_addr;
@@ -137,6 +177,7 @@ impl HttpIngressServer {
 struct HttpIngressState {
     runner_host: Arc<DemoRunnerHost>,
     domains: Vec<Domain>,
+    active_route_table: ActiveRouteTable,
 }
 
 async fn handle_request(
@@ -172,8 +213,19 @@ async fn handle_request_inner(
             .map_err(|err| *err);
     }
 
+    // Legacy Direct Line routes (root level)
     if path == "/token" || path.starts_with("/v3/directline") || path.starts_with("/directline") {
-        return handle_directline_request(req, &path, state).await;
+        return handle_directline_request(req, &path, None, state).await;
+    }
+
+    // WebChat Direct Line routes: /v1/messaging/webchat/{tenant}/token or /v1/messaging/webchat/{tenant}/v3/directline/*
+    if let Some((tenant, dl_path)) = parse_webchat_directline_route(&path) {
+        return handle_directline_request(req, &dl_path, Some(tenant), state).await;
+    }
+
+    // Static route handling - serve assets from .gtpack files
+    if let Some(route_match) = state.active_route_table.match_request(&path) {
+        return Ok(serve_static_route(&route_match));
     }
 
     let method = req.method().clone();
@@ -545,21 +597,58 @@ fn run_app_flow_safe(
     }
 }
 
+/// Parse WebChat Direct Line routes: /v1/messaging/webchat/{tenant}/token or /v1/messaging/webchat/{tenant}/v3/directline/*
+/// Returns (tenant, directline_path) if matched
+fn parse_webchat_directline_route(path: &str) -> Option<(String, String)> {
+    // Pattern: /v1/messaging/webchat/{tenant}/token
+    // Pattern: /v1/messaging/webchat/{tenant}/v3/directline/{*path}
+    let prefix = "/v1/messaging/webchat/";
+    if !path.starts_with(prefix) {
+        return None;
+    }
+    let rest = &path[prefix.len()..];
+    let mut parts = rest.splitn(2, '/');
+    let tenant = parts.next()?;
+    if tenant.is_empty() {
+        return None;
+    }
+    let remainder = parts.next().unwrap_or("");
+
+    // Check if it's a Direct Line route
+    if remainder == "token" {
+        Some((tenant.to_string(), "/token".to_string()))
+    } else if remainder.starts_with("v3/directline") {
+        Some((tenant.to_string(), format!("/{}", remainder)))
+    } else {
+        None
+    }
+}
+
 async fn handle_directline_request(
     req: Request<Incoming>,
     path: &str,
+    explicit_tenant: Option<String>,
     state: Arc<HttpIngressState>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
     let method = req.method().clone();
     let queries = collect_queries(req.uri().query());
 
-    let tenant = queries
-        .iter()
-        .find(|(k, _)| k == "tenant")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_else(|| "default".to_string());
+    // Use webchat-gui provider for tenant-scoped routes, webchat for legacy
+    let is_tenant_scoped = explicit_tenant.is_some();
+    let provider = if is_tenant_scoped {
+        "messaging-webchat-gui".to_string()
+    } else {
+        "messaging-webchat".to_string()
+    };
 
-    let provider = "messaging-webchat".to_string();
+    // Use explicit tenant from URL path, or fall back to query param
+    let tenant = explicit_tenant.unwrap_or_else(|| {
+        queries
+            .iter()
+            .find(|(k, _)| k == "tenant")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| "default".to_string())
+    });
     if !state.domains.contains(&Domain::Messaging) {
         return Err(error_response(
             StatusCode::NOT_FOUND,
@@ -815,6 +904,57 @@ fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Full<
                 ))))
                 .unwrap()
         })
+}
+
+// ============================================================================
+// Static route serving
+// ============================================================================
+
+fn serve_static_route(route_match: &StaticRouteMatch<'_>) -> Response<Full<Bytes>> {
+    if let Some(asset_path) = resolve_asset_path(route_match) {
+        match serve_static_asset(route_match.descriptor, &asset_path) {
+            Ok(Some(response)) => return response,
+            Ok(None) => {}
+            Err(err) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+            }
+        }
+    }
+    if let Some(asset_path) = fallback_asset_path(route_match) {
+        match serve_static_asset(route_match.descriptor, &asset_path) {
+            Ok(Some(response)) => return response,
+            Ok(None) => {}
+            Err(err) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+            }
+        }
+    }
+    error_response(StatusCode::NOT_FOUND, "file not found")
+}
+
+fn serve_static_asset(
+    descriptor: &StaticRouteDescriptor,
+    asset_path: &str,
+) -> anyhow::Result<Option<Response<Full<Bytes>>>> {
+    let Some(asset_path) = normalize_relative_asset_path(asset_path) else {
+        return Ok(None);
+    };
+    let full_path = format!("{}/{}", descriptor.source_root, asset_path);
+    let body = match read_pack_asset_bytes(&descriptor.pack_path, &full_path)? {
+        Some(bytes) => bytes,
+        None => return Ok(None),
+    };
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type_for_path(&full_path))
+        .header(CONTENT_LENGTH, body.len().to_string());
+    if let Some(cache_control) = cache_control_value(&descriptor.cache_strategy) {
+        builder = builder.header(CACHE_CONTROL, cache_control);
+    }
+    let response = builder
+        .body(Full::from(Bytes::from(body)))
+        .map_err(|err| anyhow::anyhow!("build static response: {err}"))?;
+    Ok(Some(response))
 }
 
 #[cfg(test)]

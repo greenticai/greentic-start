@@ -19,6 +19,9 @@ pub struct HttpInV1 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<(String, String)>,
     pub body_b64: String,
+    /// Host-injected configuration (e.g., pre-fetched secrets for provider_core_only mode)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

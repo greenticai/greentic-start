@@ -728,14 +728,11 @@ pub fn demo_up_services(
         debug_enabled,
     )?);
     let ingress_domains = detect_http_ingress_domains(&discovery, runner_host.as_ref());
-    let ingress_server = start_http_ingress_server(config, &ingress_domains, runner_host)
+    // Enable static routes if bundle declares them - no longer requires NATS mode
+    let enable_static_routes = static_routes.bundle_has_static_routes();
+    let ingress_server = start_http_ingress_server(config, &ingress_domains, runner_host.clone(), enable_static_routes)
         .with_context(|| "failed to start local HTTP ingress server")?;
     let run_gsm_services = config.services.nats.enabled;
-    if static_routes.bundle_has_static_routes() && !run_gsm_services {
-        anyhow::bail!(
-            "bundle declares static routes but this launch mode does not expose public HTTP"
-        );
-    }
     operator_log::info(
         module_path!(),
         format!(
@@ -896,9 +893,51 @@ pub fn demo_up_services(
         None
     };
 
-    let public_base_url = configured_public_base_url.or(tunnel_public_base_url);
-    let startup_contract =
-        resolve_startup_contract(static_routes, run_gsm_services, public_base_url.clone())?;
+    // Read previous public URL before it gets overwritten
+    let previous_public_url = crate::webhook_updater::read_previous_public_url(&paths.runtime_root());
+
+    // Resolve public_base_url with fallback to local HTTP listener for local dev
+    let public_base_url = configured_public_base_url
+        .or(tunnel_public_base_url)
+        .or_else(|| {
+            // Fallback: derive from local HTTP listener if static routes are enabled
+            if ingress_server.is_some() && enable_static_routes {
+                let host = &config.services.gateway.listen_addr;
+                let port = config.services.gateway.port;
+                Some(format!("http://{}:{}", host, port))
+            } else {
+                None
+            }
+        });
+
+    // Auto-update webhooks if public URL changed
+    if let Some(ref new_url) = public_base_url {
+        if let Err(err) = crate::webhook_updater::update_webhooks_if_url_changed(
+            config_dir,
+            &discovery,
+            runner_host.secrets_handle(),
+            tenant,
+            team,
+            previous_public_url.as_deref(),
+            new_url,
+        ) {
+            operator_log::warn(
+                module_path!(),
+                format!("[webhook-updater] failed to update webhooks: {}", err),
+            );
+        }
+    }
+
+    // http_listener_enabled: true if HTTP ingress server started (not tied to NATS)
+    // asset_serving_enabled: true if bundle declares static routes we're enabling
+    let http_listener_enabled = ingress_server.is_some();
+    let asset_serving_enabled = enable_static_routes;
+    let startup_contract = resolve_startup_contract(
+        static_routes,
+        http_listener_enabled,
+        asset_serving_enabled,
+        public_base_url.clone(),
+    )?;
     write_json(
         &paths.runtime_root().join("startup_contract.json"),
         &startup_contract,
@@ -1080,8 +1119,10 @@ fn start_http_ingress_server(
     config: &DemoConfig,
     domains: &[Domain],
     runner_host: Arc<DemoRunnerHost>,
+    enable_static_routes: bool,
 ) -> anyhow::Result<Option<HttpIngressServer>> {
-    if domains.is_empty() {
+    // Start HTTP server if we have ingress domains OR static routes to serve
+    if domains.is_empty() && !enable_static_routes {
         return Ok(None);
     }
     let addr = format!(
@@ -1095,6 +1136,7 @@ fn start_http_ingress_server(
         bind_addr,
         domains: domains.to_vec(),
         runner_host,
+        enable_static_routes,
     })?;
     println!(
         "HTTP ingress ready at http://{}:{}",
@@ -1339,13 +1381,14 @@ fn build_env(
 
 fn resolve_startup_contract(
     static_routes: &BundleStaticRoutesInspection,
-    run_gsm_services: bool,
+    http_listener_enabled: bool,
+    asset_serving_enabled: bool,
     public_base_url: Option<String>,
 ) -> anyhow::Result<StartupContract> {
     crate::startup_contract::resolve(StartupContractInput {
         bundle_has_static_routes: static_routes.bundle_has_static_routes(),
-        http_listener_enabled: run_gsm_services,
-        asset_serving_enabled: run_gsm_services,
+        http_listener_enabled,
+        asset_serving_enabled,
         public_base_url,
     })
 }

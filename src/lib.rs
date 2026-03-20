@@ -53,8 +53,11 @@ mod setup_input;
 mod setup_to_formspec;
 mod startup_contract;
 mod state_layout;
+mod static_routes;
 mod subscriptions_universal;
 pub mod supervisor;
+mod timer_scheduler;
+mod webhook_updater;
 
 use runtime::NatsMode;
 

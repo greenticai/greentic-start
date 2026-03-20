@@ -1039,11 +1039,6 @@ impl DemoRunnerHost {
                     dev_store_display, fresh_secrets.using_env_fallback,
                 ),
             );
-            // Debug: verify state_store is being passed
-            eprintln!(
-                "[DEBUG] invoke_provider_component_op: loading PackRuntime with state_store=Some(DynStateStore), state_store_policy.allow={}",
-                host_config.state_store_policy.allow
-            );
             let pack_runtime = PackRuntime::load(
                 &pack.path,
                 host_config.clone(),
@@ -1058,30 +1053,8 @@ impl DemoRunnerHost {
                 ComponentResolution::default(),
             )
             .await?;
-            eprintln!(
-                "[DEBUG] PackRuntime loaded, has_state_store={:?}",
-                true // state_store was passed as Some(...)
-            );
             let provider_type = primary_provider_type(&pack.path)
                 .context("failed to determine provider type for direct invocation")?;
-            let env_value = env::var("GREENTIC_ENV").unwrap_or_else(|_| "<unset>".to_string());
-            let canonical_team = secrets_manager::canonical_team(ctx.team.as_deref()).into_owned();
-            let runner_dev_store_desc = self
-                .secrets_handle
-                .dev_store_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<none>".to_string());
-            eprintln!(
-                "secrets runner ctx: env={} tenant={} canonical_team={} provider_id={} pack_id={} dev_store_path={} using_env_fallback={}",
-                env_value,
-                ctx.tenant,
-                canonical_team,
-                provider_type,
-                pack.pack_id,
-                runner_dev_store_desc,
-                self.secrets_handle.using_env_fallback,
-            );
             let binding = pack_runtime.resolve_provider(None, Some(&provider_type))?;
             let exec_ctx = ComponentExecCtx {
                 tenant: ComponentTenantCtx {

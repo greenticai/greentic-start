@@ -14,6 +14,7 @@ use crate::messaging_dto::HttpInV1;
 use crate::operator_log;
 use crate::post_ingress_hooks::apply_post_ingress_hooks_dispatch;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
+use crate::secret_requirements::load_secret_keys_from_pack;
 
 pub fn dispatch_http_ingress(
     runner_host: &DemoRunnerHost,
@@ -21,6 +22,9 @@ pub fn dispatch_http_ingress(
     request: &IngressRequestV1,
     ctx: &OperatorContext,
 ) -> anyhow::Result<IngressDispatchResult> {
+    // Inject secrets into config for providers running in provider_core_only mode
+    let config = build_injected_config(runner_host, domain, &request.provider, ctx);
+
     let http_in = build_ingress_request(
         &request.provider,
         request.handler.clone(),
@@ -32,6 +36,7 @@ pub fn dispatch_http_ingress(
         None,
         Some(request.tenant.clone()),
         request.team.clone(),
+        config,
     );
     let payload_json = serde_json::to_vec(&http_in)?;
     let outcome = runner_host.invoke_provider_op(
@@ -63,6 +68,76 @@ pub fn dispatch_http_ingress(
     Ok(decoded)
 }
 
+/// Build injected config with pre-fetched secrets for providers running in provider_core_only mode.
+/// This allows the host to inject secrets instead of the component calling secrets_store directly.
+///
+/// The function reads secret requirements from the provider's pack and fetches all required
+/// secrets, injecting them into the config as base64-encoded values with `_b64` suffix.
+fn build_injected_config(
+    runner_host: &DemoRunnerHost,
+    domain: Domain,
+    provider: &str,
+    ctx: &OperatorContext,
+) -> Option<JsonValue> {
+    // Get the pack path for this provider
+    let pack_path = runner_host.get_provider_pack_path(domain, provider)?;
+
+    // Load secret requirements from the pack
+    let secret_keys = match load_secret_keys_from_pack(pack_path) {
+        Ok(keys) => keys,
+        Err(err) => {
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "failed to load secret requirements for {provider}: {err}, skipping injection"
+                ),
+            );
+            return None;
+        }
+    };
+
+    if secret_keys.is_empty() {
+        return None;
+    }
+
+    // Fetch all required secrets and build the config
+    let mut config_map = serde_json::Map::new();
+    let mut any_found = false;
+
+    for key in &secret_keys {
+        match runner_host.get_secret(provider, key, ctx) {
+            Ok(Some(bytes)) => {
+                // Store as base64-encoded value with _b64 suffix
+                let key_b64 = format!("{}_b64", key);
+                config_map.insert(key_b64, JsonValue::String(STANDARD.encode(&bytes)));
+                any_found = true;
+            }
+            Ok(None) => {
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "secret {key} not found for provider {provider}, component will try secrets_store"
+                    ),
+                );
+            }
+            Err(err) => {
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "failed to fetch secret {key} for provider {provider}: {err}, component will try secrets_store"
+                    ),
+                );
+            }
+        }
+    }
+
+    if any_found {
+        Some(JsonValue::Object(config_map))
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_ingress_request(
     provider: &str,
@@ -75,6 +150,7 @@ fn build_ingress_request(
     binding_id: Option<String>,
     tenant_hint: Option<String>,
     team_hint: Option<String>,
+    config: Option<JsonValue>,
 ) -> HttpInV1 {
     HttpInV1 {
         v: 1,
@@ -88,6 +164,7 @@ fn build_ingress_request(
         query,
         headers,
         body_b64: STANDARD.encode(body),
+        config,
     }
 }
 
