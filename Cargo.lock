@@ -1965,10 +1965,6 @@ dependencies = [
 [[package]]
 name = "greentic-i18n"
 version = "0.4.56"
-
-[[package]]
-name = "greentic-i18n"
-version = "0.4.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44951881c763069e14624cf8cf1dddff706ad4d8132570dc299af0b855cf4458"
 
@@ -2099,7 +2095,7 @@ dependencies = [
  "greentic-pack-lib",
  "greentic-runner-host",
  "parking_lot",
- "runner-core 0.4.65",
+ "runner-core",
  "serde",
  "serde_json",
  "serde_yaml_gtc",
@@ -2112,7 +2108,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "0.4.63"
+version = "0.4.65"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f038a40e02fb3ad492651a6c4065aad073f53b10cadeca0f2d99b45e2d77a1a"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2129,7 +2127,7 @@ dependencies = [
  "greentic-config-types",
  "greentic-distributor-client",
  "greentic-flow",
- "greentic-i18n 0.4.56",
+ "greentic-i18n",
  "greentic-interfaces",
  "greentic-interfaces-host",
  "greentic-interfaces-wasmtime",
@@ -2144,13 +2142,13 @@ dependencies = [
  "hmac",
  "humantime",
  "indexmap 2.13.0",
- "jsonschema 0.42.2",
+ "jsonschema 0.45.0",
  "lru",
  "once_cell",
  "parking_lot",
  "rand 0.10.0",
  "reqwest 0.13.2",
- "runner-core 0.4.63",
+ "runner-core",
  "serde",
  "serde_cbor",
  "serde_json",
@@ -2282,7 +2280,7 @@ dependencies = [
  "clap",
  "dialoguer",
  "greentic-distributor-client",
- "greentic-i18n 0.4.56 (registry+https://github.com/rust-lang/crates.io-index)",
+ "greentic-i18n",
  "greentic-secrets-lib",
  "greentic-types",
  "hmac",
@@ -2313,7 +2311,7 @@ dependencies = [
  "clap",
  "flate2",
  "greentic-distributor-client",
- "greentic-i18n 0.4.56 (registry+https://github.com/rust-lang/crates.io-index)",
+ "greentic-i18n",
  "greentic-runner-desktop",
  "greentic-runner-host",
  "greentic-secrets-lib",
@@ -3017,35 +3015,6 @@ checksum = "b49715b7073f385ba4bc528e5747d02e66cb39c6146efb66b781f131f0fb399c"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "jsonschema"
-version = "0.42.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a44c9bb95f6ac9270bf4fd38d71c2f8704b9fe0323a293af7a5284cbd60a39b2"
-dependencies = [
- "ahash",
- "bytecount",
- "data-encoding",
- "email_address",
- "fancy-regex",
- "fraction",
- "getrandom 0.3.4",
- "idna",
- "itoa",
- "num-cmp",
- "num-traits",
- "percent-encoding",
- "referencing 0.42.2",
- "regex",
- "regex-syntax",
- "reqwest 0.13.2",
- "rustls",
- "serde",
- "serde_json",
- "unicode-general-category",
- "uuid-simd",
 ]
 
 [[package]]
@@ -4275,21 +4244,6 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.42.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97d4124f489451bb67c59d67fa16f3ae9b5690b290406a7538e38458632666df"
-dependencies = [
- "ahash",
- "fluent-uri",
- "getrandom 0.3.4",
- "hashbrown 0.16.1",
- "parking_lot",
- "percent-encoding",
- "serde_json",
-]
-
-[[package]]
-name = "referencing"
 version = "0.44.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22952642836711d7a730d23a4dfb0d732e75a85e4c4f5704266d9c8fac278ff1"
@@ -4477,25 +4431,6 @@ checksum = "a7cc970b249fbe527d6e02e0a227762c9108b2f49d81094fe357ffc6d14d7f6f"
 dependencies = [
  "libc",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "runner-core"
-version = "0.4.63"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "blake3",
- "ed25519-dalek",
- "greentic-config-types",
- "greentic-pack-lib",
- "reqwest 0.13.2",
- "semver",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "url",
 ]
 
 [[package]]

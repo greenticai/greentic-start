@@ -917,8 +917,8 @@ pub fn demo_up_services(
         });
 
     // Auto-update webhooks if public URL changed
-    if let Some(ref new_url) = public_base_url {
-        if let Err(err) = crate::webhook_updater::update_webhooks_if_url_changed(
+    if let Some(ref new_url) = public_base_url
+        && let Err(err) = crate::webhook_updater::update_webhooks_if_url_changed(
             config_dir,
             &discovery,
             runner_host.secrets_handle(),
@@ -926,12 +926,12 @@ pub fn demo_up_services(
             team,
             previous_public_url.as_deref(),
             new_url,
-        ) {
-            operator_log::warn(
-                module_path!(),
-                format!("[webhook-updater] failed to update webhooks: {}", err),
-            );
-        }
+        )
+    {
+        operator_log::warn(
+            module_path!(),
+            format!("[webhook-updater] failed to update webhooks: {}", err),
+        );
     }
 
     // http_listener_enabled: true if HTTP ingress server started (not tied to NATS)

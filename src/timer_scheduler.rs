@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};

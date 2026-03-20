@@ -1368,24 +1368,22 @@ fn pack_supports_provider_op(pack_path: &Path, op_id: &str) -> anyhow::Result<bo
         .context("failed to decode pack manifest for op support introspection")?;
 
     // Check explicit ops list in provider extension
-    if let Some(provider_ext) = manifest.provider_extension_inline() {
-        if provider_ext
+    if let Some(provider_ext) = manifest.provider_extension_inline()
+        && provider_ext
             .providers
             .iter()
             .any(|provider| provider.ops.iter().any(|op| op == op_id))
-        {
-            return Ok(true);
-        }
+    {
+        return Ok(true);
     }
 
     // For ingest_http, also check if messaging.provider_ingress.v1 extension exists
     // This extension declares HTTP ingress capability even if not in ops list
-    if op_id == "ingest_http" {
-        if let Some(extensions) = &manifest.extensions {
-            if extensions.contains_key("messaging.provider_ingress.v1") {
-                return Ok(true);
-            }
-        }
+    if op_id == "ingest_http"
+        && let Some(extensions) = &manifest.extensions
+        && extensions.contains_key("messaging.provider_ingress.v1")
+    {
+        return Ok(true);
     }
 
     Ok(false)

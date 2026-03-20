@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::runtime::Builder as TokioBuilder;
 
 use crate::discovery::{DetectedProvider, DiscoveryResult};
