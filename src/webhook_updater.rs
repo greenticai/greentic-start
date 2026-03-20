@@ -108,7 +108,13 @@ pub fn update_webhooks_if_url_changed(
 
     for provider in &messaging_providers {
         // Step 1: Update public_base_url secret for this provider
-        match update_provider_public_url_secret(secrets_handle, tenant, team, &provider.provider_id, new_url) {
+        match update_provider_public_url_secret(
+            secrets_handle,
+            tenant,
+            team,
+            &provider.provider_id,
+            new_url,
+        ) {
             Ok(true) => {
                 secrets_updated_count += 1;
                 operator_log::info(
@@ -203,9 +209,7 @@ fn update_provider_public_url_secret(
     let env = resolve_env(None);
     let uri = canonical_secret_uri(&env, tenant, Some(team), provider_id, "public_base_url");
 
-    let rt = TokioBuilder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let rt = TokioBuilder::new_current_thread().enable_all().build()?;
 
     // Check if current value is different
     let current_value = rt.block_on(secrets_handle.manager().read(&uri)).ok();
@@ -249,7 +253,8 @@ fn update_provider_webhook(
     )?;
 
     // Call webhook registration
-    let result = greentic_setup::webhook::register_webhook(provider_id, &config, tenant, Some(team));
+    let result =
+        greentic_setup::webhook::register_webhook(provider_id, &config, tenant, Some(team));
 
     match result {
         Some(result_value) => {
@@ -301,7 +306,38 @@ fn build_provider_config(
     );
 
     // Load secret keys from pack manifest
-    let secret_keys = load_secret_keys_from_pack(pack_path).unwrap_or_default();
+    let mut secret_keys = load_secret_keys_from_pack(pack_path).unwrap_or_default();
+
+    // Add webhook-related secret keys that may not be declared in pack but are needed
+    // for webhook registration (Slack, Webex, Teams)
+    let provider_short = provider_id
+        .strip_prefix("messaging-")
+        .unwrap_or(provider_id);
+    match provider_short {
+        "slack" => {
+            for key in &["slack_app_id", "slack_configuration_token", "bot_token"] {
+                let key_str = (*key).to_string();
+                if !secret_keys.contains(&key_str) {
+                    secret_keys.push(key_str);
+                }
+            }
+        }
+        "webex" => {
+            for key in &["bot_token", "webex_bot_token"] {
+                let key_str = (*key).to_string();
+                if !secret_keys.contains(&key_str) {
+                    secret_keys.push(key_str);
+                }
+            }
+        }
+        "telegram" => {
+            let key_str = "bot_token".to_string();
+            if !secret_keys.contains(&key_str) {
+                secret_keys.push(key_str);
+            }
+        }
+        _ => {}
+    }
 
     if secret_keys.is_empty() {
         return Ok(Value::Object(config));
@@ -309,9 +345,7 @@ fn build_provider_config(
 
     // Read secrets and add to config
     let env = resolve_env(None);
-    let rt = TokioBuilder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let rt = TokioBuilder::new_current_thread().enable_all().build()?;
 
     for key in &secret_keys {
         let uri = canonical_secret_uri(&env, tenant, Some(team), provider_id, key);
@@ -369,7 +403,10 @@ mod tests {
         .unwrap();
 
         let result = read_previous_public_url(tmp.path());
-        assert_eq!(result, Some("https://example.trycloudflare.com".to_string()));
+        assert_eq!(
+            result,
+            Some("https://example.trycloudflare.com".to_string())
+        );
     }
 
     #[test]
