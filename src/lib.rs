@@ -354,7 +354,21 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
     let tenant = demo_config.tenant.clone();
     let team = demo_config.team.clone();
 
-    let cloudflared = match request.cloudflared {
+    // Mutual exclusivity: if ngrok is explicitly enabled, disable cloudflared
+    // This allows `--ngrok on` to work without needing `--cloudflared off`
+    let effective_cloudflared = match (&request.cloudflared, &request.ngrok) {
+        // ngrok explicitly enabled → disable cloudflared (unless cloudflared also explicitly set)
+        (CloudflaredModeArg::On, NgrokModeArg::On) => {
+            operator_log::info(
+                module_path!(),
+                "ngrok enabled, disabling cloudflared (use --cloudflared on --ngrok off to override)",
+            );
+            CloudflaredModeArg::Off
+        }
+        (mode, _) => mode.clone(),
+    };
+
+    let cloudflared = match effective_cloudflared {
         CloudflaredModeArg::Off => None,
         CloudflaredModeArg::On => {
             let explicit = request.cloudflared_binary.clone();

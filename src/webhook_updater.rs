@@ -1,8 +1,9 @@
-//! Auto-update webhooks when public URL changes at startup.
+//! Auto-update webhooks and secrets when public URL changes at startup.
 //!
 //! When the tunnel URL changes (e.g., cloudflared/ngrok restart), this module
-//! detects the change and re-registers webhooks for all messaging providers
-//! that support automatic webhook registration (Telegram, Slack, Webex).
+//! detects the change and:
+//! 1. Updates the `public_base_url` secret for all messaging providers
+//! 2. Re-registers webhooks for providers that support it (Telegram, Slack, Webex)
 
 use std::path::Path;
 
@@ -102,9 +103,43 @@ pub fn update_webhooks_if_url_changed(
         return Ok(false);
     }
 
-    let mut updated_count = 0;
+    let mut secrets_updated_count = 0;
+    let mut webhook_updated_count = 0;
 
-    for provider in messaging_providers {
+    for provider in &messaging_providers {
+        // Step 1: Update public_base_url secret for this provider
+        match update_provider_public_url_secret(secrets_handle, tenant, team, &provider.provider_id, new_url) {
+            Ok(true) => {
+                secrets_updated_count += 1;
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "[webhook-updater] public_base_url secret updated for {}",
+                        provider.provider_id
+                    ),
+                );
+            }
+            Ok(false) => {
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "[webhook-updater] public_base_url secret unchanged for {}",
+                        provider.provider_id
+                    ),
+                );
+            }
+            Err(err) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "[webhook-updater] failed to update public_base_url secret for {}: {}",
+                        provider.provider_id, err
+                    ),
+                );
+            }
+        }
+
+        // Step 2: Update webhook for this provider (if supported)
         match update_provider_webhook(
             config_dir,
             secrets_handle,
@@ -115,7 +150,7 @@ pub fn update_webhooks_if_url_changed(
             new_url,
         ) {
             Ok(true) => {
-                updated_count += 1;
+                webhook_updated_count += 1;
                 operator_log::info(
                     module_path!(),
                     format!(
@@ -145,14 +180,49 @@ pub fn update_webhooks_if_url_changed(
         }
     }
 
-    if updated_count > 0 {
+    if secrets_updated_count > 0 || webhook_updated_count > 0 {
         println!(
-            "  [webhook-updater] updated {} webhook(s) for new public URL",
-            updated_count
+            "  [webhook-updater] updated {} secret(s) and {} webhook(s) for new public URL",
+            secrets_updated_count, webhook_updated_count
         );
     }
 
-    Ok(updated_count > 0)
+    Ok(secrets_updated_count > 0 || webhook_updated_count > 0)
+}
+
+/// Update the public_base_url secret for a single provider.
+///
+/// Returns Ok(true) if secret was updated, Ok(false) if unchanged or not applicable.
+fn update_provider_public_url_secret(
+    secrets_handle: &SecretsManagerHandle,
+    tenant: &str,
+    team: &str,
+    provider_id: &str,
+    new_url: &str,
+) -> Result<bool> {
+    let env = resolve_env(None);
+    let uri = canonical_secret_uri(&env, tenant, Some(team), provider_id, "public_base_url");
+
+    let rt = TokioBuilder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    // Check if current value is different
+    let current_value = rt.block_on(secrets_handle.manager().read(&uri)).ok();
+    let current_url = current_value
+        .as_ref()
+        .and_then(|v| String::from_utf8(v.clone()).ok());
+
+    if current_url.as_deref() == Some(new_url) {
+        // Already up to date
+        return Ok(false);
+    }
+
+    // Write new value
+    rt.block_on(secrets_handle.manager().write(&uri, new_url.as_bytes()))
+        .map_err(|e| anyhow::anyhow!("failed to write secret: {:?}", e))?;
+
+    Ok(true)
 }
 
 /// Update webhook for a single provider.
