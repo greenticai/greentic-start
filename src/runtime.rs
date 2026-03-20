@@ -724,7 +724,7 @@ pub fn demo_up_services(
         config_dir.to_path_buf(),
         &discovery,
         runner_binary.clone(),
-        secrets_handle,
+        secrets_handle.clone(),
         debug_enabled,
     )?);
     let ingress_domains = detect_http_ingress_domains(&discovery, runner_host.as_ref());
@@ -915,7 +915,7 @@ pub fn demo_up_services(
         if let Err(err) = crate::webhook_updater::update_webhooks_if_url_changed(
             config_dir,
             &discovery,
-            runner_host.secrets_handle(),
+            &secrets_handle,
             tenant,
             team,
             previous_public_url.as_deref(),
