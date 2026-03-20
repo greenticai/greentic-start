@@ -275,6 +275,7 @@ fn build_provider_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::TempDir;
 
     #[test]
