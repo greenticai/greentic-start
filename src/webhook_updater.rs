@@ -179,7 +179,8 @@ fn update_provider_webhook(
     )?;
 
     // Call webhook registration
-    let result = greentic_setup::webhook::register_webhook(provider_id, &config, tenant, Some(team));
+    let result =
+        greentic_setup::webhook::register_webhook(provider_id, &config, tenant, Some(team));
 
     match result {
         Some(result_value) => {
@@ -239,9 +240,7 @@ fn build_provider_config(
 
     // Read secrets and add to config
     let env = resolve_env(None);
-    let rt = TokioBuilder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let rt = TokioBuilder::new_current_thread().enable_all().build()?;
 
     for key in &secret_keys {
         let uri = canonical_secret_uri(&env, tenant, Some(team), provider_id, key);
@@ -298,7 +297,10 @@ mod tests {
         .unwrap();
 
         let result = read_previous_public_url(tmp.path());
-        assert_eq!(result, Some("https://example.trycloudflare.com".to_string()));
+        assert_eq!(
+            result,
+            Some("https://example.trycloudflare.com".to_string())
+        );
     }
 
     #[test]

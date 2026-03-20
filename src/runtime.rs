@@ -730,8 +730,13 @@ pub fn demo_up_services(
     let ingress_domains = detect_http_ingress_domains(&discovery, runner_host.as_ref());
     // Enable static routes if bundle declares them - no longer requires NATS mode
     let enable_static_routes = static_routes.bundle_has_static_routes();
-    let ingress_server = start_http_ingress_server(config, &ingress_domains, runner_host.clone(), enable_static_routes)
-        .with_context(|| "failed to start local HTTP ingress server")?;
+    let ingress_server = start_http_ingress_server(
+        config,
+        &ingress_domains,
+        runner_host.clone(),
+        enable_static_routes,
+    )
+    .with_context(|| "failed to start local HTTP ingress server")?;
     let run_gsm_services = config.services.nats.enabled;
     operator_log::info(
         module_path!(),
@@ -894,7 +899,8 @@ pub fn demo_up_services(
     };
 
     // Read previous public URL before it gets overwritten
-    let previous_public_url = crate::webhook_updater::read_previous_public_url(&paths.runtime_root());
+    let previous_public_url =
+        crate::webhook_updater::read_previous_public_url(&paths.runtime_root());
 
     // Resolve public_base_url with fallback to local HTTP listener for local dev
     let public_base_url = configured_public_base_url

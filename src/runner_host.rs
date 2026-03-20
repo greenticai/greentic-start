@@ -1011,71 +1011,71 @@ impl DemoRunnerHost {
         let payload = payload_bytes.to_vec();
         let result = make_runtime_or_thread_scope(|runtime| {
             runtime.block_on(async {
-            let host_config = Arc::new(build_demo_host_config(&ctx.tenant));
-            // Re-open the dev store on each invocation so newly-written secrets
-            // (e.g. from QA wizard submit) are visible without restarting the demo.
-            let fresh_secrets = secrets_gate::resolve_secrets_manager(
-                &self.bundle_root,
-                &ctx.tenant,
-                ctx.team.as_deref(),
-            )
-            .unwrap_or_else(|_| self.secrets_handle.clone());
-            let dev_store_display = fresh_secrets
-                .dev_store_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<default>".to_string());
-            operator_log::info(
-                module_path!(),
-                format!(
-                    "secrets backend for wasm: using_env_fallback={} dev_store={}",
-                    fresh_secrets.using_env_fallback, dev_store_display,
-                ),
-            );
-            operator_log::info(
-                module_path!(),
-                format!(
-                    "exec secrets: dev_store={} env_fallback={}",
-                    dev_store_display, fresh_secrets.using_env_fallback,
-                ),
-            );
-            let pack_runtime = PackRuntime::load(
-                &pack.path,
-                host_config.clone(),
-                None,
-                Some(&pack.path),
-                None::<DynSessionStore>,
-                Some(self.state_store.clone()),
-                Arc::new(RunnerWasiPolicy::default()),
-                fresh_secrets.runtime_manager(Some(&pack.pack_id)),
-                None,
-                false,
-                ComponentResolution::default(),
-            )
-            .await?;
-            let provider_type = primary_provider_type(&pack.path)
-                .context("failed to determine provider type for direct invocation")?;
-            let binding = pack_runtime.resolve_provider(None, Some(&provider_type))?;
-            let exec_ctx = ComponentExecCtx {
-                tenant: ComponentTenantCtx {
-                    tenant: ctx.tenant.clone(),
-                    team: ctx.team.clone(),
+                let host_config = Arc::new(build_demo_host_config(&ctx.tenant));
+                // Re-open the dev store on each invocation so newly-written secrets
+                // (e.g. from QA wizard submit) are visible without restarting the demo.
+                let fresh_secrets = secrets_gate::resolve_secrets_manager(
+                    &self.bundle_root,
+                    &ctx.tenant,
+                    ctx.team.as_deref(),
+                )
+                .unwrap_or_else(|_| self.secrets_handle.clone());
+                let dev_store_display = fresh_secrets
+                    .dev_store_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<default>".to_string());
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "secrets backend for wasm: using_env_fallback={} dev_store={}",
+                        fresh_secrets.using_env_fallback, dev_store_display,
+                    ),
+                );
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "exec secrets: dev_store={} env_fallback={}",
+                        dev_store_display, fresh_secrets.using_env_fallback,
+                    ),
+                );
+                let pack_runtime = PackRuntime::load(
+                    &pack.path,
+                    host_config.clone(),
+                    None,
+                    Some(&pack.path),
+                    None::<DynSessionStore>,
+                    Some(self.state_store.clone()),
+                    Arc::new(RunnerWasiPolicy::default()),
+                    fresh_secrets.runtime_manager(Some(&pack.pack_id)),
+                    None,
+                    false,
+                    ComponentResolution::default(),
+                )
+                .await?;
+                let provider_type = primary_provider_type(&pack.path)
+                    .context("failed to determine provider type for direct invocation")?;
+                let binding = pack_runtime.resolve_provider(None, Some(&provider_type))?;
+                let exec_ctx = ComponentExecCtx {
+                    tenant: ComponentTenantCtx {
+                        tenant: ctx.tenant.clone(),
+                        team: ctx.team.clone(),
+                        i18n_id: None,
+                        user: None,
+                        trace_id: None,
+                        correlation_id: ctx.correlation_id.clone(),
+                        deadline_unix_ms: None,
+                        attempt: 1,
+                        idempotency_key: None,
+                    },
                     i18n_id: None,
-                    user: None,
-                    trace_id: None,
-                    correlation_id: ctx.correlation_id.clone(),
-                    deadline_unix_ms: None,
-                    attempt: 1,
-                    idempotency_key: None,
-                },
-                i18n_id: None,
-                flow_id: op_id.to_string(),
-                node_id: Some(op_id.to_string()),
-            };
-            pack_runtime
-                .invoke_provider(&binding, exec_ctx, op_id, payload)
-                .await
-        })
+                    flow_id: op_id.to_string(),
+                    node_id: Some(op_id.to_string()),
+                };
+                pack_runtime
+                    .invoke_provider(&binding, exec_ctx, op_id, payload)
+                    .await
+            })
         });
 
         match result {

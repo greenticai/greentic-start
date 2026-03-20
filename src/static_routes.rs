@@ -574,7 +574,10 @@ fn normalize_public_path(path: &str) -> String {
 }
 
 /// Read asset bytes from a pack file (ZIP archive) or directory.
-pub fn read_pack_asset_bytes(pack_path: &Path, asset_path: &str) -> anyhow::Result<Option<Vec<u8>>> {
+pub fn read_pack_asset_bytes(
+    pack_path: &Path,
+    asset_path: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
     if pack_path.is_dir() {
         let candidate = pack_path.join(asset_path);
         return match std::fs::read(candidate) {
@@ -636,8 +639,7 @@ mod tests {
             tenant_scoped: true,
             team_scoped: false,
             cache_strategy: CacheStrategy::None,
-            route_segments: parse_route_segments("/v1/web/webchat/{tenant}")
-                .expect("segments"),
+            route_segments: parse_route_segments("/v1/web/webchat/{tenant}").expect("segments"),
         };
         let table = ActiveRouteTable::from_plan(&StaticRoutePlan {
             routes: vec![route],

@@ -2112,7 +2112,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "0.4.66"
+version = "0.4.63"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2144,13 +2144,13 @@ dependencies = [
  "hmac",
  "humantime",
  "indexmap 2.13.0",
- "jsonschema 0.45.0",
+ "jsonschema 0.42.2",
  "lru",
  "once_cell",
  "parking_lot",
  "rand 0.10.0",
  "reqwest 0.13.2",
- "runner-core 0.4.66",
+ "runner-core 0.4.63",
  "serde",
  "serde_cbor",
  "serde_json",
@@ -3017,6 +3017,35 @@ checksum = "b49715b7073f385ba4bc528e5747d02e66cb39c6146efb66b781f131f0fb399c"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jsonschema"
+version = "0.42.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a44c9bb95f6ac9270bf4fd38d71c2f8704b9fe0323a293af7a5284cbd60a39b2"
+dependencies = [
+ "ahash",
+ "bytecount",
+ "data-encoding",
+ "email_address",
+ "fancy-regex",
+ "fraction",
+ "getrandom 0.3.4",
+ "idna",
+ "itoa",
+ "num-cmp",
+ "num-traits",
+ "percent-encoding",
+ "referencing 0.42.2",
+ "regex",
+ "regex-syntax",
+ "reqwest 0.13.2",
+ "rustls",
+ "serde",
+ "serde_json",
+ "unicode-general-category",
+ "uuid-simd",
 ]
 
 [[package]]
@@ -4246,6 +4275,21 @@ dependencies = [
 
 [[package]]
 name = "referencing"
+version = "0.42.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97d4124f489451bb67c59d67fa16f3ae9b5690b290406a7538e38458632666df"
+dependencies = [
+ "ahash",
+ "fluent-uri",
+ "getrandom 0.3.4",
+ "hashbrown 0.16.1",
+ "parking_lot",
+ "percent-encoding",
+ "serde_json",
+]
+
+[[package]]
+name = "referencing"
 version = "0.44.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22952642836711d7a730d23a4dfb0d732e75a85e4c4f5704266d9c8fac278ff1"
@@ -4437,9 +4481,7 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "0.4.65"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "906ea3dc55cfead2be39f6d90a7dd691c446a31828696e76f8ba56f200d62bb7"
+version = "0.4.63"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4458,7 +4500,9 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "0.4.66"
+version = "0.4.65"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "906ea3dc55cfead2be39f6d90a7dd691c446a31828696e76f8ba56f200d62bb7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

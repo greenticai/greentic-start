@@ -72,7 +72,12 @@ impl HttpIngressServer {
                     format!(
                         "discovered {} static route(s): {}",
                         table.routes().len(),
-                        table.routes().iter().map(|r| r.public_path.as_str()).collect::<Vec<_>>().join(", ")
+                        table
+                            .routes()
+                            .iter()
+                            .map(|r| r.public_path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ),
                 );
             }
