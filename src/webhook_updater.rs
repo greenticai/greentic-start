@@ -108,7 +108,13 @@ pub fn update_webhooks_if_url_changed(
 
     for provider in &messaging_providers {
         // Step 1: Update public_base_url secret for this provider
-        match update_provider_public_url_secret(secrets_handle, tenant, team, &provider.provider_id, new_url) {
+        match update_provider_public_url_secret(
+            secrets_handle,
+            tenant,
+            team,
+            &provider.provider_id,
+            new_url,
+        ) {
             Ok(true) => {
                 secrets_updated_count += 1;
                 operator_log::info(
@@ -203,9 +209,7 @@ fn update_provider_public_url_secret(
     let env = resolve_env(None);
     let uri = canonical_secret_uri(&env, tenant, Some(team), provider_id, "public_base_url");
 
-    let rt = TokioBuilder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let rt = TokioBuilder::new_current_thread().enable_all().build()?;
 
     // Check if current value is different
     let current_value = rt.block_on(secrets_handle.manager().read(&uri)).ok();
