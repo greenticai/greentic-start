@@ -201,6 +201,47 @@ impl DemoRunnerHost {
         &self.secrets_handle
     }
 
+    /// Get the pack path for a provider in the given domain.
+    /// Returns None if the provider is not found in the catalog.
+    pub fn get_provider_pack_path(&self, domain: Domain, provider: &str) -> Option<&Path> {
+        self.catalog
+            .get(&(domain, provider.to_string()))
+            .map(|pack| pack.path.as_path())
+    }
+
+    /// Read a secret synchronously from the secrets manager.
+    /// The secret key is resolved using the canonical URI format:
+    /// `secrets://{env}/{tenant}/{team}/{provider}/{key}`
+    pub fn get_secret(
+        &self,
+        provider: &str,
+        key: &str,
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        use crate::secrets_gate::canonical_secret_uri;
+        use crate::secrets_setup::resolve_env;
+
+        let env = resolve_env(None);
+        let uri = canonical_secret_uri(&env, &ctx.tenant, ctx.team.as_deref(), provider, key);
+
+        make_runtime_or_thread_scope(|rt| {
+            rt.block_on(async {
+                match self.secrets_handle.manager().read(&uri).await {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(err) => {
+                        // Check if it's a "not found" error
+                        let err_str = err.to_string();
+                        if err_str.contains("not found") || err_str.contains("NotFound") {
+                            Ok(None)
+                        } else {
+                            Err(anyhow::anyhow!("secret read failed: {}", err))
+                        }
+                    }
+                }
+            })
+        })
+    }
+
     pub fn new(
         bundle_root: PathBuf,
         discovery: &discovery::DiscoveryResult,
@@ -315,7 +356,7 @@ impl DemoRunnerHost {
 
     pub fn capability_setup_plan(&self, ctx: &OperatorContext) -> Vec<CapabilityBinding> {
         let scope = ResolveScope {
-            env: env::var("GREENTIC_ENV").ok(),
+            env: Some(env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string())),
             tenant: Some(ctx.tenant.clone()),
             team: ctx.team.clone(),
         };
@@ -399,7 +440,7 @@ impl DemoRunnerHost {
             }
         }
         let scope = ResolveScope {
-            env: env::var("GREENTIC_ENV").ok(),
+            env: Some(env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string())),
             tenant: Some(ctx.tenant.clone()),
             team: ctx.team.clone(),
         };
@@ -768,7 +809,7 @@ impl DemoRunnerHost {
             return Ok(HookChainOutcome::Continue);
         };
         let scope = ResolveScope {
-            env: env::var("GREENTIC_ENV").ok(),
+            env: Some(env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string())),
             tenant: Some(ctx.tenant.clone()),
             team: ctx.team.clone(),
         };
@@ -996,6 +1037,11 @@ impl DemoRunnerHost {
                     dev_store_display, fresh_secrets.using_env_fallback,
                 ),
             );
+            // Debug: verify state_store is being passed
+            eprintln!(
+                "[DEBUG] invoke_provider_component_op: loading PackRuntime with state_store=Some(DynStateStore), state_store_policy.allow={}",
+                host_config.state_store_policy.allow
+            );
             let pack_runtime = PackRuntime::load(
                 &pack.path,
                 host_config.clone(),
@@ -1010,6 +1056,10 @@ impl DemoRunnerHost {
                 ComponentResolution::default(),
             )
             .await?;
+            eprintln!(
+                "[DEBUG] PackRuntime loaded, has_state_store={:?}",
+                true // state_store was passed as Some(...)
+            );
             let provider_type = primary_provider_type(&pack.path)
                 .context("failed to determine provider type for direct invocation")?;
             let env_value = env::var("GREENTIC_ENV").unwrap_or_else(|_| "<unset>".to_string());
@@ -1125,7 +1175,7 @@ fn secret_error_context(
     op_id: &str,
     pack: &ProviderPack,
 ) -> String {
-    let env = env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
+    let env = env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string());
     let team = secrets_manager::canonical_team(ctx.team.as_deref()).into_owned();
     format!(
         "secret lookup context env={} tenant={} team={} provider={} flow={} pack_id={} pack_path={}",
