@@ -201,6 +201,47 @@ impl DemoRunnerHost {
         &self.secrets_handle
     }
 
+    /// Get the pack path for a provider in the given domain.
+    /// Returns None if the provider is not found in the catalog.
+    pub fn get_provider_pack_path(&self, domain: Domain, provider: &str) -> Option<&Path> {
+        self.catalog
+            .get(&(domain, provider.to_string()))
+            .map(|pack| pack.path.as_path())
+    }
+
+    /// Read a secret synchronously from the secrets manager.
+    /// The secret key is resolved using the canonical URI format:
+    /// `secrets://{env}/{tenant}/{team}/{provider}/{key}`
+    pub fn get_secret(
+        &self,
+        provider: &str,
+        key: &str,
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        use crate::secrets_gate::canonical_secret_uri;
+        use crate::secrets_setup::resolve_env;
+
+        let env = resolve_env(None);
+        let uri = canonical_secret_uri(&env, &ctx.tenant, ctx.team.as_deref(), provider, key);
+
+        make_runtime_or_thread_scope(|rt| {
+            rt.block_on(async {
+                match self.secrets_handle.manager().read(&uri).await {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(err) => {
+                        // Check if it's a "not found" error
+                        let err_str = err.to_string();
+                        if err_str.contains("not found") || err_str.contains("NotFound") {
+                            Ok(None)
+                        } else {
+                            Err(anyhow::anyhow!("secret read failed: {}", err))
+                        }
+                    }
+                }
+            })
+        })
+    }
+
     pub fn new(
         bundle_root: PathBuf,
         discovery: &discovery::DiscoveryResult,
@@ -317,7 +358,7 @@ impl DemoRunnerHost {
 
     pub fn capability_setup_plan(&self, ctx: &OperatorContext) -> Vec<CapabilityBinding> {
         let scope = ResolveScope {
-            env: env::var("GREENTIC_ENV").ok(),
+            env: Some(env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string())),
             tenant: Some(ctx.tenant.clone()),
             team: ctx.team.clone(),
         };
@@ -401,7 +442,7 @@ impl DemoRunnerHost {
             }
         }
         let scope = ResolveScope {
-            env: env::var("GREENTIC_ENV").ok(),
+            env: Some(env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string())),
             tenant: Some(ctx.tenant.clone()),
             team: ctx.team.clone(),
         };
@@ -770,7 +811,7 @@ impl DemoRunnerHost {
             return Ok(HookChainOutcome::Continue);
         };
         let scope = ResolveScope {
-            env: env::var("GREENTIC_ENV").ok(),
+            env: Some(env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string())),
             tenant: Some(ctx.tenant.clone()),
             team: ctx.team.clone(),
         };
@@ -1014,24 +1055,6 @@ impl DemoRunnerHost {
             .await?;
             let provider_type = primary_provider_type(&pack.path)
                 .context("failed to determine provider type for direct invocation")?;
-            let env_value = env::var("GREENTIC_ENV").unwrap_or_else(|_| "<unset>".to_string());
-            let canonical_team = secrets_manager::canonical_team(ctx.team.as_deref()).into_owned();
-            let runner_dev_store_desc = self
-                .secrets_handle
-                .dev_store_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<none>".to_string());
-            eprintln!(
-                "secrets runner ctx: env={} tenant={} canonical_team={} provider_id={} pack_id={} dev_store_path={} using_env_fallback={}",
-                env_value,
-                ctx.tenant,
-                canonical_team,
-                provider_type,
-                pack.pack_id,
-                runner_dev_store_desc,
-                self.secrets_handle.using_env_fallback,
-            );
             let binding = pack_runtime.resolve_provider(None, Some(&provider_type))?;
             let exec_ctx = ComponentExecCtx {
                 tenant: ComponentTenantCtx {
@@ -1127,7 +1150,7 @@ fn secret_error_context(
     op_id: &str,
     pack: &ProviderPack,
 ) -> String {
-    let env = env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
+    let env = env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string());
     let team = secrets_manager::canonical_team(ctx.team.as_deref()).into_owned();
     format!(
         "secret lookup context env={} tenant={} team={} provider={} flow={} pack_id={} pack_path={}",
@@ -1343,13 +1366,29 @@ fn pack_supports_provider_op(pack_path: &Path, op_id: &str) -> anyhow::Result<bo
     manifest_entry.read_to_end(&mut bytes)?;
     let manifest = decode_pack_manifest(&bytes)
         .context("failed to decode pack manifest for op support introspection")?;
-    let Some(provider_ext) = manifest.provider_extension_inline() else {
-        return Ok(false);
-    };
-    Ok(provider_ext
-        .providers
-        .iter()
-        .any(|provider| provider.ops.iter().any(|op| op == op_id)))
+
+    // Check explicit ops list in provider extension
+    if let Some(provider_ext) = manifest.provider_extension_inline() {
+        if provider_ext
+            .providers
+            .iter()
+            .any(|provider| provider.ops.iter().any(|op| op == op_id))
+        {
+            return Ok(true);
+        }
+    }
+
+    // For ingest_http, also check if messaging.provider_ingress.v1 extension exists
+    // This extension declares HTTP ingress capability even if not in ops list
+    if op_id == "ingest_http" {
+        if let Some(extensions) = &manifest.extensions {
+            if extensions.contains_key("messaging.provider_ingress.v1") {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 /// Extract short aliases from a pack_id for catalog registration.
