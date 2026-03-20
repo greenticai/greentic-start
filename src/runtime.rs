@@ -1184,7 +1184,7 @@ pub fn demo_down_runtime(
                 "{}",
                 crate::operator_i18n::tr(
                     "demo.runtime.no_services_to_stop",
-                    "No services to stop."
+                    "No supervised background services to stop. If runtime was started in the foreground, stop it in the original terminal with Ctrl+C."
                 )
             );
             return Ok(());
@@ -1220,7 +1220,7 @@ pub fn demo_down_runtime(
                 "{}",
                 crate::operator_i18n::tr(
                     "demo.runtime.no_services_to_stop",
-                    "No services to stop."
+                    "No supervised background services to stop. If runtime was started in the foreground, stop it in the original terminal with Ctrl+C."
                 )
             );
             return Ok(());
@@ -1246,7 +1246,10 @@ pub fn demo_down_runtime(
     if !pids_dir.exists() {
         println!(
             "{}",
-            crate::operator_i18n::tr("demo.runtime.no_services_to_stop", "No services to stop.")
+            crate::operator_i18n::tr(
+                "demo.runtime.no_services_to_stop",
+                "No supervised background services to stop. If runtime was started in the foreground, stop it in the original terminal with Ctrl+C."
+            )
         );
         return Ok(());
     }

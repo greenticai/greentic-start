@@ -13,6 +13,7 @@ use zstd::stream::read::Decoder as ZstdDecoder;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BundleSourceKind {
     LocalArchive,
+    Http,
     Oci,
     Repo,
     Store,
@@ -78,6 +79,9 @@ pub fn parse_local_bundle_ref(reference: &str) -> Option<PathBuf> {
 
 pub fn map_remote_bundle_ref(reference: &str) -> anyhow::Result<(String, BundleSourceKind)> {
     let trimmed = reference.trim();
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        return Ok((trimmed.to_string(), BundleSourceKind::Http));
+    }
     if let Some(rest) = trimmed.strip_prefix("oci://") {
         return Ok((rest.to_string(), BundleSourceKind::Oci));
     }
@@ -100,12 +104,15 @@ pub fn map_remote_bundle_ref(reference: &str) -> anyhow::Result<(String, BundleS
             });
     }
     anyhow::bail!(
-        "unsupported bundle reference {trimmed}; expected local path, file://, oci://, repo://, or store://"
+        "unsupported bundle reference {trimmed}; expected local path, file://, http(s)://, oci://, repo://, or store://"
     );
 }
 
 fn fetch_remote_bundle(reference: &str) -> anyhow::Result<FetchedBundle> {
     let (mapped_ref, kind) = map_remote_bundle_ref(reference)?;
+    if kind == BundleSourceKind::Http {
+        return fetch_http_bundle(reference);
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -124,6 +131,34 @@ fn fetch_remote_bundle(reference: &str) -> anyhow::Result<FetchedBundle> {
         media_type: Some(fetched.media_type),
         path: fetched.path,
         kind,
+    })
+}
+
+fn fetch_http_bundle(reference: &str) -> anyhow::Result<FetchedBundle> {
+    let mut response = ureq::get(reference)
+        .call()
+        .with_context(|| format!("download bundle reference {reference}"))?;
+    let media_type = response.body().mime_type().map(str::to_string);
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(512 * 1024 * 1024)
+        .read_to_vec()
+        .with_context(|| format!("read downloaded bundle body {reference}"))?;
+    let digest = bytes_digest(&bytes);
+    let path = http_download_path(reference, &digest);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create bundle download dir {}", parent.display()))?;
+    }
+    fs::write(&path, bytes)
+        .with_context(|| format!("write downloaded bundle {}", path.display()))?;
+    Ok(FetchedBundle {
+        source_ref: reference.to_string(),
+        digest,
+        media_type,
+        path,
+        kind: BundleSourceKind::Http,
     })
 }
 
@@ -184,6 +219,40 @@ fn bundle_cache_dir(digest: &str) -> PathBuf {
         .join("greentic-start")
         .join("bundles")
         .join(slug)
+}
+
+fn http_download_path(reference: &str, digest: &str) -> PathBuf {
+    let slug = digest
+        .strip_prefix("sha256:")
+        .unwrap_or(digest)
+        .replace(':', "-");
+    let filename = reference
+        .split('?')
+        .next()
+        .and_then(|value| value.rsplit('/').next())
+        .filter(|value| !value.is_empty())
+        .map(sanitize_download_name)
+        .unwrap_or_else(|| "bundle.gtbundle".to_string());
+    std::env::temp_dir()
+        .join("greentic-start")
+        .join("downloads")
+        .join(format!("{slug}-{filename}"))
+}
+
+fn sanitize_download_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => ch,
+            _ => '-',
+        })
+        .collect()
+}
+
+fn bytes_digest(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn extract_zip(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
@@ -340,5 +409,33 @@ mod tests {
                 BundleSourceKind::Store
             )
         );
+    }
+
+    #[test]
+    fn remote_http_refs_are_supported() {
+        assert_eq!(
+            map_remote_bundle_ref("https://example.com/demo.gtbundle").expect("https ref"),
+            (
+                "https://example.com/demo.gtbundle".to_string(),
+                BundleSourceKind::Http
+            )
+        );
+        assert_eq!(
+            map_remote_bundle_ref("http://example.com/demo.gtbundle").expect("http ref"),
+            (
+                "http://example.com/demo.gtbundle".to_string(),
+                BundleSourceKind::Http
+            )
+        );
+    }
+
+    #[test]
+    fn http_download_path_preserves_filename_shape_safely() {
+        let path = http_download_path(
+            "https://example.com/releases/demo bundle.gtbundle?sig=abc",
+            "sha256:deadbeef",
+        );
+        let rendered = path.to_string_lossy();
+        assert!(rendered.contains("deadbeef-demo-bundle.gtbundle"));
     }
 }
