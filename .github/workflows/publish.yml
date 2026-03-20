@@ -225,6 +225,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: greentic-start-*
           merge-multiple: true
       - name: Create GitHub release
         uses: ncipollo/release-action@v1
