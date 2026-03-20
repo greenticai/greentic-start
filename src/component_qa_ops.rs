@@ -582,6 +582,7 @@ mod tests {
                 kind: QuestionKind::Text,
                 required: true,
                 default: None,
+                skip_if: None,
             }],
             defaults: BTreeMap::new(),
         }

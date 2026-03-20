@@ -29,6 +29,27 @@ pub struct StartupContractInput {
     pub http_listener_enabled: bool,
     pub asset_serving_enabled: bool,
     pub public_base_url: Option<String>,
+    pub runtime_config: Option<RuntimeConfig>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<RuntimePublicBaseUrl>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimePublicBaseUrl {
+    pub value: String,
+    pub source: RuntimePublicBaseUrlSource,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePublicBaseUrlSource {
+    Configured,
+    Tunnel,
+    Derived,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,6 +59,8 @@ pub struct StartupContract {
     pub static_routes_enabled: bool,
     pub asset_serving_enabled: bool,
     pub public_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_config: Option<RuntimeConfig>,
 }
 
 impl StartupContract {
@@ -76,6 +99,20 @@ pub fn inspect_bundle(root: &Path) -> anyhow::Result<BundleStaticRoutesInspectio
 }
 
 pub fn resolve(input: StartupContractInput) -> anyhow::Result<StartupContract> {
+    let runtime_config = input.runtime_config.or_else(|| {
+        input.public_base_url.clone().map(|value| RuntimeConfig {
+            public_base_url: Some(RuntimePublicBaseUrl {
+                value,
+                source: RuntimePublicBaseUrlSource::Configured,
+            }),
+        })
+    });
+    let effective_public_base_url = runtime_config
+        .as_ref()
+        .and_then(|config| config.public_base_url.as_ref())
+        .map(|public_base_url| public_base_url.value.clone())
+        .or(input.public_base_url);
+
     if input.bundle_has_static_routes {
         if !input.http_listener_enabled {
             anyhow::bail!(
@@ -87,12 +124,12 @@ pub fn resolve(input: StartupContractInput) -> anyhow::Result<StartupContract> {
                 "bundle declares static routes but asset serving is not supported in this launch mode"
             );
         }
-        if input.public_base_url.is_none() {
+        if effective_public_base_url.is_none() {
             anyhow::bail!("bundle declares static routes but no PUBLIC_BASE_URL could be resolved");
         }
     }
 
-    let public_http_enabled = input.http_listener_enabled && input.public_base_url.is_some();
+    let public_http_enabled = input.http_listener_enabled && effective_public_base_url.is_some();
     let static_routes_enabled =
         input.bundle_has_static_routes && input.asset_serving_enabled && public_http_enabled;
 
@@ -101,7 +138,8 @@ pub fn resolve(input: StartupContractInput) -> anyhow::Result<StartupContract> {
         public_http_enabled,
         static_routes_enabled,
         asset_serving_enabled: input.asset_serving_enabled,
-        public_base_url: input.public_base_url,
+        public_base_url: effective_public_base_url,
+        runtime_config,
     })
 }
 
@@ -242,6 +280,7 @@ mod tests {
             http_listener_enabled: false,
             asset_serving_enabled: true,
             public_base_url: Some("https://example.com".to_string()),
+            runtime_config: None,
         })
         .expect_err("expected launch gating failure");
         assert!(err.to_string().contains("does not expose public HTTP"));
@@ -254,6 +293,7 @@ mod tests {
             http_listener_enabled: true,
             asset_serving_enabled: true,
             public_base_url: None,
+            runtime_config: None,
         })
         .expect_err("expected launch gating failure");
         assert!(err.to_string().contains("no PUBLIC_BASE_URL"));
@@ -266,9 +306,39 @@ mod tests {
             http_listener_enabled: true,
             asset_serving_enabled: true,
             public_base_url: Some("https://example.com".to_string()),
+            runtime_config: None,
         })?;
         assert!(contract.public_http_enabled);
         assert!(contract.static_routes_enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_prefers_runtime_config_public_base_url() -> anyhow::Result<()> {
+        let contract = resolve(StartupContractInput {
+            bundle_has_static_routes: true,
+            http_listener_enabled: true,
+            asset_serving_enabled: true,
+            public_base_url: Some("https://configured.example.com".to_string()),
+            runtime_config: Some(RuntimeConfig {
+                public_base_url: Some(RuntimePublicBaseUrl {
+                    value: "https://tunnel.example.com".to_string(),
+                    source: RuntimePublicBaseUrlSource::Tunnel,
+                }),
+            }),
+        })?;
+        assert_eq!(
+            contract.public_base_url.as_deref(),
+            Some("https://tunnel.example.com")
+        );
+        assert_eq!(
+            contract
+                .runtime_config
+                .as_ref()
+                .and_then(|config| config.public_base_url.as_ref())
+                .map(|entry| entry.source),
+            Some(RuntimePublicBaseUrlSource::Tunnel)
+        );
         Ok(())
     }
 

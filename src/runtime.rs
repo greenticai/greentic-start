@@ -7,8 +7,6 @@ use std::time::Duration;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::Context;
-
 use crate::domains::Domain;
 use crate::http_ingress::{HttpIngressConfig, HttpIngressServer};
 use crate::operator_log;
@@ -20,9 +18,11 @@ use crate::runtime_state::{
 use crate::secrets_gate;
 use crate::services;
 use crate::startup_contract::{
-    BundleStaticRoutesInspection, StartupContract, StartupContractInput,
+    BundleStaticRoutesInspection, RuntimeConfig, RuntimePublicBaseUrl, RuntimePublicBaseUrlSource,
+    StartupContract, StartupContractInput,
 };
 use crate::supervisor;
+use anyhow::Context;
 
 use crate::cloudflared::{self, CloudflaredConfig};
 use crate::config::{DemoConfig, DemoSubscriptionsMode};
@@ -903,8 +903,9 @@ pub fn demo_up_services(
         crate::webhook_updater::read_previous_public_url(&paths.runtime_root());
 
     // Resolve public_base_url with fallback to local HTTP listener for local dev
-    let public_base_url = configured_public_base_url
-        .or(tunnel_public_base_url)
+    let public_base_url = tunnel_public_base_url
+        .clone()
+        .or(configured_public_base_url.clone())
         .or_else(|| {
             // Fallback: derive from local HTTP listener if static routes are enabled
             if ingress_server.is_some() && enable_static_routes {
@@ -938,11 +939,35 @@ pub fn demo_up_services(
     // asset_serving_enabled: true if bundle declares static routes we're enabling
     let http_listener_enabled = ingress_server.is_some();
     let asset_serving_enabled = enable_static_routes;
+    let runtime_config = if let Some(url) = tunnel_public_base_url {
+        Some(RuntimeConfig {
+            public_base_url: Some(RuntimePublicBaseUrl {
+                value: url,
+                source: RuntimePublicBaseUrlSource::Tunnel,
+            }),
+        })
+    } else if let Some(url) = configured_public_base_url {
+        Some(RuntimeConfig {
+            public_base_url: Some(RuntimePublicBaseUrl {
+                value: url,
+                source: RuntimePublicBaseUrlSource::Configured,
+            }),
+        })
+    } else {
+        public_base_url.clone().map(|url| RuntimeConfig {
+            public_base_url: Some(RuntimePublicBaseUrl {
+                value: url,
+                source: RuntimePublicBaseUrlSource::Derived,
+            }),
+        })
+    };
+
     let startup_contract = resolve_startup_contract(
         static_routes,
         http_listener_enabled,
         asset_serving_enabled,
         public_base_url.clone(),
+        runtime_config,
     )?;
     write_json(
         &paths.runtime_root().join("startup_contract.json"),
@@ -1390,12 +1415,14 @@ fn resolve_startup_contract(
     http_listener_enabled: bool,
     asset_serving_enabled: bool,
     public_base_url: Option<String>,
+    runtime_config: Option<RuntimeConfig>,
 ) -> anyhow::Result<StartupContract> {
     crate::startup_contract::resolve(StartupContractInput {
         bundle_has_static_routes: static_routes.bundle_has_static_routes(),
         http_listener_enabled,
         asset_serving_enabled,
         public_base_url,
+        runtime_config,
     })
 }
 
