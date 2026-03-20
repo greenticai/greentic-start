@@ -365,7 +365,7 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
             );
             CloudflaredModeArg::Off
         }
-        (mode, _) => mode.clone(),
+        (mode, _) => *mode,
     };
 
     let cloudflared = match effective_cloudflared {
