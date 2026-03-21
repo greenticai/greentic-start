@@ -1250,6 +1250,9 @@ pub fn demo_down_runtime(
     let timeout_ms = 2_000;
     let paths = RuntimePaths::new(state_dir, tenant, team);
     stop_started_nats(&paths, state_dir)?;
+    // Kill any orphaned ngrok/cloudflared processes not tracked by pidfile
+    ngrok::stop_ngrok();
+    cloudflared::stop_cloudflared();
     if all {
         let pids_root = state_dir.join("pids");
         if !pids_root.exists() {

@@ -97,17 +97,15 @@ pub fn log(level: Level, target: &str, message: String) {
         Err(_) => return,
     };
     let timestamp = Utc::now().to_rfc3339();
-    if writeln!(
+    let _ = writeln!(
         *writer,
         "{timestamp} [{level:?}] {target} - {message}",
         level = level,
         target = target,
         message = message
-    )
-    .is_err()
-    {
-        let _ = writer.flush();
-    }
+    );
+    // Always flush to ensure logs are written immediately
+    let _ = writer.flush();
 }
 
 pub fn service_log_path(log_dir: &Path, service: &str) -> PathBuf {

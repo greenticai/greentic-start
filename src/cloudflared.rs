@@ -164,3 +164,20 @@ fn read_pid(path: &Path) -> anyhow::Result<Option<u32>> {
     }
     Ok(Some(trimmed.parse()?))
 }
+
+/// Stop any orphaned cloudflared processes not tracked by pidfile.
+pub fn stop_cloudflared() {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("pkill")
+            .args(["-9", "cloudflared"])
+            .status();
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "cloudflared.exe", "/F"])
+            .status();
+    }
+}

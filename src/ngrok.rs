@@ -32,6 +32,20 @@ pub fn start_tunnel(
         let _ = supervisor::stop_pidfile(&pid_path, 2_000);
     }
 
+    // Check for orphaned ngrok process: API responds but no valid pidfile
+    // This happens when previous session crashed without cleanup
+    let has_valid_pidfile = read_pid(&pid_path)
+        .ok()
+        .flatten()
+        .is_some_and(supervisor::is_running);
+
+    if !has_valid_pidfile && is_ngrok_running() {
+        // Orphaned ngrok detected - kill it
+        kill_orphaned_ngrok();
+        // Clear stale URL cache so we get a fresh URL
+        let _ = std::fs::remove_file(&url_path);
+    }
+
     if let Some(pid) = read_pid(&pid_path)?
         && supervisor::is_running(pid)
     {
@@ -51,6 +65,9 @@ pub fn start_tunnel(
             log_path: log_path_buf,
         });
     }
+
+    // Truncate log file to avoid reading old URLs from previous sessions
+    let _ = std::fs::File::create(log_path);
 
     let mut argv = vec![
         config.binary.to_string_lossy().to_string(),
@@ -209,6 +226,39 @@ fn is_ngrok_url(value: &str) -> bool {
         return false;
     }
     value.contains(".ngrok-free.app") || value.contains(".ngrok.app") || value.contains(".ngrok.io")
+}
+
+/// Check if ngrok is running by querying its local API.
+fn is_ngrok_running() -> bool {
+    try_ngrok_api().is_some()
+}
+
+/// Kill any orphaned ngrok processes that are running but not tracked by a pidfile.
+/// This handles cases where a previous session crashed without cleanup.
+fn kill_orphaned_ngrok() {
+    // ngrok is running but not tracked - kill it
+    #[cfg(unix)]
+    {
+        // Try pkill first (more reliable)
+        let _ = std::process::Command::new("pkill")
+            .args(["-9", "ngrok"])
+            .status();
+        // Wait a bit for the process to die
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "ngrok.exe", "/F"])
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// Stop ngrok process - can be used for shutdown without pidfile.
+pub fn stop_ngrok() {
+    kill_orphaned_ngrok();
 }
 
 fn read_pid(path: &Path) -> anyhow::Result<Option<u32>> {
