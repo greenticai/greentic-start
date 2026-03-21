@@ -22,6 +22,21 @@ pub fn dispatch_http_ingress(
     request: &IngressRequestV1,
     ctx: &OperatorContext,
 ) -> anyhow::Result<IngressDispatchResult> {
+    // Debug: write directly to file
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/http_debug.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "[{}] dispatch_http_ingress: domain={:?} provider={}",
+            chrono::Utc::now().format("%H:%M:%S%.3f"),
+            domain,
+            request.provider
+        );
+    }
     // Inject secrets into config for providers running in provider_core_only mode
     let config = build_injected_config(runner_host, domain, &request.provider, ctx);
 
@@ -46,6 +61,25 @@ pub fn dispatch_http_ingress(
         &payload_json,
         ctx,
     )?;
+    // Debug: log provider outcome
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/http_debug.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "[{}] provider returned: success={} output_keys={:?}",
+            chrono::Utc::now().format("%H:%M:%S%.3f"),
+            outcome.success,
+            outcome
+                .output
+                .as_ref()
+                .and_then(|v| v.as_object())
+                .map(|o| o.keys().collect::<Vec<_>>())
+        );
+    }
 
     if !outcome.success {
         let message = outcome
@@ -56,7 +90,44 @@ pub fn dispatch_http_ingress(
     }
 
     let value = outcome.output.unwrap_or_else(|| json!({}));
+    // Debug: log the actual events field
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/http_debug.log")
+    {
+        use std::io::Write;
+        if let Some(events) = value.get("events") {
+            let _ = writeln!(
+                f,
+                "[{}] events field: {}",
+                chrono::Utc::now().format("%H:%M:%S%.3f"),
+                serde_json::to_string(events).unwrap_or_default()
+            );
+        } else {
+            let _ = writeln!(
+                f,
+                "[{}] NO events field in provider output",
+                chrono::Utc::now().format("%H:%M:%S%.3f")
+            );
+        }
+    }
     let mut decoded = parse_dispatch_result(&value).with_context(|| "decode ingest_http output")?;
+    // Debug: log parsed result
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/http_debug.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "[{}] parsed: events={} messaging_envelopes={}",
+            chrono::Utc::now().format("%H:%M:%S%.3f"),
+            decoded.events.len(),
+            decoded.messaging_envelopes.len()
+        );
+    }
     apply_post_ingress_hooks_dispatch(
         runner_host.bundle_root(),
         runner_host,
@@ -169,10 +240,43 @@ fn build_ingress_request(
 }
 
 fn parse_dispatch_result(value: &JsonValue) -> anyhow::Result<IngressDispatchResult> {
+    // Debug: log raw provider output
+    operator_log::info(
+        module_path!(),
+        format!(
+            "[DEBUG] parse_dispatch_result: raw value keys = {:?}",
+            value.as_object().map(|o| o.keys().collect::<Vec<_>>())
+        ),
+    );
+    if let Some(events_value) = value.get("events") {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[DEBUG] events field = {}",
+                serde_json::to_string(events_value).unwrap_or_default()
+            ),
+        );
+    } else {
+        operator_log::info(
+            module_path!(),
+            "[DEBUG] NO 'events' field found in provider output",
+        );
+    }
+
     let http_value = value.get("http").unwrap_or(value);
     let response = parse_http_response(http_value)?;
     let events = parse_events(value.get("events"))?;
     let messaging_envelopes = parse_messaging_envelopes(value.get("events"));
+
+    operator_log::info(
+        module_path!(),
+        format!(
+            "[DEBUG] parsed events={}, messaging_envelopes={}",
+            events.len(),
+            messaging_envelopes.len()
+        ),
+    );
+
     Ok(IngressDispatchResult {
         response,
         events,
@@ -278,9 +382,22 @@ fn parse_messaging_envelopes(value: Option<&JsonValue>) -> Vec<ChannelMessageEnv
         return Vec::new();
     };
     let mut envelopes = Vec::new();
-    for entry in array {
-        if let Ok(envelope) = serde_json::from_value::<ChannelMessageEnvelope>(entry.clone()) {
-            envelopes.push(envelope);
+    for (i, entry) in array.iter().enumerate() {
+        match serde_json::from_value::<ChannelMessageEnvelope>(entry.clone()) {
+            Ok(envelope) => {
+                envelopes.push(envelope);
+            }
+            Err(err) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "[DEBUG] parse_messaging_envelopes: failed to parse envelope {}: {} entry={}",
+                        i,
+                        err,
+                        serde_json::to_string(entry).unwrap_or_default()
+                    ),
+                );
+            }
         }
     }
     envelopes

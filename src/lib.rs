@@ -743,6 +743,61 @@ fn normalized_bundle_has_runtime_payload(root_dir: &Path) -> bool {
     root_dir.join("bundle-manifest.json").exists() || root_dir.join("resolved").is_dir()
 }
 
+/// Extended bundle.yaml structure with optional demo config fields
+#[derive(Debug, Deserialize)]
+struct ExtendedBundleYaml {
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    team: Option<String>,
+    #[serde(default)]
+    providers: Option<std::collections::BTreeMap<String, config::DemoProviderConfig>>,
+}
+
+/// Result of loading extended bundle.yaml
+struct ExtendedBundleResult {
+    tenant: Option<String>,
+    team: Option<String>,
+    providers: Option<std::collections::BTreeMap<String, config::DemoProviderConfig>>,
+}
+
+/// Load extended config from bundle.yaml if present (tenant, team, providers)
+fn load_extended_bundle_config(
+    bundle_path: &Path,
+    root_dir: &Path,
+) -> anyhow::Result<Option<ExtendedBundleResult>> {
+    if !bundle_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = std::fs::read_to_string(bundle_path)
+        .with_context(|| format!("read {}", bundle_path.display()))?;
+
+    let parsed: ExtendedBundleYaml = serde_yaml_bw::from_str(&raw)
+        .with_context(|| format!("parse extended config from {}", bundle_path.display()))?;
+
+    let mut providers = parsed.providers;
+
+    // Resolve relative pack paths to absolute paths
+    if let Some(ref mut provider_map) = providers {
+        for (_name, cfg) in provider_map.iter_mut() {
+            if let Some(pack) = cfg.pack.as_mut() {
+                let pack_path = Path::new(pack);
+                if !pack_path.is_absolute() {
+                    let resolved = root_dir.join(pack_path);
+                    *pack = resolved.to_string_lossy().to_string();
+                }
+            }
+        }
+    }
+
+    Ok(Some(ExtendedBundleResult {
+        tenant: parsed.tenant,
+        team: parsed.team,
+        providers,
+    }))
+}
+
 fn load_runtime_demo_config(
     demo_paths: &DemoPaths,
     request: &StartRequest,
@@ -751,12 +806,38 @@ fn load_runtime_demo_config(
         DemoConfigSource::LegacyFile => config::load_demo_config(&demo_paths.config_path)?,
         DemoConfigSource::NormalizedBundle => {
             let mut config = config::DemoConfig::default();
-            if let Some(target) = infer_normalized_bundle_target(&demo_paths.root_dir)? {
+            let mut tenant_from_bundle = false;
+            let mut team_from_bundle = false;
+
+            // Try to load extended config from bundle.yaml (tenant, team, providers)
+            if let Some(extended) =
+                load_extended_bundle_config(&demo_paths.config_path, &demo_paths.root_dir)?
+            {
+                // Use tenant/team from bundle.yaml if present
+                if let Some(tenant) = extended.tenant {
+                    config.tenant = tenant;
+                    tenant_from_bundle = true;
+                }
+                if let Some(team) = extended.team {
+                    config.team = team;
+                    team_from_bundle = true;
+                }
+                // Load providers
+                if extended.providers.is_some() {
+                    config.providers = extended.providers;
+                }
+            }
+
+            // Fallback to inferred target from resolved/ directory if tenant/team not set in bundle.yaml
+            if !tenant_from_bundle
+                && let Some(target) = infer_normalized_bundle_target(&demo_paths.root_dir)?
+            {
                 config.tenant = target.tenant;
-                if let Some(team) = target.team {
+                if !team_from_bundle && let Some(team) = target.team {
                     config.team = team;
                 }
             }
+
             config
         }
     };

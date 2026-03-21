@@ -200,6 +200,29 @@ async fn handle_request_inner(
     req: Request<Incoming>,
     state: Arc<HttpIngressState>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    // Debug: write directly to a debug file to verify code is being executed
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/http_debug.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "[{}] handle_request_inner: path={} method={}",
+            chrono::Utc::now().format("%H:%M:%S%.3f"),
+            req.uri().path(),
+            req.method()
+        );
+    }
+    operator_log::info(
+        module_path!(),
+        format!(
+            "[DEBUG] handle_request_inner: path={} method={}",
+            req.uri().path(),
+            req.method()
+        ),
+    );
     if req.method() == Method::OPTIONS {
         return Ok(cors_preflight_response());
     }
