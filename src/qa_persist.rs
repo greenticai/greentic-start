@@ -16,6 +16,7 @@ use greentic_secrets_lib::{
 use qa_spec::FormSpec;
 use serde_json::{Map as JsonMap, Value};
 
+use crate::secret_name::canonical_secret_name;
 use crate::secrets_gate::canonical_secret_uri;
 use crate::secrets_setup::resolve_env;
 
@@ -135,6 +136,8 @@ fn filter_secrets(config: &Value, secret_ids: &[&str]) -> Value {
 /// Convenience function to persist both secrets and config from QA results.
 ///
 /// Creates a `DevStore` from the bundle root and persists both.
+/// Also seeds secret-requirement aliases so WASM components can find secrets
+/// by their canonical requirement key.
 #[allow(clippy::too_many_arguments)]
 pub async fn persist_qa_results(
     bundle_root: &Path,
@@ -158,6 +161,30 @@ pub async fn persist_qa_results(
 
     let saved_secrets =
         persist_qa_secrets(&store, &env, tenant, team, provider_id, config, form_spec).await?;
+
+    // Seed aliases from secret-requirements.json so WASM components can find
+    // secrets by their canonical requirement key (e.g. SLACK_BOT_TOKEN →
+    // slack_bot_token) even when the answers file uses a shorter key (bot_token).
+    if let Some(config_map) = config.as_object() {
+        let alias_count = seed_secret_requirement_aliases(
+            &store,
+            config_map,
+            &env,
+            tenant,
+            team,
+            provider_id,
+            pack_path,
+        )
+        .await
+        .unwrap_or(0);
+        if alias_count > 0 {
+            tracing::debug!(
+                "seeded {} secret alias(es) for provider {}",
+                alias_count,
+                provider_id
+            );
+        }
+    }
 
     let config_written = if config.as_object().is_some_and(|m| !m.is_empty()) {
         persist_qa_config(
@@ -190,6 +217,110 @@ pub fn oauth_authorize_stub(provider_id: &str, auth_url: Option<&str>) -> Option
         println!("[oauth] OAuth integration is not yet implemented.");
     }
     None
+}
+
+// ── Alias seeding ───────────────────────────────────────────────────────────
+
+/// Read `assets/secret-requirements.json` from a pack and seed alias entries
+/// for any requirement key that differs from the answers key after
+/// canonicalization.
+///
+/// This allows WASM components to find secrets by their canonical requirement
+/// key (e.g. `SLACK_BOT_TOKEN` → `slack_bot_token`) even when the answers file
+/// uses a shorter key (e.g. `bot_token`).
+pub async fn seed_secret_requirement_aliases(
+    store: &DevStore,
+    config_map: &JsonMap<String, Value>,
+    env: &str,
+    tenant: &str,
+    team: Option<&str>,
+    provider_id: &str,
+    pack_path: &Path,
+) -> Result<usize> {
+    let reqs = match read_secret_requirements(pack_path) {
+        Ok(r) => r,
+        Err(_) => return Ok(0),
+    };
+
+    // Collect existing keys (already stored by persist_qa_secrets)
+    let existing_keys: std::collections::HashSet<String> = config_map
+        .keys()
+        .map(|k| canonical_secret_name(k))
+        .collect();
+
+    let mut entries = Vec::new();
+
+    for req in &reqs {
+        let canonical_req_key = canonical_secret_name(&req.key);
+        // Skip if already stored with this exact key
+        if existing_keys.contains(&canonical_req_key) {
+            continue;
+        }
+
+        // Find a config value where the canonical requirement key ends with the
+        // canonical config key. E.g., "slack_bot_token" ends with "bot_token".
+        let matched_value = config_map.iter().find_map(|(cfg_key, cfg_val)| {
+            let norm_cfg = canonical_secret_name(cfg_key);
+            if canonical_req_key.ends_with(&norm_cfg) {
+                let text = value_to_text(cfg_val);
+                if text.is_empty() || text == "null" {
+                    None
+                } else {
+                    Some(text)
+                }
+            } else {
+                None
+            }
+        });
+
+        if let Some(text) = matched_value {
+            let uri = canonical_secret_uri(env, tenant, team, provider_id, &canonical_req_key);
+            entries.push(SeedEntry {
+                uri,
+                format: SecretFormat::Text,
+                value: SeedValue::Text { text },
+                description: Some(format!("alias from {} for {provider_id}", req.key)),
+            });
+        }
+    }
+
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    let count = entries.len();
+    let report = apply_seed(store, &SeedDoc { entries }, ApplyOptions::default()).await;
+
+    if !report.failed.is_empty() {
+        tracing::warn!(
+            "failed to seed {} secret alias(es) for {}: {:?}",
+            report.failed.len(),
+            provider_id,
+            report.failed
+        );
+    }
+
+    Ok(count)
+}
+
+#[derive(serde::Deserialize)]
+struct SecretRequirement {
+    key: String,
+}
+
+fn read_secret_requirements(pack_path: &Path) -> Result<Vec<SecretRequirement>> {
+    let file = std::fs::File::open(pack_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let entry = archive.by_name("assets/secret-requirements.json")?;
+    let reqs: Vec<SecretRequirement> = serde_json::from_reader(entry)?;
+    Ok(reqs)
+}
+
+fn value_to_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]
