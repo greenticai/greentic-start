@@ -326,6 +326,22 @@ fn arg_takes_value(arg: &str) -> bool {
 }
 
 fn run_start(request: StartRequest) -> anyhow::Result<()> {
+    // Disable provider-core-only mode in demo so WASM components can access secrets directly.
+    // Without this, the runner-host blocks secrets_store.get() calls from WASM.
+    // SAFETY: This is called early in single-threaded startup before spawning workers.
+    unsafe {
+        std::env::set_var("GREENTIC_PROVIDER_CORE_ONLY", "0");
+    }
+
+    // Set GREENTIC_ENV to "dev" if not already set. Secrets are persisted with env="dev"
+    // (see providers.rs, onboard/wizard.rs), so the runtime must match when reading.
+    // SAFETY: This is called early in single-threaded startup before spawning workers.
+    if std::env::var("GREENTIC_ENV").is_err() {
+        unsafe {
+            std::env::set_var("GREENTIC_ENV", "dev");
+        }
+    }
+
     let restart: BTreeSet<String> = request.restart.iter().map(restart_name).collect();
     let log_level = if request.quiet {
         operator_log::Level::Warn
