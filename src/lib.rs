@@ -353,6 +353,9 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
     let configured_public_base_url = startup_contract::configured_public_base_url_from_env()?;
     let tenant = demo_config.tenant.clone();
     let team = demo_config.team.clone();
+    let runtime_paths =
+        runtime_state::RuntimePaths::new(state_dir.clone(), tenant.clone(), team.clone());
+    runtime_state::clear_stop_request(&runtime_paths)?;
 
     // Mutual exclusivity: if ngrok is explicitly enabled, disable cloudflared
     // This allows `--ngrok on` to work without needing `--cloudflared off`
@@ -422,12 +425,27 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
     )?;
 
     let _admin_server = if request.admin {
-        let certs_dir =
+        let resolved_certs_dir =
             resolve_admin_certs_dir(&config_dir, &state_dir, request.admin_certs_dir.as_deref())?;
+        let admin_cert_refs = load_admin_cert_refs();
+        operator_log::info(
+            module_path!(),
+            format!(
+                "admin certs source={} path={}",
+                resolved_certs_dir.source.as_str(),
+                resolved_certs_dir.path.display()
+            ),
+        );
+        if !admin_cert_refs.is_empty() {
+            operator_log::info(
+                module_path!(),
+                format!("admin cert refs {}", admin_cert_refs.join(" ")),
+            );
+        }
         let tls_config = greentic_setup::admin::AdminTlsConfig {
-            server_cert: certs_dir.join("server.crt"),
-            server_key: certs_dir.join("server.key"),
-            client_ca: certs_dir.join("ca.crt"),
+            server_cert: resolved_certs_dir.path.join("server.crt"),
+            server_key: resolved_certs_dir.path.join("server.key"),
+            client_ca: resolved_certs_dir.path.join("ca.crt"),
             allowed_clients: load_admin_allowed_clients(
                 &config_dir,
                 &request.admin_allowed_clients,
@@ -437,17 +455,13 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
         let admin_config = admin_server::AdminServerConfig {
             tls_config,
             bundle_root: config_dir.clone(),
+            runtime_paths: runtime_paths.clone(),
         };
-        match admin_server::AdminServer::start(admin_config) {
-            Ok(server) => Some(server),
-            Err(err) => {
-                operator_log::error(
-                    module_path!(),
-                    format!("failed to start admin server: {err}"),
-                );
-                None
-            }
-        }
+        Some(
+            admin_server::AdminServer::start(admin_config).map_err(|err| {
+                anyhow!("admin mode requested but admin server failed to start: {err}")
+            })?,
+        )
     } else {
         None
     };
@@ -458,12 +472,20 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
         tenant,
         team
     );
-    wait_for_ctrlc()?;
+    let shutdown_reason = wait_for_shutdown(&runtime_paths)?;
+    operator_log::info(
+        module_path!(),
+        format!(
+            "runtime shutdown requested via {}",
+            shutdown_reason.as_str()
+        ),
+    );
     if let Some(server) = _admin_server {
         let _ = server.stop();
     }
     handles.stop()?;
     runtime::demo_down_runtime(&state_dir, &tenant, &team, false)?;
+    let _ = runtime_state::clear_stop_request(&runtime_paths);
     Ok(())
 }
 
@@ -569,22 +591,34 @@ fn resolve_admin_certs_dir(
     bundle_root: &Path,
     state_dir: &Path,
     explicit: Option<&Path>,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<ResolvedAdminCertsDir> {
     if let Some(path) = explicit {
-        return Ok(path.to_path_buf());
+        return Ok(ResolvedAdminCertsDir {
+            path: path.to_path_buf(),
+            source: AdminCertsSource::ExplicitPath,
+        });
     }
 
     let bundle_local = bundle_root.join(".greentic").join("admin").join("certs");
     if has_admin_cert_files(&bundle_local) {
-        return Ok(bundle_local);
+        return Ok(ResolvedAdminCertsDir {
+            path: bundle_local,
+            source: AdminCertsSource::BundleLocal,
+        });
     }
 
     let generated = maybe_materialize_admin_certs_from_env(state_dir)?;
     if let Some(path) = generated {
-        return Ok(path);
+        return Ok(ResolvedAdminCertsDir {
+            path,
+            source: AdminCertsSource::EnvMaterialized,
+        });
     }
 
-    Ok(bundle_local)
+    Ok(ResolvedAdminCertsDir {
+        path: bundle_local,
+        source: AdminCertsSource::BundleLocalFallback,
+    })
 }
 
 fn has_admin_cert_files(dir: &Path) -> bool {
@@ -622,6 +656,47 @@ fn maybe_materialize_admin_certs_from_env(state_dir: &Path) -> anyhow::Result<Op
     fs::write(cert_dir.join("server.key"), key_pem)
         .with_context(|| format!("failed to write {}", cert_dir.join("server.key").display()))?;
     Ok(Some(cert_dir))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedAdminCertsDir {
+    path: PathBuf,
+    source: AdminCertsSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdminCertsSource {
+    ExplicitPath,
+    BundleLocal,
+    EnvMaterialized,
+    BundleLocalFallback,
+}
+
+impl AdminCertsSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitPath => "explicit_path",
+            Self::BundleLocal => "bundle_local",
+            Self::EnvMaterialized => "env_materialized",
+            Self::BundleLocalFallback => "bundle_local_fallback",
+        }
+    }
+}
+
+fn load_admin_cert_refs() -> Vec<String> {
+    [
+        ("GREENTIC_ADMIN_CA_SECRET_REF", "ca"),
+        ("GREENTIC_ADMIN_SERVER_CERT_SECRET_REF", "server_cert"),
+        ("GREENTIC_ADMIN_SERVER_KEY_SECRET_REF", "server_key"),
+    ]
+    .into_iter()
+    .filter_map(|(env_key, label)| {
+        std::env::var(env_key)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("{label}={value}"))
+    })
+    .collect()
 }
 
 fn stop_request_from_args(args: StopArgs) -> StopRequest {
@@ -953,13 +1028,38 @@ fn resolve_state_dir(state_dir: Option<PathBuf>, bundle: Option<&str>) -> anyhow
     Ok(PathBuf::from("state"))
 }
 
-fn wait_for_ctrlc() -> anyhow::Result<()> {
+enum ShutdownReason {
+    CtrlC,
+    AdminStop,
+}
+
+impl ShutdownReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::CtrlC => "ctrl_c",
+            Self::AdminStop => "admin_stop",
+        }
+    }
+}
+
+fn wait_for_shutdown(paths: &runtime_state::RuntimePaths) -> anyhow::Result<ShutdownReason> {
     let runtime =
         tokio::runtime::Runtime::new().context("failed to spawn runtime for Ctrl+C listener")?;
-    runtime.block_on(async {
-        tokio::signal::ctrl_c()
-            .await
-            .map_err(|err| anyhow!("failed to wait for Ctrl+C: {err}"))
+    let paths = paths.clone();
+    runtime.block_on(async move {
+        loop {
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    result.map_err(|err| anyhow!("failed to wait for Ctrl+C: {err}"))?;
+                    return Ok(ShutdownReason::CtrlC);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                    if runtime_state::read_stop_request(&paths)?.is_some() {
+                        return Ok(ShutdownReason::AdminStop);
+                    }
+                }
+            }
+        }
     })
 }
 
@@ -1261,7 +1361,8 @@ mod tests {
         std::fs::write(certs.join("server.key"), "key").expect("key");
 
         let resolved = resolve_admin_certs_dir(bundle, &bundle.join("state"), None).expect("dir");
-        assert_eq!(resolved, certs);
+        assert_eq!(resolved.path, certs);
+        assert_eq!(resolved.source, AdminCertsSource::BundleLocal);
     }
 
     #[test]
@@ -1277,17 +1378,18 @@ mod tests {
         }
 
         let resolved = resolve_admin_certs_dir(bundle, &state_dir, None).expect("dir");
-        assert_eq!(resolved, state_dir.join("admin").join("certs"));
+        assert_eq!(resolved.path, state_dir.join("admin").join("certs"));
+        assert_eq!(resolved.source, AdminCertsSource::EnvMaterialized);
         assert_eq!(
-            std::fs::read_to_string(resolved.join("ca.crt")).expect("read ca"),
+            std::fs::read_to_string(resolved.path.join("ca.crt")).expect("read ca"),
             "ca-pem"
         );
         assert_eq!(
-            std::fs::read_to_string(resolved.join("server.crt")).expect("read cert"),
+            std::fs::read_to_string(resolved.path.join("server.crt")).expect("read cert"),
             "cert-pem"
         );
         assert_eq!(
-            std::fs::read_to_string(resolved.join("server.key")).expect("read key"),
+            std::fs::read_to_string(resolved.path.join("server.key")).expect("read key"),
             "key-pem"
         );
 
@@ -1295,6 +1397,43 @@ mod tests {
             std::env::remove_var("GREENTIC_ADMIN_CA_PEM");
             std::env::remove_var("GREENTIC_ADMIN_SERVER_CERT_PEM");
             std::env::remove_var("GREENTIC_ADMIN_SERVER_KEY_PEM");
+        }
+    }
+
+    #[test]
+    fn resolve_admin_certs_dir_marks_explicit_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        let explicit = bundle.join("custom-certs");
+
+        let resolved =
+            resolve_admin_certs_dir(bundle, &bundle.join("state"), Some(&explicit)).expect("dir");
+        assert_eq!(resolved.path, explicit);
+        assert_eq!(resolved.source, AdminCertsSource::ExplicitPath);
+    }
+
+    #[test]
+    fn load_admin_cert_refs_reads_optional_env_vars() {
+        unsafe {
+            std::env::set_var("GREENTIC_ADMIN_CA_SECRET_REF", "ca-ref");
+            std::env::set_var("GREENTIC_ADMIN_SERVER_CERT_SECRET_REF", "cert-ref");
+            std::env::set_var("GREENTIC_ADMIN_SERVER_KEY_SECRET_REF", "key-ref");
+        }
+
+        let refs = load_admin_cert_refs();
+        assert_eq!(
+            refs,
+            vec![
+                "ca=ca-ref".to_string(),
+                "server_cert=cert-ref".to_string(),
+                "server_key=key-ref".to_string()
+            ]
+        );
+
+        unsafe {
+            std::env::remove_var("GREENTIC_ADMIN_CA_SECRET_REF");
+            std::env::remove_var("GREENTIC_ADMIN_SERVER_CERT_SECRET_REF");
+            std::env::remove_var("GREENTIC_ADMIN_SERVER_KEY_SECRET_REF");
         }
     }
 

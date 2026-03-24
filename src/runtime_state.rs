@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug)]
 pub struct RuntimePaths {
     state_dir: PathBuf,
     log_root: PathBuf,
@@ -75,19 +76,13 @@ impl RuntimePaths {
     pub fn service_manifest_path(&self) -> PathBuf {
         self.runtime_root().join("services.json")
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    pub fn control_dir(&self) -> PathBuf {
+        self.runtime_root().join("control")
+    }
 
-    #[test]
-    fn logs_dir_uses_bundle_logs() {
-        let paths = RuntimePaths::new("/tmp/bundle/state", "demo", "default");
-        assert_eq!(
-            paths.logs_dir(),
-            PathBuf::from("/tmp/bundle/logs").join("demo.default")
-        );
+    pub fn stop_request_path(&self) -> PathBuf {
+        self.control_dir().join("stop.json")
     }
 }
 
@@ -140,6 +135,13 @@ pub struct ServiceEntry {
     pub log_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopRequest {
+    pub requested_by: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 impl ServiceEntry {
     pub fn new(id: impl Into<String>, kind: impl Into<String>, log_path: Option<&Path>) -> Self {
         Self {
@@ -167,4 +169,52 @@ pub fn remove_service_manifest(paths: &RuntimePaths) -> anyhow::Result<()> {
         std::fs::remove_file(path)?;
     }
     Ok(())
+}
+
+pub fn write_stop_request(paths: &RuntimePaths, request: &StopRequest) -> anyhow::Result<()> {
+    write_json(&paths.stop_request_path(), request)
+}
+
+pub fn read_stop_request(paths: &RuntimePaths) -> anyhow::Result<Option<StopRequest>> {
+    read_json(&paths.stop_request_path())
+}
+
+pub fn clear_stop_request(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let path = paths.stop_request_path();
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logs_dir_uses_bundle_logs() {
+        let paths = RuntimePaths::new("/tmp/bundle/state", "demo", "default");
+        assert_eq!(
+            paths.logs_dir(),
+            PathBuf::from("/tmp/bundle/logs").join("demo.default")
+        );
+    }
+
+    #[test]
+    fn stop_request_roundtrip() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("state"), "demo", "default");
+        let req = StopRequest {
+            requested_by: "admin-api".into(),
+            reason: Some("remote stop".into()),
+        };
+
+        write_stop_request(&paths, &req).unwrap();
+        let loaded = read_stop_request(&paths).unwrap().unwrap();
+        assert_eq!(loaded.requested_by, "admin-api");
+        assert_eq!(loaded.reason.as_deref(), Some("remote stop"));
+
+        clear_stop_request(&paths).unwrap();
+        assert!(read_stop_request(&paths).unwrap().is_none());
+    }
 }
