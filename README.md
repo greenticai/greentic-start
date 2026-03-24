@@ -6,6 +6,7 @@ It exposes lifecycle orchestration as a library (`greentic_start::run_from_env`)
 ## Ownership
 
 - `greentic-start` owns lifecycle execution (`start`/`up`/`stop`/`restart`).
+- `greentic-start` also owns the runtime admin lifecycle surface when lifecycle control is exposed over mTLS.
 - `greentic-operator` (including Wizard) owns UX and planning, then delegates lifecycle execution to `greentic-start`.
 - Details: `docs/ownership.md`.
 
@@ -36,6 +37,34 @@ Primary runtime inputs:
   `PUBLIC_BASE_URL`.
 - Resolved startup values are passed forward through child-process env vars and
   persisted runtime metadata (`startup_contract.json`).
+
+For admin mTLS, `greentic-start` also logs which cert source was selected at
+startup:
+
+- `explicit_path`
+- `bundle_local`
+- `env_materialized`
+- `bundle_local_fallback`
+
+For production-oriented cloud deploys, deployers may also pass:
+
+- `GREENTIC_ADMIN_CA_SECRET_REF`
+- `GREENTIC_ADMIN_SERVER_CERT_SECRET_REF`
+- `GREENTIC_ADMIN_SERVER_KEY_SECRET_REF`
+
+These are diagnostics/trace variables. Runtime still boots from the PEM env
+payloads, not from raw secret-manager APIs directly.
+
+Admin lifecycle semantics:
+
+- `POST /admin/v1/stop` is implemented through a runtime stop-request file that
+  the foreground `greentic-start` loop observes and honors
+- `GET /admin/v1/status` and `GET /admin/v1/list` report `stopping` while that
+  stop request is pending
+- `POST /admin/v1/start` is intentionally not a remote process launcher through
+  the embedded admin endpoint; if the runtime is already active it returns an
+  idempotent success shape, and if the runtime is inactive it must be started
+  by an external `greentic-start` launcher or cloud supervisor
 
 ## Extension pack roles
 

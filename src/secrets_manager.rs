@@ -168,13 +168,7 @@ fn find_best_pack(dir: &Path) -> Result<Option<PathBuf>> {
 mod tests {
     use super::*;
     use std::env;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
-
-    fn test_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     #[test]
     fn canonical_team_maps_default_and_empty_to_underscore() {
@@ -206,7 +200,7 @@ mod tests {
 
     #[test]
     fn override_env_wins() {
-        let _env_guard = test_env_lock().lock().unwrap();
+        let _env_guard = crate::test_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         let alt = dir.path().join("alt.gtpack");
         fs::write(&alt, "").unwrap();

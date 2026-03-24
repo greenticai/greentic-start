@@ -29,7 +29,9 @@ use tokio_rustls::TlsAcceptor;
 
 use greentic_setup::admin::AdminTlsConfig;
 use greentic_setup::admin::routes::{
-    AdminResponse, BundleDeployRequest, BundleRemoveRequest, BundleStatus, BundleStatusResponse,
+    AdminClientAddRequest, AdminClientEntry, AdminClientListResponse, AdminClientRemoveRequest,
+    AdminResponse, BundleDeployRequest, BundleListResponse, BundleRemoveRequest,
+    BundleStartRequest, BundleStatus, BundleStatusResponse, BundleStopRequest, BundleUpdateRequest,
 };
 use greentic_setup::card_setup::CardSetupSession;
 use greentic_setup::discovery;
@@ -43,6 +45,7 @@ use greentic_setup::setup_to_formspec;
 use greentic_setup::{SetupEngine, SetupMode};
 
 use crate::operator_log;
+use crate::runtime_state::{self, RuntimePaths, StopRequest};
 
 type AdminHttpResponse = Response<Full<Bytes>>;
 type AdminHttpError = Box<AdminHttpResponse>;
@@ -51,6 +54,7 @@ type AdminHttpResult<T = AdminHttpResponse> = Result<T, AdminHttpError>;
 pub struct AdminServerConfig {
     pub tls_config: AdminTlsConfig,
     pub bundle_root: PathBuf,
+    pub runtime_paths: RuntimePaths,
 }
 
 pub struct AdminServer {
@@ -64,7 +68,8 @@ const SESSION_TTL_SECS: u64 = 1800;
 #[derive(Clone)]
 struct AdminState {
     bundle_root: PathBuf,
-    allowed_clients: Vec<String>,
+    runtime_paths: RuntimePaths,
+    allowed_clients: Arc<RwLock<Vec<String>>>,
     sessions: Arc<RwLock<HashMap<String, CardSetupSession>>>,
 }
 
@@ -83,7 +88,8 @@ impl AdminServer {
         let bind_addr: SocketAddr = format!("127.0.0.1:{}", tls_config.port).parse()?;
         let state = Arc::new(AdminState {
             bundle_root: config.bundle_root,
-            allowed_clients: tls_config.allowed_clients.clone(),
+            runtime_paths: config.runtime_paths,
+            allowed_clients: Arc::new(RwLock::new(tls_config.allowed_clients.clone())),
             sessions: Arc::new(RwLock::new(HashMap::new())),
         });
 
@@ -137,7 +143,8 @@ impl AdminServer {
 
                                         // Extract client CN from peer certs
                                         let client_cn = extract_client_cn(tls_stream.get_ref().1);
-                                        if !check_client_allowed(&conn_state.allowed_clients, client_cn.as_deref()) {
+                                        let allowed_clients = conn_state.allowed_clients.read().await.clone();
+                                        if !check_client_allowed(&allowed_clients, client_cn.as_deref()) {
                                             operator_log::warn(
                                                 module_path!(),
                                                 format!("admin: rejected client CN={:?} from {}", client_cn, peer),
@@ -339,15 +346,42 @@ async fn route_admin_request(
         )),
 
         (Method::GET, "/admin/v1/status") => handle_status(state),
+        (Method::GET, "/admin/v1/list") => handle_list(state),
+        (Method::GET, "/admin/v1/admins") => handle_admin_clients(state).await,
 
         (Method::POST, "/admin/v1/deploy") => {
             let body = read_json_body(req).await?;
             handle_deploy(state, body).await
         }
 
+        (Method::POST, "/admin/v1/update") => {
+            let body = read_json_body(req).await?;
+            handle_update(state, body).await
+        }
+
         (Method::POST, "/admin/v1/remove") => {
             let body = read_json_body(req).await?;
             handle_remove(state, body).await
+        }
+
+        (Method::POST, "/admin/v1/start") => {
+            let body = read_json_body(req).await?;
+            handle_start(state, body)
+        }
+
+        (Method::POST, "/admin/v1/stop") => {
+            let body = read_json_body(req).await?;
+            handle_stop(state, body)
+        }
+
+        (Method::POST, "/admin/v1/admins/add") => {
+            let body = read_json_body(req).await?;
+            handle_add_admin_client(state, body).await
+        }
+
+        (Method::POST, "/admin/v1/admins/remove") => {
+            let body = read_json_body(req).await?;
+            handle_remove_admin_client(state, body).await
         }
 
         (Method::POST, "/admin/v1/setup") => {
@@ -389,6 +423,7 @@ async fn route_admin_request(
 
 fn handle_status(state: &AdminState) -> AdminHttpResult {
     let bundle = &state.bundle_root;
+    let bundle_exists = bundle.exists();
 
     let provider_count = match discovery::discover(bundle) {
         Ok(result) => result.providers.len(),
@@ -408,7 +443,7 @@ fn handle_status(state: &AdminState) -> AdminHttpResult {
 
     let resp = BundleStatusResponse {
         bundle_path: bundle.clone(),
-        status: BundleStatus::Active,
+        status: current_bundle_status(state, bundle_exists),
         pack_count,
         tenant_count,
         provider_count,
@@ -417,6 +452,32 @@ fn handle_status(state: &AdminState) -> AdminHttpResult {
     Ok(json_response(
         StatusCode::OK,
         json!(AdminResponse::ok(resp)),
+    ))
+}
+
+fn handle_list(state: &AdminState) -> AdminHttpResult {
+    let bundle = &state.bundle_root;
+    let status = BundleStatusResponse {
+        bundle_path: bundle.clone(),
+        status: current_bundle_status(state, bundle.exists()),
+        pack_count: count_bundle_packs(bundle).unwrap_or(0),
+        tenant_count: std::fs::read_dir(bundle.join("tenants"))
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| entry.path().is_dir())
+                    .count()
+            })
+            .unwrap_or(0),
+        provider_count: discovery::discover(bundle)
+            .map(|result| result.providers.len())
+            .unwrap_or(0),
+    };
+    Ok(json_response(
+        StatusCode::OK,
+        json!(AdminResponse::ok(BundleListResponse {
+            bundles: vec![status],
+        })),
     ))
 }
 
@@ -502,6 +563,89 @@ async fn handle_deploy(_state: &AdminState, body: JsonValue) -> AdminHttpResult 
     })?
 }
 
+async fn handle_update(_state: &AdminState, body: JsonValue) -> AdminHttpResult {
+    tokio::task::spawn_blocking(move || {
+        let req: BundleUpdateRequest = serde_json::from_value(body).map_err(|err| {
+            Box::new(json_response(
+                StatusCode::BAD_REQUEST,
+                json!(AdminResponse::<()>::err(err.to_string())),
+            ))
+        })?;
+
+        let config = SetupConfig {
+            tenant: req
+                .tenants
+                .first()
+                .map(|t| t.tenant.clone())
+                .unwrap_or_else(|| "demo".into()),
+            team: req.tenants.first().and_then(|t| t.team.clone()),
+            env: greentic_setup::resolve_env(None),
+            offline: false,
+            verbose: true,
+        };
+        let engine = SetupEngine::new(config);
+
+        let setup_answers = if let Some(obj) = req.answers.as_object() {
+            obj.clone()
+        } else {
+            serde_json::Map::new()
+        };
+
+        let setup_request = SetupRequest {
+            bundle: req.bundle_path.clone(),
+            pack_refs: req.pack_refs,
+            tenants: req.tenants,
+            setup_answers,
+            ..Default::default()
+        };
+
+        let plan = engine
+            .plan(SetupMode::Update, &setup_request, req.dry_run)
+            .map_err(|err| {
+                Box::new(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!(AdminResponse::<()>::err(err.to_string())),
+                ))
+            })?;
+
+        if req.dry_run {
+            let steps: Vec<String> = plan.steps.iter().map(|s| s.description.clone()).collect();
+            return Ok(json_response(
+                StatusCode::OK,
+                json!(AdminResponse::ok(json!({
+                    "dry_run": true,
+                    "steps": steps,
+                    "mode": "update",
+                }))),
+            ));
+        }
+
+        let report = engine.execute(&plan).map_err(|err| {
+            Box::new(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!(AdminResponse::<()>::err(err.to_string())),
+            ))
+        })?;
+
+        Ok(json_response(
+            StatusCode::OK,
+            json!(AdminResponse::ok(json!({
+                "updated": true,
+                "resolved_packs": report.resolved_packs.len(),
+            }))),
+        ))
+    })
+    .await
+    .map_err(|err| {
+        Box::new(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!(AdminResponse::<()>::err(format!(
+                "update task failed: {err}"
+            ))),
+        ))
+    })?
+}
+
 async fn handle_remove(_state: &AdminState, body: JsonValue) -> AdminHttpResult {
     tokio::task::spawn_blocking(move || {
         let req: BundleRemoveRequest = serde_json::from_value(body).map_err(|err| {
@@ -574,6 +718,148 @@ async fn handle_remove(_state: &AdminState, body: JsonValue) -> AdminHttpResult 
             ))),
         ))
     })?
+}
+
+async fn handle_admin_clients(state: &AdminState) -> AdminHttpResult {
+    let admins = state
+        .allowed_clients
+        .read()
+        .await
+        .iter()
+        .cloned()
+        .map(|client_cn| AdminClientEntry { client_cn })
+        .collect::<Vec<_>>();
+    Ok(json_response(
+        StatusCode::OK,
+        json!(AdminResponse::ok(AdminClientListResponse { admins })),
+    ))
+}
+
+fn handle_start(state: &AdminState, body: JsonValue) -> AdminHttpResult {
+    let req: BundleStartRequest = serde_json::from_value(body).map_err(|err| {
+        Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            json!(AdminResponse::<()>::err(err.to_string())),
+        ))
+    })?;
+    ensure_bundle_matches(state, &req.bundle_path)?;
+
+    if !state.bundle_root.exists() {
+        return Err(Box::new(json_response(
+            StatusCode::CONFLICT,
+            json!(AdminResponse::<()>::err(
+                "runtime is inactive; remote start requires an external greentic-start launcher or cloud supervisor"
+            )),
+        )));
+    }
+
+    if runtime_state::read_stop_request(&state.runtime_paths)
+        .map_err(internal_server_error)?
+        .is_some()
+    {
+        return Err(Box::new(json_response(
+            StatusCode::CONFLICT,
+            json!(AdminResponse::<()>::err("runtime is already stopping")),
+        )));
+    }
+
+    Ok(json_response(
+        StatusCode::OK,
+        json!(AdminResponse::ok(json!({
+            "started": false,
+            "status": "active",
+            "message": "runtime is already active"
+        }))),
+    ))
+}
+
+fn handle_stop(state: &AdminState, body: JsonValue) -> AdminHttpResult {
+    let req: BundleStopRequest = serde_json::from_value(body).map_err(|err| {
+        Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            json!(AdminResponse::<()>::err(err.to_string())),
+        ))
+    })?;
+    ensure_bundle_matches(state, &req.bundle_path)?;
+
+    let stop_request = StopRequest {
+        requested_by: "admin-api".into(),
+        reason: Some("remote stop requested".into()),
+    };
+    runtime_state::write_stop_request(&state.runtime_paths, &stop_request)
+        .map_err(internal_server_error)?;
+
+    Ok(json_response(
+        StatusCode::ACCEPTED,
+        json!(AdminResponse::ok(json!({
+            "stopping": true,
+            "status": "stopping"
+        }))),
+    ))
+}
+
+async fn handle_add_admin_client(state: &AdminState, body: JsonValue) -> AdminHttpResult {
+    let req: AdminClientAddRequest = serde_json::from_value(body).map_err(|err| {
+        Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            json!(AdminResponse::<()>::err(err.to_string())),
+        ))
+    })?;
+    ensure_bundle_matches(state, &req.bundle_path)?;
+
+    let client_cn = req.client_cn.trim();
+    if client_cn.is_empty() {
+        return Err(bad_request_err("client_cn cannot be empty"));
+    }
+
+    let path = admin_registry_path(&state.bundle_root);
+    let mut doc = read_admin_registry(&path).map_err(internal_server_error)?;
+    if !doc.admins.iter().any(|entry| entry.client_cn == client_cn) {
+        doc.admins.push(AdminRegistryEntry {
+            client_cn: client_cn.to_string(),
+        });
+        doc.admins
+            .sort_by(|left, right| left.client_cn.cmp(&right.client_cn));
+        write_admin_registry(&path, &doc).map_err(internal_server_error)?;
+    }
+
+    {
+        let mut allowed = state.allowed_clients.write().await;
+        if !allowed.iter().any(|value| value == client_cn) {
+            allowed.push(client_cn.to_string());
+            allowed.sort();
+            allowed.dedup();
+        }
+    }
+
+    handle_admin_clients(state).await
+}
+
+async fn handle_remove_admin_client(state: &AdminState, body: JsonValue) -> AdminHttpResult {
+    let req: AdminClientRemoveRequest = serde_json::from_value(body).map_err(|err| {
+        Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            json!(AdminResponse::<()>::err(err.to_string())),
+        ))
+    })?;
+    ensure_bundle_matches(state, &req.bundle_path)?;
+
+    let client_cn = req.client_cn.trim();
+    if client_cn.is_empty() {
+        return Err(bad_request_err("client_cn cannot be empty"));
+    }
+
+    let path = admin_registry_path(&state.bundle_root);
+    let mut doc = read_admin_registry(&path).map_err(internal_server_error)?;
+    doc.admins.retain(|entry| entry.client_cn != client_cn);
+    write_admin_registry(&path, &doc).map_err(internal_server_error)?;
+
+    {
+        let mut allowed = state.allowed_clients.write().await;
+        allowed.retain(|value| value != client_cn);
+    }
+
+    handle_admin_clients(state).await
 }
 
 async fn handle_setup(state: &AdminState, body: JsonValue) -> AdminHttpResult {
@@ -983,6 +1269,36 @@ fn bad_request_err(msg: impl Into<String>) -> AdminHttpError {
     Box::new(bad_request(msg))
 }
 
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct AdminRegistryDocument {
+    #[serde(default)]
+    admins: Vec<AdminRegistryEntry>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct AdminRegistryEntry {
+    client_cn: String,
+}
+
+fn admin_registry_path(bundle_root: &Path) -> PathBuf {
+    bundle_root
+        .join(".greentic")
+        .join("admin")
+        .join("admins.json")
+}
+
+fn read_admin_registry(path: &Path) -> anyhow::Result<AdminRegistryDocument> {
+    if !path.exists() {
+        return Ok(AdminRegistryDocument::default());
+    }
+    let raw = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&raw).unwrap_or_default())
+}
+
+fn write_admin_registry(path: &Path, doc: &AdminRegistryDocument) -> anyhow::Result<()> {
+    runtime_state::write_json(path, doc)
+}
+
 fn count_bundle_packs(bundle_root: &Path) -> anyhow::Result<usize> {
     let packs_dir = bundle_root.join("packs");
     if !packs_dir.exists() {
@@ -1042,4 +1358,40 @@ fn json_response(status: StatusCode, value: JsonValue) -> Response<Full<Bytes>> 
                 ))))
                 .unwrap()
         })
+}
+
+fn current_bundle_status(state: &AdminState, bundle_exists: bool) -> BundleStatus {
+    if runtime_state::read_stop_request(&state.runtime_paths)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        BundleStatus::Stopping
+    } else if bundle_exists {
+        BundleStatus::Active
+    } else {
+        BundleStatus::Inactive
+    }
+}
+
+fn ensure_bundle_matches(state: &AdminState, bundle_path: &Path) -> AdminHttpResult<()> {
+    if bundle_path == state.bundle_root {
+        Ok(())
+    } else {
+        Err(Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            json!(AdminResponse::<()>::err(format!(
+                "bundle_path {} does not match managed bundle {}",
+                bundle_path.display(),
+                state.bundle_root.display()
+            ))),
+        )))
+    }
+}
+
+fn internal_server_error(err: anyhow::Error) -> AdminHttpError {
+    Box::new(json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json!(AdminResponse::<()>::err(err.to_string())),
+    ))
 }
