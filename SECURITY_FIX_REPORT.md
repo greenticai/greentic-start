@@ -1,7 +1,7 @@
 # Security Fix Report
 
-Date (UTC): 2026-03-23
-Branch: chore/add-ci-workflow
+Date (UTC): 2026-03-24
+Repository: /home/runner/work/greentic-start/greentic-start
 
 ## Inputs Reviewed
 - Dependabot alerts: 0
@@ -9,26 +9,24 @@ Branch: chore/add-ci-workflow
 - New PR dependency vulnerabilities: 0
 
 ## PR Dependency Change Review
-Compared this branch against `origin/master` (merge-base `155007c875fa5c4633efc936156a99d797dc4334`).
-
-Files changed in PR:
-- `.github/workflows/ci.yml` (added)
-
-Dependency manifests present in repository:
+Dependency manifests detected in repository:
 - `Cargo.toml`
 - `Cargo.lock`
 
-Dependency manifests changed by this PR:
+Dependency manifests changed in current working tree/PR diff:
 - None
 
-## Remediation Actions
-- No vulnerability remediation was required because no security alerts or PR-introduced dependency vulnerabilities were provided.
-- No dependency version changes were made.
+Commands used:
+- `git diff --name-only -- Cargo.toml Cargo.lock` -> no output
+- `cat security-alerts.json` -> `{"dependabot": [], "code_scanning": []}`
+- `cat pr-vulnerable-changes.json` -> `[]`
 
-## Additional Validation
-- Attempted local advisory scan with `cargo-audit`.
-- Result: tool not installed in this CI environment, so no additional local advisory database check was executed.
+## Remediation Actions
+- No vulnerabilities were provided by Dependabot or code scanning.
+- No PR-introduced dependency vulnerabilities were provided.
+- No dependency or source-code security fixes were required.
 
 ## Net Result
-- New vulnerabilities introduced by this PR: **None detected**.
-- Security code/dependency fixes applied: **None required**.
+- Vulnerabilities remediated: **0**
+- Files changed for remediation: **SECURITY_FIX_REPORT.md**
+- Residual known vulnerabilities from provided inputs: **None**
