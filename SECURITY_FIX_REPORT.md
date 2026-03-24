@@ -8,25 +8,29 @@ Repository: /home/runner/work/greentic-start/greentic-start
 - Code scanning alerts: 0
 - New PR dependency vulnerabilities: 0
 
-## PR Dependency Change Review
-Dependency manifests detected in repository:
+## PR Dependency Review
+Dependency manifests in repository:
 - `Cargo.toml`
 - `Cargo.lock`
 
-Dependency manifests changed in current working tree/PR diff:
+Changed dependency manifests in current PR/working tree:
 - None
 
-Commands used:
+Verification commands:
 - `git diff --name-only -- Cargo.toml Cargo.lock` -> no output
-- `cat security-alerts.json` -> `{"dependabot": [], "code_scanning": []}`
-- `cat pr-vulnerable-changes.json` -> `[]`
+- `sed -n '1,220p' Cargo.toml`
+- `sed -n '1,260p' Cargo.lock`
 
 ## Remediation Actions
-- No vulnerabilities were provided by Dependabot or code scanning.
-- No PR-introduced dependency vulnerabilities were provided.
-- No dependency or source-code security fixes were required.
+- No vulnerabilities were present in the provided security alert inputs.
+- No newly introduced PR dependency vulnerabilities were present.
+- No code or dependency remediation was required.
 
-## Net Result
+## Additional Validation
+- Attempted to run `cargo audit -q` for advisory validation.
+- Execution was blocked in this CI sandbox because Rustup could not write temporary files under `/home/runner/.rustup/tmp` (read-only filesystem).
+
+## Result
 - Vulnerabilities remediated: **0**
 - Files changed for remediation: **SECURITY_FIX_REPORT.md**
 - Residual known vulnerabilities from provided inputs: **None**
