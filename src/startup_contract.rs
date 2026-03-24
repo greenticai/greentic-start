@@ -124,14 +124,12 @@ pub fn resolve(input: StartupContractInput) -> anyhow::Result<StartupContract> {
                 "bundle declares static routes but asset serving is not supported in this launch mode"
             );
         }
-        if effective_public_base_url.is_none() {
-            anyhow::bail!("bundle declares static routes but no PUBLIC_BASE_URL could be resolved");
-        }
     }
 
-    let public_http_enabled = input.http_listener_enabled && effective_public_base_url.is_some();
-    let static_routes_enabled =
-        input.bundle_has_static_routes && input.asset_serving_enabled && public_http_enabled;
+    let public_http_enabled = input.http_listener_enabled;
+    let static_routes_enabled = input.bundle_has_static_routes
+        && input.asset_serving_enabled
+        && input.http_listener_enabled;
 
     Ok(StartupContract {
         bundle_has_static_routes: input.bundle_has_static_routes,
@@ -287,16 +285,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_missing_public_base_url() {
-        let err = resolve(StartupContractInput {
+    fn resolve_allows_missing_public_base_url_when_http_and_assets_are_available() {
+        let contract = resolve(StartupContractInput {
             bundle_has_static_routes: true,
             http_listener_enabled: true,
             asset_serving_enabled: true,
             public_base_url: None,
             runtime_config: None,
         })
-        .expect_err("expected launch gating failure");
-        assert!(err.to_string().contains("no PUBLIC_BASE_URL"));
+        .expect("expected static routes startup contract");
+        assert!(contract.public_http_enabled);
+        assert!(contract.static_routes_enabled);
+        assert!(contract.public_base_url.is_none());
     }
 
     #[test]
