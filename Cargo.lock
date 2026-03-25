@@ -2011,6 +2011,10 @@ dependencies = [
 [[package]]
 name = "greentic-i18n"
 version = "0.4.56"
+
+[[package]]
+name = "greentic-i18n"
+version = "0.4.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44951881c763069e14624cf8cf1dddff706ad4d8132570dc299af0b855cf4458"
 
@@ -2133,9 +2137,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "0.4.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92b5e022f29560c3bab45f8c56d0987c37804ca633261553d59b57089bf2e05c"
+version = "0.4.70"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -2154,9 +2156,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "0.4.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f4427752c93b00132f42306a9925f948096b6403c321126137ffb05b22802e5"
+version = "0.4.70"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2173,7 +2173,7 @@ dependencies = [
  "greentic-config-types",
  "greentic-distributor-client",
  "greentic-flow",
- "greentic-i18n",
+ "greentic-i18n 0.4.56",
  "greentic-interfaces",
  "greentic-interfaces-host",
  "greentic-interfaces-wasmtime",
@@ -2315,9 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-setup"
-version = "0.4.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4adbf1077be20fe6bacc685cba9a519f1514f05b691b730cb97a43c907a954b6"
+version = "0.4.6"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
@@ -2326,7 +2324,7 @@ dependencies = [
  "clap",
  "dialoguer",
  "greentic-distributor-client",
- "greentic-i18n",
+ "greentic-i18n 0.4.56 (registry+https://github.com/rust-lang/crates.io-index)",
  "greentic-secrets-lib",
  "greentic-types",
  "hmac",
@@ -2349,7 +2347,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-start"
-version = "0.4.15"
+version = "0.4.16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2358,7 +2356,7 @@ dependencies = [
  "clap",
  "flate2",
  "greentic-distributor-client",
- "greentic-i18n",
+ "greentic-i18n 0.4.56 (registry+https://github.com/rust-lang/crates.io-index)",
  "greentic-runner-desktop",
  "greentic-runner-host",
  "greentic-secrets-lib",
@@ -3452,9 +3450,9 @@ dependencies = [
 
 [[package]]
 name = "num-conv"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf97ec579c3c42f953ef76dbf8d55ac91fb219dde70e49aa4a6b7d74e9919050"
+checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
 
 [[package]]
 name = "num-integer"
@@ -4510,9 +4508,7 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "0.4.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bcda4f9de8405057a48a9ef6a37ad18f331c090f98f297c09cd9c821378c0fd"
+version = "0.4.70"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

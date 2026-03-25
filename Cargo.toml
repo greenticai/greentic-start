@@ -1,6 +1,6 @@
 [package]
 name = "greentic-start"
-version = "0.4.15"
+version = "0.4.16"
 edition = "2024"
 rust-version = "1.91"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -57,3 +57,8 @@ zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
+
+[patch.crates-io]
+greentic-setup = { version = "0.4", path = "../greentic-setup" }
+greentic-runner-desktop = { version = "0.4", path = "../greentic-runner/crates/greentic-runner-desktop" }
+greentic-runner-host = { version = "0.4", path = "../greentic-runner/crates/greentic-runner-host" }
