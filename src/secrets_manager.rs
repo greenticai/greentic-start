@@ -185,6 +185,7 @@ mod tests {
 
     #[test]
     fn selects_tenant_team_over_tenant_and_default() {
+        let _env_guard = crate::test_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         let base = dir.path().join(DEFAULT_SECRETS_DIR);
         fs::create_dir_all(base.join("tenant").join("team")).unwrap();
