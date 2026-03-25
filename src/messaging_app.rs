@@ -121,7 +121,7 @@ pub fn run_app_flow(
         tenant: ctx.tenant.clone(),
         team: ctx.team.clone(),
         input: json!({
-            "message": envelope,
+            "input": envelope,
             "tenant": ctx.tenant,
             "team": ctx.team,
             "correlation_id": ctx.correlation_id,
