@@ -246,6 +246,11 @@ async fn handle_request_inner(
         return handle_directline_request(req, &path, None, state).await;
     }
 
+    // OAuth token exchange proxy: /v1/messaging/webchat/{tenant}/oauth/token-exchange
+    if path.contains("/oauth/token-exchange") && req.method() == Method::POST {
+        return handle_oauth_token_exchange(req).await;
+    }
+
     // WebChat Direct Line routes: /v1/messaging/webchat/{tenant}/token or /v1/messaging/webchat/{tenant}/v3/directline/*
     if let Some((tenant, dl_path)) = parse_webchat_directline_route(&path) {
         return handle_directline_request(req, &dl_path, Some(tenant), state).await;
@@ -642,11 +647,13 @@ fn parse_webchat_directline_route(path: &str) -> Option<(String, String)> {
     }
     let remainder = parts.next().unwrap_or("");
 
-    // Check if it's a Direct Line route
+    // Check if it's a Direct Line or auth config route
     if remainder == "token" {
         Some((tenant.to_string(), "/token".to_string()))
     } else if remainder.starts_with("v3/directline") {
         Some((tenant.to_string(), format!("/{}", remainder)))
+    } else if remainder == "auth/config" {
+        Some((tenant.to_string(), "/auth/config".to_string()))
     } else {
         None
     }
@@ -983,6 +990,95 @@ fn serve_static_asset(
         .body(Full::from(Bytes::from(body)))
         .map_err(|err| anyhow::anyhow!("build static response: {err}"))?;
     Ok(Some(response))
+}
+
+/// Proxy OAuth token exchange to external provider (avoids browser CORS).
+/// Frontend POSTs JSON: { token_url, code, redirect_uri, client_id, code_verifier }
+/// Server forwards as form-urlencoded POST to token_url, returns the response.
+async fn handle_oauth_token_exchange(
+    req: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let body_bytes = req
+        .into_body()
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .unwrap_or_default();
+
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes)
+        .map_err(|e| error_response(StatusCode::BAD_REQUEST, format!("invalid json: {e}")))?;
+
+    let token_url = body["token_url"]
+        .as_str()
+        .ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing token_url"))?;
+    let code = body["code"].as_str().unwrap_or("");
+    let redirect_uri = body["redirect_uri"].as_str().unwrap_or("");
+    let client_id = body["client_id"].as_str().unwrap_or("");
+    let client_secret = body["client_secret"].as_str().unwrap_or("");
+    let code_verifier = body["code_verifier"].as_str().unwrap_or("");
+
+    fn encode(s: &str) -> String {
+        s.chars()
+            .map(|c| match c {
+                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+                _ => format!("%{:02X}", c as u8),
+            })
+            .collect()
+    }
+    let mut form_body = format!(
+        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
+        encode(code),
+        encode(redirect_uri),
+        encode(client_id),
+        encode(code_verifier),
+    );
+    if !client_secret.is_empty() {
+        form_body.push_str(&format!("&client_secret={}", encode(client_secret)));
+    }
+
+    let token_url_owned = token_url.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        ureq::post(&token_url_owned)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .send(form_body.as_bytes())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(mut response)) => {
+            let status = response.status().as_u16();
+            let response_body = response
+                .body_mut()
+                .read_to_string()
+                .unwrap_or_else(|_| "{}".to_string());
+            let http_status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            Ok(with_cors(
+                Response::builder()
+                    .status(http_status)
+                    .header("Content-Type", "application/json")
+                    .body(Full::new(Bytes::from(response_body)))
+                    .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}")))),
+            ))
+        }
+        Ok(Err(err)) => {
+            let error_body = serde_json::json!({
+                "error": "token_exchange_failed",
+                "error_description": err.to_string()
+            });
+            Ok(with_cors(
+                Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header("Content-Type", "application/json")
+                    .body(Full::new(Bytes::from(error_body.to_string())))
+                    .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}")))),
+            ))
+        }
+        Err(err) => Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("proxy error: {err}"),
+        )),
+    }
 }
 
 #[cfg(test)]
