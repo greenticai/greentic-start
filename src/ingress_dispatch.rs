@@ -127,12 +127,13 @@ pub fn dispatch_http_ingress(
 
     // When the events-webhook provider emits events with null payload,
     // inject the original HTTP request body so flow nodes can access the data.
-    if !decoded.events.is_empty() && !request.body.is_empty() {
-        if let Ok(body) = serde_json::from_slice::<JsonValue>(&request.body) {
-            for event in &mut decoded.events {
-                if event.payload.is_null() {
-                    event.payload = body.clone();
-                }
+    if !decoded.events.is_empty()
+        && !request.body.is_empty()
+        && let Ok(body) = serde_json::from_slice::<JsonValue>(&request.body)
+    {
+        for event in &mut decoded.events {
+            if event.payload.is_null() {
+                event.payload = body.clone();
             }
         }
     }

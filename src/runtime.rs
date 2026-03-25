@@ -1126,8 +1126,7 @@ fn detect_http_ingress_domains(
     for domain in [Domain::Messaging, Domain::Events, Domain::OAuth] {
         let supported = discovery.providers.iter().any(|provider| {
             let domain_match = parse_domain_name(&provider.domain) == Some(domain);
-            let op_support =
-                runner_host.supports_op(domain, &provider.provider_id, "ingest_http");
+            let op_support = runner_host.supports_op(domain, &provider.provider_id, "ingest_http");
             operator_log::info(
                 module_path!(),
                 format!(
