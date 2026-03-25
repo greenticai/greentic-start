@@ -358,21 +358,25 @@ async fn handle_request_inner(
         );
     }
     if domain == Domain::Events && !result.events.is_empty() {
-        crate::event_router::route_events_to_default_flow(
-            state.runner_host.bundle_root(),
-            &crate::runner_host::OperatorContext {
-                tenant: context.tenant.clone(),
-                team: context.team.clone(),
-                correlation_id: context.correlation_id.clone(),
-            },
-            &result
-                .events
-                .iter()
-                .filter_map(|event| serde_json::to_value(event).ok())
-                .filter_map(|value| serde_json::from_value(value).ok())
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|err| error_response(StatusCode::BAD_GATEWAY, err.to_string()))?;
+        let bundle = state.runner_host.bundle_root().to_path_buf();
+        let ctx = crate::runner_host::OperatorContext {
+            tenant: context.tenant.clone(),
+            team: context.team.clone(),
+            correlation_id: context.correlation_id.clone(),
+        };
+        let events: Vec<crate::ingress_types::EventEnvelopeV1> = result
+            .events
+            .iter()
+            .filter_map(|event| serde_json::to_value(event).ok())
+            .filter_map(|value| serde_json::from_value(value).ok())
+            .collect();
+        std::thread::spawn(move || {
+            if let Err(err) =
+                crate::event_router::route_events_to_default_flow(&bundle, &ctx, &events)
+            {
+                crate::operator_log::warn(module_path!(), format!("event routing failed: {err:#}"));
+            }
+        });
     }
     if domain == Domain::Messaging && !result.messaging_envelopes.is_empty() {
         let envelopes: Vec<_> = result
