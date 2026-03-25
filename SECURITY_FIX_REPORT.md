@@ -1,8 +1,8 @@
 # SECURITY_FIX_REPORT
 
-Date (UTC): 2026-03-24
+Date (UTC): 2026-03-25
 Repository: /home/runner/work/greentic-start/greentic-start
-Branch: vahe/startup-public-base-url-optional
+Branch: fix/events-webhook-ingress-dispatch
 
 ## 1) Security Alerts Analysis
 Provided alert payload:
@@ -25,14 +25,14 @@ Repository dependency manifests detected:
 - `Cargo.toml`
 - `Cargo.lock`
 
-Diff review for dependency files in current PR/worktree:
+PR/worktree dependency diff check:
 - `git diff -- Cargo.toml Cargo.lock` -> no changes
 
 Result:
-- No new dependency vulnerabilities introduced by this PR.
+- No new dependency vulnerabilities introduced in dependency files for this PR/worktree.
 
 ## 3) Remediation Actions Applied
-- No remediation changes were required because no vulnerabilities were present in alerts or PR dependency checks.
+- No remediation changes were required because no vulnerabilities were present in supplied alerts or PR dependency checks.
 
 ## 4) Final Status
 - Vulnerabilities fixed: **0**
