@@ -2016,9 +2016,9 @@ checksum = "44951881c763069e14624cf8cf1dddff706ad4d8132570dc299af0b855cf4458"
 
 [[package]]
 name = "greentic-i18n-translator"
-version = "0.4.10"
+version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be425645298963a7d7a33d9eef52143f119da7a97796ea98a0ef53c6151b45cc"
+checksum = "4928f431ae9dc810c1ea6bef41d6a2257c9dd775ceb1fe52fa6ebe8b02e67f01"
 dependencies = [
  "blake3",
  "clap",
@@ -2349,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-start"
-version = "0.4.15"
+version = "0.4.16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3452,9 +3452,9 @@ dependencies = [
 
 [[package]]
 name = "num-conv"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf97ec579c3c42f953ef76dbf8d55ac91fb219dde70e49aa4a6b7d74e9919050"
+checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
 
 [[package]]
 name = "num-integer"
