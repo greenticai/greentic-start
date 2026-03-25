@@ -1079,13 +1079,28 @@ impl DemoRunnerHost {
         });
 
         match result {
-            Ok(value) => Ok(FlowOutcome {
-                success: true,
-                output: Some(value),
-                raw: None,
-                error: None,
-                mode: RunnerExecutionMode::Exec,
-            }),
+            Ok(value) => {
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "[wasm-output] op={} provider={} value_preview={}",
+                        op_id,
+                        provider_id,
+                        serde_json::to_string(&value)
+                            .unwrap_or_default()
+                            .chars()
+                            .take(500)
+                            .collect::<String>()
+                    ),
+                );
+                Ok(FlowOutcome {
+                    success: true,
+                    output: Some(value),
+                    raw: None,
+                    error: None,
+                    mode: RunnerExecutionMode::Exec,
+                })
+            }
             Err(err) => {
                 let err_message = err.to_string();
                 let needs_context = needs_secret_context(&err_message);

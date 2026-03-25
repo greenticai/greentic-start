@@ -37,8 +37,19 @@ pub fn dispatch_http_ingress(
             request.provider
         );
     }
-    // Inject secrets into config for providers running in provider_core_only mode
-    let config = build_injected_config(runner_host, domain, &request.provider, ctx);
+    // Inject secrets into config for providers running in provider_core_only mode.
+    // Fall back to a minimal config for events providers that require a non-null
+    // config object even when no secrets or setup have been configured yet.
+    let config = build_injected_config(runner_host, domain, &request.provider, ctx).or_else(|| {
+        if matches!(domain, Domain::Events) {
+            Some(json!({
+                "target_url": "http://0.0.0.0:0/events/noop",
+                "timeout_ms": 1
+            }))
+        } else {
+            None
+        }
+    });
 
     let http_in = build_ingress_request(
         &request.provider,
@@ -113,6 +124,19 @@ pub fn dispatch_http_ingress(
         }
     }
     let mut decoded = parse_dispatch_result(&value).with_context(|| "decode ingest_http output")?;
+
+    // When the events-webhook provider emits events with null payload,
+    // inject the original HTTP request body so flow nodes can access the data.
+    if !decoded.events.is_empty()
+        && !request.body.is_empty()
+        && let Ok(body) = serde_json::from_slice::<JsonValue>(&request.body)
+    {
+        for event in &mut decoded.events {
+            if event.payload.is_null() {
+                event.payload = body.clone();
+            }
+        }
+    }
     // Debug: log parsed result
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -240,33 +264,26 @@ fn build_ingress_request(
 }
 
 fn parse_dispatch_result(value: &JsonValue) -> anyhow::Result<IngressDispatchResult> {
-    // Debug: log raw provider output
-    operator_log::info(
-        module_path!(),
-        format!(
-            "[DEBUG] parse_dispatch_result: raw value keys = {:?}",
-            value.as_object().map(|o| o.keys().collect::<Vec<_>>())
-        ),
-    );
-    if let Some(events_value) = value.get("events") {
-        operator_log::info(
-            module_path!(),
-            format!(
-                "[DEBUG] events field = {}",
-                serde_json::to_string(events_value).unwrap_or_default()
-            ),
-        );
+    // Some provider WASM components return the WIT ABI envelope {"ok": {...}, "error": ...}
+    // instead of the flat dispatch format. Unwrap "ok" when top-level looks like a WIT envelope.
+    let value = if value.get("ok").is_some()
+        && value.get("events").is_none()
+        && value.get("status").is_none()
+    {
+        value.get("ok").unwrap_or(value)
     } else {
-        operator_log::info(
-            module_path!(),
-            "[DEBUG] NO 'events' field found in provider output",
-        );
-    }
+        value
+    };
 
-    let http_value = value.get("http").unwrap_or(value);
+    let http_value = value
+        .get("http")
+        .or_else(|| value.get("response"))
+        .unwrap_or(value);
     let response = parse_http_response(http_value)?;
-    let events = parse_events(value.get("events"))?;
-    let messaging_envelopes = parse_messaging_envelopes(value.get("events"));
+    // Provider components may return events under "events" or "emitted_events".
+    let events_value = value.get("events").or_else(|| value.get("emitted_events"));
+    let events = parse_events(events_value)?;
+    let messaging_envelopes = parse_messaging_envelopes(events_value);
 
     operator_log::info(
         module_path!(),

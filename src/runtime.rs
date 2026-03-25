@@ -1125,10 +1125,28 @@ fn detect_http_ingress_domains(
     let mut domains = Vec::new();
     for domain in [Domain::Messaging, Domain::Events, Domain::OAuth] {
         let supported = discovery.providers.iter().any(|provider| {
-            parse_domain_name(&provider.domain) == Some(domain)
-                && runner_host.supports_op(domain, &provider.provider_id, "ingest_http")
+            let domain_match = parse_domain_name(&provider.domain) == Some(domain);
+            let op_support = runner_host.supports_op(domain, &provider.provider_id, "ingest_http");
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[domain-detect] domain={:?} provider={} domain_match={} op_support={}",
+                    domain, provider.provider_id, domain_match, op_support
+                ),
+            );
+            domain_match && op_support
         });
         let fallback_supported = matches!(domain, Domain::Events) && discovery.domains.events;
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[domain-detect] domain={:?} supported={} fallback={} => enabled={}",
+                domain,
+                supported,
+                fallback_supported,
+                supported || fallback_supported
+            ),
+        );
         if supported || fallback_supported {
             domains.push(domain);
         }
