@@ -258,7 +258,10 @@ async fn handle_request_inner(
 
     // Static route handling - serve assets from .gtpack files
     if let Some(route_match) = state.active_route_table.match_request(&path) {
-        return Ok(serve_static_route(&route_match));
+        return Ok(serve_static_route(
+            &route_match,
+            state.runner_host.bundle_root(),
+        ));
     }
 
     let method = req.method().clone();
@@ -949,9 +952,12 @@ fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Full<
 // Static route serving
 // ============================================================================
 
-fn serve_static_route(route_match: &StaticRouteMatch<'_>) -> Response<Full<Bytes>> {
+fn serve_static_route(
+    route_match: &StaticRouteMatch<'_>,
+    bundle_root: &Path,
+) -> Response<Full<Bytes>> {
     if let Some(asset_path) = resolve_asset_path(route_match) {
-        match serve_static_asset(route_match.descriptor, &asset_path) {
+        match serve_static_asset(route_match.descriptor, &asset_path, bundle_root) {
             Ok(Some(response)) => return response,
             Ok(None) => {}
             Err(err) => {
@@ -960,7 +966,7 @@ fn serve_static_route(route_match: &StaticRouteMatch<'_>) -> Response<Full<Bytes
         }
     }
     if let Some(asset_path) = fallback_asset_path(route_match) {
-        match serve_static_asset(route_match.descriptor, &asset_path) {
+        match serve_static_asset(route_match.descriptor, &asset_path, bundle_root) {
             Ok(Some(response)) => return response,
             Ok(None) => {}
             Err(err) => {
@@ -974,15 +980,26 @@ fn serve_static_route(route_match: &StaticRouteMatch<'_>) -> Response<Full<Bytes
 fn serve_static_asset(
     descriptor: &StaticRouteDescriptor,
     asset_path: &str,
+    bundle_root: &Path,
 ) -> anyhow::Result<Option<Response<Full<Bytes>>>> {
     let Some(asset_path) = normalize_relative_asset_path(asset_path) else {
         return Ok(None);
     };
     let full_path = format!("{}/{}", descriptor.source_root, asset_path);
-    let body = match read_pack_asset_bytes(&descriptor.pack_path, &full_path)? {
-        Some(bytes) => bytes,
-        None => return Ok(None),
+
+    // Check bundle overlay first: bundle_root/<source_root>/<asset_path>
+    // This allows users to place custom assets (e.g. skins) directly in the
+    // bundle directory without extracting or rebuilding the pack.
+    let overlay_candidate = bundle_root.join(&full_path);
+    let body = if overlay_candidate.is_file() {
+        std::fs::read(&overlay_candidate)?
+    } else {
+        match read_pack_asset_bytes(&descriptor.pack_path, &full_path)? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        }
     };
+
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, content_type_for_path(&full_path))
