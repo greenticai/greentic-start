@@ -302,7 +302,7 @@ fn should_extract_zip(media_type: Option<&str>, path: &Path) -> bool {
             | Some("application/vnd.greentic.gtpack+zip")
             | Some("application/vnd.greentic.pack+zip")
             | Some("application/zip")
-    ) || has_any_suffix(path, &[".zip", ".gtbundle.zip", ".gtpack"])
+    ) || has_any_suffix(path, &[".zip", ".gtbundle", ".gtbundle.zip", ".gtpack"])
 }
 
 fn should_extract_tar(media_type: Option<&str>, path: &Path) -> bool {
@@ -331,7 +331,7 @@ fn has_any_suffix(path: &Path, suffixes: &[&str]) -> bool {
 
 fn media_type_from_path(path: &Path) -> Option<&'static str> {
     let value = path.to_string_lossy();
-    if value.ends_with(".zip") || value.ends_with(".gtpack") {
+    if value.ends_with(".zip") || value.ends_with(".gtbundle") || value.ends_with(".gtpack") {
         return Some("application/zip");
     }
     if value.ends_with(".tar.gz") || value.ends_with(".tgz") {
@@ -437,5 +437,12 @@ mod tests {
         );
         let rendered = path.to_string_lossy();
         assert!(rendered.contains("deadbeef-demo-bundle.gtbundle"));
+    }
+
+    #[test]
+    fn gtbundle_suffix_is_treated_as_zip_archive() {
+        let path = Path::new("/tmp/cloud-deploy-demo.gtbundle");
+        assert!(should_extract_zip(Some("application/octet-stream"), path));
+        assert_eq!(media_type_from_path(path), Some("application/zip"));
     }
 }
