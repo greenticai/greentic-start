@@ -200,13 +200,13 @@ fn extract_bundle_archive(
         Some(BundleArchiveKind::TarZstd) => extract_tar_zstd(&fetched.path, &out_dir)?,
         Some(BundleArchiveKind::Squashfs) => extract_squashfs(&fetched.path, &out_dir)?,
         None => {
-        anyhow::bail!(
-            "bundle archive format is not supported for {} (kind={:?}, media_type={:?}, path={})",
-            reference,
-            fetched.kind,
-            media_type,
-            fetched.path.display()
-        );
+            anyhow::bail!(
+                "bundle archive format is not supported for {} (kind={:?}, media_type={:?}, path={})",
+                reference,
+                fetched.kind,
+                media_type,
+                fetched.path.display()
+            );
         }
     }
 
@@ -420,7 +420,10 @@ fn read_magic(path: &Path) -> anyhow::Result<[u8; 4]> {
 }
 
 fn is_zip_magic(magic: &[u8; 4]) -> bool {
-    matches!(magic, [b'P', b'K', 0x03, 0x04] | [b'P', b'K', 0x05, 0x06] | [b'P', b'K', 0x07, 0x08])
+    matches!(
+        magic,
+        [b'P', b'K', 0x03, 0x04] | [b'P', b'K', 0x05, 0x06] | [b'P', b'K', 0x07, 0x08]
+    )
 }
 
 fn is_squashfs_magic(magic: &[u8; 4]) -> bool {
