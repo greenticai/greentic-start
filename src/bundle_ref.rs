@@ -1,6 +1,7 @@
 use std::fs;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, anyhow};
 use flate2::read::GzDecoder;
@@ -33,6 +34,15 @@ struct FetchedBundle {
     media_type: Option<String>,
     path: PathBuf,
     kind: BundleSourceKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BundleArchiveKind {
+    Zip,
+    Tar,
+    TarGz,
+    TarZstd,
+    Squashfs,
 }
 
 pub fn resolve_bundle_ref(reference: &str) -> anyhow::Result<ResolvedBundle> {
@@ -183,15 +193,13 @@ fn extract_bundle_archive(
         .with_context(|| format!("create extracted bundle dir {}", out_dir.display()))?;
 
     let media_type = fetched.media_type.as_deref();
-    if should_extract_zip(media_type, &fetched.path) {
-        extract_zip(&fetched.path, &out_dir)?;
-    } else if should_extract_tar_gz(media_type, &fetched.path) {
-        extract_tar_gz(&fetched.path, &out_dir)?;
-    } else if should_extract_tar_zstd(media_type, &fetched.path) {
-        extract_tar_zstd(&fetched.path, &out_dir)?;
-    } else if should_extract_tar(media_type, &fetched.path) {
-        extract_tar(&fetched.path, &out_dir)?;
-    } else {
+    match detect_bundle_archive_kind(media_type, &fetched.path)? {
+        Some(BundleArchiveKind::Zip) => extract_zip(&fetched.path, &out_dir)?,
+        Some(BundleArchiveKind::Tar) => extract_tar(&fetched.path, &out_dir)?,
+        Some(BundleArchiveKind::TarGz) => extract_tar_gz(&fetched.path, &out_dir)?,
+        Some(BundleArchiveKind::TarZstd) => extract_tar_zstd(&fetched.path, &out_dir)?,
+        Some(BundleArchiveKind::Squashfs) => extract_squashfs(&fetched.path, &out_dir)?,
+        None => {
         anyhow::bail!(
             "bundle archive format is not supported for {} (kind={:?}, media_type={:?}, path={})",
             reference,
@@ -199,6 +207,7 @@ fn extract_bundle_archive(
             media_type,
             fetched.path.display()
         );
+        }
     }
 
     let marker_contents = format!("source={}\ndigest={}\n", fetched.source_ref, fetched.digest);
@@ -295,6 +304,61 @@ fn extract_tar_zstd(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("extract tar.zst bundle into {}", out_dir.display()))
 }
 
+fn extract_squashfs(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("create squashfs output dir {}", out_dir.display()))?;
+    let output = Command::new("unsquashfs")
+        .args([
+            "-no-progress",
+            "-quiet",
+            "-dest",
+            out_dir.to_str().unwrap_or_default(),
+            path.to_str().unwrap_or_default(),
+        ])
+        .output()
+        .map_err(|error| match error.kind() {
+            ErrorKind::NotFound => anyhow!(
+                "required tool `unsquashfs` was not found on PATH; install SquashFS tools to read `.gtbundle` artifacts"
+            ),
+            _ => anyhow::Error::new(error).context("spawn unsquashfs"),
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "unsquashfs failed while extracting {} into {}: {}",
+            path.display(),
+            out_dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn detect_bundle_archive_kind(
+    media_type: Option<&str>,
+    path: &Path,
+) -> anyhow::Result<Option<BundleArchiveKind>> {
+    let magic = read_magic(path)?;
+    if is_zip_magic(&magic) {
+        return Ok(Some(BundleArchiveKind::Zip));
+    }
+    if is_squashfs_magic(&magic) {
+        return Ok(Some(BundleArchiveKind::Squashfs));
+    }
+    if should_extract_tar_gz(media_type, path) {
+        return Ok(Some(BundleArchiveKind::TarGz));
+    }
+    if should_extract_tar_zstd(media_type, path) {
+        return Ok(Some(BundleArchiveKind::TarZstd));
+    }
+    if should_extract_tar(media_type, path) {
+        return Ok(Some(BundleArchiveKind::Tar));
+    }
+    if should_extract_zip(media_type, path) {
+        return Ok(Some(BundleArchiveKind::Zip));
+    }
+    Ok(None)
+}
+
 fn should_extract_zip(media_type: Option<&str>, path: &Path) -> bool {
     matches!(
         media_type,
@@ -302,7 +366,7 @@ fn should_extract_zip(media_type: Option<&str>, path: &Path) -> bool {
             | Some("application/vnd.greentic.gtpack+zip")
             | Some("application/vnd.greentic.pack+zip")
             | Some("application/zip")
-    ) || has_any_suffix(path, &[".zip", ".gtbundle", ".gtbundle.zip", ".gtpack"])
+    ) || has_any_suffix(path, &[".zip", ".gtbundle.zip", ".gtpack"])
 }
 
 fn should_extract_tar(media_type: Option<&str>, path: &Path) -> bool {
@@ -331,7 +395,7 @@ fn has_any_suffix(path: &Path, suffixes: &[&str]) -> bool {
 
 fn media_type_from_path(path: &Path) -> Option<&'static str> {
     let value = path.to_string_lossy();
-    if value.ends_with(".zip") || value.ends_with(".gtbundle") || value.ends_with(".gtpack") {
+    if value.ends_with(".zip") || value.ends_with(".gtpack") {
         return Some("application/zip");
     }
     if value.ends_with(".tar.gz") || value.ends_with(".tgz") {
@@ -344,6 +408,23 @@ fn media_type_from_path(path: &Path) -> Option<&'static str> {
         return Some("application/vnd.oci.image.layer.v1.tar");
     }
     None
+}
+
+fn read_magic(path: &Path) -> anyhow::Result<[u8; 4]> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("open bundle file {}", path.display()))?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)
+        .with_context(|| format!("read bundle header {}", path.display()))?;
+    Ok(magic)
+}
+
+fn is_zip_magic(magic: &[u8; 4]) -> bool {
+    matches!(magic, [b'P', b'K', 0x03, 0x04] | [b'P', b'K', 0x05, 0x06] | [b'P', b'K', 0x07, 0x08])
+}
+
+fn is_squashfs_magic(magic: &[u8; 4]) -> bool {
+    magic == b"hsqs"
 }
 
 fn local_file_digest(path: &Path) -> anyhow::Result<String> {
@@ -442,7 +523,13 @@ mod tests {
     #[test]
     fn gtbundle_suffix_is_treated_as_zip_archive() {
         let path = Path::new("/tmp/cloud-deploy-demo.gtbundle");
-        assert!(should_extract_zip(Some("application/octet-stream"), path));
-        assert_eq!(media_type_from_path(path), Some("application/zip"));
+        assert!(!should_extract_zip(Some("application/octet-stream"), path));
+        assert_eq!(media_type_from_path(path), None);
+    }
+
+    #[test]
+    fn magic_bytes_identify_zip_and_squashfs() {
+        assert!(is_zip_magic(b"PK\x03\x04"));
+        assert!(is_squashfs_magic(b"hsqs"));
     }
 }
