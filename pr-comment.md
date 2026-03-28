@@ -1,26 +1,30 @@
 <h1>Dependency Review</h1>
-The following issues were found:<ul><li>❌ 1 vulnerable package(s)</li><li>✅ 0 package(s) with incompatible licenses</li><li>✅ 0 package(s) with invalid SPDX license definitions</li><li>✅ 0 package(s) with unknown licenses.</li></ul>
+The following issues were found:<ul><li>✅ 0 vulnerable package(s)</li><li>✅ 0 package(s) with incompatible licenses</li><li>✅ 0 package(s) with invalid SPDX license definitions</li><li>⚠️ 1 package(s) with unknown licenses.</li></ul>
 See the Details below.<h2>Snapshot Warnings</h2>
-<blockquote>⚠️: No snapshots were found for the head SHA fea4eb56ce5d9c8fc56264a506e2f16be1f0eae8.</blockquote>
-Ensure that dependencies are being submitted on PR branches and consider enabling <em>retry-on-snapshot-warnings</em>. See <a href="https://docs.github.com/en/code-security/supply-chain-security/understanding-your-software-supply-chain/about-dependency-review#best-practices-for-using-the-dependency-review-api-and-the-dependency-submission-api-together">the documentation</a> for more information and troubleshooting advice.<h2>Vulnerabilities</h2>
+<blockquote>⚠️: No snapshots were found for the head SHA fd50e32bbd19ebb21afa5eba197cd102b53d39ce.</blockquote>
+Ensure that dependencies are being submitted on PR branches and consider enabling <em>retry-on-snapshot-warnings</em>. See <a href="https://docs.github.com/en/code-security/supply-chain-security/understanding-your-software-supply-chain/about-dependency-review#best-practices-for-using-the-dependency-review-api-and-the-dependency-submission-api-together">the documentation</a> for more information and troubleshooting advice.<h2>License Issues</h2>
 <h4><em>Cargo.lock</em></h4>
-<table><tr><th>Name</th><th>Version</th><th>Vulnerability</th><th>Severity</th></tr><tr><td><a href="https://github.com/rustls/webpki">rustls-webpki</a></td><td>0.102.8</td><td><a href="https://github.com/advisories/GHSA-pwjx-qhcg-rvj4">webpki: CRLs not considered authoritative by Distribution Point due to faulty matching logic</a></td><td>moderate</td></tr></table>
+<table><tr><td>Package</td><td>Version</td><td>License</td><td>Issue Type</td></tr><tr><td>rustc-hash</td><td>2.1.2</td><td>Null</td><td>Unknown License</td></tr></table>
 <h2>OpenSSF Scorecard</h2>
 <table><tr><th>Package</th><th>Version</th><th>Score</th><th>Details</th></tr>
-<tr><td><a href="https://github.com/rustls/webpki"> cargo/rustls-webpki </a></td><td>0.102.8</td>
+<tr><td><a href="https://github.com/aws/aws-lc-rs"> cargo/aws-lc-sys </a></td><td>0.39.1</td>
       <td> Unknown</td><td>Unknown</td></tr>
-<tr><td><a href="https://github.com/greenticai/greentic-runner"> cargo/greentic-runner-desktop </a></td><td>0.4.70</td>
+<tr><td><a href="https://github.com/wasm-bindgen/wasm-bindgen"> cargo/js-sys </a></td><td>0.3.92</td>
       <td> Unknown</td><td>Unknown</td></tr>
-<tr><td><a href="https://github.com/greenticai/greentic-runner"> cargo/greentic-runner-host </a></td><td>0.4.70</td>
+<tr><td> cargo/rustc-hash </td><td>2.1.2</td>
       <td> Unknown</td><td>Unknown</td></tr>
-<tr><td><a href="https://github.com/rustls/rustls"> cargo/rustls </a></td><td>0.22.4</td>
+<tr><td><a href="https://github.com/wasm-bindgen/wasm-bindgen"> cargo/wasm-bindgen </a></td><td>0.2.115</td>
       <td> Unknown</td><td>Unknown</td></tr>
-<tr><td><a href="https://github.com/rustls/tokio-rustls"> cargo/tokio-rustls </a></td><td>0.25.0</td>
+<tr><td><a href="https://github.com/wasm-bindgen/wasm-bindgen"> cargo/wasm-bindgen-futures </a></td><td>0.4.65</td>
       <td> Unknown</td><td>Unknown</td></tr>
-<tr><td><a href="https://github.com/bytecodealliance/wasmtime"> cargo/wasmtime-wasi-http </a></td><td>43.0.0</td>
-      <td>:green_circle: 5.4</td><td><details><summary>Details</summary><table><tr><th>Check</th><th>Score</th><th>Reason</th></tr><tr><td>Security-Policy</td><td>:green_circle: 10</td><td>security policy file detected</td></tr><tr><td>Code-Review</td><td>:green_circle: 10</td><td>all changesets reviewed</td></tr><tr><td>Maintained</td><td>:green_circle: 10</td><td>30 commit(s) and 17 issue activity found in the last 90 days -- score normalized to 10</td></tr><tr><td>CII-Best-Practices</td><td>:warning: 0</td><td>no effort to earn an OpenSSF best practices badge detected</td></tr><tr><td>Dangerous-Workflow</td><td>:warning: 0</td><td>dangerous workflow patterns detected</td></tr><tr><td>Token-Permissions</td><td>:warning: 0</td><td>detected GitHub workflow tokens with excessive permissions</td></tr><tr><td>License</td><td>:green_circle: 10</td><td>license file detected</td></tr><tr><td>Binary-Artifacts</td><td>:green_circle: 10</td><td>no binaries found in the repo</td></tr><tr><td>Fuzzing</td><td>:green_circle: 10</td><td>project is fuzzed</td></tr><tr><td>Packaging</td><td>:green_circle: 10</td><td>packaging workflow detected</td></tr><tr><td>Branch-Protection</td><td>:green_circle: 8</td><td>branch protection is not maximal on development and all release branches</td></tr><tr><td>Signed-Releases</td><td>:warning: 0</td><td>Project has not signed or included provenance with any releases.</td></tr><tr><td>Pinned-Dependencies</td><td>:warning: 0</td><td>dependency not pinned by hash detected -- score normalized to 0</td></tr><tr><td>SAST</td><td>:warning: 0</td><td>SAST tool is not run on all commits -- score normalized to 0</td></tr></table></details></td></tr>
-<tr><td><a href="https://github.com/bytecodealliance/wasmtime"> cargo/wasmtime-wasi-tls </a></td><td>43.0.0</td>
-      <td>:green_circle: 5.4</td><td><details><summary>Details</summary><table><tr><th>Check</th><th>Score</th><th>Reason</th></tr><tr><td>Security-Policy</td><td>:green_circle: 10</td><td>security policy file detected</td></tr><tr><td>Code-Review</td><td>:green_circle: 10</td><td>all changesets reviewed</td></tr><tr><td>Maintained</td><td>:green_circle: 10</td><td>30 commit(s) and 17 issue activity found in the last 90 days -- score normalized to 10</td></tr><tr><td>CII-Best-Practices</td><td>:warning: 0</td><td>no effort to earn an OpenSSF best practices badge detected</td></tr><tr><td>Dangerous-Workflow</td><td>:warning: 0</td><td>dangerous workflow patterns detected</td></tr><tr><td>Token-Permissions</td><td>:warning: 0</td><td>detected GitHub workflow tokens with excessive permissions</td></tr><tr><td>License</td><td>:green_circle: 10</td><td>license file detected</td></tr><tr><td>Binary-Artifacts</td><td>:green_circle: 10</td><td>no binaries found in the repo</td></tr><tr><td>Fuzzing</td><td>:green_circle: 10</td><td>project is fuzzed</td></tr><tr><td>Packaging</td><td>:green_circle: 10</td><td>packaging workflow detected</td></tr><tr><td>Branch-Protection</td><td>:green_circle: 8</td><td>branch protection is not maximal on development and all release branches</td></tr><tr><td>Signed-Releases</td><td>:warning: 0</td><td>Project has not signed or included provenance with any releases.</td></tr><tr><td>Pinned-Dependencies</td><td>:warning: 0</td><td>dependency not pinned by hash detected -- score normalized to 0</td></tr><tr><td>SAST</td><td>:warning: 0</td><td>SAST tool is not run on all commits -- score normalized to 0</td></tr></table></details></td></tr>
+<tr><td><a href="https://github.com/wasm-bindgen/wasm-bindgen"> cargo/wasm-bindgen-macro </a></td><td>0.2.115</td>
+      <td> Unknown</td><td>Unknown</td></tr>
+<tr><td><a href="https://github.com/wasm-bindgen/wasm-bindgen"> cargo/wasm-bindgen-macro-support </a></td><td>0.2.115</td>
+      <td> Unknown</td><td>Unknown</td></tr>
+<tr><td><a href="https://github.com/wasm-bindgen/wasm-bindgen"> cargo/wasm-bindgen-shared </a></td><td>0.2.115</td>
+      <td> Unknown</td><td>Unknown</td></tr>
+<tr><td><a href="https://github.com/wasm-bindgen/wasm-bindgen"> cargo/web-sys </a></td><td>0.3.92</td>
+      <td> Unknown</td><td>Unknown</td></tr>
 </table><h2>Scanned Files</h2>
 <ul><li>Cargo.lock</li></ul>
 
