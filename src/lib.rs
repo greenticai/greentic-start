@@ -943,6 +943,20 @@ fn apply_target_overrides(config: &mut config::DemoConfig, request: &StartReques
     if let Some(team) = request.team.as_ref() {
         config.team = team.clone();
     }
+    if let Ok(listen_addr) = std::env::var("GREENTIC_GATEWAY_LISTEN_ADDR") {
+        let trimmed = listen_addr.trim();
+        if !trimmed.is_empty() {
+            config.services.gateway.listen_addr = trimmed.to_string();
+        }
+    }
+    if let Ok(port) = std::env::var("GREENTIC_GATEWAY_PORT") {
+        let trimmed = port.trim();
+        if !trimmed.is_empty()
+            && let Ok(parsed) = trimmed.parse::<u16>()
+        {
+            config.services.gateway.port = parsed;
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1355,6 +1369,54 @@ mod tests {
         let config = load_runtime_demo_config(&paths, &request).expect("config");
         assert_eq!(config.tenant, "tenant-a");
         assert_eq!(config.team, "team-b");
+    }
+
+    #[test]
+    fn load_runtime_demo_config_applies_gateway_env_overrides() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        std::fs::write(bundle.join("bundle.yaml"), "bundle_id: demo-bundle\n").expect("bundle");
+        let request = StartRequest {
+            bundle: Some(bundle.display().to_string()),
+            tenant: None,
+            team: None,
+            no_nats: false,
+            nats: NatsModeArg::Off,
+            nats_url: None,
+            config: None,
+            cloudflared: CloudflaredModeArg::On,
+            cloudflared_binary: None,
+            ngrok: NgrokModeArg::Off,
+            ngrok_binary: None,
+            runner_binary: None,
+            restart: Vec::new(),
+            log_dir: None,
+            verbose: false,
+            quiet: false,
+            admin: false,
+            admin_port: 9443,
+            admin_certs_dir: None,
+            admin_allowed_clients: Vec::new(),
+        };
+        let paths = DemoPaths {
+            config_path: bundle.join("bundle.yaml"),
+            root_dir: bundle.to_path_buf(),
+            state_dir: bundle.join("state"),
+            config_source: DemoConfigSource::NormalizedBundle,
+        };
+
+        unsafe {
+            std::env::set_var("GREENTIC_GATEWAY_LISTEN_ADDR", "0.0.0.0");
+            std::env::set_var("GREENTIC_GATEWAY_PORT", "18080");
+        }
+        let config = load_runtime_demo_config(&paths, &request).expect("config");
+        unsafe {
+            std::env::remove_var("GREENTIC_GATEWAY_LISTEN_ADDR");
+            std::env::remove_var("GREENTIC_GATEWAY_PORT");
+        }
+
+        assert_eq!(config.services.gateway.listen_addr, "0.0.0.0");
+        assert_eq!(config.services.gateway.port, 18080);
     }
 
     #[test]
