@@ -235,6 +235,10 @@ async fn handle_request_inner(
 
     let path = req.uri().path().to_string();
 
+    if let Some(response) = handle_builtin_health_request(req.method(), &path) {
+        return Ok(response);
+    }
+
     if path.starts_with("/api/onboard") {
         return api::handle_onboard_request(req, &path, &state.runner_host)
             .await
@@ -932,6 +936,24 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response<Fu
     json_response(status, body)
 }
 
+fn handle_builtin_health_request(method: &Method, path: &str) -> Option<Response<Full<Bytes>>> {
+    if method != Method::GET {
+        return None;
+    }
+    match path {
+        "/healthz" => Some(json_response(
+            StatusCode::OK,
+            json!({ "status": "healthy" }),
+        )),
+        "/readyz" => Some(json_response(StatusCode::OK, json!({ "status": "ready" }))),
+        "/status" => Some(json_response(
+            StatusCode::OK,
+            json!({ "status": "running" }),
+        )),
+        _ => None,
+    }
+}
+
 fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Full<Bytes>> {
     let body = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
     Response::builder()
@@ -1123,5 +1145,14 @@ mod tests {
             .expect("route should parse");
         assert_eq!(parsed.domain, Domain::Messaging);
         assert_eq!(parsed.team, "default");
+    }
+
+    #[test]
+    fn builtin_health_routes_return_ok() {
+        for path in ["/healthz", "/readyz", "/status"] {
+            let response =
+                handle_builtin_health_request(&Method::GET, path).expect("builtin response");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
 }
