@@ -1170,8 +1170,15 @@ fn start_http_ingress_server(
     runner_host: Arc<DemoRunnerHost>,
     enable_static_routes: bool,
 ) -> anyhow::Result<Option<HttpIngressServer>> {
-    // Start HTTP server if we have ingress domains OR static routes to serve
-    if domains.is_empty() && !enable_static_routes {
+    // In cloud deploys we may need a public listener only for health probes.
+    let health_probe_listener_required = std::env::var("GREENTIC_HEALTH_LIVENESS_PATH")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+        || std::env::var("GREENTIC_HEALTH_READINESS_PATH")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
+    // Start HTTP server if we have ingress domains, static routes, or health probes to serve.
+    if domains.is_empty() && !enable_static_routes && !health_probe_listener_required {
         return Ok(None);
     }
     let addr = format!(
