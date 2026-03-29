@@ -23,6 +23,18 @@ pub const OAUTH_OP_AWAIT_RESULT: &str = "oauth.await_result";
 pub const OAUTH_OP_GET_ACCESS_TOKEN: &str = "oauth.get_access_token";
 pub const OAUTH_OP_REQUEST_RESOURCE_TOKEN: &str = "oauth.request_resource_token";
 
+/// Bundle-level capability: packs can request read-only access to bundle `./assets/`.
+pub const CAP_BUNDLE_ASSETS_READ_V1: &str = "greentic.cap.bundle_assets.read.v1";
+
+/// WebChat GUI capability: enable OAuth login providers (Microsoft, Google, custom form).
+pub const CAP_WEBCHAT_OAUTH_V1: &str = "greentic.cap.webchat.oauth.v1";
+
+/// WebChat GUI capability: enable multi-language locale picker.
+pub const CAP_WEBCHAT_I18N_V1: &str = "greentic.cap.webchat.i18n.v1";
+
+/// WebChat GUI capability: enable embeddable widget mode with iframe snippet.
+pub const CAP_WEBCHAT_EMBED_V1: &str = "greentic.cap.webchat.embed.v1";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HookStage {
     Pre,
