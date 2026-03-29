@@ -270,7 +270,32 @@ pub fn discover_from_bundle(
         plan.routes.extend(descriptors);
     }
     validate_plan(&mut plan, reserved_routes);
+    check_bundle_assets_capability(bundle_root, &mut plan);
     Ok(plan)
+}
+
+/// Checks whether the bundle has overlay asset directories on disk but does not
+/// declare the `greentic.cap.bundle_assets.read.v1` capability. Emits a warning
+/// into the plan so operators know to formalize the capability contract.
+fn check_bundle_assets_capability(bundle_root: &Path, plan: &mut StaticRoutePlan) {
+    let assets_dir = bundle_root.join("assets");
+    if !assets_dir.is_dir() {
+        return;
+    }
+    let bundle_yaml_path = bundle_root.join("bundle.yaml");
+    let has_capability = bundle_yaml_path
+        .exists()
+        .then(|| std::fs::read_to_string(&bundle_yaml_path).ok())
+        .flatten()
+        .map(|content| content.contains(crate::capabilities::CAP_BUNDLE_ASSETS_READ_V1))
+        .unwrap_or(false);
+    if !has_capability {
+        plan.warnings.push(format!(
+            "Bundle has ./assets/ directory but does not declare '{}' in bundle.yaml capabilities. \
+             Consider adding it so packs can formally request bundle asset access.",
+            crate::capabilities::CAP_BUNDLE_ASSETS_READ_V1,
+        ));
+    }
 }
 
 pub fn resolve_asset_path(route_match: &StaticRouteMatch<'_>) -> Option<String> {
