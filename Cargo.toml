@@ -1,6 +1,6 @@
 [package]
 name = "greentic-start"
-version = "0.4.24"
+version = "0.4.25"
 edition = "2024"
 rust-version = "1.91"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -18,6 +18,7 @@ base64 = "0.22"
 chrono = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 flate2 = "1"
+hmac = "0.12"
 greentic-distributor-client = { version = "0.4", default-features = false, features = ["pack-fetch"] }
 greentic-i18n = "0.4"
 greentic-setup = { version = "0.4" }

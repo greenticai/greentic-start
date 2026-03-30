@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-start"
-version = "0.4.24"
+version = "0.4.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2366,6 +2366,7 @@ dependencies = [
  "greentic-secrets-lib",
  "greentic-setup",
  "greentic-types",
+ "hmac",
  "http-body-util",
  "hyper",
  "hyper-util",

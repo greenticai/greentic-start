@@ -1,0 +1,444 @@
+#![allow(dead_code)]
+
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::{Context, anyhow};
+use base64::{Engine as _, engine::general_purpose};
+use greentic_runner_desktop::RunStatus;
+use greentic_runner_host::RunnerWasiPolicy;
+use greentic_runner_host::component_api::node::{
+    ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx,
+};
+use greentic_runner_host::pack::{ComponentResolution, PackRuntime};
+use greentic_runner_host::storage::DynSessionStore;
+use serde_json::{Value as JsonValue, json};
+
+use crate::domains::{Domain, ProviderPack};
+use crate::operator_log;
+use crate::runner_exec;
+use crate::runner_integration::RunFlowOptions;
+use crate::runner_integration::RunnerFlavor;
+use crate::runner_integration::run_flow_with_options;
+use crate::secrets_gate;
+use crate::state_layout;
+
+use super::DemoRunnerHost;
+use super::helpers::{
+    build_demo_host_config, domain_name, make_runtime_or_thread_scope, needs_secret_context,
+    payload_preview, primary_provider_type, read_transcript_outputs, secret_error_context,
+};
+use super::hooks::json_to_canonical_cbor;
+use super::types::{
+    FlowOutcome, HookChainOutcome, OperationEnvelope, OperationStatus, OperatorContext,
+    RunnerExecutionMode, RunnerMode,
+};
+
+impl DemoRunnerHost {
+    pub fn invoke_provider_op(
+        &self,
+        domain: Domain,
+        provider_type: &str,
+        op_id: &str,
+        payload_bytes: &[u8],
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<FlowOutcome> {
+        let mut envelope = OperationEnvelope::new(op_id, payload_bytes, ctx);
+        let token_validation_outcome =
+            self.evaluate_token_validation_pre_hook(&mut envelope, payload_bytes, ctx)?;
+        if let HookChainOutcome::Denied(reason) = token_validation_outcome {
+            envelope.status = OperationStatus::Denied;
+            self.emit_pre_sub(&envelope);
+            self.emit_post_sub(&envelope);
+            return Ok(FlowOutcome {
+                success: false,
+                output: None,
+                raw: None,
+                error: Some(format!("operation denied by pre-hook: {reason}")),
+                mode: RunnerExecutionMode::Exec,
+            });
+        }
+        let pre_chain = self.resolve_hook_chain(crate::capabilities::HookStage::Pre, op_id);
+        let pre_hook_outcome = self.evaluate_hook_chain(
+            &pre_chain,
+            crate::capabilities::HookStage::Pre,
+            &mut envelope,
+        )?;
+        self.emit_pre_sub(&envelope);
+        if let HookChainOutcome::Denied(reason) = pre_hook_outcome {
+            envelope.status = OperationStatus::Denied;
+            self.emit_post_sub(&envelope);
+            return Ok(FlowOutcome {
+                success: false,
+                output: Some(serde_json::to_value(&envelope).unwrap_or_else(|_| json!({}))),
+                raw: None,
+                error: Some(format!("operation denied by pre-hook: {reason}")),
+                mode: RunnerExecutionMode::Exec,
+            });
+        }
+
+        let outcome =
+            self.invoke_provider_op_inner(domain, provider_type, op_id, payload_bytes, ctx)?;
+        envelope.status = if outcome.success {
+            OperationStatus::Ok
+        } else {
+            OperationStatus::Err
+        };
+        envelope.result_cbor = outcome.output.as_ref().and_then(json_to_canonical_cbor);
+
+        let post_chain = self.resolve_hook_chain(crate::capabilities::HookStage::Post, op_id);
+        let _ = self.evaluate_hook_chain(
+            &post_chain,
+            crate::capabilities::HookStage::Post,
+            &mut envelope,
+        )?;
+        self.emit_post_sub(&envelope);
+        Ok(outcome)
+    }
+
+    fn invoke_provider_op_inner(
+        &self,
+        domain: Domain,
+        provider_type: &str,
+        op_id: &str,
+        payload_bytes: &[u8],
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<FlowOutcome> {
+        let pack = self
+            .catalog
+            .get(&(domain, provider_type.to_string()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider {} not found for domain {}",
+                    provider_type,
+                    domain_name(domain)
+                )
+            })?;
+
+        if pack.entry_flows.iter().any(|flow| flow == op_id) {
+            let flow_id = op_id;
+            if self.debug_enabled {
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "[demo dev] invoking provider domain={} provider={} flow={} tenant={} team={} payload_len={} preview={}",
+                        domain_name(domain),
+                        provider_type,
+                        flow_id,
+                        ctx.tenant,
+                        ctx.team.as_deref().unwrap_or("default"),
+                        payload_bytes.len(),
+                        payload_preview(payload_bytes),
+                    ),
+                );
+            }
+            let run_dir = state_layout::run_dir(&self.bundle_root, domain, &pack.pack_id, flow_id)?;
+            std::fs::create_dir_all(&run_dir)?;
+
+            let render_outcome = self.card_renderer.render_if_needed(
+                provider_type,
+                payload_bytes,
+                |cap_id, op, input| {
+                    let outcome = self.invoke_capability(cap_id, op, input, ctx)?;
+                    if !outcome.success {
+                        let reason = outcome
+                            .error
+                            .clone()
+                            .or(outcome.raw.clone())
+                            .unwrap_or_else(|| "capability invocation failed".to_string());
+                        return Err(anyhow!(
+                            "card capability {}:{} failed: {}",
+                            cap_id,
+                            op,
+                            reason
+                        ));
+                    }
+                    outcome.output.ok_or_else(|| {
+                        anyhow!(
+                            "card capability {}:{} returned no structured output",
+                            cap_id,
+                            op
+                        )
+                    })
+                },
+            )?;
+            let payload = serde_json::from_slice(&render_outcome.bytes).unwrap_or_else(|_| {
+                json!({
+                    "payload": general_purpose::STANDARD.encode(&render_outcome.bytes)
+                })
+            });
+
+            let outcome = match &self.runner_mode {
+                RunnerMode::Exec => {
+                    self.execute_with_runner_exec(domain, pack, flow_id, &payload, ctx, &run_dir)?
+                }
+                RunnerMode::Integration { binary, flavor } => self
+                    .execute_with_runner_integration(
+                        domain, pack, flow_id, &payload, ctx, &run_dir, binary, *flavor,
+                    )?,
+            };
+
+            if self.debug_enabled {
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "[demo dev] provider={} flow={} tenant={} team={} success={} mode={:?} error={:?} corr_id={}",
+                        provider_type,
+                        flow_id,
+                        ctx.tenant,
+                        ctx.team.as_deref().unwrap_or("default"),
+                        outcome.success,
+                        outcome.mode,
+                        outcome.error,
+                        ctx.correlation_id.as_deref().unwrap_or("none"),
+                    ),
+                );
+            }
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "invoke domain={} provider={} op={} mode={:?} corr={}",
+                    domain_name(domain),
+                    provider_type,
+                    flow_id,
+                    outcome.mode,
+                    ctx.correlation_id.as_deref().unwrap_or("none")
+                ),
+            );
+
+            return Ok(outcome);
+        }
+
+        self.invoke_provider_component_op(domain, pack, provider_type, op_id, payload_bytes, ctx)
+    }
+
+    fn execute_with_runner_exec(
+        &self,
+        domain: Domain,
+        pack: &ProviderPack,
+        flow_id: &str,
+        payload: &JsonValue,
+        ctx: &OperatorContext,
+        _run_dir: &Path,
+    ) -> anyhow::Result<FlowOutcome> {
+        let request = runner_exec::RunRequest {
+            root: self.bundle_root.clone(),
+            domain,
+            pack_path: pack.path.clone(),
+            pack_label: pack.pack_id.clone(),
+            flow_id: flow_id.to_string(),
+            tenant: ctx.tenant.clone(),
+            team: ctx.team.clone(),
+            input: payload.clone(),
+            dist_offline: true,
+        };
+        let run_output = runner_exec::run_provider_pack_flow(request)?;
+        let parsed = read_transcript_outputs(&run_output.run_dir)?;
+        Ok(FlowOutcome {
+            success: run_output.result.status == RunStatus::Success,
+            output: parsed,
+            raw: None,
+            error: run_output.result.error.clone(),
+            mode: RunnerExecutionMode::Exec,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_with_runner_integration(
+        &self,
+        _domain: Domain,
+        pack: &ProviderPack,
+        flow_id: &str,
+        payload: &JsonValue,
+        ctx: &OperatorContext,
+        run_dir: &Path,
+        runner_binary: &Path,
+        flavor: RunnerFlavor,
+    ) -> anyhow::Result<FlowOutcome> {
+        let output = run_flow_with_options(
+            runner_binary,
+            &pack.path,
+            flow_id,
+            payload,
+            RunFlowOptions {
+                dist_offline: true,
+                tenant: Some(&ctx.tenant),
+                team: ctx.team.as_deref(),
+                artifacts_dir: Some(run_dir),
+                runner_flavor: flavor,
+            },
+        )?;
+        let mut parsed = output.parsed.clone();
+        if parsed.is_none() {
+            parsed = read_transcript_outputs(run_dir)?;
+        }
+        let raw = if output.stdout.trim().is_empty() {
+            None
+        } else {
+            Some(output.stdout.clone())
+        };
+        Ok(FlowOutcome {
+            success: output.status.success(),
+            output: parsed,
+            raw,
+            error: if output.status.success() {
+                None
+            } else {
+                Some(output.stderr.clone())
+            },
+            mode: RunnerExecutionMode::Integration,
+        })
+    }
+
+    pub fn invoke_provider_component_op_direct(
+        &self,
+        domain: Domain,
+        pack: &ProviderPack,
+        provider_id: &str,
+        op_id: &str,
+        payload_bytes: &[u8],
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<FlowOutcome> {
+        self.invoke_provider_component_op(domain, pack, provider_id, op_id, payload_bytes, ctx)
+    }
+
+    pub(super) fn invoke_provider_component_op(
+        &self,
+        domain: Domain,
+        pack: &ProviderPack,
+        provider_id: &str,
+        op_id: &str,
+        payload_bytes: &[u8],
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<FlowOutcome> {
+        if let RunnerMode::Integration { binary, flavor } = &self.runner_mode {
+            let payload_value: JsonValue =
+                serde_json::from_slice(payload_bytes).unwrap_or_else(|_| json!({}));
+            let run_dir = state_layout::run_dir(&self.bundle_root, domain, &pack.pack_id, op_id)?;
+            std::fs::create_dir_all(&run_dir)?;
+            return self.execute_with_runner_integration(
+                domain,
+                pack,
+                op_id,
+                &payload_value,
+                ctx,
+                &run_dir,
+                binary,
+                *flavor,
+            );
+        }
+
+        let payload = payload_bytes.to_vec();
+        let result = make_runtime_or_thread_scope(|runtime| {
+            runtime.block_on(async {
+                let host_config = Arc::new(build_demo_host_config(&ctx.tenant));
+                // Re-open the dev store on each invocation so newly-written secrets
+                // (e.g. from QA wizard submit) are visible without restarting the demo.
+                let fresh_secrets = secrets_gate::resolve_secrets_manager(
+                    &self.bundle_root,
+                    &ctx.tenant,
+                    ctx.team.as_deref(),
+                )
+                .unwrap_or_else(|_| self.secrets_handle.clone());
+                let dev_store_display = fresh_secrets
+                    .dev_store_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<default>".to_string());
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "secrets backend for wasm: using_env_fallback={} dev_store={}",
+                        fresh_secrets.using_env_fallback, dev_store_display,
+                    ),
+                );
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "exec secrets: dev_store={} env_fallback={}",
+                        dev_store_display, fresh_secrets.using_env_fallback,
+                    ),
+                );
+                let pack_runtime = PackRuntime::load(
+                    &pack.path,
+                    host_config.clone(),
+                    None,
+                    Some(&pack.path),
+                    None::<DynSessionStore>,
+                    Some(self.state_store.clone()),
+                    Arc::new(RunnerWasiPolicy::default()),
+                    fresh_secrets.runtime_manager(Some(&pack.pack_id)),
+                    None,
+                    false,
+                    ComponentResolution::default(),
+                )
+                .await?;
+                let provider_type = primary_provider_type(&pack.path)
+                    .context("failed to determine provider type for direct invocation")?;
+                let binding = pack_runtime.resolve_provider(None, Some(&provider_type))?;
+                let exec_ctx = ComponentExecCtx {
+                    tenant: ComponentTenantCtx {
+                        tenant: ctx.tenant.clone(),
+                        team: ctx.team.clone(),
+                        i18n_id: None,
+                        user: None,
+                        trace_id: None,
+                        correlation_id: ctx.correlation_id.clone(),
+                        deadline_unix_ms: None,
+                        attempt: 1,
+                        idempotency_key: None,
+                    },
+                    i18n_id: None,
+                    flow_id: op_id.to_string(),
+                    node_id: Some(op_id.to_string()),
+                };
+                pack_runtime
+                    .invoke_provider(&binding, exec_ctx, op_id, payload)
+                    .await
+            })
+        });
+
+        match result {
+            Ok(value) => {
+                let value_str = serde_json::to_string(&value).unwrap_or_default();
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "[wasm-output] op={} provider={} value_preview={}",
+                        op_id,
+                        provider_id,
+                        value_str.chars().take(500).collect::<String>()
+                    ),
+                );
+                Ok(FlowOutcome {
+                    success: true,
+                    output: Some(value),
+                    raw: None,
+                    error: None,
+                    mode: RunnerExecutionMode::Exec,
+                })
+            }
+            Err(err) => {
+                let err_message = err.to_string();
+                let needs_context = needs_secret_context(&err_message);
+                let enriched_err = if needs_context {
+                    err.context(secret_error_context(ctx, provider_id, op_id, pack))
+                } else {
+                    err
+                };
+                let error_text = if needs_context {
+                    enriched_err.to_string()
+                } else {
+                    err_message
+                };
+                Ok(FlowOutcome {
+                    success: false,
+                    output: None,
+                    raw: None,
+                    error: Some(error_text),
+                    mode: RunnerExecutionMode::Exec,
+                })
+            }
+        }
+    }
+}

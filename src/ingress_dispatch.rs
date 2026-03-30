@@ -22,21 +22,6 @@ pub fn dispatch_http_ingress(
     request: &IngressRequestV1,
     ctx: &OperatorContext,
 ) -> anyhow::Result<IngressDispatchResult> {
-    // Debug: write directly to file
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/http_debug.log")
-    {
-        use std::io::Write;
-        let _ = writeln!(
-            f,
-            "[{}] dispatch_http_ingress: domain={:?} provider={}",
-            chrono::Utc::now().format("%H:%M:%S%.3f"),
-            domain,
-            request.provider
-        );
-    }
     // Inject secrets into config for providers running in provider_core_only mode.
     // Fall back to a minimal config for events providers that require a non-null
     // config object even when no secrets or setup have been configured yet.
@@ -72,26 +57,6 @@ pub fn dispatch_http_ingress(
         &payload_json,
         ctx,
     )?;
-    // Debug: log provider outcome
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/http_debug.log")
-    {
-        use std::io::Write;
-        let _ = writeln!(
-            f,
-            "[{}] provider returned: success={} output_keys={:?}",
-            chrono::Utc::now().format("%H:%M:%S%.3f"),
-            outcome.success,
-            outcome
-                .output
-                .as_ref()
-                .and_then(|v| v.as_object())
-                .map(|o| o.keys().collect::<Vec<_>>())
-        );
-    }
-
     if !outcome.success {
         let message = outcome
             .error
@@ -101,28 +66,6 @@ pub fn dispatch_http_ingress(
     }
 
     let value = outcome.output.unwrap_or_else(|| json!({}));
-    // Debug: log the actual events field
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/http_debug.log")
-    {
-        use std::io::Write;
-        if let Some(events) = value.get("events") {
-            let _ = writeln!(
-                f,
-                "[{}] events field: {}",
-                chrono::Utc::now().format("%H:%M:%S%.3f"),
-                serde_json::to_string(events).unwrap_or_default()
-            );
-        } else {
-            let _ = writeln!(
-                f,
-                "[{}] NO events field in provider output",
-                chrono::Utc::now().format("%H:%M:%S%.3f")
-            );
-        }
-    }
     let mut decoded = parse_dispatch_result(&value).with_context(|| "decode ingest_http output")?;
 
     // When the events-webhook provider emits events with null payload,
@@ -136,21 +79,6 @@ pub fn dispatch_http_ingress(
                 event.payload = body.clone();
             }
         }
-    }
-    // Debug: log parsed result
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/http_debug.log")
-    {
-        use std::io::Write;
-        let _ = writeln!(
-            f,
-            "[{}] parsed: events={} messaging_envelopes={}",
-            chrono::Utc::now().format("%H:%M:%S%.3f"),
-            decoded.events.len(),
-            decoded.messaging_envelopes.len()
-        );
     }
     apply_post_ingress_hooks_dispatch(
         runner_host.bundle_root(),

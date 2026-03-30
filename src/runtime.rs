@@ -1193,6 +1193,7 @@ fn start_http_ingress_server(
         domains: domains.to_vec(),
         runner_host,
         enable_static_routes,
+        tenant: config.tenant.clone(),
     })?;
     println!(
         "HTTP ingress ready at http://{}:{}",
