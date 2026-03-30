@@ -2351,13 +2351,14 @@ dependencies = [
 
 [[package]]
 name = "greentic-start"
-version = "0.4.25"
+version = "0.4.26"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
  "chrono",
  "clap",
+ "dashmap",
  "flate2",
  "greentic-distributor-client",
  "greentic-i18n",

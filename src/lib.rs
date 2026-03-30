@@ -15,6 +15,7 @@ mod component_qa_ops;
 pub mod config;
 mod demo_qa_bridge;
 mod dev_store_path;
+pub mod directline;
 mod discovery;
 mod domains;
 mod event_router;
