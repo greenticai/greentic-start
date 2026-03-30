@@ -78,6 +78,34 @@ pub(super) fn route_messaging_envelopes(
         };
 
         for out_envelope in outputs {
+            // For webchat-gui with DirectLine, skip the 3-step egress pipeline
+            // (render_plan/encode/send_payload) since the WASM component doesn't
+            // support those ops. Instead inject the bot response directly into
+            // the DirectLine conversation state for client polling.
+            if let Some((dl_state, conv_id)) = dl_inject {
+                let text = out_envelope.text.clone();
+                let attachments = out_envelope
+                    .metadata
+                    .get("adaptive_card")
+                    .and_then(|card_str| serde_json::from_str::<serde_json::Value>(card_str).ok())
+                    .map(|card| {
+                        json!([{
+                            "contentType": "application/vnd.microsoft.card.adaptive",
+                            "content": card
+                        }])
+                    });
+                if let Some(bot_id) = dl_state.add_bot_activity(conv_id, text, attachments) {
+                    operator_log::info(
+                        module_path!(),
+                        format!(
+                            "[webchat] injected bot activity id={bot_id} conv={conv_id} provider={provider}"
+                        ),
+                    );
+                }
+                continue;
+            }
+
+            // Standard egress pipeline for non-DirectLine providers (Slack, Teams, Webex, etc.)
             let message_value = serde_json::to_value(&out_envelope)?;
 
             let plan = match egress::render_plan(runner_host, ctx, provider, message_value.clone())
@@ -142,30 +170,6 @@ pub(super) fn route_messaging_envelopes(
                         provider, out_envelope.id
                     ),
                 );
-
-                // Inject bot response into DirectLine state for webchat-gui
-                // so the polling GET /activities endpoint returns it.
-                if let Some((dl_state, conv_id)) = dl_inject {
-                    let text = out_envelope.text.clone();
-                    let attachments = out_envelope
-                        .metadata
-                        .get("adaptive_card")
-                        .and_then(|card_str| {
-                            serde_json::from_str::<serde_json::Value>(card_str).ok()
-                        })
-                        .map(|card| {
-                            json!([{
-                                "contentType": "application/vnd.microsoft.card.adaptive",
-                                "content": card
-                            }])
-                        });
-                    if let Some(bot_id) = dl_state.add_bot_activity(conv_id, text, attachments) {
-                        operator_log::info(
-                            module_path!(),
-                            format!("[webchat] injected bot activity id={bot_id} conv={conv_id}"),
-                        );
-                    }
-                }
             } else {
                 let provider_msg = outcome
                     .output
