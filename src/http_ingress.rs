@@ -2,7 +2,9 @@ use std::{convert::Infallible, net::SocketAddr, path::Path, sync::Arc, thread};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use greentic_types::ChannelMessageEnvelope;
+use hmac::{Hmac, Mac};
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Method, Request, Response, StatusCode,
@@ -36,6 +38,7 @@ pub struct HttpIngressConfig {
     pub domains: Vec<Domain>,
     pub runner_host: Arc<DemoRunnerHost>,
     pub enable_static_routes: bool,
+    pub tenant: String,
 }
 
 pub struct HttpIngressServer {
@@ -80,6 +83,19 @@ impl HttpIngressServer {
                             .join(", ")
                     ),
                 );
+                for route in table.routes() {
+                    if route.public_path.contains("webchat") {
+                        let url_path = route.public_path.replace("{tenant}", &config.tenant);
+                        operator_log::info(
+                            module_path!(),
+                            format!(
+                                "WebChat GUI: http://{}/{}/",
+                                config.bind_addr,
+                                url_path.trim_start_matches('/')
+                            ),
+                        );
+                    }
+                }
             }
             table
         } else {
@@ -200,29 +216,6 @@ async fn handle_request_inner(
     req: Request<Incoming>,
     state: Arc<HttpIngressState>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
-    // Debug: write directly to a debug file to verify code is being executed
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/http_debug.log")
-    {
-        use std::io::Write;
-        let _ = writeln!(
-            f,
-            "[{}] handle_request_inner: path={} method={}",
-            chrono::Utc::now().format("%H:%M:%S%.3f"),
-            req.uri().path(),
-            req.method()
-        );
-    }
-    operator_log::info(
-        module_path!(),
-        format!(
-            "[DEBUG] handle_request_inner: path={} method={}",
-            req.uri().path(),
-            req.method()
-        ),
-    );
     if req.method() == Method::OPTIONS {
         return Ok(cors_preflight_response());
     }
@@ -265,6 +258,7 @@ async fn handle_request_inner(
         return Ok(serve_static_route(
             &route_match,
             state.runner_host.bundle_root(),
+            &path,
         ));
     }
 
@@ -708,6 +702,16 @@ async fn handle_directline_request(
         path.to_string()
     };
 
+    // Intercept /token to generate JWT natively instead of delegating to WASM
+    if path == "/token" {
+        return generate_directline_token(&tenant, &provider, &state.runner_host).await;
+    }
+
+    operator_log::info(
+        module_path!(),
+        format!("[webchat] directline request: tenant={tenant} path={path} provider={provider}"),
+    );
+
     let headers = collect_headers(req.headers());
     let payload_bytes = req
         .into_body()
@@ -765,6 +769,82 @@ async fn handle_directline_request(
 
     build_http_response(&result.response)
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err))
+}
+
+type HmacSha256 = Hmac<sha2::Sha256>;
+
+const JWT_TTL_SECONDS: i64 = 1800;
+
+async fn generate_directline_token(
+    tenant: &str,
+    provider: &str,
+    runner_host: &DemoRunnerHost,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let ctx = OperatorContext {
+        tenant: tenant.to_string(),
+        team: Some("default".to_string()),
+        correlation_id: None,
+    };
+    let signing_key = runner_host
+        .get_secret(provider, "jwt_signing_key", &ctx)
+        .map_err(|err| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to fetch jwt_signing_key: {err}"),
+            )
+        })?
+        .ok_or_else(|| {
+            operator_log::warn(
+                module_path!(),
+                format!("[webchat] token generation failed: jwt_signing_key not found for provider={provider}"),
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "jwt_signing_key secret not configured",
+            )
+        })?;
+
+    let now = chrono::Utc::now();
+    let iat = now.timestamp();
+    let exp = iat + JWT_TTL_SECONDS;
+
+    let header = json!({"alg": "HS256", "typ": "JWT"});
+    let claims = json!({
+        "iss": "greentic.webchat",
+        "aud": "directline",
+        "sub": "anonymous",
+        "iat": iat,
+        "nbf": iat,
+        "exp": exp,
+        "ctx": {
+            "tenant": tenant,
+            "team": "default"
+        }
+    });
+
+    let header_enc = URL_SAFE_NO_PAD.encode(serde_json::to_string(&header).unwrap().as_bytes());
+    let payload_enc = URL_SAFE_NO_PAD.encode(serde_json::to_string(&claims).unwrap().as_bytes());
+
+    let mut mac = HmacSha256::new_from_slice(&signing_key).expect("HMAC accepts any key length");
+    mac.update(header_enc.as_bytes());
+    mac.update(b".");
+    mac.update(payload_enc.as_bytes());
+    let signature = mac.finalize().into_bytes();
+    let signature_enc = URL_SAFE_NO_PAD.encode(signature);
+
+    let token = format!("{header_enc}.{payload_enc}.{signature_enc}");
+    let body = json!({
+        "token": token,
+        "expires_in": JWT_TTL_SECONDS,
+        "conversationId": ""
+    });
+
+    operator_log::info(
+        module_path!(),
+        format!("[webchat] token generated for tenant={tenant} expires_in={JWT_TTL_SECONDS}"),
+    );
+
+    Ok(json_response(StatusCode::OK, body))
 }
 
 fn cors_preflight_response() -> Response<Full<Bytes>> {
@@ -977,7 +1057,26 @@ fn json_response(status: StatusCode, value: serde_json::Value) -> Response<Full<
 fn serve_static_route(
     route_match: &StaticRouteMatch<'_>,
     bundle_root: &Path,
+    request_path: &str,
 ) -> Response<Full<Bytes>> {
+    // Redirect to trailing-slash when the matched route is a directory (no asset path)
+    // and the request doesn't end with '/'. Without this, relative paths in index.html
+    // (e.g. ./runtime-bootstrap.js) resolve against the wrong parent directory.
+    if route_match.asset_path.is_empty() && !route_match.request_is_directory {
+        let redirect_path = format!("{}/", request_path.trim_end_matches('/'));
+        operator_log::info(
+            module_path!(),
+            format!("[static] redirect {request_path} -> {redirect_path}"),
+        );
+        return Response::builder()
+            .status(StatusCode::MOVED_PERMANENTLY)
+            .header("Location", &redirect_path)
+            .header("Content-Length", "0")
+            .body(Full::from(Bytes::new()))
+            .unwrap_or_else(|_| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "redirect failed")
+            });
+    }
     if let Some(asset_path) = resolve_asset_path(route_match) {
         match serve_static_asset(route_match.descriptor, &asset_path, bundle_root) {
             Ok(Some(response)) => return response,
@@ -1018,7 +1117,17 @@ fn serve_static_asset(
     } else {
         match read_pack_asset_bytes(&descriptor.pack_path, &full_path)? {
             Some(bytes) => bytes,
-            None => return Ok(None),
+            None => {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "[static] asset not found: {} in {}",
+                        full_path,
+                        descriptor.pack_path.display()
+                    ),
+                );
+                return Ok(None);
+            }
         }
     };
 
