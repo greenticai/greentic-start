@@ -1,33 +1,28 @@
 # Security Fix Report
 
 Date: 2026-03-30 (UTC)
-Repository: `greentic-start`
-Branch: `feat/codeql`
+Reviewer: CI Security Reviewer
 
-## Inputs Reviewed
-- Security alerts JSON: `{"dependabot": [], "code_scanning": []}`
-- New PR dependency vulnerabilities: `[]`
-- Repository alert files:
-  - `security-alerts.json`: `{"dependabot": [], "code_scanning": []}`
-  - `dependabot-alerts.json`: `[]`
-  - `code-scanning-alerts.json`: `[]`
-  - `pr-vulnerable-changes.json`: `[]`
+## Input Alerts
+- Dependabot alerts: `0`
+- Code scanning alerts: `0`
+- New PR dependency vulnerabilities: `0`
 
-## Analysis Performed
-1. Parsed and validated all provided alert inputs.
-2. Checked PR file changes for dependency-manifest or lockfile modifications.
-   - Command: `git diff --name-only`
-   - Result: only `pr-comment.md` changed.
-3. Verified dependency manifests exist in repo (`Cargo.toml`, `Cargo.lock`) and were not modified by this PR.
+## Repository Security Review Performed
+- Checked dependency manifests/lockfiles present in repo:
+  - `Cargo.toml`
+  - `Cargo.lock`
+- Reviewed dependency-file changes in current PR commit (`HEAD~1..HEAD`):
+  - `Cargo.toml`: package version bump `0.4.27 -> 0.4.28` (no dependency add/remove/update)
+  - `Cargo.lock`: workspace package version bump only (no third-party crate version changes)
+- Validated lockfile readability/consistency via:
+  - `/home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo metadata --locked --format-version 1 --no-deps`
 
-## Findings
-- No Dependabot vulnerabilities detected.
-- No code scanning vulnerabilities detected.
-- No new PR dependency vulnerabilities detected.
-- No dependency-file changes in this PR.
+## Remediation Actions
+- No code or dependency fixes were required.
+- No vulnerabilities were detected from provided alert sources.
+- No new PR-introduced dependency vulnerabilities were identified.
 
-## Remediation
-- No code or dependency changes were required because no actionable vulnerabilities were found.
-
-## Residual Risk
-- Low for this PR scope, based on empty security alerts and no dependency updates in changed files.
+## Notes
+- `cargo-audit` is not available in this CI environment, and default rustup shims are write-restricted under `/home/runner/.rustup/tmp`.
+- Despite that limitation, PR dependency diffs were inspected directly and showed no third-party dependency changes.
