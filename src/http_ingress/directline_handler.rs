@@ -8,8 +8,6 @@ use hyper::{
 use serde_json::json;
 
 use crate::domains::Domain;
-use crate::ingress_dispatch::dispatch_http_ingress;
-use crate::ingress_types::IngressRequestV1;
 use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
 
@@ -188,30 +186,61 @@ pub(super) async fn handle_directline_request(
             format!("[webchat] stored user activity id={activity_id} conv={cid} tenant={tenant}"),
         );
 
-        // 2. Build an ingress request and route to flow engine so the
-        //    messaging pipeline processes the user message. We pass the
-        //    original body to dispatch_http_ingress which will parse the
-        //    ChannelMessageEnvelope from it.
+        // 2. Build a ChannelMessageEnvelope directly and route to the
+        //    app flow engine. We bypass WASM ingest_http entirely since
+        //    the webchat-gui component doesn't support that operation.
+        let text = body.get("text").and_then(|v| v.as_str()).map(String::from);
+        let from_id = body
+            .get("from")
+            .and_then(|f| f.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("anonymous")
+            .to_string();
+
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert("provider".to_string(), provider.clone());
+        metadata.insert("tenant".to_string(), tenant.clone());
+        // Forward Action.Submit value fields as metadata (for card routing, MCP actions, etc.)
+        if let Some(value_obj) = body.get("value").and_then(|v| v.as_object()) {
+            for (k, v) in value_obj {
+                let val_str = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                metadata.insert(k.clone(), val_str);
+            }
+        }
+
+        let envelope: greentic_types::ChannelMessageEnvelope =
+            serde_json::from_value(serde_json::json!({
+                "id": format!("webchat-{cid}"),
+                "tenant": {
+                    "env": "dev",
+                    "tenant": &tenant,
+                    "tenant_id": &tenant,
+                    "team": "default",
+                    "attempt": 0
+                },
+                "channel": cid,
+                "session_id": cid,
+                "from": {
+                    "id": &from_id,
+                    "kind": "user"
+                },
+                "text": text,
+                "metadata": metadata
+            }))
+            .map_err(|e| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("build envelope: {e}"),
+                )
+            })?;
+
         let context = OperatorContext {
             tenant: tenant.clone(),
             team: Some("default".to_string()),
             correlation_id: None,
-        };
-
-        let ingress_request = IngressRequestV1 {
-            v: 1,
-            domain: "messaging".to_string(),
-            provider: provider.clone(),
-            handler: None,
-            tenant: tenant.clone(),
-            team: Some("default".to_string()),
-            method: "POST".to_string(),
-            path: format!("/v3/directline/conversations/{cid}/activities"),
-            query: queries,
-            headers: vec![("content-type".to_string(), "application/json".to_string())],
-            body: payload_bytes.to_vec(),
-            correlation_id: None,
-            remote_addr: None,
         };
 
         let dl_state_clone = dl_state.clone();
@@ -221,47 +250,18 @@ pub(super) async fn handle_directline_request(
         let provider_clone = provider.clone();
 
         std::thread::spawn(move || {
-            // Dispatch to WASM ingress to parse envelopes, then route
-            // through the messaging pipeline.
-            let result = dispatch_http_ingress(
-                runner_host.as_ref(),
-                Domain::Messaging,
-                &ingress_request,
+            if let Err(err) = route_messaging_envelopes(
+                &bundle,
+                &runner_host,
+                &provider_clone,
                 &context,
-            );
-
-            match result {
-                Ok(result) if !result.messaging_envelopes.is_empty() => {
-                    if let Err(err) = route_messaging_envelopes(
-                        &bundle,
-                        &runner_host,
-                        &provider_clone,
-                        &context,
-                        result.messaging_envelopes,
-                        Some((&dl_state_clone, &conv_id_clone)),
-                    ) {
-                        operator_log::error(
-                            module_path!(),
-                            format!(
-                                "[webchat] messaging pipeline failed conv={conv_id_clone} err={err}"
-                            ),
-                        );
-                    }
-                }
-                Ok(_) => {
-                    operator_log::debug(
-                        module_path!(),
-                        format!(
-                            "[webchat] no messaging envelopes from ingress conv={conv_id_clone}"
-                        ),
-                    );
-                }
-                Err(err) => {
-                    operator_log::error(
-                        module_path!(),
-                        format!("[webchat] ingress dispatch failed conv={conv_id_clone} err={err}"),
-                    );
-                }
+                vec![envelope],
+                Some((&dl_state_clone, &conv_id_clone)),
+            ) {
+                operator_log::error(
+                    module_path!(),
+                    format!("[webchat] messaging pipeline failed conv={conv_id_clone} err={err}"),
+                );
             }
         });
 
