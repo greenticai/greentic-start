@@ -42,6 +42,13 @@ pub fn resolve_app_pack_path(
 
     let packs_root = bundle.join("packs");
     let mut tried = Vec::new();
+
+    // 1. Try app_packs from bundle.yaml (highest priority)
+    if let Some(pack_path) = resolve_from_bundle_yaml(bundle, &packs_root) {
+        return Ok(pack_path);
+    }
+
+    // 2. Try tenant/team-scoped default.gtpack
     if let Some(team_id) = team {
         let candidate = packs_root.join(tenant).join(team_id).join("default.gtpack");
         tried.push(candidate.clone());
@@ -54,6 +61,8 @@ pub fn resolve_app_pack_path(
     if candidate.exists() {
         return Ok(candidate);
     }
+
+    // 3. Fallback to packs/default.gtpack
     let candidate = packs_root.join("default.gtpack");
     tried.push(candidate.clone());
     if candidate.exists() {
@@ -66,6 +75,81 @@ pub fn resolve_app_pack_path(
         .collect::<Vec<_>>()
         .join(", ");
     bail!("APP_PACK_NOT_FOUND; tried {paths}");
+}
+
+/// Read bundle.yaml app_packs and try to find a matching .gtpack in the packs directory.
+/// Handles both local references (packs/name.pack) and HTTPS URLs (extracts filename).
+fn resolve_from_bundle_yaml(bundle: &Path, packs_root: &Path) -> Option<PathBuf> {
+    let yaml_path = bundle.join("bundle.yaml");
+    let content = std::fs::read_to_string(&yaml_path).ok()?;
+
+    let mut in_app_packs = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == "app_packs:" {
+            in_app_packs = true;
+            continue;
+        }
+        if in_app_packs {
+            if !trimmed.starts_with("- ") {
+                break;
+            }
+            let reference = trimmed.trim_start_matches("- ").trim();
+
+            // Extract the pack name from the reference (local path or HTTPS URL)
+            let pack_name = if reference.starts_with("http://") || reference.starts_with("https://") {
+                // URL like https://.../hr-onboarding.gtpack → "hr-onboarding"
+                reference
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(reference)
+                    .trim_end_matches(".gtpack")
+            } else {
+                // Local path like packs/hr-onboarding.pack → "hr-onboarding"
+                reference
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(reference)
+                    .trim_end_matches(".pack")
+                    .trim_end_matches(".gtpack")
+            };
+
+            // Try: packs/<name>.gtpack
+            let candidate = packs_root.join(format!("{pack_name}.gtpack"));
+            if candidate.exists() {
+                return Some(candidate);
+            }
+
+            // Try: packs/<name>.pack/dist/<name>.pack.gtpack
+            let pack_dir = packs_root.join(format!("{pack_name}.pack"));
+            if pack_dir.is_dir() && let Ok(entries) = std::fs::read_dir(pack_dir.join("dist")) {
+                for entry in entries.flatten() {
+                    if entry.path().extension().is_some_and(|ext| ext == "gtpack") {
+                        return Some(entry.path());
+                    }
+                }
+            }
+
+            // Try as direct file reference
+            let candidate = packs_root.join(reference);
+            if candidate.exists() && candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    // Fallback: find any non-default .gtpack in packs/
+    if let Ok(entries) = std::fs::read_dir(packs_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "gtpack")
+                && path.file_stem().is_some_and(|name| name != "default")
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 pub fn load_app_pack_info(pack_path: &Path) -> Result<AppPackInfo> {
