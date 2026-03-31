@@ -2,7 +2,7 @@
 
 ## Review Metadata
 - Date (UTC): 2026-03-31
-- Branch: `fix/directline-activity-enrichment`
+- Branch: `fix/suppress-text-on-card`
 
 ## Inputs Reviewed
 - `security-alerts.json`: `{"dependabot": [], "code_scanning": []}`
@@ -15,12 +15,13 @@
 - Checked PR dependency-file diff with:
   - `git diff --name-only -- Cargo.toml Cargo.lock`
 - Result: no dependency-file changes in this PR.
+- New PR dependency vulnerabilities reported: none (`[]`).
 
 ## Remediation Performed
-- No Dependabot alerts to remediate.
-- No code scanning alerts to remediate.
-- No new PR dependency vulnerabilities reported.
-- No security patches were required or applied.
+- Dependabot alerts: none to remediate.
+- Code scanning alerts: none to remediate.
+- PR dependency vulnerabilities: none to remediate.
+- No security fixes were required or applied.
 
 ## Final Status
 - Security review outcome: **No actionable vulnerabilities found**.
