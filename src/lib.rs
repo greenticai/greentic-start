@@ -483,12 +483,16 @@ fn run_start(request: StartRequest) -> anyhow::Result<()> {
         None
     };
 
-    println!(
-        "demo start running (config={} tenant={} team={}); press Ctrl+C to stop",
-        config_path.display(),
-        tenant,
-        team
+    operator_log::info(
+        module_path!(),
+        format!(
+            "demo start running config={} tenant={} team={}",
+            config_path.display(),
+            tenant,
+            team
+        ),
     );
+    println!("\nReady. Press Ctrl+C to stop.");
     let shutdown_reason = wait_for_shutdown(&runtime_paths)?;
     operator_log::info(
         module_path!(),

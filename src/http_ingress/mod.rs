@@ -44,6 +44,8 @@ pub struct HttpIngressConfig {
 pub struct HttpIngressServer {
     shutdown: Option<oneshot::Sender<()>>,
     handle: Option<thread::JoinHandle<Result<()>>>,
+    /// WebChat GUI URLs discovered from static routes during startup.
+    pub webchat_urls: Vec<String>,
 }
 
 impl HttpIngressServer {
@@ -53,6 +55,7 @@ impl HttpIngressServer {
         let runner_host = config.runner_host;
 
         // Discover static routes if enabled
+        let mut webchat_urls = Vec::new();
         let active_route_table = if config.enable_static_routes {
             let static_route_plan = discover_from_bundle(
                 runner_host.bundle_root(),
@@ -86,14 +89,13 @@ impl HttpIngressServer {
                 for route in table.routes() {
                     if route.public_path.contains("webchat") {
                         let url_path = route.public_path.replace("{tenant}", &config.tenant);
-                        operator_log::info(
-                            module_path!(),
-                            format!(
-                                "WebChat GUI: http://{}/{}/",
-                                config.bind_addr,
-                                url_path.trim_start_matches('/')
-                            ),
+                        let webchat_url = format!(
+                            "http://{}/{}/",
+                            config.bind_addr,
+                            url_path.trim_start_matches('/')
                         );
+                        operator_log::info(module_path!(), format!("WebChat GUI: {webchat_url}"));
+                        webchat_urls.push(webchat_url);
                     }
                 }
             }
@@ -178,6 +180,7 @@ impl HttpIngressServer {
         Ok(Self {
             shutdown: Some(tx),
             handle: Some(handle),
+            webchat_urls,
         })
     }
 
