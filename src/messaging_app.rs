@@ -97,7 +97,8 @@ fn resolve_from_bundle_yaml(bundle: &Path, packs_root: &Path) -> Option<PathBuf>
             let reference = trimmed.trim_start_matches("- ").trim();
 
             // Extract the pack name from the reference (local path or HTTPS URL)
-            let pack_name = if reference.starts_with("http://") || reference.starts_with("https://") {
+            let pack_name = if reference.starts_with("http://") || reference.starts_with("https://")
+            {
                 // URL like https://.../hr-onboarding.gtpack → "hr-onboarding"
                 reference
                     .rsplit('/')
@@ -122,7 +123,9 @@ fn resolve_from_bundle_yaml(bundle: &Path, packs_root: &Path) -> Option<PathBuf>
 
             // Try: packs/<name>.pack/dist/<name>.pack.gtpack
             let pack_dir = packs_root.join(format!("{pack_name}.pack"));
-            if pack_dir.is_dir() && let Ok(entries) = std::fs::read_dir(pack_dir.join("dist")) {
+            if pack_dir.is_dir()
+                && let Ok(entries) = std::fs::read_dir(pack_dir.join("dist"))
+            {
                 for entry in entries.flatten() {
                     if entry.path().extension().is_some_and(|ext| ext == "gtpack") {
                         return Some(entry.path());
