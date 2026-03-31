@@ -51,15 +51,7 @@ pub(super) fn route_messaging_envelopes(
                         "adaptive_card".to_string(),
                         serde_json::to_string(&card_json).unwrap_or_default(),
                     );
-                    let summary = card_json
-                        .get("body")
-                        .and_then(|b| b.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|item| item.get("text"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or(route_to_card)
-                        .to_string();
-                    reply.text = Some(summary);
+                    reply.text = None;
                     vec![reply]
                 }
                 None => {
