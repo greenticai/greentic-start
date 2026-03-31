@@ -1,5 +1,9 @@
 # SECURITY_FIX_REPORT
 
+## Review Metadata
+- Date (UTC): 2026-03-31
+- Branch: `fix/directline-activity-enrichment`
+
 ## Inputs Reviewed
 - `security-alerts.json`: `{"dependabot": [], "code_scanning": []}`
 - `dependabot-alerts.json`: `[]`
