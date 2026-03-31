@@ -86,14 +86,13 @@ impl HttpIngressServer {
                 for route in table.routes() {
                     if route.public_path.contains("webchat") {
                         let url_path = route.public_path.replace("{tenant}", &config.tenant);
-                        operator_log::info(
-                            module_path!(),
-                            format!(
-                                "WebChat GUI: http://{}/{}/",
-                                config.bind_addr,
-                                url_path.trim_start_matches('/')
-                            ),
+                        let webchat_url = format!(
+                            "WebChat GUI: http://{}/{}/",
+                            config.bind_addr,
+                            url_path.trim_start_matches('/')
                         );
+                        eprintln!("{webchat_url}");
+                        operator_log::info(module_path!(), &webchat_url);
                     }
                 }
             }
