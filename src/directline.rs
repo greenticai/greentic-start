@@ -152,7 +152,24 @@ impl DirectLineState {
         let mut entry = self.conversations.get_mut(conv_id)?;
         let wm = entry.bump_watermark();
         let id = uuid::Uuid::new_v4().to_string();
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now = chrono::Utc::now();
+        let now_ms = now.timestamp_millis();
+        // Enrich raw activity with required DirectLine fields
+        let mut enriched = raw;
+        if let Some(obj) = enriched.as_object_mut() {
+            obj.insert("id".to_string(), JsonValue::String(id.clone()));
+            obj.insert(
+                "timestamp".to_string(),
+                JsonValue::String(now.to_rfc3339()),
+            );
+            obj.entry("from".to_string()).or_insert_with(|| {
+                serde_json::json!({"id": from_id, "role": "user"})
+            });
+            if let Some(from) = obj.get_mut("from").and_then(|v| v.as_object_mut()) {
+                from.entry("role".to_string())
+                    .or_insert_with(|| JsonValue::String("user".to_string()));
+            }
+        }
         entry.add_activity(StoredActivity {
             id: id.clone(),
             type_: "message".to_string(),
@@ -161,7 +178,7 @@ impl DirectLineState {
             from_role: "user".to_string(),
             timestamp_ms: now_ms,
             watermark: wm,
-            raw,
+            raw: enriched,
         });
         Some(id)
     }
