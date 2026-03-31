@@ -200,9 +200,7 @@ pub fn update_webhooks_if_url_changed(
             } else {
                 format!("{provider_webhook_count} webhooks updated")
             };
-            summary
-                .results
-                .push((provider.provider_id.clone(), desc));
+            summary.results.push((provider.provider_id.clone(), desc));
         }
     }
 

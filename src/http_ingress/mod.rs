@@ -94,10 +94,7 @@ impl HttpIngressServer {
                             config.bind_addr,
                             url_path.trim_start_matches('/')
                         );
-                        operator_log::info(
-                            module_path!(),
-                            format!("WebChat GUI: {webchat_url}"),
-                        );
+                        operator_log::info(module_path!(), format!("WebChat GUI: {webchat_url}"));
                         webchat_urls.push(webchat_url);
                     }
                 }

@@ -158,13 +158,9 @@ impl DirectLineState {
         let mut enriched = raw;
         if let Some(obj) = enriched.as_object_mut() {
             obj.insert("id".to_string(), JsonValue::String(id.clone()));
-            obj.insert(
-                "timestamp".to_string(),
-                JsonValue::String(now.to_rfc3339()),
-            );
-            obj.entry("from".to_string()).or_insert_with(|| {
-                serde_json::json!({"id": from_id, "role": "user"})
-            });
+            obj.insert("timestamp".to_string(), JsonValue::String(now.to_rfc3339()));
+            obj.entry("from".to_string())
+                .or_insert_with(|| serde_json::json!({"id": from_id, "role": "user"}));
             if let Some(from) = obj.get_mut("from").and_then(|v| v.as_object_mut()) {
                 from.entry("role".to_string())
                     .or_insert_with(|| JsonValue::String("user".to_string()));

@@ -413,11 +413,7 @@ fn spawn_if_needed(
     let handle = supervisor::spawn_service(paths, spec.clone(), log_path_override.clone())?;
     operator_log::info(
         module_path!(),
-        format!(
-            "{}: started (pid={})",
-            spec.id.as_str(),
-            handle.pid
-        ),
+        format!("{}: started (pid={})", spec.id.as_str(), handle.pid),
     );
     if spec.id.as_str() == "nats" {
         operator_log::info(
