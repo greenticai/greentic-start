@@ -91,7 +91,7 @@ impl HttpIngressServer {
                             config.bind_addr,
                             url_path.trim_start_matches('/')
                         );
-                        eprintln!("{webchat_url}");
+                        println!("{webchat_url}");
                         operator_log::info(module_path!(), &webchat_url);
                     }
                 }
