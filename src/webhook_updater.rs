@@ -32,6 +32,15 @@ pub fn read_previous_public_url(runtime_root: &Path) -> Option<String> {
         .map(String::from)
 }
 
+/// Summary of a webhook update operation.
+#[derive(Debug, Default)]
+pub struct WebhookUpdateSummary {
+    /// Per-provider results: (provider_id, webhook_count or description).
+    pub results: Vec<(String, String)>,
+}
+
+impl WebhookUpdateSummary {}
+
 /// Check if public URL changed and update webhooks for messaging providers.
 ///
 /// This function compares the previous URL with the new tunnel URL and
@@ -49,7 +58,7 @@ pub fn read_previous_public_url(runtime_root: &Path) -> Option<String> {
 ///
 /// # Returns
 ///
-/// Returns Ok(true) if webhooks were updated, Ok(false) if no update needed.
+/// Returns a `WebhookUpdateSummary` with per-provider results.
 pub fn update_webhooks_if_url_changed(
     config_dir: &Path,
     discovery: &DiscoveryResult,
@@ -58,7 +67,7 @@ pub fn update_webhooks_if_url_changed(
     team: &str,
     previous_url: Option<&str>,
     new_url: &str,
-) -> Result<bool> {
+) -> Result<WebhookUpdateSummary> {
     // Only HTTPS URLs are valid for webhooks
     if !new_url.starts_with("https://") {
         operator_log::debug(
@@ -68,7 +77,7 @@ pub fn update_webhooks_if_url_changed(
                 new_url
             ),
         );
-        return Ok(false);
+        return Ok(WebhookUpdateSummary::default());
     }
 
     // Check if URL actually changed
@@ -77,7 +86,7 @@ pub fn update_webhooks_if_url_changed(
             module_path!(),
             "[webhook-updater] public URL unchanged, skipping webhook update",
         );
-        return Ok(false);
+        return Ok(WebhookUpdateSummary::default());
     }
 
     operator_log::info(
@@ -100,13 +109,14 @@ pub fn update_webhooks_if_url_changed(
             module_path!(),
             "[webhook-updater] no messaging providers found, skipping webhook update",
         );
-        return Ok(false);
+        return Ok(WebhookUpdateSummary::default());
     }
 
-    let mut secrets_updated_count = 0;
-    let mut webhook_updated_count = 0;
+    let mut summary = WebhookUpdateSummary::default();
 
     for provider in &messaging_providers {
+        let mut provider_webhook_count: u32 = 0;
+
         // Step 1: Update public_base_url secret for this provider
         match update_provider_public_url_secret(
             secrets_handle,
@@ -116,7 +126,6 @@ pub fn update_webhooks_if_url_changed(
             new_url,
         ) {
             Ok(true) => {
-                secrets_updated_count += 1;
                 operator_log::info(
                     module_path!(),
                     format!(
@@ -156,7 +165,7 @@ pub fn update_webhooks_if_url_changed(
             new_url,
         ) {
             Ok(true) => {
-                webhook_updated_count += 1;
+                provider_webhook_count += 1;
                 operator_log::info(
                     module_path!(),
                     format!(
@@ -184,16 +193,20 @@ pub fn update_webhooks_if_url_changed(
                 );
             }
         }
+
+        if provider_webhook_count > 0 {
+            let desc = if provider_webhook_count == 1 {
+                "webhook updated".to_string()
+            } else {
+                format!("{provider_webhook_count} webhooks updated")
+            };
+            summary
+                .results
+                .push((provider.provider_id.clone(), desc));
+        }
     }
 
-    if secrets_updated_count > 0 || webhook_updated_count > 0 {
-        println!(
-            "  [webhook-updater] updated {} secret(s) and {} webhook(s) for new public URL",
-            secrets_updated_count, webhook_updated_count
-        );
-    }
-
-    Ok(secrets_updated_count > 0 || webhook_updated_count > 0)
+    Ok(summary)
 }
 
 /// Update the public_base_url secret for a single provider.

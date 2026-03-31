@@ -47,6 +47,45 @@ impl ForegroundRuntimeHandles {
     }
 }
 
+/// Collected startup information printed as a clean summary block.
+struct StartupInfo {
+    bundle_name: String,
+    http_url: Option<String>,
+    webchat_url: Option<String>,
+    public_url: Option<String>,
+    channels: Vec<String>,
+    mode: String,
+    webhook_results: Vec<(String, String)>,
+}
+
+impl StartupInfo {
+    fn print(&self) {
+        println!();
+        println!("{}", self.bundle_name);
+        if let Some(ref url) = self.http_url {
+            println!("  HTTP:     {url}");
+        }
+        if let Some(ref url) = self.webchat_url {
+            println!("  WebChat:  {url}");
+        }
+        if let Some(ref url) = self.public_url {
+            println!("  Public:   {url}");
+        }
+        if !self.channels.is_empty() {
+            println!("  Channels: {}", self.channels.join(", "));
+        }
+        println!("  Mode:     {}", self.mode);
+
+        if !self.webhook_results.is_empty() {
+            println!();
+            println!("Webhooks:");
+            for (provider, desc) in &self.webhook_results {
+                println!("  [{provider}] {desc}");
+            }
+        }
+    }
+}
+
 struct ServiceSummary {
     id: String,
     pid: Option<u32>,
@@ -365,24 +404,20 @@ fn spawn_if_needed(
     if let Some(pid) = read_pid(&pid_path)?
         && supervisor::is_running(pid)
     {
-        println!(
-            "{}",
-            crate::operator_i18n::trf(
-                "demo.runtime.service_already_running",
-                "{}: already running (pid={})",
-                &[spec.id.as_str(), &pid.to_string()]
-            )
+        operator_log::info(
+            module_path!(),
+            format!("{}: already running (pid={})", spec.id.as_str(), pid),
         );
         return Ok(None);
     }
     let handle = supervisor::spawn_service(paths, spec.clone(), log_path_override.clone())?;
-    println!(
-        "{}",
-        crate::operator_i18n::trf(
-            "demo.runtime.service_started",
+    operator_log::info(
+        module_path!(),
+        format!(
             "{}: started (pid={})",
-            &[spec.id.as_str(), &handle.pid.to_string()]
-        )
+            spec.id.as_str(),
+            handle.pid
+        ),
     );
     if spec.id.as_str() == "nats" {
         operator_log::info(
@@ -500,14 +535,6 @@ pub fn demo_up(
         );
         service_summaries.push(summary);
         public_base_url = Some(url.clone());
-        println!(
-            "{}",
-            crate::operator_i18n::trf(
-                "demo.runtime.public_url_cloudflared",
-                "Public URL (service=cloudflared): {}",
-                &[&url]
-            )
-        );
     } else if let Some(config) = ngrok {
         let ngrok_log = operator_log::reserve_service_log(log_dir, "ngrok")
             .with_context(|| "unable to open ngrok.log")?;
@@ -553,14 +580,6 @@ pub fn demo_up(
         );
         service_summaries.push(summary);
         public_base_url = Some(url.clone());
-        println!(
-            "{}",
-            crate::operator_i18n::trf(
-                "demo.runtime.public_url_ngrok",
-                "Public URL (service=ngrok): {}",
-                &[&url]
-            )
-        );
     }
 
     let mut resolved_nats_url = nats_url.map(|value| value.to_string());
@@ -659,23 +678,16 @@ pub fn demo_up(
         messaging_summary.add_detail("embedded messaging stack".to_string());
         service_summaries.push(messaging_summary);
     } else {
-        println!(
-            "{}",
-            crate::operator_i18n::tr(
-                "demo.runtime.messaging_embedded",
-                "messaging: running embedded runner (no gsm gateway/egress)"
-            )
+        operator_log::info(
+            module_path!(),
+            "messaging: running embedded runner (no gsm gateway/egress)",
         );
     }
 
-    println!(
-        "{}",
-        crate::operator_i18n::tr(
-            "demo.runtime.events_in_process",
-            "events: handled in-process (HTTP ingress + timer scheduler)"
-        )
+    operator_log::info(
+        module_path!(),
+        "events: handled in-process (HTTP ingress + timer scheduler)",
     );
-    print_service_summary(&service_summaries);
 
     if !run_gsm_services {
         operator_log::info(
@@ -692,6 +704,27 @@ pub fn demo_up(
             );
         }
     }
+
+    // Print clean startup summary
+    let bundle_name = bundle_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| tenant.to_string());
+    let mode = if run_gsm_services {
+        "gsm gateway + egress".to_string()
+    } else {
+        "embedded runner".to_string()
+    };
+    let info = StartupInfo {
+        bundle_name,
+        http_url: None,
+        webchat_url: None,
+        public_url: public_base_url,
+        channels: Vec::new(),
+        mode,
+        webhook_results: Vec::new(),
+    };
+    info.print();
 
     Ok(())
 }
@@ -819,14 +852,6 @@ pub fn demo_up_services(
                     ),
                 );
             }
-            println!(
-                "{}",
-                crate::operator_i18n::trf(
-                    "demo.runtime.public_url_cloudflared_domains",
-                    "Public URL (service=cloudflared domains={}): {}",
-                    &[&domain_list, &handle.url]
-                )
-            );
             service_tracker.record_with_log(
                 "cloudflared",
                 "cloudflared",
@@ -883,14 +908,6 @@ pub fn demo_up_services(
                     ),
                 );
             }
-            println!(
-                "{}",
-                crate::operator_i18n::trf(
-                    "demo.runtime.public_url_ngrok_domains",
-                    "Public URL (service=ngrok domains={}): {}",
-                    &[&domain_list, &handle.url]
-                )
-            );
             service_tracker.record_with_log("ngrok", "ngrok", Some(&handle.log_path))?;
             Some(handle.url)
         }
@@ -918,8 +935,8 @@ pub fn demo_up_services(
         });
 
     // Auto-update webhooks if public URL changed
-    if let Some(ref new_url) = public_base_url
-        && let Err(err) = crate::webhook_updater::update_webhooks_if_url_changed(
+    let webhook_summary = if let Some(ref new_url) = public_base_url {
+        match crate::webhook_updater::update_webhooks_if_url_changed(
             config_dir,
             &discovery,
             &secrets_handle,
@@ -927,13 +944,19 @@ pub fn demo_up_services(
             team,
             previous_public_url.as_deref(),
             new_url,
-        )
-    {
-        operator_log::warn(
-            module_path!(),
-            format!("[webhook-updater] failed to update webhooks: {}", err),
-        );
-    }
+        ) {
+            Ok(summary) => summary,
+            Err(err) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!("[webhook-updater] failed to update webhooks: {}", err),
+                );
+                crate::webhook_updater::WebhookUpdateSummary::default()
+            }
+        }
+    } else {
+        crate::webhook_updater::WebhookUpdateSummary::default()
+    };
 
     // http_listener_enabled: true if HTTP ingress server started (not tied to NATS)
     // asset_serving_enabled: true if bundle declares static routes we're enabling
@@ -1077,20 +1100,6 @@ pub fn demo_up_services(
             }
         }
     } else {
-        println!(
-            "{}",
-            crate::operator_i18n::tr(
-                "demo.runtime.messaging_embedded",
-                "messaging: running embedded runner (no gsm gateway/egress)"
-            )
-        );
-        println!(
-            "{}",
-            crate::operator_i18n::tr(
-                "demo.runtime.events_in_process",
-                "events: handled in-process (HTTP ingress + timer scheduler)"
-            )
-        );
         operator_log::info(
             module_path!(),
             "demo running in embedded runner mode; gateway/egress disabled",
@@ -1115,6 +1124,46 @@ pub fn demo_up_services(
         gateway_port: config.services.gateway.port,
     };
     write_json(&paths.runtime_root().join("endpoints.json"), &endpoints)?;
+
+    // Collect and print clean startup summary
+    let bundle_name = config_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| tenant.to_string());
+    let http_url = if ingress_server.is_some() {
+        Some(format!(
+            "http://{}:{}",
+            config.services.gateway.listen_addr, config.services.gateway.port
+        ))
+    } else {
+        None
+    };
+    let webchat_url = ingress_server
+        .as_ref()
+        .and_then(|s| s.webchat_urls.first().cloned());
+    let channels: Vec<String> = discovery
+        .providers
+        .iter()
+        .filter(|p| p.domain == "messaging")
+        .map(|p| p.provider_id.clone())
+        .collect();
+    let mode = if run_gsm_services {
+        "gsm gateway + egress".to_string()
+    } else {
+        "embedded runner".to_string()
+    };
+
+    let info = StartupInfo {
+        bundle_name,
+        http_url,
+        webchat_url,
+        public_url: public_base_url,
+        channels,
+        mode,
+        webhook_results: webhook_summary.results,
+    };
+    info.print();
+
     Ok(ForegroundRuntimeHandles { ingress_server })
 }
 
@@ -1195,9 +1244,12 @@ fn start_http_ingress_server(
         enable_static_routes,
         tenant: config.tenant.clone(),
     })?;
-    println!(
-        "HTTP ingress ready at http://{}:{}",
-        config.services.gateway.listen_addr, config.services.gateway.port
+    operator_log::info(
+        module_path!(),
+        format!(
+            "HTTP ingress ready at http://{}:{}",
+            config.services.gateway.listen_addr, config.services.gateway.port
+        ),
     );
     Ok(Some(server))
 }
