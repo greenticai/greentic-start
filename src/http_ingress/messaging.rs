@@ -75,7 +75,6 @@ pub(super) fn route_messaging_envelopes(
             // support those ops. Instead inject the bot response directly into
             // the DirectLine conversation state for client polling.
             if let Some((dl_state, conv_id)) = dl_inject {
-                let text = out_envelope.text.clone();
                 let attachments = out_envelope
                     .metadata
                     .get("adaptive_card")
@@ -86,6 +85,14 @@ pub(super) fn route_messaging_envelopes(
                             "content": card
                         }])
                     });
+                // Suppress text when there is an adaptive card attachment to
+                // prevent webchat SDK from rendering a redundant text bubble
+                // above the card.
+                let text = if attachments.is_some() {
+                    None
+                } else {
+                    out_envelope.text.clone()
+                };
                 if let Some(bot_id) = dl_state.add_bot_activity(conv_id, text, attachments) {
                     operator_log::info(
                         module_path!(),
