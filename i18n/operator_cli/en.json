@@ -247,5 +247,11 @@
   "cli.wizard.help.optional_options.dry_run": "  --dry-run",
   "cli.wizard.help.optional_options.offline": "  --offline",
   "cli.wizard.help.optional_options.verbose": "  --verbose",
-  "cli.wizard.help.optional_options.run_setup": "  --run-setup"
+  "cli.wizard.help.optional_options.run_setup": "  --run-setup",
+  "cli.tunnel.prompt": "Tunnel service (for external provider webhooks):",
+  "cli.tunnel.option_none": "No tunnel (local only)",
+  "cli.tunnel.option_cloudflared": "Cloudflare Tunnel (cloudflared)",
+  "cli.tunnel.option_ngrok": "ngrok",
+  "cli.tunnel.invalid_selection": "Invalid selection. Running without tunnel.",
+  "cli.tunnel.selected_none": "Running without tunnel."
 }
