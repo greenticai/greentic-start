@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use greentic_secrets_lib::{DevStore, SecretFormat, SecretsStore};
 use serde_json::Value;
 use tokio::runtime::Builder as TokioBuilder;
 
@@ -223,7 +224,7 @@ fn update_provider_public_url_secret(
     let rt = TokioBuilder::new_current_thread().enable_all().build()?;
 
     // Check if current value is different
-    let current_value = rt.block_on(secrets_handle.manager().read(&uri)).ok();
+    let current_value = read_secret_bytes(&rt, secrets_handle, &uri).ok();
     let current_url = current_value
         .as_ref()
         .and_then(|v| String::from_utf8(v.clone()).ok());
@@ -233,11 +234,32 @@ fn update_provider_public_url_secret(
         return Ok(false);
     }
 
-    // Write new value
-    rt.block_on(secrets_handle.manager().write(&uri, new_url.as_bytes()))
-        .map_err(|e| anyhow::anyhow!("failed to write secret: {:?}", e))?;
+    // `SecretsClient` is intentionally read-only, so use the writable dev store when present.
+    if let Some(path) = secrets_handle.dev_store_path.as_ref() {
+        let store = DevStore::with_path(path.clone())?;
+        rt.block_on(store.put(&uri, SecretFormat::Text, new_url.as_bytes()))
+            .map_err(|e| anyhow::anyhow!("failed to write secret: {:?}", e))?;
+    } else {
+        rt.block_on(secrets_handle.manager().write(&uri, new_url.as_bytes()))
+            .map_err(|e| anyhow::anyhow!("failed to write secret: {:?}", e))?;
+    }
 
     Ok(true)
+}
+
+fn read_secret_bytes(
+    rt: &tokio::runtime::Runtime,
+    secrets_handle: &SecretsManagerHandle,
+    uri: &str,
+) -> Result<Vec<u8>> {
+    if let Some(path) = secrets_handle.dev_store_path.as_ref() {
+        let store = DevStore::with_path(path.clone())?;
+        return rt
+            .block_on(store.get(uri))
+            .map_err(|e| anyhow::anyhow!("failed to read secret: {:?}", e));
+    }
+    rt.block_on(secrets_handle.manager().read(uri))
+        .map_err(|e| anyhow::anyhow!("failed to read secret: {:?}", e))
 }
 
 /// Update webhook for a single provider.
@@ -330,7 +352,7 @@ fn build_provider_config(
     for key in &secret_keys {
         let uri = canonical_secret_uri(&env, tenant, Some(team), provider_id, key);
 
-        match rt.block_on(secrets_handle.manager().read(&uri)) {
+        match read_secret_bytes(&rt, secrets_handle, &uri) {
             Ok(bytes) => {
                 // Try to decode as UTF-8 string first
                 if let Ok(value_str) = String::from_utf8(bytes.clone()) {
@@ -360,8 +382,13 @@ fn build_provider_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::{DetectedDomains, DiscoveryResult};
+    use crate::secrets_gate;
+    use crate::secrets_setup::resolve_env;
     use serde_json::json;
+    use std::io::Write;
     use tempfile::TempDir;
+    use tokio::runtime::Runtime;
 
     #[test]
     fn read_previous_public_url_missing_file() {
@@ -403,5 +430,180 @@ mod tests {
 
         let result = read_previous_public_url(tmp.path());
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn update_webhooks_if_url_changed_skips_non_https_unchanged_and_non_messaging_discovery() {
+        let tmp = TempDir::new().unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(tmp.path(), "demo", Some("default"))
+                .expect("secrets");
+
+        let empty = DiscoveryResult {
+            domains: DetectedDomains {
+                messaging: false,
+                events: false,
+                oauth: false,
+            },
+            providers: Vec::new(),
+        };
+        let skipped = update_webhooks_if_url_changed(
+            tmp.path(),
+            &empty,
+            &secrets_handle,
+            "demo",
+            "default",
+            None,
+            "http://example.com",
+        )
+        .expect("non-https skip");
+        assert!(skipped.results.is_empty());
+
+        let unchanged = update_webhooks_if_url_changed(
+            tmp.path(),
+            &empty,
+            &secrets_handle,
+            "demo",
+            "default",
+            Some("https://example.com"),
+            "https://example.com",
+        )
+        .expect("unchanged skip");
+        assert!(unchanged.results.is_empty());
+    }
+
+    #[test]
+    fn build_provider_config_returns_public_url_when_pack_has_no_secret_requirements() {
+        let tmp = TempDir::new().unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(tmp.path(), "demo", Some("default"))
+                .expect("secrets");
+        let pack_path = tmp.path().join("provider.gtpack");
+        let file = std::fs::File::create(&pack_path).expect("pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", zip::write::FileOptions::<()>::default())
+            .expect("manifest");
+        zip.write_all(b"a0").expect("empty cbor map");
+        zip.finish().expect("finish pack");
+
+        let config = build_provider_config(
+            tmp.path(),
+            &secrets_handle,
+            "demo",
+            "default",
+            "provider-a",
+            &pack_path,
+            "https://demo.example",
+        )
+        .expect("provider config");
+        assert_eq!(config["public_base_url"], "https://demo.example");
+        assert_eq!(config.as_object().map(|m| m.len()), Some(1));
+    }
+
+    #[test]
+    fn update_provider_public_url_secret_writes_then_detects_unchanged_value() {
+        let tmp = TempDir::new().unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(tmp.path(), "demo", Some("default")).unwrap();
+        let env = resolve_env(None);
+        let uri = secrets_gate::canonical_secret_uri(
+            &env,
+            "demo",
+            Some("default"),
+            "messaging-slack",
+            "public_base_url",
+        );
+
+        assert!(
+            update_provider_public_url_secret(
+                &secrets_handle,
+                "demo",
+                "default",
+                "messaging-slack",
+                "https://demo.example",
+            )
+            .unwrap()
+        );
+        assert!(
+            !update_provider_public_url_secret(
+                &secrets_handle,
+                "demo",
+                "default",
+                "messaging-slack",
+                "https://demo.example",
+            )
+            .unwrap()
+        );
+
+        let runtime = Runtime::new().unwrap();
+        let store = DevStore::with_path(secrets_handle.dev_store_path.clone().unwrap()).unwrap();
+        let stored = runtime.block_on(store.get(&uri)).expect("stored secret");
+        assert_eq!(String::from_utf8(stored).unwrap(), "https://demo.example");
+    }
+
+    #[test]
+    fn build_provider_config_reads_text_and_binary_secret_values() {
+        let tmp = TempDir::new().unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(tmp.path(), "demo", Some("default")).unwrap();
+        let env = resolve_env(None);
+        let runtime = Runtime::new().unwrap();
+
+        let token_uri = secrets_gate::canonical_secret_uri(
+            &env,
+            "demo",
+            Some("default"),
+            "messaging-slack",
+            "bot_token",
+        );
+        let store = DevStore::with_path(secrets_handle.dev_store_path.clone().unwrap()).unwrap();
+        runtime
+            .block_on(store.put(&token_uri, SecretFormat::Text, b"xoxb-123"))
+            .unwrap();
+
+        let cert_uri = secrets_gate::canonical_secret_uri(
+            &env,
+            "demo",
+            Some("default"),
+            "messaging-slack",
+            "cert",
+        );
+        runtime
+            .block_on(store.put(&cert_uri, SecretFormat::Bytes, &[0, 159, 146, 150]))
+            .unwrap();
+
+        let pack_path = tmp.path().join("provider.gtpack");
+        let file = std::fs::File::create(&pack_path).expect("pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "assets/secret-requirements.json",
+            zip::write::FileOptions::<()>::default(),
+        )
+        .expect("requirements");
+        zip.write_all(
+            serde_json::to_string(&json!([
+                {"key": "bot_token", "required": true},
+                {"key": "cert", "required": true}
+            ]))
+            .unwrap()
+            .as_bytes(),
+        )
+        .expect("write requirements");
+        zip.finish().expect("finish pack");
+
+        let config = build_provider_config(
+            tmp.path(),
+            &secrets_handle,
+            "demo",
+            "default",
+            "messaging-slack",
+            &pack_path,
+            "https://demo.example",
+        )
+        .unwrap();
+
+        assert_eq!(config["public_base_url"], "https://demo.example");
+        assert_eq!(config["bot_token"], "xoxb-123");
+        assert_eq!(config["cert_b64"], "AJ+Slg==");
     }
 }

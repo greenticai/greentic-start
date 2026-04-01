@@ -470,6 +470,10 @@ mod tests {
         ComponentQaSpec, QaMode as SpecQaMode, Question, QuestionKind,
     };
     use std::collections::BTreeMap;
+    use std::fs::File;
+    use std::io::Write;
+    use tempfile::tempdir;
+    use zip::write::FileOptions;
 
     #[test]
     fn shallow_schema_type_mismatch_is_reported() {
@@ -498,6 +502,36 @@ mod tests {
         });
         let message = validate_config_strict(&config, &schema).unwrap();
         assert!(message.to_ascii_lowercase().contains("token"));
+    }
+
+    #[test]
+    fn qa_mode_and_diagnostic_codes_expose_expected_strings() {
+        assert_eq!(QaMode::Default.as_str(), "default");
+        assert_eq!(QaMode::Setup.as_str(), "setup");
+        assert_eq!(QaMode::Upgrade.as_str(), "upgrade");
+        assert_eq!(QaMode::Remove.as_str(), "remove");
+
+        assert_eq!(QaDiagnosticCode::QaSpecFailed.as_str(), "OP_QA_SPEC_FAILED");
+        assert_eq!(
+            QaDiagnosticCode::QaSpecInvalid.as_str(),
+            "OP_QA_SPEC_INVALID"
+        );
+        assert_eq!(
+            QaDiagnosticCode::I18nExportMissing.as_str(),
+            "OP_I18N_EXPORT_MISSING"
+        );
+        assert_eq!(
+            QaDiagnosticCode::I18nKeyMissing.as_str(),
+            "OP_I18N_KEY_MISSING"
+        );
+        assert_eq!(
+            QaDiagnosticCode::ApplyAnswersFailed.as_str(),
+            "OP_APPLY_ANSWERS_FAILED"
+        );
+        assert_eq!(
+            QaDiagnosticCode::ConfigSchemaMismatch.as_str(),
+            "OP_CONFIG_SCHEMA_MISMATCH"
+        );
     }
 
     #[test]
@@ -557,6 +591,123 @@ mod tests {
         assert_eq!(config, json!({"token":"x"}));
     }
 
+    #[test]
+    fn extract_apply_output_falls_back_to_payload() {
+        let config = extract_config_from_apply_output(json!({"token":"x"}));
+        assert_eq!(config, json!({"token":"x"}));
+    }
+
+    #[test]
+    fn persist_answers_artifacts_writes_json_and_cbor() {
+        let dir = tempdir().expect("tempdir");
+        let answers = json!({"token":"abc","enabled":true});
+        let (json_path, cbor_path) =
+            persist_answers_artifacts(dir.path(), "provider-a", QaMode::Setup, &answers)
+                .expect("persist answers");
+
+        assert!(json_path.exists());
+        assert!(cbor_path.exists());
+        let json_value: JsonValue =
+            serde_json::from_slice(&std::fs::read(&json_path).expect("read json")).expect("json");
+        assert_eq!(json_value, answers);
+        let cbor_value: JsonValue =
+            serde_cbor::from_slice(&std::fs::read(&cbor_path).expect("read cbor")).expect("cbor");
+        assert_eq!(cbor_value, answers);
+    }
+
+    #[test]
+    fn diagnostic_display_includes_code_and_message() {
+        let diagnostic = diagnostic(
+            QaDiagnosticCode::ApplyAnswersFailed,
+            "apply failed".to_string(),
+        );
+        assert_eq!(
+            diagnostic.to_string(),
+            "OP_APPLY_ANSWERS_FAILED: apply failed"
+        );
+    }
+
+    #[test]
+    fn shallow_schema_rejects_unknown_additional_properties() {
+        let config = json!({"enabled": true, "unexpected": "value"});
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "enabled": {"type":"boolean"}
+            },
+            "additionalProperties": false
+        });
+        let message = validate_config_shallow(&config, &schema).unwrap();
+        assert!(message.contains("unknown config key `unexpected`"));
+    }
+
+    #[test]
+    fn matches_json_type_supports_integer_null_and_unknown_type() {
+        assert!(matches_json_type(&json!(3), "integer"));
+        assert!(matches_json_type(&json!(3.0), "integer"));
+        assert!(!matches_json_type(&json!(3.5), "integer"));
+        assert!(matches_json_type(&JsonValue::Null, "null"));
+        assert!(matches_json_type(&json!("value"), "custom-extension-type"));
+    }
+
+    #[test]
+    fn supports_component_qa_contract_returns_false_for_missing_manifest_or_ops() {
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.gtpack");
+        assert!(!supports_component_qa_contract(&missing).expect("missing pack"));
+
+        let no_ops = dir.path().join("no-ops.gtpack");
+        write_component_pack(
+            &no_ops,
+            &json!({
+                "schema_version": "1.0.0",
+                "pack_id": "provider-b",
+                "name": "provider-b",
+                "version": "1.0.0",
+                "kind": "provider",
+                "publisher": "tests",
+                "components": [{
+                    "id": "provider-b",
+                    "version": "1.0.0",
+                    "supports": ["provider"],
+                    "world": "greentic:component/component-v0-v6-v0@0.6.0",
+                    "profiles": {},
+                    "capabilities": { "provides": ["messaging"], "requires": [] },
+                    "configurators": null,
+                    "operations": [],
+                    "config_schema": {"type":"object"},
+                    "resources": {},
+                    "dev_flows": {}
+                }],
+                "flows": [],
+                "dependencies": [],
+                "capabilities": [],
+                "secret_requirements": [],
+                "signatures": [],
+                "extensions": {
+                    "greentic.provider-extension.v1": {
+                        "kind": "greentic.provider-extension.v1",
+                        "version": "1.0.0",
+                        "inline": {
+                            "providers": [{
+                                "provider_type": "provider-b",
+                                "capabilities": [],
+                                "ops": ["qa-spec", "i18n-keys"],
+                                "config_schema_ref": "schemas/provider-b-config.json",
+                                "runtime": {
+                                    "component_ref": "provider-b.runtime",
+                                    "export": "greentic_provider",
+                                    "world": "greentic:provider/runtime"
+                                }
+                            }]
+                        }
+                    }
+                }
+            }),
+        );
+        assert!(!supports_component_qa_contract(&no_ops).expect("missing apply-answers"));
+    }
+
     fn sample_qa_spec() -> ComponentQaSpec {
         ComponentQaSpec {
             mode: SpecQaMode::Setup,
@@ -586,5 +737,16 @@ mod tests {
             }],
             defaults: BTreeMap::new(),
         }
+    }
+
+    fn write_component_pack(path: &Path, manifest: &JsonValue) {
+        let file = File::create(path).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .expect("start manifest");
+        let bytes =
+            greentic_types::cbor::canonical::to_canonical_cbor(manifest).expect("manifest cbor");
+        zip.write_all(&bytes).expect("write manifest");
+        zip.finish().expect("finish pack");
     }
 }

@@ -209,7 +209,7 @@ fn find_url_in_text(contents: &str) -> Option<String> {
             .find(|ch: char| ch.is_whitespace() || ch == '"')
             .unwrap_or(tail.len());
         let candidate = &contents[start..start + end_offset];
-        if is_ngrok_url(candidate) {
+        if candidate.starts_with("https://") && !candidate.contains(char::is_whitespace) {
             return Some(candidate.to_string());
         }
         offset = start + "https://".len();
@@ -276,6 +276,7 @@ fn read_pid(path: &Path) -> anyhow::Result<Option<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_find_url_in_log_output() {
@@ -321,5 +322,98 @@ mod tests {
         );
         assert_eq!(parse_public_url(""), None);
         assert_eq!(parse_public_url("  "), None);
+    }
+
+    #[test]
+    fn trims_punctuation_and_ignores_non_ngrok_urls() {
+        let log = r#"see tunnel ("https://abc123.ngrok.app"), but ignore https://example.com"#;
+        assert_eq!(
+            find_url_in_text(log),
+            Some("https://abc123.ngrok.app".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_api_response_accepts_custom_https_domain() {
+        let body = r#"{"tunnels":[{"public_url":"https://chat.example.com"}]}"#;
+        assert_eq!(
+            parse_api_response(body),
+            Some("https://chat.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn find_url_in_text_accepts_custom_domains_in_explicit_url_fields() {
+        let log = r#"lvl=info msg="started tunnel" url=https://chat.example.com"#;
+        assert_eq!(
+            find_url_in_text(log),
+            Some("https://chat.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn read_pid_and_public_url_handle_missing_and_embedded_values() {
+        let dir = tempdir().expect("tempdir");
+        let pid_path = dir.path().join("ngrok.pid");
+        let url_path = dir.path().join("public_url.txt");
+
+        assert_eq!(read_pid(&pid_path).expect("missing pid"), None);
+        assert_eq!(read_public_url(&url_path).expect("missing url"), None);
+
+        std::fs::write(&pid_path, " 42 ").expect("write pid");
+        std::fs::write(
+            &url_path,
+            "started tunnel url=https://abc123.ngrok-free.app",
+        )
+        .expect("write url");
+
+        assert_eq!(read_pid(&pid_path).expect("pid"), Some(42));
+        assert_eq!(
+            read_public_url(&url_path).expect("url"),
+            Some("https://abc123.ngrok-free.app".to_string())
+        );
+    }
+
+    #[test]
+    fn public_url_path_uses_runtime_root_and_write_roundtrips() {
+        let dir = tempdir().expect("tempdir");
+        let paths = RuntimePaths::new(dir.path().join("state"), "demo", "default");
+        let url_path = public_url_path(&paths);
+        assert_eq!(
+            url_path,
+            dir.path()
+                .join("state")
+                .join("runtime")
+                .join("demo.default")
+                .join("public_base_url.txt")
+        );
+
+        write_public_url(&url_path, "https://demo.ngrok-free.app").expect("write");
+        assert_eq!(
+            read_public_url(&url_path).expect("read"),
+            Some("https://demo.ngrok-free.app".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_public_url_accepts_embedded_custom_domain() {
+        assert_eq!(
+            parse_public_url(r#"started tunnel url=https://chat.example.com"#),
+            Some("https://chat.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn discover_public_url_times_out_when_no_log_or_api_url_is_available() {
+        let dir = tempdir().expect("tempdir");
+        let log_path = dir.path().join("ngrok.log");
+        std::fs::write(&log_path, "ngrok started without url").expect("write log");
+
+        let err = discover_public_url(&log_path, Duration::from_millis(1))
+            .expect_err("missing url should fail");
+        assert!(
+            err.to_string()
+                .contains("timed out waiting for ngrok public URL")
+        );
     }
 }

@@ -198,10 +198,11 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - uses: taiki-e/install-action@v2
+      - name: Install cross via taiki-e/install-action
+        uses: taiki-e/install-action@v2
         if: ${{ matrix.use_cross == true }}
         with:
-          tool: cross
+          tool: cross@0.2.5
       - name: Build and package
         env:
           USE_CROSS: ${{ matrix.use_cross == true && '1' || '0' }}
@@ -283,7 +284,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.91.0
-      - uses: taiki-e/install-action@v2
+      - name: Install cargo-binstall via taiki-e/install-action
+        uses: taiki-e/install-action@v2
         with:
           tool: cargo-binstall@1.6.2
       - name: Verify cargo-binstall uses release assets

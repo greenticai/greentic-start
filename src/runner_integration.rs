@@ -112,3 +112,62 @@ pub fn detect_runner_flavor(runner: &Path) -> RunnerFlavor {
         RunnerFlavor::RunSubcommand
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_runner_flavor_uses_binary_name() {
+        assert_eq!(
+            detect_runner_flavor(Path::new("/tmp/greentic-runner-cli")),
+            RunnerFlavor::RunnerCli
+        );
+        assert_eq!(
+            detect_runner_flavor(Path::new("/tmp/greentic-runner")),
+            RunnerFlavor::RunSubcommand
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_flow_with_options_executes_runner_variants_and_parses_stdout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runner = dir.path().join("runner.sh");
+        let pack = dir.path().join("pack.gtpack");
+        std::fs::write(&pack, b"pack").expect("pack");
+        std::fs::write(&runner, b"#!/bin/sh\nprintf '{\"argv\":\"%s\"}' \"$*\"\n").expect("script");
+        let mut perms = std::fs::metadata(&runner).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&runner, perms).expect("chmod");
+
+        let output = run_flow_with_options(
+            &runner,
+            &pack,
+            "default",
+            &serde_json::json!({"ok": true}),
+            RunFlowOptions {
+                dist_offline: true,
+                tenant: Some("demo"),
+                team: Some("ops"),
+                artifacts_dir: Some(dir.path()),
+                runner_flavor: RunnerFlavor::RunnerCli,
+            },
+        )
+        .expect("runner cli");
+        assert!(output.status.success());
+        assert!(output.stdout.contains("--pack"));
+        assert!(output.stdout.contains("--tenant demo"));
+        assert!(output.stdout.contains("--team ops"));
+        assert!(output.stdout.contains("--artifacts-dir"));
+        assert!(output.stdout.contains("--offline"));
+
+        let output = run_flow(&runner, &pack, "default", &serde_json::json!({"ok": true}))
+            .expect("run subcommand");
+        assert!(output.status.success());
+        assert!(output.stdout.contains("run --pack"));
+        assert!(output.stdout.contains("--flow default"));
+    }
+}

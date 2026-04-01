@@ -442,3 +442,162 @@ impl DemoRunnerHost {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery;
+    use crate::secrets_gate;
+    use tempfile::tempdir;
+
+    fn empty_host() -> DemoRunnerHost {
+        let dir = tempdir().unwrap();
+        let discovery = discovery::discover(dir.path()).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
+        DemoRunnerHost::new(dir.keep(), &discovery, None, secrets_handle, false).unwrap()
+    }
+
+    #[test]
+    fn invoke_provider_op_errors_when_provider_is_missing() {
+        let host = empty_host();
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            correlation_id: None,
+        };
+
+        let err = match host.invoke_provider_op(
+            Domain::Messaging,
+            "missing-provider",
+            "ingest_http",
+            br#"{}"#,
+            &ctx,
+        ) {
+            Ok(_) => panic!("expected missing provider to fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("provider missing-provider not found")
+        );
+    }
+
+    #[cfg(unix)]
+    fn integration_host(script_body: &str) -> (DemoRunnerHost, crate::domains::ProviderPack) {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.keep();
+        let runner = root.join("greentic-runner-cli");
+        fs::write(&runner, script_body).expect("runner script");
+        let mut perms = fs::metadata(&runner).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&runner, perms).expect("chmod");
+
+        let discovery = discovery::discover(&root).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(&root, "demo", Some("default")).unwrap();
+        let host = DemoRunnerHost::new(
+            root.clone(),
+            &discovery,
+            Some(runner),
+            secrets_handle,
+            false,
+        )
+        .unwrap();
+        let pack_path = root.join("messaging-webchat.gtpack");
+        fs::write(&pack_path, b"fixture-pack").expect("pack");
+        let pack = crate::domains::ProviderPack {
+            pack_id: "messaging-webchat".to_string(),
+            display_name: None,
+            description: None,
+            tags: Vec::new(),
+            file_name: "messaging-webchat.gtpack".to_string(),
+            path: pack_path,
+            entry_flows: vec!["ingest_http".to_string()],
+        };
+        (host, pack)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn integration_runner_executes_component_ops() {
+        let (host, pack) = integration_host("#!/bin/sh\nprintf '{\"integration\":true}'\n");
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            correlation_id: Some("corr-1".to_string()),
+        };
+
+        let component = host
+            .invoke_provider_component_op_direct(
+                Domain::Messaging,
+                &pack,
+                "messaging-webchat",
+                "custom-op",
+                br#"{"hello":"world"}"#,
+                &ctx,
+            )
+            .unwrap();
+        assert!(component.success);
+        assert_eq!(component.mode, RunnerExecutionMode::Integration);
+        assert_eq!(
+            component.output,
+            Some(serde_json::json!({"integration": true}))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn integration_runner_propagates_stderr_on_failure() {
+        let (host, pack) = integration_host("#!/bin/sh\necho 'runner failed' 1>&2\nexit 7\n");
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            correlation_id: None,
+        };
+
+        let outcome = host
+            .invoke_provider_component_op_direct(
+                Domain::Messaging,
+                &pack,
+                "messaging-webchat",
+                "custom-op",
+                br#"{}"#,
+                &ctx,
+            )
+            .unwrap();
+        assert!(!outcome.success);
+        assert_eq!(outcome.mode, RunnerExecutionMode::Integration);
+        assert_eq!(outcome.raw, None);
+        assert!(outcome.error.unwrap_or_default().contains("runner failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn integration_runner_preserves_non_json_stdout_as_raw_output() {
+        let (host, pack) = integration_host("#!/bin/sh\nprintf 'plain stdout'\n");
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            correlation_id: None,
+        };
+
+        let outcome = host
+            .invoke_provider_component_op_direct(
+                Domain::Messaging,
+                &pack,
+                "messaging-webchat",
+                "custom-op",
+                br#"{}"#,
+                &ctx,
+            )
+            .unwrap();
+        assert!(outcome.success);
+        assert_eq!(outcome.mode, RunnerExecutionMode::Integration);
+        assert_eq!(outcome.output, None);
+        assert_eq!(outcome.raw.as_deref(), Some("plain stdout"));
+    }
+}

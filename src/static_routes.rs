@@ -650,6 +650,8 @@ pub fn content_type_for_path(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn active_route_table_matches_placeholders() {
@@ -683,5 +685,201 @@ mod tests {
         assert!(reserved.conflicts_with("/v3/directline/conversations"));
         assert!(reserved.conflicts_with("/token"));
         assert!(!reserved.conflicts_with("/v1/web/webchat/demo"));
+    }
+
+    #[test]
+    fn route_helpers_handle_indexes_cache_and_fallbacks() {
+        let descriptor = StaticRouteDescriptor {
+            route_id: "tenant-gui".into(),
+            pack_id: "web".into(),
+            pack_path: PathBuf::from("web.gtpack"),
+            public_path: "/v1/web/webchat/{tenant}".into(),
+            source_root: "assets/webchat".into(),
+            index_file: Some("index.html".into()),
+            spa_fallback: Some("index.html".into()),
+            tenant_scoped: true,
+            team_scoped: false,
+            cache_strategy: CacheStrategy::PublicMaxAge {
+                max_age_seconds: 300,
+            },
+            route_segments: parse_route_segments("/v1/web/webchat/{tenant}").expect("segments"),
+        };
+        let directory_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: String::new(),
+            request_is_directory: true,
+        };
+        assert_eq!(
+            resolve_asset_path(&directory_match),
+            Some("index.html".to_string())
+        );
+        assert_eq!(
+            fallback_asset_path(&directory_match),
+            Some("index.html".to_string())
+        );
+        assert_eq!(
+            cache_control_value(&descriptor.cache_strategy),
+            Some("public, max-age=300".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_relative_asset_path_rejects_parent_and_root_segments() {
+        assert_eq!(
+            normalize_relative_asset_path("./assets/../index.html"),
+            None
+        );
+        assert_eq!(normalize_relative_asset_path("/etc/passwd"), None);
+        assert_eq!(
+            normalize_relative_asset_path("assets/./index.html"),
+            Some("assets/index.html".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_route_segments_rejects_invalid_team_placement() {
+        assert!(parse_route_segments("/").is_err());
+        assert!(parse_route_segments("/{team}/dashboard").is_err());
+        assert!(parse_route_segments("/{team}/{tenant}").is_err());
+        assert!(parse_route_segments("/v1/{tenant}/bad{segment}").is_err());
+    }
+
+    #[test]
+    fn normalize_route_descriptor_rejects_inconsistent_scope_flags() {
+        let err = normalize_route_descriptor(
+            "web",
+            Path::new("/tmp/web.gtpack"),
+            0,
+            StaticRouteRecord {
+                id: Some("route".to_string()),
+                public_path: "/web/{tenant}".to_string(),
+                source_root: "assets/web".to_string(),
+                index_file: None,
+                spa_fallback: None,
+                tenant: false,
+                team: false,
+                scope: Some(StaticRouteScopeRecord::default()),
+                cache: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("inconsistent tenant flag"));
+    }
+
+    #[test]
+    fn normalize_cache_strategy_validates_supported_values() {
+        let none = normalize_cache_strategy(None, Path::new("/tmp/web.gtpack"), Some("route"))
+            .expect("none");
+        assert_eq!(none, CacheStrategy::None);
+
+        let cache = StaticRouteCacheRecord {
+            strategy: "public-max-age".to_string(),
+            max_age_seconds: Some(60),
+        };
+        assert_eq!(
+            normalize_cache_strategy(Some(&cache), Path::new("/tmp/web.gtpack"), Some("route"))
+                .expect("cache"),
+            CacheStrategy::PublicMaxAge {
+                max_age_seconds: 60
+            }
+        );
+
+        let err = normalize_cache_strategy(
+            Some(&StaticRouteCacheRecord {
+                strategy: "public-max-age".to_string(),
+                max_age_seconds: None,
+            }),
+            Path::new("/tmp/web.gtpack"),
+            Some("route"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("without max_age_seconds"));
+    }
+
+    #[test]
+    fn validate_plan_reports_reserved_duplicate_and_overlap_paths() {
+        let mut plan = StaticRoutePlan {
+            routes: vec![
+                StaticRouteDescriptor {
+                    route_id: "a".into(),
+                    pack_id: "web".into(),
+                    pack_path: PathBuf::from("a.gtpack"),
+                    public_path: "/runtime".into(),
+                    source_root: "assets/a".into(),
+                    index_file: None,
+                    spa_fallback: None,
+                    tenant_scoped: false,
+                    team_scoped: false,
+                    cache_strategy: CacheStrategy::None,
+                    route_segments: parse_route_segments("/runtime").expect("segments"),
+                },
+                StaticRouteDescriptor {
+                    route_id: "b".into(),
+                    pack_id: "web".into(),
+                    pack_path: PathBuf::from("b.gtpack"),
+                    public_path: "/web/app".into(),
+                    source_root: "assets/b".into(),
+                    index_file: None,
+                    spa_fallback: None,
+                    tenant_scoped: false,
+                    team_scoped: false,
+                    cache_strategy: CacheStrategy::None,
+                    route_segments: parse_route_segments("/web/app").expect("segments"),
+                },
+                StaticRouteDescriptor {
+                    route_id: "c".into(),
+                    pack_id: "web".into(),
+                    pack_path: PathBuf::from("c.gtpack"),
+                    public_path: "/web/app/dashboard".into(),
+                    source_root: "assets/c".into(),
+                    index_file: None,
+                    spa_fallback: None,
+                    tenant_scoped: false,
+                    team_scoped: false,
+                    cache_strategy: CacheStrategy::None,
+                    route_segments: parse_route_segments("/web/app/dashboard").expect("segments"),
+                },
+            ],
+            warnings: Vec::new(),
+            blocking_failures: Vec::new(),
+        };
+
+        validate_plan(&mut plan, &ReservedRouteSet::operator_defaults());
+
+        assert!(
+            plan.blocking_failures
+                .iter()
+                .any(|value| value.contains("reserved operator path space"))
+        );
+        assert!(
+            plan.blocking_failures
+                .iter()
+                .any(|value| value.contains("overlap ambiguously"))
+        );
+    }
+
+    #[test]
+    fn path_utilities_handle_prefixes_and_normalization() {
+        assert!(paths_overlap("/web", "/web/app"));
+        assert!(path_has_prefix("/web/app", "/web"));
+        assert!(!path_has_prefix("/websocket", "/web"));
+        assert_eq!(normalize_public_path(" web/app/ "), "/web/app");
+    }
+
+    #[test]
+    fn read_pack_asset_bytes_reads_from_directory_packs() {
+        let dir = tempdir().expect("tempdir");
+        let asset_dir = dir.path().join("assets").join("web");
+        fs::create_dir_all(&asset_dir).expect("mkdir");
+        let asset_path = asset_dir.join("index.html");
+        fs::write(&asset_path, "<html>ok</html>").expect("write asset");
+
+        let bytes = read_pack_asset_bytes(dir.path(), "assets/web/index.html").expect("read asset");
+        assert_eq!(bytes, Some(b"<html>ok</html>".to_vec()));
+        assert_eq!(
+            read_pack_asset_bytes(dir.path(), "assets/web/missing.html").expect("missing"),
+            None
+        );
+        assert_eq!(content_type_for_path("site/app.woff2"), "font/woff2");
     }
 }

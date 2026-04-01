@@ -128,3 +128,64 @@ fn write_file(path: &Path, contents: &str) -> anyhow::Result<()> {
     std::fs::write(path, contents)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn upsert_policy_creates_and_sorts_plain_rule_files() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("tenant.gmap");
+
+        upsert_policy(&path, "pack/flow", Policy::Public).expect("insert");
+        upsert_policy(&path, "_", Policy::Forbidden).expect("insert wildcard");
+        upsert_policy(&path, "pack", Policy::Forbidden).expect("insert pack");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read gmap"),
+            "_ = forbidden\npack = forbidden\npack/flow = public\n"
+        );
+    }
+
+    #[test]
+    fn upsert_policy_preserves_comments_and_updates_existing_lines() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("tenant.gmap");
+        std::fs::write(
+            &path,
+            "# comment\n\npack/flow = forbidden\npack/other = public\n",
+        )
+        .expect("seed file");
+
+        upsert_policy(&path, "pack/flow", Policy::Public).expect("update");
+        upsert_policy(&path, "pack/new", Policy::Forbidden).expect("append");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read gmap"),
+            "# comment\n\npack/flow = public\npack/other = public\n\npack/new = forbidden\n"
+        );
+    }
+
+    #[test]
+    fn helpers_cover_rendering_and_comment_detection() {
+        assert!(contains_comments_or_blanks("# comment\npack = public\n"));
+        assert!(!contains_comments_or_blanks(
+            "pack = public\npack/flow = forbidden\n"
+        ));
+        assert_eq!(policy_string(&Policy::Public), "public");
+        assert_eq!(policy_string(&Policy::Forbidden), "forbidden");
+
+        let rendered = render_rules(&[super::super::GmapRule {
+            path: GmapPath {
+                pack: Some("pack".to_string()),
+                flow: Some("flow".to_string()),
+                node: None,
+            },
+            policy: Policy::Public,
+            line: 1,
+        }]);
+        assert_eq!(rendered, "pack/flow = public\n");
+    }
+}

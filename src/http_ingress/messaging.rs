@@ -232,3 +232,239 @@ fn run_app_flow_safe(
 }
 
 use anyhow::Context;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::messaging_app::{AppFlowInfo, AppPackInfo};
+    use crate::secrets_gate;
+    use tempfile::tempdir;
+    use zip::write::FileOptions;
+
+    fn envelope() -> ChannelMessageEnvelope {
+        serde_json::from_value(json!({
+            "id": "msg-1",
+            "tenant": {
+                "env": "dev",
+                "tenant": "demo",
+                "tenant_id": "demo",
+                "team": "default",
+                "attempt": 0
+            },
+            "channel": "conv-1",
+            "session_id": "conv-1",
+            "from": {
+                "id": "user-1",
+                "kind": "user"
+            },
+            "text": "hello",
+            "metadata": {}
+        }))
+        .expect("envelope")
+    }
+
+    fn write_test_app_pack(pack_path: &Path) {
+        use greentic_types::pack_manifest::{
+            PackFlowEntry, PackKind, PackManifest, PackSignatures,
+        };
+        use greentic_types::{Flow, FlowId, FlowKind, PackId};
+        use semver::Version;
+
+        let file = std::fs::File::create(pack_path).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .expect("start manifest");
+        let flow = Flow {
+            schema_version: "flow-v1".to_string(),
+            id: FlowId::new("default").expect("flow id"),
+            kind: FlowKind::Messaging,
+            entrypoints: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                serde_json::Value::Null,
+            )]),
+            nodes: Default::default(),
+            metadata: Default::default(),
+        };
+        let manifest = PackManifest {
+            schema_version: "pack-v1".into(),
+            pack_id: PackId::new("demo-app").expect("pack id"),
+            name: Some("demo-app".into()),
+            version: Version::parse("0.1.0").expect("version"),
+            kind: PackKind::Application,
+            publisher: "demo".into(),
+            components: Vec::new(),
+            flows: vec![PackFlowEntry {
+                id: FlowId::new("default").expect("flow id"),
+                kind: FlowKind::Messaging,
+                flow,
+                tags: vec!["default".to_string()],
+                entrypoints: vec!["default".to_string()],
+            }],
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            secret_requirements: Vec::new(),
+            signatures: PackSignatures::default(),
+            bootstrap: None,
+            extensions: None,
+        };
+        let bytes = greentic_types::encode_pack_manifest(&manifest).expect("encode manifest");
+        zip.write_all(&bytes).expect("write manifest");
+        zip.start_file("assets/cards/welcome.json", FileOptions::<()>::default())
+            .expect("start card");
+        zip.write_all(br#"{"body":[{"text":"Welcome card"}]}"#)
+            .expect("write card");
+        zip.finish().expect("finish pack");
+    }
+
+    #[test]
+    fn read_card_from_pack_loads_card_assets_and_handles_missing_cards() {
+        let dir = tempdir().expect("tempdir");
+        let pack_path = dir.path().join("app.gtpack");
+        let file = std::fs::File::create(&pack_path).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("assets/cards/welcome.json", FileOptions::<()>::default())
+            .expect("start file");
+        zip.write_all(br#"{"body":[{"text":"Welcome card"}]}"#)
+            .expect("write card");
+        zip.finish().expect("finish pack");
+
+        let card = read_card_from_pack(&pack_path, "welcome").expect("card");
+        assert_eq!(card["body"][0]["text"], "Welcome card");
+        assert!(read_card_from_pack(&pack_path, "missing").is_none());
+    }
+
+    #[test]
+    fn run_app_flow_safe_falls_back_to_original_envelope_on_errors() {
+        let dir = tempdir().expect("tempdir");
+        let original = envelope();
+        let outputs = run_app_flow_safe(
+            dir.path(),
+            &OperatorContext {
+                tenant: "demo".to_string(),
+                team: Some("default".to_string()),
+                correlation_id: None,
+            },
+            &dir.path().join("missing.gtpack"),
+            &AppPackInfo {
+                pack_id: "app-pack".to_string(),
+                flows: vec![],
+            },
+            &AppFlowInfo {
+                id: "default".to_string(),
+                kind: "messaging".to_string(),
+            },
+            &original,
+        );
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].id, original.id);
+        assert_eq!(outputs[0].text, original.text);
+    }
+
+    #[test]
+    fn read_card_from_pack_rejects_invalid_card_json() {
+        let dir = tempdir().expect("tempdir");
+        let pack_path = dir.path().join("app.gtpack");
+        let file = std::fs::File::create(&pack_path).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("assets/cards/broken.json", FileOptions::<()>::default())
+            .expect("start file");
+        zip.write_all(b"{not-json").expect("write broken card");
+        zip.finish().expect("finish pack");
+
+        assert!(read_card_from_pack(&pack_path, "broken").is_none());
+    }
+
+    #[test]
+    fn route_messaging_envelopes_errors_when_no_app_pack_is_available() {
+        let dir = tempdir().expect("tempdir");
+        let discovery = crate::discovery::discover(dir.path()).expect("discovery");
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
+                .expect("secrets");
+        let runner_host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )
+        .expect("runner host");
+
+        let err = route_messaging_envelopes(
+            dir.path(),
+            &runner_host,
+            "messaging-webchat",
+            &OperatorContext {
+                tenant: "demo".to_string(),
+                team: Some("default".to_string()),
+                correlation_id: None,
+            },
+            vec![envelope()],
+            None,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("resolve app pack"));
+    }
+
+    #[test]
+    fn route_messaging_envelopes_injects_directline_card_reply_without_egress() {
+        let dir = tempdir().expect("tempdir");
+        let packs_dir = dir.path().join("packs");
+        std::fs::create_dir_all(&packs_dir).expect("packs dir");
+        let app_pack = packs_dir.join("default.gtpack");
+        write_test_app_pack(&app_pack);
+
+        let discovery = crate::discovery::discover(dir.path()).expect("discovery");
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
+                .expect("secrets");
+        let runner_host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )
+        .expect("runner host");
+        let dl_state = crate::directline::DirectLineState::new();
+        assert!(dl_state.create_conversation("conv-1"));
+
+        let mut card_routed = envelope();
+        card_routed
+            .metadata
+            .insert("routeToCardId".to_string(), "welcome".to_string());
+
+        route_messaging_envelopes(
+            dir.path(),
+            &runner_host,
+            "messaging-webchat-gui",
+            &OperatorContext {
+                tenant: "demo".to_string(),
+                team: Some("default".to_string()),
+                correlation_id: None,
+            },
+            vec![card_routed],
+            Some((&dl_state, "conv-1")),
+        )
+        .expect("route envelopes");
+
+        let (activities, watermark) = dl_state
+            .get_activities("conv-1", None)
+            .expect("directline activities");
+        assert_eq!(watermark, "1");
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0]["text"], "Welcome card");
+        assert_eq!(
+            activities[0]["attachments"][0]["contentType"],
+            "application/vnd.microsoft.card.adaptive"
+        );
+        assert_eq!(
+            activities[0]["attachments"][0]["content"]["body"][0]["text"],
+            "Welcome card"
+        );
+    }
+
+    use std::io::Write;
+}

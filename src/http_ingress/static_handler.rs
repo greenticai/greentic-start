@@ -104,3 +104,122 @@ fn serve_static_asset(
         .map_err(|err| anyhow::anyhow!("build static response: {err}"))?;
     Ok(Some(response))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::static_routes::{
+        CacheStrategy, RouteScopeSegment, StaticRouteDescriptor, StaticRouteMatch,
+    };
+    use http_body_util::BodyExt;
+    use tempfile::tempdir;
+
+    fn descriptor(pack_path: &Path) -> StaticRouteDescriptor {
+        StaticRouteDescriptor {
+            route_id: "web".to_string(),
+            pack_id: "web".to_string(),
+            pack_path: pack_path.to_path_buf(),
+            public_path: "/web".to_string(),
+            source_root: "site".to_string(),
+            index_file: Some("index.html".to_string()),
+            spa_fallback: Some("index.html".to_string()),
+            tenant_scoped: false,
+            team_scoped: false,
+            cache_strategy: CacheStrategy::PublicMaxAge {
+                max_age_seconds: 60,
+            },
+            route_segments: vec![RouteScopeSegment::Literal("web".to_string())],
+        }
+    }
+
+    #[test]
+    fn serve_static_route_redirects_directory_requests_without_trailing_slash() {
+        let dir = tempdir().expect("tempdir");
+        let descriptor = descriptor(dir.path());
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: String::new(),
+            request_is_directory: false,
+        };
+
+        let response = serve_static_route(&route_match, dir.path(), "/web");
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(response.headers()["Location"], "/web/");
+    }
+
+    #[test]
+    fn serve_static_route_prefers_bundle_overlay_assets() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let bundle = tempdir().expect("tempdir");
+        let pack = tempdir().expect("tempdir");
+        std::fs::create_dir_all(bundle.path().join("site")).expect("mkdir");
+        std::fs::create_dir_all(pack.path().join("site")).expect("mkdir");
+        std::fs::write(bundle.path().join("site").join("app.js"), "overlay").expect("overlay");
+        std::fs::write(pack.path().join("site").join("app.js"), "pack").expect("pack");
+
+        let descriptor = descriptor(pack.path());
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: "app.js".to_string(),
+            request_is_directory: false,
+        };
+
+        let response = serve_static_route(&route_match, bundle.path(), "/web/app.js");
+        let body = runtime.block_on(async {
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+        });
+        assert_eq!(body, Bytes::from_static(b"overlay"));
+    }
+
+    #[test]
+    fn serve_static_route_uses_spa_fallback_when_asset_missing() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("site")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("site").join("index.html"),
+            "<html>ok</html>",
+        )
+        .expect("index");
+
+        let descriptor = descriptor(dir.path());
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: "missing/path".to_string(),
+            request_is_directory: false,
+        };
+
+        let response = serve_static_route(&route_match, dir.path(), "/web/missing/path");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
+        assert_eq!(response.headers()[CACHE_CONTROL], "public, max-age=60");
+        let body = runtime.block_on(async {
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+        });
+        assert!(String::from_utf8_lossy(&body).contains("<html>ok</html>"));
+    }
+
+    #[test]
+    fn serve_static_route_rejects_missing_assets() {
+        let dir = tempdir().expect("tempdir");
+        let descriptor = descriptor(dir.path());
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: "missing.js".to_string(),
+            request_is_directory: false,
+        };
+
+        let response = serve_static_route(&route_match, dir.path(), "/web/missing.js");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}

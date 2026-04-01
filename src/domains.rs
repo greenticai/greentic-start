@@ -674,7 +674,8 @@ fn build_pack_meta(manifest: &PackManifest, path: &Path) -> PackMeta {
         .clone()
         .filter(|value| !value.trim().is_empty())
         .or_else(|| manifest.pack_id.clone())
-        .or_else(|| manifest.meta.as_ref().map(|meta| meta.pack_id.clone()));
+        .or_else(|| manifest.meta.as_ref().map(|meta| meta.pack_id.clone()))
+        .or_else(|| Some(pack_id.clone()));
     let description = manifest
         .description
         .clone()
@@ -1021,6 +1022,126 @@ mod tests {
         let packs = discover_provider_packs(temp.path(), Domain::Messaging).expect("discover");
         assert_eq!(packs.len(), 1);
         assert_eq!(packs[0].pack_id, "messaging-webchat");
+    }
+
+    #[test]
+    fn validator_pack_path_matches_domain_layout() {
+        let temp = tempdir().expect("tempdir");
+        let validator = temp
+            .path()
+            .join("validators")
+            .join("messaging")
+            .join("validators-messaging.gtpack");
+        fs::create_dir_all(validator.parent().expect("parent")).expect("mkdir");
+        fs::write(&validator, "").expect("write validator");
+
+        assert_eq!(
+            validator_pack_path(temp.path(), Domain::Messaging),
+            Some(validator)
+        );
+        assert_eq!(validator_pack_path(temp.path(), Domain::OAuth), None);
+    }
+
+    #[test]
+    fn plan_runs_matches_provider_filter_and_verify_flows() {
+        let pack = ProviderPack {
+            pack_id: "messaging-webchat".to_string(),
+            display_name: Some("Messaging Webchat".to_string()),
+            description: None,
+            tags: vec![],
+            file_name: "messaging-webchat.gtpack".to_string(),
+            path: PathBuf::from("/tmp/messaging-webchat.gtpack"),
+            entry_flows: vec!["verify_webhooks".to_string(), "setup_default".to_string()],
+        };
+
+        let plan = plan_runs(
+            Domain::Messaging,
+            DomainAction::Verify,
+            &[pack],
+            Some("webchat"),
+            false,
+        )
+        .expect("plan");
+
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].flow_id, "verify_webhooks");
+        assert_eq!(plan[0].pack.pack_id, "messaging-webchat");
+    }
+
+    #[test]
+    fn setup_plan_requires_missing_flow_unless_explicitly_allowed() {
+        let pack = ProviderPack {
+            pack_id: "messaging-webchat".to_string(),
+            display_name: None,
+            description: None,
+            tags: vec![],
+            file_name: "messaging-webchat.gtpack".to_string(),
+            path: PathBuf::from("/tmp/messaging-webchat.gtpack"),
+            entry_flows: vec!["diagnostics".to_string()],
+        };
+
+        let err = plan_runs(
+            Domain::Messaging,
+            DomainAction::Setup,
+            std::slice::from_ref(&pack),
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Missing required flow 'setup_default'")
+        );
+
+        let plan = plan_runs(Domain::Messaging, DomainAction::Setup, &[pack], None, true)
+            .expect("allowed missing setup");
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn build_pack_meta_falls_back_to_flow_and_filename_information() {
+        let manifest = PackManifest {
+            name: Some("".to_string()),
+            description: Some("  ".to_string()),
+            meta: None,
+            pack_id: None,
+            flows: vec![PackFlow {
+                id: "setup_default".to_string(),
+                entrypoints: vec!["verify_webhooks".to_string()],
+                tags: vec!["default".to_string(), "".to_string()],
+            }],
+        };
+
+        let meta = build_pack_meta(&manifest, Path::new("/tmp/messaging-webchat.gtpack"));
+        assert_eq!(meta.pack_id, "messaging-webchat");
+        assert_eq!(meta.display_name.as_deref(), Some("messaging-webchat"));
+        assert_eq!(meta.entry_flows, vec!["setup_default", "verify_webhooks"]);
+        assert_eq!(meta.tags, vec!["default"]);
+        assert_eq!(meta.description, None);
+    }
+
+    #[test]
+    fn manifest_string_type_mismatch_reports_precise_path() {
+        let value = CborValue::Map(
+            [(
+                CborValue::Text("meta".to_string()),
+                CborValue::Map(
+                    [(
+                        CborValue::Text("entry_flows".to_string()),
+                        CborValue::Array(vec![CborValue::Bool(true)]),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        assert_eq!(
+            find_manifest_string_type_mismatch(&value).as_deref(),
+            Some("meta.entry_flows[0]")
+        );
     }
 
     fn write_test_gtpack(path: &Path, pack_id: &str, entry_flows: &[&str]) {

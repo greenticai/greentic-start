@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Method, Request, Response, StatusCode,
-    body::{Bytes, Incoming},
+    body::{Body, Bytes},
     server::conn::http1::Builder as Http1Builder,
     service::service_fn,
 };
@@ -206,10 +206,14 @@ struct HttpIngressState {
     dl_state: crate::directline::DirectLineState,
 }
 
-async fn handle_request(
-    req: Request<Incoming>,
+async fn handle_request<B>(
+    req: Request<B>,
     state: Arc<HttpIngressState>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<Full<Bytes>>, Infallible>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
     let response = match handle_request_inner(req, state).await {
         Ok(response) => with_cors(response),
         Err(response) => with_cors(response),
@@ -217,10 +221,14 @@ async fn handle_request(
     Ok(response)
 }
 
-async fn handle_request_inner(
-    req: Request<Incoming>,
+async fn handle_request_inner<B>(
+    req: Request<B>,
     state: Arc<HttpIngressState>,
-) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
     if req.method() == Method::OPTIONS {
         return Ok(cors_preflight_response());
     }
@@ -452,8 +460,62 @@ async fn handle_request_inner(
 #[cfg(test)]
 mod tests {
     use super::helpers::{handle_builtin_health_request, parse_route_segments};
+    use super::*;
     use crate::domains::Domain;
-    use hyper::{Method, StatusCode};
+    use crate::secrets_gate;
+    use crate::static_routes::{
+        ActiveRouteTable, CacheStrategy, RouteScopeSegment, StaticRouteDescriptor, StaticRoutePlan,
+    };
+    use http_body_util::{BodyExt, Full};
+    use hyper::{Method, Request, StatusCode, body::Bytes};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::runtime::Runtime;
+
+    fn test_state(domains: Vec<Domain>) -> Arc<HttpIngressState> {
+        let dir = tempdir().unwrap();
+        let discovery = crate::discovery::discover(dir.path()).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(
+                dir.path().to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+            )
+            .unwrap(),
+        );
+        Arc::new(HttpIngressState {
+            runner_host,
+            domains,
+            active_route_table: ActiveRouteTable::default(),
+            dl_state: crate::directline::DirectLineState::new(),
+        })
+    }
+
+    fn empty_request(method: Method, path: &str) -> Request<Full<Bytes>> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Full::from(Bytes::new()))
+            .unwrap()
+    }
+
+    fn body_request(method: Method, path: &str, body: &str) -> Request<Full<Bytes>> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Full::from(Bytes::from(body.to_string())))
+            .unwrap()
+    }
+
+    async fn response_json(response: Response<Full<Bytes>>) -> serde_json::Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
 
     #[test]
     fn parses_v1_route_with_optional_segments() {
@@ -481,5 +543,244 @@ mod tests {
                 handle_builtin_health_request(&Method::GET, path).expect("builtin response");
             assert_eq!(response.status(), StatusCode::OK);
         }
+    }
+
+    #[test]
+    fn handle_request_inner_rejects_options_and_invalid_methods() {
+        let runtime = Runtime::new().unwrap();
+        let state = test_state(vec![Domain::Events]);
+
+        let options = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::OPTIONS, "/v1/events/ingress/p/demo"),
+                state.clone(),
+            ))
+            .unwrap();
+        assert_eq!(options.status(), StatusCode::NO_CONTENT);
+
+        let invalid_method = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::PUT, "/v1/events/ingress/p/demo"),
+                state,
+            ))
+            .unwrap_err();
+        assert_eq!(invalid_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn handle_request_inner_covers_bad_route_disabled_domain_and_missing_handler() {
+        let runtime = Runtime::new().unwrap();
+
+        let bad_route = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::GET, "/v1/events/not-ingress"),
+                test_state(vec![Domain::Events]),
+            ))
+            .unwrap_err();
+        assert_eq!(bad_route.status(), StatusCode::BAD_REQUEST);
+
+        let domain_disabled = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::GET, "/v1/events/ingress/provider-a/demo"),
+                test_state(vec![Domain::Messaging]),
+            ))
+            .unwrap_err();
+        assert_eq!(domain_disabled.status(), StatusCode::NOT_FOUND);
+
+        let no_handler = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::GET, "/v1/events/ingress/provider-a/demo"),
+                test_state(vec![Domain::Events]),
+            ))
+            .unwrap_err();
+        assert_eq!(no_handler.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn handle_request_inner_routes_onboard_oauth_and_directline_paths() {
+        let runtime = Runtime::new().unwrap();
+
+        let onboard = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::GET, "/api/onboard/unknown"),
+                test_state(vec![Domain::Messaging]),
+            ))
+            .unwrap_err();
+        assert_eq!(onboard.status(), StatusCode::NOT_FOUND);
+
+        let oauth_invalid_json = runtime
+            .block_on(handle_request_inner(
+                body_request(
+                    Method::POST,
+                    "/v1/messaging/webchat/demo/oauth/token-exchange",
+                    "{not-json",
+                ),
+                test_state(vec![Domain::Messaging]),
+            ))
+            .unwrap_err();
+        assert_eq!(oauth_invalid_json.status(), StatusCode::BAD_REQUEST);
+
+        let oauth_missing_url = runtime
+            .block_on(handle_request_inner(
+                body_request(
+                    Method::POST,
+                    "/v1/messaging/webchat/demo/oauth/token-exchange",
+                    "{}",
+                ),
+                test_state(vec![Domain::Messaging]),
+            ))
+            .unwrap_err();
+        assert_eq!(oauth_missing_url.status(), StatusCode::BAD_REQUEST);
+
+        let legacy_directline = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::GET, "/token"),
+                test_state(vec![]),
+            ))
+            .unwrap_err();
+        assert_eq!(legacy_directline.status(), StatusCode::NOT_FOUND);
+
+        let webchat_directline = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::GET, "/v1/messaging/webchat/demo/token"),
+                test_state(vec![]),
+            ))
+            .unwrap_err();
+        assert_eq!(webchat_directline.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn handle_request_wraps_errors_with_cors_headers() {
+        let runtime = Runtime::new().unwrap();
+        let response = runtime
+            .block_on(handle_request(
+                empty_request(Method::PUT, "/v1/events/ingress/provider-a/demo"),
+                test_state(vec![Domain::Events]),
+            ))
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body = runtime.block_on(response_json(response));
+        assert_eq!(body["success"], false);
+    }
+
+    #[test]
+    fn handle_request_wraps_success_with_cors_headers() {
+        let runtime = Runtime::new().unwrap();
+        let response = runtime
+            .block_on(handle_request(
+                empty_request(Method::GET, "/healthz"),
+                test_state(vec![Domain::Events]),
+            ))
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .contains_key("access-control-allow-origin")
+        );
+    }
+
+    #[test]
+    fn handle_request_inner_short_circuits_builtin_health_routes() {
+        let runtime = Runtime::new().unwrap();
+        let response = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::GET, "/readyz"),
+                test_state(vec![]),
+            ))
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = runtime.block_on(response_json(response));
+        assert_eq!(body["status"], "ready");
+    }
+
+    #[test]
+    fn http_ingress_server_starts_and_stops_without_static_routes() {
+        let dir = tempdir().unwrap();
+        let discovery = crate::discovery::discover(dir.path()).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(
+                dir.path().to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let server = HttpIngressServer::start(HttpIngressConfig {
+            bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            domains: vec![Domain::Messaging],
+            runner_host,
+            enable_static_routes: false,
+            tenant: "demo".to_string(),
+        })
+        .expect("start ingress server");
+
+        assert!(server.webchat_urls.is_empty());
+        server.stop().expect("stop ingress server");
+    }
+
+    #[test]
+    fn handle_request_inner_serves_static_routes_before_ingress_dispatch() {
+        let runtime = Runtime::new().unwrap();
+        let dir = tempdir().unwrap();
+        let discovery = crate::discovery::discover(dir.path()).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(
+                dir.path().to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+            )
+            .unwrap(),
+        );
+
+        std::fs::create_dir_all(dir.path().join("site")).unwrap();
+        std::fs::write(
+            dir.path().join("site").join("index.html"),
+            "<html>ok</html>",
+        )
+        .unwrap();
+        let route = StaticRouteDescriptor {
+            route_id: "web".to_string(),
+            pack_id: "web".to_string(),
+            pack_path: dir.path().to_path_buf(),
+            public_path: "/web".to_string(),
+            source_root: "site".to_string(),
+            index_file: Some("index.html".to_string()),
+            spa_fallback: Some("index.html".to_string()),
+            tenant_scoped: false,
+            team_scoped: false,
+            cache_strategy: CacheStrategy::None,
+            route_segments: vec![RouteScopeSegment::Literal("web".to_string())],
+        };
+        let state = Arc::new(HttpIngressState {
+            runner_host,
+            domains: vec![],
+            active_route_table: ActiveRouteTable::from_plan(&StaticRoutePlan {
+                routes: vec![route],
+                warnings: vec![],
+                blocking_failures: vec![],
+            }),
+            dl_state: crate::directline::DirectLineState::new(),
+        });
+
+        let response = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::GET, "/web/"),
+                state,
+            ))
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body =
+            runtime.block_on(async { response.into_body().collect().await.unwrap().to_bytes() });
+        assert!(String::from_utf8_lossy(&body).contains("<html>ok</html>"));
     }
 }

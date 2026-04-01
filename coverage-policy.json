@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "global": {
+    "line_coverage_min": 60.0
+  },
+  "defaults": {
+    "per_file_line_coverage_min": 60.0
+  },
+  "exclusions": {
+    "files": [
+      "src/main.rs"
+    ]
+  },
+  "per_file": {
+    "src/runner_host/token_validation.rs": {
+      "line_coverage_min": 85.0
+    },
+    "src/secrets_manager.rs": {
+      "line_coverage_min": 80.0
+    },
+    "src/admin_server.rs": {
+      "line_coverage_min": 75.0
+    },
+    "src/http_ingress/directline_handler.rs": {
+      "line_coverage_min": 75.0
+    }
+  }
+}

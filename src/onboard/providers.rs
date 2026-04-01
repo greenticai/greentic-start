@@ -318,3 +318,256 @@ fn capitalize(s: &str) -> String {
         None => String::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery;
+    use crate::runner_host::DemoRunnerHost;
+    use crate::secrets_gate;
+    use http_body_util::BodyExt;
+    use std::fs;
+    use std::io::Write;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::runtime::Runtime;
+    use zip::{ZipWriter, write::FileOptions};
+
+    fn test_state(root: &std::path::Path) -> OnboardState {
+        let discovery = discovery::discover(root).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(root, "demo", Some("default")).unwrap();
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(root.to_path_buf(), &discovery, None, secrets_handle, false)
+                .unwrap(),
+        );
+        OnboardState { runner_host }
+    }
+
+    fn response_json(result: OnboardResult) -> Value {
+        let response = result.unwrap();
+        let bytes = Runtime::new()
+            .unwrap()
+            .block_on(response.into_body().collect())
+            .unwrap()
+            .to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn error_message(result: OnboardResult) -> String {
+        let response = *result.unwrap_err();
+        let bytes = Runtime::new()
+            .unwrap()
+            .block_on(response.into_body().collect())
+            .unwrap()
+            .to_bytes();
+        serde_json::from_slice::<Value>(&bytes).unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn write_test_gtpack(path: &std::path::Path, pack_id: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let file = fs::File::create(path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let manifest = serde_cbor::to_vec(&serde_cbor::Value::Map(
+            [
+                (
+                    serde_cbor::Value::Text("name".to_string()),
+                    serde_cbor::Value::Text(pack_id.to_string()),
+                ),
+                (
+                    serde_cbor::Value::Text("description".to_string()),
+                    serde_cbor::Value::Text("fixture description".to_string()),
+                ),
+                (
+                    serde_cbor::Value::Text("pack_id".to_string()),
+                    serde_cbor::Value::Text(pack_id.to_string()),
+                ),
+                (
+                    serde_cbor::Value::Text("flows".to_string()),
+                    serde_cbor::Value::Array(vec![serde_cbor::Value::Map(
+                        [
+                            (
+                                serde_cbor::Value::Text("id".to_string()),
+                                serde_cbor::Value::Text(pack_id.to_string()),
+                            ),
+                            (
+                                serde_cbor::Value::Text("entrypoints".to_string()),
+                                serde_cbor::Value::Array(vec![serde_cbor::Value::Text(
+                                    "ingest_http".to_string(),
+                                )]),
+                            ),
+                            (
+                                serde_cbor::Value::Text("tags".to_string()),
+                                serde_cbor::Value::Array(vec![serde_cbor::Value::Text(
+                                    "default".to_string(),
+                                )]),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ))
+        .unwrap();
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .unwrap();
+        zip.write_all(&manifest).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn helper_functions_validate_and_capitalize_identifiers() {
+        assert!(is_valid_identifier("demo-team"));
+        assert!(!is_valid_identifier(""));
+        assert!(!is_valid_identifier("-demo"));
+        assert!(!is_valid_identifier("demo_1"));
+        assert_eq!(capitalize("webchat"), "Webchat");
+        assert_eq!(capitalize(""), "");
+    }
+
+    #[test]
+    fn list_tenants_create_tenant_and_create_team_cover_bundle_layout() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("tenants/acme/teams/sales")).unwrap();
+        let state = test_state(dir.path());
+
+        let listed = response_json(list_tenants(&state));
+        assert!(
+            listed["tenants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["tenant"] == "default")
+        );
+        assert!(
+            listed["tenants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["tenant"] == "acme")
+        );
+
+        let created_tenant = response_json(create_tenant(&state, &json!({ "tenant": "north" })));
+        assert!(
+            created_tenant["tenants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["tenant"] == "north")
+        );
+
+        let created_team = response_json(create_team(
+            &state,
+            &json!({ "tenant": "north", "team": "ops" }),
+        ));
+        let north = created_team["tenants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["tenant"] == "north")
+            .unwrap();
+        assert!(
+            north["teams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|team| team == "ops")
+        );
+    }
+
+    #[test]
+    fn create_tenant_and_team_reject_invalid_identifiers() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+
+        assert!(
+            error_message(create_tenant(&state, &json!({}))).contains("tenant name is required")
+        );
+        assert!(
+            error_message(create_tenant(&state, &json!({ "tenant": "bad_name" })))
+                .contains("alphanumeric with hyphens only")
+        );
+        assert!(
+            error_message(create_team(&state, &json!({ "tenant": "demo" })))
+                .contains("team name is required")
+        );
+        assert!(
+            error_message(create_team(
+                &state,
+                &json!({ "tenant": "bad_name", "team": "ops" })
+            ))
+            .contains("tenant name must be alphanumeric")
+        );
+        assert!(
+            error_message(create_team(
+                &state,
+                &json!({ "tenant": "demo", "team": "bad_name" })
+            ))
+            .contains("team name must be alphanumeric")
+        );
+    }
+
+    #[test]
+    fn list_providers_and_deployment_status_report_pack_and_config_metadata() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path());
+        write_test_gtpack(
+            &dir.path()
+                .join("providers/messaging/messaging-webchat.gtpack"),
+            "messaging-webchat",
+        );
+        let providers_root = dir.path().join(".providers");
+        let pack_path = dir
+            .path()
+            .join("providers/messaging/messaging-webchat.gtpack");
+        provider_config_envelope::write_provider_config_envelope(
+            &providers_root,
+            "messaging-webchat",
+            "setup_default",
+            &json!({
+                "instance_label": "Primary Webchat",
+                "_scope_tenant": "demo",
+                "_scope_team": "default"
+            }),
+            &pack_path,
+            false,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("tenants/default")).unwrap();
+        fs::write(
+            dir.path().join("tenants/default/tenant.gmap"),
+            "messaging-webchat -> default\n",
+        )
+        .unwrap();
+
+        let providers = response_json(list_providers(&state));
+        assert_eq!(providers["providers"].as_array().unwrap().len(), 1);
+        assert!(
+            providers["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["pack_id"] == "messaging-webchat")
+        );
+
+        let status = response_json(deployment_status(&state));
+        assert_eq!(status["deployed"].as_array().unwrap().len(), 1);
+        assert_eq!(status["deployed"][0]["instance_label"], "Primary Webchat");
+        assert_eq!(status["deployed"][0]["scope_tenant"], "demo");
+        assert_eq!(status["deployed"][0]["scope_team"], "default");
+        assert!(
+            status["gmap_raw"]
+                .as_str()
+                .unwrap()
+                .contains("messaging-webchat")
+        );
+    }
+}

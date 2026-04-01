@@ -102,7 +102,7 @@ impl ConversationState {
             Some(wm) => self
                 .activities
                 .iter()
-                .filter(|a| a.watermark >= wm)
+                .filter(|a| a.watermark > wm)
                 .collect(),
             None => self.activities.iter().collect(),
         }
@@ -282,4 +282,121 @@ pub fn handle_get_activities(
         "activities": activities,
         "watermark": next_wm
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    fn decode_jwt_claims(token: &str) -> JsonValue {
+        let payload = token.split('.').nth(1).expect("jwt payload");
+        let bytes = URL_SAFE_NO_PAD.decode(payload).expect("base64 payload");
+        serde_json::from_slice(&bytes).expect("claims json")
+    }
+
+    #[test]
+    fn generate_jwt_includes_context_and_optional_conversation_id() {
+        let with_conversation = generate_jwt(b"secret", "tenant-a", "team-a", "user-1", Some("c1"));
+        let claims = decode_jwt_claims(&with_conversation);
+        assert_eq!(claims["ctx"]["tenant"], "tenant-a");
+        assert_eq!(claims["ctx"]["team"], "team-a");
+        assert_eq!(claims["sub"], "user-1");
+        assert_eq!(claims["conversationId"], "c1");
+
+        let without_conversation = generate_jwt(b"secret", "tenant-a", "team-a", "user-1", None);
+        let claims = decode_jwt_claims(&without_conversation);
+        assert!(claims.get("conversationId").is_none());
+    }
+
+    #[test]
+    fn activities_since_excludes_the_last_seen_watermark() {
+        let mut state = ConversationState::default();
+        state.add_activity(StoredActivity {
+            id: "a1".to_string(),
+            type_: "message".to_string(),
+            text: Some("one".to_string()),
+            from_id: "user".to_string(),
+            from_role: "user".to_string(),
+            timestamp_ms: 1,
+            watermark: 1,
+            raw: json!({"id": "a1"}),
+        });
+        state.add_activity(StoredActivity {
+            id: "a2".to_string(),
+            type_: "message".to_string(),
+            text: Some("two".to_string()),
+            from_id: "user".to_string(),
+            from_role: "user".to_string(),
+            timestamp_ms: 2,
+            watermark: 2,
+            raw: json!({"id": "a2"}),
+        });
+
+        let ids: Vec<_> = state
+            .activities_since(Some(1))
+            .into_iter()
+            .map(|activity| activity.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a2"]);
+    }
+
+    #[test]
+    fn directline_state_roundtrips_user_and_bot_activities() {
+        let state = DirectLineState::new();
+        assert!(state.create_conversation("conv-1"));
+
+        let user_id = state
+            .add_user_activity(
+                "conv-1",
+                Some("hello".to_string()),
+                "user-1",
+                json!({"text": "hello"}),
+            )
+            .expect("user activity");
+        assert!(user_id.len() > 10);
+
+        let bot_id = state
+            .add_bot_activity(
+                "conv-1",
+                Some("hi".to_string()),
+                Some(json!([{"type": "card"}])),
+            )
+            .expect("bot activity");
+        assert_eq!(bot_id, "bot-2");
+
+        let (activities, watermark) = state.get_activities("conv-1", Some(1)).expect("activities");
+        assert_eq!(watermark, "2");
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0]["id"], "bot-2");
+        assert_eq!(activities[0]["attachments"][0]["type"], "card");
+    }
+
+    #[test]
+    fn endpoint_helpers_require_existing_conversations() {
+        let state = DirectLineState::new();
+        assert!(handle_post_activity(&state, "missing", &json!({"text": "hello"})).is_none());
+        assert!(handle_get_activities(&state, "missing", None).is_none());
+    }
+
+    #[test]
+    fn create_and_post_handlers_populate_expected_fields() {
+        let state = DirectLineState::new();
+        let created = handle_create_conversation(&state, "tenant-a", "team-a", b"secret");
+        let conversation_id = created["conversationId"].as_str().expect("conversation id");
+        assert!(state.conversation_exists(conversation_id));
+        assert_eq!(created["expires_in"], JWT_TTL_SECONDS);
+
+        let posted = handle_post_activity(
+            &state,
+            conversation_id,
+            &json!({"text": "hello", "from": {"id": "user-1"}}),
+        )
+        .expect("post result");
+        assert!(posted["id"].as_str().is_some());
+
+        let activities = handle_get_activities(&state, conversation_id, None).expect("activities");
+        assert_eq!(activities["activities"][0]["text"], "hello");
+        assert_eq!(activities["activities"][0]["from"]["role"], "user");
+    }
 }

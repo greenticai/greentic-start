@@ -563,3 +563,320 @@ fn domain_name(domain: Domain) -> &'static str {
         Domain::OAuth => "oauth",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ingress::control_directive::{DispatchTarget, IngressReply};
+    use tempfile::tempdir;
+
+    fn body() -> HookIngressBody {
+        HookIngressBody {
+            request: json!({"path": "/v1/events"}),
+            response_status: 200,
+            response_headers: vec![("x-test".to_string(), "1".to_string())],
+            response_body: Some(b"ok".to_vec()),
+            events: vec![json!({"event_id": "evt-1"})],
+        }
+    }
+
+    #[test]
+    fn env_flags_and_segment_safety_cover_expected_values() {
+        unsafe {
+            std::env::remove_var("GREENTIC_OPERATOR_HOOKS_ENABLED");
+            std::env::remove_var("GREENTIC_OPERATOR_ENABLE_EVENT_HOOKS");
+        }
+        assert!(hooks_enabled());
+        assert!(!event_hooks_enabled());
+
+        unsafe {
+            std::env::set_var("GREENTIC_OPERATOR_HOOKS_ENABLED", "off");
+            std::env::set_var("GREENTIC_OPERATOR_ENABLE_EVENT_HOOKS", "yes");
+        }
+        assert!(!hooks_enabled());
+        assert!(event_hooks_enabled());
+
+        assert!(is_safe_segment("valid_name-1"));
+        assert!(!is_safe_segment(""));
+        assert!(!is_safe_segment("../bad"));
+        assert!(!is_safe_segment(".hidden"));
+        assert!(!is_safe_segment("bad:name"));
+
+        unsafe {
+            std::env::remove_var("GREENTIC_OPERATOR_HOOKS_ENABLED");
+            std::env::remove_var("GREENTIC_OPERATOR_ENABLE_EVENT_HOOKS");
+        }
+    }
+
+    #[test]
+    fn ensure_dispatch_target_safe_and_resolve_pack_path_validate_inputs() {
+        let target = DispatchTarget {
+            tenant: "demo".to_string(),
+            team: Some("ops".to_string()),
+            pack: "hook-pack".to_string(),
+            flow: Some("default".to_string()),
+            node: Some("node-1".to_string()),
+        };
+        ensure_dispatch_target_safe(&target).expect("safe target");
+
+        let bad_target = DispatchTarget {
+            tenant: "../bad".to_string(),
+            team: None,
+            pack: "hook-pack".to_string(),
+            flow: None,
+            node: None,
+        };
+        assert!(ensure_dispatch_target_safe(&bad_target).is_err());
+
+        let dir = tempdir().expect("tempdir");
+        let packs = dir.path().join("packs");
+        std::fs::create_dir_all(&packs).expect("packs");
+        let pack_path = packs.join("hook-pack.gtpack");
+        std::fs::write(&pack_path, b"pack").expect("write pack");
+        assert_eq!(
+            resolve_dispatch_pack_path(dir.path(), "hook-pack").expect("resolve"),
+            pack_path
+        );
+        assert!(resolve_dispatch_pack_path(dir.path(), "missing").is_err());
+    }
+
+    #[test]
+    fn apply_reply_and_directive_helpers_cover_respond_deny_and_dispatch() {
+        let mut respond_body = body();
+        apply_reply(
+            &mut respond_body,
+            IngressReply {
+                status_code: Some(201),
+                text: Some("accepted".to_string()),
+                card_cbor: None,
+                reason_code: Some("accepted".to_string()),
+            },
+            false,
+        )
+        .expect("apply reply");
+        assert_eq!(respond_body.response_status, 201);
+        assert_eq!(
+            respond_body.response_headers,
+            vec![
+                ("x-reason-code".to_string(), "accepted".to_string()),
+                ("content-type".to_string(), "text/plain".to_string())
+            ]
+        );
+        assert_eq!(respond_body.response_body, Some(b"accepted".to_vec()));
+        assert!(respond_body.events.is_empty());
+
+        let mut deny_body = body();
+        apply_control_directive_with_dispatcher(
+            Path::new("/tmp"),
+            Domain::Events,
+            &mut deny_body,
+            &OperatorContext {
+                tenant: "demo".to_string(),
+                team: Some("ops".to_string()),
+                correlation_id: None,
+            },
+            ControlDirective::Deny {
+                reply: IngressReply {
+                    status_code: None,
+                    text: None,
+                    card_cbor: None,
+                    reason_code: None,
+                },
+            },
+            |_, _, _, _, _| Ok(()),
+        )
+        .expect("deny directive");
+        assert_eq!(deny_body.response_status, 403);
+        assert_eq!(directive_action(&ControlDirective::Continue), "continue");
+        assert_eq!(
+            directive_action(&ControlDirective::Dispatch {
+                target: DispatchTarget {
+                    tenant: "demo".to_string(),
+                    team: None,
+                    pack: "hook-pack".to_string(),
+                    flow: None,
+                    node: None,
+                }
+            }),
+            "dispatch"
+        );
+    }
+
+    #[test]
+    fn dispatch_directive_uses_dispatcher_and_offer_pack_wraps_file_name() {
+        let mut dispatch_body = body();
+        let mut called = false;
+        let target = DispatchTarget {
+            tenant: "demo".to_string(),
+            team: Some("ops".to_string()),
+            pack: "hook-pack".to_string(),
+            flow: Some("default".to_string()),
+            node: Some("n1".to_string()),
+        };
+        apply_control_directive_with_dispatcher(
+            Path::new("/tmp"),
+            Domain::Events,
+            &mut dispatch_body,
+            &OperatorContext {
+                tenant: "demo".to_string(),
+                team: Some("ops".to_string()),
+                correlation_id: Some("corr-1".to_string()),
+            },
+            ControlDirective::Dispatch {
+                target: target.clone(),
+            },
+            |_, _, _, _, dispatch_target| {
+                called = true;
+                assert_eq!(dispatch_target.pack, "hook-pack");
+                Ok(())
+            },
+        )
+        .expect("dispatch directive");
+        assert!(called);
+        assert_eq!(dispatch_body.response_status, 202);
+        assert!(dispatch_body.events.is_empty());
+        let target_json = directive_target_for_audit(&ControlDirective::Dispatch { target })
+            .expect("target json");
+        assert_eq!(target_json["tenant"], "demo");
+
+        let pack = offer_pack(
+            PathBuf::from("/tmp/hook-pack.gtpack"),
+            "hook-pack".to_string(),
+        )
+        .expect("offer pack");
+        assert_eq!(pack.file_name, "hook-pack.gtpack");
+        assert_eq!(pack.pack_id, "hook-pack");
+    }
+
+    #[test]
+    fn apply_reply_handles_card_payloads_and_continue_keeps_body_unchanged() {
+        let mut card_body = body();
+        apply_reply(
+            &mut card_body,
+            IngressReply {
+                status_code: None,
+                text: Some("card text".to_string()),
+                card_cbor: Some(json!({"type": "AdaptiveCard"})),
+                reason_code: None,
+            },
+            false,
+        )
+        .expect("apply card reply");
+        assert_eq!(card_body.response_status, 200);
+        assert_eq!(
+            card_body.response_headers,
+            vec![("content-type".to_string(), "application/json".to_string())]
+        );
+        let payload: JsonValue =
+            serde_json::from_slice(card_body.response_body.as_ref().unwrap()).unwrap();
+        assert_eq!(payload["text"], "card text");
+        assert_eq!(payload["card"]["type"], "AdaptiveCard");
+
+        let mut unchanged = body();
+        let before = (
+            unchanged.response_status,
+            unchanged.response_headers.clone(),
+            unchanged.response_body.clone(),
+            unchanged.events.clone(),
+        );
+        apply_control_directive_with_dispatcher(
+            Path::new("/tmp"),
+            Domain::Messaging,
+            &mut unchanged,
+            &OperatorContext {
+                tenant: "demo".to_string(),
+                team: None,
+                correlation_id: None,
+            },
+            ControlDirective::Continue,
+            |_, _, _, _, _| Ok(()),
+        )
+        .expect("continue directive");
+        assert_eq!(
+            (
+                unchanged.response_status,
+                unchanged.response_headers,
+                unchanged.response_body,
+                unchanged.events
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn apply_post_ingress_hooks_dispatch_returns_early_when_hooks_are_disabled() {
+        let dir = tempdir().expect("tempdir");
+        let discovery = crate::discovery::discover(dir.path()).expect("discovery");
+        let secrets_handle =
+            crate::secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
+                .expect("secrets");
+        let runner_host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )
+        .expect("runner host");
+
+        let mut result = IngressDispatchResult {
+            response: IngressHttpResponse {
+                status: 200,
+                headers: vec![("x-test".to_string(), "1".to_string())],
+                body: Some(b"ok".to_vec()),
+            },
+            events: vec![],
+            messaging_envelopes: vec![],
+        };
+        let request = IngressRequestV1 {
+            v: 1,
+            domain: "messaging".to_string(),
+            provider: "provider-a".to_string(),
+            handler: None,
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            method: "POST".to_string(),
+            path: "/v1/events/ingress/provider-a/demo".to_string(),
+            query: vec![],
+            headers: vec![],
+            body: vec![],
+            correlation_id: None,
+            remote_addr: None,
+        };
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            correlation_id: None,
+        };
+        let original = (
+            result.response.status,
+            result.response.headers.clone(),
+            result.response.body.clone(),
+        );
+
+        unsafe {
+            std::env::set_var("GREENTIC_OPERATOR_HOOKS_ENABLED", "false");
+        }
+        apply_post_ingress_hooks_dispatch(
+            dir.path(),
+            &runner_host,
+            Domain::Messaging,
+            &request,
+            &mut result,
+            &ctx,
+        )
+        .expect("dispatch");
+        unsafe {
+            std::env::remove_var("GREENTIC_OPERATOR_HOOKS_ENABLED");
+        }
+
+        assert_eq!(
+            (
+                result.response.status,
+                result.response.headers,
+                result.response.body
+            ),
+            original
+        );
+    }
+}

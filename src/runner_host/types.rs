@@ -111,3 +111,72 @@ pub(super) enum TokenValidationDecision {
     Allow(Option<JsonValue>),
     Deny(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operation_envelope_new_copies_context_and_payload() {
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("ops".to_string()),
+            correlation_id: Some("corr-1".to_string()),
+        };
+        let envelope = OperationEnvelope::new("ingest_http", &[1, 2, 3], &ctx);
+
+        assert_eq!(envelope.op_name, "ingest_http");
+        assert_eq!(envelope.ctx.tenant, "demo");
+        assert_eq!(envelope.ctx.team.as_deref(), Some("ops"));
+        assert_eq!(envelope.ctx.correlation_id.as_deref(), Some("corr-1"));
+        assert_eq!(envelope.payload_cbor, vec![1, 2, 3]);
+        match envelope.status {
+            OperationStatus::Pending => {}
+            _ => panic!("expected pending status"),
+        }
+        assert!(envelope.meta_cbor.is_none());
+        assert!(envelope.result_cbor.is_none());
+        assert!(!envelope.op_id.is_empty());
+    }
+
+    #[test]
+    fn types_cover_flow_outcome_hook_eval_and_runner_modes() {
+        let outcome = FlowOutcome {
+            success: true,
+            output: Some(serde_json::json!({"ok": true})),
+            raw: Some("raw".to_string()),
+            error: None,
+            mode: RunnerExecutionMode::Integration,
+        };
+        assert!(outcome.success);
+        assert_eq!(outcome.mode, RunnerExecutionMode::Integration);
+
+        let response = HookEvalResponse {
+            decision: "deny".to_string(),
+            reason: Some("blocked".to_string()),
+            envelope: None,
+        };
+        assert_eq!(response.decision, "deny");
+        assert_eq!(response.reason.as_deref(), Some("blocked"));
+
+        let mode = RunnerMode::Integration {
+            binary: PathBuf::from("/tmp/runner"),
+            flavor: RunnerFlavor::RunSubcommand,
+        };
+        match mode {
+            RunnerMode::Integration { binary, .. } => {
+                assert_eq!(binary, PathBuf::from("/tmp/runner"));
+            }
+            RunnerMode::Exec => panic!("expected integration mode"),
+        }
+
+        match TokenValidationDecision::Allow(Some(serde_json::json!({"sub": "user"}))) {
+            TokenValidationDecision::Allow(Some(claims)) => assert_eq!(claims["sub"], "user"),
+            _ => panic!("expected allow"),
+        }
+        match TokenValidationDecision::Deny("nope".to_string()) {
+            TokenValidationDecision::Deny(reason) => assert_eq!(reason, "nope"),
+            _ => panic!("expected deny"),
+        }
+    }
+}

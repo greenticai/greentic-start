@@ -643,6 +643,18 @@ fn build_webhook_url(public_base_url: &str, provider_id: &str, tenant: &str, tea
 mod tests {
     use super::*;
 
+    fn fixture_pack() -> ProviderPack {
+        ProviderPack {
+            pack_id: "fixture".to_string(),
+            display_name: None,
+            description: None,
+            tags: Vec::new(),
+            file_name: "fixture.gtpack".to_string(),
+            path: std::path::PathBuf::from("/tmp/fixture.gtpack"),
+            entry_flows: Vec::new(),
+        }
+    }
+
     #[test]
     fn flow_output_webhook_result_uses_declared_ops() {
         let output = json!({
@@ -673,5 +685,231 @@ mod tests {
         });
 
         assert!(webhook_result_from_flow_output(Some(&output)).is_none());
+        assert!(webhook_result_from_flow_output(None).is_none());
+        assert!(
+            webhook_result_from_flow_output(Some(&json!({
+                "webhook_ops": "not-an-array"
+            })))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn flow_output_webhook_result_defaults_optional_arrays() {
+        let output = json!({
+            "webhook_ops": [{"op": "register"}]
+        });
+
+        let result = webhook_result_from_flow_output(Some(&output)).expect("flow result");
+        assert_eq!(result["subscription_ops"], json!([]));
+        assert_eq!(result["oauth_ops"], json!([]));
+    }
+
+    #[test]
+    fn try_provider_setup_webhook_rejects_non_https_and_unknown_providers() {
+        let pack = fixture_pack();
+
+        assert!(
+            try_provider_setup_webhook(
+                std::path::Path::new("/tmp"),
+                Domain::Messaging,
+                &pack,
+                "messaging-telegram",
+                "demo",
+                Some("default"),
+                &json!({"public_base_url": "http://example.com"})
+            )
+            .is_none()
+        );
+
+        assert!(
+            try_provider_setup_webhook(
+                std::path::Path::new("/tmp"),
+                Domain::Messaging,
+                &pack,
+                "messaging-custom",
+                "demo",
+                Some("default"),
+                &json!({"public_base_url": "https://example.com"})
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn try_provider_setup_webhook_requires_public_base_url() {
+        let pack = fixture_pack();
+
+        assert!(
+            try_provider_setup_webhook(
+                std::path::Path::new("/tmp"),
+                Domain::Messaging,
+                &pack,
+                "messaging-slack",
+                "demo",
+                Some("default"),
+                &json!({"slack_app_id": "A123", "slack_configuration_token": "x"})
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn slack_update_manifest_urls_populates_existing_and_missing_settings() {
+        let mut existing = json!({
+            "settings": {
+                "event_subscriptions": {"request_url": "https://old.example"},
+                "interactivity": {"is_enabled": false}
+            }
+        });
+        slack_update_manifest_urls(&mut existing, "https://new.example");
+        assert_eq!(
+            existing["settings"]["event_subscriptions"]["request_url"],
+            "https://new.example"
+        );
+        assert_eq!(
+            existing["settings"]["interactivity"]["request_url"],
+            "https://new.example"
+        );
+        assert_eq!(existing["settings"]["interactivity"]["is_enabled"], true);
+
+        let mut missing = json!({});
+        slack_update_manifest_urls(&mut missing, "https://new.example");
+        assert_eq!(
+            missing["settings"]["event_subscriptions"]["request_url"],
+            "https://new.example"
+        );
+        assert_eq!(
+            missing["settings"]["interactivity"]["request_url"],
+            "https://new.example"
+        );
+    }
+
+    #[test]
+    fn webex_reconcile_one_noops_when_target_url_is_already_current() {
+        let existing = vec![json!({
+            "id": "hook-1",
+            "name": "greentic:demo:default:webex",
+            "targetUrl": "https://demo.example/v1/messaging/ingress/messaging-webex/demo/default"
+        })];
+
+        let result = webex_reconcile_one(
+            "https://webexapis.com/v1",
+            "token",
+            &existing,
+            "greentic:demo:default:webex",
+            "https://demo.example/v1/messaging/ingress/messaging-webex/demo/default",
+            "messages",
+            "created",
+        )
+        .expect("result");
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["action"], "noop");
+        assert_eq!(result["webhook_id"], "hook-1");
+    }
+
+    #[test]
+    fn webex_reconcile_one_reports_update_failures() {
+        let existing = vec![json!({
+            "id": "hook-1",
+            "name": "greentic:demo:default:webex",
+            "targetUrl": "https://old.example/webhook"
+        })];
+
+        let result = webex_reconcile_one(
+            "not-a-valid-url",
+            "token",
+            &existing,
+            "greentic:demo:default:webex",
+            "https://new.example/webhook",
+            "messages",
+            "created",
+        )
+        .expect("result");
+        assert_eq!(result["ok"], false);
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("PUT /webhooks/hook-1 failed")
+        );
+    }
+
+    #[test]
+    fn build_webhook_url_normalizes_base_and_scope() {
+        assert_eq!(
+            build_webhook_url(
+                "https://demo.example/",
+                "messaging-telegram",
+                "tenant-a",
+                "team-b"
+            ),
+            "https://demo.example/v1/messaging/ingress/messaging-telegram/tenant-a/team-b"
+        );
+    }
+
+    #[test]
+    fn try_provider_setup_webhook_uses_default_team_and_reports_empty_telegram_token() {
+        let pack = fixture_pack();
+
+        let result = try_provider_setup_webhook(
+            std::path::Path::new("/tmp"),
+            Domain::Messaging,
+            &pack,
+            "messaging-telegram",
+            "demo",
+            None,
+            &json!({
+                "public_base_url": "https://demo.example",
+                "bot_token": ""
+            }),
+        )
+        .expect("telegram result");
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error"], "bot_token is empty");
+    }
+
+    #[test]
+    fn slack_manifest_returns_none_without_required_credentials() {
+        let result = setup_slack_manifest(
+            &json!({
+                "slack_app_id": "",
+                "slack_configuration_token": ""
+            }),
+            "https://demo.example",
+            "messaging-slack",
+            "demo",
+            "default",
+        );
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn webex_setup_accepts_alias_token_and_reports_list_failures() {
+        let result = setup_webex_webhook(
+            &json!({
+                "webex_bot_token": "secret-token",
+                "api_base_url": "not-a-valid-url"
+            }),
+            "https://demo.example",
+            "messaging-webex",
+            "demo",
+            "default",
+        )
+        .expect("result");
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(
+            result["webhook_url"],
+            "https://demo.example/v1/messaging/ingress/messaging-webex/demo/default"
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("GET /webhooks failed")
+        );
     }
 }

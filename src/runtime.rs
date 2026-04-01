@@ -1602,8 +1602,157 @@ fn read_last_lines(path: &Path, count: usize) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::{DetectedDomains, DetectedProvider, DiscoveryResult, ProviderIdSource};
+    use crate::domains::Domain;
+    use crate::secrets_gate;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn helper_types_cover_stop_describe_and_service_tracker_manifest_updates() -> anyhow::Result<()>
+    {
+        let handles = ForegroundRuntimeHandles::default();
+        handles.stop()?;
+
+        let info = StartupInfo {
+            bundle_name: "demo-bundle".to_string(),
+            http_url: Some("http://127.0.0.1:8080".to_string()),
+            webchat_url: None,
+            public_url: Some("https://demo.example".to_string()),
+            channels: vec!["webchat".to_string()],
+            mode: "embedded runner".to_string(),
+            webhook_results: vec![("slack".to_string(), "ok".to_string())],
+        };
+        info.print();
+
+        let empty = ServiceSummary::new("gateway", None);
+        assert_eq!(empty.describe(), "gateway (pid=-)");
+
+        let mut detailed =
+            ServiceSummary::with_details("egress", Some(42), vec!["log=/tmp/x".to_string()]);
+        detailed.add_detail("mode=embedded");
+        assert!(detailed.describe().contains("pid=42"));
+        assert!(detailed.describe().contains("mode=embedded"));
+
+        let dir = tempdir()?;
+        let paths = RuntimePaths::new(dir.path().join("state"), "demo", "default");
+        let mut tracker = ServiceTracker::new(&paths, Some(dir.path()))?;
+        tracker.record_with_log("gateway", "gateway", Some(&dir.path().join("gateway.log")))?;
+        tracker.record(crate::runtime_state::ServiceEntry::new(
+            "egress",
+            "egress",
+            Some(&dir.path().join("egress.log")),
+        ))?;
+
+        let manifest = read_service_manifest(&paths)?.expect("manifest");
+        assert_eq!(manifest.services.len(), 2);
+        let expected_log_dir = dir.path().display().to_string();
+        assert_eq!(manifest.log_dir.as_deref(), Some(expected_log_dir.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_helpers_cover_pid_paths_logs_env_and_tail_reads() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let state_dir = dir.path().join("state");
+        let log_dir = dir.path().join("logs");
+        let paths = RuntimePaths::new(&state_dir, "demo", "default");
+
+        assert!(!looks_like_path("runner"));
+        assert!(looks_like_path("bin/runner"));
+        assert!(looks_like_path("/bin/runner"));
+
+        let mut restart = BTreeSet::new();
+        restart.insert("gateway".to_string());
+        assert!(should_restart(&restart, "gateway"));
+        restart.insert("all".to_string());
+        assert!(should_restart(&restart, "egress"));
+
+        let pid_path = paths.pid_path("gateway");
+        assert_eq!(read_pid(&pid_path)?, None);
+        fs::create_dir_all(pid_path.parent().expect("parent"))?;
+        fs::write(&pid_path, "")?;
+        assert_eq!(read_pid(&pid_path)?, None);
+        fs::write(&pid_path, "1234\n")?;
+        assert_eq!(read_pid(&pid_path)?, Some(1234));
+
+        let tenant_log = tenant_log_path(&log_dir, "gateway", "demo", "default")?;
+        assert!(tenant_log.exists());
+        fs::write(log_dir.join("gateway-demo.log"), "service log")?;
+        assert_eq!(
+            select_log_path(&log_dir, "gateway", "demo", &tenant_log),
+            log_dir.join("gateway-demo.log")
+        );
+
+        let manifest_log_dir = dir.path().join("custom-logs");
+        let manifest = crate::runtime_state::ServiceManifest {
+            log_dir: Some(manifest_log_dir.display().to_string()),
+            services: Vec::new(),
+        };
+        persist_service_manifest(&paths, &manifest)?;
+        assert_eq!(
+            resolve_manifest_log_dir(&state_dir, "demo", "default", &log_dir)?,
+            manifest_log_dir
+        );
+
+        let env = build_env("demo", "default", Some("nats://127.0.0.1:4222"), None);
+        assert_eq!(env.get("GREENTIC_TENANT").map(String::as_str), Some("demo"));
+        assert_eq!(
+            env.get("GREENTIC_TEAM").map(String::as_str),
+            Some("default")
+        );
+        assert_eq!(
+            env.get("NATS_URL").map(String::as_str),
+            Some("nats://127.0.0.1:4222")
+        );
+
+        let marker = nats_started_marker(&paths);
+        mark_nats_started(&paths)?;
+        assert!(marker.exists());
+        stop_started_nats(&paths, &state_dir)?;
+        assert!(!marker.exists());
+
+        let missing = read_last_lines(&dir.path().join("missing.log"), 10).unwrap_err();
+        assert!(missing.to_string().contains("Log file does not exist"));
+
+        let tail_path = dir.path().join("tail.log");
+        fs::write(&tail_path, "one\ntwo\nthree\nfour\n")?;
+        assert_eq!(read_last_lines(&tail_path, 2)?, "three\nfour");
+        Ok(())
+    }
+
+    #[test]
+    fn build_service_spec_resolves_paths_and_sets_arguments() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let binary = dir.path().join("runner.sh");
+        fs::write(&binary, "#!/bin/sh\n")?;
+
+        let env = BTreeMap::from([("GREENTIC_TENANT".to_string(), "demo".to_string())]);
+        let relative = build_service_spec(
+            dir.path(),
+            "runner",
+            "./runner.sh",
+            &["--flag".to_string()],
+            &env,
+        )?;
+        assert_eq!(relative.id.as_str(), "runner");
+        assert!(relative.argv[0].ends_with("runner.sh"));
+        assert_eq!(relative.argv[1], "--flag");
+        assert_eq!(
+            relative.env.get("GREENTIC_TENANT").map(String::as_str),
+            Some("demo")
+        );
+
+        let absolute = build_service_spec(
+            dir.path(),
+            "runner_abs",
+            &binary.display().to_string(),
+            &Vec::new(),
+            &env,
+        )?;
+        assert_eq!(absolute.argv[0], binary.display().to_string());
+        Ok(())
+    }
 
     #[test]
     fn tenant_log_path_creates_file() -> anyhow::Result<()> {
@@ -1630,6 +1779,244 @@ mod tests {
         let log = dir.path().join("operator.log");
         fs::write(&log, "operator ready")?;
         demo_logs_runtime(dir.path(), dir.path(), "demo", "default", "operator", false)?;
+        Ok(())
+    }
+
+    #[test]
+    fn ingress_detection_and_runtime_noop_paths_cover_remaining_helpers() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let discovery = DiscoveryResult {
+            domains: DetectedDomains {
+                messaging: true,
+                events: true,
+                oauth: false,
+            },
+            providers: vec![
+                DetectedProvider {
+                    provider_id: "messaging-missing".to_string(),
+                    domain: "messaging".to_string(),
+                    pack_path: dir
+                        .path()
+                        .join("providers/messaging/messaging-missing.gtpack"),
+                    id_source: ProviderIdSource::Filename,
+                },
+                DetectedProvider {
+                    provider_id: "events-fallback".to_string(),
+                    domain: "events".to_string(),
+                    pack_path: dir.path().join("providers/events/events-fallback.gtpack"),
+                    id_source: ProviderIdSource::Filename,
+                },
+            ],
+        };
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))?;
+        let runner_host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )?;
+
+        assert_eq!(parse_domain_name("messaging"), Some(Domain::Messaging));
+        assert_eq!(parse_domain_name("events"), Some(Domain::Events));
+        assert_eq!(parse_domain_name("oauth"), Some(Domain::OAuth));
+        assert_eq!(parse_domain_name("secrets"), Some(Domain::Secrets));
+        assert_eq!(parse_domain_name("unknown"), None);
+
+        let detected = detect_http_ingress_domains(&discovery, &runner_host);
+        assert_eq!(detected, vec![Domain::Events]);
+
+        let config = DemoConfig::default();
+        assert!(
+            start_http_ingress_server(&config, &[], Arc::new(runner_host.clone()), false)?
+                .is_none()
+        );
+
+        let invalid_config = DemoConfig {
+            services: crate::config::DemoServicesConfig {
+                gateway: crate::config::DemoGatewayConfig {
+                    listen_addr: "not an addr".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let bind_err = match start_http_ingress_server(
+            &invalid_config,
+            &[Domain::Events],
+            Arc::new(runner_host),
+            false,
+        ) {
+            Ok(_) => panic!("expected invalid bind address to fail"),
+            Err(err) => err,
+        };
+        assert!(
+            bind_err
+                .to_string()
+                .contains("invalid gateway listen address")
+        );
+
+        demo_status_runtime(dir.path(), "demo", "default", false)?;
+        demo_down_runtime(dir.path(), "demo", "default", false)?;
+
+        let paths = RuntimePaths::new(dir.path(), "demo", "default");
+        persist_service_manifest(
+            &paths,
+            &crate::runtime_state::ServiceManifest {
+                log_dir: None,
+                services: Vec::new(),
+            },
+        )?;
+        demo_down_runtime(dir.path(), "demo", "default", false)?;
+        demo_down_runtime(dir.path(), "demo", "default", true)?;
+        Ok(())
+    }
+
+    #[test]
+    fn demo_up_runs_in_embedded_mode_without_supervised_services() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let bundle_root = dir.path().join("bundle");
+        let log_dir = dir.path().join("logs");
+        fs::create_dir_all(&bundle_root)?;
+        fs::create_dir_all(&log_dir)?;
+
+        demo_up(
+            &bundle_root,
+            "demo",
+            Some("default"),
+            None,
+            NatsMode::Off,
+            false,
+            None,
+            None,
+            &log_dir,
+            true,
+        )?;
+
+        let paths = RuntimePaths::new(bundle_root.join("state"), "demo", "default");
+        let manifest = read_service_manifest(&paths)?.expect("service manifest");
+        assert!(manifest.services.is_empty());
+        assert_eq!(
+            manifest.log_dir.as_deref(),
+            Some(log_dir.display().to_string().as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn demo_up_services_in_embedded_mode_writes_runtime_artifacts() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let bundle_root = dir.path().join("bundle");
+        let config_path = bundle_root.join("greentic-demo.yaml");
+        let log_dir = bundle_root.join("logs");
+        fs::create_dir_all(&bundle_root)?;
+        fs::create_dir_all(&log_dir)?;
+        fs::write(&config_path, "tenant: demo\nteam: default\n")?;
+
+        let config = DemoConfig {
+            tenant: "demo".to_string(),
+            team: "default".to_string(),
+            services: crate::config::DemoServicesConfig {
+                nats: crate::config::DemoNatsConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            providers: None,
+        };
+        let static_routes = BundleStaticRoutesInspection::default();
+        let restart = BTreeSet::new();
+
+        let handles = demo_up_services(
+            &config_path,
+            &config,
+            &static_routes,
+            None,
+            None,
+            None,
+            &restart,
+            None,
+            &log_dir,
+            true,
+        )?;
+        assert!(handles.ingress_server.is_none());
+
+        let paths = RuntimePaths::new(bundle_root.join("state"), "demo", "default");
+        let runtime_root = paths.runtime_root();
+        assert!(runtime_root.join("startup_contract.json").exists());
+        assert!(runtime_root.join("endpoints.json").exists());
+
+        let startup_contract: StartupContract =
+            serde_json::from_slice(&fs::read(runtime_root.join("startup_contract.json"))?)?;
+        assert!(!startup_contract.public_http_enabled);
+        assert!(!startup_contract.static_routes_enabled);
+
+        let endpoints: serde_json::Value =
+            serde_json::from_slice(&fs::read(runtime_root.join("endpoints.json"))?)?;
+        assert_eq!(endpoints["tenant"], "demo");
+        assert_eq!(endpoints["team"], "default");
+        assert!(endpoints["public_base_url"].is_null());
+        assert!(endpoints["nats_url"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn supervised_spawn_helpers_cover_running_and_summary_paths() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let state_dir = dir.path().join("state");
+        let log_dir = dir.path().join("logs");
+        fs::create_dir_all(&log_dir)?;
+        let paths = RuntimePaths::new(&state_dir, "demo", "default");
+        let mut tracker = ServiceTracker::new(&paths, Some(&log_dir))?;
+        let restart = BTreeSet::new();
+
+        let spec = supervisor::ServiceSpec {
+            id: supervisor::ServiceId::new("svc")?,
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 5".to_string(),
+            ],
+            cwd: None,
+            env: BTreeMap::new(),
+        };
+
+        log_service_spec_debug("svc", "worker", &spec, "demo", "default", true);
+        let handle = spawn_if_needed(&paths, &spec, &restart, None)?.expect("spawned");
+        assert!(supervisor::is_running(handle.pid));
+        assert!(spawn_if_needed(&paths, &spec, &restart, None)?.is_none());
+        demo_status_runtime(&state_dir, "demo", "default", true)?;
+
+        let spec2 = supervisor::ServiceSpec {
+            id: supervisor::ServiceId::new("svc2")?,
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "sleep 5".to_string(),
+            ],
+            cwd: None,
+            env: BTreeMap::from([("GREENTIC_TENANT".to_string(), "demo".to_string())]),
+        };
+        let summary = spawn_supervised_service(
+            "svc2",
+            "worker",
+            &spec2,
+            &log_dir,
+            &paths,
+            &restart,
+            &mut tracker,
+            "demo",
+            "default",
+            true,
+        )?;
+        assert!(summary.describe().contains("log="));
+        print_service_summary(&[summary]);
+
+        supervisor::stop_service(&paths, &spec.id, 100)?;
+        supervisor::stop_service(&paths, &spec2.id, 100)?;
         Ok(())
     }
 }

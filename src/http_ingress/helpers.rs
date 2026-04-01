@@ -141,14 +141,18 @@ pub(super) fn handle_builtin_health_request(
 }
 
 use http_body_util::BodyExt;
-use hyper::{Request, body::Incoming};
+use hyper::{Request, body::Body};
 
 /// Proxy OAuth token exchange to external provider (avoids browser CORS).
 /// Frontend POSTs JSON: { token_url, code, redirect_uri, client_id, code_verifier }
 /// Server forwards as form-urlencoded POST to token_url, returns the response.
-pub(super) async fn handle_oauth_token_exchange(
-    req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+pub(super) async fn handle_oauth_token_exchange<B>(
+    req: Request<B>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
     let body_bytes = req
         .into_body()
         .collect()
@@ -311,4 +315,111 @@ fn parse_legacy_route(segments: &[&str]) -> Option<ParsedIngressRoute> {
         team,
         handler,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+    use hyper::header::{CONTENT_TYPE, HeaderValue};
+
+    #[test]
+    fn cors_helpers_attach_expected_headers() {
+        let preflight = cors_preflight_response();
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            preflight.headers()["Access-Control-Allow-Origin"],
+            HeaderValue::from_static("*")
+        );
+
+        let response = with_cors(Response::new(Full::from(Bytes::from("ok"))));
+        assert_eq!(
+            response.headers()["Access-Control-Allow-Methods"],
+            HeaderValue::from_static("GET, POST, OPTIONS")
+        );
+    }
+
+    #[test]
+    fn build_http_response_defaults_content_type_and_skips_invalid_headers() {
+        let response = build_http_response(&IngressHttpResponse {
+            status: 201,
+            headers: vec![
+                ("x-test".to_string(), "yes".to_string()),
+                ("bad header".to_string(), "ignored".to_string()),
+            ],
+            body: Some(b"{\"ok\":true}".to_vec()),
+        })
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            HeaderValue::from_static("application/json")
+        );
+        assert_eq!(
+            response.headers()["x-test"],
+            HeaderValue::from_static("yes")
+        );
+        assert!(response.headers().get("bad header").is_none());
+    }
+
+    #[test]
+    fn collect_helpers_preserve_only_valid_values() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-tenant", HeaderValue::from_static("demo"));
+        let collected = collect_headers(&headers);
+        assert_eq!(
+            collected,
+            vec![("x-tenant".to_string(), "demo".to_string())]
+        );
+
+        let queries = collect_queries(Some("tenant=demo&&empty=&team=blue%20sky&novalue"));
+        assert_eq!(
+            queries,
+            vec![
+                ("tenant".to_string(), "demo".to_string()),
+                ("empty".to_string(), "".to_string()),
+                ("team".to_string(), "blue%20sky".to_string()),
+                ("novalue".to_string(), "".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn builtin_health_and_domain_parsing_cover_known_routes() {
+        assert!(handle_builtin_health_request(&Method::POST, "/healthz").is_none());
+        assert!(handle_builtin_health_request(&Method::GET, "/unknown").is_none());
+        assert_eq!(parse_domain("Messaging"), Some(Domain::Messaging));
+        assert_eq!(domain_name(Domain::OAuth), "oauth");
+    }
+
+    #[test]
+    fn route_parsing_supports_v1_and_legacy_variants() {
+        let v1 = parse_route_segments("/v1/messaging/ingress/provider/demo/team-a/hook")
+            .expect("v1 route");
+        assert_eq!(v1.team, "team-a");
+        assert_eq!(v1.handler.as_deref(), Some("hook"));
+
+        let legacy = parse_route_segments("/events/ingress/provider/demo").expect("legacy route");
+        assert_eq!(legacy.team, "default");
+        assert_eq!(legacy.handler, None);
+
+        assert!(parse_route_segments("/v1/events/provider/demo").is_none());
+        assert!(parse_route_segments("/unknown/ingress/provider/demo").is_none());
+    }
+
+    #[test]
+    fn error_and_json_responses_emit_json_bodies() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let error = error_response(StatusCode::BAD_REQUEST, "bad request");
+        let json = json_response(StatusCode::OK, json!({"status": "ok"}));
+
+        let error_body =
+            runtime.block_on(async { error.into_body().collect().await.expect("body").to_bytes() });
+        let json_body =
+            runtime.block_on(async { json.into_body().collect().await.expect("body").to_bytes() });
+
+        assert!(String::from_utf8_lossy(&error_body).contains("\"bad request\""));
+        assert!(String::from_utf8_lossy(&json_body).contains("\"status\":\"ok\""));
+    }
 }

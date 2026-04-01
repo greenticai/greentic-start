@@ -359,3 +359,120 @@ pub(super) fn capability_route_error_outcome(
         mode: RunnerExecutionMode::Exec,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn helper_functions_cover_domains_aliases_and_secret_detection() {
+        assert_eq!(domain_name(Domain::Messaging), "messaging");
+        assert_eq!(domain_name(Domain::Events), "events");
+        assert_eq!(domain_name(Domain::Secrets), "secrets");
+        assert_eq!(domain_name(Domain::OAuth), "oauth");
+
+        assert_eq!(
+            extract_provider_short_aliases("greentic.events.email.sendgrid", Domain::Events),
+            vec![
+                "sendgrid".to_string(),
+                "email.sendgrid".to_string(),
+                "events.email.sendgrid".to_string()
+            ]
+        );
+        assert_eq!(
+            extract_provider_short_aliases("messaging-telegram", Domain::Messaging),
+            vec!["telegram".to_string()]
+        );
+
+        assert!(needs_secret_context("SecretsError: failed"));
+        assert!(needs_secret_context(
+            "secret store error while fetching key"
+        ));
+        assert!(!needs_secret_context("ordinary validation failure"));
+    }
+
+    #[test]
+    fn payload_preview_and_transcript_outputs_handle_text_binary_and_missing_files() {
+        assert_eq!(payload_preview(b""), "<empty>");
+        assert_eq!(payload_preview(b"hello"), "hello");
+        assert_eq!(payload_preview(&[0xff, 0x00]), "/wA=");
+
+        let long = vec![b'a'; 300];
+        assert!(payload_preview(&long).ends_with("..."));
+
+        let dir = tempdir().expect("tempdir");
+        assert!(
+            read_transcript_outputs(dir.path())
+                .expect("missing transcript")
+                .is_none()
+        );
+
+        std::fs::write(
+            dir.path().join("transcript.jsonl"),
+            concat!(
+                "{\"outputs\":null}\n",
+                "{\"outputs\":{\"text\":\"first\"}}\n",
+                "not-json\n",
+                "{\"outputs\":{\"text\":\"last\"}}\n"
+            ),
+        )
+        .expect("write transcript");
+        let outputs = read_transcript_outputs(dir.path())
+            .expect("transcript")
+            .expect("outputs");
+        assert_eq!(outputs["text"], "last");
+    }
+
+    #[test]
+    fn secret_and_capability_outcomes_include_expected_context() {
+        let pack = ProviderPack {
+            pack_id: "messaging-webchat".to_string(),
+            display_name: None,
+            description: None,
+            tags: vec![],
+            file_name: "messaging-webchat.gtpack".to_string(),
+            path: PathBuf::from("/tmp/messaging-webchat.gtpack"),
+            entry_flows: vec![],
+        };
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("ops".to_string()),
+            correlation_id: Some("corr-1".to_string()),
+        };
+
+        unsafe {
+            env::set_var("GREENTIC_ENV", "test");
+        }
+        let secret_context = secret_error_context(&ctx, "provider-a", "lookup", &pack);
+        assert!(secret_context.contains("env=test"));
+        assert!(secret_context.contains("tenant=demo"));
+        assert!(secret_context.contains("team=ops"));
+        assert!(secret_context.contains("provider=provider-a"));
+        unsafe {
+            env::remove_var("GREENTIC_ENV");
+        }
+
+        let missing = missing_capability_outcome("cap-x", "op-y", Some("cmp-z"));
+        assert!(!missing.success);
+        assert_eq!(missing.mode, RunnerExecutionMode::Exec);
+        assert_eq!(
+            missing.output.as_ref().expect("output")["code"],
+            "missing_capability"
+        );
+
+        let not_installed = capability_not_installed_outcome("cap-x", "op-y", "stable-z");
+        assert_eq!(
+            not_installed.output.as_ref().expect("output")["code"],
+            "capability_not_installed"
+        );
+
+        let route_error =
+            capability_route_error_outcome("cap-x", "op-y", "route missing".to_string());
+        assert_eq!(
+            route_error.output.as_ref().expect("output")["code"],
+            "capability_route_error"
+        );
+        assert_eq!(route_error.error.as_deref(), Some("route missing"));
+    }
+}

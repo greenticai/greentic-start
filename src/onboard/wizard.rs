@@ -1083,7 +1083,12 @@ fn resolve_gmap_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_config_envelope;
+    use qa_spec::QuestionType;
+    use std::io::Write;
     use std::path::PathBuf;
+    use tempfile::tempdir;
+    use zip::write::FileOptions;
 
     fn pack_with_flows(flows: &[&str]) -> ProviderPack {
         ProviderPack {
@@ -1109,5 +1114,317 @@ mod tests {
         let pack = pack_with_flows(&["setup_default", "verify_webhooks", "verify_subscriptions"]);
         let flows = applicable_verify_flows(Domain::Events, &pack);
         assert_eq!(flows, vec!["verify_subscriptions".to_string()]);
+    }
+
+    #[test]
+    fn parse_request_uses_scope_fallbacks_and_normalizes_case() {
+        let params = parse_request(&json!({
+            "provider_id": "messaging-slack",
+            "domain": "messaging",
+            "answers": {
+                "_scope_tenant": "Demo",
+                "_scope_team": "Blue"
+            },
+            "locale": "nl"
+        }))
+        .expect("request params");
+
+        assert_eq!(params.provider_id, "messaging-slack");
+        assert_eq!(params.domain, Domain::Messaging);
+        assert_eq!(params.tenant, "demo");
+        assert_eq!(params.team.as_deref(), Some("blue"));
+        assert_eq!(params.locale, "nl");
+        assert_eq!(params.mode, QaMode::Setup);
+    }
+
+    #[test]
+    fn parse_request_rejects_missing_provider_and_invalid_domain() {
+        assert!(parse_request(&json!({"domain": "messaging"})).is_err());
+        assert!(
+            parse_request(&json!({
+                "provider_id": "messaging-slack",
+                "domain": "invalid"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn inject_provider_aliases_adds_runtime_secret_aliases_once() {
+        let mut config = json!({
+            "bot_token": "secret-value"
+        });
+        let mut form_spec = make_minimal_form_spec("messaging-slack", &config);
+        let original_question_count = form_spec.questions.len();
+
+        inject_provider_aliases(
+            "messaging-slack",
+            &mut config,
+            &mut form_spec,
+            &json!({
+                "bot_token": "secret-value",
+                "slack_app_id": "A123",
+                "slack_configuration_token": "cfg-secret"
+            }),
+        );
+        inject_provider_aliases(
+            "messaging-slack",
+            &mut config,
+            &mut form_spec,
+            &json!({
+                "bot_token": "secret-value",
+                "slack_app_id": "A123",
+                "slack_configuration_token": "cfg-secret"
+            }),
+        );
+
+        assert_eq!(config["slack_bot_token"], "secret-value");
+        assert_eq!(config["slack_app_id"], "A123");
+        assert_eq!(config["slack_configuration_token"], "cfg-secret");
+        assert!(
+            form_spec
+                .questions
+                .iter()
+                .any(|q| q.id == "slack_bot_token" && q.secret)
+        );
+        assert!(
+            form_spec
+                .questions
+                .iter()
+                .any(|q| q.id == "slack_configuration_token" && q.secret)
+        );
+        assert!(
+            form_spec
+                .questions
+                .iter()
+                .any(|q| q.id == "slack_app_id" && !q.secret)
+        );
+        assert!(form_spec.questions.len() >= original_question_count + 3);
+    }
+
+    #[test]
+    fn push_synthetic_question_deduplicates_existing_entries() {
+        let mut form_spec = make_minimal_form_spec("provider-a", &json!({"token": "x"}));
+        let initial = form_spec.questions.len();
+        push_synthetic_question(&mut form_spec, "token", true);
+        push_synthetic_question(&mut form_spec, "token", true);
+        assert_eq!(form_spec.questions.len(), initial);
+    }
+
+    #[test]
+    fn helper_functions_cover_mode_gmap_and_setup_input_shapes() {
+        assert_eq!(parse_mode(&json!({})), QaMode::Setup);
+        assert_eq!(parse_mode(&json!({"mode": "upgrade"})), QaMode::Upgrade);
+        assert_eq!(parse_mode(&json!({"mode": "remove"})), QaMode::Remove);
+
+        let spec = make_minimal_form_spec(
+            "provider-a",
+            &json!({
+                "secret_token": "s3cr3t",
+                "enabled": true
+            }),
+        );
+        assert_eq!(spec.id, "provider-a-setup");
+        assert!(
+            spec.questions
+                .iter()
+                .any(|q| q.id == "secret_token" && q.secret && q.kind == QuestionType::String)
+        );
+        assert!(
+            spec.questions
+                .iter()
+                .any(|q| q.id == "enabled" && !q.secret)
+        );
+
+        let gmap = resolve_gmap_path(std::path::Path::new("/bundle"), "tenant-a", Some("team-b"));
+        assert_eq!(
+            gmap,
+            std::path::Path::new("/bundle/tenants/tenant-a/teams/team-b/team.gmap")
+        );
+
+        let payload = build_setup_flow_input(
+            "provider-a",
+            "tenant-a",
+            Some("team-b"),
+            Some("https://demo.example"),
+            &json!({"alpha": 1}),
+        );
+        assert_eq!(payload["payload"]["id"], "provider-a-setup_default");
+        assert_eq!(payload["msg"]["id"], "provider-a.setup");
+        assert_eq!(payload["tenant"], "tenant-a");
+        assert_eq!(payload["team"], "team-b");
+        assert_eq!(payload["public_base_url"], "https://demo.example");
+        assert_eq!(payload["config"]["alpha"], 1);
+    }
+
+    #[test]
+    fn merge_existing_config_overlays_answers_on_saved_envelope() {
+        let dir = tempdir().unwrap();
+        let providers_root = dir.path().join(".providers");
+        let pack_path = dir.path().join("provider.gtpack");
+        std::fs::write(&pack_path, b"not-a-zip-but-good-enough").unwrap();
+
+        provider_config_envelope::write_provider_config_envelope(
+            &providers_root,
+            "messaging-slack",
+            "setup_default",
+            &json!({
+                "bot_token": "stored-token",
+                "workspace": "stored-workspace"
+            }),
+            &pack_path,
+            false,
+        )
+        .unwrap();
+
+        let merged = merge_existing_config(
+            dir.path(),
+            "messaging-slack",
+            &json!({
+                "workspace": "fresh-workspace",
+                "channel": "alerts"
+            }),
+        );
+
+        assert_eq!(merged["bot_token"], "stored-token");
+        assert_eq!(merged["workspace"], "fresh-workspace");
+        assert_eq!(merged["channel"], "alerts");
+    }
+
+    #[test]
+    fn apply_i18n_and_runtime_url_helpers_populate_response_metadata() {
+        let dir = tempdir().unwrap();
+        let i18n_dir = dir.path().join("i18n").join("providers");
+        std::fs::create_dir_all(&i18n_dir).unwrap();
+        std::fs::write(
+            i18n_dir.join("en.json"),
+            serde_json::to_vec(&json!({
+                "slack.qa.setup.title": "Slack setup",
+                "slack.qa.setup.bot_token": "Bot token",
+                "slack.schema.config.bot_token.description": "Needed for webhook calls"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let runtime_a = dir.path().join("state").join("runtime").join("a");
+        let runtime_b = dir.path().join("state").join("runtime").join("b");
+        std::fs::create_dir_all(&runtime_a).unwrap();
+        std::fs::create_dir_all(&runtime_b).unwrap();
+        std::fs::write(
+            runtime_a.join("public_base_url.txt"),
+            "https://older.example",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(
+            runtime_b.join("public_base_url.txt"),
+            "time=2025-01-01T00:00:00Z level=info msg=tunnel url=https://newer.example",
+        )
+        .unwrap();
+
+        let mut form_spec = make_minimal_form_spec("messaging-slack", &json!({"bot_token": ""}));
+        apply_i18n_to_form_spec(&mut form_spec, dir.path(), "messaging-slack", "en", "setup");
+        assert_eq!(form_spec.title, "Slack setup");
+        assert_eq!(form_spec.questions[0].title, "Bot token");
+        assert_eq!(
+            form_spec.questions[0].description.as_deref(),
+            Some("Needed for webhook calls")
+        );
+
+        assert_eq!(
+            read_runtime_public_url(dir.path(), "demo", Some("default")).as_deref(),
+            Some("https://newer.example")
+        );
+
+        let mut response = json!({});
+        inject_public_url_meta(&mut response, dir.path(), "demo", Some("default"));
+        assert_eq!(response["meta"]["public_url"], "https://newer.example");
+    }
+
+    #[test]
+    fn load_form_spec_with_fallback_uses_setup_yaml_when_component_qa_is_unavailable() {
+        let dir = tempdir().unwrap();
+        let i18n_dir = dir.path().join("i18n").join("providers");
+        std::fs::create_dir_all(&i18n_dir).unwrap();
+        std::fs::write(
+            i18n_dir.join("en.json"),
+            serde_json::to_vec(&json!({
+                "telegram.qa.setup.title": "Localized Telegram setup",
+                "telegram.qa.setup.bot_token": "Localized Bot Token"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let pack_path = dir.path().join("messaging-telegram.gtpack");
+        let file = std::fs::File::create(&pack_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("assets/setup.yaml", FileOptions::<()>::default())
+            .unwrap();
+        zip.write_all(
+            br#"
+title: Telegram Setup
+questions:
+  - name: bot_token
+    kind: string
+    required: true
+"#,
+        )
+        .unwrap();
+        zip.finish().unwrap();
+
+        let pack = ProviderPack {
+            pack_id: "messaging-telegram".to_string(),
+            display_name: None,
+            description: None,
+            tags: Vec::new(),
+            file_name: "messaging-telegram.gtpack".to_string(),
+            path: pack_path,
+            entry_flows: vec![],
+        };
+        let params = RequestParams {
+            provider_id: "messaging-telegram".to_string(),
+            domain: Domain::Messaging,
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            answers: json!({}),
+            locale: "en".to_string(),
+            mode: QaMode::Setup,
+        };
+
+        let spec = load_form_spec_with_fallback(dir.path(), Domain::Messaging, &pack, &params)
+            .expect("fallback form spec");
+        assert_eq!(spec.title, "Localized Telegram setup");
+        assert!(spec.questions.iter().any(|q| q.id == "bot_token"));
+        assert!(
+            spec.questions
+                .iter()
+                .any(|q| q.title == "Localized Bot Token")
+        );
+    }
+
+    #[test]
+    fn parse_domain_defaults_to_messaging_and_accepts_known_domains() {
+        assert_eq!(parse_domain(&json!({})).unwrap(), Domain::Messaging);
+        assert_eq!(
+            parse_domain(&json!({"domain": "events"})).unwrap(),
+            Domain::Events
+        );
+        assert_eq!(
+            parse_domain(&json!({"domain": "secrets"})).unwrap(),
+            Domain::Secrets
+        );
+    }
+
+    #[test]
+    fn build_setup_flow_input_uses_default_team_and_injects_pack_id_without_public_url() {
+        let payload =
+            build_setup_flow_input("provider-a", "tenant-a", None, None, &json!({"alpha": 1}));
+
+        assert_eq!(payload["team"], "_");
+        assert_eq!(payload["config"]["id"], "provider-a");
+        assert!(payload.get("public_base_url").is_none());
+        assert_eq!(payload["setup_answers"]["alpha"], 1);
     }
 }

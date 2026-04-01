@@ -159,3 +159,144 @@ fn placeholder_entry(uri: String) -> SeedEntry {
         description: Some("auto-applied placeholder".to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secrets_gate::canonical_secret_uri;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    fn write_pack_with_secret_requirements(path: &Path, keys: &[&str]) {
+        let file = std::fs::File::create(path).expect("pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "assets/secret-requirements.json",
+            zip::write::FileOptions::<()>::default(),
+        )
+        .expect("start file");
+        let requirements = serde_json::to_vec(
+            &keys
+                .iter()
+                .map(|key| serde_json::json!({ "key": key }))
+                .collect::<Vec<_>>(),
+        )
+        .expect("requirements");
+        zip.write_all(&requirements).expect("write");
+        zip.finish().expect("finish");
+    }
+
+    fn write_seed_doc(path: &Path, entries: Vec<SeedEntry>) {
+        let doc = SeedDoc { entries };
+        let yaml = serde_yaml_bw::to_string(&doc).expect("yaml");
+        std::fs::write(path, yaml).expect("seed file");
+    }
+
+    #[test]
+    fn resolve_env_prefers_override_then_env_then_dev() {
+        assert_eq!(resolve_env(Some("stage")), "stage");
+        unsafe {
+            std::env::set_var("GREENTIC_ENV", "prod");
+        }
+        assert_eq!(resolve_env(None), "prod");
+        unsafe {
+            std::env::remove_var("GREENTIC_ENV");
+        }
+        assert_eq!(resolve_env(None), "dev");
+    }
+
+    #[test]
+    fn seed_helpers_load_existing_docs_and_build_placeholders() {
+        let dir = tempdir().expect("tempdir");
+        let seed_uri = "secrets://dev/demo/default/provider/token";
+        write_seed_doc(
+            &dir.path().join("seeds.yaml"),
+            vec![SeedEntry {
+                uri: seed_uri.to_string(),
+                format: SecretFormat::Text,
+                value: SeedValue::Text {
+                    text: "seeded-value".to_string(),
+                },
+                description: None,
+            }],
+        );
+
+        let paths = seed_paths(dir.path());
+        assert_eq!(paths[0], dir.path().join("seeds.yaml"));
+        assert_eq!(paths[1], dir.path().join("state").join("seeds.yaml"));
+
+        let seeds = load_seed_entries(dir.path()).expect("load seeds");
+        assert_eq!(seeds.get(seed_uri).expect("seed").uri, seed_uri);
+
+        let placeholder = placeholder_entry(seed_uri.to_string());
+        assert_eq!(placeholder.uri, seed_uri);
+        assert_eq!(
+            placeholder.description.as_deref(),
+            Some("auto-applied placeholder")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_pack_secrets_seeds_missing_values_from_seed_doc_and_placeholders() {
+        let dir = tempdir().expect("tempdir");
+        let pack = dir.path().join("provider.gtpack");
+        write_pack_with_secret_requirements(&pack, &["BOT_TOKEN", "API_KEY"]);
+
+        let seeded_uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-slack",
+            "BOT_TOKEN",
+        );
+        write_seed_doc(
+            &dir.path().join("seeds.yaml"),
+            vec![SeedEntry {
+                uri: seeded_uri.clone(),
+                format: SecretFormat::Text,
+                value: SeedValue::Text {
+                    text: "seeded-bot-token".to_string(),
+                },
+                description: None,
+            }],
+        );
+
+        let setup = SecretsSetup::new(dir.path(), "dev", "demo", Some("default")).expect("setup");
+        setup
+            .ensure_pack_secrets(&pack, "messaging-slack")
+            .await
+            .expect("ensure secrets");
+
+        let seeded = setup.store.get(&seeded_uri).await.expect("seeded");
+        assert_eq!(String::from_utf8(seeded).expect("utf8"), "seeded-bot-token");
+
+        let placeholder_uri =
+            canonical_secret_uri("dev", "demo", Some("default"), "messaging-slack", "API_KEY");
+        let placeholder = setup
+            .store
+            .get(&placeholder_uri)
+            .await
+            .expect("placeholder");
+        assert!(
+            String::from_utf8(placeholder)
+                .expect("utf8")
+                .contains("placeholder for")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_pack_secrets_skips_when_pack_declares_no_secret_requirements() {
+        let dir = tempdir().expect("tempdir");
+        let pack = dir.path().join("provider.gtpack");
+        let file = std::fs::File::create(&pack).expect("pack");
+        let zip = zip::ZipWriter::new(file);
+        zip.finish().expect("finish");
+
+        let setup = SecretsSetup::new(dir.path(), "dev", "demo", Some("default")).expect("setup");
+        setup
+            .ensure_pack_secrets(&pack, "messaging-slack")
+            .await
+            .expect("ensure");
+        assert!(load_seed_entries(dir.path()).expect("seeds").is_empty());
+    }
+}

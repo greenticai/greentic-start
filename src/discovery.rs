@@ -257,3 +257,131 @@ fn missing_cbor_error(path: &Path) -> anyhow::Error {
         path.display()
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    use tempfile::tempdir;
+    use zip::write::FileOptions;
+
+    fn write_pack(path: &Path, entries: &[(&str, Vec<u8>)]) {
+        let file = std::fs::File::create(path).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, bytes) in entries {
+            zip.start_file(*name, FileOptions::<()>::default())
+                .expect("start file");
+            zip.write_all(bytes).expect("write file");
+        }
+        zip.finish().expect("finish pack");
+    }
+
+    #[test]
+    fn discover_falls_back_to_filename_and_persists_results() {
+        let dir = tempdir().expect("tempdir");
+        let messaging_dir = dir.path().join("providers").join("messaging");
+        let oauth_dir = dir.path().join("providers").join("oauth");
+        std::fs::create_dir_all(&messaging_dir).expect("messaging dir");
+        std::fs::create_dir_all(&oauth_dir).expect("oauth dir");
+
+        write_pack(
+            &messaging_dir.join("alpha.gtpack"),
+            &[(
+                "manifest.cbor",
+                serde_cbor::to_vec(&CborValue::Map(std::collections::BTreeMap::from([(
+                    CborValue::Text("pack_id".to_string()),
+                    CborValue::Text("messaging-alpha".to_string()),
+                )])))
+                .expect("manifest"),
+            )],
+        );
+        write_pack(
+            &oauth_dir.join("fallback.gtpack"),
+            &[(
+                "pack.manifest.json",
+                serde_json::to_vec(&serde_json::json!({})).expect("json"),
+            )],
+        );
+
+        let discovered = discover(dir.path()).expect("discover");
+        assert!(discovered.domains.messaging);
+        assert!(discovered.domains.oauth);
+        assert!(!discovered.domains.events);
+        assert_eq!(discovered.providers.len(), 2);
+        assert_eq!(discovered.providers[0].provider_id, "messaging-alpha");
+        assert_eq!(
+            discovered.providers[0].id_source,
+            ProviderIdSource::Manifest
+        );
+        assert_eq!(discovered.providers[1].provider_id, "fallback");
+        assert_eq!(
+            discovered.providers[1].id_source,
+            ProviderIdSource::Filename
+        );
+
+        persist(dir.path(), "tenant-a", &discovered).expect("persist");
+        assert!(
+            dir.path()
+                .join("state")
+                .join("runtime")
+                .join("tenant-a")
+                .join("detected_domains.json")
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join("state")
+                .join("runtime")
+                .join("tenant-a")
+                .join("detected_providers.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn discover_cbor_only_requires_manifest_cbor() {
+        let dir = tempdir().expect("tempdir");
+        let messaging_dir = dir.path().join("providers").join("messaging");
+        std::fs::create_dir_all(&messaging_dir).expect("messaging dir");
+        write_pack(
+            &messaging_dir.join("json-only.gtpack"),
+            &[(
+                "pack.manifest.json",
+                serde_json::to_vec(&serde_json::json!({"pack_id":"json-only"})).expect("json"),
+            )],
+        );
+
+        let err = discover_with_options(dir.path(), DiscoveryOptions { cbor_only: true })
+            .expect_err("cbor-only should fail");
+        assert!(err.to_string().contains("CBOR-only"));
+    }
+
+    #[test]
+    fn extract_pack_id_from_value_supports_symbol_tables_and_meta_fallback() {
+        let value = CborValue::Map(std::collections::BTreeMap::from([
+            (
+                CborValue::Text("symbols".to_string()),
+                CborValue::Map(std::collections::BTreeMap::from([(
+                    CborValue::Text("pack_ids".to_string()),
+                    CborValue::Array(vec![CborValue::Text("events-hook".to_string())]),
+                )])),
+            ),
+            (
+                CborValue::Text("meta".to_string()),
+                CborValue::Map(std::collections::BTreeMap::from([(
+                    CborValue::Text("pack_id".to_string()),
+                    CborValue::Integer(0),
+                )])),
+            ),
+        ]));
+        assert_eq!(
+            extract_pack_id_from_value(&value).expect("extract"),
+            Some("events-hook".to_string())
+        );
+        assert_eq!(
+            resolve_string_symbol(&CborValue::Integer(3), None, "pack_ids").expect("fallback"),
+            Some("3".to_string())
+        );
+    }
+}
