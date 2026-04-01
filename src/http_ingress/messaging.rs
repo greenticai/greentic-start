@@ -38,7 +38,7 @@ pub(super) fn route_messaging_envelopes(
     for envelope in &envelopes {
         let outputs = if let Some(route_to_card) = envelope.metadata.get("routeToCardId") {
             match read_card_from_pack(&app_pack_path, route_to_card) {
-                Some(card_json) => {
+                Some(mut card_json) => {
                     operator_log::info(
                         module_path!(),
                         format!(
@@ -46,20 +46,15 @@ pub(super) fn route_messaging_envelopes(
                             route_to_card
                         ),
                     );
+                    // Resolve {{i18n:KEY}} tokens from pack i18n bundle
+                    let locale = envelope.metadata.get("locale").map(String::as_str).unwrap_or("en");
+                    resolve_i18n_tokens(&mut card_json, &app_pack_path, locale);
                     let mut reply = envelope.clone();
                     reply.metadata.insert(
                         "adaptive_card".to_string(),
                         serde_json::to_string(&card_json).unwrap_or_default(),
                     );
-                    let summary = card_json
-                        .get("body")
-                        .and_then(|b| b.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|item| item.get("text"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or(route_to_card)
-                        .to_string();
-                    reply.text = Some(summary);
+                    reply.text = None;
                     vec![reply]
                 }
                 None => {
@@ -83,17 +78,27 @@ pub(super) fn route_messaging_envelopes(
             // support those ops. Instead inject the bot response directly into
             // the DirectLine conversation state for client polling.
             if let Some((dl_state, conv_id)) = dl_inject {
-                let text = out_envelope.text.clone();
+                let locale = envelope.metadata.get("locale").map(String::as_str).unwrap_or("en");
                 let attachments = out_envelope
                     .metadata
                     .get("adaptive_card")
                     .and_then(|card_str| serde_json::from_str::<serde_json::Value>(card_str).ok())
-                    .map(|card| {
+                    .map(|mut card| {
+                        // Resolve {{i18n:KEY}} tokens from pack i18n bundle
+                        resolve_i18n_tokens(&mut card, &app_pack_path, locale);
                         json!([{
                             "contentType": "application/vnd.microsoft.card.adaptive",
                             "content": card
                         }])
                     });
+                // Suppress text when there is an adaptive card attachment to
+                // prevent webchat SDK from rendering a redundant text bubble
+                // above the card.
+                let text = if attachments.is_some() {
+                    None
+                } else {
+                    out_envelope.text.clone()
+                };
                 if let Some(bot_id) = dl_state.add_bot_activity(conv_id, text, attachments) {
                     operator_log::info(
                         module_path!(),
@@ -232,3 +237,67 @@ fn run_app_flow_safe(
 }
 
 use anyhow::Context;
+
+/// Read i18n bundle from pack and resolve `{{i18n:KEY}}` tokens in card JSON.
+fn resolve_i18n_tokens(card: &mut serde_json::Value, pack_path: &Path, locale: &str) {
+    // Try locale-specific bundle first, fallback to English
+    let bundle = read_i18n_bundle(pack_path, locale)
+        .or_else(|| read_i18n_bundle(pack_path, "en"));
+    let Some(bundle) = bundle else { return };
+    replace_tokens_recursive(card, &bundle);
+}
+
+fn read_i18n_bundle(
+    pack_path: &Path,
+    locale: &str,
+) -> Option<std::collections::HashMap<String, String>> {
+    let file = std::fs::File::open(pack_path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let asset_path = format!("assets/i18n/{locale}.json");
+    let mut entry = archive.by_name(&asset_path).ok()?;
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut buf).ok()?;
+    serde_json::from_slice(&buf).ok()
+}
+
+fn replace_tokens_recursive(
+    value: &mut serde_json::Value,
+    bundle: &std::collections::HashMap<String, String>,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.contains("{{i18n:") {
+                let mut output = String::with_capacity(text.len());
+                let mut rest = text.as_str();
+                loop {
+                    let Some(start) = rest.find("{{i18n:") else {
+                        output.push_str(rest);
+                        break;
+                    };
+                    output.push_str(&rest[..start]);
+                    let token_start = start + "{{i18n:".len();
+                    let after = &rest[token_start..];
+                    let Some(end) = after.find("}}") else {
+                        output.push_str(&rest[start..]);
+                        break;
+                    };
+                    let key = after[..end].trim();
+                    output.push_str(bundle.get(key).map(String::as_str).unwrap_or(key));
+                    rest = &after[end + 2..];
+                }
+                *text = output;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                replace_tokens_recursive(item, bundle);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for val in map.values_mut() {
+                replace_tokens_recursive(val, bundle);
+            }
+        }
+        _ => {}
+    }
+}

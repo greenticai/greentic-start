@@ -200,6 +200,10 @@ pub(super) async fn handle_directline_request(
         let mut metadata = std::collections::BTreeMap::new();
         metadata.insert("provider".to_string(), provider.clone());
         metadata.insert("tenant".to_string(), tenant.clone());
+        // Forward locale from activity for i18n resolution
+        if let Some(locale) = body.get("locale").and_then(|v| v.as_str()) {
+            metadata.insert("locale".to_string(), locale.to_string());
+        }
         // Forward Action.Submit value fields as metadata (for card routing, MCP actions, etc.)
         if let Some(value_obj) = body.get("value").and_then(|v| v.as_object()) {
             for (k, v) in value_obj {
