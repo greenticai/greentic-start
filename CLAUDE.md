@@ -22,7 +22,7 @@ cargo clippy -p greentic-start --all-targets --all-features -- -D warnings
 cargo test -p greentic-start -- test_name_here
 ```
 
-Rust 1.91.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is committed.
+Rust 1.94.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is committed.
 
 ## Release Flow
 
@@ -85,4 +85,4 @@ Do NOT add Claude co-author attribution to commits or PRs.
 
 ## Parent Workspace
 
-This project is part of the Greentic platform ecosystem. See `/home/bimbim/works/greentic/CLAUDE.md` for workspace-level conventions including shared crates, WASM component model, pack/bundle formats, and i18n patterns.
+This project is part of the Greentic platform ecosystem. See the workspace root `CLAUDE.md` for workspace-level conventions including shared crates, WASM component model, pack/bundle formats, and i18n patterns.

@@ -196,7 +196,11 @@ impl DirectLineState {
             "from": {"id": "bot", "name": "Bot", "role": "bot"},
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
-        if let Some(ref t) = text {
+        // Only include "text" when there are no attachments — webchat SDK
+        // renders both as separate bubbles otherwise.
+        if attachments.is_none()
+            && let Some(ref t) = text
+        {
             raw["text"] = JsonValue::String(t.clone());
         }
         if let Some(ref att) = attachments {
