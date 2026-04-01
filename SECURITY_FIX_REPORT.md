@@ -3,6 +3,14 @@
 Date: 2026-04-01 (UTC)
 Reviewer: CI Security Reviewer (Codex)
 
+## Provided Alert Payload
+```json
+{
+  "dependabot": [],
+  "code_scanning": []
+}
+```
+
 ## Inputs Reviewed
 - Dependabot alerts: `0`
 - Code scanning alerts: `0`
