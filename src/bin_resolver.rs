@@ -112,3 +112,123 @@ fn normalize_env_key(name: &str) -> String {
         })
         .collect::<String>()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn resolves_explicit_relative_binary_from_config_dir() {
+        let dir = tempdir().expect("tempdir");
+        let bin = dir.path().join("bin").join("runner");
+        std::fs::create_dir_all(bin.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&bin, "").expect("write binary");
+
+        let resolved = resolve_binary(
+            "runner",
+            &ResolveCtx {
+                config_dir: dir.path().to_path_buf(),
+                explicit_path: Some(PathBuf::from("bin/runner")),
+            },
+        )
+        .expect("resolved");
+
+        assert_eq!(resolved, bin);
+    }
+
+    #[test]
+    fn explicit_missing_binary_reports_resolved_path() {
+        let dir = tempdir().expect("tempdir");
+        let err = resolve_binary(
+            "runner",
+            &ResolveCtx {
+                config_dir: dir.path().to_path_buf(),
+                explicit_path: Some(PathBuf::from("bin/runner")),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("explicit binary path not found"));
+        assert!(err.to_string().contains("bin/runner"));
+    }
+
+    #[test]
+    fn env_override_is_used_before_local_candidates() {
+        let _env_guard = crate::test_env_lock().lock().unwrap();
+        let dir = tempdir().expect("tempdir");
+        let env_bin = dir.path().join("custom-runner");
+        std::fs::write(&env_bin, "").expect("write env binary");
+        unsafe {
+            std::env::set_var("GREENTIC_OPERATOR_BINARY_RUNNER", &env_bin);
+        }
+
+        let resolved = resolve_binary(
+            "runner",
+            &ResolveCtx {
+                config_dir: dir.path().to_path_buf(),
+                explicit_path: None,
+            },
+        )
+        .expect("resolved");
+
+        unsafe {
+            std::env::remove_var("GREENTIC_OPERATOR_BINARY_RUNNER");
+        }
+        assert_eq!(resolved, env_bin);
+    }
+
+    #[test]
+    fn missing_env_override_reports_the_override_path() {
+        let _env_guard = crate::test_env_lock().lock().unwrap();
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("missing-runner");
+        unsafe {
+            std::env::set_var("GREENTIC_OPERATOR_BINARY_RUNNER", &missing);
+        }
+
+        let err = resolve_binary(
+            "runner",
+            &ResolveCtx {
+                config_dir: dir.path().to_path_buf(),
+                explicit_path: None,
+            },
+        )
+        .unwrap_err();
+
+        unsafe {
+            std::env::remove_var("GREENTIC_OPERATOR_BINARY_RUNNER");
+        }
+        assert!(
+            err.to_string()
+                .contains("binary override from environment not found")
+        );
+        assert!(err.to_string().contains(missing.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn missing_binary_lists_candidates_and_env_key_suggestion() {
+        let dir = tempdir().expect("tempdir");
+        let err = resolve_binary(
+            "operator-runner",
+            &ResolveCtx {
+                config_dir: dir.path().to_path_buf(),
+                explicit_path: None,
+            },
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("binary not found: operator-runner"));
+        assert!(message.contains("target/debug/operator-runner"));
+        assert!(message.contains("GREENTIC_OPERATOR_BINARY_OPERATOR_RUNNER"));
+    }
+
+    #[test]
+    fn normalize_env_key_replaces_non_alphanumeric_characters() {
+        assert_eq!(
+            normalize_env_key("operator-runner.v2"),
+            "OPERATOR_RUNNER_V2"
+        );
+    }
+}

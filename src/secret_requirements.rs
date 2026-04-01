@@ -145,3 +145,135 @@ struct AssetSecretRequirement {
     #[serde(default)]
     required: Option<bool>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    use tempfile::tempdir;
+    use zip::write::FileOptions;
+
+    fn write_pack(path: &Path, entries: &[(&str, Vec<u8>)]) {
+        let file = File::create(path).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, bytes) in entries {
+            zip.start_file(*name, FileOptions::<()>::default())
+                .expect("start file");
+            zip.write_all(bytes).expect("write file");
+        }
+        zip.finish().expect("finish pack");
+    }
+
+    #[test]
+    fn load_secret_keys_prefers_asset_file_and_filters_optional_entries() {
+        let dir = tempdir().expect("tempdir");
+        let pack = dir.path().join("pack.gtpack");
+        write_pack(
+            &pack,
+            &[(
+                "assets/secret-requirements.json",
+                serde_json::to_vec(&serde_json::json!([
+                    {"key": "API_TOKEN", "required": true},
+                    {"key": "OPTIONAL_TOKEN", "required": false},
+                    {"required": true}
+                ]))
+                .expect("asset json"),
+            )],
+        );
+
+        assert_eq!(
+            load_secret_keys_from_pack(&pack).expect("load keys"),
+            vec!["api_token".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_secret_keys_falls_back_to_manifest_symbol_resolution() {
+        let dir = tempdir().expect("tempdir");
+        let pack = dir.path().join("pack.gtpack");
+        let manifest = CborValue::Map(BTreeMap::from([
+            (
+                CborValue::Text("symbols".to_string()),
+                CborValue::Map(BTreeMap::from([(
+                    CborValue::Text("secret_requirements".to_string()),
+                    CborValue::Array(vec![CborValue::Text("jwt_signing_key".to_string())]),
+                )])),
+            ),
+            (
+                CborValue::Text("secret_requirements".to_string()),
+                CborValue::Array(vec![
+                    CborValue::Map(BTreeMap::from([
+                        (CborValue::Text("key".to_string()), CborValue::Integer(0)),
+                        (
+                            CborValue::Text("required".to_string()),
+                            CborValue::Bool(true),
+                        ),
+                    ])),
+                    CborValue::Map(BTreeMap::from([
+                        (
+                            CborValue::Text("key".to_string()),
+                            CborValue::Text("ignored".to_string()),
+                        ),
+                        (
+                            CborValue::Text("required".to_string()),
+                            CborValue::Bool(false),
+                        ),
+                    ])),
+                ]),
+            ),
+        ]));
+        write_pack(
+            &pack,
+            &[(
+                "manifest.cbor",
+                serde_cbor::to_vec(&manifest).expect("manifest cbor"),
+            )],
+        );
+
+        assert_eq!(
+            load_secret_keys_from_pack(&pack).expect("load keys"),
+            vec!["jwt_signing_key".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_string_symbol_handles_text_indices_and_invalid_types() {
+        let symbols = BTreeMap::from([(
+            CborValue::Text("secret_requirement".to_string()),
+            CborValue::Array(vec![CborValue::Text("token".to_string())]),
+        )]);
+
+        assert_eq!(
+            resolve_string_symbol(
+                Some(&CborValue::Text("direct".to_string())),
+                Some(&symbols),
+                "secret_requirements",
+            )
+            .expect("text"),
+            Some("direct".to_string())
+        );
+        assert_eq!(
+            resolve_string_symbol(
+                Some(&CborValue::Integer(0)),
+                Some(&symbols),
+                "secret_requirements",
+            )
+            .expect("symbol"),
+            Some("token".to_string())
+        );
+        assert_eq!(
+            resolve_string_symbol(Some(&CborValue::Integer(3)), None, "secret_requirements")
+                .expect("fallback index"),
+            Some("3".to_string())
+        );
+        assert!(
+            resolve_string_symbol(
+                Some(&CborValue::Bool(true)),
+                Some(&symbols),
+                "secret_requirements",
+            )
+            .is_err()
+        );
+    }
+}

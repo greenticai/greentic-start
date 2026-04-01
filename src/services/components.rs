@@ -30,3 +30,26 @@ pub fn component_status(root: &Path, id: &str) -> anyhow::Result<ProcessStatus> 
     let pid = pid_path(root, id);
     super::runner::process_status(&pid)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn component_status_is_not_running_without_pidfile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            component_status(dir.path(), "component-a").expect("status"),
+            ProcessStatus::NotRunning
+        );
+    }
+
+    #[test]
+    fn stop_component_is_not_running_without_pidfile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            stop_component(dir.path(), "component-a").expect("stop"),
+            ServiceState::NotRunning
+        );
+    }
+}

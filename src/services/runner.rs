@@ -283,6 +283,7 @@ pub fn pid_path(root: &Path, name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
     #[cfg(unix)]
     #[test]
@@ -308,5 +309,58 @@ mod tests {
             stop,
             ServiceState::Stopped | ServiceState::NotRunning
         ));
+    }
+
+    #[test]
+    fn process_status_and_read_pid_handle_missing_and_empty_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid = pid_path(temp.path(), "missing");
+        assert_eq!(process_status(&pid).unwrap(), ProcessStatus::NotRunning);
+        assert_eq!(read_pid(&pid).unwrap(), None);
+
+        std::fs::create_dir_all(pid.parent().unwrap()).unwrap();
+        std::fs::write(&pid, " \n ").unwrap();
+        assert_eq!(read_pid(&pid).unwrap(), None);
+        assert_eq!(process_status(&pid).unwrap(), ProcessStatus::NotRunning);
+    }
+
+    #[test]
+    fn ensure_dir_logged_creates_nested_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("a").join("b").join("c");
+        ensure_dir_logged(&nested, "nested dir").unwrap();
+        assert!(nested.is_dir());
+    }
+
+    #[test]
+    fn demo_debug_env_recognizes_supported_truthy_values() {
+        unsafe {
+            env::remove_var("GREENTIC_OPERATOR_DEMO_DEBUG");
+        }
+        assert!(!demo_debug_enabled());
+
+        unsafe {
+            env::set_var("GREENTIC_OPERATOR_DEMO_DEBUG", "1");
+        }
+        assert!(demo_debug_enabled());
+
+        unsafe {
+            env::set_var("GREENTIC_OPERATOR_DEMO_DEBUG", "true");
+        }
+        assert!(demo_debug_enabled());
+
+        unsafe {
+            env::set_var("GREENTIC_OPERATOR_DEMO_DEBUG", "yes");
+        }
+        assert!(demo_debug_enabled());
+
+        unsafe {
+            env::set_var("GREENTIC_OPERATOR_DEMO_DEBUG", "no");
+        }
+        assert!(!demo_debug_enabled());
+
+        unsafe {
+            env::remove_var("GREENTIC_OPERATOR_DEMO_DEBUG");
+        }
     }
 }

@@ -239,3 +239,135 @@ pub(super) fn extract_cbor_blob(value: &JsonValue) -> Option<Vec<u8>> {
 pub(super) fn json_to_canonical_cbor(value: &JsonValue) -> Option<Vec<u8>> {
     canonical::to_canonical_cbor_allow_floats(value).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runner_host::types::{OperationEnvelope, OperationStatus};
+
+    fn sample_envelope() -> OperationEnvelope {
+        OperationEnvelope {
+            op_id: "op-1".to_string(),
+            op_name: "ingest_http".to_string(),
+            ctx: super::super::types::OperationEnvelopeContext {
+                tenant: "demo".to_string(),
+                team: Some("ops".to_string()),
+                correlation_id: Some("corr-1".to_string()),
+                auth_claims: None,
+            },
+            payload_cbor: vec![1, 2, 3],
+            meta_cbor: None,
+            status: OperationStatus::Pending,
+            result_cbor: None,
+        }
+    }
+
+    #[test]
+    fn extract_cbor_blob_supports_arrays_strings_and_nested_objects() {
+        let cbor = serde_cbor::to_vec(&serde_json::json!({
+            "decision": "continue",
+            "reason": null,
+            "envelope": null
+        }))
+        .unwrap();
+        let b64 = general_purpose::STANDARD.encode(&cbor);
+
+        assert_eq!(
+            extract_cbor_blob(&JsonValue::Array(
+                cbor.iter().copied().map(JsonValue::from).collect()
+            )),
+            Some(cbor.clone())
+        );
+        assert_eq!(
+            extract_cbor_blob(&JsonValue::String(b64.clone())),
+            Some(cbor.clone())
+        );
+        assert_eq!(
+            extract_cbor_blob(&serde_json::json!({"hook_decision_cbor_b64": b64})),
+            Some(cbor)
+        );
+    }
+
+    #[test]
+    fn decode_hook_response_prefers_cbor_and_falls_back_to_legacy_json() {
+        let response = serde_json::json!({
+            "decision": "deny",
+            "reason": "nope",
+            "envelope": sample_envelope()
+        });
+        let cbor = serde_cbor::to_vec(&response).unwrap();
+        let cbor_json = serde_json::json!({
+            "cbor_b64": general_purpose::STANDARD.encode(&cbor)
+        });
+        let decoded = decode_hook_response(&cbor_json).unwrap();
+        assert_eq!(decoded.decision, "deny");
+        assert_eq!(decoded.reason.as_deref(), Some("nope"));
+        assert_eq!(decoded.envelope.unwrap().op_name, "ingest_http");
+
+        let legacy = serde_json::json!({
+            "decision": "continue",
+            "reason": "legacy"
+        });
+        let decoded = decode_hook_response(&legacy).unwrap();
+        assert_eq!(decoded.decision, "continue");
+        assert_eq!(decoded.reason.as_deref(), Some("legacy"));
+    }
+
+    #[test]
+    fn json_to_canonical_cbor_round_trips_simple_values() {
+        let value = serde_json::json!({
+            "decision": "continue",
+            "score": 1.5
+        });
+        let bytes = json_to_canonical_cbor(&value).expect("canonical cbor");
+        let decoded: serde_json::Value = serde_cbor::from_slice(&bytes).unwrap();
+        assert_eq!(decoded["decision"], "continue");
+        assert_eq!(decoded["score"], 1.5);
+    }
+
+    #[test]
+    fn extract_cbor_blob_rejects_invalid_shapes() {
+        assert_eq!(
+            extract_cbor_blob(&serde_json::json!({"cbor_b64": 42})),
+            None
+        );
+        assert_eq!(extract_cbor_blob(&serde_json::json!(true)), None);
+        assert_eq!(extract_cbor_blob(&serde_json::json!(["x", 1])), None);
+    }
+
+    #[test]
+    fn decode_hook_response_rejects_invalid_payloads() {
+        let err = decode_hook_response(&serde_json::json!({"cbor_b64": "%%%"})).unwrap_err();
+        assert!(err.to_string().contains("not valid cbor or legacy json"));
+    }
+
+    #[test]
+    fn extract_cbor_blob_supports_nested_array_payloads() {
+        let bytes = vec![1_u8, 2, 3, 4];
+        let value = serde_json::json!({
+            "hook_decision_cbor": bytes.iter().copied().map(serde_json::Value::from).collect::<Vec<_>>()
+        });
+        assert_eq!(extract_cbor_blob(&value), Some(bytes));
+    }
+
+    #[test]
+    fn emit_pre_and_post_sub_accept_envelopes() {
+        let host = crate::runner_host::tests::empty_host_for_tests();
+        let envelope = sample_envelope();
+        host.emit_pre_sub(&envelope);
+        host.emit_post_sub(&envelope);
+    }
+
+    #[test]
+    fn decode_hook_response_accepts_raw_cbor_byte_arrays() {
+        let cbor = serde_cbor::to_vec(&serde_json::json!({
+            "decision": "continue",
+            "reason": "array-form"
+        }))
+        .unwrap();
+        let value = JsonValue::Array(cbor.into_iter().map(JsonValue::from).collect());
+        let decoded = decode_hook_response(&value).unwrap();
+        assert_eq!(decoded.decision, "continue");
+        assert_eq!(decoded.reason.as_deref(), Some("array-form"));
+    }
+}

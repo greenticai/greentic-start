@@ -45,9 +45,16 @@ fn extract_bearer_token(payload: &JsonValue) -> Option<String> {
             "/bearer_token",
             "/token",
             "/access_token",
-            "/authorization",
         ],
-    ) && let Some(token) = parse_bearer_value(&value)
+    ) && let Some(token) = parse_token_value(&value)
+    {
+        return Some(token);
+    }
+
+    if let Some(value) = payload
+        .pointer("/authorization")
+        .and_then(JsonValue::as_str)
+        && let Some(token) = parse_authorization_value(value)
     {
         return Some(token);
     }
@@ -61,7 +68,7 @@ fn extract_bearer_token(payload: &JsonValue) -> Option<String> {
     if let Some(value) = payload
         .pointer("/metadata/authorization")
         .and_then(JsonValue::as_str)
-        && let Some(token) = parse_bearer_value(value)
+        && let Some(token) = parse_authorization_value(value)
     {
         return Some(token);
     }
@@ -74,7 +81,7 @@ fn extract_bearer_from_headers(headers: &JsonValue) -> Option<String> {
         JsonValue::Object(map) => {
             for key in ["authorization", "Authorization"] {
                 if let Some(value) = map.get(key).and_then(JsonValue::as_str)
-                    && let Some(token) = parse_bearer_value(value)
+                    && let Some(token) = parse_authorization_value(value)
                 {
                     return Some(token);
                 }
@@ -90,27 +97,33 @@ fn extract_bearer_from_headers(headers: &JsonValue) -> Option<String> {
                 return None;
             }
             let value = entry.get("value").and_then(JsonValue::as_str)?;
-            parse_bearer_value(value)
+            parse_authorization_value(value)
         }),
         _ => None,
     }
 }
 
-fn parse_bearer_value(raw: &str) -> Option<String> {
+fn parse_token_value(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return None;
-    }
-    if let Some(rest) = trimmed.strip_prefix("Bearer ") {
-        let token = rest.trim();
-        if token.is_empty() {
-            None
-        } else {
-            Some(token.to_string())
-        }
+        None
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn parse_authorization_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let mut parts = trimmed.split_whitespace();
+    let scheme = parts.next()?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = parts.next()?;
+    if token.trim().is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(token.to_string())
 }
 
 fn first_string_at_paths(payload: &JsonValue, paths: &[&str]) -> Option<String> {
@@ -215,6 +228,49 @@ mod tests {
     }
 
     #[test]
+    fn token_validation_request_accepts_case_insensitive_bearer_authorization() {
+        let payload = json!({
+            "headers": {
+                "authorization": "bearer token-123"
+            }
+        });
+        let request =
+            extract_token_validation_request(&serde_json::to_vec(&payload).expect("payload bytes"))
+                .expect("request");
+        assert_eq!(
+            request.pointer("/token").and_then(JsonValue::as_str),
+            Some("token-123")
+        );
+    }
+
+    #[test]
+    fn token_validation_request_rejects_non_bearer_authorization_headers() {
+        let payload = json!({
+            "headers": {
+                "Authorization": "Basic Zm9vOmJhcg=="
+            }
+        });
+        assert!(
+            extract_token_validation_request(&serde_json::to_vec(&payload).expect("payload bytes"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn token_validation_request_accepts_explicit_token_fields_without_bearer_prefix() {
+        let payload = json!({
+            "token": " token-123 "
+        });
+        let request =
+            extract_token_validation_request(&serde_json::to_vec(&payload).expect("payload bytes"))
+                .expect("request");
+        assert_eq!(
+            request.pointer("/token").and_then(JsonValue::as_str),
+            Some("token-123")
+        );
+    }
+
+    #[test]
     fn token_validation_output_deny_when_invalid() {
         let output = json!({
             "valid": false,
@@ -229,6 +285,20 @@ mod tests {
     }
 
     #[test]
+    fn token_validation_output_uses_error_fallback_reason() {
+        let output = json!({
+            "ok": false,
+            "error": "token expired"
+        });
+        match evaluate_token_validation_output(&output) {
+            TokenValidationDecision::Deny(reason) => {
+                assert_eq!(reason, "token expired");
+            }
+            TokenValidationDecision::Allow(_) => panic!("expected deny"),
+        }
+    }
+
+    #[test]
     fn token_validation_output_allows_and_returns_claims() {
         let output = json!({
             "valid": true,
@@ -237,6 +307,25 @@ mod tests {
                 "scope": "read write",
                 "aud": ["api://svc"]
             }
+        });
+        match evaluate_token_validation_output(&output) {
+            TokenValidationDecision::Allow(Some(claims)) => {
+                assert_eq!(
+                    claims.pointer("/sub").and_then(JsonValue::as_str),
+                    Some("user-1")
+                );
+            }
+            TokenValidationDecision::Allow(None) => panic!("expected claims"),
+            TokenValidationDecision::Deny(reason) => panic!("unexpected deny: {reason}"),
+        }
+    }
+
+    #[test]
+    fn token_validation_output_uses_root_object_as_claims_when_sub_present() {
+        let output = json!({
+            "ok": true,
+            "sub": "user-1",
+            "scope": "read"
         });
         match evaluate_token_validation_output(&output) {
             TokenValidationDecision::Allow(Some(claims)) => {

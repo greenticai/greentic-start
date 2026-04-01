@@ -90,7 +90,7 @@ impl<R: ProviderRunner> SubscriptionService<R> {
             self.context.team.clone(),
             &request.binding_id,
             request.resource.as_ref(),
-            &request.change_types,
+            &dto.change_types,
             request.notification_url.as_ref(),
             request.client_state.as_ref(),
             request.user.as_ref(),
@@ -240,5 +240,239 @@ impl<R: ProviderRunner> SubscriptionService<R> {
             email: None,
             display_name: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runner_host::RunnerExecutionMode;
+    use serde_json::json;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Debug)]
+    struct CallRecord {
+        provider: String,
+        op: String,
+        payload: serde_json::Value,
+    }
+
+    struct FakeRunner {
+        outcome: RefCell<Option<FlowOutcome>>,
+        calls: RefCell<Vec<CallRecord>>,
+    }
+
+    impl FakeRunner {
+        fn new(outcome: FlowOutcome) -> Self {
+            Self {
+                outcome: RefCell::new(Some(outcome)),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ProviderRunner for FakeRunner {
+        fn invoke(
+            &self,
+            provider: &str,
+            op: &str,
+            payload: &[u8],
+            _context: &OperatorContext,
+        ) -> Result<FlowOutcome> {
+            self.calls.borrow_mut().push(CallRecord {
+                provider: provider.to_string(),
+                op: op.to_string(),
+                payload: serde_json::from_slice(payload).expect("json payload"),
+            });
+            Ok(self
+                .outcome
+                .borrow_mut()
+                .take()
+                .expect("runner outcome available"))
+        }
+    }
+
+    fn test_context() -> OperatorContext {
+        OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("ops".to_string()),
+            correlation_id: None,
+        }
+    }
+
+    fn success_outcome(output: serde_json::Value) -> FlowOutcome {
+        FlowOutcome {
+            success: true,
+            output: Some(output),
+            raw: None,
+            error: None,
+            mode: RunnerExecutionMode::Exec,
+        }
+    }
+
+    #[test]
+    fn build_ensure_payload_defaults_change_types_and_user() {
+        let service =
+            SubscriptionService::new(FakeRunner::new(success_outcome(json!({}))), test_context());
+        let dto = service
+            .build_ensure_payload(
+                "messaging-graph",
+                &SubscriptionEnsureRequest {
+                    binding_id: "binding-1".to_string(),
+                    resource: Some("/me/messages".to_string()),
+                    change_types: Vec::new(),
+                    notification_url: Some("https://example.test/hook".to_string()),
+                    client_state: None,
+                    user: None,
+                    expiration_target_unix_ms: Some(42),
+                },
+            )
+            .expect("payload");
+
+        assert_eq!(dto.change_types, vec!["created".to_string()]);
+        assert_eq!(dto.user.user_id, "demo-ops");
+        assert_eq!(dto.user.token_key, "operator-ops");
+        assert_eq!(dto.expiration_target_unix_ms, Some(42));
+    }
+
+    #[test]
+    fn build_payloads_require_resource_and_subscription_id() {
+        let service =
+            SubscriptionService::new(FakeRunner::new(success_outcome(json!({}))), test_context());
+
+        let ensure_err = service
+            .build_ensure_payload(
+                "messaging-graph",
+                &SubscriptionEnsureRequest {
+                    binding_id: "binding-1".to_string(),
+                    resource: None,
+                    change_types: Vec::new(),
+                    notification_url: Some("https://example.test/hook".to_string()),
+                    client_state: None,
+                    user: None,
+                    expiration_target_unix_ms: None,
+                },
+            )
+            .unwrap_err();
+        assert!(ensure_err.to_string().contains("resource is required"));
+
+        let renew_err = service
+            .build_renew_payload(
+                "messaging-graph",
+                &SubscriptionRenewRequest {
+                    binding_id: "binding-1".to_string(),
+                    subscription_id: None,
+                    user: None,
+                    resource: None,
+                    change_types: Vec::new(),
+                    expiration_target_unix_ms: None,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            renew_err
+                .to_string()
+                .contains("subscription_id is required")
+        );
+
+        let delete_err = service
+            .build_delete_payload(
+                "messaging-graph",
+                &SubscriptionDeleteRequest {
+                    binding_id: "binding-1".to_string(),
+                    subscription_id: None,
+                    user: None,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            delete_err
+                .to_string()
+                .contains("subscription_id is required")
+        );
+    }
+
+    #[test]
+    fn ensure_once_invokes_runner_and_builds_subscription_state() {
+        let runner = FakeRunner::new(success_outcome(json!({
+            "subscription": {
+                "subscription_id": "sub-123",
+                "expiration_unix_ms": 123456789i64
+            }
+        })));
+        let service = SubscriptionService::new(runner, test_context());
+        let request = SubscriptionEnsureRequest {
+            binding_id: "binding-1".to_string(),
+            resource: Some("/me/messages".to_string()),
+            change_types: Vec::new(),
+            notification_url: Some("https://example.test/hook".to_string()),
+            client_state: Some("secret".to_string()),
+            user: None,
+            expiration_target_unix_ms: None,
+        };
+
+        let state = service
+            .ensure_once("messaging-graph", &request)
+            .expect("state");
+        assert_eq!(state.subscription_id.as_deref(), Some("sub-123"));
+        assert_eq!(state.change_types, vec!["created".to_string()]);
+
+        let calls = service.runner_host.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].provider, "messaging-graph");
+        assert_eq!(calls[0].op, "subscription_ensure");
+        assert_eq!(calls[0].payload["resource"], "/me/messages");
+    }
+
+    #[test]
+    fn renew_delete_and_failure_paths_use_runner_outputs() {
+        let renew_runner = FakeRunner::new(success_outcome(json!({
+            "subscription_id": "sub-456",
+            "expiration_unix_ms": 987654321i64
+        })));
+        let renew_service = SubscriptionService::new(renew_runner, test_context());
+        let renewed = renew_service
+            .renew_once(
+                "messaging-graph",
+                &SubscriptionRenewRequest {
+                    binding_id: "binding-1".to_string(),
+                    subscription_id: Some("sub-123".to_string()),
+                    user: None,
+                    resource: Some("/me/messages".to_string()),
+                    change_types: vec!["updated".to_string()],
+                    expiration_target_unix_ms: Some(77),
+                },
+            )
+            .expect("renewed");
+        assert_eq!(renewed.subscription_id.as_deref(), Some("sub-456"));
+
+        let delete_runner = FakeRunner::new(success_outcome(json!({})));
+        let delete_service = SubscriptionService::new(delete_runner, test_context());
+        delete_service
+            .delete_once(
+                "messaging-graph",
+                &SubscriptionDeleteRequest {
+                    binding_id: "binding-1".to_string(),
+                    subscription_id: Some("sub-123".to_string()),
+                    user: None,
+                },
+            )
+            .expect("delete");
+        assert_eq!(
+            delete_service.runner_host.calls.borrow()[0].op,
+            "subscription_delete"
+        );
+
+        let err = match SubscriptionService::<FakeRunner>::ensure_success(FlowOutcome {
+            success: false,
+            output: None,
+            raw: None,
+            error: Some("provider boom".to_string()),
+            mode: RunnerExecutionMode::Exec,
+        }) {
+            Ok(_) => panic!("expected provider failure"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("provider boom"));
     }
 }

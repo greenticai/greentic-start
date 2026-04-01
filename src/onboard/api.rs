@@ -3,7 +3,7 @@ use std::sync::Arc;
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Method, Request, Response, StatusCode,
-    body::{Bytes, Incoming},
+    body::{Body, Bytes},
     header::CONTENT_TYPE,
 };
 use serde_json::{Value, json};
@@ -35,11 +35,15 @@ pub fn into_error(response: OnboardResponse) -> OnboardError {
 ///   POST /api/onboard/qa/spec     → get FormSpec for a provider
 ///   POST /api/onboard/qa/validate → validate partial answers
 ///   POST /api/onboard/qa/submit   → submit answers → deploy
-pub async fn handle_onboard_request(
-    req: Request<Incoming>,
+pub async fn handle_onboard_request<B>(
+    req: Request<B>,
     path: &str,
     runner_host: &Arc<DemoRunnerHost>,
-) -> OnboardResult {
+) -> OnboardResult
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
     let state = OnboardState {
         runner_host: runner_host.clone(),
     };
@@ -89,7 +93,11 @@ pub async fn handle_onboard_request(
 }
 
 /// Read and parse a JSON body from the request.
-async fn read_json_body(req: Request<Incoming>) -> OnboardResult<Value> {
+async fn read_json_body<B>(req: Request<B>) -> OnboardResult<Value>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
     let payload_bytes = req
         .into_body()
         .collect()
@@ -142,4 +150,185 @@ pub fn error_response(status: StatusCode, message: impl Into<String>) -> Onboard
             "message": message.into()
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery;
+    use crate::runner_host::DemoRunnerHost;
+    use crate::secrets_gate;
+    use http_body_util::BodyExt;
+    use tempfile::tempdir;
+    use tokio::runtime::Runtime;
+
+    fn test_runner_host(root: &std::path::Path) -> Arc<DemoRunnerHost> {
+        let discovery = discovery::discover(root).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(root, "demo", Some("default")).unwrap();
+        Arc::new(
+            DemoRunnerHost::new(root.to_path_buf(), &discovery, None, secrets_handle, false)
+                .unwrap(),
+        )
+    }
+
+    fn request(method: Method, path: &str, body: Option<&str>) -> Request<Full<Bytes>> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Full::from(Bytes::from(
+                body.unwrap_or_default().to_string(),
+            )))
+            .unwrap()
+    }
+
+    fn response_json(response: OnboardResponse) -> Value {
+        let bytes = Runtime::new()
+            .unwrap()
+            .block_on(response.into_body().collect())
+            .unwrap()
+            .to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn error_json(err: OnboardResponse) -> Value {
+        response_json(err)
+    }
+
+    #[test]
+    fn read_json_body_accepts_empty_and_rejects_invalid_json() {
+        let runtime = Runtime::new().unwrap();
+
+        let empty = runtime
+            .block_on(read_json_body(request(
+                Method::POST,
+                "/api/onboard/qa/spec",
+                None,
+            )))
+            .unwrap();
+        assert_eq!(empty, json!({}));
+
+        let invalid = runtime
+            .block_on(read_json_body(request(
+                Method::POST,
+                "/api/onboard/qa/spec",
+                Some("{not-json"),
+            )))
+            .unwrap_err();
+        assert_eq!(
+            error_json(*invalid)["message"],
+            "invalid JSON: key must be a string at line 1 column 2"
+        );
+    }
+
+    #[test]
+    fn response_helpers_emit_json_status_and_messages() {
+        let ok = json_ok(json!({"status": "ok"})).unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(ok.headers().get(CONTENT_TYPE).unwrap(), "application/json");
+        assert_eq!(response_json(ok)["status"], "ok");
+
+        let err = error_response(StatusCode::BAD_REQUEST, "boom");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(err)["message"], "boom");
+    }
+
+    #[test]
+    fn handle_onboard_request_routes_unknown_and_tenant_endpoints() {
+        let runtime = Runtime::new().unwrap();
+        let dir = tempdir().unwrap();
+        let runner_host = test_runner_host(dir.path());
+
+        let unknown = runtime
+            .block_on(handle_onboard_request(
+                request(Method::GET, "/api/onboard/nope", None),
+                "/api/onboard/nope",
+                &runner_host,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error_json(*unknown)["message"],
+            "unknown onboard endpoint: /nope"
+        );
+
+        let tenants = runtime
+            .block_on(handle_onboard_request(
+                request(Method::GET, "/api/onboard/tenants", None),
+                "/api/onboard/tenants",
+                &runner_host,
+            ))
+            .unwrap();
+        assert_eq!(tenants.status(), StatusCode::OK);
+        assert!(
+            response_json(tenants)["tenants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["tenant"] == "default")
+        );
+
+        let create_tenant = runtime
+            .block_on(handle_onboard_request(
+                request(
+                    Method::POST,
+                    "/api/onboard/tenants/create",
+                    Some(r#"{"tenant":"north"}"#),
+                ),
+                "/api/onboard/tenants/create",
+                &runner_host,
+            ))
+            .unwrap();
+        assert!(
+            response_json(create_tenant)["tenants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["tenant"] == "north")
+        );
+
+        let create_team = runtime
+            .block_on(handle_onboard_request(
+                request(
+                    Method::POST,
+                    "/api/onboard/tenants/teams/create",
+                    Some(r#"{"tenant":"north","team":"ops"}"#),
+                ),
+                "/api/onboard/tenants/teams/create",
+                &runner_host,
+            ))
+            .unwrap();
+        let north = response_json(create_team)["tenants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["tenant"] == "north")
+            .unwrap()
+            .clone();
+        assert!(
+            north["teams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|team| team == "ops")
+        );
+    }
+
+    #[test]
+    fn handle_onboard_request_rejects_invalid_json_for_post_routes() {
+        let runtime = Runtime::new().unwrap();
+        let dir = tempdir().unwrap();
+        let runner_host = test_runner_host(dir.path());
+
+        let err = runtime
+            .block_on(handle_onboard_request(
+                request(Method::POST, "/api/onboard/tenants/create", Some("{bad")),
+                "/api/onboard/tenants/create",
+                &runner_host,
+            ))
+            .unwrap_err();
+        assert_eq!(
+            error_json(*err)["message"],
+            "invalid JSON: key must be a string at line 1 column 2"
+        );
+    }
 }

@@ -75,3 +75,124 @@ fn specificity_rank(path: &GmapPath) -> u8 {
         _ => 0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(path: GmapPath, policy: Policy) -> GmapRule {
+        GmapRule {
+            path,
+            policy,
+            line: 1,
+        }
+    }
+
+    #[test]
+    fn eval_policy_prefers_more_specific_and_later_rules() {
+        let rules = vec![
+            rule(
+                GmapPath {
+                    pack: None,
+                    flow: None,
+                    node: None,
+                },
+                Policy::Forbidden,
+            ),
+            rule(
+                GmapPath {
+                    pack: Some("pack".to_string()),
+                    flow: Some("flow".to_string()),
+                    node: None,
+                },
+                Policy::Public,
+            ),
+            rule(
+                GmapPath {
+                    pack: Some("pack".to_string()),
+                    flow: Some("flow".to_string()),
+                    node: None,
+                },
+                Policy::Forbidden,
+            ),
+        ];
+        let target = GmapPath {
+            pack: Some("pack".to_string()),
+            flow: Some("flow".to_string()),
+            node: None,
+        };
+
+        let decision = eval_policy(&rules, &target).expect("decision");
+        assert_eq!(decision.policy, Policy::Forbidden);
+        assert_eq!(decision.rank, 4);
+    }
+
+    #[test]
+    fn eval_policy_matches_pack_wildcards_and_nodes() {
+        let rules = vec![
+            rule(
+                GmapPath {
+                    pack: Some("pack".to_string()),
+                    flow: Some("_".to_string()),
+                    node: None,
+                },
+                Policy::Public,
+            ),
+            rule(
+                GmapPath {
+                    pack: Some("pack".to_string()),
+                    flow: Some("flow".to_string()),
+                    node: Some("node".to_string()),
+                },
+                Policy::Forbidden,
+            ),
+        ];
+        let target = GmapPath {
+            pack: Some("pack".to_string()),
+            flow: Some("flow".to_string()),
+            node: Some("node".to_string()),
+        };
+        assert_eq!(
+            eval_policy(&rules, &target).expect("decision").policy,
+            Policy::Forbidden
+        );
+    }
+
+    #[test]
+    fn eval_with_overlay_prefers_team_then_tenant() {
+        let tenant_rules = vec![rule(
+            GmapPath {
+                pack: Some("pack".to_string()),
+                flow: None,
+                node: None,
+            },
+            Policy::Forbidden,
+        )];
+        let team_rules = vec![rule(
+            GmapPath {
+                pack: Some("pack".to_string()),
+                flow: Some("flow".to_string()),
+                node: None,
+            },
+            Policy::Public,
+        )];
+        let target = GmapPath {
+            pack: Some("pack".to_string()),
+            flow: Some("flow".to_string()),
+            node: None,
+        };
+        assert_eq!(
+            eval_with_overlay(&tenant_rules, &team_rules, &target)
+                .expect("team overlay")
+                .policy,
+            Policy::Public
+        );
+
+        assert_eq!(
+            eval_with_overlay(&tenant_rules, &[], &target)
+                .expect("tenant fallback")
+                .policy,
+            Policy::Forbidden
+        );
+    }
+}

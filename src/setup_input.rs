@@ -137,6 +137,9 @@ pub fn collect_setup_answers(
         if spec.questions.is_empty() {
             return Ok(Value::Object(JsonMap::new()));
         }
+        if !has_required_questions(Some(&spec)) && !interactive {
+            return Ok(Value::Object(JsonMap::new()));
+        }
         if interactive {
             let answers = prompt_setup_answers(&spec, provider_id)?;
             ensure_required_answers(Some(&spec), &answers)?;
@@ -388,6 +391,79 @@ questions:
         let error = collect_setup_answers(&pack_path, "messaging-slack", Some(&answers), false)
             .unwrap_err();
         assert!(error.to_string().contains("missing required setup answer"));
+        Ok(())
+    }
+
+    #[test]
+    fn answers_for_provider_falls_back_to_raw_object_when_not_provider_keyed() -> Result<()> {
+        let answers = SetupInputAnswers::new(
+            json!({"public_base_url": "https://example.com"}),
+            BTreeSet::from(["messaging-slack".to_string()]),
+        )?;
+        assert_eq!(
+            answers
+                .answers_for_provider("messaging-slack")
+                .and_then(|value| value.get("public_base_url")),
+            Some(&Value::String("https://example.com".to_string()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn non_interactive_setup_without_required_questions_returns_empty_object() -> Result<()> {
+        let yaml = r#"
+questions:
+  - name: optional_value
+    required: false
+"#;
+        let (_dir, pack_path) = create_test_pack(yaml)?;
+        let collected = collect_setup_answers(&pack_path, "messaging-test", None, false)?;
+        assert_eq!(collected, Value::Object(JsonMap::new()));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_question_value_handles_choice_boolean_and_number_inputs() -> Result<()> {
+        let choice = SetupQuestion {
+            name: "mode".to_string(),
+            kind: "choice".to_string(),
+            required: false,
+            help: None,
+            choices: vec!["alpha".to_string(), "beta".to_string()],
+            default: None,
+            secret: false,
+            title: None,
+        };
+        assert_eq!(
+            parse_question_value(&choice, "2")?,
+            Value::String("beta".to_string())
+        );
+        assert!(parse_question_value(&choice, "3").is_err());
+
+        let boolean = SetupQuestion {
+            name: "enabled".to_string(),
+            kind: "boolean".to_string(),
+            required: false,
+            help: None,
+            choices: vec![],
+            default: None,
+            secret: false,
+            title: None,
+        };
+        assert_eq!(parse_question_value(&boolean, "y")?, Value::Bool(true));
+        assert_eq!(parse_question_value(&boolean, "no")?, Value::Bool(false));
+
+        let number = SetupQuestion {
+            name: "count".to_string(),
+            kind: "number".to_string(),
+            required: false,
+            help: None,
+            choices: vec![],
+            default: None,
+            secret: false,
+            title: None,
+        };
+        assert_eq!(parse_question_value(&number, "42")?, json!(42));
         Ok(())
     }
 }

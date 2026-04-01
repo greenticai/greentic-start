@@ -62,6 +62,28 @@ mod tests {
     use super::SecretValue;
 
     #[test]
+    fn borrowed_and_owned_values_expose_bytes_and_lengths() {
+        let borrowed = SecretValue::new(b"super-secret");
+        assert_eq!(borrowed.as_bytes(), b"super-secret");
+        assert_eq!(borrowed.len(), 12);
+        assert!(!borrowed.is_empty());
+
+        let owned = SecretValue::owned(vec![1, 2, 3]);
+        assert_eq!(owned.as_bytes(), &[1, 2, 3]);
+        assert_eq!(owned.len(), 3);
+        assert!(!owned.is_empty());
+    }
+
+    #[test]
+    fn conversions_preserve_contents_and_empty_state() {
+        let empty = SecretValue::from(Vec::new());
+        assert!(empty.is_empty());
+
+        let slice = SecretValue::from(&b"abc"[..]);
+        assert_eq!(slice.as_bytes(), b"abc");
+    }
+
+    #[test]
     fn debug_and_display_are_redacted() {
         let value = SecretValue::new(b"super-secret");
         assert_eq!(format!("{value}"), "[REDACTED]");

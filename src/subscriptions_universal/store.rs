@@ -175,3 +175,94 @@ impl SubscriptionStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn sample_state() -> SubscriptionState {
+        SubscriptionState {
+            binding_id: "binding-1".to_string(),
+            provider: "messaging-graph".to_string(),
+            tenant: "demo".to_string(),
+            team: Some("ops".to_string()),
+            resource: Some("/me/messages".to_string()),
+            change_types: vec!["created".to_string()],
+            notification_url: Some("https://example.test/hook".to_string()),
+            client_state: Some("secret".to_string()),
+            user: None,
+            subscription_id: Some("sub-123".to_string()),
+            expiration_unix_ms: Some(123456789),
+            last_error: Some("boom".to_string()),
+        }
+    }
+
+    #[test]
+    fn from_provider_result_extracts_nested_subscription_fields() {
+        let resource = "/me/messages".to_string();
+        let notification_url = "https://example.test/hook".to_string();
+        let client_state = "secret".to_string();
+
+        let state = SubscriptionState::from_provider_result(
+            "messaging-graph",
+            "demo",
+            Some("ops".to_string()),
+            "binding-1",
+            Some(&resource),
+            &["created".to_string()],
+            Some(&notification_url),
+            Some(&client_state),
+            None,
+            Some(&json!({
+                "subscription": {
+                    "subscription_id": "sub-123",
+                    "expiration_unix_ms": 123456789i64,
+                    "last_error": "boom"
+                }
+            })),
+        );
+
+        assert_eq!(state.subscription_id.as_deref(), Some("sub-123"));
+        assert_eq!(state.expiration_unix_ms, Some(123456789));
+        assert_eq!(state.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn store_roundtrips_lists_and_deletes_states() {
+        let dir = tempdir().expect("tempdir");
+        let store = SubscriptionStore::new(dir.path());
+        let state = sample_state();
+
+        let expected_path = dir
+            .path()
+            .join("messaging-graph")
+            .join("demo")
+            .join("ops")
+            .join("binding-1.json");
+        assert_eq!(
+            store.state_path("messaging-graph", "demo", Some("ops"), "binding-1"),
+            expected_path
+        );
+
+        store.write_state(&state).expect("write");
+        let loaded = store
+            .read_state("messaging-graph", "demo", Some("ops"), "binding-1")
+            .expect("read")
+            .expect("state");
+        assert_eq!(loaded.subscription_id.as_deref(), Some("sub-123"));
+
+        let listed = store.list_states().expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].binding_id, "binding-1");
+
+        store.delete_state(&state).expect("delete");
+        assert!(
+            store
+                .read_state("messaging-graph", "demo", Some("ops"), "binding-1")
+                .expect("read after delete")
+                .is_none()
+        );
+    }
+}

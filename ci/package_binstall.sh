@@ -48,6 +48,10 @@ fi
 
 BUILD_CMD=(cargo build --release --target "$TARGET" --bin "$BIN_NAME")
 if [[ "${USE_CROSS:-0}" == "1" ]]; then
+  if ! command -v cross >/dev/null 2>&1; then
+    echo "cross is required when USE_CROSS=1. Install it first (CI should use taiki-e/install-action)." >&2
+    exit 1
+  fi
   BUILD_CMD=(cross build --release --target "$TARGET" --bin "$BIN_NAME")
 fi
 "${BUILD_CMD[@]}"

@@ -107,3 +107,62 @@ fn ensure_success<'a>(
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_inputs_wrap_message_plan_and_tenant_hints() {
+        let render = build_render_plan_input(json!({"text": "hello"}));
+        assert_eq!(render.v, 1);
+        assert_eq!(render.message["text"], "hello");
+
+        let encode = build_encode_input(json!({"text": "hello"}), json!({"steps": []}));
+        assert_eq!(encode.v, 1);
+        assert_eq!(encode.plan["steps"], json!([]));
+
+        let send = build_send_payload(
+            ProviderPayloadV1 {
+                content_type: "application/json".to_string(),
+                body_b64: "e30=".to_string(),
+                metadata_json: Some("{}".to_string()),
+                metadata: None,
+            },
+            "messaging-slack",
+            "demo",
+            Some("ops".to_string()),
+        );
+        assert_eq!(send.v, 1);
+        assert_eq!(send.provider_type, "messaging-slack");
+        assert_eq!(send.tenant.tenant, "demo");
+        assert_eq!(send.tenant.team.as_deref(), Some("ops"));
+        assert!(send.reply_scope.is_none());
+    }
+
+    #[test]
+    fn ensure_success_returns_errors_with_provider_and_op_context() {
+        let ok = FlowOutcome {
+            success: true,
+            output: Some(
+                json!({"payload": {"body_b64": "e30=", "content_type": "application/json"}}),
+            ),
+            raw: None,
+            error: None,
+            mode: crate::runner_host::RunnerExecutionMode::Exec,
+        };
+        assert!(ensure_success(&ok, "provider-a", "encode").is_ok());
+
+        let failed = FlowOutcome {
+            success: false,
+            output: None,
+            raw: None,
+            error: Some("boom".to_string()),
+            mode: crate::runner_host::RunnerExecutionMode::Exec,
+        };
+        match ensure_success(&failed, "provider-a", "encode") {
+            Ok(_) => panic!("expected error"),
+            Err(err) => assert!(err.to_string().contains("provider-a.encode failed: boom")),
+        }
+    }
+}

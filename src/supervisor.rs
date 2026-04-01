@@ -249,3 +249,73 @@ fn terminate_process(pid: u32, graceful_timeout_ms: u64) -> anyhow::Result<()> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn service_id_validates_expected_formats() {
+        assert_eq!(
+            ServiceId::new("worker_1").expect("service id").as_str(),
+            "worker_1"
+        );
+        assert!(ServiceId::new("").is_err());
+        assert!(ServiceId::new("bad/id").is_err());
+    }
+
+    #[test]
+    fn read_status_returns_empty_without_pid_directory() {
+        let dir = tempdir().expect("tempdir");
+        let paths = RuntimePaths::new(dir.path().join("state"), "demo", "default");
+        assert!(read_status(&paths).expect("read status").is_empty());
+    }
+
+    #[test]
+    fn read_status_uses_resolved_log_path_and_running_flag() {
+        let dir = tempdir().expect("tempdir");
+        let paths = RuntimePaths::new(dir.path().join("state"), "demo", "default");
+        let id = ServiceId::new("svc").expect("id");
+        std::fs::create_dir_all(paths.pids_dir()).expect("pids dir");
+        std::fs::write(paths.pid_path(id.as_str()), "999999").expect("pid");
+        write_json(
+            &paths.resolved_path(id.as_str()),
+            &ResolvedService {
+                argv: vec!["echo".to_string()],
+                cwd: None,
+                env: BTreeMap::new(),
+                log_path: Some(dir.path().join("custom.log")),
+            },
+        )
+        .expect("resolved");
+
+        let statuses = read_status(&paths).expect("statuses");
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].id.as_str(), "svc");
+        assert!(!statuses[0].running);
+        assert_eq!(statuses[0].pid, Some(999999));
+        assert_eq!(statuses[0].log_path, dir.path().join("custom.log"));
+    }
+
+    #[test]
+    fn read_resolved_returns_none_for_missing_file() {
+        let dir = tempdir().expect("tempdir");
+        let paths = RuntimePaths::new(dir.path().join("state"), "demo", "default");
+        let id = ServiceId::new("svc").expect("id");
+        assert!(read_resolved(&paths, &id).expect("read resolved").is_none());
+    }
+
+    #[test]
+    fn stop_pidfile_and_read_pid_handle_missing_and_stale_files() {
+        let dir = tempdir().expect("tempdir");
+        let pid_path = dir.path().join("svc.pid");
+
+        stop_pidfile(&pid_path, 1).expect("missing pidfile");
+        assert_eq!(read_pid(&pid_path).expect("missing pid"), None);
+
+        std::fs::write(&pid_path, "999999").expect("stale pid");
+        stop_pidfile(&pid_path, 1).expect("stale pidfile");
+        assert!(!pid_path.exists());
+    }
+}

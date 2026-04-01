@@ -61,3 +61,70 @@ fn build_event_flow_input(event: &EventEnvelopeV1, ctx: &OperatorContext) -> Jso
         "correlation_id": event.correlation_id.clone().or(ctx.correlation_id.clone()),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::build_event_flow_input;
+    use crate::runner_host::OperatorContext;
+
+    #[test]
+    fn build_event_flow_input_prefers_event_correlation_id() {
+        let event: crate::ingress_types::EventEnvelopeV1 =
+            serde_json::from_value(serde_json::json!({
+                "event_id": "evt-1",
+                "event_type": "subscription.created",
+                "occurred_at": "2026-04-01T00:00:00Z",
+                "source": {
+                    "domain": "events",
+                    "provider": "events-webhook",
+                    "handler_id": "default"
+                },
+                "scope": {
+                    "tenant": "demo",
+                    "team": "default"
+                },
+                "correlation_id": "evt-corr",
+                "payload": {"id": "1"}
+            }))
+            .expect("event");
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            correlation_id: Some("ctx-corr".to_string()),
+        };
+
+        let input = build_event_flow_input(&event, &ctx);
+        assert_eq!(input["tenant"], "demo");
+        assert_eq!(input["team"], "default");
+        assert_eq!(input["correlation_id"], "evt-corr");
+        assert_eq!(input["events"].as_array().expect("events").len(), 1);
+    }
+
+    #[test]
+    fn build_event_flow_input_falls_back_to_context_correlation_id() {
+        let event: crate::ingress_types::EventEnvelopeV1 =
+            serde_json::from_value(serde_json::json!({
+                "event_id": "evt-2",
+                "event_type": "subscription.deleted",
+                "occurred_at": "2026-04-01T00:00:01Z",
+                "source": {
+                    "domain": "events",
+                    "provider": "events-webhook"
+                },
+                "scope": {
+                    "tenant": "demo"
+                },
+                "payload": {"id": "2"}
+            }))
+            .expect("event");
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: None,
+            correlation_id: Some("ctx-corr".to_string()),
+        };
+
+        let input = build_event_flow_input(&event, &ctx);
+        assert_eq!(input["correlation_id"], "ctx-corr");
+        assert!(input["team"].is_null());
+    }
+}

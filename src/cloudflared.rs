@@ -181,3 +181,91 @@ pub fn stop_cloudflared() {
             .status();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_state::RuntimePaths;
+    use tempfile::tempdir;
+
+    #[test]
+    fn finds_trycloudflare_url_in_log_text() {
+        let log = "INF Requesting new quick Tunnel on https://demo.trycloudflare.com";
+        assert_eq!(
+            find_url_in_text(log),
+            Some("https://demo.trycloudflare.com".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_public_url_accepts_clean_value_and_log_embedded_value() {
+        assert_eq!(
+            parse_public_url("https://demo.trycloudflare.com"),
+            Some("https://demo.trycloudflare.com".to_string())
+        );
+        assert_eq!(
+            parse_public_url("Created tunnel at https://demo.trycloudflare.com"),
+            Some("https://demo.trycloudflare.com".to_string())
+        );
+        assert_eq!(parse_public_url(""), None);
+    }
+
+    #[test]
+    fn clean_trycloudflare_url_requires_https_and_no_whitespace() {
+        assert!(is_clean_trycloudflare_url("https://demo.trycloudflare.com"));
+        assert!(!is_clean_trycloudflare_url("http://demo.trycloudflare.com"));
+        assert!(!is_clean_trycloudflare_url(
+            "https://demo.trycloudflare.com extra"
+        ));
+    }
+
+    #[test]
+    fn read_pid_and_public_url_handle_empty_and_missing_files() {
+        let dir = tempdir().expect("tempdir");
+        let pid_path = dir.path().join("cloudflared.pid");
+        let url_path = dir.path().join("public_url.txt");
+
+        assert_eq!(read_pid(&pid_path).expect("missing pid"), None);
+        assert_eq!(read_public_url(&url_path).expect("missing url"), None);
+
+        std::fs::write(&pid_path, " \n ").expect("empty pid");
+        std::fs::write(&url_path, " \n ").expect("empty url");
+        assert_eq!(read_pid(&pid_path).expect("empty pid"), None);
+        assert_eq!(read_public_url(&url_path).expect("empty url"), None);
+    }
+
+    #[test]
+    fn public_url_path_uses_runtime_root_and_write_roundtrips() {
+        let dir = tempdir().expect("tempdir");
+        let paths = RuntimePaths::new(dir.path().join("state"), "demo", "default");
+        let url_path = public_url_path(&paths);
+        assert_eq!(
+            url_path,
+            dir.path()
+                .join("state")
+                .join("runtime")
+                .join("demo.default")
+                .join("public_base_url.txt")
+        );
+
+        write_public_url(&url_path, "https://demo.trycloudflare.com").expect("write url");
+        assert_eq!(
+            read_public_url(&url_path).expect("read url"),
+            Some("https://demo.trycloudflare.com".to_string())
+        );
+    }
+
+    #[test]
+    fn discover_public_url_times_out_when_no_url_is_present() {
+        let dir = tempdir().expect("tempdir");
+        let log_path = dir.path().join("cloudflared.log");
+        std::fs::write(&log_path, "starting cloudflared without a url").expect("write log");
+
+        let err = discover_public_url(&log_path, Duration::from_millis(1))
+            .expect_err("missing url should time out");
+        assert!(
+            err.to_string()
+                .contains("timed out waiting for cloudflared public URL")
+        );
+    }
+}

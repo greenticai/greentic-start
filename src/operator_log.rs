@@ -160,4 +160,16 @@ mod tests {
         assert!(contents.contains("hello world"));
         Ok(())
     }
+
+    #[test]
+    fn service_log_helpers_create_expected_path() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = service_log_path(dir.path(), "runner");
+        assert_eq!(path, dir.path().join("runner.log"));
+
+        let reserved = reserve_service_log(dir.path(), "runner")?;
+        assert_eq!(reserved, path);
+        assert!(reserved.exists());
+        Ok(())
+    }
 }

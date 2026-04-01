@@ -379,3 +379,145 @@ pub fn log_invalid_event_warning(err: &anyhow::Error) {
         format!("ingress events decode warning: {err}"),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn messaging_envelope() -> JsonValue {
+        json!({
+            "id": "msg-1",
+            "tenant": {
+                "env": "dev",
+                "tenant": "demo",
+                "tenant_id": "demo",
+                "team": "default",
+                "attempt": 0
+            },
+            "channel": "conv-1",
+            "session_id": "conv-1",
+            "from": {
+                "id": "user-1",
+                "kind": "user"
+            },
+            "text": "hello",
+            "metadata": {}
+        })
+    }
+
+    fn event() -> JsonValue {
+        json!({
+            "event_id": "evt-1",
+            "event_type": "subscription.created",
+            "occurred_at": "2026-04-01T00:00:00Z",
+            "source": {
+                "domain": "events",
+                "provider": "events-webhook"
+            },
+            "scope": {
+                "tenant": "demo",
+                "team": "default"
+            },
+            "payload": {"id": "1"}
+        })
+    }
+
+    #[test]
+    fn build_ingress_request_and_parse_headers_cover_supported_shapes() {
+        let request = build_ingress_request(
+            "provider-a",
+            Some("hook".to_string()),
+            "POST",
+            "/v1/events",
+            vec![("x-test".to_string(), "1".to_string())],
+            vec![("q".to_string(), "v".to_string())],
+            b"body",
+            Some("binding-1".to_string()),
+            Some("demo".to_string()),
+            Some("ops".to_string()),
+            Some(json!({"token_b64": "e30="})),
+        );
+        assert_eq!(request.provider, "provider-a");
+        assert_eq!(request.route.as_deref(), Some("hook"));
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.binding_id.as_deref(), Some("binding-1"));
+        assert_eq!(request.tenant_hint.as_deref(), Some("demo"));
+        assert_eq!(request.team_hint.as_deref(), Some("ops"));
+        assert_eq!(request.body_b64, STANDARD.encode(b"body"));
+
+        assert_eq!(
+            parse_headers(Some(&json!({"x-a": "1", "x-b": 2}))),
+            vec![
+                ("x-a".to_string(), "1".to_string()),
+                ("x-b".to_string(), "2".to_string())
+            ]
+        );
+        assert_eq!(
+            parse_headers(Some(&json!([
+                ["x-a", "1"],
+                {"name": "x-b", "value": "2"},
+                ["ignored"]
+            ]))),
+            vec![
+                ("x-a".to_string(), "1".to_string()),
+                ("x-b".to_string(), "2".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn body_event_and_messaging_parsers_handle_multiple_shapes() {
+        assert_eq!(
+            parse_body_bytes(&json!({"body_b64": STANDARD.encode(b"hello")})).expect("b64"),
+            Some(b"hello".to_vec())
+        );
+        assert_eq!(
+            parse_body_bytes(&json!({"body": "hello"})).expect("text"),
+            Some(b"hello".to_vec())
+        );
+        assert_eq!(
+            parse_body_bytes(&json!({"body_json": {"ok": true}})).expect("json"),
+            Some(br#"{"ok":true}"#.to_vec())
+        );
+        assert_eq!(parse_body_bytes(&json!({})).expect("missing"), None);
+
+        let events = parse_events(Some(&json!([event(), {"bad": true}]))).expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, "evt-1");
+
+        let envelopes =
+            parse_messaging_envelopes(Some(&json!([messaging_envelope(), {"bad": true}])));
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].id, "msg-1");
+    }
+
+    #[test]
+    fn parse_dispatch_result_supports_wit_envelopes_and_debug_helpers() {
+        let result = parse_dispatch_result(&json!({
+            "ok": {
+                "response": {
+                    "status": 202,
+                    "headers": [{"name": "content-type", "value": "application/json"}],
+                    "body_json": {"ok": true}
+                },
+                "events": [event(), messaging_envelope()]
+            }
+        }))
+        .expect("dispatch result");
+
+        assert_eq!(result.response.status, 202);
+        assert_eq!(
+            result.response.headers,
+            vec![("content-type".to_string(), "application/json".to_string())]
+        );
+        assert_eq!(result.response.body, Some(br#"{"ok":true}"#.to_vec()));
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.messaging_envelopes.len(), 1);
+
+        let debug = events_debug_json(&result.events);
+        assert_eq!(debug.as_array().expect("array").len(), 1);
+        assert_eq!(debug[0]["provider"], "events-webhook");
+
+        log_invalid_event_warning(&anyhow::anyhow!("bad event"));
+    }
+}

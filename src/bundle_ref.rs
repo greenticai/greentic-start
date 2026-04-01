@@ -461,6 +461,12 @@ fn map_registry_target(target: &str, base: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    use tar::Builder as TarBuilder;
+    use tempfile::tempdir;
+    use zip::write::FileOptions;
 
     #[test]
     fn local_ref_accepts_existing_path_and_file_scheme() {
@@ -534,5 +540,150 @@ mod tests {
     fn magic_bytes_identify_zip_and_squashfs() {
         assert!(is_zip_magic(b"PK\x03\x04"));
         assert!(is_squashfs_magic(b"hsqs"));
+    }
+
+    #[test]
+    fn registry_target_mapping_trims_duplicate_slashes() {
+        assert_eq!(
+            map_registry_target("/packs/demo:latest", Some("ghcr.io/acme/repo/".to_string())),
+            Some("ghcr.io/acme/repo/packs/demo:latest".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_bundle_archive_kind_prefers_magic_bytes_over_suffix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bundle.tar");
+        fs::write(&path, b"PK\x03\x04not-really-a-tar").expect("write archive");
+
+        let kind = detect_bundle_archive_kind(None, &path).expect("kind");
+        assert_eq!(kind, Some(BundleArchiveKind::Zip));
+    }
+
+    #[test]
+    fn detect_bundle_archive_kind_uses_media_type_and_suffix_fallbacks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tgz = dir.path().join("bundle.tgz");
+        fs::write(&tgz, b"xxxxpayload").expect("write tgz");
+        assert_eq!(
+            detect_bundle_archive_kind(None, &tgz).expect("tgz"),
+            Some(BundleArchiveKind::TarGz)
+        );
+
+        let zst = dir.path().join("bundle.tar.zst");
+        fs::write(&zst, b"xxxxpayload").expect("write zst");
+        assert_eq!(
+            detect_bundle_archive_kind(Some("application/vnd.oci.image.layer.v1.tar+zstd"), &zst)
+                .expect("zst"),
+            Some(BundleArchiveKind::TarZstd)
+        );
+    }
+
+    #[test]
+    fn parse_local_bundle_ref_rejects_missing_paths_and_remote_urls() {
+        assert!(parse_local_bundle_ref("/definitely/missing").is_none());
+        assert!(parse_local_bundle_ref("oci://ghcr.io/acme/demo:latest").is_none());
+    }
+
+    #[test]
+    fn empty_and_unsupported_bundle_references_error() {
+        assert!(resolve_bundle_ref("   ").is_err());
+        assert!(map_remote_bundle_ref("ftp://example.com/demo").is_err());
+    }
+
+    #[test]
+    fn path_media_type_and_hash_helpers_cover_known_suffixes() {
+        assert_eq!(
+            media_type_from_path(Path::new("/tmp/demo.gtpack")),
+            Some("application/zip")
+        );
+        assert_eq!(
+            media_type_from_path(Path::new("/tmp/demo.tar.gz")),
+            Some("application/vnd.oci.image.layer.v1.tar+gzip")
+        );
+        assert_eq!(
+            sanitize_download_name("demo bundle?.gtbundle"),
+            "demo-bundle-.gtbundle"
+        );
+        assert_eq!(
+            bytes_digest(b"abc"),
+            format!("sha256:{}", sha256_hex(b"abc"))
+        );
+    }
+
+    #[test]
+    fn extract_zip_and_tar_archives_populate_output_directory() {
+        let dir = tempdir().expect("tempdir");
+
+        let zip_path = dir.path().join("demo.zip");
+        {
+            let file = fs::File::create(&zip_path).expect("zip");
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("app/config.json", FileOptions::<()>::default())
+                .expect("start zip");
+            zip.write_all(br#"{"ok":true}"#).expect("write zip");
+            zip.finish().expect("finish zip");
+        }
+        let zip_out = dir.path().join("zip-out");
+        extract_zip(&zip_path, &zip_out).expect("extract zip");
+        assert_eq!(
+            fs::read_to_string(zip_out.join("app").join("config.json")).expect("zip output"),
+            r#"{"ok":true}"#
+        );
+
+        let tar_path = dir.path().join("demo.tar");
+        {
+            let file = fs::File::create(&tar_path).expect("tar");
+            let mut tar = TarBuilder::new(file);
+            let mut header = tar::Header::new_gnu();
+            let bytes = b"hello tar";
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, "bundle/readme.txt", &bytes[..])
+                .expect("append tar");
+            tar.finish().expect("finish tar");
+        }
+        let tar_out = dir.path().join("tar-out");
+        extract_tar(&tar_path, &tar_out).expect("extract tar");
+        assert_eq!(
+            fs::read_to_string(tar_out.join("bundle").join("readme.txt")).expect("tar output"),
+            "hello tar"
+        );
+    }
+
+    #[test]
+    fn extract_tar_gz_archive_and_bundle_resolution_work_for_local_archives() {
+        let dir = tempdir().expect("tempdir");
+        let tar_gz_path = dir.path().join("demo.tar.gz");
+        {
+            let file = fs::File::create(&tar_gz_path).expect("tar.gz");
+            let encoder = GzEncoder::new(file, Compression::default());
+            let mut tar = TarBuilder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            let bytes = b"hello gz";
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, "bundle/index.txt", &bytes[..])
+                .expect("append tar.gz");
+            tar.finish().expect("finish tar.gz");
+        }
+
+        let out = dir.path().join("targz-out");
+        extract_tar_gz(&tar_gz_path, &out).expect("extract tar.gz");
+        assert_eq!(
+            fs::read_to_string(out.join("bundle").join("index.txt")).expect("tar.gz output"),
+            "hello gz"
+        );
+
+        let resolved = resolve_bundle_ref(tar_gz_path.to_string_lossy().as_ref()).expect("resolve");
+        assert!(
+            resolved
+                .bundle_dir
+                .join("bundle")
+                .join("index.txt")
+                .exists()
+        );
     }
 }

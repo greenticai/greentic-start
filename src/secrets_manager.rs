@@ -174,6 +174,7 @@ mod tests {
     fn canonical_team_maps_default_and_empty_to_underscore() {
         assert_eq!(canonical_team(Some("default")), "_");
         assert_eq!(canonical_team(Some("")), "_");
+        assert_eq!(canonical_team(Some(" Default ")), "_");
         assert_eq!(canonical_team(Some("team")), "team");
     }
 
@@ -214,5 +215,36 @@ mod tests {
         }
         assert_eq!(selection.scope, SelectedKind::Override);
         assert_eq!(selection.pack_path.unwrap(), alt);
+    }
+
+    #[test]
+    fn override_env_errors_when_pack_is_missing() {
+        let _env_guard = crate::test_env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        unsafe {
+            env::set_var(OVERRIDE_ENV, "missing.gtpack");
+        }
+        let err = select_secrets_manager(dir.path(), "tenant", "team").unwrap_err();
+        unsafe {
+            env::remove_var(OVERRIDE_ENV);
+        }
+        assert!(err.to_string().contains("override secrets manager pack"));
+    }
+
+    #[test]
+    fn selects_lexicographically_first_pack_within_scope() {
+        let _env_guard = crate::test_env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let base = dir.path().join(DEFAULT_SECRETS_DIR);
+        fs::create_dir_all(&base).unwrap();
+        let alpha = base.join("alpha.gtpack");
+        let zeta = base.join("zeta.gtpack");
+        fs::write(&zeta, "").unwrap();
+        fs::write(&alpha, "").unwrap();
+
+        let selection = select_secrets_manager(dir.path(), "tenant", "team").unwrap();
+
+        assert_eq!(selection.scope, SelectedKind::Default);
+        assert_eq!(selection.pack_path.unwrap(), alpha);
     }
 }

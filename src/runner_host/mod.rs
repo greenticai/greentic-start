@@ -404,3 +404,107 @@ impl DemoRunnerHost {
             .unwrap_or(false)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery;
+    use crate::secrets_gate;
+    use tempfile::tempdir;
+
+    pub(super) fn empty_host_for_tests() -> DemoRunnerHost {
+        let dir = tempdir().unwrap();
+        let discovery = discovery::discover(dir.path()).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
+        DemoRunnerHost::new(dir.keep(), &discovery, None, secrets_handle, false).unwrap()
+    }
+
+    #[test]
+    fn empty_catalog_helpers_return_safe_defaults() {
+        let host = empty_host_for_tests();
+
+        assert_eq!(
+            host.get_provider_pack_path(Domain::Messaging, "missing"),
+            None
+        );
+        assert_eq!(
+            host.canonical_provider_type(Domain::Messaging, "missing"),
+            "missing"
+        );
+        assert!(!host.has_provider_packs_for_domain(Domain::Messaging));
+        assert!(!host.supports_op(Domain::Messaging, "missing", "ingest_http"));
+    }
+
+    #[test]
+    fn invoke_capability_returns_missing_outcome_when_registry_is_empty() {
+        let host = empty_host_for_tests();
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            correlation_id: None,
+        };
+        let outcome = host
+            .invoke_capability("greentic.cap.missing", "op", br#"{}"#, &ctx)
+            .unwrap();
+        assert!(!outcome.success);
+        assert!(
+            outcome
+                .error
+                .unwrap_or_default()
+                .contains("MissingCapability")
+        );
+    }
+
+    #[test]
+    fn empty_host_reports_no_secret_or_capability_setup_plan() {
+        let host = empty_host_for_tests();
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            correlation_id: Some("corr-1".to_string()),
+        };
+
+        assert_eq!(
+            host.capability_setup_plan(&ctx),
+            Vec::<CapabilityBinding>::new()
+        );
+        assert_eq!(
+            host.get_secret("missing-provider", "missing-key", &ctx)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn oauth_capability_requires_supported_explicit_ops() {
+        let host = empty_host_for_tests();
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            correlation_id: None,
+        };
+
+        let missing_op = host
+            .invoke_capability(CAP_OAUTH_BROKER_V1, "", br#"{}"#, &ctx)
+            .unwrap();
+        assert!(!missing_op.success);
+        assert!(
+            missing_op
+                .error
+                .unwrap_or_default()
+                .contains("requires an explicit op")
+        );
+
+        let unsupported = host
+            .invoke_capability(CAP_OAUTH_BROKER_V1, "oauth.nope", br#"{}"#, &ctx)
+            .unwrap();
+        assert!(!unsupported.success);
+        assert!(
+            unsupported
+                .error
+                .unwrap_or_default()
+                .contains("unsupported oauth broker op")
+        );
+    }
+}

@@ -189,4 +189,36 @@ mod tests {
         assert_eq!(normalize_locale_tag("POSIX"), None);
         assert_eq!(normalize_locale_tag("C.UTF-8"), None);
     }
+
+    #[test]
+    fn locale_candidates_deduplicate_and_fall_back_to_english() {
+        assert_eq!(
+            locale_candidates("de-DE"),
+            vec![
+                "de-DE.json".to_string(),
+                "de.json".to_string(),
+                "en.json".to_string()
+            ]
+        );
+        assert_eq!(locale_candidates("en"), vec!["en.json".to_string()]);
+    }
+
+    #[test]
+    fn resolve_supported_falls_back_to_base_language() {
+        let supported = vec!["de".to_string(), "en".to_string()];
+        assert_eq!(
+            resolve_supported("de-DE.UTF-8", &supported),
+            Some("de".to_string())
+        );
+        assert_eq!(resolve_supported("fr-FR", &supported), None);
+    }
+
+    #[test]
+    fn translation_helpers_use_fallbacks_and_substitutions() {
+        assert_eq!(tr_for_locale("missing.key", "fallback", "en"), "fallback");
+        assert_eq!(
+            trf("missing.key", "hello {} {}", &["demo", "team"]),
+            "hello demo team"
+        );
+    }
 }

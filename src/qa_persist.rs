@@ -326,8 +326,14 @@ fn value_to_text(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greentic_secrets_lib::{
+        ApplyOptions, DevStore, SecretsStore, SeedDoc, SeedEntry, SeedValue, apply_seed,
+    };
     use qa_spec::{QuestionSpec, QuestionType};
     use serde_json::json;
+    use std::fs;
+    use std::io::Write;
+    use tokio::runtime::Runtime;
 
     fn make_form_spec(questions: Vec<QuestionSpec>) -> FormSpec {
         FormSpec {
@@ -402,5 +408,188 @@ mod tests {
             .map(|q| q.id.as_str())
             .collect();
         assert_eq!(secret_ids, vec!["bot_token", "api_secret"]);
+    }
+
+    #[test]
+    fn value_to_text_handles_strings_and_json_values() {
+        assert_eq!(value_to_text(&json!("token")), "token");
+        assert_eq!(value_to_text(&json!(true)), "true");
+        assert_eq!(value_to_text(&json!({"a": 1})), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn oauth_stub_is_noop_with_and_without_url() {
+        assert!(oauth_authorize_stub("provider-a", Some("https://auth.example.com")).is_none());
+        assert!(oauth_authorize_stub("provider-a", None).is_none());
+    }
+
+    #[test]
+    fn filter_secrets_leaves_non_object_values_unchanged() {
+        let value = json!(true);
+        assert_eq!(filter_secrets(&value, &["token"]), value);
+    }
+
+    #[test]
+    fn read_secret_requirements_reads_asset_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join("pack.gtpack");
+        let file = std::fs::File::create(&pack).expect("pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "assets/secret-requirements.json",
+            zip::write::FileOptions::<()>::default(),
+        )
+        .expect("start file");
+        zip.write_all(br#"[{"key":"SLACK_BOT_TOKEN"},{"key":"API_KEY"}]"#)
+            .expect("write");
+        zip.finish().expect("finish");
+
+        let reqs = read_secret_requirements(&pack).expect("requirements");
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].key, "SLACK_BOT_TOKEN");
+        assert_eq!(reqs[1].key, "API_KEY");
+    }
+
+    #[test]
+    fn persist_qa_config_filters_secret_fields_before_writing_envelope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let providers_root = dir.path().join(".providers");
+        fs::create_dir_all(&providers_root).expect("providers");
+
+        let pack = dir.path().join("provider.gtpack");
+        fs::write(&pack, b"fixture").expect("pack");
+
+        let spec = make_form_spec(vec![
+            question("bot_token", true),
+            question("public_url", false),
+        ]);
+        persist_qa_config(
+            &providers_root,
+            "messaging-slack",
+            &json!({
+                "bot_token": "secret123",
+                "public_url": "https://example.com"
+            }),
+            &pack,
+            &spec,
+            false,
+        )
+        .expect("persist config");
+
+        let envelope = crate::provider_config_envelope::read_provider_config_envelope(
+            &providers_root,
+            "messaging-slack",
+        )
+        .expect("read envelope")
+        .expect("envelope");
+        assert_eq!(envelope.config["public_url"], "https://example.com");
+        assert!(envelope.config.get("bot_token").is_none());
+    }
+
+    #[test]
+    fn persist_qa_secrets_saves_non_empty_answers_and_skips_nulls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = DevStore::with_path(dir.path().join("secrets.env")).expect("store");
+        let spec = make_form_spec(vec![
+            question("bot_token", true),
+            question("retries", false),
+            question("empty", true),
+        ]);
+        let runtime = Runtime::new().expect("runtime");
+        let saved = runtime
+            .block_on(persist_qa_secrets(
+                &store,
+                "dev",
+                "demo",
+                Some("default"),
+                "messaging-slack",
+                &json!({
+                    "bot_token": "secret123",
+                    "retries": 3,
+                    "empty": ""
+                }),
+                &spec,
+            ))
+            .expect("persist secrets");
+
+        assert_eq!(saved, vec!["bot_token".to_string(), "retries".to_string()]);
+        let bot_uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-slack",
+            "bot_token",
+        );
+        let retries_uri =
+            canonical_secret_uri("dev", "demo", Some("default"), "messaging-slack", "retries");
+        let bot = runtime
+            .block_on(store.get(&bot_uri))
+            .expect("read bot token");
+        let retries = runtime
+            .block_on(store.get(&retries_uri))
+            .expect("read retries");
+        assert_eq!(bot, b"secret123".to_vec());
+        assert_eq!(retries, b"3".to_vec());
+    }
+
+    #[test]
+    fn seed_secret_requirement_aliases_creates_alias_entries_for_suffix_matches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = DevStore::with_path(dir.path().join("secrets.env")).expect("store");
+        let runtime = Runtime::new().expect("runtime");
+        let existing = SeedDoc {
+            entries: vec![SeedEntry {
+                uri: canonical_secret_uri(
+                    "dev",
+                    "demo",
+                    Some("default"),
+                    "messaging-slack",
+                    "bot_token",
+                ),
+                format: greentic_secrets_lib::SecretFormat::Text,
+                value: SeedValue::Text {
+                    text: "secret123".to_string(),
+                },
+                description: None,
+            }],
+        };
+        let report = runtime
+            .block_on(async { apply_seed(&store, &existing, ApplyOptions::default()).await });
+        assert_eq!(report.ok, 1);
+
+        let pack = dir.path().join("pack.gtpack");
+        let file = std::fs::File::create(&pack).expect("pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "assets/secret-requirements.json",
+            zip::write::FileOptions::<()>::default(),
+        )
+        .expect("start file");
+        zip.write_all(br#"[{"key":"SLACK_BOT_TOKEN"}]"#)
+            .expect("write");
+        zip.finish().expect("finish");
+
+        let count = runtime
+            .block_on(seed_secret_requirement_aliases(
+                &store,
+                json!({"bot_token": "secret123"}).as_object().unwrap(),
+                "dev",
+                "demo",
+                Some("default"),
+                "messaging-slack",
+                &pack,
+            ))
+            .expect("seed aliases");
+        assert_eq!(count, 1);
+
+        let alias_uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-slack",
+            "slack_bot_token",
+        );
+        let alias = runtime.block_on(store.get(&alias_uri)).expect("alias");
+        assert_eq!(alias, b"secret123".to_vec());
     }
 }

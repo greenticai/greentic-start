@@ -412,7 +412,11 @@ fn parse_timer_op(op: &str, default_interval_seconds: u64) -> Option<(String, u6
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_explicit_timer_handlers, parse_timer_op};
+    use super::{
+        parse_events, parse_explicit_timer_handlers, parse_provider_ops, parse_timer_handler_entry,
+        parse_timer_op, provider_extension_inline_json,
+    };
+    use crate::ingress_types::EventEnvelopeV1;
     use serde_json::json;
 
     #[test]
@@ -452,5 +456,129 @@ mod tests {
         assert_eq!(handlers[0].op_id, "timer_poll");
         assert_eq!(handlers[0].handler_id, "poll");
         assert_eq!(handlers[0].interval_seconds, 15);
+    }
+
+    #[test]
+    fn parses_nested_provider_timer_handlers_and_defaults() {
+        let manifest = json!({
+            "extensions": {
+                "greentic.provider-extension.v1": {
+                    "inline": {
+                        "providers": [
+                            {
+                                "provider_type": "events-slack",
+                                "timer_handlers": [
+                                    "timer_tick",
+                                    {"op": "timer_cleanup_0", "handler": "cleanup", "interval": 0}
+                                ]
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        let handlers =
+            parse_explicit_timer_handlers(&manifest, "events-default", 30).expect("parse");
+        assert_eq!(handlers.len(), 2);
+        assert_eq!(handlers[0].provider, "events-slack");
+        assert_eq!(handlers[0].op_id, "timer_tick");
+        assert_eq!(handlers[0].handler_id, "default");
+        assert_eq!(handlers[0].interval_seconds, 30);
+        assert_eq!(handlers[1].provider, "events-slack");
+        assert_eq!(handlers[1].op_id, "timer_cleanup_0");
+        assert_eq!(handlers[1].handler_id, "cleanup");
+        assert_eq!(handlers[1].interval_seconds, 1);
+    }
+
+    #[test]
+    fn parses_provider_ops_and_inline_payload_errors() {
+        let manifest = json!({
+            "extensions": {
+                "greentic.provider-extension.v1": {
+                    "inline": {
+                        "providers": [
+                            {"provider_type": "events-a", "ops": ["timer_poll", "ingest_http"]},
+                            {"provider_type": "events-b", "ops": ["timer_tick"]}
+                        ]
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            parse_provider_ops(&manifest, "events-a").expect("provider ops"),
+            vec!["timer_poll".to_string(), "ingest_http".to_string()]
+        );
+        let err = provider_extension_inline_json(&json!({})).expect_err("missing extension");
+        assert!(
+            err.to_string()
+                .contains("provider extension inline payload missing")
+        );
+    }
+
+    #[test]
+    fn parses_timer_handler_entries_and_event_outputs() {
+        let handler = parse_timer_handler_entry(
+            &json!({
+                "op_id": "timer_digest",
+                "handler_id": "digest",
+                "provider": "events-email",
+                "interval_seconds": 45
+            }),
+            "events-default",
+            30,
+        )
+        .expect("handler");
+        assert_eq!(handler.provider, "events-email");
+        assert_eq!(handler.op_id, "timer_digest");
+        assert_eq!(handler.handler_id, "digest");
+        assert_eq!(handler.interval_seconds, 45);
+
+        let event: EventEnvelopeV1 = serde_json::from_value(json!({
+            "event_id": "evt-1",
+            "event_type": "timer.fired",
+            "occurred_at": "2026-04-01T00:00:00Z",
+            "source": {
+                "domain": "events",
+                "provider": "events-email",
+                "handler_id": "digest"
+            },
+            "scope": {
+                "tenant": "demo",
+                "team": "default"
+            },
+            "payload": {"ok": true}
+        }))
+        .expect("event");
+        let parsed = parse_events(&json!({"events": [event]})).expect("parse events");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].event_type, "timer.fired");
+
+        assert!(parse_events(&json!({})).expect("missing events").is_empty());
+        let err = parse_events(&json!({"events": [{"bad": true}]})).expect_err("invalid event");
+        assert!(err.to_string().contains("invalid EventEnvelopeV1"));
+    }
+
+    #[test]
+    fn parse_timer_handler_entry_accepts_string_and_provider_alias_fields() {
+        let string_handler =
+            parse_timer_handler_entry(&json!("timer_tick"), "events-default", 25).expect("string");
+        assert_eq!(string_handler.provider, "events-default");
+        assert_eq!(string_handler.handler_id, "default");
+        assert_eq!(string_handler.interval_seconds, 25);
+
+        let alias_handler = parse_timer_handler_entry(
+            &json!({
+                "op": "timer_sync",
+                "provider_type": "events-sync",
+                "interval": 5
+            }),
+            "events-default",
+            30,
+        )
+        .expect("alias handler");
+        assert_eq!(alias_handler.provider, "events-sync");
+        assert_eq!(alias_handler.op_id, "timer_sync");
+        assert_eq!(alias_handler.handler_id, "default");
+        assert_eq!(alias_handler.interval_seconds, 5);
     }
 }

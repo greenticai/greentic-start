@@ -103,3 +103,88 @@ fn provider_id_for_pack(pack: &ProviderPack, provider: &str) -> String {
         pack.pack_id.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DemoDesiredSubscription;
+    use tempfile::tempdir;
+
+    fn pack(pack_id: &str, file_name: &str) -> ProviderPack {
+        ProviderPack {
+            pack_id: pack_id.to_string(),
+            display_name: None,
+            description: None,
+            tags: Vec::new(),
+            file_name: file_name.to_string(),
+            path: PathBuf::from(format!("/tmp/{file_name}")),
+            entry_flows: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn state_root_uses_bundle_state_subdirectory() {
+        assert_eq!(
+            state_root(Path::new("/tmp/demo-bundle")),
+            PathBuf::from("/tmp/demo-bundle/state/subscriptions")
+        );
+    }
+
+    #[test]
+    fn resolve_demo_provider_pack_matches_pack_id_suffix_and_filename() {
+        let packs = vec![
+            pack("messaging.graph", "messaging-graph.gtpack"),
+            pack("messaging.webex", "custom-webex.gtpack"),
+        ];
+
+        assert_eq!(
+            resolve_demo_provider_pack(&packs, "messaging.graph")
+                .expect("exact pack")
+                .pack_id,
+            "messaging.graph"
+        );
+        assert_eq!(
+            resolve_demo_provider_pack(&packs, "graph")
+                .expect("suffix pack")
+                .pack_id,
+            "messaging.graph"
+        );
+        assert_eq!(
+            resolve_demo_provider_pack(&packs, "custom-webex")
+                .expect("filename pack")
+                .pack_id,
+            "messaging.webex"
+        );
+        assert!(resolve_demo_provider_pack(&packs, "missing").is_err());
+    }
+
+    #[test]
+    fn provider_id_for_pack_prefers_explicit_provider_and_falls_back_to_pack_id() {
+        let pack = pack("messaging.graph", "messaging-graph.gtpack");
+        assert_eq!(
+            provider_id_for_pack(&pack, "messaging-graph"),
+            "messaging-graph"
+        );
+        assert_eq!(provider_id_for_pack(&pack, "   "), "messaging.graph");
+    }
+
+    #[test]
+    fn ensure_desired_subscriptions_is_noop_for_empty_desired_list() {
+        let dir = tempdir().expect("tempdir");
+        let (runner_host, context) =
+            build_runner(dir.path(), "demo", Some("default".to_string()), None).unwrap();
+        let scheduler = Scheduler::new(
+            crate::subscriptions_universal::service::SubscriptionService::new(runner_host, context),
+            crate::subscriptions_universal::store::SubscriptionStore::new(state_root(dir.path())),
+        );
+
+        ensure_desired_subscriptions(
+            dir.path(),
+            "demo",
+            Some("default".to_string()),
+            &Vec::<DemoDesiredSubscription>::new(),
+            &scheduler,
+        )
+        .expect("empty desired");
+    }
+}

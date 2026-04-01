@@ -115,3 +115,108 @@ impl std::fmt::Display for GmapPath {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn parse_file_missing_returns_empty_and_parse_str_skips_comments() {
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.gmap");
+        assert!(parse_file(&missing).expect("missing file").is_empty());
+
+        let rules = parse_str(
+            r#"
+            # comment
+
+            _ = forbidden
+            pack/flow = public
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].line, 4);
+        assert_eq!(rules[1].path.flow.as_deref(), Some("flow"));
+    }
+
+    #[test]
+    fn parse_rule_line_and_path_support_wildcard_and_segments() {
+        let rule = parse_rule_line("pack/flow/node = public", 7).expect("rule");
+        assert_eq!(rule.path.pack.as_deref(), Some("pack"));
+        assert_eq!(rule.path.flow.as_deref(), Some("flow"));
+        assert_eq!(rule.path.node.as_deref(), Some("node"));
+        assert_eq!(rule.policy, Policy::Public);
+        assert_eq!(rule.line, 7);
+
+        let wildcard = parse_path("_", 1).expect("wildcard");
+        assert_eq!(
+            wildcard,
+            GmapPath {
+                pack: None,
+                flow: None,
+                node: None
+            }
+        );
+    }
+
+    #[test]
+    fn parse_errors_are_reported_for_invalid_lines_paths_and_policies() {
+        assert!(
+            parse_rule_line("= public", 2)
+                .expect_err("missing path")
+                .to_string()
+                .contains("missing path")
+        );
+        assert!(
+            parse_rule_line("pack =", 3)
+                .expect_err("missing policy")
+                .to_string()
+                .contains("missing policy")
+        );
+        assert!(
+            parse_path("a/b/c/d", 4)
+                .expect_err("too many segments")
+                .to_string()
+                .contains("too many segments")
+        );
+        assert!(
+            parse_policy("private", 5)
+                .expect_err("invalid policy")
+                .to_string()
+                .contains("Invalid policy")
+        );
+    }
+
+    #[test]
+    fn gmap_path_display_renders_supported_shapes() {
+        assert_eq!(
+            GmapPath {
+                pack: None,
+                flow: None,
+                node: None
+            }
+            .to_string(),
+            "_"
+        );
+        assert_eq!(
+            GmapPath {
+                pack: Some("pack".to_string()),
+                flow: None,
+                node: None
+            }
+            .to_string(),
+            "pack"
+        );
+        assert_eq!(
+            GmapPath {
+                pack: Some("pack".to_string()),
+                flow: Some("flow".to_string()),
+                node: Some("node".to_string())
+            }
+            .to_string(),
+            "pack/flow/node"
+        );
+    }
+}

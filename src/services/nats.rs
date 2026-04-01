@@ -79,3 +79,53 @@ fn nats_port(root: &Path) -> u16 {
     let hash = hasher.finish();
     4222 + (hash % 1000) as u16
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn nats_helpers_use_expected_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let url = nats_url(root);
+        assert!(url.starts_with("nats://127.0.0.1:"));
+        assert!(container_name(root).starts_with(NATS_CONTAINER_PREFIX));
+    }
+
+    #[test]
+    fn nats_port_honors_env_override_and_is_stable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        unsafe {
+            env::set_var("GREENTIC_OPERATOR_NATS_PORT", "4333");
+        }
+        assert_eq!(nats_port(root), 4333);
+
+        unsafe {
+            env::set_var("GREENTIC_OPERATOR_NATS_PORT", "invalid");
+        }
+        let derived = nats_port(root);
+        assert_eq!(derived, nats_port(root));
+        assert!((4222..=5221).contains(&derived));
+
+        unsafe {
+            env::remove_var("GREENTIC_OPERATOR_NATS_PORT");
+        }
+    }
+
+    #[test]
+    fn nats_status_and_stop_are_safe_without_pidfile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            nats_status(dir.path()).expect("status"),
+            ProcessStatus::NotRunning
+        );
+        assert_eq!(
+            stop_nats(dir.path()).expect("stop"),
+            ServiceState::NotRunning
+        );
+    }
+}
