@@ -69,7 +69,13 @@ impl StartupInfo {
             println!("  WebChat:  {url}");
         }
         if let Some(ref url) = self.public_url {
-            println!("  Public:   {url}");
+            if let Some(ref wc) = self.webchat_url {
+                // Show public webchat URL by combining public host with webchat path
+                let path = wc.find("/v1/").map(|i| &wc[i..]).unwrap_or("");
+                println!("  Public:   {url}{path}");
+            } else {
+                println!("  Public:   {url}");
+            }
         }
         if !self.channels.is_empty() {
             println!("  Channels: {}", self.channels.join(", "));
