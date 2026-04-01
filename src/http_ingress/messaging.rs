@@ -47,7 +47,11 @@ pub(super) fn route_messaging_envelopes(
                         ),
                     );
                     // Resolve {{i18n:KEY}} tokens from pack i18n bundle
-                    let locale = envelope.metadata.get("locale").map(String::as_str).unwrap_or("en");
+                    let locale = envelope
+                        .metadata
+                        .get("locale")
+                        .map(String::as_str)
+                        .unwrap_or("en");
                     resolve_i18n_tokens(&mut card_json, &app_pack_path, locale);
                     let mut reply = envelope.clone();
                     reply.metadata.insert(
@@ -78,7 +82,11 @@ pub(super) fn route_messaging_envelopes(
             // support those ops. Instead inject the bot response directly into
             // the DirectLine conversation state for client polling.
             if let Some((dl_state, conv_id)) = dl_inject {
-                let locale = envelope.metadata.get("locale").map(String::as_str).unwrap_or("en");
+                let locale = envelope
+                    .metadata
+                    .get("locale")
+                    .map(String::as_str)
+                    .unwrap_or("en");
                 let attachments = out_envelope
                     .metadata
                     .get("adaptive_card")
@@ -241,8 +249,7 @@ use anyhow::Context;
 /// Read i18n bundle from pack and resolve `{{i18n:KEY}}` tokens in card JSON.
 fn resolve_i18n_tokens(card: &mut serde_json::Value, pack_path: &Path, locale: &str) {
     // Try locale-specific bundle first, fallback to English
-    let bundle = read_i18n_bundle(pack_path, locale)
-        .or_else(|| read_i18n_bundle(pack_path, "en"));
+    let bundle = read_i18n_bundle(pack_path, locale).or_else(|| read_i18n_bundle(pack_path, "en"));
     let Some(bundle) = bundle else { return };
     replace_tokens_recursive(card, &bundle);
 }
