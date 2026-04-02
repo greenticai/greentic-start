@@ -117,6 +117,15 @@ impl DemoRunnerHost {
 
         if pack.entry_flows.iter().any(|flow| flow == op_id) {
             let flow_id = op_id;
+
+            // Log flow execution start to flow.log
+            crate::flow_log::flow_start(
+                provider_type,
+                flow_id,
+                &ctx.tenant,
+                ctx.team.as_deref().unwrap_or("default"),
+            );
+
             if self.debug_enabled {
                 operator_log::debug(
                     module_path!(),
@@ -177,6 +186,16 @@ impl DemoRunnerHost {
                         domain, pack, flow_id, &payload, ctx, &run_dir, binary, *flavor,
                     )?,
             };
+
+            // Log flow execution result to flow.log
+            crate::flow_log::flow_end(
+                provider_type,
+                flow_id,
+                &ctx.tenant,
+                ctx.team.as_deref().unwrap_or("default"),
+                outcome.success,
+                outcome.error.as_deref(),
+            );
 
             if self.debug_enabled {
                 operator_log::debug(
