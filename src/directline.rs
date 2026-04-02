@@ -292,6 +292,13 @@ pub fn handle_get_activities(
 mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use rand::RngExt;
+
+    fn random_signing_key() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        rand::rng().fill(&mut key);
+        key
+    }
 
     fn decode_jwt_claims(token: &str) -> JsonValue {
         let payload = token.split('.').nth(1).expect("jwt payload");
@@ -301,14 +308,21 @@ mod tests {
 
     #[test]
     fn generate_jwt_includes_context_and_optional_conversation_id() {
-        let with_conversation = generate_jwt(b"secret", "tenant-a", "team-a", "user-1", Some("c1"));
+        let signing_key = random_signing_key();
+        let with_conversation = generate_jwt(
+            &signing_key,
+            "tenant-a",
+            "team-a",
+            "user-1",
+            Some("c1"),
+        );
         let claims = decode_jwt_claims(&with_conversation);
         assert_eq!(claims["ctx"]["tenant"], "tenant-a");
         assert_eq!(claims["ctx"]["team"], "team-a");
         assert_eq!(claims["sub"], "user-1");
         assert_eq!(claims["conversationId"], "c1");
 
-        let without_conversation = generate_jwt(b"secret", "tenant-a", "team-a", "user-1", None);
+        let without_conversation = generate_jwt(&signing_key, "tenant-a", "team-a", "user-1", None);
         let claims = decode_jwt_claims(&without_conversation);
         assert!(claims.get("conversationId").is_none());
     }
@@ -386,7 +400,8 @@ mod tests {
     #[test]
     fn create_and_post_handlers_populate_expected_fields() {
         let state = DirectLineState::new();
-        let created = handle_create_conversation(&state, "tenant-a", "team-a", b"secret");
+        let signing_key = random_signing_key();
+        let created = handle_create_conversation(&state, "tenant-a", "team-a", &signing_key);
         let conversation_id = created["conversationId"].as_str().expect("conversation id");
         assert!(state.conversation_exists(conversation_id));
         assert_eq!(created["expires_in"], JWT_TTL_SECONDS);
