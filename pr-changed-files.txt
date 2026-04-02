@@ -1,8 +1,5 @@
-Cargo.lock
-Cargo.toml
-i18n/operator_cli/en.json
-src/admin_certs.rs
-src/bundle_config.rs
-src/cli_args.rs
-src/lib.rs
-src/tunnel_prompt.rs
+.github/workflows/ci.yml
+.github/workflows/codeql.yml
+.github/workflows/codex-security-fix.yml
+.github/workflows/dependency-review.yml
+.github/workflows/publish.yml
