@@ -1,1 +1,8 @@
-.github/workflows/dependency-review.yml
+Cargo.lock
+Cargo.toml
+i18n/operator_cli/en.json
+src/admin_certs.rs
+src/bundle_config.rs
+src/cli_args.rs
+src/lib.rs
+src/tunnel_prompt.rs
