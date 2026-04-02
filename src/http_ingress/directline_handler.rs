@@ -66,6 +66,7 @@ pub(super) async fn handle_directline_request<B>(
     req: Request<B>,
     path: &str,
     explicit_tenant: Option<String>,
+    explicit_provider: Option<String>,
     state: Arc<HttpIngressState>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>>
 where
@@ -76,13 +77,18 @@ where
     let query_string = req.uri().query().map(String::from);
     let queries = collect_queries(query_string.as_deref());
 
-    // Use webchat-gui provider for tenant-scoped routes, webchat for legacy
-    let is_tenant_scoped = explicit_tenant.is_some();
-    let provider = if is_tenant_scoped {
-        "messaging-webchat-gui".to_string()
-    } else {
-        "messaging-webchat".to_string()
-    };
+    // Provider resolution priority:
+    // 1) explicit provider from route handoff (e.g. matched static route pack_id),
+    // 2) `provider=` query parameter override,
+    // 3) legacy default.
+    let provider = explicit_provider
+        .or_else(|| {
+            queries
+                .iter()
+                .find(|(k, _)| k == "provider")
+                .map(|(_, v)| v.clone())
+        })
+        .unwrap_or_else(|| "messaging-webchat".to_string());
 
     // Use explicit tenant from URL path, or fall back to query param
     let tenant = explicit_tenant.unwrap_or_else(|| {
@@ -507,6 +513,7 @@ mod tests {
                 empty_request(Method::GET, "/auth/config"),
                 "/auth/config",
                 Some("demo".to_string()),
+                None,
                 test_state(vec![]),
             ))
             .unwrap_err();
@@ -517,6 +524,7 @@ mod tests {
                 empty_request(Method::GET, "/v3/directline/unknown"),
                 "/v3/directline/unknown",
                 Some("demo".to_string()),
+                None,
                 test_state(vec![Domain::Messaging]),
             ))
             .unwrap_err();
@@ -533,6 +541,7 @@ mod tests {
                 empty_request(Method::GET, "/auth/config"),
                 "/auth/config",
                 Some("demo".to_string()),
+                None,
                 state.clone(),
             ))
             .unwrap();
@@ -543,6 +552,7 @@ mod tests {
                 empty_request(Method::GET, "/v3/directline/conversations/missing"),
                 "/v3/directline/conversations/missing",
                 Some("demo".to_string()),
+                None,
                 state,
             ))
             .unwrap_err();
@@ -559,7 +569,7 @@ mod tests {
             "dev",
             "demo",
             Some("default"),
-            "messaging-webchat-gui",
+            "messaging-webchat",
             "jwt_signing_key",
         );
         unsafe {
@@ -571,6 +581,7 @@ mod tests {
                 empty_request(Method::POST, "/v3/directline/conversations"),
                 "/v3/directline/conversations",
                 Some("demo".to_string()),
+                None,
                 state.clone(),
             ))
             .unwrap();
@@ -585,6 +596,7 @@ mod tests {
                 empty_request(Method::GET, &reconnect_path),
                 &reconnect_path,
                 Some("demo".to_string()),
+                None,
                 state.clone(),
             ))
             .unwrap();
@@ -596,6 +608,7 @@ mod tests {
                 empty_request(Method::GET, &activities_path),
                 &activities_path,
                 Some("demo".to_string()),
+                None,
                 state,
             ))
             .unwrap();
@@ -623,7 +636,7 @@ mod tests {
             "dev",
             "demo",
             Some("default"),
-            "messaging-webchat-gui",
+            "messaging-webchat",
             "jwt_signing_key",
         );
         unsafe {
@@ -635,6 +648,7 @@ mod tests {
                 empty_request(Method::GET, "/token"),
                 "/token",
                 Some("demo".to_string()),
+                None,
                 state.clone(),
             ))
             .unwrap();
@@ -657,6 +671,7 @@ mod tests {
                 ),
                 "/v3/directline/conversations/conv-1/activities",
                 Some("demo".to_string()),
+                None,
                 state.clone(),
             ))
             .unwrap_err();
@@ -671,6 +686,7 @@ mod tests {
                 ),
                 "/v3/directline/conversations/missing/activities",
                 Some("demo".to_string()),
+                None,
                 state.clone(),
             ))
             .unwrap_err();
@@ -685,12 +701,100 @@ mod tests {
                 empty_request(Method::GET, "/token"),
                 "/token",
                 Some("demo".to_string()),
+                None,
                 state,
             ))
             .unwrap_err();
         assert_eq!(missing_key.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
         unsafe {
+            std::env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+        }
+        drop(env_guard);
+    }
+
+    #[test]
+    fn tenant_scoped_token_uses_same_provider_default_as_legacy_route() {
+        let runtime = Runtime::new().unwrap();
+        let dir = tempdir().unwrap();
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        let state = env_backed_state(dir.path());
+
+        // Configure only messaging-webchat, mirroring a perf bundle that does not
+        // include messaging-webchat-gui secrets.
+        let webchat_secret_uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-webchat",
+            "jwt_signing_key",
+        );
+        unsafe {
+            std::env::set_var(&webchat_secret_uri, "legacy-webchat-signing-key");
+        }
+
+        // Legacy root route selects messaging-webchat and succeeds.
+        let legacy_ok = runtime
+            .block_on(handle_directline_request(
+                empty_request(Method::GET, "/token?tenant=demo"),
+                "/token",
+                None,
+                None,
+                state.clone(),
+            ))
+            .unwrap();
+        assert_eq!(legacy_ok.status(), StatusCode::OK);
+
+        // Tenant-scoped route also resolves to messaging-webchat by default.
+        let tenant_scoped_ok = runtime
+            .block_on(handle_directline_request(
+                empty_request(Method::GET, "/token"),
+                "/token",
+                Some("demo".to_string()),
+                None,
+                state,
+            ))
+            .unwrap();
+        assert_eq!(tenant_scoped_ok.status(), StatusCode::OK);
+
+        unsafe {
+            std::env::remove_var(&webchat_secret_uri);
+            std::env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+        }
+        drop(env_guard);
+    }
+
+    #[test]
+    fn explicit_provider_is_used_for_tenant_scoped_token_generation() {
+        let runtime = Runtime::new().unwrap();
+        let dir = tempdir().unwrap();
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        let state = env_backed_state(dir.path());
+
+        let gui_secret_uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
+        unsafe {
+            std::env::set_var(&gui_secret_uri, "gui-signing-key");
+        }
+
+        let token = runtime
+            .block_on(handle_directline_request(
+                empty_request(Method::GET, "/token"),
+                "/token",
+                Some("demo".to_string()),
+                Some("messaging-webchat-gui".to_string()),
+                state,
+            ))
+            .unwrap();
+        assert_eq!(token.status(), StatusCode::OK);
+
+        unsafe {
+            std::env::remove_var(&gui_secret_uri);
             std::env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
         }
         drop(env_guard);
