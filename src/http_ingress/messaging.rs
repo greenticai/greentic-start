@@ -46,6 +46,18 @@ pub(super) fn route_messaging_envelopes(
                             route_to_card
                         ),
                     );
+                    let from_id = envelope
+                        .from
+                        .as_ref()
+                        .map(|f| f.id.as_str())
+                        .unwrap_or("?");
+                    crate::flow_log::log(
+                        "CARD",
+                        &format!(
+                            "pack={} routeToCardId={} tenant={} from={}",
+                            pack_info.pack_id, route_to_card, ctx.tenant, from_id
+                        ),
+                    );
                     // Resolve {{i18n:KEY}} tokens from pack i18n bundle
                     let locale = envelope
                         .metadata
