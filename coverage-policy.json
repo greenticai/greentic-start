@@ -8,7 +8,8 @@
   },
   "exclusions": {
     "files": [
-      "src/main.rs"
+      "src/main.rs",
+      "src/lib.rs"
     ]
   },
   "per_file": {

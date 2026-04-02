@@ -194,10 +194,7 @@ fn extract_pack_id_from_value(value: &CborValue) -> anyhow::Result<Option<String
     let CborValue::Map(map) = value else {
         return Ok(None);
     };
-    let symbols = match map_get(map, "symbols") {
-        Some(CborValue::Map(map)) => Some(map),
-        _ => None,
-    };
+    let symbols = symbols_map(map);
 
     if let Some(pack_id) = map_get(map, "pack_id")
         && let Some(value) = resolve_string_symbol(pack_id, symbols, "pack_ids")?
@@ -215,6 +212,15 @@ fn extract_pack_id_from_value(value: &CborValue) -> anyhow::Result<Option<String
     Ok(None)
 }
 
+fn symbols_map(
+    map: &std::collections::BTreeMap<CborValue, CborValue>,
+) -> Option<&std::collections::BTreeMap<CborValue, CborValue>> {
+    match map_get(map, "symbols") {
+        Some(CborValue::Map(map)) => Some(map),
+        _ => None,
+    }
+}
+
 fn resolve_string_symbol(
     value: &CborValue,
     symbols: Option<&std::collections::BTreeMap<CborValue, CborValue>>,
@@ -226,9 +232,7 @@ fn resolve_string_symbol(
             let Some(symbols) = symbols else {
                 return Ok(Some(idx.to_string()));
             };
-            let Some(CborValue::Array(values)) = map_get(symbols, symbol_key)
-                .or_else(|| map_get(symbols, symbol_key.strip_suffix('s').unwrap_or(symbol_key)))
-            else {
+            let Some(values) = symbol_array(symbols, symbol_key) else {
                 return Ok(Some(idx.to_string()));
             };
             let idx = usize::try_from(*idx).unwrap_or(usize::MAX);
@@ -241,14 +245,26 @@ fn resolve_string_symbol(
     }
 }
 
+fn symbol_array<'a>(
+    symbols: &'a std::collections::BTreeMap<CborValue, CborValue>,
+    key: &'a str,
+) -> Option<&'a Vec<CborValue>> {
+    if let Some(CborValue::Array(values)) = map_get(symbols, key) {
+        return Some(values);
+    }
+    if let Some(stripped) = key.strip_suffix('s')
+        && let Some(CborValue::Array(values)) = map_get(symbols, stripped)
+    {
+        return Some(values);
+    }
+    None
+}
+
 fn map_get<'a>(
     map: &'a std::collections::BTreeMap<CborValue, CborValue>,
     key: &str,
 ) -> Option<&'a CborValue> {
-    map.iter().find_map(|(k, v)| match k {
-        CborValue::Text(text) if text == key => Some(v),
-        _ => None,
-    })
+    map.get(&CborValue::Text(key.to_string()))
 }
 
 fn missing_cbor_error(path: &Path) -> anyhow::Error {
