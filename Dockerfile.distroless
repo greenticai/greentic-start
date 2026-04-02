@@ -19,6 +19,7 @@ ENV CXX_x86_64_unknown_linux_musl=g++
 ENV CARGO_TARGET_DIR=/tmp/target
 
 COPY Cargo.toml Cargo.lock ./
+COPY benches ./benches
 COPY src ./src
 COPY i18n ./i18n
 
