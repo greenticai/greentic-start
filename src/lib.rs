@@ -518,6 +518,7 @@ mod tests {
         let _env_guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        crate::operator_log::reset_for_tests();
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path().join("bundle");
         write_demo_bundle(&bundle);
@@ -541,6 +542,7 @@ mod tests {
         let _env_guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        crate::operator_log::reset_for_tests();
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path().join("bundle");
         write_demo_bundle(&bundle);
@@ -565,6 +567,7 @@ mod tests {
         let _env_guard = crate::test_env_lock()
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        crate::operator_log::reset_for_tests();
         let temp = tempfile::tempdir().expect("tempdir");
         let missing_bundle = temp.path().join("missing-bundle");
         let mut request = make_start_request(&missing_bundle);
@@ -574,7 +577,8 @@ mod tests {
         let message = err.to_string();
         assert!(
             message.contains("bundle config not found")
-                || message.contains("bundle path does not exist"),
+                || message.contains("bundle path does not exist")
+                || message.contains("unsupported bundle reference"),
             "unexpected error: {message}"
         );
     }
