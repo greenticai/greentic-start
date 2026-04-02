@@ -21,6 +21,7 @@ pub mod directline;
 mod discovery;
 mod domains;
 mod event_router;
+pub(crate) mod flow_log;
 mod gmap;
 mod http_ingress;
 mod ingress;
@@ -151,6 +152,19 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             .unwrap_or_else(|| config_dir.join("logs")),
         log_level,
     )?;
+
+    // Initialize flow execution logger (writes to logs/flow.log)
+    match flow_log::init(&log_dir) {
+        Ok(path) => {
+            operator_log::info(
+                module_path!(),
+                format!("flow.log initialized at {}", path.display()),
+            );
+        }
+        Err(e) => {
+            operator_log::warn(module_path!(), format!("failed to init flow.log: {e}"));
+        }
+    }
 
     let mut demo_config = bundle_config::load_runtime_demo_config(&demo_paths, &request)?;
     apply_nats_overrides(&mut demo_config, &request);

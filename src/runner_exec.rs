@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use greentic_runner_desktop::{RunOptions, RunResult, TenantContext};
+use greentic_runner_desktop::{RunOptions, RunResult, RunStatus, TenantContext};
 use serde_json::Value as JsonValue;
 
 use crate::domains::Domain;
@@ -24,6 +24,9 @@ pub struct RunRequest {
 }
 
 pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> {
+    // Ensure flow.log is initialized in bundle's logs directory
+    let _ = crate::flow_log::init(&request.root.join("logs"));
+
     let run_dir = state_layout::run_dir(
         &request.root,
         request.domain,
@@ -34,6 +37,50 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
     let input_path = run_dir.join("input.json");
     let input_json = serde_json::to_string_pretty(&request.input)?;
     std::fs::write(&input_path, input_json)?;
+
+    let log_pack = request.pack_label.clone();
+    let log_flow = request.flow_id.clone();
+    let log_tenant = request.tenant.clone();
+    let log_team = request.team.as_deref().unwrap_or("default").to_string();
+
+    // Extract user input for logging
+    let user_text = request
+        .input
+        .pointer("/input/text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let user_verb = request
+        .input
+        .pointer("/input/metadata/verb")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let user_from = request
+        .input
+        .pointer("/input/from/id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+
+    let input_summary = if !user_verb.is_empty() {
+        format!("verb={user_verb}")
+    } else if !user_text.is_empty() {
+        let truncated = if user_text.len() > 80 {
+            format!("{}...", &user_text[..80])
+        } else {
+            user_text.clone()
+        };
+        format!("text=\"{truncated}\"")
+    } else {
+        "empty".to_string()
+    };
+
+    crate::flow_log::flow_start(&log_pack, &log_flow, &log_tenant, &log_team);
+    crate::flow_log::log(
+        "INPUT",
+        &format!("pack={log_pack} flow={log_flow} from={user_from} {input_summary}"),
+    );
 
     let opts = RunOptions {
         entry_flow: Some(request.flow_id.clone()),
@@ -50,6 +97,27 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
     };
 
     let result = greentic_runner_desktop::run_pack_with_options(&request.pack_path, opts)?;
+
+    // Log node-level execution trace
+    for node in &result.node_summaries {
+        crate::flow_log::log(
+            "NODE",
+            &format!(
+                "pack={log_pack} flow={log_flow} node={} component={} status={:?} duration={}ms",
+                node.node_id, node.component, node.status, node.duration_ms,
+            ),
+        );
+    }
+
+    crate::flow_log::flow_end(
+        &log_pack,
+        &log_flow,
+        &log_tenant,
+        &log_team,
+        result.status == RunStatus::Success,
+        result.error.as_deref(),
+    );
+
     write_run_artifacts(&run_dir, &result)?;
 
     Ok(RunOutput { result, run_dir })

@@ -305,16 +305,14 @@ fn collect_transcript_outputs(
         return Ok(None);
     }
     let contents = std::fs::read_to_string(path)?;
-    let mut first = None;
+    let mut last = None;
     let mut targeted = None;
     for line in contents.lines() {
         if let Ok(value) = serde_json::from_str::<JsonValue>(line)
             && let Some(outputs) = value.get("outputs")
             && !outputs.is_null()
         {
-            if first.is_none() {
-                first = Some(outputs.clone());
-            }
+            last = Some(outputs.clone());
             if let Some(target) = target_node_id
                 && let Some(node_id) = value.get("node_id").and_then(|n| n.as_str())
                 && node_id == target
@@ -323,7 +321,7 @@ fn collect_transcript_outputs(
             }
         }
     }
-    Ok(targeted.or(first))
+    Ok(targeted.or(last))
 }
 
 fn parse_envelopes(
@@ -573,28 +571,30 @@ mod tests {
     }
 
     #[test]
-    fn collect_transcript_outputs_prefers_targeted_node_and_first_non_null_output() {
+    fn collect_transcript_outputs_prefers_targeted_node_then_last_output() {
         let dir = tempdir().expect("tempdir");
         let transcript = dir.path().join("transcript.jsonl");
         std::fs::write(
             &transcript,
             concat!(
                 "{\"node_id\":\"first\",\"outputs\":null}\n",
-                "{\"node_id\":\"other\",\"outputs\":{\"text\":\"fallback\"}}\n",
+                "{\"node_id\":\"other\",\"outputs\":{\"text\":\"middle\"}}\n",
                 "{\"node_id\":\"target\",\"outputs\":{\"text\":\"targeted\"}}\n"
             ),
         )
         .expect("write transcript");
 
+        // Targeted node takes priority
         let targeted = collect_transcript_outputs(dir.path(), Some("target"))
             .expect("collect outputs")
             .expect("targeted output");
         assert_eq!(targeted["text"], "targeted");
 
+        // When target not found, fall back to LAST non-null output
         let fallback = collect_transcript_outputs(dir.path(), Some("missing"))
             .expect("collect fallback")
             .expect("fallback output");
-        assert_eq!(fallback["text"], "fallback");
+        assert_eq!(fallback["text"], "targeted");
 
         let missing = collect_transcript_outputs(&dir.path().join("no-run"), None)
             .expect("missing transcript");
