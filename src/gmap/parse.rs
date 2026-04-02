@@ -73,23 +73,26 @@ pub fn parse_path(raw: &str, line_number: usize) -> anyhow::Result<GmapPath> {
             node: None,
         });
     }
-    let segments: Vec<&str> = raw.split('/').filter(|seg| !seg.is_empty()).collect();
-    if segments.is_empty() {
+    let mut segments = raw.split('/').filter(|seg| !seg.is_empty());
+    let Some(pack) = segments.next() else {
         return Err(anyhow::anyhow!(
             "Invalid path on line {}: empty path",
             line_number
         ));
-    }
-    if segments.len() > 3 {
+    };
+    let flow = segments.next();
+    let node = segments.next();
+    if segments.next().is_some() {
         return Err(anyhow::anyhow!(
             "Invalid path on line {}: too many segments",
             line_number
         ));
     }
-    let pack = Some(segments[0].to_string());
-    let flow = segments.get(1).map(|seg| seg.to_string());
-    let node = segments.get(2).map(|seg| seg.to_string());
-    Ok(GmapPath { pack, flow, node })
+    Ok(GmapPath {
+        pack: Some(pack.to_string()),
+        flow: flow.map(str::to_string),
+        node: node.map(str::to_string),
+    })
 }
 
 pub fn parse_policy(raw: &str, line_number: usize) -> anyhow::Result<Policy> {
