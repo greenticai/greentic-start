@@ -17,7 +17,7 @@ pub(super) fn route_messaging_envelopes(
     provider: &str,
     ctx: &OperatorContext,
     envelopes: Vec<ChannelMessageEnvelope>,
-    dl_inject: Option<(&crate::directline::DirectLineState, &str)>,
+    dl_inject: Option<super::legacy_directline::LegacyDirectLineReplyTarget<'_>>,
 ) -> anyhow::Result<()> {
     let team = ctx.team.as_deref();
     let app_pack_path = app::resolve_app_pack_path(bundle, &ctx.tenant, team, None)
@@ -85,11 +85,9 @@ pub(super) fn route_messaging_envelopes(
         };
 
         for out_envelope in outputs {
-            // For webchat-gui with DirectLine, skip the 3-step egress pipeline
-            // (render_plan/encode/send_payload) since the WASM component doesn't
-            // support those ops. Instead inject the bot response directly into
-            // the DirectLine conversation state for client polling.
-            if let Some((dl_state, conv_id)) = dl_inject {
+            // When a Direct Line state is attached, bypass provider egress and
+            // inject the bot response directly into the conversation state for polling.
+            if let Some(dl_reply_target) = dl_inject {
                 let locale = envelope
                     .metadata
                     .get("locale")
@@ -107,19 +105,18 @@ pub(super) fn route_messaging_envelopes(
                             "content": card
                         }])
                     });
-                // Suppress text when there is an adaptive card attachment to
-                // prevent webchat SDK from rendering a redundant text bubble
-                // above the card.
+                // Suppress text when there is an adaptive card attachment to avoid
+                // rendering a redundant text bubble above the card.
                 let text = if attachments.is_some() {
                     None
                 } else {
                     out_envelope.text.clone()
                 };
-                if let Some(bot_id) = dl_state.add_bot_activity(conv_id, text, attachments) {
+                if let Some(bot_id) = dl_reply_target.inject_bot_activity(text, attachments) {
                     operator_log::info(
                         module_path!(),
                         format!(
-                            "[webchat] injected bot activity id={bot_id} conv={conv_id} provider={provider}"
+                            "[directline] injected bot activity id={bot_id} provider={provider}"
                         ),
                     );
                 }
@@ -511,8 +508,8 @@ mod tests {
             false,
         )
         .expect("runner host");
-        let dl_state = crate::directline::DirectLineState::new();
-        assert!(dl_state.create_conversation("conv-1"));
+        let dl_compat = crate::http_ingress::legacy_directline::LegacyDirectLineCompat::new();
+        assert!(dl_compat.create_conversation("conv-1"));
 
         let mut card_routed = envelope();
         card_routed
@@ -529,11 +526,11 @@ mod tests {
                 correlation_id: None,
             },
             vec![card_routed],
-            Some((&dl_state, "conv-1")),
+            Some(dl_compat.reply_target("conv-1")),
         )
         .expect("route envelopes");
 
-        let (activities, watermark) = dl_state
+        let (activities, watermark) = dl_compat
             .get_activities("conv-1", None)
             .expect("directline activities");
         assert_eq!(watermark, "1");
