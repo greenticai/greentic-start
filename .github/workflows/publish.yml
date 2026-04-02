@@ -45,72 +45,12 @@ jobs:
               out.write(f"tag={tag}\n")
           PY
 
-  fmt:
-    runs-on: ubuntu-latest
-    needs: [version]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.91.0
-          components: rustfmt, clippy
-      - name: Ensure rustfmt + clippy
-        run: rustup component add --toolchain 1.91.0 rustfmt clippy
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - name: Format
-        run: cargo fmt --check
-
-  clippy:
-    runs-on: ubuntu-latest
-    needs: [version]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.91.0
-          components: rustfmt, clippy
-      - name: Ensure rustfmt + clippy
-        run: rustup component add --toolchain 1.91.0 rustfmt clippy
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - name: Clippy
-        run: cargo clippy --locked -p greentic-start --all-targets --all-features -- -D warnings
-
-  test:
-    runs-on: ubuntu-latest
-    needs: [version]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.91.0
-          components: rustfmt, clippy
-      - name: Ensure rustfmt + clippy
-        run: rustup component add --toolchain 1.91.0 rustfmt clippy
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - name: Test
-        run: cargo test --locked -p greentic-start --all-features
+  ci:
+    uses: ./.github/workflows/ci.yml
 
   publish-crates:
     runs-on: ubuntu-latest
-    needs: [version, fmt, clippy, test]
+    needs: [version, ci]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -165,7 +105,7 @@ jobs:
 
   binstall-artifacts:
     runs-on: ${{ matrix.os }}
-    needs: [version, fmt, clippy, test]
+    needs: [version, ci]
     strategy:
       fail-fast: false
       matrix:
@@ -240,7 +180,7 @@ jobs:
 
   publish_distroless_image:
     runs-on: ubuntu-latest
-    needs: [version, fmt, clippy, test]
+    needs: [version, ci]
     permissions:
       contents: read
       packages: write
