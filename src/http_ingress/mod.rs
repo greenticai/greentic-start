@@ -253,7 +253,7 @@ where
 
     // Legacy Direct Line routes (root level)
     if path == "/token" || path.starts_with("/v3/directline") || path.starts_with("/directline") {
-        return handle_directline_request(req, &path, None, state).await;
+        return handle_directline_request(req, &path, None, None, state).await;
     }
 
     // OAuth token exchange proxy: /v1/messaging/webchat/{tenant}/oauth/token-exchange
@@ -263,7 +263,11 @@ where
 
     // WebChat Direct Line routes: /v1/messaging/webchat/{tenant}/token or /v1/messaging/webchat/{tenant}/v3/directline/*
     if let Some((tenant, dl_path)) = parse_webchat_directline_route(&path) {
-        return handle_directline_request(req, &dl_path, Some(tenant), state).await;
+        let provider = state
+            .active_route_table
+            .match_request(&path)
+            .map(|route_match| route_match.descriptor.pack_id.clone());
+        return handle_directline_request(req, &dl_path, Some(tenant), provider, state).await;
     }
 
     // Static route handling - serve assets from .gtpack files
@@ -782,5 +786,96 @@ mod tests {
         let body =
             runtime.block_on(async { response.into_body().collect().await.unwrap().to_bytes() });
         assert!(String::from_utf8_lossy(&body).contains("<html>ok</html>"));
+    }
+
+    #[test]
+    fn tenant_scoped_directline_uses_provider_from_matching_static_route_pack_id() {
+        use crate::secrets_gate::canonical_secret_uri;
+        use std::fs::File;
+        use std::io::Write;
+        use zip::write::FileOptions;
+
+        let runtime = Runtime::new().unwrap();
+        let dir = tempdir().unwrap();
+        let env_guard = crate::test_env_lock().lock().unwrap();
+
+        let pack_path = dir.path().join("env-backend.gtpack");
+        let file = File::create(&pack_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("assets/secrets_backend.json", FileOptions::<()>::default())
+            .unwrap();
+        zip.write_all(br#"{"backend":"env"}"#).unwrap();
+        zip.finish().unwrap();
+        unsafe {
+            std::env::set_var("GREENTIC_SECRETS_MANAGER_PACK", &pack_path);
+        }
+
+        let discovery = crate::discovery::discover(dir.path()).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(
+                dir.path().to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let route = StaticRouteDescriptor {
+            route_id: "webchat-gui".to_string(),
+            pack_id: "messaging-webchat-gui".to_string(),
+            pack_path: dir.path().to_path_buf(),
+            public_path: "/v1/messaging/webchat/{tenant}".to_string(),
+            source_root: "site".to_string(),
+            index_file: Some("index.html".to_string()),
+            spa_fallback: Some("index.html".to_string()),
+            tenant_scoped: true,
+            team_scoped: false,
+            cache_strategy: CacheStrategy::None,
+            route_segments: vec![
+                RouteScopeSegment::Literal("v1".to_string()),
+                RouteScopeSegment::Literal("messaging".to_string()),
+                RouteScopeSegment::Literal("webchat".to_string()),
+                RouteScopeSegment::Tenant,
+            ],
+        };
+        let state = Arc::new(HttpIngressState {
+            runner_host,
+            domains: vec![Domain::Messaging],
+            active_route_table: ActiveRouteTable::from_plan(&StaticRoutePlan {
+                routes: vec![route],
+                warnings: vec![],
+                blocking_failures: vec![],
+            }),
+            dl_state: crate::directline::DirectLineState::new(),
+        });
+
+        let gui_secret_uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
+        unsafe {
+            std::env::set_var(&gui_secret_uri, "gui-signing-key");
+        }
+
+        let response = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::GET, "/v1/messaging/webchat/demo/token"),
+                state,
+            ))
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        unsafe {
+            std::env::remove_var(&gui_secret_uri);
+            std::env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+        }
+        drop(env_guard);
     }
 }

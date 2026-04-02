@@ -35,6 +35,8 @@ mod offers;
 mod onboard;
 mod operator_i18n;
 mod operator_log;
+#[doc(hidden)]
+pub mod perf_harness;
 mod post_ingress_hooks;
 mod project;
 mod provider_config_envelope;
@@ -398,6 +400,9 @@ pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn apply_nats_overrides_disables_nats_for_flag() {
@@ -469,5 +474,126 @@ mod tests {
         let state_dir =
             resolve_state_dir(None, Some(bundle.to_string_lossy().as_ref())).expect("state dir");
         assert_eq!(state_dir, bundle.join("state"));
+    }
+
+    fn make_start_request(bundle: &Path) -> StartRequest {
+        StartRequest {
+            bundle: Some(bundle.display().to_string()),
+            tenant: None,
+            team: None,
+            no_nats: false,
+            nats: NatsModeArg::Off,
+            nats_url: None,
+            config: None,
+            cloudflared: CloudflaredModeArg::Off,
+            cloudflared_binary: None,
+            ngrok: NgrokModeArg::Off,
+            ngrok_binary: None,
+            runner_binary: None,
+            restart: Vec::new(),
+            log_dir: None,
+            verbose: false,
+            quiet: false,
+            admin: false,
+            admin_port: 9443,
+            admin_certs_dir: None,
+            admin_allowed_clients: Vec::new(),
+            tunnel_explicit: true,
+        }
+    }
+
+    fn write_demo_bundle(bundle: &Path) {
+        std::fs::create_dir_all(bundle).expect("bundle dir");
+        std::fs::write(
+            bundle.join("greentic.demo.yaml"),
+            "tenant: demo\nteam: default\n",
+        )
+        .expect("write demo config");
+    }
+
+    fn request_runtime_stop(bundle: &Path) -> thread::JoinHandle<()> {
+        let runtime_paths =
+            runtime_state::RuntimePaths::new(bundle.join("state"), "demo", "default");
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(350));
+            runtime_state::write_stop_request(
+                &runtime_paths,
+                &runtime_state::StopRequest {
+                    requested_by: "test".to_string(),
+                    reason: Some("coverage".to_string()),
+                },
+            )
+            .expect("write stop request");
+        })
+    }
+
+    #[test]
+    fn run_start_request_embedded_mode_stops_cleanly() {
+        let _env_guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        crate::operator_log::reset_for_tests();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        write_demo_bundle(&bundle);
+        let stop_thread = request_runtime_stop(&bundle);
+
+        let request = make_start_request(&bundle);
+        run_start_request(request).expect("start request");
+        stop_thread.join().expect("join stop thread");
+
+        let paths = runtime_state::RuntimePaths::new(bundle.join("state"), "demo", "default");
+        assert!(paths.service_manifest_path().exists());
+        assert!(
+            runtime_state::read_stop_request(&paths)
+                .expect("read stop")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn run_restart_request_embedded_mode_stops_cleanly() {
+        let _env_guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        crate::operator_log::reset_for_tests();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        write_demo_bundle(&bundle);
+        let stop_thread = request_runtime_stop(&bundle);
+
+        let mut request = make_start_request(&bundle);
+        request.verbose = true;
+        run_restart_request(request).expect("restart request");
+        stop_thread.join().expect("join stop thread");
+
+        let paths = runtime_state::RuntimePaths::new(bundle.join("state"), "demo", "default");
+        assert!(paths.service_manifest_path().exists());
+        assert!(
+            runtime_state::read_stop_request(&paths)
+                .expect("read stop")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn run_start_request_quiet_mode_returns_bundle_errors() {
+        let _env_guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        crate::operator_log::reset_for_tests();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing_bundle = temp.path().join("missing-bundle");
+        let mut request = make_start_request(&missing_bundle);
+        request.quiet = true;
+
+        let err = run_start_request(request).expect_err("missing bundle should error");
+        let message = err.to_string();
+        assert!(
+            message.contains("bundle config not found")
+                || message.contains("bundle path does not exist")
+                || message.contains("unsupported bundle reference"),
+            "unexpected error: {message}"
+        );
     }
 }

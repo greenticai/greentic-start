@@ -1,5 +1,4 @@
 name: CI
-
 on:
   workflow_call:
   push:
@@ -9,67 +8,13 @@ on:
 permissions:
   contents: read
 
-defaults:
-  run:
-    shell: bash
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  fmt:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.91.0
-          components: rustfmt, clippy
-      - name: Ensure rustfmt + clippy
-        run: rustup component add --toolchain 1.91.0 rustfmt clippy
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - name: Format
-        run: cargo fmt --all -- --check
-
-  clippy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.91.0
-          components: rustfmt, clippy
-      - name: Ensure rustfmt + clippy
-        run: rustup component add --toolchain 1.91.0 rustfmt clippy
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.91.0
-          components: rustfmt, clippy
-      - name: Ensure rustfmt + clippy
-        run: rustup component add --toolchain 1.91.0 rustfmt clippy
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - name: Test
-        run: cargo test --workspace --all-features
+  ci:
+    uses: greenticai/.github/.github/workflows/host-crate-ci.yml@main
+    with:
+      clippy-args: "-p greentic-start --all-targets --all-features -- -D warnings"
+      test-args: "-p greentic-start --all-features"

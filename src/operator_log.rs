@@ -26,7 +26,11 @@ struct Logger {
     min_level: Level,
 }
 
-static LOGGER: OnceLock<Logger> = OnceLock::new();
+static LOGGER: OnceLock<Mutex<Option<Logger>>> = OnceLock::new();
+
+fn logger_slot() -> &'static Mutex<Option<Logger>> {
+    LOGGER.get_or_init(|| Mutex::new(None))
+}
 
 pub fn init(log_dir: PathBuf, min_level: Level) -> anyhow::Result<PathBuf> {
     let fallback = std::env::current_dir()
@@ -46,9 +50,13 @@ pub fn init(log_dir: PathBuf, min_level: Level) -> anyhow::Result<PathBuf> {
                     writer: Mutex::new(file),
                     min_level,
                 };
-                if LOGGER.set(logger).is_err() {
+                let mut slot = logger_slot()
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("operator logger lock poisoned"))?;
+                if slot.is_some() {
                     anyhow::bail!("operator logger already initialized");
                 }
+                *slot = Some(logger);
                 if candidate != log_dir {
                     eprintln!(
                         "unable to write operator.log at {}; falling back to {}",
@@ -85,7 +93,11 @@ fn try_open_operator_log(log_dir: &Path) -> io::Result<File> {
 }
 
 pub fn log(level: Level, target: &str, message: String) {
-    let logger = match LOGGER.get() {
+    let slot = match logger_slot().lock() {
+        Ok(slot) => slot,
+        Err(_) => return,
+    };
+    let logger = match slot.as_ref() {
         Some(logger) => logger,
         None => return,
     };
@@ -106,6 +118,13 @@ pub fn log(level: Level, target: &str, message: String) {
     );
     // Always flush to ensure logs are written immediately
     let _ = writer.flush();
+}
+
+#[cfg(test)]
+pub fn reset_for_tests() {
+    if let Ok(mut slot) = logger_slot().lock() {
+        *slot = None;
+    }
 }
 
 pub fn service_log_path(log_dir: &Path, service: &str) -> PathBuf {
@@ -153,6 +172,7 @@ mod tests {
 
     #[test]
     fn writes_operator_log() -> anyhow::Result<()> {
+        reset_for_tests();
         let dir = tempdir()?;
         let _ = init(dir.path().to_path_buf(), Level::Info)?;
         info("tests::writes_operator_log", "hello world");
