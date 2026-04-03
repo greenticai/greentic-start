@@ -90,11 +90,13 @@ where
 
     // Intercept /auth/config — read OAuth settings from secrets store
     if path == "/auth/config" {
+        let provider =
+            require_directline_provider(provider.as_deref()).map_err(|response| *response)?;
         operator_log::debug(
             module_path!(),
-            format!("[directline] auth/config request for tenant={tenant}"),
+            format!("[directline] auth/config request for tenant={tenant} provider={provider}"),
         );
-        return generate_auth_config(&tenant, &provider, &state.runner_host);
+        return generate_auth_config(&tenant, provider, &state.runner_host);
     }
 
     operator_log::info(
