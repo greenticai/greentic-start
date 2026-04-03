@@ -52,13 +52,12 @@ where
     // Provider resolution priority:
     // 1) explicit provider from route handoff (e.g. matched static route pack_id),
     // 2) `provider=` query parameter override.
-    let provider = explicit_provider
-        .or_else(|| {
-            queries
-                .iter()
-                .find(|(k, _)| k == "provider")
-                .map(|(_, v)| v.clone())
-        });
+    let provider = explicit_provider.or_else(|| {
+        queries
+            .iter()
+            .find(|(k, _)| k == "provider")
+            .map(|(_, v)| v.clone())
+    });
 
     // Use explicit scope from route handoff, or fall back to query params.
     let tenant = explicit_tenant.unwrap_or_else(|| {
@@ -84,8 +83,9 @@ where
 
     // Intercept /token to generate JWT natively
     if path == "/token" {
-        let provider = require_directline_provider(provider.as_deref())?;
-        return generate_directline_token(&tenant, &team, &provider, &state.runner_host).await;
+        let provider =
+            require_directline_provider(provider.as_deref()).map_err(|response| *response)?;
+        return generate_directline_token(&tenant, &team, provider, &state.runner_host).await;
     }
 
     // Intercept /auth/config — read OAuth settings from secrets store
@@ -110,7 +110,8 @@ where
 
     // POST /v3/directline/conversations — create new conversation
     if method == Method::POST && path == "/v3/directline/conversations" {
-        let provider = require_directline_provider(provider.as_deref())?;
+        let provider =
+            require_directline_provider(provider.as_deref()).map_err(|response| *response)?;
         let ctx = OperatorContext {
             tenant: tenant.clone(),
             team: Some(team.clone()),
@@ -118,7 +119,7 @@ where
         };
         let signing_key = state
             .runner_host
-            .get_secret(&provider, "jwt_signing_key", &ctx)
+            .get_secret(provider, "jwt_signing_key", &ctx)
             .map_err(|err| {
                 error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -147,7 +148,9 @@ where
         && let Some(ref cid) = conv_id
         && path.ends_with("/activities")
     {
-        let provider = require_directline_provider(provider.as_deref())?.to_string();
+        let provider = require_directline_provider(provider.as_deref())
+            .map_err(|response| *response)?
+            .to_string();
         let payload_bytes = req
             .into_body()
             .collect()
@@ -170,7 +173,9 @@ where
 
         operator_log::info(
             module_path!(),
-            format!("[directline] stored user activity id={activity_id} conv={cid} tenant={tenant}"),
+            format!(
+                "[directline] stored user activity id={activity_id} conv={cid} tenant={tenant}"
+            ),
         );
 
         let envelope = super::legacy_directline::LegacyDirectLineCompat::build_user_envelope(
@@ -206,7 +211,9 @@ where
             ) {
                 operator_log::error(
                     module_path!(),
-                    format!("[directline] messaging pipeline failed conv={conv_id_clone} err={err}"),
+                    format!(
+                        "[directline] messaging pipeline failed conv={conv_id_clone} err={err}"
+                    ),
                 );
             }
         });
@@ -256,12 +263,12 @@ where
 
 fn require_directline_provider(
     provider: Option<&str>,
-) -> Result<&str, Response<Full<Bytes>>> {
+) -> std::result::Result<&str, Box<Response<Full<Bytes>>>> {
     provider.ok_or_else(|| {
-        error_response(
+        Box::new(error_response(
             StatusCode::BAD_REQUEST,
             "provider must be supplied by the route or query",
-        )
+        ))
     })
 }
 
@@ -488,7 +495,8 @@ mod tests {
             runner_host,
             domains,
             active_route_table: crate::static_routes::ActiveRouteTable::default(),
-            legacy_directline: crate::http_ingress::legacy_directline::LegacyDirectLineCompat::new(),
+            legacy_directline: crate::http_ingress::legacy_directline::LegacyDirectLineCompat::new(
+            ),
         })
     }
 
@@ -535,7 +543,8 @@ mod tests {
             ),
             domains: vec![Domain::Messaging],
             active_route_table: crate::static_routes::ActiveRouteTable::default(),
-            legacy_directline: crate::http_ingress::legacy_directline::LegacyDirectLineCompat::new(),
+            legacy_directline: crate::http_ingress::legacy_directline::LegacyDirectLineCompat::new(
+            ),
         })
     }
 
@@ -724,7 +733,9 @@ mod tests {
         );
         assert_eq!(token_body["expires_in"], 1800);
 
-        state.legacy_directline_compat().create_conversation("conv-1");
+        state
+            .legacy_directline_compat()
+            .create_conversation("conv-1");
         let invalid_json = runtime
             .block_on(handle_legacy_directline_request(
                 body_request(

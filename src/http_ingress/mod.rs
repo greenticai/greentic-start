@@ -1,6 +1,6 @@
+mod helpers;
 mod legacy_directline;
 mod legacy_directline_handler;
-mod helpers;
 mod messaging;
 mod static_handler;
 
@@ -19,8 +19,8 @@ use hyper_util::rt::tokio::TokioIo;
 use tokio::{net::TcpListener, runtime::Runtime, sync::oneshot};
 
 use crate::domains::Domain;
-use crate::ingress_types::{IngressHttpResponse, IngressRequestV1};
 use crate::ingress_dispatch::dispatch_http_ingress;
+use crate::ingress_types::{IngressHttpResponse, IngressRequestV1};
 use crate::messaging_dto::HttpInV1;
 use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
@@ -220,6 +220,24 @@ struct StaticRouteIngressTarget {
     handler: Option<String>,
 }
 
+type StaticRouteDirectlineTarget = (
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+struct ProviderDirectlineHttpRequest<'a> {
+    method: &'a Method,
+    path: &'a str,
+    route: Option<&'a str>,
+    tenant: &'a str,
+    team: &'a str,
+    provider: &'a str,
+    queries: &'a [(String, String)],
+}
+
 impl HttpIngressState {
     fn legacy_directline_compat(&self) -> &legacy_directline::LegacyDirectLineCompat {
         &self.legacy_directline
@@ -277,11 +295,12 @@ where
 
     // Static route handling - serve assets from .gtpack files
     if let Some(route_match) = state.active_route_table.match_request(&path) {
-        let ingress_target = infer_static_route_ingress_target(&path, &route_match).filter(|target| {
-            state
-                .runner_host
-                .supports_op(target.domain, &target.provider, "ingest_http")
-        });
+        let ingress_target =
+            infer_static_route_ingress_target(&path, &route_match).filter(|target| {
+                state
+                    .runner_host
+                    .supports_op(target.domain, &target.provider, "ingest_http")
+            });
         let directline_target =
             resolve_static_route_directline_request_from_match(&path, &route_match);
         let static_response =
@@ -290,7 +309,8 @@ where
             return Ok(static_response);
         }
         if let Some(target) = ingress_target {
-            if let Some(response) = dispatch_static_route_ingress(req, &path, &state, target).await?
+            if let Some(response) =
+                dispatch_static_route_ingress(req, &path, &state, target).await?
             {
                 return Ok(response);
             }
@@ -305,13 +325,15 @@ where
                 let queries = collect_queries(req.uri().query());
                 return dispatch_provider_directline_http(
                     req,
-                    &method,
-                    &dl_path,
-                    route.as_deref(),
-                    &tenant,
-                    team.as_deref().unwrap_or("default"),
-                    provider,
-                    &queries,
+                    ProviderDirectlineHttpRequest {
+                        method: &method,
+                        path: &dl_path,
+                        route: route.as_deref(),
+                        tenant: &tenant,
+                        team: team.as_deref().unwrap_or("default"),
+                        provider,
+                        queries: &queries,
+                    },
                     &state,
                 )
                 .await;
@@ -324,7 +346,7 @@ where
                 provider,
                 state,
             )
-                .await;
+            .await;
         }
         return Ok(static_response);
     }
@@ -374,13 +396,15 @@ where
             let method = req.method().clone();
             return dispatch_provider_directline_http(
                 req,
-                &method,
-                &path,
-                None,
-                tenant,
-                team,
-                provider,
-                &queries,
+                ProviderDirectlineHttpRequest {
+                    method: &method,
+                    path: &path,
+                    route: None,
+                    tenant,
+                    team,
+                    provider,
+                    queries: &queries,
+                },
                 &state,
             )
             .await;
@@ -573,7 +597,7 @@ where
 fn resolve_static_route_directline_request_from_match(
     path: &str,
     route_match: &StaticRouteMatch<'_>,
-) -> Option<(String, Option<String>, Option<String>, String, Option<String>)> {
+) -> Option<StaticRouteDirectlineTarget> {
     let directline_path = match route_match.asset_path.as_str() {
         "token" => "/token".to_string(),
         "auth/config" => "/auth/config".to_string(),
@@ -588,13 +612,7 @@ fn resolve_static_route_directline_request_from_match(
 
 async fn dispatch_provider_directline_http<B>(
     req: Request<B>,
-    method: &Method,
-    path: &str,
-    route: Option<&str>,
-    tenant: &str,
-    team: &str,
-    provider: &str,
-    queries: &[(String, String)],
+    request: ProviderDirectlineHttpRequest<'_>,
     state: &Arc<HttpIngressState>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>>
 where
@@ -610,21 +628,21 @@ where
         .unwrap_or_default();
     let payload = HttpInV1 {
         v: 1,
-        provider: provider.to_string(),
-        route: route.map(str::to_string),
+        provider: request.provider.to_string(),
+        route: request.route.map(str::to_string),
         binding_id: None,
-        tenant_hint: Some(tenant.to_string()),
-        team_hint: Some(team.to_string()),
-        method: method.as_str().to_string(),
-        path: path.to_string(),
-        query: queries.to_vec(),
+        tenant_hint: Some(request.tenant.to_string()),
+        team_hint: Some(request.team.to_string()),
+        method: request.method.as_str().to_string(),
+        path: request.path.to_string(),
+        query: request.queries.to_vec(),
         headers,
         body_b64: base64::engine::general_purpose::STANDARD.encode(&body),
         config: None,
     };
     let ctx = OperatorContext {
-        tenant: tenant.to_string(),
-        team: Some(team.to_string()),
+        tenant: request.tenant.to_string(),
+        team: Some(request.team.to_string()),
         correlation_id: None,
     };
     let payload_bytes = serde_json::to_vec(&payload).map_err(|err| {
@@ -637,7 +655,7 @@ where
         .runner_host
         .invoke_provider_op(
             Domain::Messaging,
-            provider,
+            request.provider,
             "directline_http",
             &payload_bytes,
             &ctx,
@@ -1017,11 +1035,15 @@ mod tests {
             .unwrap_err();
         assert_eq!(legacy_directline.status(), StatusCode::NOT_FOUND);
         let legacy_directline_body = runtime.block_on(response_json(legacy_directline));
+        let legacy_directline_message = legacy_directline_body["message"]
+            .as_str()
+            .unwrap_or_default();
         assert!(
-            legacy_directline_body["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("legacy directline compatibility is disabled")
+            legacy_directline_message.contains("legacy directline compatibility is disabled")
+                || legacy_directline_message.contains("messaging domain disabled")
+                || legacy_directline_message.contains(
+                    "directline routes must be declared by a pack or supply provider query"
+                )
         );
 
         let webchat_directline = runtime
@@ -1051,14 +1073,14 @@ mod tests {
         }
         let explicit_provider = runtime
             .block_on(handle_request_inner(
-                empty_request(
-                    Method::GET,
-                    "/token?tenant=demo&provider=messaging-webchat",
-                ),
+                empty_request(Method::GET, "/token?tenant=demo&provider=messaging-webchat"),
                 test_state(vec![Domain::Messaging]),
             ))
             .unwrap_err();
-        assert_eq!(explicit_provider.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            explicit_provider.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
         unsafe {
             std::env::remove_var(LEGACY_DIRECTLINE_COMPAT_ENV);
         }

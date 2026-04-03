@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
-use clap::error::ErrorKind;
 use clap::Parser;
+use clap::error::ErrorKind;
 
 mod admin_certs;
 mod admin_server;
@@ -100,7 +100,12 @@ pub fn run_from_env() -> anyhow::Result<()> {
     let args = normalize_args(raw_tail);
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
-        Err(err) if matches!(err.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
             print!("{err}");
             return Ok(());
         }

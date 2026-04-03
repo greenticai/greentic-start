@@ -430,14 +430,16 @@ mod tests {
 
     #[test]
     fn generate_jwt_includes_context_and_optional_conversation_id() {
-        let with_conversation = generate_legacy_directline_jwt(b"secret", "tenant-a", "team-a", "user-1", Some("c1"));
+        let with_conversation =
+            generate_legacy_directline_jwt(b"secret", "tenant-a", "team-a", "user-1", Some("c1"));
         let claims = decode_jwt_claims(&with_conversation);
         assert_eq!(claims["ctx"]["tenant"], "tenant-a");
         assert_eq!(claims["ctx"]["team"], "team-a");
         assert_eq!(claims["sub"], "user-1");
         assert_eq!(claims["conversationId"], "c1");
 
-        let without_conversation = generate_legacy_directline_jwt(b"secret", "tenant-a", "team-a", "user-1", None);
+        let without_conversation =
+            generate_legacy_directline_jwt(b"secret", "tenant-a", "team-a", "user-1", None);
         let claims = decode_jwt_claims(&without_conversation);
         assert!(claims.get("conversationId").is_none());
     }
@@ -508,9 +510,11 @@ mod tests {
     #[test]
     fn endpoint_helpers_require_existing_conversations() {
         let compat = LegacyDirectLineCompat::new();
-        assert!(compat
-            .post_activity_response("missing", &json!({"text": "hello"}))
-            .is_none());
+        assert!(
+            compat
+                .post_activity_response("missing", &json!({"text": "hello"}))
+                .is_none()
+        );
         assert!(compat.get_activities_response("missing", None).is_none());
     }
 
@@ -523,7 +527,10 @@ mod tests {
         assert_eq!(created["expires_in"], JWT_TTL_SECONDS);
 
         let posted = compat
-            .post_activity_response(conversation_id, &json!({"text": "hello", "from": {"id": "user-1"}}))
+            .post_activity_response(
+                conversation_id,
+                &json!({"text": "hello", "from": {"id": "user-1"}}),
+            )
             .expect("post result");
         assert!(posted["id"].as_str().is_some());
 
