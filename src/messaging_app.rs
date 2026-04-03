@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -13,6 +14,7 @@ use zip::ZipArchive;
 
 use crate::runner_exec::{self, RunRequest};
 use crate::runner_host::OperatorContext;
+use crate::operator_log;
 
 #[derive(Clone, Debug)]
 pub struct AppPackInfo {
@@ -221,7 +223,19 @@ pub fn run_app_flow(
         .metadata
         .get("routeToCardId")
         .or_else(|| envelope.metadata.get("toCardId"));
-    let value = collect_transcript_outputs(&output.run_dir, target_node.map(|s| s.as_str()))?
+    operator_log::info(
+        module_path!(),
+        format!(
+            "[messaging_app] run_app_flow completed run_dir={} target_node={}",
+            output.run_dir.display(),
+            target_node.map(String::as_str).unwrap_or("<none>")
+        ),
+    );
+    let value = collect_transcript_outputs_with_retry(
+        &output.run_dir,
+        target_node.map(|s| s.as_str()),
+        envelope,
+    )?
         .ok_or_else(|| anyhow::anyhow!("app flow produced no outputs"))?;
     parse_envelopes(&value, envelope)
 }
@@ -296,6 +310,79 @@ fn extract_text_from_map(map: &BTreeMap<CborValue, CborValue>, key: &str) -> Opt
         })
 }
 
+const TRANSCRIPT_OUTPUT_RETRIES: usize = 6;
+const TRANSCRIPT_OUTPUT_RETRY_DELAY: Duration = Duration::from_millis(40);
+
+fn collect_transcript_outputs_with_retry(
+    run_dir: &Path,
+    target_node_id: Option<&str>,
+    ingress_envelope: &ChannelMessageEnvelope,
+) -> Result<Option<JsonValue>> {
+    let mut fallback = None;
+    for attempt in 0..TRANSCRIPT_OUTPUT_RETRIES {
+        if let Some(value) = collect_transcript_outputs(run_dir, target_node_id)? {
+            let envelope_like = looks_like_envelope_output(&value);
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[messaging_app] transcript attempt={}/{} target_node={} envelope_like={} shape={}",
+                    attempt + 1,
+                    TRANSCRIPT_OUTPUT_RETRIES,
+                    target_node_id.unwrap_or("<none>"),
+                    envelope_like,
+                    summarize_output_shape(&value)
+                ),
+            );
+            if envelope_like {
+                return Ok(Some(value));
+            }
+            fallback = Some(value);
+        } else {
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[messaging_app] transcript attempt={}/{} target_node={} no_output",
+                    attempt + 1,
+                    TRANSCRIPT_OUTPUT_RETRIES,
+                    target_node_id.unwrap_or("<none>")
+                ),
+            );
+        }
+
+        if attempt + 1 < TRANSCRIPT_OUTPUT_RETRIES {
+            std::thread::sleep(TRANSCRIPT_OUTPUT_RETRY_DELAY);
+        }
+    }
+
+    if let Some(value) = fallback.as_ref()
+        && parse_envelopes(value, ingress_envelope).is_ok()
+    {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "[messaging_app] transcript retry exhausted; using parseable non-envelope output shape={}",
+                summarize_output_shape(value)
+            ),
+        );
+        return Ok(fallback);
+    }
+    if let Some(value) = fallback.as_ref() {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "[messaging_app] transcript retry exhausted; fallback not parseable shape={}",
+                summarize_output_shape(value)
+            ),
+        );
+    } else {
+        operator_log::warn(
+            module_path!(),
+            "[messaging_app] transcript retry exhausted; no outputs found",
+        );
+    }
+    Ok(fallback)
+}
+
 fn collect_transcript_outputs(
     run_dir: &Path,
     target_node_id: Option<&str>,
@@ -305,6 +392,8 @@ fn collect_transcript_outputs(
         return Ok(None);
     }
     let contents = std::fs::read_to_string(path)?;
+    let mut first = None;
+    let mut preferred = None;
     let mut last = None;
     let mut targeted = None;
     for line in contents.lines() {
@@ -312,6 +401,12 @@ fn collect_transcript_outputs(
             && let Some(outputs) = value.get("outputs")
             && !outputs.is_null()
         {
+            if first.is_none() {
+                first = Some(outputs.clone());
+            }
+            if preferred.is_none() && looks_like_envelope_output(outputs) {
+                preferred = Some(outputs.clone());
+            }
             last = Some(outputs.clone());
             if let Some(target) = target_node_id
                 && let Some(node_id) = value.get("node_id").and_then(|n| n.as_str())
@@ -321,7 +416,88 @@ fn collect_transcript_outputs(
             }
         }
     }
-    Ok(targeted.or(last))
+    Ok(targeted.or(preferred).or(last).or(first))
+}
+
+fn looks_like_envelope_output(value: &JsonValue) -> bool {
+    value.is_array()
+        || value.get("events").and_then(|v| v.as_array()).is_some()
+        || value.get("message").is_some()
+        || value.get("renderedCard").is_some_and(|v| !v.is_null())
+        || value
+            .get("payload")
+            .and_then(|p| p.get("text"))
+            .and_then(JsonValue::as_str)
+            .is_some()
+        || value.get("text").and_then(JsonValue::as_str).is_some()
+        || value.as_str().is_some()
+}
+
+fn summarize_output_shape(value: &JsonValue) -> String {
+    let kind = if value.is_object() {
+        "object"
+    } else if value.is_array() {
+        "array"
+    } else if value.is_string() {
+        "string"
+    } else if value.is_number() {
+        "number"
+    } else if value.is_boolean() {
+        "bool"
+    } else if value.is_null() {
+        "null"
+    } else {
+        "unknown"
+    };
+
+    let keys = value
+        .as_object()
+        .map(|obj| {
+            let mut keys = obj.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            keys.into_iter().take(8).collect::<Vec<_>>().join(",")
+        })
+        .unwrap_or_default();
+
+    let messages_len = value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let events_len = value
+        .get("events")
+        .and_then(|e| e.as_array())
+        .map(|e| e.len())
+        .unwrap_or(0);
+    let has_rendered_card = value.get("renderedCard").is_some_and(|v| !v.is_null());
+    let has_message = value.get("message").is_some();
+    let has_payload_text = value
+        .get("payload")
+        .and_then(|p| p.get("text"))
+        .and_then(JsonValue::as_str)
+        .is_some();
+    let has_text = value.get("text").and_then(JsonValue::as_str).is_some();
+    let has_result_content = value
+        .get("result")
+        .and_then(|r| r.get("content"))
+        .and_then(JsonValue::as_array)
+        .is_some();
+    let has_structured = value
+        .get("result")
+        .and_then(|r| r.get("structured_content"))
+        .is_some();
+
+    format!(
+        "kind={kind} keys=[{keys}] has_renderedCard={} has_message={} messages_len={} events_len={} has_payload_text={} has_text={} has_result_content={} has_structured_content={}",
+        has_rendered_card,
+        has_message,
+        messages_len,
+        events_len,
+        has_payload_text,
+        has_text,
+        has_result_content,
+        has_structured
+    )
 }
 
 fn parse_envelopes(
@@ -329,12 +505,35 @@ fn parse_envelopes(
     ingress_envelope: &ChannelMessageEnvelope,
 ) -> Result<Vec<ChannelMessageEnvelope>> {
     if let Some(v) = value.as_array() {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[messaging_app] parse_envelopes path=array len={} shape={}",
+                v.len(),
+                summarize_output_shape(value)
+            ),
+        );
         return parse_envelope_array(v);
     }
     if let Some(events) = value.get("events").and_then(|v| v.as_array()) {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[messaging_app] parse_envelopes path=events len={} shape={}",
+                events.len(),
+                summarize_output_shape(value)
+            ),
+        );
         return parse_envelope_array(events);
     }
     if let Some(envelope) = value.get("message") {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[messaging_app] parse_envelopes path=message shape={}",
+                summarize_output_shape(value)
+            ),
+        );
         let envelope: ChannelMessageEnvelope = serde_json::from_value(envelope.clone())
             .context("app flow message payload is not a ChannelMessageEnvelope")?;
         return Ok(vec![envelope]);
@@ -354,19 +553,69 @@ fn parse_envelopes(
         if let Ok(ac_json) = serde_json::to_string(rendered_card) {
             reply.metadata.insert("adaptive_card".to_string(), ac_json);
         }
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[messaging_app] parse_envelopes path=renderedCard title={} shape={}",
+                reply.text.as_deref().unwrap_or("Adaptive Card"),
+                summarize_output_shape(value)
+            ),
+        );
         return Ok(vec![reply]);
     }
-    if let Some(text) = value
+    let messages_text = value
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find_map(|entry| entry.get("text").and_then(JsonValue::as_str))
+        });
+    let result_content_text = value
+        .get("result")
+        .and_then(|result| result.get("content"))
+        .and_then(JsonValue::as_array)
+        .and_then(|content| {
+            content
+                .iter()
+                .find_map(|entry| entry.get("text").and_then(JsonValue::as_str))
+        });
+    let structured_text = value
+        .get("result")
+        .and_then(|result| result.get("structured_content"))
+        .map(|structured| structured.to_string())
+        .filter(|text| !text.is_empty());
+    let payload_text = value
         .get("payload")
         .and_then(|p| p.get("text"))
-        .and_then(JsonValue::as_str)
+        .and_then(JsonValue::as_str);
+
+    if let Some(text) = messages_text
+        .or(result_content_text)
+        .or_else(|| structured_text.as_deref())
+        .or(payload_text)
         .or_else(|| value.get("text").and_then(JsonValue::as_str))
         .or_else(|| value.as_str())
     {
         let mut reply = ingress_envelope.clone();
         reply.text = Some(text.to_string());
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[messaging_app] parse_envelopes path=text_fallback text_len={} shape={}",
+                text.len(),
+                summarize_output_shape(value)
+            ),
+        );
         return Ok(vec![reply]);
     }
+    operator_log::warn(
+        module_path!(),
+        format!(
+            "[messaging_app] parse_envelopes failed shape={}",
+            summarize_output_shape(value)
+        ),
+    );
     Err(anyhow::anyhow!(
         "app flow output did not produce envelope(s)"
     ))
@@ -602,6 +851,65 @@ mod tests {
     }
 
     #[test]
+    fn collect_transcript_outputs_prefers_envelope_compatible_output() {
+        let dir = tempdir().expect("tempdir");
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"node_id\":\"call_weather\",\"outputs\":{\"ok\":true,\"result\":{\"structured_content\":{\"temp_c\":21.3}}}}\n",
+                "{\"node_id\":\"render_current_card\",\"outputs\":{\"renderedCard\":{\"body\":[{\"text\":\"Current Weather\"}]}}}\n"
+            ),
+        )
+        .expect("write transcript");
+
+        let selected = collect_transcript_outputs(dir.path(), None)
+            .expect("collect outputs")
+            .expect("selected output");
+        assert!(selected.get("renderedCard").is_some());
+
+        let targeted = collect_transcript_outputs(dir.path(), Some("call_weather"))
+            .expect("collect targeted")
+            .expect("targeted output");
+        assert_eq!(targeted["ok"], true);
+        assert!(targeted.get("renderedCard").is_none());
+    }
+
+    #[test]
+    fn collect_transcript_outputs_with_retry_prefers_eventual_envelope() {
+        let dir = tempdir().expect("tempdir");
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"node_id\":\"call_weather\",\"outputs\":{\"messages\":[{\"text\":\"intermediate\"}]}}\n",
+        )
+        .expect("write transcript");
+
+        let transcript_clone = transcript.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(70));
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript_clone)
+                .expect("open transcript");
+            use std::io::Write as _;
+            writeln!(
+                file,
+                "{}",
+                r#"{"node_id":"render_current_card","outputs":{"renderedCard":{"body":[{"text":"Current Weather"}]}}}"#
+            )
+            .expect("append rendered card output");
+        });
+
+        let selected = collect_transcript_outputs_with_retry(dir.path(), None, &envelope())
+            .expect("collect outputs with retry")
+            .expect("selected output");
+
+        writer.join().expect("join writer");
+        assert!(selected.get("renderedCard").is_some());
+    }
+
+    #[test]
     fn parse_envelopes_supports_message_events_cards_and_text_payloads() {
         let ingress = envelope();
 
@@ -660,6 +968,17 @@ mod tests {
         .expect("card output");
         assert_eq!(card_output[0].text.as_deref(), Some("Welcome card"));
         assert!(card_output[0].metadata.contains_key("adaptive_card"));
+
+        let messages_output = parse_envelopes(
+            &json!({
+                "messages": [
+                    {"type": "text", "text": "messages fallback"}
+                ]
+            }),
+            &ingress,
+        )
+        .expect("messages output");
+        assert_eq!(messages_output[0].text.as_deref(), Some("messages fallback"));
 
         let text_output = parse_envelopes(&json!({"payload": {"text": "payload text"}}), &ingress)
             .expect("text output");
