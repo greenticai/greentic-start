@@ -610,7 +610,7 @@ mod tests {
                 "/auth/config",
                 Some("demo".to_string()),
                 None,
-                None,
+                Some("messaging-webchat".to_string()),
                 state.clone(),
             ))
             .unwrap();
