@@ -51,7 +51,7 @@ impl ForegroundRuntimeHandles {
 struct StartupInfo {
     bundle_name: String,
     http_url: Option<String>,
-    webchat_url: Option<String>,
+    static_route_urls: Vec<String>,
     public_url: Option<String>,
     channels: Vec<String>,
     mode: String,
@@ -65,17 +65,11 @@ impl StartupInfo {
         if let Some(ref url) = self.http_url {
             println!("  HTTP:     {url}");
         }
-        if let Some(ref url) = self.webchat_url {
-            println!("  WebChat:  {url}");
+        if !self.static_route_urls.is_empty() {
+            println!("  Routes:   {}", self.static_route_urls.join(", "));
         }
         if let Some(ref url) = self.public_url {
-            if let Some(ref wc) = self.webchat_url {
-                // Show public webchat URL by combining public host with webchat path
-                let path = wc.find("/v1/").map(|i| &wc[i..]).unwrap_or("");
-                println!("  Public:   {url}{path}");
-            } else {
-                println!("  Public:   {url}");
-            }
+            println!("  Public:   {url}");
         }
         if !self.channels.is_empty() {
             println!("  Channels: {}", self.channels.join(", "));
@@ -720,7 +714,7 @@ pub fn demo_up(
     let info = StartupInfo {
         bundle_name,
         http_url: None,
-        webchat_url: None,
+        static_route_urls: Vec::new(),
         public_url: public_base_url,
         channels: Vec::new(),
         mode,
@@ -1140,9 +1134,10 @@ pub fn demo_up_services(
     } else {
         None
     };
-    let webchat_url = ingress_server
+    let static_route_urls = ingress_server
         .as_ref()
-        .and_then(|s| s.webchat_urls.first().cloned());
+        .map(|s| s.ui_urls.clone())
+        .unwrap_or_default();
     let channels: Vec<String> = discovery
         .providers
         .iter()
@@ -1158,7 +1153,7 @@ pub fn demo_up_services(
     let info = StartupInfo {
         bundle_name,
         http_url,
-        webchat_url,
+        static_route_urls,
         public_url: public_base_url,
         channels,
         mode,
@@ -1623,7 +1618,7 @@ mod tests {
         let info = StartupInfo {
             bundle_name: "demo-bundle".to_string(),
             http_url: Some("http://127.0.0.1:8080".to_string()),
-            webchat_url: None,
+            static_route_urls: Vec::new(),
             public_url: Some("https://demo.example".to_string()),
             channels: vec!["webchat".to_string()],
             mode: "embedded runner".to_string(),
