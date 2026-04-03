@@ -416,7 +416,15 @@ fn collect_transcript_outputs(
             }
         }
     }
-    Ok(targeted.or(preferred).or(last).or(first))
+    let selected = if target_node_id.is_some() {
+        // Preserve historical routing behavior when the caller asked for a specific node:
+        // prefer explicit target match, then the latest output.
+        targeted.or(last.clone()).or(preferred).or(first)
+    } else {
+        // Non-targeted flows should prefer envelope-compatible outputs for handoff.
+        targeted.or(preferred).or(last).or(first)
+    };
+    Ok(selected)
 }
 
 fn looks_like_envelope_output(value: &JsonValue) -> bool {
