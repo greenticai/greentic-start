@@ -221,6 +221,10 @@ pub(crate) fn normalize_args(raw_tail: Vec<String>) -> Vec<String> {
         out.push(arg);
     }
 
+    if only_global_flags(&out[1..]) {
+        return out;
+    }
+
     let known = ["start", "up", "stop", "restart"];
     let mut first_pos = None;
     let mut skip_next_value = false;
@@ -246,6 +250,33 @@ pub(crate) fn normalize_args(raw_tail: Vec<String>) -> Vec<String> {
         out.insert(1, "start".to_string());
     }
     out
+}
+
+fn only_global_flags(args: &[String]) -> bool {
+    if args.is_empty() {
+        return false;
+    }
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--help" | "-h" | "--version" | "-V" => {
+                index += 1;
+            }
+            "--locale" => {
+                if index + 1 >= args.len() {
+                    return false;
+                }
+                index += 2;
+            }
+            value if value.starts_with("--locale=") => {
+                index += 1;
+            }
+            _ => return false,
+        }
+    }
+
+    true
 }
 
 fn arg_takes_value(arg: &str) -> bool {
@@ -344,5 +375,37 @@ mod tests {
         assert_eq!(args[1], "start");
         assert_eq!(args[2], "--runner-binary");
         assert_eq!(args[3], "/tmp/runner");
+    }
+
+    #[test]
+    fn normalize_args_keeps_global_version_flag_without_start() {
+        let args = normalize_args(vec!["--version".into()]);
+        assert_eq!(
+            args,
+            vec!["greentic-start".to_string(), "--version".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_args_keeps_global_help_flag_without_start() {
+        let args = normalize_args(vec!["--help".into()]);
+        assert_eq!(
+            args,
+            vec!["greentic-start".to_string(), "--help".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_args_keeps_locale_and_version_without_start() {
+        let args = normalize_args(vec!["--locale".into(), "en".into(), "--version".into()]);
+        assert_eq!(
+            args,
+            vec![
+                "greentic-start".to_string(),
+                "--locale".to_string(),
+                "en".to_string(),
+                "--version".to_string(),
+            ]
+        );
     }
 }

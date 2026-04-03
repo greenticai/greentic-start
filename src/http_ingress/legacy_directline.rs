@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
+use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // JWT generation (reusable, extracted from http_ingress)
@@ -15,10 +16,10 @@ type HmacSha256 = Hmac<sha2::Sha256>;
 
 const JWT_TTL_SECONDS: i64 = 1800;
 
-/// Generate an HS256 JWT compatible with the DirectLine token format used by
-/// the webchat ingress.  When `conv_id` is `Some`, the claim is bound to a
-/// specific conversation.
-pub fn generate_jwt(
+/// Generate an HS256 JWT compatible with the Direct Line token format used by
+/// the messaging ingress facade. When `conv_id` is `Some`, the claim is bound
+/// to a specific conversation.
+pub fn generate_legacy_directline_jwt(
     signing_key: &[u8],
     tenant: &str,
     team: &str,
@@ -32,7 +33,7 @@ pub fn generate_jwt(
     let header = json!({"alg": "HS256", "typ": "JWT"});
 
     let mut claims = json!({
-        "iss": "greentic.webchat",
+        "iss": "greentic.messaging",
         "aud": "directline",
         "sub": sub,
         "iat": iat,
@@ -114,17 +115,17 @@ impl ConversationState {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct DirectLineState {
+pub struct LegacyDirectLineState {
     conversations: Arc<DashMap<String, ConversationState>>,
 }
 
-impl Default for DirectLineState {
+impl Default for LegacyDirectLineState {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl DirectLineState {
+impl LegacyDirectLineState {
     pub fn new() -> Self {
         Self {
             conversations: Arc::new(DashMap::new()),
@@ -196,8 +197,8 @@ impl DirectLineState {
             "from": {"id": "bot", "name": "Bot", "role": "bot"},
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
-        // Only include "text" when there are no attachments — webchat SDK
-        // renders both as separate bubbles otherwise.
+        // Only include "text" when there are no attachments so clients do not
+        // render a redundant text bubble above the card payload.
         if attachments.is_none()
             && let Some(ref t) = text
         {
@@ -236,56 +237,184 @@ impl DirectLineState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Endpoint handlers
-// ---------------------------------------------------------------------------
-
-pub fn handle_create_conversation(
-    dl_state: &DirectLineState,
-    tenant: &str,
-    team: &str,
-    signing_key: &[u8],
-) -> JsonValue {
-    let conv_id = uuid::Uuid::new_v4().to_string();
-    dl_state.create_conversation(&conv_id);
-
-    // Generate conversation-bound token
-    let token = generate_jwt(signing_key, tenant, team, "anonymous", Some(&conv_id));
-
-    json!({
-        "conversationId": conv_id,
-        "token": token,
-        "expires_in": JWT_TTL_SECONDS,
-        "streamUrl": null
-    })
+#[derive(Clone, Default)]
+pub struct LegacyDirectLineCompat {
+    state: Arc<OnceLock<LegacyDirectLineState>>,
 }
 
-pub fn handle_post_activity(
-    dl_state: &DirectLineState,
-    conv_id: &str,
-    body: &JsonValue,
-) -> Option<JsonValue> {
-    let text = body.get("text").and_then(|v| v.as_str()).map(String::from);
-    let from_id = body
-        .get("from")
-        .and_then(|f| f.get("id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("anonymous");
-
-    let activity_id = dl_state.add_user_activity(conv_id, text, from_id, body.clone())?;
-    Some(json!({ "id": activity_id }))
+#[derive(Clone, Copy)]
+pub struct LegacyDirectLineReplyTarget<'a> {
+    compat: &'a LegacyDirectLineCompat,
+    conversation_id: &'a str,
 }
 
-pub fn handle_get_activities(
-    dl_state: &DirectLineState,
-    conv_id: &str,
-    watermark: Option<u64>,
-) -> Option<JsonValue> {
-    let (activities, next_wm) = dl_state.get_activities(conv_id, watermark)?;
-    Some(json!({
-        "activities": activities,
-        "watermark": next_wm
-    }))
+impl LegacyDirectLineCompat {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn state(&self) -> &LegacyDirectLineState {
+        self.state.get_or_init(LegacyDirectLineState::new)
+    }
+
+    pub fn create_conversation(&self, conv_id: &str) -> bool {
+        self.state().create_conversation(conv_id)
+    }
+
+    pub fn conversation_exists(&self, conv_id: &str) -> bool {
+        self.state().conversation_exists(conv_id)
+    }
+
+    pub fn inject_user_activity(
+        &self,
+        conv_id: &str,
+        text: Option<String>,
+        from_id: &str,
+        raw: JsonValue,
+    ) -> Option<String> {
+        self.state().add_user_activity(conv_id, text, from_id, raw)
+    }
+
+    pub fn inject_bot_activity(
+        &self,
+        conv_id: &str,
+        text: Option<String>,
+        attachments: Option<JsonValue>,
+    ) -> Option<String> {
+        self.state().add_bot_activity(conv_id, text, attachments)
+    }
+
+    pub fn get_activities(
+        &self,
+        conv_id: &str,
+        watermark: Option<u64>,
+    ) -> Option<(Vec<JsonValue>, String)> {
+        self.state().get_activities(conv_id, watermark)
+    }
+
+    pub fn reply_target<'a>(&'a self, conversation_id: &'a str) -> LegacyDirectLineReplyTarget<'a> {
+        LegacyDirectLineReplyTarget {
+            compat: self,
+            conversation_id,
+        }
+    }
+
+    pub fn create_conversation_response(
+        &self,
+        tenant: &str,
+        team: &str,
+        signing_key: &[u8],
+    ) -> JsonValue {
+        let conv_id = uuid::Uuid::new_v4().to_string();
+        self.create_conversation(&conv_id);
+
+        let token =
+            generate_legacy_directline_jwt(signing_key, tenant, team, "anonymous", Some(&conv_id));
+
+        json!({
+            "conversationId": conv_id,
+            "token": token,
+            "expires_in": JWT_TTL_SECONDS,
+            "streamUrl": null
+        })
+    }
+
+    pub fn token_response(tenant: &str, team: &str, signing_key: &[u8]) -> JsonValue {
+        let token = generate_legacy_directline_jwt(signing_key, tenant, team, "anonymous", None);
+
+        json!({
+            "token": token,
+            "expires_in": JWT_TTL_SECONDS,
+            "conversationId": ""
+        })
+    }
+
+    pub fn post_activity_response(&self, conv_id: &str, body: &JsonValue) -> Option<JsonValue> {
+        let text = body.get("text").and_then(|v| v.as_str()).map(String::from);
+        let from_id = body
+            .get("from")
+            .and_then(|f| f.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("anonymous");
+
+        let activity_id = self.inject_user_activity(conv_id, text, from_id, body.clone())?;
+        Some(json!({ "id": activity_id }))
+    }
+
+    pub fn get_activities_response(
+        &self,
+        conv_id: &str,
+        watermark: Option<u64>,
+    ) -> Option<JsonValue> {
+        let (activities, next_wm) = self.get_activities(conv_id, watermark)?;
+        Some(json!({
+            "activities": activities,
+            "watermark": next_wm
+        }))
+    }
+
+    pub fn build_user_envelope(
+        tenant: &str,
+        team: &str,
+        provider: &str,
+        conversation_id: &str,
+        body: &JsonValue,
+    ) -> Result<greentic_types::ChannelMessageEnvelope, serde_json::Error> {
+        let text = body.get("text").and_then(|v| v.as_str()).map(String::from);
+        let from_id = body
+            .get("from")
+            .and_then(|f| f.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("anonymous")
+            .to_string();
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("provider".to_string(), provider.to_string());
+        metadata.insert("tenant".to_string(), tenant.to_string());
+        metadata.insert("team".to_string(), team.to_string());
+        if let Some(locale) = body.get("locale").and_then(|v| v.as_str()) {
+            metadata.insert("locale".to_string(), locale.to_string());
+        }
+        if let Some(value_obj) = body.get("value").and_then(|v| v.as_object()) {
+            for (k, v) in value_obj {
+                let val_str = match v {
+                    JsonValue::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                metadata.insert(k.clone(), val_str);
+            }
+        }
+
+        serde_json::from_value(serde_json::json!({
+            "id": format!("directline-{conversation_id}"),
+            "tenant": {
+                "env": "dev",
+                "tenant": tenant,
+                "tenant_id": tenant,
+                "team": team,
+                "attempt": 0
+            },
+            "channel": conversation_id,
+            "session_id": conversation_id,
+            "from": {
+                "id": from_id,
+                "kind": "user"
+            },
+            "text": text,
+            "metadata": metadata
+        }))
+    }
+}
+
+impl LegacyDirectLineReplyTarget<'_> {
+    pub fn inject_bot_activity(
+        &self,
+        text: Option<String>,
+        attachments: Option<JsonValue>,
+    ) -> Option<String> {
+        self.compat
+            .inject_bot_activity(self.conversation_id, text, attachments)
+    }
 }
 
 #[cfg(test)]
@@ -301,14 +430,16 @@ mod tests {
 
     #[test]
     fn generate_jwt_includes_context_and_optional_conversation_id() {
-        let with_conversation = generate_jwt(b"secret", "tenant-a", "team-a", "user-1", Some("c1"));
+        let with_conversation =
+            generate_legacy_directline_jwt(b"secret", "tenant-a", "team-a", "user-1", Some("c1"));
         let claims = decode_jwt_claims(&with_conversation);
         assert_eq!(claims["ctx"]["tenant"], "tenant-a");
         assert_eq!(claims["ctx"]["team"], "team-a");
         assert_eq!(claims["sub"], "user-1");
         assert_eq!(claims["conversationId"], "c1");
 
-        let without_conversation = generate_jwt(b"secret", "tenant-a", "team-a", "user-1", None);
+        let without_conversation =
+            generate_legacy_directline_jwt(b"secret", "tenant-a", "team-a", "user-1", None);
         let claims = decode_jwt_claims(&without_conversation);
         assert!(claims.get("conversationId").is_none());
     }
@@ -347,7 +478,7 @@ mod tests {
 
     #[test]
     fn directline_state_roundtrips_user_and_bot_activities() {
-        let state = DirectLineState::new();
+        let state = LegacyDirectLineState::new();
         assert!(state.create_conversation("conv-1"));
 
         let user_id = state
@@ -378,28 +509,34 @@ mod tests {
 
     #[test]
     fn endpoint_helpers_require_existing_conversations() {
-        let state = DirectLineState::new();
-        assert!(handle_post_activity(&state, "missing", &json!({"text": "hello"})).is_none());
-        assert!(handle_get_activities(&state, "missing", None).is_none());
+        let compat = LegacyDirectLineCompat::new();
+        assert!(
+            compat
+                .post_activity_response("missing", &json!({"text": "hello"}))
+                .is_none()
+        );
+        assert!(compat.get_activities_response("missing", None).is_none());
     }
 
     #[test]
     fn create_and_post_handlers_populate_expected_fields() {
-        let state = DirectLineState::new();
-        let created = handle_create_conversation(&state, "tenant-a", "team-a", b"secret");
+        let compat = LegacyDirectLineCompat::new();
+        let created = compat.create_conversation_response("tenant-a", "team-a", b"secret");
         let conversation_id = created["conversationId"].as_str().expect("conversation id");
-        assert!(state.conversation_exists(conversation_id));
+        assert!(compat.conversation_exists(conversation_id));
         assert_eq!(created["expires_in"], JWT_TTL_SECONDS);
 
-        let posted = handle_post_activity(
-            &state,
-            conversation_id,
-            &json!({"text": "hello", "from": {"id": "user-1"}}),
-        )
-        .expect("post result");
+        let posted = compat
+            .post_activity_response(
+                conversation_id,
+                &json!({"text": "hello", "from": {"id": "user-1"}}),
+            )
+            .expect("post result");
         assert!(posted["id"].as_str().is_some());
 
-        let activities = handle_get_activities(&state, conversation_id, None).expect("activities");
+        let activities = compat
+            .get_activities_response(conversation_id, None)
+            .expect("activities");
         assert_eq!(activities["activities"][0]["text"], "hello");
         assert_eq!(activities["activities"][0]["from"]["role"], "user");
     }
