@@ -31,8 +31,13 @@ pub fn webhook_result_from_flow_output(output: Option<&Value>) -> Option<Value> 
 
 /// After submit, register webhooks with external APIs where applicable.
 ///
-/// This makes native HTTP calls from the operator (not through WASM) so
-/// it can reliably reach external APIs. Currently supports Telegram, Slack, and Webex.
+/// Dispatch chain:
+/// 1. Declared ops from flow output (`webhook_ops`) — checked by caller
+/// 2. Legacy provider-specific fallback — will be removed once all provider
+///    packs implement `webhook_register` in their WASM component
+///
+/// Returns `Some(result)` with status JSON, or `None` if the provider
+/// doesn't need webhook registration.
 pub fn try_provider_setup_webhook(
     _bundle_root: &std::path::Path,
     _domain: Domain,
@@ -49,6 +54,8 @@ pub fn try_provider_setup_webhook(
 
     let team = team.unwrap_or("default");
 
+    // Legacy fallback: provider-specific webhook registration via native HTTP calls.
+    // TODO: Remove once all provider packs implement `webhook_register` WASM operation.
     let provider_short = provider_id
         .strip_prefix("messaging-")
         .unwrap_or(provider_id);

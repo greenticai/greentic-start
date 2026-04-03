@@ -17,7 +17,6 @@ pub(super) fn route_messaging_envelopes(
     provider: &str,
     ctx: &OperatorContext,
     envelopes: Vec<ChannelMessageEnvelope>,
-    dl_inject: Option<(&crate::directline::DirectLineState, &str)>,
 ) -> anyhow::Result<()> {
     let team = ctx.team.as_deref();
     let app_pack_path = app::resolve_app_pack_path(bundle, &ctx.tenant, team, None)
@@ -46,11 +45,7 @@ pub(super) fn route_messaging_envelopes(
                             route_to_card
                         ),
                     );
-                    let from_id = envelope
-                        .from
-                        .as_ref()
-                        .map(|f| f.id.as_str())
-                        .unwrap_or("?");
+                    let from_id = envelope.from.as_ref().map(|f| f.id.as_str()).unwrap_or("?");
                     crate::flow_log::log(
                         "CARD",
                         &format!(
@@ -89,48 +84,10 @@ pub(super) fn route_messaging_envelopes(
         };
 
         for out_envelope in outputs {
-            // For webchat-gui with DirectLine, skip the 3-step egress pipeline
-            // (render_plan/encode/send_payload) since the WASM component doesn't
-            // support those ops. Instead inject the bot response directly into
-            // the DirectLine conversation state for client polling.
-            if let Some((dl_state, conv_id)) = dl_inject {
-                let locale = envelope
-                    .metadata
-                    .get("locale")
-                    .map(String::as_str)
-                    .unwrap_or("en");
-                let attachments = out_envelope
-                    .metadata
-                    .get("adaptive_card")
-                    .and_then(|card_str| serde_json::from_str::<serde_json::Value>(card_str).ok())
-                    .map(|mut card| {
-                        // Resolve {{i18n:KEY}} tokens from pack i18n bundle
-                        resolve_i18n_tokens(&mut card, &app_pack_path, locale);
-                        json!([{
-                            "contentType": "application/vnd.microsoft.card.adaptive",
-                            "content": card
-                        }])
-                    });
-                // Suppress text when there is an adaptive card attachment to
-                // prevent webchat SDK from rendering a redundant text bubble
-                // above the card.
-                let text = if attachments.is_some() {
-                    None
-                } else {
-                    out_envelope.text.clone()
-                };
-                if let Some(bot_id) = dl_state.add_bot_activity(conv_id, text, attachments) {
-                    operator_log::info(
-                        module_path!(),
-                        format!(
-                            "[webchat] injected bot activity id={bot_id} conv={conv_id} provider={provider}"
-                        ),
-                    );
-                }
-                continue;
-            }
-
-            // Standard egress pipeline for non-DirectLine providers (Slack, Teams, Webex, etc.)
+            // Standard egress pipeline: render → encode → send_payload.
+            // All providers (including webchat) use this path. The webchat provider's
+            // send_payload writes bot activities to the conversation state store for
+            // client polling via DirectLine GET /activities.
             let message_value = serde_json::to_value(&out_envelope)?;
 
             let plan = match egress::render_plan(runner_host, ctx, provider, message_value.clone())
@@ -488,7 +445,6 @@ mod tests {
                 correlation_id: None,
             },
             vec![envelope()],
-            None,
         )
         .unwrap_err();
 
@@ -496,7 +452,11 @@ mod tests {
     }
 
     #[test]
-    fn route_messaging_envelopes_injects_directline_card_reply_without_egress() {
+    fn route_messaging_envelopes_card_routing_uses_standard_egress_pipeline() {
+        // After removing DirectLine injection, all providers (including webchat)
+        // use the standard egress pipeline: render_plan → encode → send_payload.
+        // Without a provider pack in the test bundle, egress fails — confirming
+        // that webchat now goes through the same path as all other providers.
         let dir = tempdir().expect("tempdir");
         let packs_dir = dir.path().join("packs");
         std::fs::create_dir_all(&packs_dir).expect("packs dir");
@@ -515,41 +475,28 @@ mod tests {
             false,
         )
         .expect("runner host");
-        let dl_state = crate::directline::DirectLineState::new();
-        assert!(dl_state.create_conversation("conv-1"));
 
         let mut card_routed = envelope();
         card_routed
             .metadata
             .insert("routeToCardId".to_string(), "welcome".to_string());
 
-        route_messaging_envelopes(
+        // Without a messaging provider pack, egress fails because render_plan
+        // can't find the provider. This proves webchat uses standard egress.
+        let result = route_messaging_envelopes(
             dir.path(),
             &runner_host,
-            "messaging-webchat-gui",
+            "messaging-webchat",
             &OperatorContext {
                 tenant: "demo".to_string(),
                 team: Some("default".to_string()),
                 correlation_id: None,
             },
             vec![card_routed],
-            Some((&dl_state, "conv-1")),
-        )
-        .expect("route envelopes");
-
-        let (activities, watermark) = dl_state
-            .get_activities("conv-1", None)
-            .expect("directline activities");
-        assert_eq!(watermark, "1");
-        assert_eq!(activities.len(), 1);
-        assert!(activities[0]["text"].is_null());
-        assert_eq!(
-            activities[0]["attachments"][0]["contentType"],
-            "application/vnd.microsoft.card.adaptive"
         );
-        assert_eq!(
-            activities[0]["attachments"][0]["content"]["body"][0]["text"],
-            "Welcome card"
+        assert!(
+            result.is_err(),
+            "expected error because no messaging provider pack is available"
         );
     }
 

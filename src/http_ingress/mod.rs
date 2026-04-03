@@ -1,4 +1,3 @@
-mod directline_handler;
 mod helpers;
 mod messaging;
 mod static_handler;
@@ -17,13 +16,13 @@ use hyper_util::rt::tokio::TokioIo;
 use tokio::{net::TcpListener, runtime::Runtime, sync::oneshot};
 
 use crate::domains::Domain;
+use crate::http_routes::{HttpRouteTable, discover_http_routes_from_bundle};
 use crate::ingress_dispatch::dispatch_http_ingress;
 use crate::ingress_types::IngressRequestV1;
 use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
 use crate::static_routes::{ActiveRouteTable, ReservedRouteSet, discover_from_bundle};
 
-use directline_handler::{handle_directline_request, parse_webchat_directline_route};
 use helpers::{
     build_http_response, collect_headers, collect_queries, cors_preflight_response, domain_name,
     error_response, handle_builtin_health_request, handle_oauth_token_exchange,
@@ -86,16 +85,19 @@ impl HttpIngressServer {
                             .join(", ")
                     ),
                 );
+                // Discover user-facing UI URLs from tenant-scoped static routes.
+                // Any static route with SPA fallback and tenant scope is treated
+                // as a UI endpoint worth surfacing at startup.
                 for route in table.routes() {
-                    if route.public_path.contains("webchat") {
+                    if route.tenant_scoped && route.spa_fallback.is_some() {
                         let url_path = route.public_path.replace("{tenant}", &config.tenant);
-                        let webchat_url = format!(
+                        let ui_url = format!(
                             "http://{}/{}/",
                             config.bind_addr,
                             url_path.trim_start_matches('/')
                         );
-                        operator_log::info(module_path!(), format!("WebChat GUI: {webchat_url}"));
-                        webchat_urls.push(webchat_url);
+                        operator_log::info(module_path!(), format!("UI: {ui_url}"));
+                        webchat_urls.push(ui_url);
                     }
                 }
             }
@@ -104,12 +106,45 @@ impl HttpIngressServer {
             ActiveRouteTable::default()
         };
 
+        // Discover pack-declared HTTP API routes (greentic.http-routes.v1)
+        let http_route_table = if config.enable_static_routes {
+            match discover_http_routes_from_bundle(runner_host.bundle_root()) {
+                Ok(routes) => {
+                    if !routes.is_empty() {
+                        operator_log::info(
+                            module_path!(),
+                            format!(
+                                "discovered {} HTTP route(s): {}",
+                                routes.len(),
+                                routes
+                                    .iter()
+                                    .map(|r| r.pattern.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        );
+                    }
+                    HttpRouteTable::from_descriptors(routes)
+                }
+                Err(err) => {
+                    operator_log::warn(
+                        module_path!(),
+                        format!("http route discovery failed: {err:#}"),
+                    );
+                    HttpRouteTable::default()
+                }
+            }
+        } else {
+            HttpRouteTable::default()
+        };
+
         let state = Arc::new(HttpIngressState {
             runner_host,
             domains,
             active_route_table,
-            dl_state: crate::directline::DirectLineState::new(),
+            http_route_table,
         });
+
         let (tx, rx) = oneshot::channel();
         let addr = config.bind_addr;
         let handle = thread::Builder::new()
@@ -198,12 +233,74 @@ impl HttpIngressServer {
     }
 }
 
-#[derive(Clone)]
 struct HttpIngressState {
     runner_host: Arc<DemoRunnerHost>,
     domains: Vec<Domain>,
     active_route_table: ActiveRouteTable,
-    dl_state: crate::directline::DirectLineState,
+    http_route_table: HttpRouteTable,
+}
+
+/// Transitional URL rewriter: route webchat/directline URL patterns through generic ingress.
+/// Phase 2 will replace this with pack-declared HTTP routes (`greentic.http-routes.v1`).
+fn try_resolve_webchat_ingress(
+    path: &str,
+    route_table: &ActiveRouteTable,
+) -> Option<helpers::ParsedIngressRoute> {
+    // Legacy root-level routes: /token, /v3/directline/*, /directline/*
+    if path == "/token" || path.starts_with("/v3/directline") || path.starts_with("/directline") {
+        let provider = route_table
+            .match_request(path)
+            .map(|m| m.descriptor.pack_id.clone())
+            .unwrap_or_else(|| resolve_webchat_provider(route_table));
+        return Some(helpers::ParsedIngressRoute {
+            domain: Domain::Messaging,
+            provider,
+            tenant: crate::DEMO_DEFAULT_TENANT.to_string(),
+            team: crate::DEMO_DEFAULT_TEAM.to_string(),
+            handler: None,
+        });
+    }
+
+    // Tenant-scoped routes: /v1/messaging/webchat/{tenant}/token|v3/directline/*|auth/config
+    let prefix = "/v1/messaging/webchat/";
+    if !path.starts_with(prefix) {
+        return None;
+    }
+    let after_prefix = &path[prefix.len()..];
+    let slash = after_prefix.find('/')?;
+    let tenant = &after_prefix[..slash];
+    if tenant.is_empty() {
+        return None;
+    }
+    let remainder = &after_prefix[slash + 1..];
+    if remainder == "token" || remainder.starts_with("v3/directline") || remainder == "auth/config"
+    {
+        let provider = route_table
+            .match_request(path)
+            .map(|m| m.descriptor.pack_id.clone())
+            .unwrap_or_else(|| resolve_webchat_provider(route_table));
+        return Some(helpers::ParsedIngressRoute {
+            domain: Domain::Messaging,
+            provider,
+            tenant: tenant.to_string(),
+            team: crate::DEMO_DEFAULT_TEAM.to_string(),
+            handler: None,
+        });
+    }
+    None
+}
+
+/// Discover webchat provider from registered static routes. Falls back to a generic name
+/// if no matching route is found. This avoids hardcoding a specific pack ID.
+fn resolve_webchat_provider(route_table: &ActiveRouteTable) -> String {
+    // Look for any static route whose public_path contains the webchat ingress pattern
+    for route in route_table.routes() {
+        if route.public_path.contains("/messaging/webchat/") {
+            return route.pack_id.clone();
+        }
+    }
+    // Last resort: use the generic messaging ingress path naming convention
+    "messaging-webchat".to_string()
 }
 
 async fn handle_request<B>(
@@ -251,42 +348,54 @@ where
             .map_err(|err| *err);
     }
 
-    // Legacy Direct Line routes (root level)
-    if path == "/token" || path.starts_with("/v3/directline") || path.starts_with("/directline") {
-        return handle_directline_request(req, &path, None, None, state).await;
-    }
-
     // OAuth token exchange proxy: /v1/messaging/webchat/{tenant}/oauth/token-exchange
     if path.contains("/oauth/token-exchange") && req.method() == Method::POST {
         return handle_oauth_token_exchange(req).await;
     }
 
-    // WebChat Direct Line routes: /v1/messaging/webchat/{tenant}/token or /v1/messaging/webchat/{tenant}/v3/directline/*
-    if let Some((tenant, dl_path)) = parse_webchat_directline_route(&path) {
-        let provider = state
-            .active_route_table
-            .match_request(&path)
-            .map(|route_match| route_match.descriptor.pack_id.clone());
-        return handle_directline_request(req, &dl_path, Some(tenant), provider, state).await;
-    }
-
-    // Static route handling - serve assets from .gtpack files
-    if let Some(route_match) = state.active_route_table.match_request(&path) {
-        return Ok(serve_static_route(
-            &route_match,
-            state.runner_host.bundle_root(),
-            &path,
-        ));
-    }
-
+    // Resolve path to a parsed ingress route.
+    // Tries: (1) pack-declared HTTP routes, (2) static routes, (3) standard ingress.
     let method = req.method().clone();
-    let parsed = match parse_route_segments(req.uri().path()) {
-        Some(value) => value,
-        None => {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "expected /v1/{domain}/ingress/{provider}/{tenant}/{team?}/{handler?}",
+    let parsed = 'resolve: {
+        // Pack-declared HTTP routes (greentic.http-routes.v1): provider packs declare
+        // which URL patterns they handle, and the ingress server dispatches to them
+        // via the generic `dispatch_http_ingress` pipeline.
+        if let Some(route_match) = state.http_route_table.match_request(&path, method.as_str()) {
+            break 'resolve helpers::ParsedIngressRoute {
+                domain: route_match.descriptor.domain,
+                provider: route_match.descriptor.pack_id.clone(),
+                tenant: route_match.tenant,
+                team: route_match.team,
+                handler: None,
+            };
+        }
+
+        // Transitional fallback: route well-known webchat/directline URLs through
+        // generic ingress dispatch when no pack-declared HTTP route matches.
+        // Remove this block once all provider packs declare their routes via
+        // greentic.http-routes.v1.
+        if let Some(p) = try_resolve_webchat_ingress(&path, &state.active_route_table) {
+            break 'resolve p;
+        }
+
+        // Static route handling — serve assets from .gtpack files
+        if let Some(route_match) = state.active_route_table.match_request(&path) {
+            return Ok(serve_static_route(
+                &route_match,
+                state.runner_host.bundle_root(),
+                &path,
             ));
+        }
+
+        // Standard ingress route: /v1/{domain}/ingress/{provider}/{tenant}/{team?}/{handler?}
+        match parse_route_segments(req.uri().path()) {
+            Some(value) => value,
+            None => {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "expected /v1/{domain}/ingress/{provider}/{tenant}/{team?}/{handler?}",
+                ));
+            }
         }
     };
     let domain = parsed.domain;
@@ -401,12 +510,21 @@ where
             .messaging_envelopes
             .iter()
             .filter(|env| {
-                let dominated_by_bot = env
-                    .from
-                    .as_ref()
-                    .map(|f| f.id.ends_with(".bot") || f.id.ends_with("@webex.bot"))
-                    .unwrap_or(false);
-                if dominated_by_bot {
+                // Providers set `is_bot_message=true` in envelope metadata to
+                // signal bot self-messages that should not be routed back through
+                // the app flow.  Legacy fallback checks from-id suffixes for
+                // providers that don't set the flag yet.
+                let is_bot = env
+                    .metadata
+                    .get("is_bot_message")
+                    .map(|v| v == "true")
+                    .unwrap_or_else(|| {
+                        env.from
+                            .as_ref()
+                            .map(|f| f.id.ends_with(".bot") || f.id.ends_with("@webex.bot"))
+                            .unwrap_or(false)
+                    });
+                if is_bot {
                     operator_log::debug(
                         module_path!(),
                         format!(
@@ -415,7 +533,7 @@ where
                         ),
                     );
                 }
-                !dominated_by_bot
+                !is_bot
             })
             .cloned()
             .collect();
@@ -429,7 +547,7 @@ where
         let runner_host = state.runner_host.clone();
         std::thread::spawn(move || {
             if let Err(err) =
-                route_messaging_envelopes(&bundle, &runner_host, &provider, &ctx, envelopes, None)
+                route_messaging_envelopes(&bundle, &runner_host, &provider, &ctx, envelopes)
             {
                 operator_log::error(
                     module_path!(),
@@ -496,7 +614,7 @@ mod tests {
             runner_host,
             domains,
             active_route_table: ActiveRouteTable::default(),
-            dl_state: crate::directline::DirectLineState::new(),
+            http_route_table: HttpRouteTable::default(),
         })
     }
 
@@ -773,7 +891,7 @@ mod tests {
                 warnings: vec![],
                 blocking_failures: vec![],
             }),
-            dl_state: crate::directline::DirectLineState::new(),
+            http_route_table: HttpRouteTable::default(),
         });
 
         let response = runtime
@@ -789,45 +907,11 @@ mod tests {
     }
 
     #[test]
-    fn tenant_scoped_directline_uses_provider_from_matching_static_route_pack_id() {
-        use crate::secrets_gate::canonical_secret_uri;
-        use std::fs::File;
-        use std::io::Write;
-        use zip::write::FileOptions;
-
-        let runtime = Runtime::new().unwrap();
-        let dir = tempdir().unwrap();
-        let env_guard = crate::test_env_lock().lock().unwrap();
-
-        let pack_path = dir.path().join("env-backend.gtpack");
-        let file = File::create(&pack_path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        zip.start_file("assets/secrets_backend.json", FileOptions::<()>::default())
-            .unwrap();
-        zip.write_all(br#"{"backend":"env"}"#).unwrap();
-        zip.finish().unwrap();
-        unsafe {
-            std::env::set_var("GREENTIC_SECRETS_MANAGER_PACK", &pack_path);
-        }
-
-        let discovery = crate::discovery::discover(dir.path()).unwrap();
-        let secrets_handle =
-            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
-        let runner_host = Arc::new(
-            DemoRunnerHost::new(
-                dir.path().to_path_buf(),
-                &discovery,
-                None,
-                secrets_handle,
-                false,
-            )
-            .unwrap(),
-        );
-
+    fn webchat_ingress_resolves_provider_from_static_route_pack_id() {
         let route = StaticRouteDescriptor {
             route_id: "webchat-gui".to_string(),
             pack_id: "messaging-webchat-gui".to_string(),
-            pack_path: dir.path().to_path_buf(),
+            pack_path: std::path::PathBuf::from("/tmp"),
             public_path: "/v1/messaging/webchat/{tenant}".to_string(),
             source_root: "site".to_string(),
             index_file: Some("index.html".to_string()),
@@ -842,40 +926,40 @@ mod tests {
                 RouteScopeSegment::Tenant,
             ],
         };
-        let state = Arc::new(HttpIngressState {
-            runner_host,
-            domains: vec![Domain::Messaging],
-            active_route_table: ActiveRouteTable::from_plan(&StaticRoutePlan {
-                routes: vec![route],
-                warnings: vec![],
-                blocking_failures: vec![],
-            }),
-            dl_state: crate::directline::DirectLineState::new(),
+        let table = ActiveRouteTable::from_plan(&StaticRoutePlan {
+            routes: vec![route],
+            warnings: vec![],
+            blocking_failures: vec![],
         });
 
-        let gui_secret_uri = canonical_secret_uri(
-            "dev",
-            "demo",
-            Some("default"),
-            "messaging-webchat-gui",
-            "jwt_signing_key",
-        );
-        unsafe {
-            std::env::set_var(&gui_secret_uri, "gui-signing-key");
-        }
+        // Tenant-scoped webchat token URL resolves provider from static route pack_id
+        let parsed = try_resolve_webchat_ingress("/v1/messaging/webchat/demo/token", &table)
+            .expect("should resolve webchat token route");
+        assert_eq!(parsed.provider, "messaging-webchat-gui");
+        assert_eq!(parsed.tenant, "demo");
 
-        let response = runtime
-            .block_on(handle_request_inner(
-                empty_request(Method::GET, "/v1/messaging/webchat/demo/token"),
-                state,
-            ))
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        // DirectLine API routes also resolve
+        let parsed = try_resolve_webchat_ingress(
+            "/v1/messaging/webchat/acme/v3/directline/conversations",
+            &table,
+        )
+        .expect("should resolve directline route");
+        assert_eq!(parsed.provider, "messaging-webchat-gui");
+        assert_eq!(parsed.tenant, "acme");
 
-        unsafe {
-            std::env::remove_var(&gui_secret_uri);
-            std::env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
-        }
-        drop(env_guard);
+        // Auth config resolves
+        let parsed = try_resolve_webchat_ingress("/v1/messaging/webchat/demo/auth/config", &table)
+            .expect("should resolve auth config route");
+        assert_eq!(parsed.tenant, "demo");
+
+        // Legacy /token resolves with fallback provider
+        let parsed = try_resolve_webchat_ingress("/token", &table)
+            .expect("should resolve legacy token route");
+        assert_eq!(parsed.tenant, "demo");
+
+        // Non-webchat paths return None
+        assert!(try_resolve_webchat_ingress("/v1/other/path", &table).is_none());
+        assert!(try_resolve_webchat_ingress("/healthz", &table).is_none());
+        assert!(try_resolve_webchat_ingress("/v1/messaging/webchat//token", &table).is_none());
     }
 }

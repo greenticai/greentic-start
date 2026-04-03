@@ -54,7 +54,6 @@ impl CardRenderer {
         let mut adaptive_card: Value = serde_json::from_str(&adaptive_card_raw)
             .with_context(|| "invalid metadata.adaptive_card JSON")?;
         let had_teams_placeholder = adaptive_card_raw.contains("{{oauth.teams.connectionName}}");
-        let teams_native_platform = is_teams_provider(provider_type);
         let has_placeholder = adaptive_card_raw.contains("{{oauth.start_url}}")
             || adaptive_card_raw.contains("{{oauth.teams.connectionName}}")
             || contains_oauth_start_marker(&adaptive_card);
@@ -83,11 +82,18 @@ impl CardRenderer {
             .or_else(|| resolve_result.pointer("/teams/connection_name"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        // Determine native OAuth card support from the capability response rather
+        // than checking the provider name. Providers that support native OAuth
+        // connection cards return `native_oauth_card: true` in their resolve output.
+        let supports_native_oauth_card = resolve_result
+            .get("native_oauth_card")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         rewrite_oauth_fields(
             &mut adaptive_card,
             start_url,
             teams_connection_name.as_deref(),
-            teams_native_platform,
+            supports_native_oauth_card,
         );
         if let Some(metadata) = payload_json
             .pointer_mut("/metadata")
@@ -98,7 +104,8 @@ impl CardRenderer {
                 Value::String(serde_json::to_string(&adaptive_card)?),
             );
             metadata.insert("oauth_card_resolved".to_string(), resolve_result);
-            if had_teams_placeholder && (!teams_native_platform || teams_connection_name.is_none())
+            if had_teams_placeholder
+                && (!supports_native_oauth_card || teams_connection_name.is_none())
             {
                 metadata.insert(
                     "oauth_card_downgrade".to_string(),
@@ -248,10 +255,6 @@ fn rewrite_oauth_fields(
     }
 }
 
-fn is_teams_provider(provider_type: &str) -> bool {
-    provider_type.to_ascii_lowercase().contains("teams")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +277,7 @@ mod tests {
                 assert_eq!(op, "oauth.card.resolve");
                 Ok(json!({
                     "start_url": "https://oauth.example/start/session",
+                    "native_oauth_card": true,
                     "teams": { "connectionName": "greentic-oauth" }
                 }))
             })

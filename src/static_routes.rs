@@ -86,8 +86,6 @@ impl ReservedRouteSet {
         reserved.insert_prefix("/config");
         reserved.insert_prefix("/cache");
         reserved.insert_prefix("/observability");
-        reserved.insert_prefix("/v3/directline");
-        reserved.insert_prefix("/directline");
         for domain in [
             Domain::Messaging,
             Domain::Events,
@@ -680,10 +678,10 @@ mod tests {
     }
 
     #[test]
-    fn reserved_routes_include_directline() {
+    fn reserved_routes_include_health_and_onboard() {
         let reserved = ReservedRouteSet::operator_defaults();
-        assert!(reserved.conflicts_with("/v3/directline/conversations"));
         assert!(reserved.conflicts_with("/token"));
+        assert!(reserved.conflicts_with("/api/onboard/providers"));
         assert!(!reserved.conflicts_with("/v1/web/webchat/demo"));
     }
 
