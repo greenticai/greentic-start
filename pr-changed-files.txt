@@ -1,1 +1,4 @@
+SECURITY_FIX_REPORT.md
+all-code-scanning-alerts.json
+pr-changed-files.txt
 src/messaging_app.rs
