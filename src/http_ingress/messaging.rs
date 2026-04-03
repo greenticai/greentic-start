@@ -46,11 +46,7 @@ pub(super) fn route_messaging_envelopes(
                             route_to_card
                         ),
                     );
-                    let from_id = envelope
-                        .from
-                        .as_ref()
-                        .map(|f| f.id.as_str())
-                        .unwrap_or("?");
+                    let from_id = envelope.from.as_ref().map(|f| f.id.as_str()).unwrap_or("?");
                     crate::flow_log::log(
                         "CARD",
                         &format!(

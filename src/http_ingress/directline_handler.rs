@@ -366,6 +366,148 @@ async fn generate_directline_token(
     Ok(json_response(StatusCode::OK, body))
 }
 
+/// Build OAuth auth config from provider secrets.
+///
+/// Reads `oauth_enabled`, `oauth_enable_google`, `oauth_google_client_id`, etc.
+/// from the secrets store and returns an auth config payload for the webchat GUI.
+#[allow(clippy::result_large_err)]
+fn generate_auth_config(
+    tenant: &str,
+    provider: &str,
+    runner_host: &DemoRunnerHost,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let ctx = OperatorContext {
+        tenant: tenant.to_string(),
+        team: Some("default".to_string()),
+        correlation_id: None,
+    };
+
+    let get = |key: &str| -> Option<String> {
+        runner_host
+            .get_secret(provider, key, &ctx)
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    };
+
+    let oauth_enabled = get("oauth_enabled").map(|v| v == "true").unwrap_or(false);
+
+    if !oauth_enabled {
+        return Ok(json_response(StatusCode::OK, json!({ "enabled": false })));
+    }
+
+    let public_base_url =
+        get("public_base_url").unwrap_or_else(|| "http://localhost:8080".to_string());
+    let redirect_base = format!(
+        "{}/v1/web/webchat/{}/",
+        public_base_url.trim_end_matches('/'),
+        tenant,
+    );
+
+    let mut providers = Vec::new();
+
+    // Guest/demo login (always available)
+    providers.push(json!({
+        "id": format!("{tenant}-demo"),
+        "label": "Continue as Guest",
+        "type": "dummy",
+        "enabled": true
+    }));
+
+    struct OidcDef {
+        suffix: &'static str,
+        label: &'static str,
+        enable_key: &'static str,
+        client_id_key: &'static str,
+        auth_url: &'static str,
+        scope: &'static str,
+    }
+
+    let oidc_providers = [
+        OidcDef {
+            suffix: "google",
+            label: "Sign in with Google",
+            enable_key: "oauth_enable_google",
+            client_id_key: "oauth_google_client_id",
+            auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
+            scope: "openid profile email",
+        },
+        OidcDef {
+            suffix: "microsoft",
+            label: "Sign in with Microsoft",
+            enable_key: "oauth_enable_microsoft",
+            client_id_key: "oauth_microsoft_client_id",
+            auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            scope: "openid profile email",
+        },
+        OidcDef {
+            suffix: "github",
+            label: "Sign in with GitHub",
+            enable_key: "oauth_enable_github",
+            client_id_key: "oauth_github_client_id",
+            auth_url: "https://github.com/login/oauth/authorize",
+            scope: "read:user user:email",
+        },
+    ];
+
+    for def in &oidc_providers {
+        let enabled = get(def.enable_key).map(|v| v == "true").unwrap_or(false);
+        let client_id = get(def.client_id_key).unwrap_or_default();
+
+        providers.push(json!({
+            "id": format!("{tenant}-{}", def.suffix),
+            "label": def.label,
+            "type": "oidc",
+            "enabled": enabled,
+            "authorizationUrl": def.auth_url,
+            "clientId": client_id,
+            "redirectUri": &redirect_base,
+            "scope": def.scope,
+            "responseType": "code"
+        }));
+    }
+
+    // Custom OIDC
+    let custom_enabled = get("oauth_enable_custom")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if custom_enabled {
+        let label = get("oauth_custom_label").unwrap_or_else(|| "SSO Login".to_string());
+        let auth_url = get("oauth_custom_auth_url").unwrap_or_default();
+        let client_id = get("oauth_custom_client_id").unwrap_or_default();
+        let scopes =
+            get("oauth_custom_scopes").unwrap_or_else(|| "openid profile email".to_string());
+
+        providers.push(json!({
+            "id": format!("{tenant}-custom-oidc"),
+            "label": label,
+            "type": "oidc",
+            "enabled": true,
+            "authorizationUrl": auth_url,
+            "clientId": client_id,
+            "redirectUri": &redirect_base,
+            "scope": scopes,
+            "responseType": "code"
+        }));
+    }
+
+    operator_log::info(
+        module_path!(),
+        format!(
+            "[webchat] auth/config for tenant={tenant}: enabled={oauth_enabled} providers={}",
+            providers.len()
+        ),
+    );
+
+    Ok(json_response(
+        StatusCode::OK,
+        json!({
+            "enabled": true,
+            "providers": providers
+        }),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,146 +941,4 @@ mod tests {
         }
         drop(env_guard);
     }
-}
-
-/// Build OAuth auth config from provider secrets.
-///
-/// Reads `oauth_enabled`, `oauth_enable_google`, `oauth_google_client_id`, etc.
-/// from the secrets store and returns an auth config payload for the webchat GUI.
-#[allow(clippy::result_large_err)]
-fn generate_auth_config(
-    tenant: &str,
-    provider: &str,
-    runner_host: &DemoRunnerHost,
-) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
-    let ctx = OperatorContext {
-        tenant: tenant.to_string(),
-        team: Some("default".to_string()),
-        correlation_id: None,
-    };
-
-    let get = |key: &str| -> Option<String> {
-        runner_host
-            .get_secret(provider, key, &ctx)
-            .ok()
-            .flatten()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-    };
-
-    let oauth_enabled = get("oauth_enabled").map(|v| v == "true").unwrap_or(false);
-
-    if !oauth_enabled {
-        return Ok(json_response(StatusCode::OK, json!({ "enabled": false })));
-    }
-
-    let public_base_url =
-        get("public_base_url").unwrap_or_else(|| "http://localhost:8080".to_string());
-    let redirect_base = format!(
-        "{}/v1/web/webchat/{}/",
-        public_base_url.trim_end_matches('/'),
-        tenant,
-    );
-
-    let mut providers = Vec::new();
-
-    // Guest/demo login (always available)
-    providers.push(json!({
-        "id": format!("{tenant}-demo"),
-        "label": "Continue as Guest",
-        "type": "dummy",
-        "enabled": true
-    }));
-
-    struct OidcDef {
-        suffix: &'static str,
-        label: &'static str,
-        enable_key: &'static str,
-        client_id_key: &'static str,
-        auth_url: &'static str,
-        scope: &'static str,
-    }
-
-    let oidc_providers = [
-        OidcDef {
-            suffix: "google",
-            label: "Sign in with Google",
-            enable_key: "oauth_enable_google",
-            client_id_key: "oauth_google_client_id",
-            auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
-            scope: "openid profile email",
-        },
-        OidcDef {
-            suffix: "microsoft",
-            label: "Sign in with Microsoft",
-            enable_key: "oauth_enable_microsoft",
-            client_id_key: "oauth_microsoft_client_id",
-            auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
-            scope: "openid profile email",
-        },
-        OidcDef {
-            suffix: "github",
-            label: "Sign in with GitHub",
-            enable_key: "oauth_enable_github",
-            client_id_key: "oauth_github_client_id",
-            auth_url: "https://github.com/login/oauth/authorize",
-            scope: "read:user user:email",
-        },
-    ];
-
-    for def in &oidc_providers {
-        let enabled = get(def.enable_key).map(|v| v == "true").unwrap_or(false);
-        let client_id = get(def.client_id_key).unwrap_or_default();
-
-        providers.push(json!({
-            "id": format!("{tenant}-{}", def.suffix),
-            "label": def.label,
-            "type": "oidc",
-            "enabled": enabled,
-            "authorizationUrl": def.auth_url,
-            "clientId": client_id,
-            "redirectUri": &redirect_base,
-            "scope": def.scope,
-            "responseType": "code"
-        }));
-    }
-
-    // Custom OIDC
-    let custom_enabled = get("oauth_enable_custom")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-    if custom_enabled {
-        let label = get("oauth_custom_label").unwrap_or_else(|| "SSO Login".to_string());
-        let auth_url = get("oauth_custom_auth_url").unwrap_or_default();
-        let client_id = get("oauth_custom_client_id").unwrap_or_default();
-        let scopes =
-            get("oauth_custom_scopes").unwrap_or_else(|| "openid profile email".to_string());
-
-        providers.push(json!({
-            "id": format!("{tenant}-custom-oidc"),
-            "label": label,
-            "type": "oidc",
-            "enabled": true,
-            "authorizationUrl": auth_url,
-            "clientId": client_id,
-            "redirectUri": &redirect_base,
-            "scope": scopes,
-            "responseType": "code"
-        }));
-    }
-
-    operator_log::info(
-        module_path!(),
-        format!(
-            "[webchat] auth/config for tenant={tenant}: enabled={oauth_enabled} providers={}",
-            providers.len()
-        ),
-    );
-
-    Ok(json_response(
-        StatusCode::OK,
-        json!({
-            "enabled": true,
-            "providers": providers
-        }),
-    ))
 }
