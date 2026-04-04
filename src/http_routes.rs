@@ -16,9 +16,6 @@ use zip::ZipArchive;
 use crate::domains::{self, Domain};
 
 pub const EXT_HTTP_ROUTES_V1: &str = "greentic.http-routes.v1";
-/// Legacy extension used by messaging-webchat-gui. Supported for backward
-/// compatibility — new packs should prefer `greentic.http-routes.v1`.
-const EXT_PROVIDER_ROUTES_V1: &str = "messaging.provider_routes.v1";
 
 /// A single HTTP route declared by a pack.
 #[derive(Clone, Debug)]
@@ -281,12 +278,8 @@ fn read_pack_http_routes(pack_path: &Path) -> anyhow::Result<Option<Vec<HttpRout
         None => return Ok(None),
     };
 
-    // Try the canonical extension first, then the legacy provider_routes format.
     if let Some(extension) = extensions.get(EXT_HTTP_ROUTES_V1) {
         return parse_http_routes_v1(extension, manifest.pack_id.as_str(), pack_path);
-    }
-    if let Some(extension) = extensions.get(EXT_PROVIDER_ROUTES_V1) {
-        return parse_provider_routes_v1(extension, manifest.pack_id.as_str(), pack_path);
     }
     Ok(None)
 }
@@ -335,60 +328,6 @@ fn parse_http_routes_v1(
         });
     }
     Ok(Some(routes))
-}
-
-/// Parse the legacy `messaging.provider_routes.v1` extension used by
-/// messaging-webchat-gui packs. Converts to the same `HttpRouteDescriptor`
-/// format as `greentic.http-routes.v1`.
-fn parse_provider_routes_v1(
-    extension: &greentic_types::pack_manifest::ExtensionRef,
-    pack_id: &str,
-    pack_path: &Path,
-) -> anyhow::Result<Option<Vec<HttpRouteDescriptor>>> {
-    let inline = extension
-        .inline
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("provider_routes extension inline payload missing"))?;
-    let ExtensionInline::Other(value) = inline else {
-        anyhow::bail!("provider_routes extension inline payload has unexpected type");
-    };
-    let decoded: ProviderRoutesExtensionV1 =
-        serde_json::from_value(value.clone()).with_context(|| {
-            format!(
-                "failed to parse messaging.provider_routes.v1 in {}",
-                pack_path.display()
-            )
-        })?;
-    let mut routes = Vec::new();
-    for (idx, record) in decoded.routes.into_iter().enumerate() {
-        let route_id = record
-            .id
-            .unwrap_or_else(|| format!("{pack_id}:provider-route-{idx}"));
-        let segments = parse_route_pattern(&record.path);
-        routes.push(HttpRouteDescriptor {
-            route_id,
-            pack_id: pack_id.to_string(),
-            pattern: record.path,
-            methods: vec![], // provider_routes.v1 doesn't restrict methods
-            provider_op: "ingest_http".to_string(),
-            domain: Domain::Messaging,
-            segments,
-        });
-    }
-    Ok(Some(routes))
-}
-
-#[derive(Deserialize)]
-struct ProviderRoutesExtensionV1 {
-    #[serde(default)]
-    routes: Vec<ProviderRouteRecord>,
-}
-
-#[derive(Deserialize)]
-struct ProviderRouteRecord {
-    #[serde(default)]
-    id: Option<String>,
-    path: String,
 }
 
 fn collect_runtime_pack_paths(bundle_root: &Path) -> anyhow::Result<Vec<PathBuf>> {

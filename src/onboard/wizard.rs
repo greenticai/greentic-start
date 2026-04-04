@@ -577,28 +577,9 @@ pub fn submit_answers(state: &OnboardState, body: &Value) -> OnboardResult {
             webhook_result = setup_flow_result
                 .as_ref()
                 .and_then(|result| result.get("output"))
-                .and_then(|output| webhook_setup::webhook_result_from_flow_output(Some(output)))
-                .or_else(|| {
-                    webhook_setup::try_provider_setup_webhook(
-                        bundle_root,
-                        params.domain,
-                        &pack,
-                        &params.provider_id,
-                        params.tenant(),
-                        params.team(),
-                        &config,
-                    )
-                });
+                .and_then(|output| webhook_setup::webhook_result_from_flow_output(Some(output)));
         } else {
-            webhook_result = webhook_setup::try_provider_setup_webhook(
-                bundle_root,
-                params.domain,
-                &pack,
-                &params.provider_id,
-                params.tenant(),
-                params.team(),
-                &config,
-            );
+            webhook_result = None;
         }
     } else {
         webhook_result = None;

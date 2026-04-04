@@ -240,69 +240,6 @@ struct HttpIngressState {
     http_route_table: HttpRouteTable,
 }
 
-/// Transitional URL rewriter: route webchat/directline URL patterns through generic ingress.
-/// Phase 2 will replace this with pack-declared HTTP routes (`greentic.http-routes.v1`).
-fn try_resolve_webchat_ingress(
-    path: &str,
-    route_table: &ActiveRouteTable,
-) -> Option<helpers::ParsedIngressRoute> {
-    // Legacy root-level routes: /token, /v3/directline/*, /directline/*
-    if path == "/token" || path.starts_with("/v3/directline") || path.starts_with("/directline") {
-        let provider = route_table
-            .match_request(path)
-            .map(|m| m.descriptor.pack_id.clone())
-            .unwrap_or_else(|| resolve_webchat_provider(route_table));
-        return Some(helpers::ParsedIngressRoute {
-            domain: Domain::Messaging,
-            provider,
-            tenant: crate::DEMO_DEFAULT_TENANT.to_string(),
-            team: crate::DEMO_DEFAULT_TEAM.to_string(),
-            handler: None,
-        });
-    }
-
-    // Tenant-scoped routes: /v1/messaging/webchat/{tenant}/token|v3/directline/*|auth/config
-    let prefix = "/v1/messaging/webchat/";
-    if !path.starts_with(prefix) {
-        return None;
-    }
-    let after_prefix = &path[prefix.len()..];
-    let slash = after_prefix.find('/')?;
-    let tenant = &after_prefix[..slash];
-    if tenant.is_empty() {
-        return None;
-    }
-    let remainder = &after_prefix[slash + 1..];
-    if remainder == "token" || remainder.starts_with("v3/directline") || remainder == "auth/config"
-    {
-        let provider = route_table
-            .match_request(path)
-            .map(|m| m.descriptor.pack_id.clone())
-            .unwrap_or_else(|| resolve_webchat_provider(route_table));
-        return Some(helpers::ParsedIngressRoute {
-            domain: Domain::Messaging,
-            provider,
-            tenant: tenant.to_string(),
-            team: crate::DEMO_DEFAULT_TEAM.to_string(),
-            handler: None,
-        });
-    }
-    None
-}
-
-/// Discover webchat provider from registered static routes. Falls back to a generic name
-/// if no matching route is found. This avoids hardcoding a specific pack ID.
-fn resolve_webchat_provider(route_table: &ActiveRouteTable) -> String {
-    // Look for any static route whose public_path contains the webchat ingress pattern
-    for route in route_table.routes() {
-        if route.public_path.contains("/messaging/webchat/") {
-            return route.pack_id.clone();
-        }
-    }
-    // Last resort: use the generic messaging ingress path naming convention
-    "messaging-webchat".to_string()
-}
-
 async fn handle_request<B>(
     req: Request<B>,
     state: Arc<HttpIngressState>,
@@ -368,14 +305,6 @@ where
                 team: route_match.team,
                 handler: None,
             };
-        }
-
-        // Transitional fallback: route well-known webchat/directline URLs through
-        // generic ingress dispatch when no pack-declared HTTP route matches.
-        // Remove this block once all provider packs declare their routes via
-        // greentic.http-routes.v1.
-        if let Some(p) = try_resolve_webchat_ingress(&path, &state.active_route_table) {
-            break 'resolve p;
         }
 
         // Static route handling — serve assets from .gtpack files
@@ -512,18 +441,12 @@ where
             .filter(|env| {
                 // Providers set `is_bot_message=true` in envelope metadata to
                 // signal bot self-messages that should not be routed back through
-                // the app flow.  Legacy fallback checks from-id suffixes for
-                // providers that don't set the flag yet.
+                // the app flow.
                 let is_bot = env
                     .metadata
                     .get("is_bot_message")
                     .map(|v| v == "true")
-                    .unwrap_or_else(|| {
-                        env.from
-                            .as_ref()
-                            .map(|f| f.id.ends_with(".bot") || f.id.ends_with("@webex.bot"))
-                            .unwrap_or(false)
-                    });
+                    .unwrap_or(false);
                 if is_bot {
                     operator_log::debug(
                         module_path!(),
@@ -754,13 +677,15 @@ mod tests {
             .unwrap_err();
         assert_eq!(oauth_missing_url.status(), StatusCode::BAD_REQUEST);
 
+        // Legacy directline paths no longer have a transitional rewriter;
+        // they fall through to the standard ingress parser which rejects them.
         let legacy_directline = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/token"),
                 test_state(vec![]),
             ))
             .unwrap_err();
-        assert_eq!(legacy_directline.status(), StatusCode::NOT_FOUND);
+        assert_eq!(legacy_directline.status(), StatusCode::BAD_REQUEST);
 
         let webchat_directline = runtime
             .block_on(handle_request_inner(
@@ -768,7 +693,7 @@ mod tests {
                 test_state(vec![]),
             ))
             .unwrap_err();
-        assert_eq!(webchat_directline.status(), StatusCode::NOT_FOUND);
+        assert_eq!(webchat_directline.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -906,60 +831,4 @@ mod tests {
         assert!(String::from_utf8_lossy(&body).contains("<html>ok</html>"));
     }
 
-    #[test]
-    fn webchat_ingress_resolves_provider_from_static_route_pack_id() {
-        let route = StaticRouteDescriptor {
-            route_id: "webchat-gui".to_string(),
-            pack_id: "messaging-webchat-gui".to_string(),
-            pack_path: std::path::PathBuf::from("/tmp"),
-            public_path: "/v1/messaging/webchat/{tenant}".to_string(),
-            source_root: "site".to_string(),
-            index_file: Some("index.html".to_string()),
-            spa_fallback: Some("index.html".to_string()),
-            tenant_scoped: true,
-            team_scoped: false,
-            cache_strategy: CacheStrategy::None,
-            route_segments: vec![
-                RouteScopeSegment::Literal("v1".to_string()),
-                RouteScopeSegment::Literal("messaging".to_string()),
-                RouteScopeSegment::Literal("webchat".to_string()),
-                RouteScopeSegment::Tenant,
-            ],
-        };
-        let table = ActiveRouteTable::from_plan(&StaticRoutePlan {
-            routes: vec![route],
-            warnings: vec![],
-            blocking_failures: vec![],
-        });
-
-        // Tenant-scoped webchat token URL resolves provider from static route pack_id
-        let parsed = try_resolve_webchat_ingress("/v1/messaging/webchat/demo/token", &table)
-            .expect("should resolve webchat token route");
-        assert_eq!(parsed.provider, "messaging-webchat-gui");
-        assert_eq!(parsed.tenant, "demo");
-
-        // DirectLine API routes also resolve
-        let parsed = try_resolve_webchat_ingress(
-            "/v1/messaging/webchat/acme/v3/directline/conversations",
-            &table,
-        )
-        .expect("should resolve directline route");
-        assert_eq!(parsed.provider, "messaging-webchat-gui");
-        assert_eq!(parsed.tenant, "acme");
-
-        // Auth config resolves
-        let parsed = try_resolve_webchat_ingress("/v1/messaging/webchat/demo/auth/config", &table)
-            .expect("should resolve auth config route");
-        assert_eq!(parsed.tenant, "demo");
-
-        // Legacy /token resolves with fallback provider
-        let parsed = try_resolve_webchat_ingress("/token", &table)
-            .expect("should resolve legacy token route");
-        assert_eq!(parsed.tenant, "demo");
-
-        // Non-webchat paths return None
-        assert!(try_resolve_webchat_ingress("/v1/other/path", &table).is_none());
-        assert!(try_resolve_webchat_ingress("/healthz", &table).is_none());
-        assert!(try_resolve_webchat_ingress("/v1/messaging/webchat//token", &table).is_none());
-    }
 }
