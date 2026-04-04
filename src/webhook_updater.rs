@@ -3,7 +3,7 @@
 //! When the tunnel URL changes (e.g., cloudflared/ngrok restart), this module
 //! detects the change and:
 //! 1. Updates the `public_base_url` secret for all messaging providers
-//! 2. Re-registers webhooks for providers that support it (Telegram, Slack, Webex)
+//! 2. Re-registers webhooks for providers that declare webhook ops
 
 use std::path::Path;
 
@@ -313,7 +313,7 @@ fn update_provider_webhook(
             }
         }
         None => {
-            // Provider doesn't support webhook registration (not Telegram/Slack/Webex)
+            // Provider doesn't declare webhook ops in its config
             // or missing required config
             Ok(false)
         }
