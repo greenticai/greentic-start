@@ -12,9 +12,9 @@ use serde_cbor::Value as CborValue;
 use serde_json::{Value as JsonValue, json};
 use zip::ZipArchive;
 
+use crate::operator_log;
 use crate::runner_exec::{self, RunRequest};
 use crate::runner_host::OperatorContext;
-use crate::operator_log;
 
 #[derive(Clone, Debug)]
 pub struct AppPackInfo {
@@ -236,7 +236,7 @@ pub fn run_app_flow(
         target_node.map(|s| s.as_str()),
         envelope,
     )?
-        .ok_or_else(|| anyhow::anyhow!("app flow produced no outputs"))?;
+    .ok_or_else(|| anyhow::anyhow!("app flow produced no outputs"))?;
     parse_envelopes(&value, envelope)
 }
 
@@ -600,7 +600,7 @@ fn parse_envelopes(
 
     if let Some(text) = messages_text
         .or(result_content_text)
-        .or_else(|| structured_text.as_deref())
+        .or(structured_text.as_deref())
         .or(payload_text)
         .or_else(|| value.get("text").and_then(JsonValue::as_str))
         .or_else(|| value.as_str())
@@ -901,10 +901,9 @@ mod tests {
                 .open(&transcript_clone)
                 .expect("open transcript");
             use std::io::Write as _;
-            writeln!(
-                file,
-                "{}",
-                r#"{"node_id":"render_current_card","outputs":{"renderedCard":{"body":[{"text":"Current Weather"}]}}}"#
+            file.write_all(
+                br#"{"node_id":"render_current_card","outputs":{"renderedCard":{"body":[{"text":"Current Weather"}]}}}
+"#,
             )
             .expect("append rendered card output");
         });
@@ -986,7 +985,10 @@ mod tests {
             &ingress,
         )
         .expect("messages output");
-        assert_eq!(messages_output[0].text.as_deref(), Some("messages fallback"));
+        assert_eq!(
+            messages_output[0].text.as_deref(),
+            Some("messages fallback")
+        );
 
         let text_output = parse_envelopes(&json!({"payload": {"text": "payload text"}}), &ingress)
             .expect("text output");

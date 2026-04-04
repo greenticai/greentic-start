@@ -335,7 +335,15 @@ where
                     None
                 }
             });
-        return handle_directline_request(req, &dl_path, Some(tenant), provider, state).await;
+        return handle_legacy_directline_request(
+            req,
+            &dl_path,
+            Some(tenant),
+            None,
+            provider,
+            state,
+        )
+        .await;
     }
 
     // Static route handling - serve assets from .gtpack files
@@ -862,6 +870,29 @@ fn is_oauth_token_exchange_path(path: &str) -> bool {
         .split('/')
         .collect::<Vec<_>>()
         .ends_with(&["oauth", "token-exchange"])
+}
+
+fn parse_webchat_directline_route(path: &str) -> Option<(String, String)> {
+    let segments = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() < 5
+        || segments[0] != "v1"
+        || segments[1] != "messaging"
+        || segments[2] != "webchat"
+    {
+        return None;
+    }
+    let tenant = segments[3].to_string();
+    if segments[4] == "token" && segments.len() == 5 {
+        return Some((tenant, "/token".to_string()));
+    }
+    if segments[4] == "v3" && segments.get(5).is_some_and(|value| *value == "directline") {
+        return Some((tenant, format!("/{}", segments[4..].join("/"))));
+    }
+    None
 }
 
 fn is_legacy_directline_path(path: &str) -> bool {
