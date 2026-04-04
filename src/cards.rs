@@ -1,9 +1,10 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde_json::{Map, Value};
 
 use crate::capabilities::CAP_OAUTH_CARD_V1;
 
-/// Lightweight renderer that used to downgrade message_card payloads.
+/// Lightweight renderer that delegates OAuth card resolution to
+/// `greentic.cap.oauth.card.v1` capability (provided by greentic-oauth).
 #[derive(Clone, Default)]
 pub struct CardRenderer;
 
@@ -51,12 +52,10 @@ impl CardRenderer {
                 bytes: payload_bytes.to_vec(),
             });
         };
-        let mut adaptive_card: Value = serde_json::from_str(&adaptive_card_raw)
-            .with_context(|| "invalid metadata.adaptive_card JSON")?;
-        let had_teams_placeholder = adaptive_card_raw.contains("{{oauth.teams.connectionName}}");
+        // Lightweight pre-flight: skip capability call if no OAuth markers present.
         let has_placeholder = adaptive_card_raw.contains("{{oauth.start_url}}")
             || adaptive_card_raw.contains("{{oauth.teams.connectionName}}")
-            || contains_oauth_start_marker(&adaptive_card);
+            || adaptive_card_raw.contains("oauth://start");
         let request_seed = payload_json
             .pointer("/metadata/oauth_card_request")
             .and_then(Value::as_object)
@@ -66,60 +65,41 @@ impl CardRenderer {
                 bytes: payload_bytes.to_vec(),
             });
         }
-        let request_payload =
+        let mut request_payload =
             build_card_resolve_request(request_seed, &payload_json, provider_type);
+        // Pass the raw card to the capability so it can do the rewriting.
+        if let Some(obj) = request_payload.as_object_mut() {
+            obj.insert(
+                "adaptive_card".to_string(),
+                Value::String(adaptive_card_raw),
+            );
+        }
         let resolve_result = resolve_capability(
             CAP_OAUTH_CARD_V1,
             "oauth.card.resolve",
             &serde_json::to_vec(&request_payload)?,
         )?;
-        let start_url = resolve_result
-            .get("start_url")
+        // The capability returns the fully resolved card — just swap it in.
+        let resolved_card = resolve_result
+            .get("resolved_card")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("oauth.card.resolve output missing start_url"))?;
-        let teams_connection_name = resolve_result
-            .pointer("/teams/connectionName")
-            .or_else(|| resolve_result.pointer("/teams/connection_name"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        // Determine native OAuth card support from the capability response rather
-        // than checking the provider name. Providers that support native OAuth
-        // connection cards return `native_oauth_card: true` in their resolve output.
-        let supports_native_oauth_card = resolve_result
-            .get("native_oauth_card")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        rewrite_oauth_fields(
-            &mut adaptive_card,
-            start_url,
-            teams_connection_name.as_deref(),
-            supports_native_oauth_card,
-        );
+            .ok_or_else(|| anyhow!("oauth.card.resolve output missing resolved_card"))?;
         if let Some(metadata) = payload_json
             .pointer_mut("/metadata")
             .and_then(Value::as_object_mut)
         {
             metadata.insert(
                 "adaptive_card".to_string(),
-                Value::String(serde_json::to_string(&adaptive_card)?),
+                Value::String(resolved_card.to_string()),
             );
-            metadata.insert("oauth_card_resolved".to_string(), resolve_result);
-            if had_teams_placeholder
-                && (!supports_native_oauth_card || teams_connection_name.is_none())
-            {
-                metadata.insert(
-                    "oauth_card_downgrade".to_string(),
-                    Value::Object(Map::from_iter([
-                        (
-                            "mode".to_string(),
-                            Value::String("non_native_fallback".to_string()),
-                        ),
-                        (
-                            "reason".to_string(),
-                            Value::String("teams_connection_name_unavailable".to_string()),
-                        ),
-                    ])),
-                );
+            // Store resolve audit without the card (already in adaptive_card).
+            let mut audit = resolve_result.clone();
+            if let Some(obj) = audit.as_object_mut() {
+                obj.remove("resolved_card");
+            }
+            metadata.insert("oauth_card_resolved".to_string(), audit);
+            if let Some(downgrade) = resolve_result.get("downgrade").filter(|v| !v.is_null()) {
+                metadata.insert("oauth_card_downgrade".to_string(), downgrade.clone());
             }
         }
         let rendered = serde_json::to_vec(&payload_json)?;
@@ -169,99 +149,13 @@ fn build_card_resolve_request(
     Value::Object(request)
 }
 
-fn contains_oauth_start_marker(value: &Value) -> bool {
-    match value {
-        Value::Object(map) => {
-            let is_open_url = map
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value.eq_ignore_ascii_case("Action.OpenUrl"));
-            if is_open_url
-                && map
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .is_some_and(|url| url == "oauth://start")
-            {
-                return true;
-            }
-            map.values().any(contains_oauth_start_marker)
-        }
-        Value::Array(values) => values.iter().any(contains_oauth_start_marker),
-        _ => false,
-    }
-}
-
-fn rewrite_oauth_fields(
-    value: &mut Value,
-    start_url: &str,
-    teams_connection_name: Option<&str>,
-    teams_native_platform: bool,
-) {
-    match value {
-        Value::Object(map) => {
-            let is_open_url = map
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value.eq_ignore_ascii_case("Action.OpenUrl"));
-            let has_oauth_url_marker =
-                map.get("url").and_then(Value::as_str) == Some("oauth://start");
-            if is_open_url && has_oauth_url_marker {
-                map.insert("url".to_string(), Value::String(start_url.to_string()));
-            }
-            if map.get("connectionName").and_then(Value::as_str)
-                == Some("{{oauth.teams.connectionName}}")
-            {
-                if teams_native_platform && let Some(name) = teams_connection_name {
-                    map.insert(
-                        "connectionName".to_string(),
-                        Value::String(name.to_string()),
-                    );
-                } else {
-                    map.remove("connectionName");
-                }
-            }
-            for entry in map.values_mut() {
-                rewrite_oauth_fields(
-                    entry,
-                    start_url,
-                    teams_connection_name,
-                    teams_native_platform,
-                );
-            }
-        }
-        Value::Array(values) => {
-            for entry in values {
-                rewrite_oauth_fields(
-                    entry,
-                    start_url,
-                    teams_connection_name,
-                    teams_native_platform,
-                );
-            }
-        }
-        Value::String(text) => {
-            *text = text.replace("{{oauth.start_url}}", start_url);
-            if teams_native_platform {
-                if let Some(name) = teams_connection_name {
-                    *text = text.replace("{{oauth.teams.connectionName}}", name);
-                } else {
-                    *text = text.replace("{{oauth.teams.connectionName}}", "");
-                }
-            } else {
-                *text = text.replace("{{oauth.teams.connectionName}}", "");
-            }
-        }
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     #[test]
-    fn oauth_card_resolve_rewrites_adaptive_card() {
+    fn oauth_card_resolve_swaps_resolved_card() {
         let renderer = CardRenderer::new();
         let payload = json!({
             "tenant": { "tenant_id": "demo", "team_id": "default" },
@@ -276,9 +170,12 @@ mod tests {
                 assert_eq!(cap_id, CAP_OAUTH_CARD_V1);
                 assert_eq!(op, "oauth.card.resolve");
                 Ok(json!({
+                    "ok": true,
+                    "resolved_card": "{\"type\":\"AdaptiveCard\",\"actions\":[{\"type\":\"Action.OpenUrl\",\"title\":\"Connect\",\"url\":\"https://oauth.example/start/session\"}],\"connectionName\":\"greentic-oauth\"}",
                     "start_url": "https://oauth.example/start/session",
                     "native_oauth_card": true,
-                    "teams": { "connectionName": "greentic-oauth" }
+                    "teams": { "connectionName": "greentic-oauth" },
+                    "downgrade": null
                 }))
             })
             .expect("render");
@@ -302,10 +199,17 @@ mod tests {
                 .and_then(Value::as_str),
             Some("https://oauth.example/start/session")
         );
+        // resolved_card should be stripped from audit metadata (already in adaptive_card).
+        assert!(
+            rendered
+                .pointer("/metadata/oauth_card_resolved/resolved_card")
+                .is_none(),
+            "resolved_card should not be duplicated in audit metadata"
+        );
     }
 
     #[test]
-    fn oauth_card_non_teams_downgrades_connection_name() {
+    fn oauth_card_downgrade_propagated_from_capability() {
         let renderer = CardRenderer::new();
         let payload = json!({
             "tenant": { "tenant_id": "demo", "team_id": "default" },
@@ -318,8 +222,15 @@ mod tests {
         let output = renderer
             .render_if_needed("messaging.telegram", &bytes, |_cap_id, _op, _input| {
                 Ok(json!({
+                    "ok": true,
+                    "resolved_card": "{\"type\":\"AdaptiveCard\",\"actions\":[{\"type\":\"Action.OpenUrl\",\"title\":\"Connect\",\"url\":\"https://oauth.example/start/session\"}]}",
                     "start_url": "https://oauth.example/start/session",
-                    "teams": { "connectionName": "greentic-oauth" }
+                    "native_oauth_card": false,
+                    "teams": { "connectionName": null },
+                    "downgrade": {
+                        "mode": "non_native_fallback",
+                        "reason": "teams_connection_name_unavailable"
+                    }
                 }))
             })
             .expect("render");
@@ -335,7 +246,7 @@ mod tests {
         );
         assert!(
             card_json.get("connectionName").is_none(),
-            "non-teams provider should drop teams-only placeholder"
+            "non-teams provider should not have connectionName"
         );
         assert_eq!(
             rendered
