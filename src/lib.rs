@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
 use clap::Parser;
+use clap::error::ErrorKind;
 
 mod admin_certs;
 mod admin_server;
@@ -17,7 +18,6 @@ mod component_qa_ops;
 pub mod config;
 mod demo_qa_bridge;
 mod dev_store_path;
-pub mod directline;
 mod discovery;
 mod domains;
 mod event_router;
@@ -98,7 +98,19 @@ pub fn run_from_env() -> anyhow::Result<()> {
         .iter()
         .any(|a| a.starts_with("--cloudflared") || a.starts_with("--ngrok"));
     let args = normalize_args(raw_tail);
-    let cli = Cli::try_parse_from(args)?;
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            print!("{err}");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
     if let Some(locale) = cli.locale.as_deref() {
         operator_i18n::set_locale(locale);
     }
