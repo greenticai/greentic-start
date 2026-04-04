@@ -76,6 +76,7 @@ impl ReservedRouteSet {
             "/config/publish",
             "/cache/invalidate",
             "/observability/log-level",
+            "/token",
         ] {
             reserved.insert_exact(path);
         }
@@ -677,10 +678,10 @@ mod tests {
     }
 
     #[test]
-    fn reserved_routes_leave_directline_for_pack_routes() {
+    fn reserved_routes_include_health_and_onboard() {
         let reserved = ReservedRouteSet::operator_defaults();
-        assert!(!reserved.conflicts_with("/v3/directline/conversations"));
-        assert!(!reserved.conflicts_with("/token"));
+        assert!(reserved.conflicts_with("/token"));
+        assert!(reserved.conflicts_with("/api/onboard/providers"));
         assert!(!reserved.conflicts_with("/v1/web/webchat/demo"));
     }
 

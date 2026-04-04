@@ -1136,7 +1136,7 @@ pub fn demo_up_services(
     };
     let static_route_urls = ingress_server
         .as_ref()
-        .map(|s| s.static_route_urls.clone())
+        .map(|s| s.ui_urls.clone())
         .unwrap_or_default();
     let channels: Vec<String> = discovery
         .providers

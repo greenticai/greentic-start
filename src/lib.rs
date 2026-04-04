@@ -24,6 +24,7 @@ mod event_router;
 pub(crate) mod flow_log;
 mod gmap;
 mod http_ingress;
+mod http_routes;
 mod ingress;
 mod ingress_dispatch;
 mod ingress_types;
