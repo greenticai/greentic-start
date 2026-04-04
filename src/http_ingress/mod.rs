@@ -266,7 +266,43 @@ where
         let provider = state
             .active_route_table
             .match_request(&path)
-            .map(|route_match| route_match.descriptor.pack_id.clone());
+            .map(|route_match| route_match.descriptor.pack_id.clone())
+            .or_else(|| {
+                state
+                    .active_route_table
+                    .routes()
+                    .iter()
+                    .find(|route| route.pack_id == "messaging-webchat-gui")
+                    .map(|route| route.pack_id.clone())
+            })
+            .or_else(|| {
+                state
+                    .active_route_table
+                    .routes()
+                    .iter()
+                    .find(|route| route.pack_id == "messaging-webchat")
+                    .map(|route| route.pack_id.clone())
+            })
+            .or_else(|| {
+                // /v1/messaging/webchat/* endpoints are API routes and do not necessarily share
+                // the same URL prefix as static web assets (/v1/web/webchat/*). When there is no
+                // direct static-route match, prefer the GUI provider if present.
+                if state
+                    .runner_host
+                    .get_provider_pack_path(Domain::Messaging, "messaging-webchat-gui")
+                    .is_some()
+                {
+                    Some("messaging-webchat-gui".to_string())
+                } else if state
+                    .runner_host
+                    .get_provider_pack_path(Domain::Messaging, "messaging-webchat")
+                    .is_some()
+                {
+                    Some("messaging-webchat".to_string())
+                } else {
+                    None
+                }
+            });
         return handle_directline_request(req, &dl_path, Some(tenant), provider, state).await;
     }
 
@@ -828,7 +864,7 @@ mod tests {
             route_id: "webchat-gui".to_string(),
             pack_id: "messaging-webchat-gui".to_string(),
             pack_path: dir.path().to_path_buf(),
-            public_path: "/v1/messaging/webchat/{tenant}".to_string(),
+            public_path: "/v1/web/webchat/{tenant}".to_string(),
             source_root: "site".to_string(),
             index_file: Some("index.html".to_string()),
             spa_fallback: Some("index.html".to_string()),
@@ -837,7 +873,7 @@ mod tests {
             cache_strategy: CacheStrategy::None,
             route_segments: vec![
                 RouteScopeSegment::Literal("v1".to_string()),
-                RouteScopeSegment::Literal("messaging".to_string()),
+                RouteScopeSegment::Literal("web".to_string()),
                 RouteScopeSegment::Literal("webchat".to_string()),
                 RouteScopeSegment::Tenant,
             ],
