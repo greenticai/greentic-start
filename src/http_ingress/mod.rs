@@ -830,5 +830,4 @@ mod tests {
             runtime.block_on(async { response.into_body().collect().await.unwrap().to_bytes() });
         assert!(String::from_utf8_lossy(&body).contains("<html>ok</html>"));
     }
-
 }
