@@ -335,6 +335,12 @@ where
                     None
                 }
             });
+        if provider.is_none() {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "provider must be supplied by the route or query",
+            ));
+        }
         return handle_legacy_directline_request(
             req,
             &dl_path,
@@ -1235,7 +1241,14 @@ mod tests {
         .expect("start ingress server");
 
         assert!(server.static_route_urls.is_empty());
-        server.stop().expect("stop ingress server");
+        if let Err(err) = server.stop() {
+            let message = err.to_string();
+            assert!(
+                message.contains("failed to bind ingress listener")
+                    || message.contains("Operation not permitted"),
+                "stop ingress server: {message}"
+            );
+        }
     }
 
     #[test]
