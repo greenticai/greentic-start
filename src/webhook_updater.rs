@@ -13,7 +13,9 @@ use serde_json::Value;
 use tokio::runtime::Builder as TokioBuilder;
 
 use crate::discovery::{DetectedProvider, DiscoveryResult};
+use crate::domains::Domain;
 use crate::operator_log;
+use crate::runner_host::{DemoRunnerHost, OperatorContext};
 use crate::secret_requirements::load_secret_keys_from_pack;
 use crate::secrets_gate::{SecretsManagerHandle, canonical_secret_uri};
 use crate::secrets_setup::resolve_env;
@@ -60,10 +62,12 @@ impl WebhookUpdateSummary {}
 /// # Returns
 ///
 /// Returns a `WebhookUpdateSummary` with per-provider results.
+#[allow(clippy::too_many_arguments)]
 pub fn update_webhooks_if_url_changed(
     config_dir: &Path,
     discovery: &DiscoveryResult,
     secrets_handle: &SecretsManagerHandle,
+    runner_host: Option<&DemoRunnerHost>,
     tenant: &str,
     team: &str,
     previous_url: Option<&str>,
@@ -159,6 +163,7 @@ pub fn update_webhooks_if_url_changed(
         match update_provider_webhook(
             config_dir,
             secrets_handle,
+            runner_host,
             tenant,
             team,
             &provider.provider_id,
@@ -265,9 +270,11 @@ fn read_secret_bytes(
 /// Update webhook for a single provider.
 ///
 /// Returns Ok(true) if webhook was updated, Ok(false) if not applicable.
+#[allow(clippy::too_many_arguments)]
 fn update_provider_webhook(
     config_dir: &Path,
     secrets_handle: &SecretsManagerHandle,
+    runner_host: Option<&DemoRunnerHost>,
     tenant: &str,
     team: &str,
     provider_id: &str,
@@ -285,36 +292,80 @@ fn update_provider_webhook(
         new_url,
     )?;
 
-    // Call webhook registration
-    let result =
-        greentic_setup::webhook::register_webhook(provider_id, &config, tenant, Some(team));
-
-    match result {
-        Some(result_value) => {
-            let ok = result_value
-                .get("ok")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if ok {
-                Ok(true)
-            } else {
-                let err = result_value
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown error");
-                operator_log::warn(
-                    module_path!(),
-                    format!(
-                        "[webhook-updater] webhook registration failed for {}: {}",
-                        provider_id, err
-                    ),
-                );
-                Ok(false)
-            }
+    // Try declared ops from config first
+    if let Some(result_value) =
+        greentic_setup::webhook::register_webhook(provider_id, &config, tenant, Some(team))
+    {
+        let ok = result_value
+            .get("ok")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if ok {
+            return Ok(true);
         }
-        None => {
-            // Provider doesn't declare webhook ops in its config
-            // or missing required config
+        let err = result_value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "[webhook-updater] webhook registration failed for {}: {}",
+                provider_id, err
+            ),
+        );
+        return Ok(false);
+    }
+
+    // Fallback: invoke provider WASM setup_webhook op directly
+    let Some(host) = runner_host else {
+        return Ok(false);
+    };
+    if !host.supports_op(Domain::Messaging, provider_id, "setup_webhook") {
+        return Ok(false);
+    }
+    let ctx = OperatorContext {
+        tenant: tenant.to_string(),
+        team: Some(team.to_string()),
+        correlation_id: None,
+    };
+    let payload = serde_json::to_vec(&config)?;
+    match host.invoke_provider_op(
+        Domain::Messaging,
+        provider_id,
+        "setup_webhook",
+        &payload,
+        &ctx,
+    ) {
+        Ok(outcome) if outcome.success => {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[webhook-updater] WASM setup_webhook succeeded for {}",
+                    provider_id
+                ),
+            );
+            Ok(true)
+        }
+        Ok(outcome) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "[webhook-updater] WASM setup_webhook failed for {}: {}",
+                    provider_id,
+                    outcome.error.as_deref().unwrap_or("unknown")
+                ),
+            );
+            Ok(false)
+        }
+        Err(err) => {
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[webhook-updater] WASM setup_webhook not available for {}: {err:#}",
+                    provider_id
+                ),
+            );
             Ok(false)
         }
     }
@@ -451,6 +502,7 @@ mod tests {
             tmp.path(),
             &empty,
             &secrets_handle,
+            None,
             "demo",
             "default",
             None,
@@ -463,6 +515,7 @@ mod tests {
             tmp.path(),
             &empty,
             &secrets_handle,
+            None,
             "demo",
             "default",
             Some("https://example.com"),
