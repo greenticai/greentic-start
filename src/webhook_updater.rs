@@ -582,7 +582,10 @@ mod tests {
         )
         .expect("provider config");
         assert_eq!(config["public_base_url"], "https://demo.example");
-        assert_eq!(config.as_object().map(|m| m.len()), Some(1));
+        assert_eq!(config["tenant"], "demo");
+        assert_eq!(config["team"], "default");
+        assert_eq!(config["provider_id"], "provider-a");
+        assert_eq!(config.as_object().map(|m| m.len()), Some(4));
     }
 
     #[test]
