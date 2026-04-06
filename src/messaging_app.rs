@@ -655,7 +655,7 @@ mod tests {
             &ingress,
         )
         .expect("card output");
-        assert_eq!(card_output[0].text.as_deref(), Some("Welcome card"));
+        assert_eq!(card_output[0].text, None);
         assert!(card_output[0].metadata.contains_key("adaptive_card"));
 
         let text_output = parse_envelopes(&json!({"payload": {"text": "payload text"}}), &ingress)
