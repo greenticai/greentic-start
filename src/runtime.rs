@@ -957,6 +957,7 @@ pub fn demo_up_services(
             config_dir,
             &discovery,
             &secrets_handle,
+            Some(runner_host.as_ref()),
             tenant,
             team,
             previous_public_url.as_deref(),
