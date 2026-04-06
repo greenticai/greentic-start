@@ -17,6 +17,7 @@ mod cloudflared;
 mod component_qa_ops;
 pub mod config;
 mod demo_qa_bridge;
+mod dependency_resolver;
 mod dev_store_path;
 mod discovery;
 mod domains;

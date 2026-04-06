@@ -746,6 +746,27 @@ pub fn demo_up_services(
     let team = config.team.as_str();
     let paths = RuntimePaths::new(&state_dir, tenant, team);
     let mut service_tracker = ServiceTracker::new(&paths, Some(log_dir))?;
+    // Check pack dependencies and warn about missing ones.
+    match crate::dependency_resolver::check_all(config_dir) {
+        Ok(report) => {
+            for dep in &report.missing {
+                crate::operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "missing pack dependency: {} (required by {}, capabilities: {:?})",
+                        dep.pack_id, dep.required_by, dep.required_capabilities
+                    ),
+                );
+            }
+        }
+        Err(err) => {
+            crate::operator_log::debug(
+                module_path!(),
+                format!("dependency check skipped: {err:#}"),
+            );
+        }
+    }
+
     let discovery = crate::discovery::discover(config_dir)?;
     crate::discovery::persist(config_dir, tenant, &discovery)?;
     let secrets_handle = secrets_gate::resolve_secrets_manager(config_dir, tenant, Some(team))?;

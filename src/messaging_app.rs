@@ -343,14 +343,11 @@ fn parse_envelopes(
         && !rendered_card.is_null()
     {
         let mut reply = ingress_envelope.clone();
-        let title = rendered_card
-            .get("body")
-            .and_then(|b| b.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|e| e.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("Adaptive Card");
-        reply.text = Some(title.to_string());
+        // Don't set text when adaptive card is present — the card renders
+        // natively on TierA channels (Teams, WebChat) and the redundant text
+        // bubble is distracting.  TierD providers already get a downsampled
+        // text summary via the render_plan pipeline.
+        reply.text = None;
         if let Ok(ac_json) = serde_json::to_string(rendered_card) {
             reply.metadata.insert("adaptive_card".to_string(), ac_json);
         }
