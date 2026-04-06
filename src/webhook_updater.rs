@@ -408,10 +408,17 @@ fn build_provider_config(
 ) -> Result<Value> {
     let mut config = serde_json::Map::new();
 
-    // Add new public_base_url
+    // Add new public_base_url and tenant/team so provider can build
+    // the correct webhook URL (e.g. /v1/messaging/ingress/{provider}/{tenant}/{team})
     config.insert(
         "public_base_url".to_string(),
         Value::String(new_url.to_string()),
+    );
+    config.insert("tenant".to_string(), Value::String(tenant.to_string()));
+    config.insert("team".to_string(), Value::String(team.to_string()));
+    config.insert(
+        "provider_id".to_string(),
+        Value::String(provider_id.to_string()),
     );
 
     // Load secret keys from pack manifest
