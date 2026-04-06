@@ -168,10 +168,7 @@ fn read_manifest(path: &Path) -> anyhow::Result<greentic_types::pack_manifest::P
     let file = std::fs::File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
     let mut entry = archive.by_name("manifest.cbor").map_err(|err| {
-        anyhow::anyhow!(
-            "failed to open manifest.cbor in {}: {err}",
-            path.display()
-        )
+        anyhow::anyhow!("failed to open manifest.cbor in {}: {err}", path.display())
     })?;
     let mut bytes = Vec::new();
     entry.read_to_end(&mut bytes)?;
