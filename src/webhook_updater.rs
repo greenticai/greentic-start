@@ -338,14 +338,39 @@ fn update_provider_webhook(
         &ctx,
     ) {
         Ok(outcome) if outcome.success => {
-            operator_log::info(
-                module_path!(),
-                format!(
-                    "[webhook-updater] WASM setup_webhook succeeded for {}",
-                    provider_id
-                ),
-            );
-            Ok(true)
+            // WASM invocation succeeded — but also check the output payload
+            // for {"ok": false} which indicates the op ran but failed logically.
+            let output_ok = outcome
+                .output
+                .as_ref()
+                .and_then(|v| v.get("ok"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if output_ok {
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "[webhook-updater] WASM setup_webhook succeeded for {}",
+                        provider_id
+                    ),
+                );
+                Ok(true)
+            } else {
+                let err_msg = outcome
+                    .output
+                    .as_ref()
+                    .and_then(|v| v.get("error"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "[webhook-updater] WASM setup_webhook returned error for {}: {}",
+                        provider_id, err_msg
+                    ),
+                );
+                Ok(false)
+            }
         }
         Ok(outcome) => {
             operator_log::warn(
