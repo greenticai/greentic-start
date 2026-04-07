@@ -68,8 +68,25 @@ impl StartupInfo {
         if !self.static_route_urls.is_empty() {
             println!("  Routes:   {}", self.static_route_urls.join(", "));
         }
-        if let Some(ref url) = self.public_url {
-            println!("  Public:   {url}");
+        if let Some(ref pub_url) = self.public_url {
+            if self.static_route_urls.is_empty() {
+                println!("  Public:   {pub_url}");
+            } else {
+                let public_routes: Vec<String> = self
+                    .static_route_urls
+                    .iter()
+                    .filter_map(|local_url| {
+                        local_url
+                            .find("/v1/")
+                            .map(|pos| format!("{}{}", pub_url.trim_end_matches('/'), &local_url[pos..]))
+                    })
+                    .collect();
+                if public_routes.is_empty() {
+                    println!("  Public:   {pub_url}");
+                } else {
+                    println!("  Public:   {}", public_routes.join(", "));
+                }
+            }
         }
         if !self.channels.is_empty() {
             println!("  Channels: {}", self.channels.join(", "));
@@ -749,12 +766,32 @@ pub fn demo_up_services(
     // Check pack dependencies and warn about missing ones.
     match crate::dependency_resolver::check_all(config_dir) {
         Ok(report) => {
+            for dep in &report.satisfied {
+                if dep.by_capability {
+                    crate::operator_log::info(
+                        module_path!(),
+                        format!(
+                            "dependency {} satisfied by capability (provider: {})",
+                            dep.pack_id,
+                            dep.satisfied_by.display()
+                        ),
+                    );
+                }
+            }
             for dep in &report.missing {
+                let cap_hint = if dep.required_capabilities.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " — add a pack providing: {}",
+                        dep.required_capabilities.join(", ")
+                    )
+                };
                 crate::operator_log::warn(
                     module_path!(),
                     format!(
-                        "missing pack dependency: {} (required by {}, capabilities: {:?})",
-                        dep.pack_id, dep.required_by, dep.required_capabilities
+                        "missing pack dependency: {} (required by {}){cap_hint}",
+                        dep.pack_id, dep.required_by,
                     ),
                 );
             }
