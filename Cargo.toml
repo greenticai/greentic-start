@@ -64,4 +64,3 @@ zstd = "0.13"
 [dev-dependencies]
 criterion = "0.8"
 tempfile = "3"
-
