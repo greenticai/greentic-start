@@ -1,4 +1,5 @@
 Cargo.lock
 Cargo.toml
+Dockerfile.distroless
 src/http_ingress/mod.rs
 src/ingress_dispatch.rs

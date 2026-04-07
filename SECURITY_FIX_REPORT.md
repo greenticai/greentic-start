@@ -17,9 +17,9 @@ Reviewer: CI Security Reviewer (Codex)
 - Actionable vulnerabilities found: `0`
 
 ## Remediation Actions
-- No dependency vulnerabilities were reported; no dependency updates were applied.
-- No code scanning vulnerabilities were reported; no source-code patches were applied.
-- Repository changes made for vulnerability remediation: none.
+- Minimal safe fixes applied: none.
+- Dependency updates required: none.
+- Source-code patches required: none.
 
 ## Outcome
-The provided CI security alert payload contains no vulnerabilities. No security fixes were required.
+No vulnerabilities were present in the provided CI security alert payload, so no remediation changes to code or dependencies were necessary.
