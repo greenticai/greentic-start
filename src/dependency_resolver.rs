@@ -33,6 +33,8 @@ pub struct CheckReport {
 pub struct SatisfiedDep {
     pub pack_id: String,
     pub satisfied_by: PathBuf,
+    /// `true` when satisfied by capability match rather than exact pack_id.
+    pub by_capability: bool,
 }
 
 #[derive(Debug)]
@@ -56,6 +58,7 @@ pub fn check_all(bundle_root: &Path) -> anyhow::Result<CheckReport> {
     }
 
     let pack_index = build_pack_index(&pack_paths);
+    let capability_index = build_capability_index(&pack_paths);
 
     // Collect all dependency requirements.
     let mut requirements: Vec<(String, String, Vec<String>)> = Vec::new();
@@ -93,10 +96,49 @@ pub fn check_all(bundle_root: &Path) -> anyhow::Result<CheckReport> {
 
     for (dep_pack_id, required_by, required_caps) in requirements {
         if let Some(path) = pack_index.get(&dep_pack_id) {
+            // Exact pack_id match.
             report.satisfied.push(SatisfiedDep {
                 pack_id: dep_pack_id,
                 satisfied_by: path.clone(),
+                by_capability: false,
             });
+        } else if !required_caps.is_empty() {
+            // Capability-based matching: check if all required capabilities
+            // are provided by some pack in the bundle.
+            let all_satisfied = required_caps
+                .iter()
+                .all(|cap| capability_index.contains_key(cap));
+            if all_satisfied {
+                let provider_path = required_caps
+                    .first()
+                    .and_then(|cap| capability_index.get(cap))
+                    .cloned()
+                    .unwrap_or_default();
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "dependency {dep_pack_id} satisfied by capability match \
+                         (required: {})",
+                        required_caps.join(", ")
+                    ),
+                );
+                report.satisfied.push(SatisfiedDep {
+                    pack_id: dep_pack_id,
+                    satisfied_by: provider_path,
+                    by_capability: true,
+                });
+            } else {
+                let missing_caps: Vec<_> = required_caps
+                    .iter()
+                    .filter(|cap| !capability_index.contains_key(cap.as_str()))
+                    .cloned()
+                    .collect();
+                report.missing.push(MissingDep {
+                    pack_id: dep_pack_id,
+                    required_by,
+                    required_capabilities: missing_caps,
+                });
+            }
         } else {
             report.missing.push(MissingDep {
                 pack_id: dep_pack_id,
@@ -147,6 +189,19 @@ fn build_pack_index(paths: &[PathBuf]) -> BTreeMap<String, PathBuf> {
             index.insert(pack_id, path.clone());
         } else if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             index.insert(stem.to_string(), path.clone());
+        }
+    }
+    index
+}
+
+/// Build capability_name -> pack_path index from all packs.
+fn build_capability_index(paths: &[PathBuf]) -> BTreeMap<String, PathBuf> {
+    let mut index = BTreeMap::new();
+    for path in paths {
+        if let Ok(manifest) = read_manifest(path) {
+            for cap in &manifest.capabilities {
+                index.entry(cap.name.clone()).or_insert_with(|| path.clone());
+            }
         }
     }
     index
