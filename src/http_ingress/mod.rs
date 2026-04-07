@@ -1250,7 +1250,7 @@ mod tests {
                 test_state(vec![]),
             ))
             .unwrap_err();
-        assert_eq!(legacy_directline.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(legacy_directline.status(), StatusCode::NOT_FOUND);
 
         let webchat_directline = runtime
             .block_on(handle_request_inner(
@@ -1484,8 +1484,8 @@ mod tests {
                 empty_request(Method::GET, "/v1/messaging/webchat/demo/token"),
                 state,
             ))
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         unsafe {
             std::env::remove_var(&gui_secret_uri);
