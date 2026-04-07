@@ -31,9 +31,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && mkdir -p /out \
     && cp /tmp/target/x86_64-unknown-linux-musl/release/greentic-start /out/greentic-start
 
-FROM cgr.dev/chainguard/static:latest
+FROM debian:bookworm-slim
 
-COPY --from=build /out/greentic-start /greentic-start
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    squashfs-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /out/greentic-start /usr/local/bin/greentic-start
 
 USER 65532:65532
-ENTRYPOINT ["/greentic-start"]
+ENTRYPOINT ["/usr/local/bin/greentic-start"]
