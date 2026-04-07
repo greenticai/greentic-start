@@ -1,6 +1,4 @@
 mod helpers;
-mod legacy_directline;
-mod legacy_directline_handler;
 mod messaging;
 mod static_handler;
 
@@ -19,6 +17,7 @@ use hyper_util::rt::tokio::TokioIo;
 use tokio::{net::TcpListener, runtime::Runtime, sync::oneshot};
 
 use crate::domains::Domain;
+use crate::http_routes::{HttpRouteTable, discover_http_routes_from_bundle};
 use crate::ingress_dispatch::dispatch_http_ingress;
 use crate::ingress_types::{IngressHttpResponse, IngressRequestV1};
 use crate::messaging_dto::HttpInV1;
@@ -33,7 +32,6 @@ use helpers::{
     error_response, handle_builtin_health_request, handle_oauth_token_exchange, parse_domain,
     parse_route_segments, with_cors,
 };
-use legacy_directline_handler::handle_legacy_directline_request;
 use messaging::route_messaging_envelopes;
 use static_handler::serve_static_route;
 
@@ -51,8 +49,8 @@ pub struct HttpIngressConfig {
 pub struct HttpIngressServer {
     shutdown: Option<oneshot::Sender<()>>,
     handle: Option<thread::JoinHandle<Result<()>>>,
-    /// Public URLs discovered from static routes during startup.
-    pub static_route_urls: Vec<String>,
+    /// WebChat GUI URLs discovered from static routes during startup.
+    pub ui_urls: Vec<String>,
 }
 
 impl HttpIngressServer {
@@ -62,7 +60,7 @@ impl HttpIngressServer {
         let runner_host = config.runner_host;
 
         // Discover static routes if enabled
-        let mut static_route_urls = Vec::new();
+        let mut ui_urls = Vec::new();
         let active_route_table = if config.enable_static_routes {
             let static_route_plan = discover_from_bundle(
                 runner_host.bundle_root(),
@@ -93,15 +91,20 @@ impl HttpIngressServer {
                             .join(", ")
                     ),
                 );
+                // Discover user-facing UI URLs from tenant-scoped static routes.
+                // Any static route with SPA fallback and tenant scope is treated
+                // as a UI endpoint worth surfacing at startup.
                 for route in table.routes() {
-                    let url_path = route.public_path.replace("{tenant}", &config.tenant);
-                    let route_url = format!(
-                        "http://{}/{}/",
-                        config.bind_addr,
-                        url_path.trim_start_matches('/')
-                    );
-                    operator_log::info(module_path!(), format!("Static route: {route_url}"));
-                    static_route_urls.push(route_url);
+                    if route.tenant_scoped && route.spa_fallback.is_some() {
+                        let url_path = route.public_path.replace("{tenant}", &config.tenant);
+                        let ui_url = format!(
+                            "http://{}/{}/",
+                            config.bind_addr,
+                            url_path.trim_start_matches('/')
+                        );
+                        operator_log::info(module_path!(), format!("UI: {ui_url}"));
+                        ui_urls.push(ui_url);
+                    }
                 }
             }
             table
@@ -109,12 +112,45 @@ impl HttpIngressServer {
             ActiveRouteTable::default()
         };
 
+        // Discover pack-declared HTTP API routes (greentic.http-routes.v1)
+        let http_route_table = if config.enable_static_routes {
+            match discover_http_routes_from_bundle(runner_host.bundle_root()) {
+                Ok(routes) => {
+                    if !routes.is_empty() {
+                        operator_log::info(
+                            module_path!(),
+                            format!(
+                                "discovered {} HTTP route(s): {}",
+                                routes.len(),
+                                routes
+                                    .iter()
+                                    .map(|r| r.pattern.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        );
+                    }
+                    HttpRouteTable::from_descriptors(routes)
+                }
+                Err(err) => {
+                    operator_log::warn(
+                        module_path!(),
+                        format!("http route discovery failed: {err:#}"),
+                    );
+                    HttpRouteTable::default()
+                }
+            }
+        } else {
+            HttpRouteTable::default()
+        };
+
         let state = Arc::new(HttpIngressState {
             runner_host,
             domains,
             active_route_table,
-            legacy_directline: legacy_directline::LegacyDirectLineCompat::new(),
+            http_route_table,
         });
+
         let (tx, rx) = oneshot::channel();
         let addr = config.bind_addr;
         let handle = thread::Builder::new()
@@ -185,7 +221,7 @@ impl HttpIngressServer {
         Ok(Self {
             shutdown: Some(tx),
             handle: Some(handle),
-            static_route_urls,
+            ui_urls,
         })
     }
 
@@ -203,12 +239,11 @@ impl HttpIngressServer {
     }
 }
 
-#[derive(Clone)]
 struct HttpIngressState {
     runner_host: Arc<DemoRunnerHost>,
     domains: Vec<Domain>,
     active_route_table: ActiveRouteTable,
-    legacy_directline: legacy_directline::LegacyDirectLineCompat,
+    http_route_table: HttpRouteTable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -236,12 +271,6 @@ struct ProviderDirectlineHttpRequest<'a> {
     team: &'a str,
     provider: &'a str,
     queries: &'a [(String, String)],
-}
-
-impl HttpIngressState {
-    fn legacy_directline_compat(&self) -> &legacy_directline::LegacyDirectLineCompat {
-        &self.legacy_directline
-    }
 }
 
 async fn handle_request<B>(
@@ -289,6 +318,7 @@ where
             .map_err(|err| *err);
     }
 
+    // OAuth token exchange proxy: /v1/messaging/webchat/{tenant}/oauth/token-exchange
     if is_oauth_token_exchange_path(&path) && req.method() == Method::POST {
         return handle_oauth_token_exchange(req).await;
     }
@@ -471,14 +501,41 @@ where
         return handle_legacy_directline_request(req, &path, None, None, None, state).await;
     }
 
+    // Resolve path to a parsed ingress route.
+    // Tries: (1) pack-declared HTTP routes, (2) static routes, (3) standard ingress.
     let method = req.method().clone();
-    let parsed = match parse_route_segments(req.uri().path()) {
-        Some(value) => value,
-        None => {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "expected /v1/{domain}/ingress/{provider}/{tenant}/{team?}/{handler?}",
+    let parsed = 'resolve: {
+        // Pack-declared HTTP routes (greentic.http-routes.v1): provider packs declare
+        // which URL patterns they handle, and the ingress server dispatches to them
+        // via the generic `dispatch_http_ingress` pipeline.
+        if let Some(route_match) = state.http_route_table.match_request(&path, method.as_str()) {
+            break 'resolve helpers::ParsedIngressRoute {
+                domain: route_match.descriptor.domain,
+                provider: route_match.descriptor.pack_id.clone(),
+                tenant: route_match.tenant,
+                team: route_match.team,
+                handler: None,
+            };
+        }
+
+        // Static route handling — serve assets from .gtpack files
+        if let Some(route_match) = state.active_route_table.match_request(&path) {
+            return Ok(serve_static_route(
+                &route_match,
+                state.runner_host.bundle_root(),
+                &path,
             ));
+        }
+
+        // Standard ingress route: /v1/{domain}/ingress/{provider}/{tenant}/{team?}/{handler?}
+        match parse_route_segments(req.uri().path()) {
+            Some(value) => value,
+            None => {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "expected /v1/{domain}/ingress/{provider}/{tenant}/{team?}/{handler?}",
+                ));
+            }
         }
     };
     let domain = parsed.domain;
@@ -593,12 +650,15 @@ where
             .messaging_envelopes
             .iter()
             .filter(|env| {
-                let dominated_by_bot = env
-                    .from
-                    .as_ref()
-                    .map(|f| f.id.ends_with(".bot") || f.id.ends_with("@webex.bot"))
+                // Providers set `is_bot_message=true` in envelope metadata to
+                // signal bot self-messages that should not be routed back through
+                // the app flow.
+                let is_bot = env
+                    .metadata
+                    .get("is_bot_message")
+                    .map(|v| v == "true")
                     .unwrap_or(false);
-                if dominated_by_bot {
+                if is_bot {
                     operator_log::debug(
                         module_path!(),
                         format!(
@@ -607,7 +667,7 @@ where
                         ),
                     );
                 }
-                !dominated_by_bot
+                !is_bot
             })
             .cloned()
             .collect();
@@ -621,7 +681,7 @@ where
         let runner_host = state.runner_host.clone();
         std::thread::spawn(move || {
             if let Err(err) =
-                route_messaging_envelopes(&bundle, &runner_host, &provider, &ctx, envelopes, None)
+                route_messaging_envelopes(&bundle, &runner_host, &provider, &ctx, envelopes)
             {
                 operator_log::error(
                     module_path!(),
@@ -651,6 +711,79 @@ where
 
     build_http_response(&result.response)
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err))
+}
+
+async fn handle_legacy_directline_request<B>(
+    req: Request<B>,
+    path: &str,
+    explicit_tenant: Option<String>,
+    explicit_team: Option<String>,
+    explicit_provider: Option<String>,
+    state: Arc<HttpIngressState>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    let queries = collect_queries(req.uri().query());
+    let provider = explicit_provider.or_else(|| {
+        queries
+            .iter()
+            .find(|(name, _)| name == "provider")
+            .map(|(_, value)| value.clone())
+    });
+    let tenant = explicit_tenant.unwrap_or_else(|| {
+        queries
+            .iter()
+            .find(|(name, _)| name == "tenant")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| "default".to_string())
+    });
+    let team = explicit_team.unwrap_or_else(|| {
+        queries
+            .iter()
+            .find(|(name, _)| name == "team")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| "default".to_string())
+    });
+
+    if !state.domains.contains(&Domain::Messaging) {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "messaging domain disabled",
+        ));
+    }
+    let provider = provider.ok_or_else(|| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "provider must be supplied by the route or query",
+        )
+    })?;
+    if !state
+        .runner_host
+        .supports_op(Domain::Messaging, &provider, "directline_http")
+    {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "provider does not implement directline_http",
+        ));
+    }
+
+    let method = req.method().clone();
+    dispatch_provider_directline_http(
+        req,
+        ProviderDirectlineHttpRequest {
+            method: &method,
+            path,
+            route: None,
+            tenant: &tenant,
+            team: &team,
+            provider: &provider,
+            queries: &queries,
+        },
+        &state,
+    )
+    .await
 }
 
 fn resolve_static_route_directline_request_from_match(
@@ -969,7 +1102,7 @@ mod tests {
             runner_host,
             domains,
             active_route_table: ActiveRouteTable::default(),
-            legacy_directline: legacy_directline::LegacyDirectLineCompat::new(),
+            http_route_table: HttpRouteTable::default(),
         })
     }
 
@@ -1109,24 +1242,15 @@ mod tests {
             .unwrap_err();
         assert_eq!(oauth_missing_url.status(), StatusCode::BAD_REQUEST);
 
+        // Legacy directline paths no longer have a transitional rewriter;
+        // they fall through to the standard ingress parser which rejects them.
         let legacy_directline = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/token"),
                 test_state(vec![]),
             ))
             .unwrap_err();
-        assert_eq!(legacy_directline.status(), StatusCode::NOT_FOUND);
-        let legacy_directline_body = runtime.block_on(response_json(legacy_directline));
-        let legacy_directline_message = legacy_directline_body["message"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(
-            legacy_directline_message.contains("legacy directline compatibility is disabled")
-                || legacy_directline_message.contains("messaging domain disabled")
-                || legacy_directline_message.contains(
-                    "directline routes must be declared by a pack or supply provider query"
-                )
-        );
+        assert_eq!(legacy_directline.status(), StatusCode::BAD_REQUEST);
 
         let webchat_directline = runtime
             .block_on(handle_request_inner(
@@ -1135,38 +1259,6 @@ mod tests {
             ))
             .unwrap_err();
         assert_eq!(webchat_directline.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn legacy_directline_root_routes_require_explicit_provider_query() {
-        let runtime = Runtime::new().unwrap();
-        let env_guard = crate::test_env_lock().lock().unwrap();
-
-        let missing_provider = runtime
-            .block_on(handle_request_inner(
-                empty_request(Method::GET, "/v3/directline/conversations"),
-                test_state(vec![Domain::Messaging]),
-            ))
-            .unwrap_err();
-        assert_eq!(missing_provider.status(), StatusCode::NOT_FOUND);
-
-        unsafe {
-            std::env::set_var(LEGACY_DIRECTLINE_COMPAT_ENV, "1");
-        }
-        let explicit_provider = runtime
-            .block_on(handle_request_inner(
-                empty_request(Method::GET, "/token?tenant=demo&provider=messaging-webchat"),
-                test_state(vec![Domain::Messaging]),
-            ))
-            .unwrap_err();
-        assert_eq!(
-            explicit_provider.status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        unsafe {
-            std::env::remove_var(LEGACY_DIRECTLINE_COMPAT_ENV);
-        }
-        drop(env_guard);
     }
 
     #[test]
@@ -1240,7 +1332,7 @@ mod tests {
         })
         .expect("start ingress server");
 
-        assert!(server.static_route_urls.is_empty());
+        assert!(server.ui_urls.is_empty());
         if let Err(err) = server.stop() {
             let message = err.to_string();
             assert!(
@@ -1296,7 +1388,7 @@ mod tests {
                 warnings: vec![],
                 blocking_failures: vec![],
             }),
-            legacy_directline: legacy_directline::LegacyDirectLineCompat::new(),
+            http_route_table: HttpRouteTable::default(),
         });
 
         let response = runtime
@@ -1373,7 +1465,7 @@ mod tests {
                 warnings: vec![],
                 blocking_failures: vec![],
             }),
-            legacy_directline: legacy_directline::LegacyDirectLineCompat::new(),
+            http_route_table: HttpRouteTable::default(),
         });
 
         let gui_secret_uri = canonical_secret_uri(

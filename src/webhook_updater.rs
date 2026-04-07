@@ -3,7 +3,7 @@
 //! When the tunnel URL changes (e.g., cloudflared/ngrok restart), this module
 //! detects the change and:
 //! 1. Updates the `public_base_url` secret for all messaging providers
-//! 2. Re-registers webhooks for providers that support it (Telegram, Slack, Webex)
+//! 2. Re-registers webhooks for providers that declare webhook ops
 
 use std::path::Path;
 
@@ -13,7 +13,9 @@ use serde_json::Value;
 use tokio::runtime::Builder as TokioBuilder;
 
 use crate::discovery::{DetectedProvider, DiscoveryResult};
+use crate::domains::Domain;
 use crate::operator_log;
+use crate::runner_host::{DemoRunnerHost, OperatorContext};
 use crate::secret_requirements::load_secret_keys_from_pack;
 use crate::secrets_gate::{SecretsManagerHandle, canonical_secret_uri};
 use crate::secrets_setup::resolve_env;
@@ -60,10 +62,12 @@ impl WebhookUpdateSummary {}
 /// # Returns
 ///
 /// Returns a `WebhookUpdateSummary` with per-provider results.
+#[allow(clippy::too_many_arguments)]
 pub fn update_webhooks_if_url_changed(
     config_dir: &Path,
     discovery: &DiscoveryResult,
     secrets_handle: &SecretsManagerHandle,
+    runner_host: Option<&DemoRunnerHost>,
     tenant: &str,
     team: &str,
     previous_url: Option<&str>,
@@ -159,6 +163,7 @@ pub fn update_webhooks_if_url_changed(
         match update_provider_webhook(
             config_dir,
             secrets_handle,
+            runner_host,
             tenant,
             team,
             &provider.provider_id,
@@ -265,9 +270,11 @@ fn read_secret_bytes(
 /// Update webhook for a single provider.
 ///
 /// Returns Ok(true) if webhook was updated, Ok(false) if not applicable.
+#[allow(clippy::too_many_arguments)]
 fn update_provider_webhook(
     config_dir: &Path,
     secrets_handle: &SecretsManagerHandle,
+    runner_host: Option<&DemoRunnerHost>,
     tenant: &str,
     team: &str,
     provider_id: &str,
@@ -285,36 +292,105 @@ fn update_provider_webhook(
         new_url,
     )?;
 
-    // Call webhook registration
-    let result =
-        greentic_setup::webhook::register_webhook(provider_id, &config, tenant, Some(team));
+    // Try declared ops from config first
+    if let Some(result_value) =
+        greentic_setup::webhook::register_webhook(provider_id, &config, tenant, Some(team))
+    {
+        let ok = result_value
+            .get("ok")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if ok {
+            return Ok(true);
+        }
+        let err = result_value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "[webhook-updater] webhook registration failed for {}: {}",
+                provider_id, err
+            ),
+        );
+        return Ok(false);
+    }
 
-    match result {
-        Some(result_value) => {
-            let ok = result_value
-                .get("ok")
+    // Fallback: invoke provider WASM setup_webhook op directly
+    let Some(host) = runner_host else {
+        return Ok(false);
+    };
+    if !host.supports_op(Domain::Messaging, provider_id, "setup_webhook") {
+        return Ok(false);
+    }
+    let ctx = OperatorContext {
+        tenant: tenant.to_string(),
+        team: Some(team.to_string()),
+        correlation_id: None,
+    };
+    let payload = serde_json::to_vec(&config)?;
+    match host.invoke_provider_op(
+        Domain::Messaging,
+        provider_id,
+        "setup_webhook",
+        &payload,
+        &ctx,
+    ) {
+        Ok(outcome) if outcome.success => {
+            // WASM invocation succeeded — but also check the output payload
+            // for {"ok": false} which indicates the op ran but failed logically.
+            let output_ok = outcome
+                .output
+                .as_ref()
+                .and_then(|v| v.get("ok"))
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if ok {
+                .unwrap_or(true);
+            if output_ok {
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "[webhook-updater] WASM setup_webhook succeeded for {}",
+                        provider_id
+                    ),
+                );
                 Ok(true)
             } else {
-                let err = result_value
-                    .get("error")
+                let err_msg = outcome
+                    .output
+                    .as_ref()
+                    .and_then(|v| v.get("error"))
                     .and_then(Value::as_str)
-                    .unwrap_or("unknown error");
+                    .unwrap_or("unknown");
                 operator_log::warn(
                     module_path!(),
                     format!(
-                        "[webhook-updater] webhook registration failed for {}: {}",
-                        provider_id, err
+                        "[webhook-updater] WASM setup_webhook returned error for {}: {}",
+                        provider_id, err_msg
                     ),
                 );
                 Ok(false)
             }
         }
-        None => {
-            // Provider doesn't support webhook registration (not Telegram/Slack/Webex)
-            // or missing required config
+        Ok(outcome) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "[webhook-updater] WASM setup_webhook failed for {}: {}",
+                    provider_id,
+                    outcome.error.as_deref().unwrap_or("unknown")
+                ),
+            );
+            Ok(false)
+        }
+        Err(err) => {
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[webhook-updater] WASM setup_webhook not available for {}: {err:#}",
+                    provider_id
+                ),
+            );
             Ok(false)
         }
     }
@@ -332,10 +408,17 @@ fn build_provider_config(
 ) -> Result<Value> {
     let mut config = serde_json::Map::new();
 
-    // Add new public_base_url
+    // Add new public_base_url and tenant/team so provider can build
+    // the correct webhook URL (e.g. /v1/messaging/ingress/{provider}/{tenant}/{team})
     config.insert(
         "public_base_url".to_string(),
         Value::String(new_url.to_string()),
+    );
+    config.insert("tenant".to_string(), Value::String(tenant.to_string()));
+    config.insert("team".to_string(), Value::String(team.to_string()));
+    config.insert(
+        "provider_id".to_string(),
+        Value::String(provider_id.to_string()),
     );
 
     // Load secret keys from pack manifest
@@ -451,6 +534,7 @@ mod tests {
             tmp.path(),
             &empty,
             &secrets_handle,
+            None,
             "demo",
             "default",
             None,
@@ -463,6 +547,7 @@ mod tests {
             tmp.path(),
             &empty,
             &secrets_handle,
+            None,
             "demo",
             "default",
             Some("https://example.com"),
@@ -497,7 +582,10 @@ mod tests {
         )
         .expect("provider config");
         assert_eq!(config["public_base_url"], "https://demo.example");
-        assert_eq!(config.as_object().map(|m| m.len()), Some(1));
+        assert_eq!(config["tenant"], "demo");
+        assert_eq!(config["team"], "default");
+        assert_eq!(config["provider_id"], "provider-a");
+        assert_eq!(config.as_object().map(|m| m.len()), Some(4));
     }
 
     #[test]
