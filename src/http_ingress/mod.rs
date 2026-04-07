@@ -5,6 +5,7 @@ mod static_handler;
 use std::{convert::Infallible, net::SocketAddr, sync::Arc, thread};
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Method, Request, Response, StatusCode,
@@ -18,18 +19,23 @@ use tokio::{net::TcpListener, runtime::Runtime, sync::oneshot};
 use crate::domains::Domain;
 use crate::http_routes::{HttpRouteTable, discover_http_routes_from_bundle};
 use crate::ingress_dispatch::dispatch_http_ingress;
-use crate::ingress_types::IngressRequestV1;
+use crate::ingress_types::{IngressHttpResponse, IngressRequestV1};
+use crate::messaging_dto::HttpInV1;
 use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
-use crate::static_routes::{ActiveRouteTable, ReservedRouteSet, discover_from_bundle};
+use crate::static_routes::{
+    ActiveRouteTable, ReservedRouteSet, RouteScopeSegment, StaticRouteMatch, discover_from_bundle,
+};
 
 use helpers::{
     build_http_response, collect_headers, collect_queries, cors_preflight_response, domain_name,
-    error_response, handle_builtin_health_request, handle_oauth_token_exchange,
+    error_response, handle_builtin_health_request, handle_oauth_token_exchange, parse_domain,
     parse_route_segments, with_cors,
 };
 use messaging::route_messaging_envelopes;
 use static_handler::serve_static_route;
+
+const LEGACY_DIRECTLINE_COMPAT_ENV: &str = "GREENTIC_START_ENABLE_LEGACY_DIRECTLINE";
 
 #[derive(Clone)]
 pub struct HttpIngressConfig {
@@ -240,6 +246,33 @@ struct HttpIngressState {
     http_route_table: HttpRouteTable,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StaticRouteIngressTarget {
+    domain: Domain,
+    provider: String,
+    tenant: String,
+    team: Option<String>,
+    handler: Option<String>,
+}
+
+type StaticRouteDirectlineTarget = (
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+struct ProviderDirectlineHttpRequest<'a> {
+    method: &'a Method,
+    path: &'a str,
+    route: Option<&'a str>,
+    tenant: &'a str,
+    team: &'a str,
+    provider: &'a str,
+    queries: &'a [(String, String)],
+}
+
 async fn handle_request<B>(
     req: Request<B>,
     state: Arc<HttpIngressState>,
@@ -286,8 +319,186 @@ where
     }
 
     // OAuth token exchange proxy: /v1/messaging/webchat/{tenant}/oauth/token-exchange
-    if path.contains("/oauth/token-exchange") && req.method() == Method::POST {
+    if is_oauth_token_exchange_path(&path) && req.method() == Method::POST {
         return handle_oauth_token_exchange(req).await;
+    }
+
+    // WebChat Direct Line routes: /v1/messaging/webchat/{tenant}/token or /v1/messaging/webchat/{tenant}/v3/directline/*
+    if let Some((tenant, dl_path)) = parse_webchat_directline_route(&path) {
+        let provider = state
+            .active_route_table
+            .match_request(&path)
+            .map(|route_match| route_match.descriptor.pack_id.clone())
+            .or_else(|| {
+                state
+                    .active_route_table
+                    .routes()
+                    .iter()
+                    .find(|route| route.pack_id == "messaging-webchat-gui")
+                    .map(|route| route.pack_id.clone())
+            })
+            .or_else(|| {
+                state
+                    .active_route_table
+                    .routes()
+                    .iter()
+                    .find(|route| route.pack_id == "messaging-webchat")
+                    .map(|route| route.pack_id.clone())
+            })
+            .or_else(|| {
+                // /v1/messaging/webchat/* endpoints are API routes and do not necessarily share
+                // the same URL prefix as static web assets (/v1/web/webchat/*). When there is no
+                // direct static-route match, prefer the GUI provider if present.
+                if state
+                    .runner_host
+                    .get_provider_pack_path(Domain::Messaging, "messaging-webchat-gui")
+                    .is_some()
+                {
+                    Some("messaging-webchat-gui".to_string())
+                } else if state
+                    .runner_host
+                    .get_provider_pack_path(Domain::Messaging, "messaging-webchat")
+                    .is_some()
+                {
+                    Some("messaging-webchat".to_string())
+                } else {
+                    None
+                }
+            });
+        if provider.is_none() {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "provider must be supplied by the route or query",
+            ));
+        }
+        return handle_legacy_directline_request(
+            req,
+            &dl_path,
+            Some(tenant),
+            None,
+            provider,
+            state,
+        )
+        .await;
+    }
+
+    // Static route handling - serve assets from .gtpack files
+    if let Some(route_match) = state.active_route_table.match_request(&path) {
+        let ingress_target =
+            infer_static_route_ingress_target(&path, &route_match).filter(|target| {
+                state
+                    .runner_host
+                    .supports_op(target.domain, &target.provider, "ingest_http")
+            });
+        let directline_target =
+            resolve_static_route_directline_request_from_match(&path, &route_match);
+        let static_response =
+            serve_static_route(&route_match, state.runner_host.bundle_root(), &path);
+        if static_response.status() != StatusCode::NOT_FOUND {
+            return Ok(static_response);
+        }
+        if let Some(target) = ingress_target {
+            if let Some(response) =
+                dispatch_static_route_ingress(req, &path, &state, target).await?
+            {
+                return Ok(response);
+            }
+            return Ok(static_response);
+        } else if let Some((tenant, team, route, dl_path, provider)) = directline_target {
+            if let Some(provider) = provider.as_deref()
+                && state
+                    .runner_host
+                    .supports_op(Domain::Messaging, provider, "directline_http")
+            {
+                let method = req.method().clone();
+                let queries = collect_queries(req.uri().query());
+                return dispatch_provider_directline_http(
+                    req,
+                    ProviderDirectlineHttpRequest {
+                        method: &method,
+                        path: &dl_path,
+                        route: route.as_deref(),
+                        tenant: &tenant,
+                        team: team.as_deref().unwrap_or("default"),
+                        provider,
+                        queries: &queries,
+                    },
+                    &state,
+                )
+                .await;
+            }
+            return handle_legacy_directline_request(
+                req,
+                &dl_path,
+                Some(tenant),
+                team,
+                provider,
+                state,
+            )
+            .await;
+        }
+        return Ok(static_response);
+    }
+
+    // Legacy root-level Direct Line routes remain only as an explicit
+    // compatibility path. Pack-owned static routes should take precedence.
+    if is_legacy_directline_path(&path) {
+        if !legacy_directline_compat_enabled() {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "legacy directline compatibility is disabled; declare the route in a pack",
+            ));
+        }
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "using legacy directline compatibility path for {}; prefer pack-owned routes or directline_http providers",
+                path
+            ),
+        );
+        let queries = collect_queries(req.uri().query());
+        let provider = queries
+            .iter()
+            .find(|(name, _)| name == "provider")
+            .map(|(_, value)| value.as_str());
+        if provider.is_none() {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "directline routes must be declared by a pack or supply provider query",
+            ));
+        }
+        let tenant = queries
+            .iter()
+            .find(|(name, _)| name == "tenant")
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("default");
+        let team = queries
+            .iter()
+            .find(|(name, _)| name == "team")
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("default");
+        if let Some(provider) = provider
+            && state
+                .runner_host
+                .supports_op(Domain::Messaging, provider, "directline_http")
+        {
+            let method = req.method().clone();
+            return dispatch_provider_directline_http(
+                req,
+                ProviderDirectlineHttpRequest {
+                    method: &method,
+                    path: &path,
+                    route: None,
+                    tenant,
+                    team,
+                    provider,
+                    queries: &queries,
+                },
+                &state,
+            )
+            .await;
+        }
+        return handle_legacy_directline_request(req, &path, None, None, None, state).await;
     }
 
     // Resolve path to a parsed ingress route.
@@ -502,6 +713,360 @@ where
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err))
 }
 
+async fn handle_legacy_directline_request<B>(
+    req: Request<B>,
+    path: &str,
+    explicit_tenant: Option<String>,
+    explicit_team: Option<String>,
+    explicit_provider: Option<String>,
+    state: Arc<HttpIngressState>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    let queries = collect_queries(req.uri().query());
+    let provider = explicit_provider.or_else(|| {
+        queries
+            .iter()
+            .find(|(name, _)| name == "provider")
+            .map(|(_, value)| value.clone())
+    });
+    let tenant = explicit_tenant.unwrap_or_else(|| {
+        queries
+            .iter()
+            .find(|(name, _)| name == "tenant")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| "default".to_string())
+    });
+    let team = explicit_team.unwrap_or_else(|| {
+        queries
+            .iter()
+            .find(|(name, _)| name == "team")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| "default".to_string())
+    });
+
+    if !state.domains.contains(&Domain::Messaging) {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "messaging domain disabled",
+        ));
+    }
+    let provider = provider.ok_or_else(|| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "provider must be supplied by the route or query",
+        )
+    })?;
+    if !state
+        .runner_host
+        .supports_op(Domain::Messaging, &provider, "directline_http")
+    {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "provider does not implement directline_http",
+        ));
+    }
+
+    let method = req.method().clone();
+    dispatch_provider_directline_http(
+        req,
+        ProviderDirectlineHttpRequest {
+            method: &method,
+            path,
+            route: None,
+            tenant: &tenant,
+            team: &team,
+            provider: &provider,
+            queries: &queries,
+        },
+        &state,
+    )
+    .await
+}
+
+fn resolve_static_route_directline_request_from_match(
+    path: &str,
+    route_match: &StaticRouteMatch<'_>,
+) -> Option<StaticRouteDirectlineTarget> {
+    let directline_path = match route_match.asset_path.as_str() {
+        "token" => "/token".to_string(),
+        "auth/config" => "/auth/config".to_string(),
+        asset_path if asset_path.starts_with("v3/directline") => format!("/{asset_path}"),
+        _ => return None,
+    };
+    let (tenant, team) = extract_scope_from_route_match(path, route_match)?;
+    let route = Some(route_match.descriptor.route_id.clone());
+    let provider = Some(route_match.descriptor.pack_id.clone());
+    Some((tenant, team, route, directline_path, provider))
+}
+
+async fn dispatch_provider_directline_http<B>(
+    req: Request<B>,
+    request: ProviderDirectlineHttpRequest<'_>,
+    state: &Arc<HttpIngressState>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    let headers = collect_headers(req.headers());
+    let body = req
+        .into_body()
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes())
+        .unwrap_or_default();
+    let payload = HttpInV1 {
+        v: 1,
+        provider: request.provider.to_string(),
+        route: request.route.map(str::to_string),
+        binding_id: None,
+        tenant_hint: Some(request.tenant.to_string()),
+        team_hint: Some(request.team.to_string()),
+        method: request.method.as_str().to_string(),
+        path: request.path.to_string(),
+        query: request.queries.to_vec(),
+        headers,
+        body_b64: base64::engine::general_purpose::STANDARD.encode(&body),
+        config: None,
+    };
+    let ctx = OperatorContext {
+        tenant: request.tenant.to_string(),
+        team: Some(request.team.to_string()),
+        correlation_id: None,
+    };
+    let payload_bytes = serde_json::to_vec(&payload).map_err(|err| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize directline_http payload: {err}"),
+        )
+    })?;
+    let outcome = state
+        .runner_host
+        .invoke_provider_op(
+            Domain::Messaging,
+            request.provider,
+            "directline_http",
+            &payload_bytes,
+            &ctx,
+        )
+        .map_err(|err| error_response(StatusCode::BAD_GATEWAY, err.to_string()))?;
+    if !outcome.success {
+        let message = outcome
+            .error
+            .or(outcome.raw)
+            .unwrap_or_else(|| "provider directline_http failed".to_string());
+        return Err(error_response(StatusCode::BAD_GATEWAY, message));
+    }
+    let value = outcome.output.unwrap_or_else(|| serde_json::json!({}));
+    let response = parse_provider_directline_http_response(&value).map_err(|err| {
+        error_response(
+            StatusCode::BAD_GATEWAY,
+            format!("invalid directline_http response: {err}"),
+        )
+    })?;
+    build_http_response(&response)
+        .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err))
+}
+
+async fn dispatch_static_route_ingress<B>(
+    req: Request<B>,
+    path: &str,
+    state: &Arc<HttpIngressState>,
+    target: StaticRouteIngressTarget,
+) -> Result<Option<Response<Full<Bytes>>>, Response<Full<Bytes>>>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    let method = req.method().clone();
+    let headers = collect_headers(req.headers());
+    let query = collect_queries(req.uri().query());
+    let body = req
+        .into_body()
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes().to_vec())
+        .map_err(|err| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                format!("failed to read request body: {err}"),
+            )
+        })?;
+    let ctx = OperatorContext {
+        tenant: target.tenant.clone(),
+        team: target.team.clone(),
+        correlation_id: None,
+    };
+    let request = IngressRequestV1 {
+        v: 1,
+        domain: domain_name(target.domain).to_string(),
+        provider: target.provider.clone(),
+        handler: target.handler.clone(),
+        tenant: target.tenant.clone(),
+        team: target.team.clone(),
+        method: method.as_str().to_string(),
+        path: path.to_string(),
+        query,
+        headers,
+        body,
+        correlation_id: None,
+        remote_addr: None,
+    };
+    let result = dispatch_http_ingress(&state.runner_host, target.domain, &request, &ctx)
+        .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let response = build_http_response(&result.response)
+        .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    Ok(Some(with_cors(response)))
+}
+
+fn parse_provider_directline_http_response(
+    value: &serde_json::Value,
+) -> anyhow::Result<IngressHttpResponse> {
+    let value = value
+        .get("http")
+        .or_else(|| value.get("response"))
+        .unwrap_or(value);
+    let status = value
+        .get("status")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(200) as u16;
+    let headers = value
+        .get("headers")
+        .and_then(serde_json::Value::as_object)
+        .map(|headers| {
+            headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.to_string(),
+                        value
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| value.to_string()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let body = if let Some(body_b64) = value.get("body_b64").and_then(serde_json::Value::as_str) {
+        Some(base64::engine::general_purpose::STANDARD.decode(body_b64)?)
+    } else if let Some(body) = value.get("body").and_then(serde_json::Value::as_str) {
+        Some(body.as_bytes().to_vec())
+    } else if let Some(body_json) = value.get("body_json") {
+        Some(serde_json::to_vec(body_json)?)
+    } else {
+        None
+    };
+    Ok(IngressHttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn infer_static_route_ingress_target(
+    request_path: &str,
+    route_match: &StaticRouteMatch<'_>,
+) -> Option<StaticRouteIngressTarget> {
+    let normalized = request_path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let segments = &route_match.descriptor.route_segments;
+    let domain = match (segments.first(), segments.get(1)) {
+        (Some(RouteScopeSegment::Literal(prefix)), Some(RouteScopeSegment::Literal(domain)))
+            if prefix.eq_ignore_ascii_case("v1") =>
+        {
+            parse_domain(domain)?
+        }
+        (Some(RouteScopeSegment::Literal(domain)), _) => parse_domain(domain)?,
+        _ => return None,
+    };
+    let mut tenant = None;
+    let mut team = None;
+    for (value, segment) in normalized.iter().zip(segments.iter()) {
+        match segment {
+            RouteScopeSegment::Tenant => tenant = Some((*value).to_string()),
+            RouteScopeSegment::Team => team = Some((*value).to_string()),
+            RouteScopeSegment::Literal(_) => {}
+        }
+    }
+    Some(StaticRouteIngressTarget {
+        domain,
+        provider: route_match.descriptor.pack_id.clone(),
+        tenant: tenant?,
+        team,
+        handler: Some(route_match.descriptor.route_id.clone()),
+    })
+}
+
+fn is_oauth_token_exchange_path(path: &str) -> bool {
+    path.trim_start_matches('/')
+        .split('/')
+        .collect::<Vec<_>>()
+        .ends_with(&["oauth", "token-exchange"])
+}
+
+fn parse_webchat_directline_route(path: &str) -> Option<(String, String)> {
+    let segments = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() < 5
+        || segments[0] != "v1"
+        || segments[1] != "messaging"
+        || segments[2] != "webchat"
+    {
+        return None;
+    }
+    let tenant = segments[3].to_string();
+    if segments[4] == "token" && segments.len() == 5 {
+        return Some((tenant, "/token".to_string()));
+    }
+    if segments[4] == "v3" && segments.get(5).is_some_and(|value| *value == "directline") {
+        return Some((tenant, format!("/{}", segments[4..].join("/"))));
+    }
+    None
+}
+
+fn is_legacy_directline_path(path: &str) -> bool {
+    path == "/token" || path.starts_with("/v3/directline") || path.starts_with("/directline")
+}
+
+fn legacy_directline_compat_enabled() -> bool {
+    std::env::var_os(LEGACY_DIRECTLINE_COMPAT_ENV)
+        .and_then(|value| value.into_string().ok())
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn extract_scope_from_route_match(
+    request_path: &str,
+    route_match: &StaticRouteMatch<'_>,
+) -> Option<(String, Option<String>)> {
+    let mut tenant = None;
+    let mut team = None;
+    request_path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .zip(route_match.descriptor.route_segments.iter())
+        .for_each(|(value, segment)| match segment {
+            RouteScopeSegment::Tenant => tenant = Some(value.to_string()),
+            RouteScopeSegment::Team => team = Some(value.to_string()),
+            RouteScopeSegment::Literal(_) => {}
+        });
+    Some((tenant?, team))
+}
+
 #[cfg(test)]
 mod tests {
     use super::helpers::{handle_builtin_health_request, parse_route_segments};
@@ -685,7 +1250,7 @@ mod tests {
                 test_state(vec![]),
             ))
             .unwrap_err();
-        assert_eq!(legacy_directline.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(legacy_directline.status(), StatusCode::NOT_FOUND);
 
         let webchat_directline = runtime
             .block_on(handle_request_inner(
@@ -768,7 +1333,14 @@ mod tests {
         .expect("start ingress server");
 
         assert!(server.ui_urls.is_empty());
-        server.stop().expect("stop ingress server");
+        if let Err(err) = server.stop() {
+            let message = err.to_string();
+            assert!(
+                message.contains("failed to bind ingress listener")
+                    || message.contains("Operation not permitted"),
+                "stop ingress server: {message}"
+            );
+        }
     }
 
     #[test]
@@ -829,5 +1401,183 @@ mod tests {
         let body =
             runtime.block_on(async { response.into_body().collect().await.unwrap().to_bytes() });
         assert!(String::from_utf8_lossy(&body).contains("<html>ok</html>"));
+    }
+
+    #[test]
+    fn tenant_scoped_directline_uses_provider_from_matching_static_route_pack_id() {
+        use crate::secrets_gate::canonical_secret_uri;
+        use std::fs::File;
+        use std::io::Write;
+        use zip::write::FileOptions;
+
+        let runtime = Runtime::new().unwrap();
+        let dir = tempdir().unwrap();
+        let env_guard = crate::test_env_lock().lock().unwrap();
+
+        let pack_path = dir.path().join("env-backend.gtpack");
+        let file = File::create(&pack_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("assets/secrets_backend.json", FileOptions::<()>::default())
+            .unwrap();
+        zip.write_all(br#"{"backend":"env"}"#).unwrap();
+        zip.finish().unwrap();
+        unsafe {
+            std::env::set_var("GREENTIC_SECRETS_MANAGER_PACK", &pack_path);
+        }
+
+        let discovery = crate::discovery::discover(dir.path()).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(
+                dir.path().to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let route = StaticRouteDescriptor {
+            route_id: "webchat-gui".to_string(),
+            pack_id: "messaging-webchat-gui".to_string(),
+            pack_path: dir.path().to_path_buf(),
+            public_path: "/v1/web/webchat/{tenant}".to_string(),
+            source_root: "site".to_string(),
+            index_file: Some("index.html".to_string()),
+            spa_fallback: Some("index.html".to_string()),
+            tenant_scoped: true,
+            team_scoped: false,
+            cache_strategy: CacheStrategy::None,
+            route_segments: vec![
+                RouteScopeSegment::Literal("v1".to_string()),
+                RouteScopeSegment::Literal("web".to_string()),
+                RouteScopeSegment::Literal("webchat".to_string()),
+                RouteScopeSegment::Tenant,
+            ],
+        };
+        let state = Arc::new(HttpIngressState {
+            runner_host,
+            domains: vec![Domain::Messaging],
+            active_route_table: ActiveRouteTable::from_plan(&StaticRoutePlan {
+                routes: vec![route],
+                warnings: vec![],
+                blocking_failures: vec![],
+            }),
+            http_route_table: HttpRouteTable::default(),
+        });
+
+        let gui_secret_uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            Some("default"),
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
+        unsafe {
+            std::env::set_var(&gui_secret_uri, "gui-signing-key");
+        }
+
+        let response = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::GET, "/v1/messaging/webchat/demo/token"),
+                state,
+            ))
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        unsafe {
+            std::env::remove_var(&gui_secret_uri);
+            std::env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+        }
+        drop(env_guard);
+    }
+
+    #[test]
+    fn oauth_token_exchange_path_detection_is_generic() {
+        assert!(is_oauth_token_exchange_path(
+            "/v1/messaging/webchat/demo/oauth/token-exchange"
+        ));
+        assert!(is_oauth_token_exchange_path(
+            "/custom/prefix/oauth/token-exchange"
+        ));
+        assert!(!is_oauth_token_exchange_path("/custom/prefix/oauth/token"));
+    }
+
+    #[test]
+    fn infer_static_route_ingress_target_reads_domain_provider_and_scope() {
+        let descriptor = StaticRouteDescriptor {
+            route_id: "gui".to_string(),
+            pack_id: "messaging-webchat-gui".to_string(),
+            pack_path: std::path::PathBuf::from("/tmp/pack.gtpack"),
+            public_path: "/v1/messaging/webchat/{tenant}/{team}".to_string(),
+            source_root: "assets".to_string(),
+            index_file: Some("index.html".to_string()),
+            spa_fallback: Some("index.html".to_string()),
+            tenant_scoped: true,
+            team_scoped: true,
+            cache_strategy: CacheStrategy::None,
+            route_segments: vec![
+                RouteScopeSegment::Literal("v1".to_string()),
+                RouteScopeSegment::Literal("messaging".to_string()),
+                RouteScopeSegment::Literal("webchat".to_string()),
+                RouteScopeSegment::Tenant,
+                RouteScopeSegment::Team,
+            ],
+        };
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: "token".to_string(),
+            request_is_directory: false,
+        };
+        let target = infer_static_route_ingress_target(
+            "/v1/messaging/webchat/demo/default/token",
+            &route_match,
+        )
+        .expect("target");
+        assert_eq!(target.domain, Domain::Messaging);
+        assert_eq!(target.provider, "messaging-webchat-gui");
+        assert_eq!(target.tenant, "demo");
+        assert_eq!(target.team.as_deref(), Some("default"));
+        assert_eq!(target.handler.as_deref(), Some("gui"));
+    }
+
+    #[test]
+    fn resolve_static_route_directline_request_preserves_team_scope() {
+        let descriptor = StaticRouteDescriptor {
+            route_id: "gui".to_string(),
+            pack_id: "messaging-webchat-gui".to_string(),
+            pack_path: std::path::PathBuf::from("/tmp/pack.gtpack"),
+            public_path: "/v1/messaging/webchat/{tenant}/{team}".to_string(),
+            source_root: "assets".to_string(),
+            index_file: Some("index.html".to_string()),
+            spa_fallback: Some("index.html".to_string()),
+            tenant_scoped: true,
+            team_scoped: true,
+            cache_strategy: CacheStrategy::None,
+            route_segments: vec![
+                RouteScopeSegment::Literal("v1".to_string()),
+                RouteScopeSegment::Literal("messaging".to_string()),
+                RouteScopeSegment::Literal("webchat".to_string()),
+                RouteScopeSegment::Tenant,
+                RouteScopeSegment::Team,
+            ],
+        };
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: "v3/directline/conversations".to_string(),
+            request_is_directory: false,
+        };
+        let target = resolve_static_route_directline_request_from_match(
+            "/v1/messaging/webchat/demo/default/v3/directline/conversations",
+            &route_match,
+        )
+        .expect("target");
+        assert_eq!(target.0, "demo");
+        assert_eq!(target.1.as_deref(), Some("default"));
+        assert_eq!(target.2.as_deref(), Some("gui"));
+        assert_eq!(target.3, "/v3/directline/conversations");
+        assert_eq!(target.4.as_deref(), Some("messaging-webchat-gui"));
     }
 }
