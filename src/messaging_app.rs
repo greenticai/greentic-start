@@ -181,6 +181,14 @@ pub fn select_app_flow(info: &AppPackInfo) -> Result<&AppFlowInfo> {
         .iter()
         .filter(|flow| flow.kind.eq_ignore_ascii_case("messaging"))
         .collect();
+    let non_main_messaging_flows: Vec<_> = messaging_flows
+        .iter()
+        .copied()
+        .filter(|flow| flow.id != "main")
+        .collect();
+    if non_main_messaging_flows.len() == 1 {
+        return Ok(non_main_messaging_flows[0]);
+    }
     if messaging_flows.len() == 1 {
         return Ok(messaging_flows[0]);
     }
@@ -758,6 +766,26 @@ mod tests {
                 .expect("single messaging flow")
                 .id,
             "notify"
+        );
+
+        let main_plus_one = AppPackInfo {
+            pack_id: "pack".to_string(),
+            flows: vec![
+                AppFlowInfo {
+                    id: "main".to_string(),
+                    kind: "messaging".to_string(),
+                },
+                AppFlowInfo {
+                    id: "global_redbutton".to_string(),
+                    kind: "messaging".to_string(),
+                },
+            ],
+        };
+        assert_eq!(
+            select_app_flow(&main_plus_one)
+                .expect("non-main messaging flow")
+                .id,
+            "global_redbutton"
         );
     }
 
