@@ -1,6 +1,6 @@
 [package]
 name = "greentic-start"
-version = "0.4.42"
+version = "0.4.43"
 edition = "2024"
 rust-version = "1.91"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -64,4 +64,3 @@ zstd = "0.13"
 [dev-dependencies]
 criterion = "0.8"
 tempfile = "3"
-

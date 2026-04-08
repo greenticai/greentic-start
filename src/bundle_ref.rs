@@ -177,7 +177,7 @@ fn extract_bundle_archive(
     reference: &str,
 ) -> anyhow::Result<ResolvedBundle> {
     let out_dir = bundle_cache_dir(&fetched.digest);
-    let marker = out_dir.join(".bundle-ready");
+    let marker = bundle_cache_marker_path(&fetched.digest);
     if marker.exists() {
         return Ok(ResolvedBundle {
             source_ref: fetched.source_ref.clone(),
@@ -220,14 +220,22 @@ fn extract_bundle_archive(
 }
 
 fn bundle_cache_dir(digest: &str) -> PathBuf {
-    let slug = digest
+    bundle_cache_root().join(bundle_cache_slug(digest))
+}
+
+fn bundle_cache_marker_path(digest: &str) -> PathBuf {
+    bundle_cache_root().join(format!("{}.bundle-ready", bundle_cache_slug(digest)))
+}
+
+fn bundle_cache_root() -> PathBuf {
+    std::env::temp_dir().join("greentic-start").join("bundles")
+}
+
+fn bundle_cache_slug(digest: &str) -> String {
+    digest
         .strip_prefix("sha256:")
         .unwrap_or(digest)
-        .replace(':', "-");
-    std::env::temp_dir()
-        .join("greentic-start")
-        .join("bundles")
-        .join(slug)
+        .replace(':', "-")
 }
 
 fn http_download_path(reference: &str, digest: &str) -> PathBuf {
@@ -615,6 +623,20 @@ mod tests {
         assert_eq!(
             bytes_digest(b"abc"),
             format!("sha256:{}", sha256_hex(b"abc"))
+        );
+    }
+
+    #[test]
+    fn bundle_cache_marker_path_is_outside_extracted_bundle_dir() {
+        let digest = "sha256:deadbeef";
+        let bundle_dir = bundle_cache_dir(digest);
+        let marker = bundle_cache_marker_path(digest);
+
+        assert_eq!(marker.parent(), bundle_dir.parent());
+        assert_ne!(marker.parent(), Some(bundle_dir.as_path()));
+        assert_eq!(
+            marker.file_name().and_then(|value| value.to_str()),
+            Some("deadbeef.bundle-ready")
         );
     }
 
