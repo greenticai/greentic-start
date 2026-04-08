@@ -17,9 +17,9 @@ Reviewer: CI Security Reviewer (Codex)
 - Actionable vulnerabilities found: `0`
 
 ## Remediation Actions
-- No dependency vulnerabilities were reported, so no dependency updates were applied.
-- No code scanning vulnerabilities were reported, so no source-level security patches were applied.
-- Changed files in this run: `SECURITY_FIX_REPORT.md` (report refresh only).
+- No dependency vulnerabilities were reported, so no dependency updates were required.
+- No code scanning vulnerabilities were reported, so no source-code security patches were required.
+- Repository changes made for remediation: none.
 
 ## Outcome
-No vulnerabilities were present in the provided CI security alert payload. No security code fixes were required for this run.
+No vulnerabilities were present in the provided CI security alert payload. No security fixes were necessary.
