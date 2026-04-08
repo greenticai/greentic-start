@@ -20,7 +20,6 @@ use crate::runner_exec;
 use crate::runner_integration::RunFlowOptions;
 use crate::runner_integration::RunnerFlavor;
 use crate::runner_integration::run_flow_with_options;
-use crate::secrets_gate;
 use crate::state_layout;
 
 use super::DemoRunnerHost;
@@ -351,33 +350,9 @@ impl DemoRunnerHost {
         let result = make_runtime_or_thread_scope(|runtime| {
             runtime.block_on(async {
                 let host_config = Arc::new(build_demo_host_config(&ctx.tenant));
-                // Re-open the dev store on each invocation so newly-written secrets
-                // (e.g. from QA wizard submit) are visible without restarting the demo.
-                let fresh_secrets = secrets_gate::resolve_secrets_manager(
-                    &self.bundle_root,
-                    &ctx.tenant,
-                    ctx.team.as_deref(),
-                )
-                .unwrap_or_else(|_| self.secrets_handle.clone());
-                let dev_store_display = fresh_secrets
-                    .dev_store_path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "<default>".to_string());
-                operator_log::info(
-                    module_path!(),
-                    format!(
-                        "secrets backend for wasm: using_env_fallback={} dev_store={}",
-                        fresh_secrets.using_env_fallback, dev_store_display,
-                    ),
-                );
-                operator_log::info(
-                    module_path!(),
-                    format!(
-                        "exec secrets: dev_store={} env_fallback={}",
-                        dev_store_display, fresh_secrets.using_env_fallback,
-                    ),
-                );
+                // Reuse the cached secrets handle — the CachingSecretsManager
+                // layer handles TTL expiry and write-through invalidation, so
+                // newly-written secrets are picked up after cache expiry.
                 let pack_runtime = PackRuntime::load(
                     &pack.path,
                     host_config.clone(),
@@ -386,7 +361,7 @@ impl DemoRunnerHost {
                     None::<DynSessionStore>,
                     Some(self.state_store.clone()),
                     Arc::new(RunnerWasiPolicy::default()),
-                    fresh_secrets.runtime_manager(Some(&pack.pack_id)),
+                    self.secrets_handle.runtime_manager(Some(&pack.pack_id)),
                     None,
                     false,
                     ComponentResolution::default(),

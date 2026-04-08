@@ -1,12 +1,13 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Error as AnyhowError, Result as AnyhowResult, anyhow};
@@ -29,6 +30,103 @@ use crate::secrets_manager;
 type CborMap = BTreeMap<CborValue, CborValue>;
 
 pub type DynSecretsManager = Arc<dyn SecretsManager>;
+
+// ---------------------------------------------------------------------------
+// Caching wrapper — avoids hitting the secrets backend on every WASM call.
+// ---------------------------------------------------------------------------
+
+const CACHE_TTL_SECS: u64 = 300;
+const CACHE_MAX_ENTRIES: usize = 512;
+
+struct CacheEntry {
+    data: Vec<u8>,
+    inserted_at: Instant,
+}
+
+struct CachingSecretsManager {
+    inner: DynSecretsManager,
+    cache: Mutex<HashMap<String, CacheEntry>>,
+    ttl: Duration,
+    max_entries: usize,
+}
+
+impl CachingSecretsManager {
+    fn wrap(inner: DynSecretsManager) -> DynSecretsManager {
+        let ttl_secs = env::var("SECRETS_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(CACHE_TTL_SECS);
+        if ttl_secs == 0 {
+            return inner;
+        }
+        let max = env::var("SECRETS_CACHE_MAX_ENTRIES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(CACHE_MAX_ENTRIES);
+        Arc::new(Self {
+            inner,
+            cache: Mutex::new(HashMap::new()),
+            ttl: Duration::from_secs(ttl_secs),
+            max_entries: max,
+        })
+    }
+}
+
+#[async_trait]
+impl SecretsManager for CachingSecretsManager {
+    async fn read(&self, path: &str) -> SecretResult<Vec<u8>> {
+        {
+            let mut cache = self.cache.lock().expect("secrets cache poisoned");
+            if let Some(entry) = cache.get(path) {
+                if entry.inserted_at.elapsed() < self.ttl {
+                    return Ok(entry.data.clone());
+                }
+                cache.remove(path);
+            }
+        }
+        let data = self.inner.read(path).await?;
+        {
+            let mut cache = self.cache.lock().expect("secrets cache poisoned");
+            if cache.len() >= self.max_entries {
+                // Evict oldest entry.
+                if let Some(oldest_key) = cache
+                    .iter()
+                    .min_by_key(|(_, e)| e.inserted_at)
+                    .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest_key);
+                }
+            }
+            cache.insert(
+                path.to_owned(),
+                CacheEntry {
+                    data: data.clone(),
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+        Ok(data)
+    }
+
+    async fn write(&self, path: &str, bytes: &[u8]) -> SecretResult<()> {
+        self.inner.write(path, bytes).await?;
+        self.cache
+            .lock()
+            .expect("secrets cache poisoned")
+            .remove(path);
+        Ok(())
+    }
+
+    async fn delete(&self, path: &str) -> SecretResult<()> {
+        self.inner.delete(path).await?;
+        self.cache
+            .lock()
+            .expect("secrets cache poisoned")
+            .remove(path);
+        Ok(())
+    }
+}
 
 struct LoggingSecretsManager {
     inner: DynSecretsManager,
@@ -229,6 +327,7 @@ pub fn resolve_secrets_manager(
             ),
         );
     }
+    let manager = CachingSecretsManager::wrap(manager);
     Ok(SecretsManagerHandle {
         manager,
         selection,
