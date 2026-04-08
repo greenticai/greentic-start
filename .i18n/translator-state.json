@@ -1,0 +1,1545 @@
+{
+  "version": 0,
+  "langs": {
+    "ar": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "a34436aec911699021e527f63c67369d33ba9743f192d82244429880dfcc5226",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584365
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "09bd47dbb64fdfdfc21c599decb62cc92206e824f4becc385f271d5d8548fd2e",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584365
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "c91e428629ccbe8211d319d3f0a7f7c89854dbd771fbdb21807a62a5ea595685",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584365
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "6dba9612c9a44867655683431ac54f0823f429ec599de0c130197dd705119972",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584365
+        }
+      }
+    },
+    "ay": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "4c8aa8f08b8334fabff3b80546620d9627bacdfec9f9ef5c7bf8da81e649b764",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584371
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "f7ae0376a729bec661b80ed788ffd7dade8c672e48a3cb012c5d340e7890c18b",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584371
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "1e2c66bfd83e69907a67162b1bdd1e4eb21abcfda8a1e9151a9892c0a76b16da",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584371
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "a120c3f9d6b5e5805df520bc760aa206ed6051a64fb48d821b93bc0b5fcda927",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584371
+        }
+      }
+    },
+    "bg": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "35a63c7f9487dec493d6d7e4c8819408d34faa8f393a472da685d7f1655fbe14",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584374
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "626bd637b11c6ef322c721e63abf9fdd4ab5dcd4559855968b82e69dc5f52199",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584374
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "6f25aa5fdb4d286070fa2c10c46c5ba86c1984ea71c393f95a136c1b72651899",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584374
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "34d8812776724d75e19d132aaf70360e2298806649dcf9a7ae0f64f22f6415c6",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584374
+        }
+      }
+    },
+    "bn": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "0fd3bde92f94be8c2e97706713457d4c1e4ad8f5925fa32b8ece3299286fbf4f",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584382
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "0afccaa26c386226e3ae253d66160ec72278cf7170676ee0cfe21125eb2acfd8",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584382
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "890b6b7cae799e582ba7a760186a0ca488052c44bf95f4c41ba875efb0e92f6d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584382
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "b459038c622060ae16e72828d3620f8ddb82c0360a71fbbd810d86ae191f3fe2",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584382
+        }
+      }
+    },
+    "cs": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "48f3c8beb3f4cb30ec9bd58cfc854fae59349c956e311d842163b3fc19b2f92d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584388
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "8a4e68178b7fd3cb38eff41f4747a17478629539b6d9d45327ca25975946b0de",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584388
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "955f9833bfe91edd4cb10a23722be98d0c6ba32b39c9ad06c5c51348a49486e0",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584388
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "1c36917fe99f2ca0a59124a81e5bff6e9013df49692f9161dab9f3918efe28bf",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584388
+        }
+      }
+    },
+    "da": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "7ec6035f79aa3bbfebdb2c7e568eed3edbcc77e8703a92458370b0ccdec37fa3",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584394
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "8144d49aed089dfc7fd025626bb4b5d374f70095a2968b26b45cac4e20b7e35a",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584394
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "25ccdbbed59bce3eb47abc4f3167dfc900e716f5b1f8ef09032ab6c9f8fdb761",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584394
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "a44ace410839fa5cfcb43cbb400e177b7ed6daa7c999944194d01516a7c9bad5",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584394
+        }
+      }
+    },
+    "de": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "caf565528dc1f1a92d7f2911d0205b9d5b0148d6d055b47424c2c4155c7b3daf",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584397
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "e9f9fc0b27cc2acc892906a677ba714a6b2ff4224a66284abd577f1d019a3d13",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584397
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "28486a580f3a392f6959a420b93732b27a25dda789b567f82474845eeb6cf678",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584397
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "a3d14246c7d5cbc1466d7047163bd36ec6c3a93f7bda74749b1a503d0159b605",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584397
+        }
+      }
+    },
+    "el": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "9f2ee7523a2d5e102c2e51762331acacf631fd6765ca50b7bd8a1864460ee565",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584400
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "f96fae3d58d3f8eba4daf4f9ec31ac4b32adb50b800b75767b1d8ef0b24bf668",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584400
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "15fbc51198ab9c6dca634ec85e4b2817bdb812de9884b8992721c93574404d44",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584400
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "4740621a9ac80c477d6bd3513a7e798b1c18e2cc7e0db4701152cfac75680a88",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584400
+        }
+      }
+    },
+    "es": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "fcb92fb60646973662c9afe1d260083b8efb137504bae5157f116016aaed33cd",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584402
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "cdb9df2773dae8faa723d41781530f39869c795cbcfd8a36d7da3ff1212d09ef",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584402
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "06c74da53e01636f7910e576702c3505273b5eee82d2b4c53c1157a46beab1cb",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584402
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "9e496be316d8ca94913399881f6599b5fcde824fbbc3b9fc269c16447264e717",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584402
+        }
+      }
+    },
+    "et": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "a06fbf77033dd1b252c88fd09d82cb711b8263c6eb2a11b0c4cc081e4f52865f",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584405
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "cf5ac32ca9a5c2dd2f5e57bb6fb14dc1802103a9c481799132f416d92a1b1f09",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584405
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "7bc82a317aa857516dfdeb4eaee63c3049c38029d2efa75153bc01d249ea185e",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584405
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "f576c0afd112eb2a9329d78e8205dbdf859688404fbfdadfcf8820cc27bebb08",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584405
+        }
+      }
+    },
+    "fa": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "3e2d6c0d4d6660630e9a3fc263ca50bdfc9e60c25e64cd3d20bc602950704754",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584410
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "446cf3095894d8f388a5c204f141e6d9a17ec2bd5f653685e2d3f41f85ee8029",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584410
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "48775cfca50c54ca1807d0544a5842aff72a804c2642a273235fca09698e775a",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584410
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "5442bbf06cdf60147ae0ec6f4b09a2f2100d6704b4d2f3b1a3b60f1904d3b1f6",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584410
+        }
+      }
+    },
+    "fi": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "56444b82cf91d5d78fe20ec49337d0561c68b54b544f2c35fc2d9b90b56a9c68",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584413
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "e27711276a87acb4a05fb7ed598cd46adaec6941e9ff255ed88e8ab51f7ed5f8",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584413
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "9e80447cb61f902a54b65c1bc165aded7b69fb223108bf8c0267fd011a390585",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584413
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "2b364a03522ba7db8971cf5143b9d56753a7d07748a23c153099a2634866145b",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584413
+        }
+      }
+    },
+    "fr": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "497b452d339f4e1d33694cda99d10fcadbfdc4b72856b1b5292ce271091ef6ab",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584415
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "0bfb644517cce25fbe0759347b469a92b4b95af4453fbd3ec4279709f8c97eef",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584415
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "2834c6022b4433d9e654585c86ac28fe0ef96fae24c9f046da604173a49ff668",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584415
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "6d5b02172e884c41273439f45f718a6ed7070e2fea40e7d10aa89a7db5fccd52",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584415
+        }
+      }
+    },
+    "gn": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "64e8d31911bd82cbafb2b06f4f9b05b548a3608159aa0624ed94b18d687a65ac",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584421
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "8429b27a569b0e89810b95bebb0c10d2c63f2b8cc46a25b5f70d777fdcea4099",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584421
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "629441b9306838458aa42f41e70f6adeec26afc5688f5853e1e5ae9b50e60b83",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584421
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "a367965d9693cf0d11e53d09e41da26c1482f7960e887a005e3c8cbca11b60c9",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584421
+        }
+      }
+    },
+    "gu": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "5ead1915c8b6ee8d103ced72c925485ecee4dd4b4d73f3b02f7daa45d851c017",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584424
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "a236af17b40243494a4d8c59e52c779f6240f7317fce76ddb5898b17c2248396",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584424
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "89ae73b2a7b1cd66874200c56d178186ccfd9fbf6f35c6c639d7a4db3ae7f604",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584424
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "f2fb49f831583a60b6f266c97ffa4570e75bbc93af1ec331bc3da53031ea47ab",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584424
+        }
+      }
+    },
+    "he": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "7623de9e12c26650b7f9fbf57ebfcf0ab99a70a88b6eccb9aa57a81140a59cfc",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584426
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "f3bb25cb30a3b523c014a0cf353fd755cc4b48f73615ac5af05eda6b9c7abd76",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584426
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "ad8fe78835cc77cd06be4034bc2db7d85542c4cd866b8dce61a46df6caf982c8",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584426
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "0ddeecc83eba24575b24470cae2f6989d1791ab83ce2b18c8940ebbb8a0e6f2e",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584426
+        }
+      }
+    },
+    "hi": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "c8e58f3fe94ae0cba21bd2210035b0891e2530c004b317fd6b15891705e5bedd",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584429
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "aff1634405b35677aab7f90bc561a1421bb4da4dbe9e41e7ed882ec25f0b1f71",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584429
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "ee05892a5123e14ab399f2d9b3b7403e5c1b7c28ab2b874bee622c98c8eceedd",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584429
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "f34ec241a4793092bb078f9185cf0b58d995ab615e825c6ebeda4a2d87fd8f12",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584429
+        }
+      }
+    },
+    "hr": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "ae23c0e502fbf282adc0fd4d74ac502e163440ba60ecd334e1af45a0479c9c47",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584433
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "74e5a7d4436db2bd7bd13009910d8a551638fe4956bd48257d84151abaec4f20",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584433
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "0919f671bd280425f1c5739526a37e73919af683e4aabf517f6197227d0bbd5d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584433
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "337769a13672654f57b1440442c7355f27e38e8fe30080f6b5168f132d5bd04c",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584433
+        }
+      }
+    },
+    "ht": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "9644ee5602e2c0ba4513ee83f9e6507b77adc7da174315b13342917d5c516512",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584436
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "120c6ac3ca020821065f97b0306f18207a0a2134ec524159c5bc0e49c8772e73",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584436
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "842a06829f6c8ec67edcea14b70678c286e30ffbc27760f31eeb7367960bad9d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584436
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "f0d84dda57232d95d2d3df2b51058f2b926d1c5c654b4cb17e5c88014e23157e",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584436
+        }
+      }
+    },
+    "hu": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "b660b938774990ffb6b765e069128dd5a62698ba88d339f06aa97155b41e7b5d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584444
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "28e93fe453275d4a8f9961d59f2ac3dd124a3ab8e45c17851a1907c12c132b6c",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584444
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "efc279512cb7e6f57d0c119dddf9d5e0c585b6cdd4e3e4e67f2faa3873ef9966",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584444
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "50c61cb50b83926bd412b793f4ebe261c497935c89fe90865e4dab44569aa83e",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584444
+        }
+      }
+    },
+    "id": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "276c41d8e88921cade1de3c470cc8b992f0fa18df799a099735274341add31fd",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584451
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "012907dbc1b02b9afec6ef0a962332cd9cfebcef4adc62b1dc70fec150492897",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584451
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "917cfc41c5efc56e2248a7bc838c0ecdc40c1b948504b5da7bb76ecc7014120d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584451
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "66fd0f8d40800fe0459f0208d485e3e8e112d0177456f5782a6c9368c91ed9f2",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584451
+        }
+      }
+    },
+    "it": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "dbc0bbbd855353a08ca54e3f27a7dadf0146c32b953431ccd424e01699ab9928",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584453
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "146c7d115accaecc141715f1fdbc7ec61272a14a6b93469f0b837bd4b8659676",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584453
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "eeaa470d13b8060e6ec52aaaa860eec48d0baf6c48f2e138ddb76d9a86f122a1",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584453
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "af9f306553b6c4617332eb690b0c51c143a5e9f9c6c507079cb473b717dd19e5",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584453
+        }
+      }
+    },
+    "ja": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "8133f6f909c78ad94b798cfc22d2b9234561ff4c432eceefafcb928078a02f6a",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584456
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "27bb1e03842211f378a7d73d01ff5addf1a4ac5f287990970f38cf45b36b5bfe",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584456
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "764fa2a77aa2b48bfaf8fcb4cbd7a7443539826bdd67885db8474603223fb2a1",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584456
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "4bc23d5032d43ed44b44aa78156d25f8b829e7b32863f097dd7cbfd5cc9fae6c",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584456
+        }
+      }
+    },
+    "km": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "80dc77240c9bcac642238707d3fb0c9ffe1cfbe86e8fc649eda80a8af031c990",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584459
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "7fb403f0f45ecdca8b011fdc63d1b8d6f5f60df7fb23f5ff782a54600dff7ca9",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584459
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "40b309b7113492605b216d397c40ab563e04526a75b1932ccb1f2f4d28f78626",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584459
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "f786e4de7697f2a2dad50098cbd068cb9a5746255e0ee166b98284622ecd39fc",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584459
+        }
+      }
+    },
+    "kn": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "20f290fb92f916cc4b54a02b679b2d0825a98dff2ee2b6970f1f786b5add15d3",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584464
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "b1873008b6bbb17f00442aadcb21b5eb5a1bc983a29935a252ce449964984a26",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584464
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "d01d917e5aae512d502d1b47333c62b23c82a39a6ed7ed336aba39b084118a6d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584464
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "128ed0d76ef87f02a2d8df3fbfc7bacc25492f8ffe8046b46d6b7395be8ff5fa",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584464
+        }
+      }
+    },
+    "ko": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "3d280be119b68b4a26f72f78f2082ce86880f8894757b95a319b890e6916cca8",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584468
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "93b9f014a92c37b36d287a86f9d5d46b175f01f3da994a5f9981fadf5b5a3141",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584468
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "2509f6ea33ca0910897b1500aa331494ef1db748f8f99bf885491d5b85ec3532",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584468
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "5842094f9e37accebf4b3d89c32d2093c64d41e5c8ccbdf51ea8d12c48bac72f",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584468
+        }
+      }
+    },
+    "lo": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "7c3353ca49c442375c7ba7dd57a7c806181ccc1aa15280a9ca5c9ed0c8971875",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584474
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "e71072cdb7aa2e7b3b447014c58fdf0a983e5635d16b7aebc5698ece6eabb5af",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584474
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "f3c630fc2d48a4b3d45a50c728dbe3738acf9659438527da25b0c409d99a7f90",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584474
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "d1445c6b2d1e3f92539ab059eb327066e41e3c57233dfb6a6224b50b18cb09c9",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584474
+        }
+      }
+    },
+    "lt": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "2fa576cba6f07b6608666680161d2882f628c1a7d90bfaad48b4b838daf0cee1",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584477
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "ceaa9176f1156c30dcb4aec99e9d703f6d4d43d88b2b5f0178db4ecc1d7ea7ac",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584477
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "1f04540482d2a9dc8683cd03521168d4513d293641375c6c2c69a55188e5485d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584477
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "c96fc0234d67331eb8f2b2d49d82aedb51dae7112589a97b9781ce3d923b0476",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584477
+        }
+      }
+    },
+    "lv": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "8f47df5581cbf6828b29feeed6782aba9186b5c95dd7a0c64ac2ea3af16bafa7",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584480
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "9a006a9d592bc136cb8c72dcaf1f3fc2cb439ddee89428e8b51eef74b6f4164c",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584480
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "714edc2a72bcfec69357907a5f9cfe73e75e06c887da90cffd57e11f3133384a",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584480
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "e677f2af88e70685691ae445e250a97925c754248907a44a247095dd090cd428",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584480
+        }
+      }
+    },
+    "ml": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "cb6400549e04aead30fe805588dc8de2e9dd14d45a9d91248294489d2bfd310b",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584483
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "4943c8e991af089cd154144732f5a36b4621105a2c600c4db22f9da82e245404",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584483
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "3caaff6859902d2ef75563bd602b30518888e6b791cf334bd27ca0bf329fee68",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584483
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "5ff07616e5dfc07eb5442acec0289ec4f4965b1b76ea69853da1e5006521bcf9",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584483
+        }
+      }
+    },
+    "mr": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "4694a4d9d6a02ab07bd5c84d5ac962e9c6bbc64491a5855341015b3bb9c71c71",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584486
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "a5bea73682eeb620b8794973917343cea28139e57dd5daecf68a93ba6af58d89",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584486
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "1f9d0d93dc065024a086e65a3132dc966086db951bde2f927979cc34d7a1c24b",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584486
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "db0bb29f6d0d5dfbfeff477200f3b1505101179033f4b51ce3d6a3afb049e94d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584486
+        }
+      }
+    },
+    "ms": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "72a8059de72e86188f1ee112de7d4799ae193ff99fdbd0df73d9e1b5e2d5cf7e",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584489
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "5dc2a1a98d4b59891d9a7d28a9209600f1ddb9d40e9df6bb9560de0f0851071b",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584489
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "917cfc41c5efc56e2248a7bc838c0ecdc40c1b948504b5da7bb76ecc7014120d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584489
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "5b3a215c1058b897e2f973d332651582c1939fc70e3fc7aa47cb0148c6f001b2",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584489
+        }
+      }
+    },
+    "my": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "0b86eecfb471540674d89d6b0083b604967ce064fe329ac073e192ad616a6f10",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584492
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "091b480c34f6c47a47ac0a28331f454b3196ebe4134c8edb417841e22c6b48bf",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584492
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "7e471a9e02fb5af15ab35c3862cd963191e4e5a17717b3797fec15f8b5202c35",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584492
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "e7ac5d991a7f01b4311778e08f7e30619334d07ac156c1b448750eb1b3115c71",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584492
+        }
+      }
+    },
+    "ne": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "970f7df587ab87425d3cc61b42260c560d93169cf64ac45b8a124c4279eb6311",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584498
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "88aca2e79e4036995d3c78e784a3a93ef7dadccc1cd674749984c27d81aa94c3",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584498
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "e176da1d301d1d4c7a47b78501c644f24ef617eab18aad6345f2687c9499ff99",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584498
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "80b0871d54bb1774b26d93d1357a691926c5d981109f0112a022e9e4d11264fd",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584498
+        }
+      }
+    },
+    "nl": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "a2fd9fb494a47b49247c019eaba225971e35785a244a7c63efd536934dbffa96",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584501
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "89a06686fbf99e69b7dc7bf77e62c5b287aaf42a6b4a17fe35bafc3d883a1061",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584501
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "3cb720fa413e6c5c8a88b30ef617bd015057d2b184b3276ab6202a7a09d26555",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584501
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "2a58b3b9ed4d4ae53f9b7dc55bf08284dd7542c0f00ef5c07f0240da3ce6dde9",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584501
+        }
+      }
+    },
+    "no": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "7ec6035f79aa3bbfebdb2c7e568eed3edbcc77e8703a92458370b0ccdec37fa3",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584503
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "4d2634c80d2e37b68c44e1cfc45e5a53e38858d8fe4fb2816385ab38035d28ed",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584503
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "25ccdbbed59bce3eb47abc4f3167dfc900e716f5b1f8ef09032ab6c9f8fdb761",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584503
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "0e3e7ec31f1bbe02db54c7b9c4dfa41e556999a6ec3f55c923a74fc517df6462",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584503
+        }
+      }
+    },
+    "pa": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "d2315412c4c184db06993c2713d5b4663ea4e07433236809f49bda66681af108",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584508
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "446a4ea9b091eb95691b388b514a84e4b8219a6b96d04059797f84d4f673a6f2",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584508
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "c20fc112589cc58c64b5d5d115f081fea87b2a7d133a90a3dbd129ccd76c74fb",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584508
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "581eb59c1650d30907871fd270d6e122c7cf6e4f31b8412d87f71a77d3361520",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584508
+        }
+      }
+    },
+    "pl": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "bd8ce28eabaeb34d3cbd3ad7cc84e9de6c6b6dafbd71b2bd6bc9a0be5bf203f8",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584510
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "b01b5dbab6ddaa51d4307253d4addbbac08d9f816b73ba73bda62238fba78956",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584510
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "45cbbd2539878c8debdc3eebd992686a56ac3557dea79874ade539687c09a932",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584510
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "72eb1d43384c8bb48492d02154327a42dd89787f20051e4473b3bc5b68cfbf2d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584510
+        }
+      }
+    },
+    "pt": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "11bb84a0a1c69fa40ae036f320c510b4be2fbb3c80a94ab841fb876b0ea73fc8",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584513
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "0c596459086bfc77c6e45634c57f7d218ea555c8eb006567a3c3ef31ccb2dc75",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584513
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "d5e43b25873f69aa279e5f511d5899bb291af8b5f2b03272520862daeaf1085e",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584513
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "44e3983bed989dc2bfca4ab36c71b2e80f78368a25f35754a8acfc2730f8b22d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584513
+        }
+      }
+    },
+    "qu": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "d847239406699e022a8163cc2756fc2baf269a2bdd5900a2a4af82a939317055",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584517
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "537f7fe33209c51205f96987d642579869a62a8b068490d161fbf8891242ce0d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584517
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "cf1a7ba1811be319472a377b283776223c6a9b789933a0ce95f15b833dc0150a",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584517
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "8e15e1fabad71e49210268feffe4c8399b6dcd861347abd9d16c23d265a32b5d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584517
+        }
+      }
+    },
+    "ro": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "09e46cef318ed4afc92e4e04bd41c947841e6ae0dcc0382ec03ef8a84cb33305",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584520
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "37d5f2cbd7dcf035a89f2ae553006704a36c3b03239d0fd118aae35c16246901",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584520
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "2d5b06bc160107a2e769d4c2818dbd7a3b7ad4e6ec2fe7ffd2647cefaee76e2c",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584520
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "d1170d25c0d5a9937791ccbb18d09d2b6e12d605eb11707b9b94c9caea5c1d97",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584520
+        }
+      }
+    },
+    "ru": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "37a7bea4aab5b2098b8c347daa9ad9ba032a2d847f3c768f3fab325d23670152",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584523
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "f9dd606b993e071a91e1e17f7481b9309bd1a0e22627ed42d224d43d35c5b162",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584523
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "945b21f934a8e59d831c36e77c5dd43d83b50f931682fecca7f3f539ed8ba2ca",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584523
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "670850a9b9f3f74fbefb1f9d35be0e7d257763484dc0842a118bccfd0f6383a5",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584523
+        }
+      }
+    },
+    "si": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "08fb86e911dee06aa5ef6c7d983d5b9079290130dac643828702dd78d17d00a5",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584526
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "b613546b142b6b072b68a5759a712fbd8c252e1d52e0d322e825d3795870192d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584526
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "63e367f66bbb058cb597cbe1b9f65bc5b11d6b99024f9fcf4a710b7cd845d592",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584526
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "fabd0c01c59199413cb1e69afd602b4e19d2345754be111c0f2988a6bb09cc80",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584526
+        }
+      }
+    },
+    "sk": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "3aacee8afa8a0cc69337636739a0db4cf8dab8ffdd235717ac3f468faecb46dc",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584528
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "fd15fe0aeeeddd61c96abf6d1b394b1bb3ca4bc184b0e77f8b707b4a773e84cd",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584528
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "eb45ab2ecd9134134580fdcb4d6cac94f0b16b4fb8badf030a417d85ec41d5d8",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584528
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "42a0686faeae41c1f8db85ee2aeaeffd398fd501c0cde134da55dd517173fcd6",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584528
+        }
+      }
+    },
+    "sr": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "ae23c0e502fbf282adc0fd4d74ac502e163440ba60ecd334e1af45a0479c9c47",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584534
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "b5bc51b0d2a67497de7444a6b147235c99e14974b8c4edb20d4228d7c7e77bfd",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584534
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "0919f671bd280425f1c5739526a37e73919af683e4aabf517f6197227d0bbd5d",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584534
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "9151e1e91813afacde829567dda3c5b56ac2d7d6f8f2480d13a7480229076da0",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584534
+        }
+      }
+    },
+    "sv": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "741624931a6b2c82d8d631d746e0542e7975924d6c41f3e6e0f77144249adf71",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584536
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "76a1cda1d62efbd594842071d7016b1d8709a2a9f428206185213190e07793b0",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584536
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "29fa4802110e0061db3ec76cc2e9fd9e5d7e81e4692fe9a3eb267af1cdbd03e3",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584536
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "69ac1d874ba29eb58159129abe3c026848def631c8a003431978bcf0a4179ccb",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584536
+        }
+      }
+    },
+    "ta": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "4ee1e63f9cae26bc40765c770b11c98d2f1e79484ff5eca226b4ed572348685a",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584539
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "1b081405bfde6f00bd683529de17666ab99a5c2c3c0b034a1dad7ebd49926c9f",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584539
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "e441b47aea4e81c8f95844f4e8e30839dbe8baf64e2f8fe8b6393fb348c76520",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584539
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "c3ce30f0b731aacac5f0ac4c8b29e0bc110d63b41ce49c49b5f6a9d58fcb7831",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584539
+        }
+      }
+    },
+    "te": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "9f509171786e82d1b7f6d392b8ee237b3ce25c26df3d1bfc4d4fe8f81d9973c5",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584545
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "d5257c03fadee67ccf25909e63717b238dbe696354bebcccf124171e5615fd32",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584545
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "5715c8de841d16cd489254730b2dd57e695de915db24dc61c4caacb5b465400a",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584545
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "8ffc3cb5649662edc548baaca5fa66c3494eef19103199d1f54349f63c6c4fb1",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584545
+        }
+      }
+    },
+    "th": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "579ddd3fbea2c52c14fc7795853c280f1af131e626bd2ae912a0401faa21041b",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584547
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "841d6bc889e993995f88c7c5e372d9bafdcd6d6d47f0f2f131eabb540f0d4dce",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584547
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "72752cc6dfa38b2aeba3d21610934eb7ef095523af576bee57771a53d150faac",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584547
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "8d866de43e8128c755024cd5fabbc06c94e3ab1dc11a03608648a017e9312d15",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584547
+        }
+      }
+    },
+    "tl": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "8c0105cfe2ce48493cc37969cf21574dbd1a5f6cd412a3bd7e59f9d989b2eacb",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584551
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "f9253a399264b0c3734dc4ec97b3d7729d6f0abbe7c96fb866b79636b04fdc03",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584551
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "eb70118ac65c3759dfd35c787995b83846373a54ca630d837e6e980939230e25",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584551
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "0028daa6dead150baa57618e06fe18de255c1f923fb118f968729557d03d0437",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584551
+        }
+      }
+    },
+    "tr": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "2d6762d41c59c54a9f51bde9a3c18840247960512544e05e974f730cf5b16636",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584554
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "4b5bdbab66b10f24024b8c52450cd4ad10f62ca53d6516475c75f50629ff7d07",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584554
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "63d97747424f43aac92ccd7824d281257fb9869c3c494a48b1c00ca1310adb37",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584554
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "184b34fd9dd8a15104f474e82233295319de5fa2fcfc7807a1e9ad3f591cbb06",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584554
+        }
+      }
+    },
+    "uk": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "8d65d59efdce02bfa60958dd970d882ad1b3b0f5fc0dd50adea6bd6fcbb18f99",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584559
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "4e3200d2b319c719425e843ba8f13673363f86249a24b4f27352ce3dcf7c9080",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584559
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "37403dbd4867142aaeb5342bc39add8fdfd1150e0b470586f90971f06eea4ef1",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584559
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "a98fc555a7bb04ed260a3ed4265a92176f22167b29833499ff963c8b65550ce8",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584559
+        }
+      }
+    },
+    "ur": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "35bde58894a32bb9ed78e720482ed92a33c71b78d8979f6f0462c2ead80e3765",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584561
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "ae559e285b2484799c0a7d635932f742e22ab63b5fac1fb690d4c75d98a1a712",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584561
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "48775cfca50c54ca1807d0544a5842aff72a804c2642a273235fca09698e775a",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584561
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "f6043b462fe3eccf1932c224731c516c0bf4452fbc88c9e4ced5620fd4681d5b",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584561
+        }
+      }
+    },
+    "vi": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "d2d77815fc7bea9478f062a63926081faa29d8287c58c131165cb8e6b06b0af9",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584566
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "e3c487b1963d32226ae4a7b45dfa3caaf255778760da847625ca79bd81005535",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584566
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "2a838fad314ad1e22a4a737cbfc76a218787f515bd27140b0164ba8c41f33e45",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584566
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "92de009c0b9367984646814099bcb996b2bca4e6d79972d43628e18bfa548c07",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584566
+        }
+      }
+    },
+    "zh": {
+      "keys": {
+        "welcome.btn1": {
+          "last_english_hash": "394a0a4266c3719723d5b43ab49824ac3a93e7c56befc69fb998063d1b3e1761",
+          "last_bot_translation_hash": "9de41750f9962f488d419ed92800bb00a1d7105e0f3bf02ea51a111d7a55a757",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584569
+        },
+        "welcome.btn2": {
+          "last_english_hash": "4ab39dda8cde3b8b2baff085c6dedf6d87efc6be87803e677e59fd77bad99e4d",
+          "last_bot_translation_hash": "ef2b491c5b4bd0f8f96b9e7eef233a735e4645aa9da16ce4cd396112f759a64f",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584569
+        },
+        "welcome.heading": {
+          "last_english_hash": "b0da11ac2e829f93d431e6b6ec7820ac19f1b15872c92909d3d4f9e14e61234b",
+          "last_bot_translation_hash": "8718656d8269a2a8e58ef69ac0cd4733bb229d88fcaa61e1f3460d78c5bfd5d8",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584569
+        },
+        "welcome.text": {
+          "last_english_hash": "0644ef4d8b52da5d3543ed52263e33ada421373dc595c2595d0f6e04ef8e483a",
+          "last_bot_translation_hash": "4990423349f3b2623c7d85d6ddcd845b74540f939fde4e91dd1ab38468c4d817",
+          "engine": "codex-cli",
+          "timestamp_epoch_secs": 1775584569
+        }
+      }
+    }
+  }
+}

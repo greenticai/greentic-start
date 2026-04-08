@@ -37,17 +37,17 @@ use helpers::{
 use hooks::json_to_canonical_cbor;
 use types::{HookChainOutcome, OperationEnvelope, OperationStatus, RunnerMode};
 
-#[derive(Clone)]
 pub struct DemoRunnerHost {
     bundle_root: PathBuf,
     runner_mode: RunnerMode,
     catalog: HashMap<(Domain, String), ProviderPack>,
     packs_by_path: BTreeMap<PathBuf, ProviderPack>,
-    capability_registry: CapabilityRegistry,
+    pub(crate) capability_registry: CapabilityRegistry,
     secrets_handle: SecretsManagerHandle,
-    card_renderer: CardRenderer,
+    pub(crate) card_renderer: CardRenderer,
     state_store: DynStateStore,
     debug_enabled: bool,
+    pub(crate) cross_pack_resolver: std::sync::RwLock<Option<std::sync::Arc<dyn greentic_runner_host::runner::engine::CrossPackResolver>>>,
 }
 
 impl DemoRunnerHost {
@@ -80,6 +80,33 @@ impl DemoRunnerHost {
         key: &str,
         ctx: &OperatorContext,
     ) -> anyhow::Result<Option<Vec<u8>>> {
+        self.get_secret_with_handle(&self.secrets_handle, provider, key, ctx)
+    }
+
+    /// Read a secret using a fresh secrets handle (re-reads from disk).
+    /// Use this for values that may have been updated at runtime (e.g., public_base_url).
+    pub fn get_secret_fresh(
+        &self,
+        provider: &str,
+        key: &str,
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let fresh = crate::secrets_gate::resolve_secrets_manager(
+            &self.bundle_root,
+            &ctx.tenant,
+            ctx.team.as_deref(),
+        )
+        .unwrap_or_else(|_| self.secrets_handle.clone());
+        self.get_secret_with_handle(&fresh, provider, key, ctx)
+    }
+
+    fn get_secret_with_handle(
+        &self,
+        handle: &SecretsManagerHandle,
+        provider: &str,
+        key: &str,
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
         use crate::secrets_gate::canonical_secret_uri;
         use crate::secrets_setup::resolve_env;
 
@@ -88,10 +115,9 @@ impl DemoRunnerHost {
 
         make_runtime_or_thread_scope(|rt| {
             rt.block_on(async {
-                match self.secrets_handle.manager().read(&uri).await {
+                match handle.manager().read(&uri).await {
                     Ok(bytes) => Ok(Some(bytes)),
                     Err(err) => {
-                        // Check if it's a "not found" error
                         let err_str = err.to_string();
                         if err_str.contains("not found") || err_str.contains("NotFound") {
                             Ok(None)
@@ -180,6 +206,7 @@ impl DemoRunnerHost {
             card_renderer: CardRenderer::new(),
             state_store: new_state_store(),
             debug_enabled,
+            cross_pack_resolver: std::sync::RwLock::new(None),
         })
     }
 

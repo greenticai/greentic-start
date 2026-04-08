@@ -2104,6 +2104,10 @@ dependencies = [
 [[package]]
 name = "greentic-i18n"
 version = "0.4.56"
+
+[[package]]
+name = "greentic-i18n"
+version = "0.4.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44951881c763069e14624cf8cf1dddff706ad4d8132570dc299af0b855cf4458"
 
@@ -2226,9 +2230,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "0.4.72"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30947742281111d704b2f948268bba4bfdec13cafdd61e1c719b01766f1ef883"
+version = "0.4.74"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -2247,9 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "0.4.72"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8659a6374cbb418f0c5253fd675e525d084a1728424f313d4c1e728e3b00b4b6"
+version = "0.4.74"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2266,7 +2266,7 @@ dependencies = [
  "greentic-config-types",
  "greentic-distributor-client",
  "greentic-flow",
- "greentic-i18n",
+ "greentic-i18n 0.4.56",
  "greentic-interfaces",
  "greentic-interfaces-host",
  "greentic-interfaces-wasmtime",
@@ -2422,7 +2422,7 @@ dependencies = [
  "clap",
  "dialoguer",
  "greentic-distributor-client",
- "greentic-i18n",
+ "greentic-i18n 0.4.56 (registry+https://github.com/rust-lang/crates.io-index)",
  "greentic-secrets-lib",
  "greentic-types",
  "hmac 0.13.0",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-start"
-version = "0.4.39"
+version = "0.4.40"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2457,7 +2457,7 @@ dependencies = [
  "dashmap",
  "flate2",
  "greentic-distributor-client",
- "greentic-i18n",
+ "greentic-i18n 0.4.56 (registry+https://github.com/rust-lang/crates.io-index)",
  "greentic-runner-desktop",
  "greentic-runner-host",
  "greentic-secrets-lib",
@@ -4663,9 +4663,7 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "0.4.72"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d66e0fb7d5b33cd31641b154e52e2c114c3544234a7d191cead8f034c4065554"
+version = "0.4.74"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

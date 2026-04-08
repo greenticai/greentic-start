@@ -14,6 +14,8 @@ use greentic_runner_host::pack::{ComponentResolution, PackRuntime};
 use greentic_runner_host::storage::DynSessionStore;
 use serde_json::{Value as JsonValue, json};
 
+use greentic_runner_host::runner::engine::CrossPackResolver;
+
 use crate::domains::{Domain, ProviderPack};
 use crate::operator_log;
 use crate::runner_exec;
@@ -34,7 +36,123 @@ use super::types::{
     RunnerExecutionMode, RunnerMode,
 };
 
+
+/// Bridges `DemoRunnerHost::invoke_capability` to `CrossPackResolver`.
+struct BundleCrossPackResolver(Arc<super::DemoRunnerHost>);
+
+
+impl CrossPackResolver for BundleCrossPackResolver {
+    fn invoke(
+        &self,
+        provider_id: &str,
+        _provider_type: Option<&str>,
+        op: &str,
+        input: &[u8],
+        tenant: &str,
+        team: Option<&str>,
+    ) -> anyhow::Result<JsonValue> {
+        let ctx = super::OperatorContext {
+            tenant: tenant.to_string(),
+            team: team.map(String::from),
+            correlation_id: None,
+        };
+        // Map provider_id → capability ID. Known mappings first, then convention.
+        let cap_id = match provider_id {
+            "oauth-oidc-generic" | "oauth" => {
+                crate::capabilities::CAP_OAUTH_BROKER_V1.to_string()
+            }
+            other => format!("greentic.cap.{other}.v1"),
+        };
+
+        // The OAuth WASM component expects WitDispatchInput format:
+        // { "host": { "public_base_url": "..." }, "provider": { ... }, "input": { ... } }
+        // Read provider config from secrets and wrap accordingly.
+        let input_value: JsonValue = serde_json::from_slice(input).unwrap_or(json!({}));
+        let env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string());
+        // Try reading public_base_url from the OAuth provider secrets first,
+        // then from the webchat provider, then from environment.
+        let public_base_url = self.0.get_secret("oauth-oidc-generic", "public_base_url", &ctx)
+            .ok().flatten()
+            .and_then(|v| String::from_utf8(v).ok())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.0.get_secret("messaging-webchat-gui", "public_base_url", &ctx)
+                    .ok().flatten()
+                    .and_then(|v| String::from_utf8(v).ok())
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| std::env::var("PUBLIC_BASE_URL").ok())
+            .unwrap_or_else(|| "https://localhost:8080".to_string());
+        // Ensure https — OAuth providers require it.
+        let public_base_url = if public_base_url.starts_with("http://") {
+            public_base_url.replacen("http://", "https://", 1)
+        } else {
+            public_base_url
+        };
+        let secret_provider = "oauth-oidc-generic";
+        let client_id = self.0.get_secret(secret_provider, "client_id", &ctx)
+            .ok().flatten()
+            .and_then(|v| String::from_utf8(v).ok())
+            .unwrap_or_default();
+        let auth_url = self.0.get_secret(secret_provider, "auth_url", &ctx)
+            .ok().flatten()
+            .and_then(|v| String::from_utf8(v).ok())
+            .unwrap_or_else(|| "https://github.com/login/oauth/authorize".to_string());
+        let token_url = self.0.get_secret(secret_provider, "token_url", &ctx)
+            .ok().flatten()
+            .and_then(|v| String::from_utf8(v).ok())
+            .unwrap_or_else(|| "https://github.com/login/oauth/access_token".to_string());
+        let default_scopes_raw = self.0.get_secret(secret_provider, "default_scopes", &ctx)
+            .ok().flatten()
+            .and_then(|v| String::from_utf8(v).ok())
+            .unwrap_or_else(|| "repo,user:email".to_string());
+        // Parse as JSON array first, fall back to comma-separated string.
+        let scopes_list: Vec<String> = serde_json::from_str::<Vec<String>>(&default_scopes_raw)
+            .unwrap_or_else(|_| {
+                default_scopes_raw
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            });
+
+        let wrapped = json!({
+            "host": { "public_base_url": public_base_url },
+            "provider": {
+                "provider_id": provider_id,
+                "client_id": client_id,
+                "auth_url": auth_url,
+                "token_url": token_url,
+                "default_scopes": scopes_list,
+            },
+            "input": input_value,
+        });
+        let wrapped_bytes = serde_json::to_vec(&wrapped).unwrap_or_default();
+        eprintln!("[cross-pack] wrapped input for {provider_id}:{op}: {}", String::from_utf8_lossy(&wrapped_bytes).chars().take(500).collect::<String>());
+
+        let outcome = self.0.invoke_capability(&cap_id, op, &wrapped_bytes, &ctx)?;
+        if outcome.success {
+            outcome
+                .output
+                .ok_or_else(|| anyhow!("cross-pack {provider_id}:{op} returned no output"))
+        } else {
+            Err(anyhow!(
+                "cross-pack {provider_id}:{op} failed: {}",
+                outcome.error.unwrap_or_else(|| "unknown".to_string())
+            ))
+        }
+    }
+}
+
 impl DemoRunnerHost {
+    /// Create a `CrossPackResolver` for use in flow engine `provider.invoke` nodes.
+    pub fn cross_pack_resolver(
+        self: &Arc<Self>,
+    ) -> Arc<dyn CrossPackResolver> {
+        Arc::new(BundleCrossPackResolver(Arc::clone(self)))
+    }
+
+
     pub fn invoke_provider_op(
         &self,
         domain: Domain,
@@ -250,6 +368,7 @@ impl DemoRunnerHost {
             team: ctx.team.clone(),
             input: payload.clone(),
             dist_offline: true,
+            cross_pack_resolver: self.cross_pack_resolver.read().ok().and_then(|r| r.clone()),
         };
         let run_output = runner_exec::run_provider_pack_flow(request)?;
         let parsed = read_transcript_outputs(&run_output.run_dir)?;
