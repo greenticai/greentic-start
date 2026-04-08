@@ -725,11 +725,19 @@ mod tests {
         normalize_extracted_permissions(dir.path()).expect("normalize");
 
         assert_eq!(
-            fs::metadata(&nested).expect("meta nested").permissions().mode() & 0o777,
+            fs::metadata(&nested)
+                .expect("meta nested")
+                .permissions()
+                .mode()
+                & 0o777,
             0o755
         );
         assert_eq!(
-            fs::metadata(&child).expect("meta child").permissions().mode() & 0o777,
+            fs::metadata(&child)
+                .expect("meta child")
+                .permissions()
+                .mode()
+                & 0o777,
             0o755
         );
         assert_eq!(
