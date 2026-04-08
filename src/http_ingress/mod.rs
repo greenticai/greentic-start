@@ -285,6 +285,16 @@ where
             .map_err(|err| *err);
     }
 
+    // OAuth authorize URL: GET /oauth/authorize → returns JSON with authorize_url
+    if path.contains("/oauth/authorize") && req.method() == Method::GET {
+        return helpers::handle_oauth_authorize(&req, &state.runner_host).await;
+    }
+
+    // OAuth callback: GET /oauth/callback?code=...&state=...
+    if path.contains("/oauth/callback") && req.method() == Method::GET {
+        return helpers::handle_oauth_callback(&req, &state.runner_host).await;
+    }
+
     // OAuth token exchange proxy: /v1/messaging/webchat/{tenant}/oauth/token-exchange
     if path.contains("/oauth/token-exchange") && req.method() == Method::POST {
         return handle_oauth_token_exchange(req).await;

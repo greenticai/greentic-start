@@ -34,6 +34,12 @@ pub(super) fn route_messaging_envelopes(
         ),
     );
 
+    let cross_pack_resolver = runner_host
+        .cross_pack_resolver
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone());
+
     for envelope in &envelopes {
         let outputs = if let Some(route_to_card) = envelope.metadata.get("routeToCardId") {
             match read_card_from_pack(&app_pack_path, route_to_card) {
@@ -76,14 +82,86 @@ pub(super) fn route_messaging_envelopes(
                             route_to_card
                         ),
                     );
-                    run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
+                    run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope, cross_pack_resolver.clone())
                 }
             }
         } else {
-            run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
+            run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope, cross_pack_resolver.clone())
         };
 
-        for out_envelope in outputs {
+        for mut out_envelope in outputs {
+            // Post-process: the flow engine's WASM component may emit cards with
+            // unresolved i18n (empty titles/text) because the pack asset resolver
+            // is not available inside the WASM sandbox. Detect this and re-read
+            // the original card from the pack, applying i18n token replacement.
+            if let Some(card_str) = out_envelope.metadata.get("adaptive_card").cloned() {
+                let needs_patch = card_str.contains("\"title\":\"\"")
+                    || card_str.contains("\"text\":\"\"")
+                    || card_str.contains("{{i18n:");
+
+                if needs_patch {
+                    let locale = out_envelope
+                        .metadata
+                        .get("locale")
+                        .map(String::as_str)
+                        .unwrap_or("en");
+
+                    // Identify the card by scanning ALL pack card assets and matching
+                    // on the action data fingerprint (action_ids are unique per card).
+                    let action_ids = extract_action_ids(&card_str);
+                    if let Some(card_name) = find_card_by_actions(&app_pack_path, &action_ids) {
+                        if let Some(mut fresh_card) = read_card_from_pack(&app_pack_path, &card_name) {
+                            resolve_i18n_tokens(&mut fresh_card, &app_pack_path, locale);
+                            out_envelope.metadata.insert(
+                                "adaptive_card".to_string(),
+                                serde_json::to_string(&fresh_card).unwrap_or_default(),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Resolve oauth://start URLs in card output by reading OAuth config
+            // from secrets and building the real GitHub authorize URL.
+            if let Some(card_str) = out_envelope.metadata.get("adaptive_card").cloned() {
+                if card_str.contains("oauth://start") {
+                    let oauth_provider = "oauth-oidc-generic";
+                    let client_id = runner_host.get_secret(oauth_provider, "client_id", ctx)
+                        .ok().flatten().and_then(|v| String::from_utf8(v).ok()).unwrap_or_default();
+                    let auth_url = runner_host.get_secret(oauth_provider, "auth_url", ctx)
+                        .ok().flatten().and_then(|v| String::from_utf8(v).ok())
+                        .unwrap_or_else(|| "https://github.com/login/oauth/authorize".into());
+                    // Read public_base_url: try env var first (set by webhook updater),
+                    // then fall back to secrets (may be stale from startup).
+                    let mut base_url = runner_host.get_secret_fresh("messaging-webchat-gui", "public_base_url", ctx)
+                        .ok().flatten().and_then(|v| String::from_utf8(v).ok())
+                        .unwrap_or_else(|| "https://localhost:8080".into());
+                    if base_url.starts_with("http://") {
+                        base_url = base_url.replacen("http://", "https://", 1);
+                    }
+                    let scopes = runner_host.get_secret(oauth_provider, "default_scopes", ctx)
+                        .ok().flatten().and_then(|v| String::from_utf8(v).ok())
+                        .unwrap_or_else(|| "repo user:email".into());
+                    let state = uuid::Uuid::new_v4().to_string();
+                    let redirect_uri = format!("{base_url}/oauth/callback");
+                    let encode = |s: &str| -> String {
+                        s.bytes().map(|b| match b {
+                            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                                String::from(b as char)
+                            }
+                            _ => format!("%{b:02X}"),
+                        }).collect()
+                    };
+                    let real_url = format!(
+                        "{auth_url}?response_type=code&client_id={client_id}&redirect_uri={}&scope={}&state={state}",
+                        encode(&redirect_uri),
+                        encode(&scopes),
+                    );
+                    let patched = card_str.replace("oauth://start", &real_url);
+                    out_envelope.metadata.insert("adaptive_card".to_string(), patched);
+                }
+            }
+
             // Standard egress pipeline: render → encode → send_payload.
             // All providers (including webchat) use this path. The webchat provider's
             // send_payload writes bot activities to the conversation state store for
@@ -92,7 +170,42 @@ pub(super) fn route_messaging_envelopes(
 
             let plan = match egress::render_plan(runner_host, ctx, provider, message_value.clone())
             {
-                Ok(plan) => plan,
+                Ok(mut plan) => {
+                    // Resolve oauth://start URLs in the rendered plan
+                    let plan_str = plan.to_string();
+                    if plan_str.contains("oauth://start") {
+                        let oauth_provider = "oauth-oidc-generic";
+                        let client_id = runner_host.get_secret(oauth_provider, "client_id", ctx)
+                            .ok().flatten().and_then(|v| String::from_utf8(v).ok()).unwrap_or_default();
+                        let auth_url = runner_host.get_secret(oauth_provider, "auth_url", ctx)
+                            .ok().flatten().and_then(|v| String::from_utf8(v).ok())
+                            .unwrap_or_else(|| "https://github.com/login/oauth/authorize".into());
+                        let mut base_url = runner_host.get_secret_fresh("messaging-webchat-gui", "public_base_url", ctx)
+                            .ok().flatten().and_then(|v| String::from_utf8(v).ok())
+                            .unwrap_or_else(|| "https://localhost:8080".into());
+                        if base_url.starts_with("http://") {
+                            base_url = base_url.replacen("http://", "https://", 1);
+                        }
+                        let scopes = runner_host.get_secret(oauth_provider, "default_scopes", ctx)
+                            .ok().flatten().and_then(|v| String::from_utf8(v).ok())
+                            .unwrap_or_else(|| "repo user:email".into());
+                        let state = uuid::Uuid::new_v4().to_string();
+                        let callback = format!("{base_url}/oauth/callback");
+                        let enc = |s: &str| -> String {
+                            s.bytes().map(|b| match b {
+                                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => String::from(b as char),
+                                _ => format!("%{b:02X}"),
+                            }).collect()
+                        };
+                        let real_url = format!(
+                            "{auth_url}?response_type=code&client_id={client_id}&redirect_uri={}&scope={}&state={state}",
+                            enc(&callback), enc(&scopes),
+                        );
+                        let patched = plan_str.replace("oauth://start", &real_url);
+                        plan = serde_json::from_str(&patched).unwrap_or(plan);
+                    }
+                    plan
+                }
                 Err(err) => {
                     operator_log::warn(
                         module_path!(),
@@ -193,6 +306,7 @@ fn run_app_flow_safe(
     pack_info: &app::AppPackInfo,
     flow: &app::AppFlowInfo,
     envelope: &ChannelMessageEnvelope,
+    resolver: Option<std::sync::Arc<dyn greentic_runner_host::runner::engine::CrossPackResolver>>,
 ) -> Vec<ChannelMessageEnvelope> {
     match app::run_app_flow(
         bundle,
@@ -201,6 +315,7 @@ fn run_app_flow_safe(
         &pack_info.pack_id,
         &flow.id,
         envelope,
+        resolver,
     ) {
         Ok(outputs) => outputs,
         Err(err) => {
@@ -214,6 +329,59 @@ fn run_app_flow_safe(
 }
 
 use anyhow::Context;
+
+/// Extract action_id values from a card JSON string.
+fn extract_action_ids(card_str: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(card_str) else {
+        return ids;
+    };
+    if let Some(actions) = val.get("actions").and_then(|a| a.as_array()) {
+        for action in actions {
+            if let Some(id) = action.pointer("/data/action_id").and_then(|v| v.as_str()) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    ids
+}
+
+/// Find a card asset name in the pack whose actions match the given action_ids.
+fn find_card_by_actions(pack_path: &Path, action_ids: &[String]) -> Option<String> {
+    if action_ids.is_empty() {
+        return None;
+    }
+    let file = std::fs::File::open(pack_path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    for idx in 0..archive.len() {
+        let entry = archive.by_index(idx).ok()?;
+        let name = entry.name().to_string();
+        if !name.starts_with("assets/cards/") || !name.ends_with(".json") {
+            continue;
+        }
+        drop(entry);
+        let mut entry = archive.by_name(&name).ok()?;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut buf).ok()?;
+        let card: serde_json::Value = serde_json::from_slice(&buf).ok()?;
+        let card_actions = card.get("actions").and_then(|a| a.as_array());
+        if let Some(card_actions) = card_actions {
+            let card_ids: Vec<String> = card_actions
+                .iter()
+                .filter_map(|a| a.pointer("/data/action_id").and_then(|v| v.as_str()).map(String::from))
+                .collect();
+            if !card_ids.is_empty() && card_ids == *action_ids {
+                // Extract card name stem from path
+                let stem = std::path::Path::new(&name)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(String::from)?;
+                return Some(stem);
+            }
+        }
+    }
+    None
+}
 
 /// Read i18n bundle from pack and resolve `{{i18n:KEY}}` tokens in card JSON.
 fn resolve_i18n_tokens(card: &mut serde_json::Value, pack_path: &Path, locale: &str) {

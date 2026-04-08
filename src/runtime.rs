@@ -814,6 +814,12 @@ pub fn demo_up_services(
         secrets_handle.clone(),
         debug_enabled,
     )?);
+    // Initialize cross-pack resolver so flow engine can invoke providers
+    // from other packs (e.g., OAuth broker from oauth-oidc-generic pack).
+    {
+        let resolver = runner_host.cross_pack_resolver();
+        *runner_host.cross_pack_resolver.write().expect("rwlock") = Some(resolver);
+    }
     let ingress_domains = detect_http_ingress_domains(&discovery, runner_host.as_ref());
     // Enable static routes if bundle declares them - no longer requires NATS mode
     let enable_static_routes = static_routes.bundle_has_static_routes();

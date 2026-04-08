@@ -236,6 +236,201 @@ where
     }
 }
 
+/// Return OAuth authorize URL as JSON: GET /oauth/authorize
+pub(super) async fn handle_oauth_authorize(
+    req: &hyper::Request<impl Body>,
+    runner_host: &crate::runner_host::DemoRunnerHost,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let ctx = crate::runner_host::OperatorContext {
+        tenant: "demo".to_string(),
+        team: None,
+        correlation_id: None,
+    };
+    let secret_provider = "oauth-oidc-generic";
+    let client_id = runner_host.get_secret(secret_provider, "client_id", &ctx)
+        .ok().flatten().and_then(|v| String::from_utf8(v).ok()).unwrap_or_default();
+    let auth_url = runner_host.get_secret(secret_provider, "auth_url", &ctx)
+        .ok().flatten().and_then(|v| String::from_utf8(v).ok())
+        .unwrap_or_else(|| "https://github.com/login/oauth/authorize".into());
+    let scopes = runner_host.get_secret(secret_provider, "default_scopes", &ctx)
+        .ok().flatten().and_then(|v| String::from_utf8(v).ok())
+        .unwrap_or_else(|| "repo user:email".into());
+    let mut base_url = runner_host.get_secret_fresh("messaging-webchat-gui", "public_base_url", &ctx)
+        .ok().flatten().and_then(|v| String::from_utf8(v).ok())
+        .unwrap_or_else(|| "https://localhost:8080".into());
+    if base_url.starts_with("http://") {
+        base_url = base_url.replacen("http://", "https://", 1);
+    }
+    let callback_url = format!("{base_url}/oauth/callback");
+    let state = uuid::Uuid::new_v4().to_string();
+
+    fn encode(s: &str) -> String {
+        s.bytes().map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => String::from(b as char),
+            _ => format!("%{b:02X}"),
+        }).collect()
+    }
+
+    let authorize_url = format!(
+        "{auth_url}?response_type=code&client_id={client_id}&redirect_uri={}&scope={}&state={state}",
+        encode(&callback_url),
+        encode(&scopes),
+    );
+
+    let body = json!({
+        "authorize_url": authorize_url,
+        "client_id": client_id,
+        "state": state,
+    });
+    Ok(with_cors(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(body.to_string())))
+            .unwrap(),
+    ))
+}
+
+/// Handle OAuth callback: GET /oauth/callback?code=...&state=...
+/// Exchanges the authorization code for an access token and redirects
+/// the user back to the webchat UI.
+pub(super) async fn handle_oauth_callback(
+    req: &hyper::Request<impl Body>,
+    runner_host: &crate::runner_host::DemoRunnerHost,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let query = req.uri().query().unwrap_or("");
+    let params: std::collections::HashMap<String, String> = query
+        .split('&')
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            Some((parts.next()?.to_string(), parts.next().unwrap_or("").to_string()))
+        })
+        .collect();
+
+    let code = params.get("code").cloned().unwrap_or_default();
+    let state = params.get("state").cloned().unwrap_or_default();
+
+    if code.is_empty() {
+        return Err(error_response(StatusCode::BAD_REQUEST, "missing code parameter"));
+    }
+
+    // Read OAuth config from secrets
+    let ctx = crate::runner_host::OperatorContext {
+        tenant: "demo".to_string(),
+        team: None,
+        correlation_id: None,
+    };
+    let secret_provider = "oauth-oidc-generic";
+    let client_id = runner_host.get_secret(secret_provider, "client_id", &ctx)
+        .ok().flatten().and_then(|v| String::from_utf8(v).ok()).unwrap_or_default();
+    let client_secret = runner_host.get_secret(secret_provider, "client_secret", &ctx)
+        .ok().flatten().and_then(|v| String::from_utf8(v).ok()).unwrap_or_default();
+    let token_url = runner_host.get_secret(secret_provider, "token_url", &ctx)
+        .ok().flatten().and_then(|v| String::from_utf8(v).ok())
+        .unwrap_or_else(|| "https://github.com/login/oauth/access_token".into());
+    let mut base_url = runner_host.get_secret_fresh("messaging-webchat-gui", "public_base_url", &ctx)
+        .ok().flatten().and_then(|v| String::from_utf8(v).ok())
+        .unwrap_or_else(|| "http://localhost:8080".into());
+    if base_url.starts_with("http://") && !base_url.contains("localhost") {
+        base_url = base_url.replacen("http://", "https://", 1);
+    }
+    let redirect_uri = format!("{base_url}/oauth/callback");
+
+    // Exchange code for token
+    fn encode(s: &str) -> String {
+        s.chars()
+            .map(|c| match c {
+                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+                _ => format!("%{:02X}", c as u8),
+            })
+            .collect()
+    }
+    let form_body = format!(
+        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&client_secret={}",
+        encode(&code),
+        encode(&redirect_uri),
+        encode(&client_id),
+        encode(&client_secret),
+    );
+
+    let token_url_owned = token_url.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        ureq::post(&token_url_owned)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .send(form_body.as_bytes())
+    })
+    .await;
+
+    let (success, token_info) = match result {
+        Ok(Ok(mut response)) => {
+            let body = response.body_mut().read_to_string().unwrap_or_default();
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(json!({}));
+            if parsed.get("access_token").is_some() {
+                (true, parsed)
+            } else {
+                (false, parsed)
+            }
+        }
+        _ => (false, json!({"error": "token exchange failed"})),
+    };
+
+    // Return HTML that communicates result to the opener window and closes the popup.
+    // If opened as popup: postMessage to opener → close.
+    // If opened as tab: redirect back to webchat with hash params.
+    let (status_str, token_str, error_str) = if success {
+        let t = token_info["access_token"].as_str().unwrap_or("");
+        ("success", t.to_string(), String::new())
+    } else {
+        let e = token_info["error"].as_str().unwrap_or("unknown");
+        ("error", String::new(), e.to_string())
+    };
+    let webchat_url = format!("{base_url}/v1/web/webchat/demo/");
+    let html = format!(r#"<!DOCTYPE html>
+<html><head><title>OAuth</title></head>
+<body>
+<p>Authentication {status}. This window will close automatically.</p>
+<script>
+(function() {{
+  var result = {{
+    type: 'greentic_oauth_callback',
+    status: '{status}',
+    access_token: '{token}',
+    error: '{error}',
+    state: '{state}'
+  }};
+  // Try postMessage to opener (popup mode)
+  if (window.opener) {{
+    window.opener.postMessage(result, '*');
+    setTimeout(function() {{ window.close(); }}, 500);
+  }} else {{
+    // Tab mode: save token to sessionStorage then redirect back
+    try {{
+      localStorage.setItem('greentic_oauth_token_handle', '{token}');
+      localStorage.setItem('greentic_oauth_flow_id', 'oauth-code');
+      localStorage.setItem('greentic_oauth_user_name', 'GitHub User');
+      localStorage.setItem('greentic_oauth_provider', JSON.stringify({{id:'github',type:'oauth'}}));
+      localStorage.setItem('greentic_oauth_just_logged_in', 'true');
+    }} catch(e) {{}}
+    window.location.href = '{webchat_url}?oauth_done=true';
+  }}
+}})();
+</script>
+</body></html>"#,
+        status = status_str,
+        token = token_str,
+        error = error_str,
+        state = state,
+        webchat_url = webchat_url,
+    );
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/html")
+        .header("Cache-Control", "no-store")
+        .body(Full::new(Bytes::from(html)))
+        .unwrap())
+}
+
 use crate::domains::Domain;
 
 pub(super) fn parse_domain(value: &str) -> Option<Domain> {

@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use greentic_runner_desktop::{RunOptions, RunResult, RunStatus, TenantContext};
+use greentic_runner_host::runner::engine::CrossPackResolver;
 use serde_json::Value as JsonValue;
 
 use crate::domains::Domain;
@@ -21,6 +23,7 @@ pub struct RunRequest {
     pub team: Option<String>,
     pub input: JsonValue,
     pub dist_offline: bool,
+    pub cross_pack_resolver: Option<Arc<dyn CrossPackResolver>>,
 }
 
 pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> {
@@ -93,6 +96,7 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
         },
         dist_offline: request.dist_offline,
         artifacts_dir: Some(run_dir.clone()),
+        cross_pack_resolver: request.cross_pack_resolver,
         ..RunOptions::default()
     };
 

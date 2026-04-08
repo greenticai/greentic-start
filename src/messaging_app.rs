@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -198,6 +199,7 @@ pub fn run_app_flow(
     pack_id: &str,
     flow_id: &str,
     envelope: &ChannelMessageEnvelope,
+    cross_pack_resolver: Option<Arc<dyn greentic_runner_host::runner::engine::CrossPackResolver>>,
 ) -> Result<Vec<ChannelMessageEnvelope>> {
     let request = RunRequest {
         root: bundle.to_path_buf(),
@@ -214,6 +216,7 @@ pub fn run_app_flow(
             "correlation_id": ctx.correlation_id,
         }),
         dist_offline: true,
+        cross_pack_resolver,
     };
 
     let output = runner_exec::run_provider_pack_flow(request)?;

@@ -301,6 +301,7 @@ fn dispatch_to_target(
         team: target.team.clone().or_else(|| ctx.team.clone()),
         input,
         dist_offline: true,
+            cross_pack_resolver: None,
     };
     runner_exec::run_provider_pack_flow(request)
         .with_context(|| format!("hook dispatch failed for {}", pack_path.display()))?;

@@ -79,15 +79,28 @@ fn serve_static_asset(
         match read_pack_asset_bytes(&descriptor.pack_path, &full_path)? {
             Some(bytes) => bytes,
             None => {
-                operator_log::warn(
-                    module_path!(),
-                    format!(
-                        "[static] asset not found: {} in {}",
-                        full_path,
-                        descriptor.pack_path.display()
-                    ),
-                );
-                return Ok(None);
+                // For i18n assets, fall back to app packs in the bundle.
+                // The webchat-gui provider pack doesn't carry card translations —
+                // those live in the app pack under assets/i18n/.
+                if asset_path.starts_with("i18n/") {
+                    if let Some(bytes) =
+                        try_read_i18n_from_app_packs(bundle_root, &asset_path)?
+                    {
+                        bytes
+                    } else {
+                        return Ok(None);
+                    }
+                } else {
+                    operator_log::warn(
+                        module_path!(),
+                        format!(
+                            "[static] asset not found: {} in {}",
+                            full_path,
+                            descriptor.pack_path.display()
+                        ),
+                    );
+                    return Ok(None);
+                }
             }
         }
     };
@@ -103,6 +116,31 @@ fn serve_static_asset(
         .body(Full::from(Bytes::from(body)))
         .map_err(|err| anyhow::anyhow!("build static response: {err}"))?;
     Ok(Some(response))
+}
+
+/// Try to read an i18n asset from app packs in the bundle's `packs/` directory.
+/// App packs store card translations under `assets/i18n/` — the webchat-gui provider
+/// pack doesn't carry these, so this provides a fallback.
+fn try_read_i18n_from_app_packs(
+    bundle_root: &Path,
+    i18n_relative_path: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let packs_dir = bundle_root.join("packs");
+    if !packs_dir.is_dir() {
+        return Ok(None);
+    }
+    let asset_path = format!("assets/{i18n_relative_path}");
+    for entry in std::fs::read_dir(&packs_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("gtpack") {
+            continue;
+        }
+        if let Some(bytes) = read_pack_asset_bytes(&path, &asset_path)? {
+            return Ok(Some(bytes));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
