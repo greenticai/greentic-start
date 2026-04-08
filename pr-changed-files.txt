@@ -1,8 +1,4 @@
 Cargo.lock
 Cargo.toml
-SECURITY_FIX_REPORT.md
-all-code-scanning-alerts.json
-pr-changed-files.txt
 src/http_ingress/mod.rs
-src/messaging_app.rs
-tests/perf_scaling.rs
+src/ingress_dispatch.rs

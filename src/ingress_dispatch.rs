@@ -22,6 +22,16 @@ pub fn dispatch_http_ingress(
     request: &IngressRequestV1,
     ctx: &OperatorContext,
 ) -> anyhow::Result<IngressDispatchResult> {
+    dispatch_http_ingress_with_op(runner_host, domain, request, ctx, "ingest_http")
+}
+
+pub fn dispatch_http_ingress_with_op(
+    runner_host: &DemoRunnerHost,
+    domain: Domain,
+    request: &IngressRequestV1,
+    ctx: &OperatorContext,
+    op_name: &str,
+) -> anyhow::Result<IngressDispatchResult> {
     // Inject secrets into config for providers running in provider_core_only mode.
     // Fall back to a minimal config for events providers that require a non-null
     // config object even when no secrets or setup have been configured yet.
@@ -50,18 +60,26 @@ pub fn dispatch_http_ingress(
         config,
     );
     let payload_json = serde_json::to_vec(&http_in)?;
-    let outcome = runner_host.invoke_provider_op(
-        domain,
-        &request.provider,
-        "ingest_http",
-        &payload_json,
-        ctx,
-    )?;
+    let outcome =
+        runner_host.invoke_provider_op(domain, &request.provider, op_name, &payload_json, ctx)?;
     if !outcome.success {
         let message = outcome
             .error
             .or(outcome.raw)
             .unwrap_or_else(|| "provider ingest_http failed".to_string());
+        anyhow::bail!("{message}");
+    }
+    if let Some(output) = outcome.output.as_ref()
+        && output
+            .get("ok")
+            .and_then(JsonValue::as_bool)
+            .is_some_and(|ok| !ok)
+    {
+        let message = output
+            .get("error")
+            .and_then(JsonValue::as_str)
+            .or_else(|| output.get("message").and_then(JsonValue::as_str))
+            .unwrap_or("provider ingest_http reported ok=false");
         anyhow::bail!("{message}");
     }
 
@@ -202,6 +220,21 @@ fn parse_dispatch_result(value: &JsonValue) -> anyhow::Result<IngressDispatchRes
     } else {
         value
     };
+
+    if value.get("http").is_none() && value.get("response").is_none() {
+        if let Some(error) = value.get("error").and_then(JsonValue::as_str)
+            && !error.trim().is_empty()
+        {
+            anyhow::bail!("{error}");
+        }
+        if value
+            .get("ok")
+            .and_then(JsonValue::as_bool)
+            .is_some_and(|ok| !ok)
+        {
+            anyhow::bail!("provider returned ok=false without http response");
+        }
+    }
 
     let http_value = value
         .get("http")
