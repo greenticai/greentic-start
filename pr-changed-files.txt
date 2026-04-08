@@ -1,5 +1,6 @@
 Cargo.lock
 Cargo.toml
-Dockerfile.distroless
-src/http_ingress/mod.rs
-src/ingress_dispatch.rs
+SECURITY_FIX_REPORT.md
+all-code-scanning-alerts.json
+pr-changed-files.txt
+src/bundle_ref.rs
