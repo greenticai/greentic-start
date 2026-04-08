@@ -181,7 +181,7 @@ fn extract_bundle_archive(
     if marker.exists() {
         return Ok(ResolvedBundle {
             source_ref: fetched.source_ref.clone(),
-            bundle_dir: out_dir,
+            bundle_dir: resolve_extracted_bundle_root(&out_dir),
         });
     }
 
@@ -215,7 +215,7 @@ fn extract_bundle_archive(
         .with_context(|| format!("write bundle extraction marker {}", marker.display()))?;
     Ok(ResolvedBundle {
         source_ref: fetched.source_ref.clone(),
-        bundle_dir: out_dir,
+        bundle_dir: resolve_extracted_bundle_root(&out_dir),
     })
 }
 
@@ -236,6 +236,25 @@ fn bundle_cache_slug(digest: &str) -> String {
         .strip_prefix("sha256:")
         .unwrap_or(digest)
         .replace(':', "-")
+}
+
+fn resolve_extracted_bundle_root(out_dir: &Path) -> PathBuf {
+    if extracted_bundle_root_has_config(out_dir) {
+        return out_dir.to_path_buf();
+    }
+    let nested = out_dir.join("squashfs-root");
+    if extracted_bundle_root_has_config(&nested) {
+        return nested;
+    }
+    out_dir.to_path_buf()
+}
+
+fn extracted_bundle_root_has_config(root: &Path) -> bool {
+    root.join("greentic.demo.yaml").exists()
+        || root.join("greentic.operator.yaml").exists()
+        || root.join("demo").join("demo.yaml").exists()
+        || (root.join("bundle.yaml").exists()
+            && (root.join("bundle-manifest.json").exists() || root.join("resolved").is_dir()))
 }
 
 fn http_download_path(reference: &str, digest: &str) -> PathBuf {
@@ -638,6 +657,16 @@ mod tests {
             marker.file_name().and_then(|value| value.to_str()),
             Some("deadbeef.bundle-ready")
         );
+    }
+
+    #[test]
+    fn resolve_extracted_bundle_root_prefers_nested_squashfs_root_layout() {
+        let dir = tempdir().expect("tempdir");
+        let nested = dir.path().join("squashfs-root");
+        fs::create_dir_all(nested.join("resolved")).expect("mkdir");
+        fs::write(nested.join("bundle.yaml"), "tenant: demo\n").expect("write bundle yaml");
+
+        assert_eq!(resolve_extracted_bundle_root(dir.path()), nested);
     }
 
     #[test]
