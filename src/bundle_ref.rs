@@ -364,6 +364,42 @@ fn extract_squashfs(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    normalize_extracted_permissions(out_dir)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn normalize_extracted_permissions(root: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn apply(path: &Path) -> anyhow::Result<()> {
+        let metadata =
+            fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Ok(());
+        }
+        if file_type.is_dir() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("chmod dir {}", path.display()))?;
+            for entry in
+                fs::read_dir(path).with_context(|| format!("read dir {}", path.display()))?
+            {
+                let entry = entry.with_context(|| format!("read entry in {}", path.display()))?;
+                apply(&entry.path())?;
+            }
+        } else if file_type.is_file() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+                .with_context(|| format!("chmod file {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    apply(root)
+}
+
+#[cfg(not(unix))]
+fn normalize_extracted_permissions(_root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -667,6 +703,39 @@ mod tests {
         fs::write(nested.join("bundle.yaml"), "tenant: demo\n").expect("write bundle yaml");
 
         assert_eq!(resolve_extracted_bundle_root(dir.path()), nested);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_extracted_permissions_makes_bundle_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("tempdir");
+        let nested = dir.path().join("squashfs-root");
+        let child = nested.join("resolved");
+        let file = child.join("default.yaml");
+        fs::create_dir_all(&child).expect("mkdir");
+        fs::write(&file, "ok: true\n").expect("write");
+
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod root");
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).expect("chmod nested");
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).expect("chmod child");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).expect("chmod file");
+
+        normalize_extracted_permissions(dir.path()).expect("normalize");
+
+        assert_eq!(
+            fs::metadata(&nested).expect("meta nested").permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(&child).expect("meta child").permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(&file).expect("meta file").permissions().mode() & 0o777,
+            0o644
+        );
     }
 
     #[test]
