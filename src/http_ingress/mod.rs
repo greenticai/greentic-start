@@ -764,9 +764,10 @@ where
             "provider must be supplied by the route or query",
         )
     })?;
-    let has_directline = state
-        .runner_host
-        .supports_op(Domain::Messaging, &provider, "directline_http");
+    let has_directline =
+        state
+            .runner_host
+            .supports_op(Domain::Messaging, &provider, "directline_http");
     let has_ingest = state
         .runner_host
         .supports_op(Domain::Messaging, &provider, "ingest_http")
@@ -966,20 +967,20 @@ where
             &ingress_request,
             &ctx,
         )
-        .map_err(|_secondary_err| error_response(StatusCode::BAD_GATEWAY, primary_err.to_string()))?,
+        .map_err(|_secondary_err| {
+            error_response(StatusCode::BAD_GATEWAY, primary_err.to_string())
+        })?,
     };
-    if request.path == "/token"
-        && (200..300).contains(&result.response.status)
-    {
-        let body = result
-            .response
-            .body
-            .as_ref()
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+    if request.path == "/token" && (200..300).contains(&result.response.status) {
+        let body = result.response.body.as_deref().unwrap_or_default();
         let token_ok = serde_json::from_slice::<serde_json::Value>(body)
             .ok()
-            .and_then(|value| value.get("token").and_then(serde_json::Value::as_str).map(str::to_string))
+            .and_then(|value| {
+                value
+                    .get("token")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
             .is_some_and(|token| !token.trim().is_empty());
         if !token_ok {
             return Err(error_response(
@@ -1424,7 +1425,10 @@ mod tests {
                 test_state(vec![]),
             ))
             .unwrap_err();
-        assert_eq!(webchat_directline_web_route.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            webchat_directline_web_route.status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
@@ -1758,9 +1762,8 @@ mod tests {
         let token_web = parse_webchat_directline_route("/v1/web/webchat/demo/token");
         assert_eq!(token_web, Some(("demo".to_string(), "/token".to_string())));
 
-        let dl_web = parse_webchat_directline_route(
-            "/v1/web/webchat/demo/v3/directline/conversations",
-        );
+        let dl_web =
+            parse_webchat_directline_route("/v1/web/webchat/demo/v3/directline/conversations");
         assert_eq!(
             dl_web,
             Some((

@@ -2060,9 +2060,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-flow"
-version = "0.4.69"
+version = "0.4.70"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fafa1b3a38560a247ac897208f0a6978c3ee30b523ae7064954d2a526d48292"
+checksum = "d74863eb9988b1b92fcfb9499f848844b01653cab9896f8acb22f19f74a47f99"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-start"
-version = "0.4.41"
+version = "0.4.42"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2517,9 +2517,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-telemetry"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61a2069bca02b9162598486ddeef9cda37ee41754e14c777f00468f118f4b5cc"
+checksum = "1d7a9e8d0693e9752dd9cdf633922901bd65591a895b4186454abc7d3741e473"
 dependencies = [
  "anyhow",
  "once_cell",
@@ -5636,9 +5636,9 @@ dependencies = [
 
 [[package]]
 name = "toml_edit"
-version = "0.25.10+spec-1.1.0"
+version = "0.25.11+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a82418ca169e235e6c399a84e395ab6debeb3bc90edc959bf0f48647c6a32d1b"
+checksum = "0b59c4d22ed448339746c59b905d24568fcbb3ab65a500494f7b8c3e97739f2b"
 dependencies = [
  "indexmap 2.13.1",
  "toml_datetime 1.1.1+spec-1.1.0",

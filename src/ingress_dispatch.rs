@@ -60,13 +60,8 @@ pub fn dispatch_http_ingress_with_op(
         config,
     );
     let payload_json = serde_json::to_vec(&http_in)?;
-    let outcome = runner_host.invoke_provider_op(
-        domain,
-        &request.provider,
-        op_name,
-        &payload_json,
-        ctx,
-    )?;
+    let outcome =
+        runner_host.invoke_provider_op(domain, &request.provider, op_name, &payload_json, ctx)?;
     if !outcome.success {
         let message = outcome
             .error
