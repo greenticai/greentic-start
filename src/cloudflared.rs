@@ -33,7 +33,9 @@ pub fn start_quick_tunnel(
         let _ = supervisor::stop_pidfile(&pid_path, 2_000);
     }
 
-    if let Some(pid) = read_pid(&pid_path)?
+    // Reuse a still-running cloudflared that we own (valid PID file).
+    // This avoids DNS propagation delays on quick restarts.
+    if let Ok(Some(pid)) = read_pid(&pid_path)
         && supervisor::is_running(pid)
     {
         let log_path_buf = log_path.to_path_buf();
@@ -41,7 +43,7 @@ pub fn start_quick_tunnel(
             return Ok(CloudflaredHandle {
                 url,
                 pid,
-                log_path: log_path_buf.clone(),
+                log_path: log_path_buf,
             });
         }
         let url = discover_public_url(&log_path_buf, Duration::from_secs(10))?;
@@ -52,6 +54,15 @@ pub fn start_quick_tunnel(
             log_path: log_path_buf,
         });
     }
+
+    // No valid owned process — kill any orphaned cloudflared from a
+    // previous session and start fresh.
+    if is_cloudflared_running() {
+        stop_cloudflared();
+    }
+    let _ = std::fs::remove_file(&url_path);
+    let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::File::create(log_path);
 
     let mut argv = vec![
         config.binary.to_string_lossy().to_string(),
@@ -165,6 +176,29 @@ fn read_pid(path: &Path) -> anyhow::Result<Option<u32>> {
     Ok(Some(trimmed.parse()?))
 }
 
+/// Remove the cached public URL file so a fresh tunnel URL is discovered on
+/// the next start.
+pub fn cleanup_url_file(paths: &RuntimePaths) {
+    let url_path = public_url_path(paths);
+    let _ = std::fs::remove_file(&url_path);
+}
+
+/// Check whether a cloudflared process is running on this machine.
+fn is_cloudflared_running() -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("pgrep")
+            .arg("cloudflared")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 /// Stop any orphaned cloudflared processes not tracked by pidfile.
 pub fn stop_cloudflared() {
     #[cfg(unix)]
@@ -172,6 +206,7 @@ pub fn stop_cloudflared() {
         let _ = std::process::Command::new("pkill")
             .args(["-9", "cloudflared"])
             .status();
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
     #[cfg(windows)]
@@ -179,6 +214,7 @@ pub fn stop_cloudflared() {
         let _ = std::process::Command::new("taskkill")
             .args(["/IM", "cloudflared.exe", "/F"])
             .status();
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }
 
