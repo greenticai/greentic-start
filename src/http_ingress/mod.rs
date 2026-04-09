@@ -2,7 +2,12 @@ mod helpers;
 mod messaging;
 mod static_handler;
 
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, thread};
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{Arc, mpsc},
+    thread,
+};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -152,15 +157,30 @@ impl HttpIngressServer {
         });
 
         let (tx, rx) = oneshot::channel();
+        let (startup_tx, startup_rx) = mpsc::channel();
         let addr = config.bind_addr;
         let handle = thread::Builder::new()
             .name("demo-ingress".to_string())
             .spawn(move || -> Result<()> {
-                let runtime = Runtime::new().context("failed to create ingress runtime")?;
+                let runtime = match Runtime::new().context("failed to create ingress runtime") {
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        let _ = startup_tx.send(Err(anyhow::anyhow!("{err:#}")));
+                        return Err(err);
+                    }
+                };
                 runtime.block_on(async move {
-                    let listener = TcpListener::bind(addr)
+                    let listener = match TcpListener::bind(addr)
                         .await
-                        .context("failed to bind ingress listener")?;
+                        .context("failed to bind ingress listener")
+                    {
+                        Ok(listener) => listener,
+                        Err(err) => {
+                            let _ = startup_tx.send(Err(anyhow::anyhow!("{err:#}")));
+                            return Err(err);
+                        }
+                    };
+                    let _ = startup_tx.send(Ok(()));
                     operator_log::info(
                         module_path!(),
                         format!("demo ingress listening on http://{}", addr),
@@ -218,6 +238,10 @@ impl HttpIngressServer {
                     Ok(())
                 })
             })?;
+        startup_rx
+            .recv()
+            .context("failed to receive ingress startup result")??;
+
         Ok(Self {
             shutdown: Some(tx),
             handle: Some(handle),
@@ -1511,6 +1535,46 @@ mod tests {
                 "stop ingress server: {message}"
             );
         }
+    }
+
+    #[test]
+    fn http_ingress_server_fails_fast_when_port_is_occupied() {
+        let dir = tempdir().unwrap();
+        let discovery = crate::discovery::discover(dir.path()).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(
+                dir.path().to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+            )
+            .unwrap(),
+        );
+
+        let occupied = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = occupied.local_addr().unwrap();
+
+        let err = match HttpIngressServer::start(HttpIngressConfig {
+            bind_addr: addr,
+            domains: vec![Domain::Messaging],
+            runner_host,
+            enable_static_routes: false,
+            tenant: "demo".to_string(),
+        }) {
+            Ok(_) => panic!("occupied port should fail ingress startup"),
+            Err(err) => err,
+        };
+
+        let message = err.to_string();
+        assert!(
+            message.contains("failed to bind ingress listener")
+                || message.contains("Address already in use")
+                || message.contains("address already in use"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]
