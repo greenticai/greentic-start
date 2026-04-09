@@ -83,7 +83,15 @@ pub(super) fn route_messaging_envelopes(
             run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
         };
 
-        for out_envelope in outputs {
+        for mut out_envelope in outputs {
+            // Ensure i18n tokens are resolved in any adaptive card.  The WASM
+            // component *should* resolve them, but when running through
+            // greentic-runner-desktop the host resolver is not registered so the
+            // component falls back to Handlebars which silently eats unresolved
+            // `{{i18n:KEY}}` tokens.  Re-read the card from the pack and apply
+            // i18n as a safety net.
+            ensure_card_i18n_resolved(&mut out_envelope, &app_pack_path);
+
             // Standard egress pipeline: render → encode → send_payload.
             // All providers (including webchat) use this path. The webchat provider's
             // send_payload writes bot activities to the conversation state store for
@@ -274,6 +282,54 @@ fn replace_tokens_recursive(
             }
         }
         _ => {}
+    }
+}
+
+/// Re-read the adaptive card from the pack and apply i18n when the card has
+/// empty text fields.  This compensates for the WASM component not having a
+/// host asset resolver for `i18n_bundle_path` when running through the desktop
+/// runner path.
+fn ensure_card_i18n_resolved(envelope: &mut ChannelMessageEnvelope, pack_path: &Path) {
+    let Some(ac_str) = envelope.metadata.get("adaptive_card") else {
+        return;
+    };
+    let Ok(card) = serde_json::from_str::<serde_json::Value>(ac_str) else {
+        return;
+    };
+    // Only act if the card has a greentic.cardId (cards2pack-generated).
+    let card_id = card
+        .pointer("/greentic/cardId")
+        .and_then(serde_json::Value::as_str);
+    let Some(card_id) = card_id else { return };
+    // Check if any body text is empty (i18n failed).
+    let has_empty_text = card
+        .get("body")
+        .and_then(serde_json::Value::as_array)
+        .map(|body| {
+            body.iter().any(|item| {
+                item.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(str::is_empty)
+            })
+        })
+        .unwrap_or(false);
+    if !has_empty_text {
+        return;
+    }
+    // Re-read the original card from the pack and apply i18n.
+    let Some(mut fresh_card) = read_card_from_pack(pack_path, card_id) else {
+        return;
+    };
+    let locale = envelope
+        .metadata
+        .get("locale")
+        .map(String::as_str)
+        .unwrap_or("en");
+    resolve_i18n_tokens(&mut fresh_card, pack_path, locale);
+    if let Ok(resolved) = serde_json::to_string(&fresh_card) {
+        envelope
+            .metadata
+            .insert("adaptive_card".to_string(), resolved);
     }
 }
 
