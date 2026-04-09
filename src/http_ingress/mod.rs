@@ -49,6 +49,8 @@ pub struct HttpIngressConfig {
     pub runner_host: Arc<DemoRunnerHost>,
     pub enable_static_routes: bool,
     pub tenant: String,
+    /// When set, UI URLs use this base instead of the local bind address.
+    pub public_base_url: Option<String>,
 }
 
 pub struct HttpIngressServer {
@@ -56,6 +58,9 @@ pub struct HttpIngressServer {
     handle: Option<thread::JoinHandle<Result<()>>>,
     /// WebChat GUI URLs discovered from static routes during startup.
     pub ui_urls: Vec<String>,
+    /// The port the server actually bound to (may differ from requested port
+    /// when port cycling is active).
+    pub actual_port: u16,
 }
 
 impl HttpIngressServer {
@@ -97,16 +102,24 @@ impl HttpIngressServer {
                     ),
                 );
                 // Discover user-facing UI URLs from tenant-scoped static routes.
-                // Any static route with SPA fallback and tenant scope is treated
-                // as a UI endpoint worth surfacing at startup.
+                // When a public base URL is available (tunnel), use it so users
+                // get the externally-reachable address.
                 for route in table.routes() {
                     if route.tenant_scoped && route.spa_fallback.is_some() {
                         let url_path = route.public_path.replace("{tenant}", &config.tenant);
-                        let ui_url = format!(
-                            "http://{}/{}/",
-                            config.bind_addr,
-                            url_path.trim_start_matches('/')
-                        );
+                        let ui_url = if let Some(ref base) = config.public_base_url {
+                            format!(
+                                "{}/{}/",
+                                base.trim_end_matches('/'),
+                                url_path.trim_start_matches('/')
+                            )
+                        } else {
+                            format!(
+                                "http://{}/{}/",
+                                config.bind_addr,
+                                url_path.trim_start_matches('/')
+                            )
+                        };
                         operator_log::info(module_path!(), format!("UI: {ui_url}"));
                         ui_urls.push(ui_url);
                     }
@@ -156,9 +169,24 @@ impl HttpIngressServer {
             http_route_table,
         });
 
+        // Resolve an available port before spawning the server thread.
+        let requested_port = config.bind_addr.port();
+        let listen_addr_str = config.bind_addr.ip().to_string();
+        let actual_port =
+            crate::port_utils::find_available_port(&listen_addr_str, requested_port, 10)
+                .context("failed to find available port for HTTP ingress")?;
+        if actual_port != requested_port {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "requested port {requested_port} is in use; using port {actual_port} instead"
+                ),
+            );
+        }
+        let addr = SocketAddr::new(config.bind_addr.ip(), actual_port);
+
         let (tx, rx) = oneshot::channel();
         let (startup_tx, startup_rx) = mpsc::channel();
-        let addr = config.bind_addr;
         let handle = thread::Builder::new()
             .name("demo-ingress".to_string())
             .spawn(move || -> Result<()> {
@@ -246,6 +274,7 @@ impl HttpIngressServer {
             shutdown: Some(tx),
             handle: Some(handle),
             ui_urls,
+            actual_port,
         })
     }
 
@@ -1523,6 +1552,7 @@ mod tests {
             runner_host,
             enable_static_routes: false,
             tenant: "demo".to_string(),
+            public_base_url: None,
         })
         .expect("start ingress server");
 
@@ -1538,7 +1568,7 @@ mod tests {
     }
 
     #[test]
-    fn http_ingress_server_fails_fast_when_port_is_occupied() {
+    fn http_ingress_server_fails_fast_when_all_ports_occupied() {
         let dir = tempdir().unwrap();
         let discovery = crate::discovery::discover(dir.path()).unwrap();
         let secrets_handle =
@@ -1554,8 +1584,19 @@ mod tests {
             .unwrap(),
         );
 
-        let occupied = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = occupied.local_addr().unwrap();
+        // Occupy a contiguous block of ports so port cycling exhausts the range.
+        let base = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let base_port = base.local_addr().unwrap().port();
+        let mut _holders = vec![base];
+        for offset in 1..=10u16 {
+            if let Ok(listener) =
+                std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, base_port + offset))
+            {
+                _holders.push(listener);
+            }
+        }
+
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, base_port));
 
         let err = match HttpIngressServer::start(HttpIngressConfig {
             bind_addr: addr,
@@ -1563,16 +1604,16 @@ mod tests {
             runner_host,
             enable_static_routes: false,
             tenant: "demo".to_string(),
+            public_base_url: None,
         }) {
-            Ok(_) => panic!("occupied port should fail ingress startup"),
+            Ok(_) => panic!("occupied port range should fail ingress startup"),
             Err(err) => err,
         };
 
         let message = err.to_string();
         assert!(
-            message.contains("failed to bind ingress listener")
-                || message.contains("Address already in use")
-                || message.contains("address already in use"),
+            message.contains("no available port found")
+                || message.contains("failed to find available port"),
             "unexpected error: {message}"
         );
     }

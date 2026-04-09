@@ -39,6 +39,7 @@ mod operator_i18n;
 mod operator_log;
 #[doc(hidden)]
 pub mod perf_harness;
+mod port_utils;
 mod post_ingress_hooks;
 mod project;
 mod provider_config_envelope;

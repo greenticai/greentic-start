@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-start"
-version = "0.4.48"
+version = "0.4.49"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2471,6 +2471,7 @@ dependencies = [
  "jsonschema",
  "libc",
  "once_cell",
+ "open",
  "qa-spec",
  "rand 0.10.0",
  "rpassword",

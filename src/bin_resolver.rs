@@ -51,6 +51,11 @@ pub fn resolve_binary(name: &str, ctx: &ResolveCtx) -> anyhow::Result<PathBuf> {
         return Ok(path);
     }
 
+    // Auto-install known binaries when missing.
+    if let Some(path) = try_auto_install(name, &ctx.config_dir)? {
+        return Ok(path);
+    }
+
     let mut message = format!("binary not found: {name}");
     if !tried.is_empty() {
         message.push_str("\nTried:");
@@ -63,6 +68,66 @@ pub fn resolve_binary(name: &str, ctx: &ResolveCtx) -> anyhow::Result<PathBuf> {
         normalize_env_key(name)
     ));
     Err(anyhow::anyhow!(message))
+}
+
+/// Return a download URL for known external binaries, or `None` if the binary
+/// is not in the auto-install list.
+fn auto_install_url(name: &str) -> Option<String> {
+    let (os, ext) = if cfg!(target_os = "linux") {
+        ("linux", "")
+    } else if cfg!(target_os = "macos") {
+        ("darwin", "")
+    } else if cfg!(target_os = "windows") {
+        ("windows", ".exe")
+    } else {
+        return None;
+    };
+
+    let arch = if cfg!(target_arch = "x86_64") {
+        "amd64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        return None;
+    };
+
+    match name {
+        "cloudflared" => Some(format!(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-{os}-{arch}{ext}"
+        )),
+        _ => None,
+    }
+}
+
+/// Try to download and install a known binary into `{config_dir}/bin/`.
+fn try_auto_install(name: &str, config_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let url = match auto_install_url(name) {
+        Some(url) => url,
+        None => return Ok(None),
+    };
+
+    let bin_dir = config_dir.join("bin");
+    let dest = bin_dir.join(binary_name(name));
+
+    eprintln!("Installing {name} → {}", dest.display());
+    eprintln!("  Downloading {url}");
+
+    let response = ureq::get(&url)
+        .call()
+        .map_err(|err| anyhow::anyhow!("failed to download {name} from {url}: {err}"))?;
+
+    std::fs::create_dir_all(&bin_dir)?;
+    let mut file = std::fs::File::create(&dest)?;
+    std::io::copy(&mut response.into_body().into_reader(), &mut file)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    eprintln!("  Installed {name} successfully");
+    Ok(Some(dest))
 }
 
 fn resolve_relative(base: &Path, path: &Path) -> PathBuf {

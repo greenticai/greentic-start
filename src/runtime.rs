@@ -785,6 +785,7 @@ pub fn demo_up_services(
         &ingress_domains,
         runner_host.clone(),
         enable_static_routes,
+        None, // public URL not yet known; UI URLs rewritten below after tunnel starts
     )
     .with_context(|| "failed to start local HTTP ingress server")?;
     let run_gsm_services = config.services.nats.enabled;
@@ -817,7 +818,7 @@ pub fn demo_up_services(
         let _ = supervisor::stop_pidfile(&paths.pid_path("ngrok"), 2_000);
     }
 
-    let tunnel_public_base_url = if let Some(cfg) = cloudflared {
+    let tunnel_public_base_url = if let Some(mut cfg) = cloudflared {
         if ingress_server.is_none() {
             operator_log::warn(
                 module_path!(),
@@ -825,6 +826,11 @@ pub fn demo_up_services(
             );
             None
         } else {
+            // Use the actual port the ingress server bound to (may differ from
+            // the configured port when port cycling is active).
+            if let Some(ref server) = ingress_server {
+                cfg.local_port = server.actual_port;
+            }
             let cloudflared_log = operator_log::reserve_service_log(log_dir, "cloudflared")
                 .with_context(|| "unable to open cloudflared.log")?;
             operator_log::info(
@@ -1148,18 +1154,34 @@ pub fn demo_up_services(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| tenant.to_string());
-    let http_url = if ingress_server.is_some() {
-        Some(format!(
+    let http_url = ingress_server.as_ref().map(|s| {
+        format!(
             "http://{}:{}",
-            config.services.gateway.listen_addr, config.services.gateway.port
-        ))
-    } else {
-        None
+            config.services.gateway.listen_addr, s.actual_port
+        )
+    });
+    // Rewrite local UI URLs with the public base URL when a tunnel is active.
+    let static_route_urls = match (&ingress_server, &public_base_url) {
+        (Some(server), Some(base_url)) => server
+            .ui_urls
+            .iter()
+            .map(|local_url| {
+                // Extract the path portion from the local URL and prepend the
+                // tunnel base URL so the printed URL is externally reachable.
+                if let Some(path_start) = local_url.find("/v1/") {
+                    format!(
+                        "{}/{}",
+                        base_url.trim_end_matches('/'),
+                        local_url[path_start..].trim_start_matches('/')
+                    )
+                } else {
+                    local_url.clone()
+                }
+            })
+            .collect(),
+        (Some(server), None) => server.ui_urls.clone(),
+        _ => Vec::new(),
     };
-    let static_route_urls = ingress_server
-        .as_ref()
-        .map(|s| s.ui_urls.clone())
-        .unwrap_or_default();
     let channels: Vec<String> = discovery
         .providers
         .iter()
@@ -1175,13 +1197,20 @@ pub fn demo_up_services(
     let info = StartupInfo {
         bundle_name,
         http_url,
-        static_route_urls,
+        static_route_urls: static_route_urls.clone(),
         public_url: public_base_url,
         channels,
         mode,
         webhook_results: webhook_summary.results,
     };
     info.print();
+
+    // Auto-open the first webchat UI URL in the default browser.
+    if let Some(url) = static_route_urls.first()
+        && let Err(err) = open::that(url)
+    {
+        operator_log::warn(module_path!(), format!("failed to open browser: {err}"));
+    }
 
     Ok(ForegroundRuntimeHandles { ingress_server })
 }
@@ -1237,6 +1266,7 @@ fn start_http_ingress_server(
     domains: &[Domain],
     runner_host: Arc<DemoRunnerHost>,
     enable_static_routes: bool,
+    public_base_url: Option<String>,
 ) -> anyhow::Result<Option<HttpIngressServer>> {
     // In cloud deploys we may need a public listener only for health probes.
     let health_probe_listener_required = std::env::var("GREENTIC_HEALTH_LIVENESS_PATH")
@@ -1262,12 +1292,13 @@ fn start_http_ingress_server(
         runner_host,
         enable_static_routes,
         tenant: config.tenant.clone(),
+        public_base_url,
     })?;
     operator_log::info(
         module_path!(),
         format!(
             "HTTP ingress ready at http://{}:{}",
-            config.services.gateway.listen_addr, config.services.gateway.port
+            config.services.gateway.listen_addr, server.actual_port
         ),
     );
     Ok(Some(server))
@@ -1350,6 +1381,8 @@ pub fn demo_down_runtime(
     // Kill any orphaned ngrok/cloudflared processes not tracked by pidfile
     ngrok::stop_ngrok();
     cloudflared::stop_cloudflared();
+    // Remove cached tunnel URL so a fresh URL is discovered on next start.
+    cloudflared::cleanup_url_file(&paths);
     if all {
         let pids_root = state_dir.join("pids");
         if !pids_root.exists() {
@@ -1852,7 +1885,7 @@ mod tests {
 
         let config = DemoConfig::default();
         assert!(
-            start_http_ingress_server(&config, &[], Arc::new(runner_host.clone()), false)?
+            start_http_ingress_server(&config, &[], Arc::new(runner_host.clone()), false, None)?
                 .is_none()
         );
 
@@ -1871,6 +1904,7 @@ mod tests {
             &[Domain::Events],
             Arc::new(runner_host),
             false,
+            None,
         ) {
             Ok(_) => panic!("expected invalid bind address to fail"),
             Err(err) => err,
