@@ -237,6 +237,19 @@ async fn handle_oauth_callback_inner(
         format!("[oauth callback] persisted access_token to {secret_uri}"),
     );
 
+    if let Err(err) = inject_oauth_login_success_activity(
+        ctx.gateway_port,
+        &session.tenant,
+        &session.conversation_id,
+    )
+    .await
+    {
+        crate::operator_log::warn(
+            module_path!(),
+            format!("[oauth callback] activity injection failed (non-fatal): {err}"),
+        );
+    }
+
     Ok(success_html(&session.tenant))
 }
 
@@ -330,6 +343,67 @@ async fn persist_access_token(
         ));
     }
     Ok(uri)
+}
+
+async fn inject_oauth_login_success_activity(
+    gateway_port: u16,
+    tenant: &str,
+    conversation_id: &str,
+) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|err| anyhow!("build reqwest client: {err}"))?;
+
+    // Step 1: mint a Direct Line token via the local webchat-gui endpoint.
+    let token_url = format!(
+        "http://127.0.0.1:{gateway_port}/v1/messaging/webchat/{tenant}/token?tenant={tenant}",
+    );
+    let token_resp = client
+        .post(&token_url)
+        .send()
+        .await
+        .map_err(|err| anyhow!("mint token POST failed: {err}"))?;
+    let token_status = token_resp.status();
+    let token_body = token_resp
+        .text()
+        .await
+        .map_err(|err| anyhow!("read token body: {err}"))?;
+    if !token_status.is_success() {
+        return Err(anyhow!("mint token HTTP {token_status}: {token_body}"));
+    }
+    let token_json: serde_json::Value = serde_json::from_str(&token_body)
+        .map_err(|err| anyhow!("token response not JSON: {err} — body: {token_body}"))?;
+    let token = token_json
+        .get("token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("token response missing `token` field"))?;
+
+    // Step 2: POST the synthetic activity to the existing conversation.
+    let activities_url = format!(
+        "http://127.0.0.1:{gateway_port}/v1/messaging/webchat/{tenant}/v3/directline/conversations/{conversation_id}/activities?tenant={tenant}",
+    );
+    let body = serde_json::json!({
+        "type": "message",
+        "from": {"id": "system", "name": "OAuth Callback"},
+        "text": "oauth_login_success"
+    });
+    let post_resp = client
+        .post(&activities_url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|err| anyhow!("inject activities POST failed: {err}"))?;
+    let post_status = post_resp.status();
+    if !post_status.is_success() {
+        let post_body = post_resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "inject activities HTTP {post_status}: {post_body}"
+        ));
+    }
+    Ok(())
 }
 
 fn html_escape(s: &str) -> String {
