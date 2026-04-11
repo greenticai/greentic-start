@@ -70,6 +70,7 @@ fn error_html(message: &str) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn success_html(tenant: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
