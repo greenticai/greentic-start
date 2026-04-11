@@ -108,6 +108,31 @@ pub fn load_public_base_url(
     Ok(format!("http://127.0.0.1:{fallback_port}"))
 }
 
+pub fn wrap_dispatch_envelope(
+    public_base_url: &str,
+    provider: &OauthProviderConfig,
+    inner_input: Value,
+) -> Result<Vec<u8>> {
+    let envelope = serde_json::json!({
+        "host": {
+            "public_base_url": public_base_url,
+        },
+        "provider": {
+            "provider_id": provider.provider_id,
+            "client_id": provider.client_id,
+            "client_secret": provider.client_secret,
+            "client_id_key": Value::Null,
+            "client_secret_key": Value::Null,
+            "auth_url": provider.auth_url,
+            "token_url": provider.token_url,
+            "default_scopes": provider.default_scopes,
+        },
+        "input": inner_input,
+    });
+    serde_json::to_vec(&envelope)
+        .with_context(|| "failed to serialize WitDispatchInput envelope")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +233,32 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let url = load_public_base_url(dir.path(), "demo", Some("default"), 8090).unwrap();
         assert_eq!(url, "http://127.0.0.1:8090");
+    }
+
+    #[test]
+    fn wrap_dispatch_envelope_produces_correct_shape() {
+        let cfg = OauthProviderConfig {
+            provider_id: "github".to_string(),
+            auth_url: "https://github.com/login/oauth/authorize".to_string(),
+            token_url: "https://github.com/login/oauth/access_token".to_string(),
+            client_id: "abc".to_string(),
+            client_secret: "secret".to_string(),
+            default_scopes: vec!["repo".to_string()],
+        };
+        let inner = json!({
+            "adaptive_card": "{}",
+            "tenant": "demo",
+            "state": "state-1",
+            "code_challenge": "ch-1"
+        });
+        let bytes = wrap_dispatch_envelope("http://127.0.0.1:8090", &cfg, inner.clone()).unwrap();
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(parsed["host"]["public_base_url"], "http://127.0.0.1:8090");
+        assert_eq!(parsed["provider"]["provider_id"], "github");
+        assert_eq!(parsed["provider"]["client_id"], "abc");
+        assert_eq!(parsed["provider"]["client_secret"], "secret");
+        assert_eq!(parsed["provider"]["auth_url"], "https://github.com/login/oauth/authorize");
+        assert_eq!(parsed["input"], inner);
     }
 }
