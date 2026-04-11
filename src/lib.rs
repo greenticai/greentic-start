@@ -32,6 +32,7 @@ mod messaging_app;
 mod messaging_dto;
 mod messaging_egress;
 mod ngrok;
+pub mod oauth_callback;
 pub mod oauth_envelope;
 pub mod oauth_session_store;
 mod offers;
