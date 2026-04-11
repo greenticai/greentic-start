@@ -59,6 +59,7 @@ tar = "0.4"
 tracing = "0.1"
 unic-langid = "0.9"
 ureq = { version = "3", features = ["json"] }
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 zip = "8"
 zstd = "0.13"

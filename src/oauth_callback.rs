@@ -10,8 +10,10 @@ use anyhow::{Result, anyhow};
 use http_body_util::Full;
 use hyper::body::Bytes;
 use std::path::Path;
+use url::form_urlencoded;
 
 use crate::oauth_session_store::OauthSessionStore;
+use crate::oauth_session_store::PersistedSession;
 use crate::runner_host::DemoRunnerHost;
 
 pub struct OauthCallbackContext<'a> {
@@ -41,12 +43,74 @@ pub async fn handle_oauth_callback(
     }
 }
 
+struct CallbackParams {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+fn parse_callback_query(query_string: &str) -> CallbackParams {
+    let mut code = None;
+    let mut state = None;
+    let mut error = None;
+    let mut error_description = None;
+    for (k, v) in form_urlencoded::parse(query_string.as_bytes()) {
+        match k.as_ref() {
+            "code" => code = Some(v.into_owned()),
+            "state" => state = Some(v.into_owned()),
+            "error" => error = Some(v.into_owned()),
+            "error_description" => error_description = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    CallbackParams {
+        code,
+        state,
+        error,
+        error_description,
+    }
+}
+
 async fn handle_oauth_callback_inner(
-    _ctx: OauthCallbackContext<'_>,
-    _provider_id: &str,
-    _query_string: &str,
+    ctx: OauthCallbackContext<'_>,
+    provider_id: &str,
+    query_string: &str,
 ) -> Result<String> {
-    Err(anyhow!("not implemented yet"))
+    let params = parse_callback_query(query_string);
+
+    if let Some(err) = params.error {
+        let detail = params
+            .error_description
+            .unwrap_or_else(|| "OAuth provider returned an error".to_string());
+        return Err(anyhow!("provider error: {err} — {detail}"));
+    }
+
+    let state = params
+        .state
+        .ok_or_else(|| anyhow!("callback missing 'state' query param"))?;
+    let code = params
+        .code
+        .ok_or_else(|| anyhow!("callback missing 'code' query param"))?;
+
+    let session: PersistedSession = ctx
+        .session_store
+        .consume(&state)
+        .map_err(|err| anyhow!("session not found or already used: {err}"))?;
+
+    if session.provider_id != provider_id {
+        return Err(anyhow!(
+            "provider_id mismatch: callback path says {provider_id}, session says {}",
+            session.provider_id
+        ));
+    }
+
+    // Tasks 13-15 will fill in the rest. For now, just acknowledge.
+    let _ = code;
+    let _ = ctx.runner_host;
+    let _ = ctx.bundle_root;
+    let _ = ctx.gateway_port;
+    Ok(success_html(&session.tenant))
 }
 
 fn html_response(status: u16, body: &str) -> hyper::Response<Full<Bytes>> {
@@ -70,7 +134,6 @@ fn error_html(message: &str) -> String {
     )
 }
 
-#[allow(dead_code)]
 fn success_html(tenant: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
@@ -107,5 +170,21 @@ mod tests {
         let h = success_html("demo");
         assert!(h.contains("/v1/web/webchat/demo/"));
         assert!(h.contains("Login successful"));
+    }
+
+    #[test]
+    fn parse_callback_query_extracts_code_and_state() {
+        let p = parse_callback_query("code=abc&state=xyz&unrelated=1");
+        assert_eq!(p.code.as_deref(), Some("abc"));
+        assert_eq!(p.state.as_deref(), Some("xyz"));
+        assert!(p.error.is_none());
+    }
+
+    #[test]
+    fn parse_callback_query_extracts_error_fields() {
+        let p = parse_callback_query("error=access_denied&error_description=user+canceled");
+        assert_eq!(p.error.as_deref(), Some("access_denied"));
+        assert_eq!(p.error_description.as_deref(), Some("user canceled"));
+        assert!(p.code.is_none());
     }
 }
