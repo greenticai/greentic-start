@@ -83,7 +83,10 @@ pub fn load_public_base_url(
         Some(t) if !t.is_empty() => format!("{tenant}.{t}"),
         _ => format!("{tenant}.default"),
     };
-    let runtime_dir = bundle_root.join("state").join("runtime").join(&team_segment);
+    let runtime_dir = bundle_root
+        .join("state")
+        .join("runtime")
+        .join(&team_segment);
 
     // Try endpoints.json first.
     let endpoints_path = runtime_dir.join("endpoints.json");
@@ -129,8 +132,7 @@ pub fn wrap_dispatch_envelope(
         },
         "input": inner_input,
     });
-    serde_json::to_vec(&envelope)
-        .with_context(|| "failed to serialize WitDispatchInput envelope")
+    serde_json::to_vec(&envelope).with_context(|| "failed to serialize WitDispatchInput envelope")
 }
 
 #[cfg(test)]
@@ -258,7 +260,10 @@ mod tests {
         assert_eq!(parsed["provider"]["provider_id"], "github");
         assert_eq!(parsed["provider"]["client_id"], "abc");
         assert_eq!(parsed["provider"]["client_secret"], "secret");
-        assert_eq!(parsed["provider"]["auth_url"], "https://github.com/login/oauth/authorize");
+        assert_eq!(
+            parsed["provider"]["auth_url"],
+            "https://github.com/login/oauth/authorize"
+        );
         assert_eq!(parsed["input"], inner);
     }
 }
