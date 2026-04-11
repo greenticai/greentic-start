@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +71,41 @@ pub fn load_provider_config(
         client_secret: parsed.client_secret,
         default_scopes,
     })
+}
+
+pub fn load_public_base_url(
+    bundle_root: &Path,
+    tenant: &str,
+    team: Option<&str>,
+    fallback_port: u16,
+) -> Result<String> {
+    let team_segment = match team {
+        Some(t) if !t.is_empty() => format!("{tenant}.{t}"),
+        _ => format!("{tenant}.default"),
+    };
+    let runtime_dir = bundle_root.join("state").join("runtime").join(&team_segment);
+
+    // Try endpoints.json first.
+    let endpoints_path = runtime_dir.join("endpoints.json");
+    if let Ok(raw) = std::fs::read_to_string(&endpoints_path)
+        && let Ok(value) = serde_json::from_str::<Value>(&raw)
+        && let Some(url) = value.get("public_base_url").and_then(Value::as_str)
+        && !url.trim().is_empty()
+    {
+        return Ok(url.trim_end_matches('/').to_string());
+    }
+
+    // Fall back to public_base_url.txt.
+    let txt_path = runtime_dir.join("public_base_url.txt");
+    if let Ok(raw) = std::fs::read_to_string(&txt_path) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.trim_end_matches('/').to_string());
+        }
+    }
+
+    // Final fallback: local loopback at the configured gateway port.
+    Ok(format!("http://127.0.0.1:{fallback_port}"))
 }
 
 #[cfg(test)]
@@ -139,5 +175,38 @@ mod tests {
         );
         let err = load_provider_config(dir.path(), "oauth-oidc-generic").unwrap_err();
         assert!(err.to_string().contains("client_id is empty"));
+    }
+
+    #[test]
+    fn load_public_base_url_reads_endpoints_json() {
+        let dir = tempdir().expect("tempdir");
+        let runtime = dir.path().join("state/runtime/demo.default");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(
+            runtime.join("endpoints.json"),
+            json!({"public_base_url": "https://abc.ngrok-free.app/"}).to_string(),
+        )
+        .unwrap();
+
+        let url = load_public_base_url(dir.path(), "demo", Some("default"), 9999).unwrap();
+        assert_eq!(url, "https://abc.ngrok-free.app");
+    }
+
+    #[test]
+    fn load_public_base_url_falls_back_to_txt_then_loopback() {
+        let dir = tempdir().expect("tempdir");
+        let runtime = dir.path().join("state/runtime/demo.default");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(runtime.join("public_base_url.txt"), "http://from-txt:1234/").unwrap();
+
+        let url = load_public_base_url(dir.path(), "demo", Some("default"), 9999).unwrap();
+        assert_eq!(url, "http://from-txt:1234");
+    }
+
+    #[test]
+    fn load_public_base_url_falls_back_to_local_loopback() {
+        let dir = tempdir().expect("tempdir");
+        let url = load_public_base_url(dir.path(), "demo", Some("default"), 8090).unwrap();
+        assert_eq!(url, "http://127.0.0.1:8090");
     }
 }
