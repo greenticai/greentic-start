@@ -23,7 +23,6 @@ use crate::capabilities::{
     OAUTH_OP_INITIATE_AUTH, OAUTH_OP_REQUEST_RESOURCE_TOKEN, ResolveScope, is_binding_ready,
     is_oauth_broker_operation, write_install_record,
 };
-use crate::cards::CardRenderer;
 use crate::discovery;
 use crate::domains::{self, Domain, ProviderPack};
 use crate::runner_integration;
@@ -45,7 +44,6 @@ pub struct DemoRunnerHost {
     packs_by_path: BTreeMap<PathBuf, ProviderPack>,
     capability_registry: CapabilityRegistry,
     secrets_handle: SecretsManagerHandle,
-    card_renderer: CardRenderer,
     state_store: DynStateStore,
     debug_enabled: bool,
 }
@@ -177,7 +175,6 @@ impl DemoRunnerHost {
             packs_by_path,
             capability_registry,
             secrets_handle,
-            card_renderer: CardRenderer::new(),
             state_store: new_state_store(),
             debug_enabled,
         })
