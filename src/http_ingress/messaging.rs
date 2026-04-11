@@ -93,6 +93,47 @@ pub(super) fn route_messaging_envelopes(
             // i18n as a safety net.
             ensure_card_i18n_resolved(&mut out_envelope, &app_pack_path);
 
+            // Resolve OAuth card placeholders (oauth://start, {{oauth.start_url}},
+            // {{oauth.teams.connectionName}}) by delegating to the
+            // `greentic.cap.oauth.card.v1` capability. Fail-soft: on any error
+            // we log and continue with the unresolved envelope so the rest of
+            // the pipeline still runs.
+            let provider_type =
+                runner_host.canonical_provider_type(Domain::Messaging, provider);
+            if let Err(err) = resolve_oauth_card_placeholders(
+                &provider_type,
+                &mut out_envelope,
+                |cap_id, op, input| {
+                    let outcome = runner_host.invoke_capability(cap_id, op, input, ctx)?;
+                    if !outcome.success {
+                        return Err(anyhow::anyhow!(
+                            "capability {}:{} failed: {}",
+                            cap_id,
+                            op,
+                            outcome
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string())
+                        ));
+                    }
+                    outcome.output.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "capability {}:{} returned no structured output",
+                            cap_id,
+                            op
+                        )
+                    })
+                },
+            ) {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "[demo messaging] oauth card resolve failed for provider={} envelope_id={}: {err}; sending unresolved",
+                        provider, out_envelope.id
+                    ),
+                );
+            }
+
             // Standard egress pipeline: render → encode → send_payload.
             // All providers (including webchat) use this path. The webchat provider's
             // send_payload writes bot activities to the conversation state store for
@@ -134,9 +175,14 @@ pub(super) fn route_messaging_envelopes(
                 }
             };
 
-            let provider_type = runner_host.canonical_provider_type(Domain::Messaging, provider);
-            let send_input =
-                egress::build_send_payload(payload, &provider_type, &ctx.tenant, ctx.team.clone());
+            let egress_provider_type =
+                runner_host.canonical_provider_type(Domain::Messaging, provider);
+            let send_input = egress::build_send_payload(
+                payload,
+                &egress_provider_type,
+                &ctx.tenant,
+                ctx.team.clone(),
+            );
             let send_bytes = serde_json::to_vec(&send_input)?;
             let outcome = runner_host.invoke_provider_op(
                 Domain::Messaging,
