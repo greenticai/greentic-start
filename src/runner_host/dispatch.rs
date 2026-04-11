@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose};
 use greentic_runner_desktop::RunStatus;
 use greentic_runner_host::RunnerWasiPolicy;
@@ -143,36 +143,9 @@ impl DemoRunnerHost {
             let run_dir = state_layout::run_dir(&self.bundle_root, domain, &pack.pack_id, flow_id)?;
             std::fs::create_dir_all(&run_dir)?;
 
-            let render_outcome = self.card_renderer.render_if_needed(
-                provider_type,
-                payload_bytes,
-                |cap_id, op, input| {
-                    let outcome = self.invoke_capability(cap_id, op, input, ctx)?;
-                    if !outcome.success {
-                        let reason = outcome
-                            .error
-                            .clone()
-                            .or(outcome.raw.clone())
-                            .unwrap_or_else(|| "capability invocation failed".to_string());
-                        return Err(anyhow!(
-                            "card capability {}:{} failed: {}",
-                            cap_id,
-                            op,
-                            reason
-                        ));
-                    }
-                    outcome.output.ok_or_else(|| {
-                        anyhow!(
-                            "card capability {}:{} returned no structured output",
-                            cap_id,
-                            op
-                        )
-                    })
-                },
-            )?;
-            let payload = serde_json::from_slice(&render_outcome.bytes).unwrap_or_else(|_| {
+            let payload = serde_json::from_slice(payload_bytes).unwrap_or_else(|_| {
                 json!({
-                    "payload": general_purpose::STANDARD.encode(&render_outcome.bytes)
+                    "payload": general_purpose::STANDARD.encode(payload_bytes)
                 })
             });
 
