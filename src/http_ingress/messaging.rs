@@ -354,9 +354,21 @@ fn resolve_oauth_card_placeholders(
     // We cannot round-trip the full ChannelMessageEnvelope because `metadata`
     // is `BTreeMap<String, String>` and the renderer inserts nested JSON
     // values under /metadata/oauth_card_resolved.
+    // TenantCtx has both `team` and `team_id` fields (greentic-types). Populate
+    // both keys in the resolve-card request, preferring `team_id` as the
+    // primary source and coalescing the missing one so the capability's
+    // fallback chain in cards.rs (`/tenant/team_id` -> `/tenant/team`) never
+    // sees a null team when either source field is populated.
+    let team_primary = envelope
+        .tenant
+        .team_id
+        .as_ref()
+        .map(|t| t.as_str())
+        .or_else(|| envelope.tenant.team.as_ref().map(|t| t.as_str()));
     let tenant_value = serde_json::json!({
         "tenant_id": envelope.tenant.tenant_id,
-        "team": envelope.tenant.team,
+        "team_id": team_primary,
+        "team": team_primary,
     });
     let payload = serde_json::json!({
         "metadata": { "adaptive_card": card_str },
@@ -369,7 +381,10 @@ fn resolve_oauth_card_placeholders(
     let outcome = renderer.render_if_needed(provider_type, &payload_bytes, dispatcher)?;
 
     // Fast path: nothing changed (no placeholder, or renderer returned the
-    // original bytes unchanged).
+    // original bytes unchanged). Relies on CardRenderer::render_if_needed
+    // returning the exact input bytes on its early-return paths (see cards.rs
+    // short-circuit branches). If that contract changes, remove this fast
+    // path — byte inequality from re-serialization would make it unreliable.
     if outcome.bytes == payload_bytes {
         return Ok(());
     }
@@ -385,6 +400,9 @@ fn resolve_oauth_card_placeholders(
             .metadata
             .insert("adaptive_card".to_string(), new_card.to_string());
     }
+    // Audit fields are stored as compact JSON strings (serde_json::Value::to_string)
+    // because envelope.metadata is `BTreeMap<String, String>`. Consumers that
+    // want structured access must re-parse via serde_json::from_str.
     if let Some(audit) = rewritten.pointer("/metadata/oauth_card_resolved") {
         envelope
             .metadata
