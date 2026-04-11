@@ -522,6 +522,145 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_oauth_card_placeholders_fails_soft_when_dispatcher_errors() {
+        let mut env = envelope_with_oauth_card();
+        let original_card = env
+            .metadata
+            .get("adaptive_card")
+            .cloned()
+            .expect("seed card");
+
+        let dispatcher = |_cap_id: &str,
+                          _op: &str,
+                          _input: &[u8]|
+         -> anyhow::Result<serde_json::Value> {
+            Err(anyhow::anyhow!("capability not installed"))
+        };
+
+        let result =
+            resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher);
+
+        // The helper propagates the error so the caller can log it. The
+        // envelope must be left untouched so the caller can still send the
+        // card unresolved as a fail-soft fallback.
+        assert!(result.is_err(), "dispatcher error should be propagated");
+        assert_eq!(
+            env.metadata.get("adaptive_card"),
+            Some(&original_card),
+            "envelope card should be unchanged on dispatcher error"
+        );
+        assert!(
+            !env.metadata.contains_key("oauth_card_resolved"),
+            "no audit should be stored on error"
+        );
+    }
+
+    #[test]
+    fn resolve_oauth_card_placeholders_noop_when_no_card_in_metadata() {
+        let mut env = envelope(); // no adaptive_card in metadata
+        let called = std::cell::Cell::new(false);
+        let dispatcher = |_cap_id: &str,
+                          _op: &str,
+                          _input: &[u8]|
+         -> anyhow::Result<serde_json::Value> {
+            called.set(true);
+            Ok(serde_json::json!({}))
+        };
+
+        resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher)
+            .expect("no-op succeeds");
+        assert!(!called.get(), "dispatcher should not be invoked when no card");
+    }
+
+    #[test]
+    fn resolve_oauth_card_placeholders_propagates_team_id_when_team_is_none() {
+        // Regression test for the team coalesce fix from commit 59d9fa1.
+        // TenantCtx has both `team` and `team_id`. If only `team_id` is set
+        // on the envelope, the helper must still propagate it into the
+        // resolve-card dispatcher payload (under both `team_id` and `team`
+        // keys) so the capability can resolve correctly.
+        let mut env: ChannelMessageEnvelope = serde_json::from_value(serde_json::json!({
+            "id": "msg-team-id-only",
+            "tenant": {
+                "env": "dev",
+                "tenant": "demo",
+                "tenant_id": "demo",
+                "team_id": "ops",
+                "attempt": 0
+            },
+            "channel": "conv-1",
+            "session_id": "conv-1",
+            "from": {
+                "id": "user-1",
+                "kind": "user"
+            },
+            "text": null,
+            "metadata": {}
+        }))
+        .expect("envelope");
+
+        // Add the OAuth card to metadata (same shape as envelope_with_oauth_card).
+        let card = serde_json::json!({
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type": "AdaptiveCard",
+            "version": "1.5",
+            "body": [{"type": "TextBlock", "text": "Sign in", "wrap": true}],
+            "actions": [{
+                "type": "Action.OpenUrl",
+                "title": "Login with OAuth",
+                "url": "oauth://start"
+            }]
+        });
+        env.metadata
+            .insert("adaptive_card".to_string(), card.to_string());
+
+        let captured_input = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
+        let captured_input_for_closure = captured_input.clone();
+        let dispatcher = move |_cap_id: &str,
+                               _op: &str,
+                               input: &[u8]|
+              -> anyhow::Result<serde_json::Value> {
+            captured_input_for_closure.borrow_mut().extend_from_slice(input);
+            let resolved_card = serde_json::json!({
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [],
+                "actions": [{
+                    "type": "Action.OpenUrl",
+                    "title": "Login",
+                    "url": "https://example.com/oauth"
+                }]
+            });
+            Ok(serde_json::json!({
+                "resolved_card": resolved_card.to_string(),
+            }))
+        };
+
+        resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher)
+            .expect("resolution should succeed");
+
+        // Parse the captured dispatcher input to verify tenant propagation.
+        // build_card_resolve_request (cards.rs) produces a flat request object with
+        // `team` (string) extracted from /tenant/team_id or /tenant/team in the payload.
+        // The messaging.rs helper sets both `team_id` and `team` keys on the tenant object,
+        // so build_card_resolve_request finds `/tenant/team_id` = "ops" and puts it as `team`.
+        let captured = captured_input.borrow().clone();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&captured).expect("dispatcher input is valid json");
+        assert_eq!(
+            parsed.get("team").and_then(|v| v.as_str()),
+            Some("ops"),
+            "team_id should propagate from envelope.tenant.team_id into dispatcher request as 'team'"
+        );
+        assert_eq!(
+            parsed.get("tenant").and_then(|v| v.as_str()),
+            Some("demo"),
+            "tenant key should be populated from envelope.tenant.tenant_id"
+        );
+    }
+
     fn write_test_app_pack(pack_path: &Path) {
         use greentic_types::pack_manifest::{
             PackFlowEntry, PackKind, PackManifest, PackSignatures,
