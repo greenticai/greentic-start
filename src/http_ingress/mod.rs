@@ -376,6 +376,28 @@ where
         return handle_oauth_token_exchange(req).await;
     }
 
+    // OAuth callback: /v1/oauth/callback/{provider_id}
+    if let Some(provider_id) = path.strip_prefix("/v1/oauth/callback/")
+        && !provider_id.is_empty()
+        && !provider_id.contains('/')
+    {
+        let bundle_root_buf: std::path::PathBuf =
+            state.runner_host.bundle_root().to_path_buf();
+        let session_store =
+            crate::oauth_session_store::OauthSessionStore::new(bundle_root_buf.clone());
+        let ctx = crate::oauth_callback::OauthCallbackContext {
+            bundle_root: &bundle_root_buf,
+            session_store: &session_store,
+            runner_host: &state.runner_host,
+            gateway_port: state.runner_host.gateway_port(),
+        };
+        let query_string = req.uri().query().unwrap_or("");
+        let resp =
+            crate::oauth_callback::handle_oauth_callback(ctx, provider_id, query_string)
+                .await;
+        return Ok(resp);
+    }
+
     // WebChat Direct Line routes:
     // - /v1/messaging/webchat/{tenant}/token
     // - /v1/messaging/webchat/{tenant}/v3/directline/*
