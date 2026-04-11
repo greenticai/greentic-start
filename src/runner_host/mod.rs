@@ -17,14 +17,17 @@ use std::path::{Path, PathBuf};
 
 use greentic_runner_host::storage::{DynStateStore, new_state_store};
 
+use anyhow::Context;
+
 use crate::capabilities::{
-    CAP_OAUTH_BROKER_V1, CapabilityBinding, CapabilityInstallRecord, CapabilityPackRecord,
-    CapabilityRegistry, HookStage, OAUTH_OP_AWAIT_RESULT, OAUTH_OP_GET_ACCESS_TOKEN,
-    OAUTH_OP_INITIATE_AUTH, OAUTH_OP_REQUEST_RESOURCE_TOKEN, ResolveScope, is_binding_ready,
-    is_oauth_broker_operation, write_install_record,
+    CAP_OAUTH_BROKER_V1, CAP_OAUTH_CARD_V1, CapabilityBinding, CapabilityInstallRecord,
+    CapabilityPackRecord, CapabilityRegistry, HookStage, OAUTH_OP_AWAIT_RESULT,
+    OAUTH_OP_GET_ACCESS_TOKEN, OAUTH_OP_INITIATE_AUTH, OAUTH_OP_REQUEST_RESOURCE_TOKEN,
+    ResolveScope, is_binding_ready, is_oauth_broker_operation, write_install_record,
 };
 use crate::discovery;
 use crate::domains::{self, Domain, ProviderPack};
+use crate::oauth_envelope;
 use crate::runner_integration;
 use crate::secrets_gate::{DynSecretsManager, SecretsManagerHandle};
 
@@ -377,12 +380,34 @@ impl DemoRunnerHost {
             ));
         }
 
+        let final_payload_bytes: Vec<u8> = if cap_id == CAP_OAUTH_CARD_V1 {
+            // OAuth card resolution requires the WASM dispatch envelope
+            // {host, provider, input}. Build it from the bundle's
+            // state/config/{provider_pack_id}/setup-answers.json and
+            // state/runtime/{tenant}.{team}/endpoints.json.
+            let inner_input: serde_json::Value = serde_json::from_slice(payload_bytes)
+                .with_context(|| {
+                    format!("oauth.card.resolve input must be valid JSON for cap {cap_id}")
+                })?;
+            let provider_cfg =
+                oauth_envelope::load_provider_config(&self.bundle_root, &binding.pack_id)?;
+            let public_base_url = oauth_envelope::load_public_base_url(
+                &self.bundle_root,
+                &ctx.tenant,
+                ctx.team.as_deref(),
+                self.gateway_port,
+            )?;
+            oauth_envelope::wrap_dispatch_envelope(&public_base_url, &provider_cfg, inner_input)?
+        } else {
+            payload_bytes.to_vec()
+        };
+
         let outcome = self.invoke_provider_component_op(
             binding.domain,
             pack,
             &binding.pack_id,
             target_op,
-            payload_bytes,
+            &final_payload_bytes,
             ctx,
         )?;
 
