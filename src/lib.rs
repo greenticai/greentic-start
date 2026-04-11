@@ -34,6 +34,7 @@ mod messaging_dto;
 mod messaging_egress;
 mod ngrok;
 pub mod oauth_envelope;
+pub mod oauth_session_store;
 mod offers;
 mod onboard;
 mod operator_i18n;
