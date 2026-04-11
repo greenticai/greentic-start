@@ -730,7 +730,10 @@ mod tests {
             serde_json::from_slice(&captured).expect("dispatcher input is valid json");
         // New shape: adaptive_card, tenant (string), state, code_challenge, native_oauth_card
         assert!(
-            parsed.get("adaptive_card").and_then(|v| v.as_str()).is_some(),
+            parsed
+                .get("adaptive_card")
+                .and_then(|v| v.as_str())
+                .is_some(),
             "dispatcher input must contain adaptive_card"
         );
         assert_eq!(
@@ -756,6 +759,28 @@ mod tests {
             parsed.get("native_oauth_card").and_then(|v| v.as_bool()),
             Some(false),
             "native_oauth_card should be false"
+        );
+
+        // Verify team propagation reached the session file on disk.
+        let sessions_dir = dir.path().join("state/oauth-sessions");
+        let session_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+            .expect("sessions_dir exists")
+            .map(|e| e.expect("readdir entry").path())
+            .collect();
+        assert_eq!(session_files.len(), 1, "expected exactly one session file");
+        let session_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&session_files[0]).expect("read session file"),
+        )
+        .expect("session file is valid json");
+        assert_eq!(
+            session_json.get("team"),
+            Some(&serde_json::Value::String("ops".to_string())),
+            "team should propagate from envelope.tenant.team_id"
+        );
+        assert_eq!(
+            session_json.get("tenant"),
+            Some(&serde_json::Value::String("demo".to_string())),
+            "tenant should be from envelope.tenant.tenant_id"
         );
     }
 
