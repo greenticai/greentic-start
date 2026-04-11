@@ -333,6 +333,22 @@ fn ensure_card_i18n_resolved(envelope: &mut ChannelMessageEnvelope, pack_path: &
     }
 }
 
+/// Resolve OAuth card placeholders in an outbound envelope by delegating to
+/// `greentic.cap.oauth.card.v1`. Operates on a minimal JSON payload to avoid
+/// round-tripping the envelope through serde (metadata is a string map,
+/// incompatible with the nested JSON values the capability produces).
+///
+/// Fail-soft: any internal error is returned to the caller, which is expected
+/// to log and continue with the unresolved envelope.
+fn resolve_oauth_card_placeholders(
+    provider_type: &str,
+    envelope: &mut ChannelMessageEnvelope,
+    dispatcher: impl FnMut(&str, &str, &[u8]) -> anyhow::Result<serde_json::Value>,
+) -> anyhow::Result<()> {
+    let _ = (provider_type, envelope, dispatcher);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,6 +377,76 @@ mod tests {
             "metadata": {}
         }))
         .expect("envelope")
+    }
+
+    fn envelope_with_oauth_card() -> ChannelMessageEnvelope {
+        let mut env = envelope();
+        let card = serde_json::json!({
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type": "AdaptiveCard",
+            "version": "1.5",
+            "body": [{"type": "TextBlock", "text": "Sign in", "wrap": true}],
+            "actions": [{
+                "type": "Action.OpenUrl",
+                "title": "Login with OAuth",
+                "url": "oauth://start"
+            }]
+        });
+        env.metadata
+            .insert("adaptive_card".to_string(), card.to_string());
+        env
+    }
+
+    #[test]
+    fn resolve_oauth_card_placeholders_swaps_url_from_capability() {
+        let mut env = envelope_with_oauth_card();
+        let resolved_url =
+            "https://github.com/login/oauth/authorize?client_id=abc&state=xyz".to_string();
+        let resolved_url_for_closure = resolved_url.clone();
+
+        let dispatcher = move |cap_id: &str,
+                               op: &str,
+                               _input: &[u8]|
+              -> anyhow::Result<serde_json::Value> {
+            assert_eq!(cap_id, "greentic.cap.oauth.card.v1");
+            assert_eq!(op, "oauth.card.resolve");
+            let resolved_card = serde_json::json!({
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [{"type": "TextBlock", "text": "Sign in", "wrap": true}],
+                "actions": [{
+                    "type": "Action.OpenUrl",
+                    "title": "Login with OAuth",
+                    "url": resolved_url_for_closure.clone()
+                }]
+            });
+            Ok(serde_json::json!({
+                "resolved_card": resolved_card.to_string(),
+                "start_url": resolved_url_for_closure.clone(),
+            }))
+        };
+
+        let result =
+            resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher);
+        assert!(result.is_ok(), "helper should succeed: {result:?}");
+
+        let card = env
+            .metadata
+            .get("adaptive_card")
+            .expect("adaptive_card present");
+        assert!(
+            card.contains(&resolved_url),
+            "resolved URL missing from card: {card}"
+        );
+        assert!(
+            !card.contains("oauth://start"),
+            "oauth://start marker still present in card: {card}"
+        );
+        assert!(
+            env.metadata.contains_key("oauth_card_resolved"),
+            "audit metadata missing"
+        );
     }
 
     fn write_test_app_pack(pack_path: &Path) {
