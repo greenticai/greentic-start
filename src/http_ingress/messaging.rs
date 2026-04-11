@@ -84,6 +84,9 @@ pub(super) fn route_messaging_envelopes(
             run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
         };
 
+        let provider_type =
+            runner_host.canonical_provider_type(Domain::Messaging, provider);
+
         for mut out_envelope in outputs {
             // Ensure i18n tokens are resolved in any adaptive card.  The WASM
             // component *should* resolve them, but when running through
@@ -98,8 +101,6 @@ pub(super) fn route_messaging_envelopes(
             // `greentic.cap.oauth.card.v1` capability. Fail-soft: on any error
             // we log and continue with the unresolved envelope so the rest of
             // the pipeline still runs.
-            let provider_type =
-                runner_host.canonical_provider_type(Domain::Messaging, provider);
             if let Err(err) = resolve_oauth_card_placeholders(
                 &provider_type,
                 &mut out_envelope,
@@ -175,11 +176,9 @@ pub(super) fn route_messaging_envelopes(
                 }
             };
 
-            let egress_provider_type =
-                runner_host.canonical_provider_type(Domain::Messaging, provider);
             let send_input = egress::build_send_payload(
                 payload,
-                &egress_provider_type,
+                &provider_type,
                 &ctx.tenant,
                 ctx.team.clone(),
             );
