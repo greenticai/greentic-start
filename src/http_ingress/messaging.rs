@@ -4,11 +4,12 @@ use base64::Engine as _;
 use greentic_types::ChannelMessageEnvelope;
 use serde_json::json;
 
-use crate::cards::CardRenderer;
+use crate::capabilities::CAP_OAUTH_CARD_V1;
 use crate::domains::Domain;
 use crate::messaging_app as app;
 use crate::messaging_dto::ProviderPayloadV1;
 use crate::messaging_egress as egress;
+use crate::oauth_session_store::OauthSessionStore;
 use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
 
@@ -95,14 +96,17 @@ pub(super) fn route_messaging_envelopes(
             // i18n as a safety net.
             ensure_card_i18n_resolved(&mut out_envelope, &app_pack_path);
 
-            // Resolve OAuth card placeholders (oauth://start, {{oauth.start_url}},
-            // {{oauth.teams.connectionName}}) by delegating to the
-            // `greentic.cap.oauth.card.v1` capability. Fail-soft: on any error
-            // we log and continue with the unresolved envelope so the rest of
-            // the pipeline still runs.
+            // Resolve OAuth card placeholders. Phase 2: also persists a
+            // session record so the upcoming /v1/oauth/callback/{provider_id}
+            // can recover state + PKCE verifier.
+            let session_store = OauthSessionStore::new(bundle.to_path_buf());
+            let conversation_id = out_envelope.session_id.clone();
             if let Err(err) = resolve_oauth_card_placeholders(
                 &provider_type,
                 &mut out_envelope,
+                &session_store,
+                "oauth-oidc-generic",
+                &conversation_id,
                 |cap_id, op, input| {
                     let outcome = runner_host.invoke_capability(cap_id, op, input, ctx)?;
                     if !outcome.success {
@@ -374,90 +378,88 @@ fn ensure_card_i18n_resolved(envelope: &mut ChannelMessageEnvelope, pack_path: &
     }
 }
 
-/// Resolve OAuth card placeholders in an outbound envelope by delegating to
-/// `greentic.cap.oauth.card.v1`. Operates on a minimal JSON payload to avoid
-/// round-tripping the envelope through serde (metadata is a string map,
-/// incompatible with the nested JSON values the capability produces).
-///
-/// Fail-soft: any internal error is returned to the caller, which is expected
-/// to log and continue with the unresolved envelope.
 fn resolve_oauth_card_placeholders(
     provider_type: &str,
     envelope: &mut ChannelMessageEnvelope,
-    dispatcher: impl FnMut(&str, &str, &[u8]) -> anyhow::Result<serde_json::Value>,
+    session_store: &OauthSessionStore,
+    provider_pack_id: &str,
+    conversation_id: &str,
+    mut dispatcher: impl FnMut(&str, &str, &[u8]) -> anyhow::Result<serde_json::Value>,
 ) -> anyhow::Result<()> {
+    let _ = provider_type; // Reserved for future Teams native handling
     let Some(card_str) = envelope.metadata.get("adaptive_card").cloned() else {
         return Ok(());
     };
-
-    // Minimal payload matching the shape CardRenderer::render_if_needed expects.
-    // We cannot round-trip the full ChannelMessageEnvelope because `metadata`
-    // is `BTreeMap<String, String>` and the renderer inserts nested JSON
-    // values under /metadata/oauth_card_resolved.
-    // TenantCtx has both `team` and `team_id` fields (greentic-types). Populate
-    // both keys in the resolve-card request, preferring `team_id` as the
-    // primary source and coalescing the missing one so the capability's
-    // fallback chain in cards.rs (`/tenant/team_id` -> `/tenant/team`) never
-    // sees a null team when either source field is populated.
-    let team_primary = envelope
-        .tenant
-        .team_id
-        .as_ref()
-        .map(|t| t.as_str())
-        .or_else(|| envelope.tenant.team.as_ref().map(|t| t.as_str()));
-    let tenant_value = serde_json::json!({
-        "tenant_id": envelope.tenant.tenant_id,
-        "team_id": team_primary,
-        "team": team_primary,
-    });
-    let payload = serde_json::json!({
-        "metadata": { "adaptive_card": card_str },
-        "tenant": tenant_value,
-    });
-    let payload_bytes =
-        serde_json::to_vec(&payload).map_err(|err| anyhow::anyhow!("serialize payload: {err}"))?;
-
-    let renderer = CardRenderer::new();
-    let outcome = renderer.render_if_needed(provider_type, &payload_bytes, dispatcher)?;
-
-    // Fast path: nothing changed (no placeholder, or renderer returned the
-    // original bytes unchanged). Relies on CardRenderer::render_if_needed
-    // returning the exact input bytes on its early-return paths (see cards.rs
-    // short-circuit branches). If that contract changes, remove this fast
-    // path — byte inequality from re-serialization would make it unreliable.
-    if outcome.bytes == payload_bytes {
+    if !card_str.contains("oauth://start")
+        && !card_str.contains("{{oauth.start_url}}")
+        && !card_str.contains("{{oauth.teams.connectionName}}")
+    {
         return Ok(());
     }
 
-    let rewritten: serde_json::Value = serde_json::from_slice(&outcome.bytes)
-        .map_err(|err| anyhow::anyhow!("parse rewritten payload: {err}"))?;
+    // Create a session and persist verifier+challenge for the upcoming callback.
+    let team = envelope
+        .tenant
+        .team
+        .as_ref()
+        .map(|t| t.as_str())
+        .or_else(|| envelope.tenant.team_id.as_ref().map(|t| t.as_str()));
+    let provider_id_for_session = derive_provider_id_from_pack(provider_pack_id);
+    let ticket = session_store.create(
+        &provider_id_for_session,
+        provider_pack_id,
+        envelope.tenant.tenant_id.as_str(),
+        team,
+        conversation_id,
+    )?;
 
-    if let Some(new_card) = rewritten
-        .pointer("/metadata/adaptive_card")
+    // Build the dispatcher input matching CardResolveDispatchInput in
+    // oidc-provider-runtime/src/lib.rs (handle_resolve_card).
+    let inner_input = serde_json::json!({
+        "adaptive_card": card_str,
+        "tenant": envelope.tenant.tenant_id.as_str(),
+        "state": ticket.state_token,
+        "code_challenge": ticket.code_challenge,
+        "scopes": serde_json::Value::Null, // provider config supplies default_scopes
+        "native_oauth_card": false,
+    });
+    let input_bytes =
+        serde_json::to_vec(&inner_input).map_err(|err| anyhow::anyhow!("serialize: {err}"))?;
+
+    let resolve_result = dispatcher(CAP_OAUTH_CARD_V1, "oauth.card.resolve", &input_bytes)?;
+
+    let resolved_card = resolve_result
+        .get("resolved_card")
         .and_then(serde_json::Value::as_str)
-    {
-        envelope
-            .metadata
-            .insert("adaptive_card".to_string(), new_card.to_string());
+        .ok_or_else(|| anyhow::anyhow!("oauth.card.resolve output missing resolved_card"))?;
+
+    envelope
+        .metadata
+        .insert("adaptive_card".to_string(), resolved_card.to_string());
+
+    // Audit fields stored as compact JSON strings (BTreeMap<String,String>).
+    let mut audit = resolve_result.clone();
+    if let Some(obj) = audit.as_object_mut() {
+        obj.remove("resolved_card");
     }
-    // Audit fields are stored as compact JSON strings (serde_json::Value::to_string)
-    // because envelope.metadata is `BTreeMap<String, String>`. Consumers that
-    // want structured access must re-parse via serde_json::from_str.
-    if let Some(audit) = rewritten.pointer("/metadata/oauth_card_resolved") {
-        envelope
-            .metadata
-            .insert("oauth_card_resolved".to_string(), audit.to_string());
-    }
-    if let Some(downgrade) = rewritten
-        .pointer("/metadata/oauth_card_downgrade")
-        .filter(|v| !v.is_null())
-    {
+    envelope
+        .metadata
+        .insert("oauth_card_resolved".to_string(), audit.to_string());
+    if let Some(downgrade) = resolve_result.get("downgrade").filter(|v| !v.is_null()) {
         envelope
             .metadata
             .insert("oauth_card_downgrade".to_string(), downgrade.to_string());
     }
-
     Ok(())
+}
+
+/// Derive a provider_id given the pack id. Hardcoded for the only supported
+/// OAuth provider pack. TODO: discover from setup-answers.json or capability binding.
+fn derive_provider_id_from_pack(provider_pack_id: &str) -> String {
+    match provider_pack_id {
+        "oauth-oidc-generic" => "github".to_string(),
+        other => other.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -533,12 +535,23 @@ mod tests {
                 // Only `resolved_card` is load-bearing; `start_url` is informational
                 // and ends up inside the oauth_card_resolved audit metadata.
                 Ok(serde_json::json!({
+                    "ok": true,
                     "resolved_card": resolved_card.to_string(),
                     "start_url": resolved_url_for_closure.clone(),
+                    "native_oauth_card": false,
                 }))
             };
 
-        let result = resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher);
+        let dir = tempdir().unwrap();
+        let store = OauthSessionStore::new(dir.path());
+        let result = resolve_oauth_card_placeholders(
+            "messaging.webchat-gui",
+            &mut env,
+            &store,
+            "oauth-oidc-generic",
+            "test-conv-1",
+            dispatcher,
+        );
         assert!(result.is_ok(), "helper should succeed: {result:?}");
 
         let card = env
@@ -573,11 +586,21 @@ mod tests {
                 Err(anyhow::anyhow!("capability not installed"))
             };
 
-        let result = resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher);
+        let dir = tempdir().unwrap();
+        let store = OauthSessionStore::new(dir.path());
+        let result = resolve_oauth_card_placeholders(
+            "messaging.webchat-gui",
+            &mut env,
+            &store,
+            "oauth-oidc-generic",
+            "test-conv-1",
+            dispatcher,
+        );
 
         // The helper propagates the error so the caller can log it. The
         // envelope must be left untouched so the caller can still send the
         // card unresolved as a fail-soft fallback.
+        // NOTE: A session file IS created before the dispatcher call (by design).
         assert!(result.is_err(), "dispatcher error should be propagated");
         assert_eq!(
             env.metadata.get("adaptive_card"),
@@ -600,8 +623,17 @@ mod tests {
                 Ok(serde_json::json!({}))
             };
 
-        resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher)
-            .expect("no-op succeeds");
+        let dir = tempdir().unwrap();
+        let store = OauthSessionStore::new(dir.path());
+        resolve_oauth_card_placeholders(
+            "messaging.webchat-gui",
+            &mut env,
+            &store,
+            "oauth-oidc-generic",
+            "test-conv-1",
+            dispatcher,
+        )
+        .expect("no-op succeeds");
         assert!(
             !called.get(),
             "dispatcher should not be invoked when no card"
@@ -614,13 +646,12 @@ mod tests {
 
     #[test]
     fn resolve_oauth_card_placeholders_propagates_team_id_when_team_is_none() {
-        // Regression test for the team coalesce fix from commit 59d9fa1.
-        // TenantCtx has both `team` and `team_id`. If only `team_id` is set
-        // on the envelope, the helper must still propagate it into the
-        // resolve-card dispatcher payload. Note: build_card_resolve_request
-        // reads `/tenant/team_id` (and falls back to `/tenant/team`) and
-        // writes it to the FLAT top-level `team` key of the dispatcher
-        // payload — not under a nested structure.
+        // Regression test: TenantCtx has both `team` and `team_id`. If only
+        // `team_id` is set on the envelope, the session store must still
+        // record it. The dispatcher input now uses the new inner_input shape
+        // (tenant, state, code_challenge, etc.) rather than the old flat
+        // CardRenderer shape. Team propagation is verified via the session
+        // file on disk.
         let mut env: ChannelMessageEnvelope = serde_json::from_value(serde_json::json!({
             "id": "msg-team-id-only",
             "tenant": {
@@ -675,30 +706,56 @@ mod tests {
                     }]
                 });
                 Ok(serde_json::json!({
+                    "ok": true,
                     "resolved_card": resolved_card.to_string(),
+                    "native_oauth_card": false,
                 }))
             };
 
-        resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher)
-            .expect("resolution should succeed");
+        let dir = tempdir().unwrap();
+        let store = OauthSessionStore::new(dir.path());
+        resolve_oauth_card_placeholders(
+            "messaging.webchat-gui",
+            &mut env,
+            &store,
+            "oauth-oidc-generic",
+            "conv-1",
+            dispatcher,
+        )
+        .expect("resolution should succeed");
 
-        // Parse the captured dispatcher input to verify tenant propagation.
-        // build_card_resolve_request (cards.rs) produces a flat request object with
-        // `team` (string) extracted from /tenant/team_id or /tenant/team in the payload.
-        // The messaging.rs helper sets both `team_id` and `team` keys on the tenant object,
-        // so build_card_resolve_request finds `/tenant/team_id` = "ops" and puts it as `team`.
+        // Parse the captured dispatcher input and verify the new inner_input shape.
         let captured = captured_input.borrow().clone();
         let parsed: serde_json::Value =
             serde_json::from_slice(&captured).expect("dispatcher input is valid json");
-        assert_eq!(
-            parsed.get("team").and_then(|v| v.as_str()),
-            Some("ops"),
-            "team_id should propagate from envelope.tenant.team_id into dispatcher request as 'team'"
+        // New shape: adaptive_card, tenant (string), state, code_challenge, native_oauth_card
+        assert!(
+            parsed.get("adaptive_card").and_then(|v| v.as_str()).is_some(),
+            "dispatcher input must contain adaptive_card"
         );
         assert_eq!(
             parsed.get("tenant").and_then(|v| v.as_str()),
             Some("demo"),
             "tenant key should be populated from envelope.tenant.tenant_id"
+        );
+        assert!(
+            parsed
+                .get("state")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
+            "state token must be present and non-empty"
+        );
+        assert!(
+            parsed
+                .get("code_challenge")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
+            "code_challenge must be present and non-empty"
+        );
+        assert_eq!(
+            parsed.get("native_oauth_card").and_then(|v| v.as_bool()),
+            Some(false),
+            "native_oauth_card should be false"
         );
     }
 
