@@ -571,6 +571,10 @@ mod tests {
         resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher)
             .expect("no-op succeeds");
         assert!(!called.get(), "dispatcher should not be invoked when no card");
+        assert!(
+            env.metadata.is_empty(),
+            "metadata must be untouched on no-op"
+        );
     }
 
     #[test]
@@ -578,8 +582,10 @@ mod tests {
         // Regression test for the team coalesce fix from commit 59d9fa1.
         // TenantCtx has both `team` and `team_id`. If only `team_id` is set
         // on the envelope, the helper must still propagate it into the
-        // resolve-card dispatcher payload (under both `team_id` and `team`
-        // keys) so the capability can resolve correctly.
+        // resolve-card dispatcher payload. Note: build_card_resolve_request
+        // reads `/tenant/team_id` (and falls back to `/tenant/team`) and
+        // writes it to the FLAT top-level `team` key of the dispatcher
+        // payload — not under a nested structure.
         let mut env: ChannelMessageEnvelope = serde_json::from_value(serde_json::json!({
             "id": "msg-team-id-only",
             "tenant": {
