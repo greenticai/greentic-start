@@ -10,6 +10,7 @@ use crate::messaging_dto::ProviderPayloadV1;
 use crate::messaging_egress as egress;
 use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
+use crate::cards::CardRenderer;
 
 pub(super) fn route_messaging_envelopes(
     bundle: &Path,
@@ -345,7 +346,59 @@ fn resolve_oauth_card_placeholders(
     envelope: &mut ChannelMessageEnvelope,
     dispatcher: impl FnMut(&str, &str, &[u8]) -> anyhow::Result<serde_json::Value>,
 ) -> anyhow::Result<()> {
-    let _ = (provider_type, envelope, dispatcher);
+    let Some(card_str) = envelope.metadata.get("adaptive_card").cloned() else {
+        return Ok(());
+    };
+
+    // Minimal payload matching the shape CardRenderer::render_if_needed expects.
+    // We cannot round-trip the full ChannelMessageEnvelope because `metadata`
+    // is `BTreeMap<String, String>` and the renderer inserts nested JSON
+    // values under /metadata/oauth_card_resolved.
+    let tenant_value = serde_json::json!({
+        "tenant_id": envelope.tenant.tenant_id,
+        "team": envelope.tenant.team,
+    });
+    let payload = serde_json::json!({
+        "metadata": { "adaptive_card": card_str },
+        "tenant": tenant_value,
+    });
+    let payload_bytes =
+        serde_json::to_vec(&payload).map_err(|err| anyhow::anyhow!("serialize payload: {err}"))?;
+
+    let renderer = CardRenderer::new();
+    let outcome = renderer.render_if_needed(provider_type, &payload_bytes, dispatcher)?;
+
+    // Fast path: nothing changed (no placeholder, or renderer returned the
+    // original bytes unchanged).
+    if outcome.bytes == payload_bytes {
+        return Ok(());
+    }
+
+    let rewritten: serde_json::Value = serde_json::from_slice(&outcome.bytes)
+        .map_err(|err| anyhow::anyhow!("parse rewritten payload: {err}"))?;
+
+    if let Some(new_card) = rewritten
+        .pointer("/metadata/adaptive_card")
+        .and_then(serde_json::Value::as_str)
+    {
+        envelope
+            .metadata
+            .insert("adaptive_card".to_string(), new_card.to_string());
+    }
+    if let Some(audit) = rewritten.pointer("/metadata/oauth_card_resolved") {
+        envelope
+            .metadata
+            .insert("oauth_card_resolved".to_string(), audit.to_string());
+    }
+    if let Some(downgrade) = rewritten
+        .pointer("/metadata/oauth_card_downgrade")
+        .filter(|v| !v.is_null())
+    {
+        envelope
+            .metadata
+            .insert("oauth_card_downgrade".to_string(), downgrade.to_string());
+    }
+
     Ok(())
 }
 
@@ -421,6 +474,8 @@ mod tests {
                     "url": resolved_url_for_closure.clone()
                 }]
             });
+            // Only `resolved_card` is load-bearing; `start_url` is informational
+            // and ends up inside the oauth_card_resolved audit metadata.
             Ok(serde_json::json!({
                 "resolved_card": resolved_card.to_string(),
                 "start_url": resolved_url_for_closure.clone(),
