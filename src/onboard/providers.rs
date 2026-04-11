@@ -338,8 +338,15 @@ mod tests {
         let secrets_handle =
             secrets_gate::resolve_secrets_manager(root, "demo", Some("default")).unwrap();
         let runner_host = Arc::new(
-            DemoRunnerHost::new(root.to_path_buf(), &discovery, None, secrets_handle, false, 8080)
-                .unwrap(),
+            DemoRunnerHost::new(
+                root.to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+                8080,
+            )
+            .unwrap(),
         );
         OnboardState { runner_host }
     }

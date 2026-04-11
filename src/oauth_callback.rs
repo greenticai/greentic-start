@@ -32,14 +32,8 @@ pub async fn handle_oauth_callback(
     match handle_oauth_callback_inner(ctx, provider_id, query_string).await {
         Ok(html) => html_response(200, &html),
         Err(err) => {
-            crate::operator_log::warn(
-                module_path!(),
-                format!("[oauth callback] failed: {err:#}"),
-            );
-            html_response(
-                400,
-                &error_html(&format!("OAuth callback failed: {err}")),
-            )
+            crate::operator_log::warn(module_path!(), format!("[oauth callback] failed: {err:#}"));
+            html_response(400, &error_html(&format!("OAuth callback failed: {err}")))
         }
     }
 }
@@ -126,9 +120,8 @@ async fn exchange_code_for_token(
 
     // GitHub returns either JSON (when Accept: application/json) or form-encoded.
     let parsed: TokenResponse = if body_text.trim_start().starts_with('{') {
-        serde_json::from_str(&body_text).map_err(|err| {
-            anyhow!("token response not valid JSON: {err} — body: {body_text}")
-        })?
+        serde_json::from_str(&body_text)
+            .map_err(|err| anyhow!("token response not valid JSON: {err} — body: {body_text}"))?
     } else {
         // form-encoded fallback
         let mut access_token = None;
@@ -165,9 +158,7 @@ async fn exchange_code_for_token(
         ));
     }
     if !status.is_success() {
-        return Err(anyhow!(
-            "token endpoint HTTP {status}: {body_text}"
-        ));
+        return Err(anyhow!("token endpoint HTTP {status}: {body_text}"));
     }
     if parsed.access_token.is_none() {
         return Err(anyhow!("token response missing access_token"));
@@ -324,8 +315,12 @@ async fn persist_access_token(
         .as_deref()
         .ok_or_else(|| anyhow!("no dev store path available to persist access_token"))?;
 
-    let store = DevStore::with_path(dev_store_path)
-        .map_err(|err| anyhow!("failed to open dev store at {}: {err}", dev_store_path.display()))?;
+    let store = DevStore::with_path(dev_store_path).map_err(|err| {
+        anyhow!(
+            "failed to open dev store at {}: {err}",
+            dev_store_path.display()
+        )
+    })?;
 
     let report = apply_seed(
         &store,
@@ -399,9 +394,7 @@ async fn inject_oauth_login_success_activity(
     let post_status = post_resp.status();
     if !post_status.is_success() {
         let post_body = post_resp.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "inject activities HTTP {post_status}: {post_body}"
-        ));
+        return Err(anyhow!("inject activities HTTP {post_status}: {post_body}"));
     }
     Ok(())
 }

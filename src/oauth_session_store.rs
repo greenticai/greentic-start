@@ -88,8 +88,8 @@ impl OauthSessionStore {
         std::fs::create_dir_all(self.sessions_dir())
             .with_context(|| "failed to create oauth-sessions dir")?;
         let path = self.session_path(&state_token);
-        let body = serde_json::to_vec_pretty(&session)
-            .with_context(|| "failed to serialize session")?;
+        let body =
+            serde_json::to_vec_pretty(&session).with_context(|| "failed to serialize session")?;
         std::fs::write(&path, body)
             .with_context(|| format!("failed to write session file {}", path.display()))?;
 
@@ -111,8 +111,8 @@ impl OauthSessionStore {
         let path = self.session_path(state_token);
         let raw = std::fs::read_to_string(&path)
             .map_err(|err| anyhow!("session not found ({state_token}): {err}"))?;
-        let session: PersistedSession = serde_json::from_str(&raw)
-            .with_context(|| format!("session {state_token} corrupt"))?;
+        let session: PersistedSession =
+            serde_json::from_str(&raw).with_context(|| format!("session {state_token} corrupt"))?;
         // Best-effort delete.
         let _ = std::fs::remove_file(&path);
         Ok(session)
@@ -175,7 +175,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = OauthSessionStore::new(dir.path());
         let ticket = store
-            .create("github", "oauth-oidc-generic", "demo", Some("default"), "conv-1")
+            .create(
+                "github",
+                "oauth-oidc-generic",
+                "demo",
+                Some("default"),
+                "conv-1",
+            )
             .unwrap();
         assert!(!ticket.state_token.is_empty());
         assert!(!ticket.code_verifier.is_empty());
@@ -202,7 +208,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = OauthSessionStore::new(dir.path());
         let ticket = store
-            .create("github", "oauth-oidc-generic", "demo", Some("default"), "conv-1")
+            .create(
+                "github",
+                "oauth-oidc-generic",
+                "demo",
+                Some("default"),
+                "conv-1",
+            )
             .unwrap();
         let session = store.consume(&ticket.state_token).unwrap();
         assert_eq!(session.provider_id, "github");
@@ -227,9 +239,7 @@ mod tests {
     fn gc_expired_removes_old_sessions() {
         let dir = tempdir().unwrap();
         let store = OauthSessionStore::new(dir.path());
-        let ticket = store
-            .create("github", "p", "demo", None, "c1")
-            .unwrap();
+        let ticket = store.create("github", "p", "demo", None, "c1").unwrap();
         // Backdate the session by mutating the file directly.
         let path = dir
             .path()

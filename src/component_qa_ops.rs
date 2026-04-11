@@ -120,13 +120,20 @@ pub fn apply_answers_via_component_qa(
                 format!("resolve secrets manager: {err}"),
             )
         })?;
-    let host = DemoRunnerHost::new(root.to_path_buf(), &discovery, None, secrets_handle, false, 0)
-        .map_err(|err| {
-            diagnostic(
-                QaDiagnosticCode::QaSpecFailed,
-                format!("build runner host: {err}"),
-            )
-        })?;
+    let host = DemoRunnerHost::new(
+        root.to_path_buf(),
+        &discovery,
+        None,
+        secrets_handle,
+        false,
+        0,
+    )
+    .map_err(|err| {
+        diagnostic(
+            QaDiagnosticCode::QaSpecFailed,
+            format!("build runner host: {err}"),
+        )
+    })?;
     let ctx = OperatorContext {
         tenant: tenant.to_string(),
         team: team.map(|value| value.to_string()),
