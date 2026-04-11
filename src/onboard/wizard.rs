@@ -650,6 +650,7 @@ fn get_form_spec_from_pack(
         None,
         secrets_handle,
         false,
+        0,
     )
     .ok()?;
 

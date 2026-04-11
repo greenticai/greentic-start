@@ -120,7 +120,7 @@ pub fn apply_answers_via_component_qa(
                 format!("resolve secrets manager: {err}"),
             )
         })?;
-    let host = DemoRunnerHost::new(root.to_path_buf(), &discovery, None, secrets_handle, false)
+    let host = DemoRunnerHost::new(root.to_path_buf(), &discovery, None, secrets_handle, false, 0)
         .map_err(|err| {
             diagnostic(
                 QaDiagnosticCode::QaSpecFailed,

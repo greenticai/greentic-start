@@ -29,6 +29,7 @@ pub fn build_runner(
         runner_binary,
         secrets_handle,
         false,
+        0,
     )?;
     let context = OperatorContext {
         tenant: tenant.to_string(),

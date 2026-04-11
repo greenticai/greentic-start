@@ -1307,6 +1307,7 @@ mod tests {
                 None,
                 secrets_handle,
                 false,
+                8080,
             )
             .unwrap(),
         );
@@ -1542,6 +1543,7 @@ mod tests {
                 None,
                 secrets_handle,
                 false,
+                8080,
             )
             .unwrap(),
         );
@@ -1580,6 +1582,7 @@ mod tests {
                 None,
                 secrets_handle,
                 false,
+                8080,
             )
             .unwrap(),
         );
@@ -1632,6 +1635,7 @@ mod tests {
                 None,
                 secrets_handle,
                 false,
+                8080,
             )
             .unwrap(),
         );
@@ -1710,6 +1714,7 @@ mod tests {
                 None,
                 secrets_handle,
                 false,
+                8080,
             )
             .unwrap(),
         );

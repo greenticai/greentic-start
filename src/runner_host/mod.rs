@@ -46,6 +46,7 @@ pub struct DemoRunnerHost {
     secrets_handle: SecretsManagerHandle,
     state_store: DynStateStore,
     debug_enabled: bool,
+    gateway_port: u16,
 }
 
 impl DemoRunnerHost {
@@ -108,6 +109,7 @@ impl DemoRunnerHost {
         runner_binary: Option<PathBuf>,
         secrets_handle: SecretsManagerHandle,
         debug_enabled: bool,
+        gateway_port: u16,
     ) -> anyhow::Result<Self> {
         let runner_binary = runner_binary.and_then(validate_runner_binary);
         let mode = if let Some(ref binary) = runner_binary {
@@ -177,11 +179,16 @@ impl DemoRunnerHost {
             secrets_handle,
             state_store: new_state_store(),
             debug_enabled,
+            gateway_port,
         })
     }
 
     pub fn debug_enabled(&self) -> bool {
         self.debug_enabled
+    }
+
+    pub fn gateway_port(&self) -> u16 {
+        self.gateway_port
     }
 
     /// Return the canonical `provider_type` stored inside a provider pack manifest
@@ -414,7 +421,7 @@ mod tests {
         let discovery = discovery::discover(dir.path()).unwrap();
         let secrets_handle =
             secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
-        DemoRunnerHost::new(dir.keep(), &discovery, None, secrets_handle, false).unwrap()
+        DemoRunnerHost::new(dir.keep(), &discovery, None, secrets_handle, false, 8080).unwrap()
     }
 
     #[test]

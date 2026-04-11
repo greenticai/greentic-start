@@ -422,7 +422,7 @@ mod tests {
         let discovery = discovery::discover(dir.path()).unwrap();
         let secrets_handle =
             secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
-        DemoRunnerHost::new(dir.keep(), &discovery, None, secrets_handle, false).unwrap()
+        DemoRunnerHost::new(dir.keep(), &discovery, None, secrets_handle, false, 8080).unwrap()
     }
 
     #[test]
@@ -472,6 +472,7 @@ mod tests {
             Some(runner),
             secrets_handle,
             false,
+            8080,
         )
         .unwrap();
         let pack_path = root.join("messaging-webchat.gtpack");

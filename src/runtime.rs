@@ -776,6 +776,7 @@ pub fn demo_up_services(
         runner_binary.clone(),
         secrets_handle.clone(),
         debug_enabled,
+        config.services.gateway.port,
     )?);
     let ingress_domains = detect_http_ingress_domains(&discovery, runner_host.as_ref());
     // Enable static routes if bundle declares them - no longer requires NATS mode
@@ -1872,6 +1873,7 @@ mod tests {
             None,
             secrets_handle,
             false,
+            8080,
         )?;
 
         assert_eq!(parse_domain_name("messaging"), Some(Domain::Messaging));

@@ -827,6 +827,7 @@ mod tests {
             None,
             secrets_handle,
             false,
+            8080,
         )
         .expect("runner host");
 
@@ -868,6 +869,7 @@ mod tests {
             None,
             secrets_handle,
             false,
+            8080,
         )
         .expect("runner host");
 
