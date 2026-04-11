@@ -231,9 +231,12 @@ async fn handle_oauth_callback_inner(
         ),
     );
 
-    // Tasks 14-15 will persist + inject. For now, log and return success HTML.
-    let _ = access_token;
-    let _ = ctx.runner_host;
+    let secret_uri = persist_access_token(ctx.runner_host, &session, &access_token).await?;
+    crate::operator_log::info(
+        module_path!(),
+        format!("[oauth callback] persisted access_token to {secret_uri}"),
+    );
+
     Ok(success_html(&session.tenant))
 }
 
@@ -272,6 +275,61 @@ fn success_html(tenant: &str) -> String {
 </body>
 </html>"#,
     )
+}
+
+async fn persist_access_token(
+    runner_host: &DemoRunnerHost,
+    session: &PersistedSession,
+    access_token: &str,
+) -> Result<String> {
+    use greentic_secrets_lib::{
+        ApplyOptions, DevStore, SecretFormat, SeedDoc, SeedEntry, SeedValue, apply_seed,
+    };
+
+    let env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string());
+    let team = session.team.as_deref().unwrap_or("_");
+    let uri = format!(
+        "secrets://{env}/{}/{}/{}/access_token",
+        session.tenant, team, session.provider_pack_id,
+    );
+
+    let entry = SeedEntry {
+        uri: uri.clone(),
+        format: SecretFormat::Text,
+        value: SeedValue::Text {
+            text: access_token.to_string(),
+        },
+        description: Some(format!(
+            "OAuth access_token for {} (callback)",
+            session.provider_id
+        )),
+    };
+
+    let dev_store_path = runner_host
+        .secrets_handle()
+        .dev_store_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("no dev store path available to persist access_token"))?;
+
+    let store = DevStore::with_path(dev_store_path)
+        .map_err(|err| anyhow!("failed to open dev store at {}: {err}", dev_store_path.display()))?;
+
+    let report = apply_seed(
+        &store,
+        &SeedDoc {
+            entries: vec![entry],
+        },
+        ApplyOptions::default(),
+    )
+    .await;
+
+    if !report.failed.is_empty() {
+        return Err(anyhow!(
+            "failed to persist access_token: {:?}",
+            report.failed
+        ));
+    }
+    Ok(uri)
 }
 
 fn html_escape(s: &str) -> String {
