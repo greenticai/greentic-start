@@ -4,13 +4,13 @@ use base64::Engine as _;
 use greentic_types::ChannelMessageEnvelope;
 use serde_json::json;
 
+use crate::cards::CardRenderer;
 use crate::domains::Domain;
 use crate::messaging_app as app;
 use crate::messaging_dto::ProviderPayloadV1;
 use crate::messaging_egress as egress;
 use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
-use crate::cards::CardRenderer;
 
 pub(super) fn route_messaging_envelopes(
     bundle: &Path,
@@ -84,8 +84,7 @@ pub(super) fn route_messaging_envelopes(
             run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
         };
 
-        let provider_type =
-            runner_host.canonical_provider_type(Domain::Messaging, provider);
+        let provider_type = runner_host.canonical_provider_type(Domain::Messaging, provider);
 
         for mut out_envelope in outputs {
             // Ensure i18n tokens are resolved in any adaptive card.  The WASM
@@ -176,12 +175,8 @@ pub(super) fn route_messaging_envelopes(
                 }
             };
 
-            let send_input = egress::build_send_payload(
-                payload,
-                &provider_type,
-                &ctx.tenant,
-                ctx.team.clone(),
-            );
+            let send_input =
+                egress::build_send_payload(payload, &provider_type, &ctx.tenant, ctx.team.clone());
             let send_bytes = serde_json::to_vec(&send_input)?;
             let outcome = runner_host.invoke_provider_op(
                 Domain::Messaging,
@@ -520,33 +515,30 @@ mod tests {
             "https://github.com/login/oauth/authorize?client_id=abc&state=xyz".to_string();
         let resolved_url_for_closure = resolved_url.clone();
 
-        let dispatcher = move |cap_id: &str,
-                               op: &str,
-                               _input: &[u8]|
-              -> anyhow::Result<serde_json::Value> {
-            assert_eq!(cap_id, "greentic.cap.oauth.card.v1");
-            assert_eq!(op, "oauth.card.resolve");
-            let resolved_card = serde_json::json!({
-                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                "type": "AdaptiveCard",
-                "version": "1.5",
-                "body": [{"type": "TextBlock", "text": "Sign in", "wrap": true}],
-                "actions": [{
-                    "type": "Action.OpenUrl",
-                    "title": "Login with OAuth",
-                    "url": resolved_url_for_closure.clone()
-                }]
-            });
-            // Only `resolved_card` is load-bearing; `start_url` is informational
-            // and ends up inside the oauth_card_resolved audit metadata.
-            Ok(serde_json::json!({
-                "resolved_card": resolved_card.to_string(),
-                "start_url": resolved_url_for_closure.clone(),
-            }))
-        };
+        let dispatcher =
+            move |cap_id: &str, op: &str, _input: &[u8]| -> anyhow::Result<serde_json::Value> {
+                assert_eq!(cap_id, "greentic.cap.oauth.card.v1");
+                assert_eq!(op, "oauth.card.resolve");
+                let resolved_card = serde_json::json!({
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.5",
+                    "body": [{"type": "TextBlock", "text": "Sign in", "wrap": true}],
+                    "actions": [{
+                        "type": "Action.OpenUrl",
+                        "title": "Login with OAuth",
+                        "url": resolved_url_for_closure.clone()
+                    }]
+                });
+                // Only `resolved_card` is load-bearing; `start_url` is informational
+                // and ends up inside the oauth_card_resolved audit metadata.
+                Ok(serde_json::json!({
+                    "resolved_card": resolved_card.to_string(),
+                    "start_url": resolved_url_for_closure.clone(),
+                }))
+            };
 
-        let result =
-            resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher);
+        let result = resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher);
         assert!(result.is_ok(), "helper should succeed: {result:?}");
 
         let card = env
@@ -576,15 +568,12 @@ mod tests {
             .cloned()
             .expect("seed card");
 
-        let dispatcher = |_cap_id: &str,
-                          _op: &str,
-                          _input: &[u8]|
-         -> anyhow::Result<serde_json::Value> {
-            Err(anyhow::anyhow!("capability not installed"))
-        };
+        let dispatcher =
+            |_cap_id: &str, _op: &str, _input: &[u8]| -> anyhow::Result<serde_json::Value> {
+                Err(anyhow::anyhow!("capability not installed"))
+            };
 
-        let result =
-            resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher);
+        let result = resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher);
 
         // The helper propagates the error so the caller can log it. The
         // envelope must be left untouched so the caller can still send the
@@ -605,17 +594,18 @@ mod tests {
     fn resolve_oauth_card_placeholders_noop_when_no_card_in_metadata() {
         let mut env = envelope(); // no adaptive_card in metadata
         let called = std::cell::Cell::new(false);
-        let dispatcher = |_cap_id: &str,
-                          _op: &str,
-                          _input: &[u8]|
-         -> anyhow::Result<serde_json::Value> {
-            called.set(true);
-            Ok(serde_json::json!({}))
-        };
+        let dispatcher =
+            |_cap_id: &str, _op: &str, _input: &[u8]| -> anyhow::Result<serde_json::Value> {
+                called.set(true);
+                Ok(serde_json::json!({}))
+            };
 
         resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher)
             .expect("no-op succeeds");
-        assert!(!called.get(), "dispatcher should not be invoked when no card");
+        assert!(
+            !called.get(),
+            "dispatcher should not be invoked when no card"
+        );
         assert!(
             env.metadata.is_empty(),
             "metadata must be untouched on no-op"
@@ -668,26 +658,26 @@ mod tests {
 
         let captured_input = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new()));
         let captured_input_for_closure = captured_input.clone();
-        let dispatcher = move |_cap_id: &str,
-                               _op: &str,
-                               input: &[u8]|
-              -> anyhow::Result<serde_json::Value> {
-            captured_input_for_closure.borrow_mut().extend_from_slice(input);
-            let resolved_card = serde_json::json!({
-                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                "type": "AdaptiveCard",
-                "version": "1.5",
-                "body": [],
-                "actions": [{
-                    "type": "Action.OpenUrl",
-                    "title": "Login",
-                    "url": "https://example.com/oauth"
-                }]
-            });
-            Ok(serde_json::json!({
-                "resolved_card": resolved_card.to_string(),
-            }))
-        };
+        let dispatcher =
+            move |_cap_id: &str, _op: &str, input: &[u8]| -> anyhow::Result<serde_json::Value> {
+                captured_input_for_closure
+                    .borrow_mut()
+                    .extend_from_slice(input);
+                let resolved_card = serde_json::json!({
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.5",
+                    "body": [],
+                    "actions": [{
+                        "type": "Action.OpenUrl",
+                        "title": "Login",
+                        "url": "https://example.com/oauth"
+                    }]
+                });
+                Ok(serde_json::json!({
+                    "resolved_card": resolved_card.to_string(),
+                }))
+            };
 
         resolve_oauth_card_placeholders("messaging.webchat-gui", &mut env, dispatcher)
             .expect("resolution should succeed");
