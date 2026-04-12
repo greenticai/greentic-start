@@ -27,7 +27,6 @@ pub struct HttpRouteDescriptor {
     pub methods: Vec<String>,
     /// The provider operation to invoke (e.g. `ingest_http`). Used when the
     /// dispatch layer needs to call a non-default operation on the provider.
-    #[allow(dead_code)]
     pub provider_op: String,
     pub domain: Domain,
     /// Parsed segments from the pattern for matching.

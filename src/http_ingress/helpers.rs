@@ -264,6 +264,9 @@ pub(super) struct ParsedIngressRoute {
     pub tenant: String,
     pub team: String,
     pub handler: Option<String>,
+    /// Op name declared by the pack route descriptor. `None` for standard ingress routes,
+    /// which fall back to `"ingest_http"` at the dispatch layer.
+    pub provider_op: Option<String>,
 }
 
 pub(super) fn parse_route_segments(path: &str) -> Option<ParsedIngressRoute> {
@@ -296,6 +299,7 @@ fn parse_v1_route(segments: &[&str]) -> Option<ParsedIngressRoute> {
         tenant,
         team,
         handler,
+        provider_op: None,
     })
 }
 
@@ -314,6 +318,7 @@ fn parse_legacy_route(segments: &[&str]) -> Option<ParsedIngressRoute> {
         tenant,
         team,
         handler,
+        provider_op: None,
     })
 }
 

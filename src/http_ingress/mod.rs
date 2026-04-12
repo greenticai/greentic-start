@@ -573,6 +573,7 @@ where
                 tenant: route_match.tenant,
                 team: route_match.team,
                 handler: None,
+                provider_op: Some(route_match.descriptor.provider_op.clone()),
             };
         }
 
@@ -600,13 +601,14 @@ where
     if !state.domains.contains(&domain) {
         return Err(error_response(StatusCode::NOT_FOUND, "domain disabled"));
     }
+    let resolved_op = parsed.provider_op.as_deref().unwrap_or("ingest_http");
     if !state
         .runner_host
-        .supports_op(domain, &parsed.provider, "ingest_http")
+        .supports_op(domain, &parsed.provider, resolved_op)
     {
         return Err(error_response(
             StatusCode::NOT_FOUND,
-            "no ingest_http handler available",
+            format!("no {resolved_op} handler available"),
         ));
     }
 
@@ -663,11 +665,12 @@ where
         remote_addr: None,
     };
 
-    let result = dispatch_http_ingress(
+    let result = dispatch_http_ingress_with_op(
         state.runner_host.as_ref(),
         domain,
         &ingress_request,
         &context,
+        resolved_op,
     )
     .map_err(|err| error_response(StatusCode::BAD_GATEWAY, err.to_string()))?;
     if !result.events.is_empty() {
