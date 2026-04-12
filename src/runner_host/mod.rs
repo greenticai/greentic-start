@@ -53,6 +53,60 @@ impl DemoRunnerHost {
         &self.bundle_root
     }
 
+    /// Resolve the public base URL for the given tenant/team.
+    ///
+    /// Priority:
+    /// 1. `state/runtime/{tenant}.{team}/endpoints.json#public_base_url` (tunnel URL)
+    /// 2. `state/runtime/{tenant}.{team}/public_base_url.txt` (manual override)
+    /// 3. `http://127.0.0.1:{gateway_port}` from `endpoints.json#gateway_port`, or
+    ///    `http://127.0.0.1:8080` when the file is absent
+    pub(crate) fn load_public_base_url(
+        &self,
+        tenant: &str,
+        team: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let team_segment = match team {
+            Some(t) if !t.is_empty() => format!("{tenant}.{t}"),
+            _ => format!("{tenant}.default"),
+        };
+        let runtime_dir = self
+            .bundle_root
+            .join("state")
+            .join("runtime")
+            .join(&team_segment);
+
+        // Try endpoints.json#public_base_url first (written by cloudflared/ngrok tunnel setup)
+        let endpoints_path = runtime_dir.join("endpoints.json");
+        let mut gateway_port_from_endpoints: Option<u16> = None;
+        if let Ok(raw) = std::fs::read_to_string(&endpoints_path)
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw)
+        {
+            if let Some(url) = value.get("public_base_url").and_then(|v| v.as_str())
+                && !url.trim().is_empty()
+            {
+                return Ok(url.trim_end_matches('/').to_string());
+            }
+            // Capture gateway_port for the loopback fallback below
+            gateway_port_from_endpoints = value
+                .get("gateway_port")
+                .and_then(|v| v.as_u64())
+                .and_then(|p| u16::try_from(p).ok());
+        }
+
+        // Fall back to public_base_url.txt (manual override written by operators)
+        let txt_path = runtime_dir.join("public_base_url.txt");
+        if let Ok(raw) = std::fs::read_to_string(&txt_path) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.trim_end_matches('/').to_string());
+            }
+        }
+
+        // Final fallback: loopback at gateway port
+        let port = gateway_port_from_endpoints.unwrap_or(8080);
+        Ok(format!("http://127.0.0.1:{port}"))
+    }
+
     pub fn secrets_manager(&self) -> DynSecretsManager {
         self.secrets_handle.manager()
     }
@@ -415,6 +469,53 @@ mod tests {
         let secrets_handle =
             secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
         DemoRunnerHost::new(dir.keep(), &discovery, None, secrets_handle, false).unwrap()
+    }
+
+    /// Like `empty_host_for_tests` but with a caller-supplied `bundle_root`.
+    /// The `_gateway_port` parameter is kept for readability in tests — the loopback
+    /// fallback reads the port from `endpoints.json` when present, so tests that want
+    /// a specific port should write it into the fixture file.
+    pub(super) fn empty_host_for_tests_with_bundle_root(
+        bundle_root: std::path::PathBuf,
+        _gateway_port: u16,
+    ) -> DemoRunnerHost {
+        let discovery = discovery::discover(&bundle_root).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(&bundle_root, "demo", Some("default")).unwrap();
+        DemoRunnerHost::new(bundle_root, &discovery, None, secrets_handle, false).unwrap()
+    }
+
+    #[test]
+    fn load_public_base_url_reads_endpoints_json() {
+        let dir = tempdir().unwrap();
+        let runtime_dir = dir.path().join("state/runtime/demo.default");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(
+            runtime_dir.join("endpoints.json"),
+            r#"{"public_base_url": "http://test.example:9000", "gateway_port": 8080}"#,
+        )
+        .unwrap();
+
+        let host = empty_host_for_tests_with_bundle_root(dir.path().to_path_buf(), 8080);
+        let url = host.load_public_base_url("demo", Some("default")).unwrap();
+        assert_eq!(url, "http://test.example:9000");
+    }
+
+    #[test]
+    fn load_public_base_url_falls_back_to_loopback() {
+        let dir = tempdir().unwrap();
+        // Write endpoints.json without public_base_url but with gateway_port
+        let runtime_dir = dir.path().join("state/runtime/demo.default");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(
+            runtime_dir.join("endpoints.json"),
+            r#"{"gateway_port": 8090}"#,
+        )
+        .unwrap();
+
+        let host = empty_host_for_tests_with_bundle_root(dir.path().to_path_buf(), 8090);
+        let url = host.load_public_base_url("demo", Some("default")).unwrap();
+        assert_eq!(url, "http://127.0.0.1:8090");
     }
 
     #[test]

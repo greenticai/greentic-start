@@ -137,10 +137,6 @@ fn build_injected_config(
         }
     };
 
-    if secret_keys.is_empty() {
-        return None;
-    }
-
     // Fetch all required secrets and build the config
     let mut config_map = serde_json::Map::new();
     let mut any_found = false;
@@ -170,6 +166,14 @@ fn build_injected_config(
                 );
             }
         }
+    }
+
+    // Inject runtime context: public_base_url (always, if available).
+    // WASM components that don't need it ignore the field; OAuth callback
+    // handlers read it to construct redirect_uri and loopback URLs.
+    if let Ok(url) = runner_host.load_public_base_url(&ctx.tenant, ctx.team.as_deref()) {
+        config_map.insert("public_base_url".to_string(), JsonValue::String(url));
+        any_found = true;
     }
 
     if any_found {
