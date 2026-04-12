@@ -36,6 +36,7 @@ mod offers;
 mod onboard;
 mod operator_i18n;
 mod operator_log;
+pub(crate) mod pack_card_rewrites;
 #[doc(hidden)]
 pub mod perf_harness;
 mod port_utils;

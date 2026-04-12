@@ -34,6 +34,15 @@ pub(super) fn route_messaging_envelopes(
         ),
     );
 
+    let card_rewrites = crate::pack_card_rewrites::discover_card_rewrites_from_bundle(bundle)
+        .unwrap_or_else(|err| {
+            operator_log::warn(
+                module_path!(),
+                format!("[demo messaging] failed to load card rewrites: {err}"),
+            );
+            Vec::new()
+        });
+
     for envelope in &envelopes {
         let outputs = if let Some(route_to_card) = envelope.metadata.get("routeToCardId") {
             match read_card_from_pack(&app_pack_path, route_to_card) {
@@ -91,6 +100,35 @@ pub(super) fn route_messaging_envelopes(
             // `{{i18n:KEY}}` tokens.  Re-read the card from the pack and apply
             // i18n as a safety net.
             ensure_card_i18n_resolved(&mut out_envelope, &app_pack_path);
+
+            if !card_rewrites.is_empty()
+                && let Err(err) = crate::pack_card_rewrites::apply_card_rewrites(
+                    &card_rewrites,
+                    &mut out_envelope,
+                    |cap_id, op, input| {
+                        let outcome = runner_host.invoke_capability(cap_id, op, input, ctx)?;
+                        if !outcome.success {
+                            return Err(anyhow::anyhow!(
+                                "capability {}:{} failed: {}",
+                                cap_id,
+                                op,
+                                outcome
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown".to_string())
+                            ));
+                        }
+                        outcome.output.ok_or_else(|| {
+                            anyhow::anyhow!("capability {}:{} returned no output", cap_id, op)
+                        })
+                    },
+                )
+            {
+                operator_log::warn(
+                    module_path!(),
+                    format!("[demo messaging] card rewrite failed: {err}; sending unresolved",),
+                );
+            }
 
             // Standard egress pipeline: render → encode → send_payload.
             // All providers (including webchat) use this path. The webchat provider's
