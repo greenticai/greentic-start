@@ -13,6 +13,7 @@ pub use types::{FlowOutcome, OperatorContext, RunnerExecutionMode};
 
 use std::collections::{BTreeMap, HashMap};
 use std::env;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use greentic_runner_host::storage::{DynStateStore, new_state_store};
@@ -424,12 +425,27 @@ impl DemoRunnerHost {
             ));
         }
 
+        // Envelope-wrap the payload if the pack declares `greentic.envelope-wrap.v1`.
+        let final_payload: Vec<u8> = if pack_requires_envelope_wrap(&pack.path) {
+            let public_base_url = self
+                .load_public_base_url(&ctx.tenant, ctx.team.as_deref())
+                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+            wrap_payload_for_dispatch(
+                &self.bundle_root,
+                &public_base_url,
+                &binding.pack_id,
+                payload_bytes,
+            )?
+        } else {
+            payload_bytes.to_vec()
+        };
+
         let outcome = self.invoke_provider_component_op(
             binding.domain,
             pack,
             &binding.pack_id,
             target_op,
-            payload_bytes,
+            &final_payload,
             ctx,
         )?;
 
@@ -454,6 +470,93 @@ impl DemoRunnerHost {
             })
             .unwrap_or(false)
     }
+}
+
+/// Returns true if the pack's `greentic.envelope-wrap.v1` extension declares
+/// `inline.enabled: true`.
+///
+/// The pack archive is opened and `manifest.cbor` is parsed on each call; the
+/// overhead is negligible compared to WASM execution. Returns false on any
+/// error (conservative default).
+fn pack_requires_envelope_wrap(pack_path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(pack_path) else {
+        return false;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return false;
+    };
+    let Ok(mut entry) = archive.by_name("manifest.cbor") else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if entry.read_to_end(&mut bytes).is_err() {
+        return false;
+    }
+    let Ok(manifest) = greentic_types::decode_pack_manifest(&bytes) else {
+        return false;
+    };
+    let Some(exts) = manifest.extensions.as_ref() else {
+        return false;
+    };
+    let Some(ext) = exts.get("greentic.envelope-wrap.v1") else {
+        return false;
+    };
+    let Some(inline) = ext.inline.as_ref() else {
+        return false;
+    };
+    match inline {
+        greentic_types::ExtensionInline::Other(value) => value
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Build a `{host, provider, input}` dispatch envelope from the pack's persisted
+/// config and the resolved public base URL.
+///
+/// The provider config is read from `{bundle_root}/.providers/{pack_id}/config.envelope.cbor`.
+/// This is a free function (no `&self`) so it can be unit-tested independently.
+fn wrap_payload_for_dispatch(
+    bundle_root: &Path,
+    public_base_url: &str,
+    pack_id: &str,
+    payload_bytes: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context as _;
+
+    let providers_root = bundle_root.join(".providers");
+    let envelope =
+        crate::provider_config_envelope::read_provider_config_envelope(&providers_root, pack_id)
+            .with_context(|| format!("read provider config for {pack_id}"))?;
+    let provider_cfg = envelope
+        .map(|e| e.config)
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+
+    let inner_input: serde_json::Value = serde_json::from_slice(payload_bytes)
+        .with_context(|| "capability payload is not valid JSON")?;
+
+    let dispatch_envelope = serde_json::json!({
+        "host": { "public_base_url": public_base_url },
+        "provider": {
+            "provider_id": provider_cfg.get("provider_id"),
+            "client_id": provider_cfg.get("client_id"),
+            "client_secret": provider_cfg.get("client_secret"),
+            "client_id_key": serde_json::Value::Null,
+            "client_secret_key": serde_json::Value::Null,
+            "auth_url": provider_cfg.get("auth_url"),
+            "token_url": provider_cfg.get("token_url"),
+            "default_scopes": provider_cfg
+                .get("default_scopes")
+                .and_then(|v| v.as_str())
+                .map(|s| s.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        },
+        "input": inner_input,
+    });
+
+    serde_json::to_vec(&dispatch_envelope).with_context(|| "serialize dispatch envelope")
 }
 
 #[cfg(test)]
