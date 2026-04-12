@@ -191,6 +191,24 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         runtime_state::RuntimePaths::new(state_dir.clone(), tenant.clone(), team.clone());
     runtime_state::clear_stop_request(&runtime_paths)?;
 
+    // Auto-enable cloudflared when no deployer packs are present in the bundle
+    // (i.e. local dev mode). External webhooks (Webex, Telegram, etc.) need a
+    // public URL to reach the local instance.
+    if !request.tunnel_explicit {
+        let has_deployer =
+            !greentic_setup::deployment_targets::discover_deployer_pack_candidates(&config_dir)
+                .unwrap_or_default()
+                .is_empty();
+        if !has_deployer {
+            operator_log::info(
+                module_path!(),
+                "no deployer packs detected; defaulting to cloudflared tunnel",
+            );
+            request.cloudflared = CloudflaredModeArg::On;
+            request.tunnel_explicit = true;
+        }
+    }
+
     // If the user didn't explicitly set a tunnel flag, prompt for tunnel selection
     tunnel_prompt::maybe_prompt_tunnel(&mut request);
 
@@ -609,6 +627,35 @@ mod tests {
                 || message.contains("bundle path does not exist")
                 || message.contains("unsupported bundle reference"),
             "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn auto_enables_cloudflared_when_no_deployer_packs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Empty bundle dir → no deployer packs
+        std::fs::create_dir_all(dir.path().join("packs")).expect("packs dir");
+        let candidates =
+            greentic_setup::deployment_targets::discover_deployer_pack_candidates(dir.path())
+                .unwrap_or_default();
+        assert!(
+            candidates.is_empty(),
+            "empty bundle should have no deployer"
+        );
+    }
+
+    #[test]
+    fn detects_deployer_pack_when_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let deployer_dir = dir.path().join("providers").join("deployer");
+        std::fs::create_dir_all(&deployer_dir).expect("deployer dir");
+        std::fs::write(deployer_dir.join("terraform.gtpack"), b"fake").expect("write pack");
+        let candidates =
+            greentic_setup::deployment_targets::discover_deployer_pack_candidates(dir.path())
+                .unwrap_or_default();
+        assert!(
+            !candidates.is_empty(),
+            "bundle with terraform.gtpack should detect deployer"
         );
     }
 }
