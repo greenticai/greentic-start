@@ -1,8 +1,5 @@
-Cargo.lock
-Cargo.toml
-src/bin_resolver.rs
-src/cloudflared.rs
-src/http_ingress/mod.rs
-src/lib.rs
-src/port_utils.rs
-src/runtime.rs
+.github/workflows/crates-publish.yml
+.github/workflows/distroless.yml
+.github/workflows/publish.yml
+.github/workflows/release-binaries.yml
+.github/workflows/tag-on-version-bump.yml
