@@ -2,17 +2,7 @@ name: publish-distroless
 
 on:
   push:
-    branches:
-      - "**"
-    paths:
-      - "Dockerfile.distroless"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "src/**"
-      - ".github/workflows/distroless.yml"
-  release:
-    types:
-      - published
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -44,25 +34,14 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract Docker metadata
-        if: ${{ github.event_name != 'release' }}
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/greenticai/greentic-start-distroless
           tags: |
-            type=ref,event=branch
-            type=sha,prefix=sha-
-
-      - name: Extract release Docker metadata
-        if: ${{ github.event_name == 'release' }}
-        id: release_meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/greenticai/greentic-start-distroless
-          tags: |
             type=raw,value=latest
-            type=raw,value=${{ github.event.release.tag_name }}
-            type=match,pattern=v(.*),group=1,value=${{ github.event.release.tag_name }}
+            type=raw,value=${{ github.ref_name }}
+            type=match,pattern=v(.*),group=1,value=${{ github.ref_name }}
 
       - name: Build and push distroless greentic-start image
         uses: docker/build-push-action@v6
@@ -71,5 +50,5 @@ jobs:
           file: ./Dockerfile.distroless
           push: true
           platforms: linux/amd64
-          tags: ${{ github.event_name == 'release' && steps.release_meta.outputs.tags || steps.meta.outputs.tags }}
-          labels: ${{ github.event_name == 'release' && steps.release_meta.outputs.labels || steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
