@@ -2410,9 +2410,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-setup"
-version = "0.4.17"
+version = "0.4.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96c414b8ed4c19b738971f9919091db8f9cee61b64a647dbebcb906c15a7a03d"
+checksum = "00f37acd01b8605629934654805eb63c13accbc293f6b2af72770ffd8ab6c606"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
