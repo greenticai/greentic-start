@@ -192,6 +192,9 @@ pub fn update_webhooks_if_url_changed(
                         provider.provider_id
                     ),
                 );
+                summary
+                    .results
+                    .push((provider.provider_id.clone(), "skipped".to_string()));
             }
             Err(err) => {
                 let msg = format!("{err}");
