@@ -1,6 +1,1 @@
 Cargo.lock
-Cargo.toml
-src/cloudflared.rs
-src/lib.rs
-src/runtime.rs
-src/webhook_updater.rs
