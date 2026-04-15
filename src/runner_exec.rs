@@ -294,9 +294,10 @@ fn build_pack_wasi_policy(request: &RunRequest) -> anyhow::Result<RunnerWasiPoli
             &key,
         );
         let value = match make_runtime_or_thread_scope(|runtime| {
-            runtime.block_on(async { greentic_secrets_lib::SecretsManager::read(&secrets, &uri).await })
-        })
-        {
+            runtime.block_on(async {
+                greentic_secrets_lib::SecretsManager::read(&secrets, &uri).await
+            })
+        }) {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(value) => value,
                 Err(_) => continue,
