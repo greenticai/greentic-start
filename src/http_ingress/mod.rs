@@ -25,7 +25,6 @@ use crate::domains::Domain;
 use crate::http_routes::{HttpRouteTable, discover_http_routes_from_bundle};
 use crate::ingress_dispatch::{dispatch_http_ingress, dispatch_http_ingress_with_op};
 use crate::ingress_types::{IngressHttpResponse, IngressRequestV1};
-use crate::messaging_dto::HttpInV1;
 use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
 use crate::static_routes::{
@@ -894,6 +893,9 @@ where
 {
     let (provider_method, provider_path) =
         normalize_directline_dispatch(request.method, request.path);
+    let provider_queries =
+        augment_directline_queries(request.queries, request.tenant, Some(request.team));
+    let provider_query_string = encode_directline_query_string(&provider_queries);
     let headers = collect_headers(req.headers());
     let body = req
         .into_body()
@@ -901,20 +903,20 @@ where
         .await
         .map(|collected| collected.to_bytes())
         .unwrap_or_default();
-    let payload = HttpInV1 {
-        v: 1,
-        provider: request.provider.to_string(),
-        route: request.route.map(str::to_string),
-        binding_id: None,
-        tenant_hint: Some(request.tenant.to_string()),
-        team_hint: Some(request.team.to_string()),
-        method: provider_method.as_str().to_string(),
-        path: provider_path,
-        query: request.queries.to_vec(),
-        headers,
-        body_b64: base64::engine::general_purpose::STANDARD.encode(&body),
-        config: None,
-    };
+    let payload = serde_json::json!({
+        "v": 1,
+        "provider": request.provider,
+        "route": request.route,
+        "binding_id": serde_json::Value::Null,
+        "tenant_hint": request.tenant,
+        "team_hint": request.team,
+        "method": provider_method.as_str(),
+        "path": provider_path,
+        "query": provider_query_string,
+        "headers": headers,
+        "body_b64": base64::engine::general_purpose::STANDARD.encode(&body),
+        "config": serde_json::Value::Null,
+    });
     let ctx = OperatorContext {
         tenant: request.tenant.to_string(),
         team: Some(request.team.to_string()),
@@ -967,6 +969,56 @@ fn normalize_directline_dispatch(method: &Method, path: &str) -> (Method, String
     (method.clone(), path.to_string())
 }
 
+fn augment_directline_queries(
+    queries: &[(String, String)],
+    tenant: &str,
+    team: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut augmented = queries.to_vec();
+    if !augmented.iter().any(|(name, _)| name == "tenant") {
+        augmented.push(("tenant".to_string(), tenant.to_string()));
+    }
+    if let Some(team) = team.filter(|value| !value.is_empty())
+        && !augmented.iter().any(|(name, _)| name == "team")
+    {
+        augmented.push(("team".to_string(), team.to_string()));
+    }
+    augmented
+}
+
+fn encode_directline_query_string(queries: &[(String, String)]) -> Option<String> {
+    if queries.is_empty() {
+        return None;
+    }
+    Some(
+        queries
+            .iter()
+            .map(|(name, value)| {
+                format!(
+                    "{}={}",
+                    percent_encode_query_component(name),
+                    percent_encode_query_component(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&"),
+    )
+}
+
+fn percent_encode_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            b' ' => encoded.push_str("%20"),
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    encoded
+}
+
 async fn dispatch_provider_directline_via_ingest_http<B>(
     req: Request<B>,
     request: ProviderDirectlineHttpRequest<'_>,
@@ -978,6 +1030,8 @@ where
 {
     let (provider_method, provider_path) =
         normalize_directline_dispatch(request.method, request.path);
+    let provider_queries =
+        augment_directline_queries(request.queries, request.tenant, Some(request.team));
     let headers = collect_headers(req.headers());
     let body = req
         .into_body()
@@ -999,7 +1053,7 @@ where
         team: Some(request.team.to_string()),
         method: provider_method.as_str().to_string(),
         path: provider_path,
-        query: request.queries.to_vec(),
+        query: provider_queries,
         headers,
         body,
         correlation_id: None,
@@ -1888,5 +1942,76 @@ mod tests {
             normalize_directline_dispatch(&Method::POST, "/directline/conversations");
         assert_eq!(method, Method::POST);
         assert_eq!(path, "/v3/directline/conversations");
+    }
+
+    #[test]
+    fn augment_directline_queries_injects_tenant_and_team_when_missing() {
+        let augmented = augment_directline_queries(
+            &[("env".into(), "default".into())],
+            "demo",
+            Some("default"),
+        );
+        assert!(
+            augmented
+                .iter()
+                .any(|(name, value)| name == "env" && value == "default")
+        );
+        assert!(
+            augmented
+                .iter()
+                .any(|(name, value)| name == "tenant" && value == "demo")
+        );
+        assert!(
+            augmented
+                .iter()
+                .any(|(name, value)| name == "team" && value == "default")
+        );
+
+        let preserved = augment_directline_queries(
+            &[
+                ("tenant".into(), "custom".into()),
+                ("team".into(), "ops".into()),
+            ],
+            "demo",
+            Some("default"),
+        );
+        assert!(
+            preserved
+                .iter()
+                .any(|(name, value)| name == "tenant" && value == "custom")
+        );
+        assert!(
+            preserved
+                .iter()
+                .any(|(name, value)| name == "team" && value == "ops")
+        );
+        assert_eq!(
+            preserved
+                .iter()
+                .filter(|(name, _)| name == "tenant")
+                .count(),
+            1
+        );
+        assert_eq!(
+            preserved.iter().filter(|(name, _)| name == "team").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn encode_directline_query_string_serializes_pairs() {
+        assert_eq!(encode_directline_query_string(&[]), None);
+        assert_eq!(
+            encode_directline_query_string(&[
+                ("env".into(), "default".into()),
+                ("tenant".into(), "demo space".into()),
+                ("team".into(), "blue/ops".into()),
+            ]),
+            Some("env=default&tenant=demo%20space&team=blue%2Fops".to_string())
+        );
+        assert_eq!(
+            percent_encode_query_component("a+b&c=d"),
+            "a%2Bb%26c%3Dd".to_string()
+        );
     }
 }

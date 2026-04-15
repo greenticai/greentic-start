@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    collections::BTreeSet,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -521,7 +522,7 @@ fn parse_envelopes(
                 summarize_output_shape(value)
             ),
         );
-        return parse_envelope_array(v);
+        return parse_envelope_array(v, ingress_envelope);
     }
     if let Some(events) = value.get("events").and_then(|v| v.as_array()) {
         operator_log::info(
@@ -532,7 +533,7 @@ fn parse_envelopes(
                 summarize_output_shape(value)
             ),
         );
-        return parse_envelope_array(events);
+        return parse_envelope_array(events, ingress_envelope);
     }
     if let Some(envelope) = value.get("message") {
         operator_log::info(
@@ -626,14 +627,37 @@ fn parse_envelopes(
     ))
 }
 
-fn parse_envelope_array(array: &[JsonValue]) -> Result<Vec<ChannelMessageEnvelope>> {
+fn parse_envelope_array(
+    array: &[JsonValue],
+    ingress_envelope: &ChannelMessageEnvelope,
+) -> Result<Vec<ChannelMessageEnvelope>> {
     let mut envelopes = Vec::new();
+    let mut seen = BTreeSet::new();
     for element in array {
-        let envelope: ChannelMessageEnvelope = serde_json::from_value(element.clone())
+        if let Ok(envelope) = serde_json::from_value::<ChannelMessageEnvelope>(element.clone()) {
+            push_unique_envelope(&mut envelopes, &mut seen, envelope)?;
+            continue;
+        }
+
+        let nested = parse_envelopes(element, ingress_envelope)
             .context("app flow output array contains invalid channel envelope")?;
-        envelopes.push(envelope);
+        for envelope in nested {
+            push_unique_envelope(&mut envelopes, &mut seen, envelope)?;
+        }
     }
     Ok(envelopes)
+}
+
+fn push_unique_envelope(
+    envelopes: &mut Vec<ChannelMessageEnvelope>,
+    seen: &mut BTreeSet<String>,
+    envelope: ChannelMessageEnvelope,
+) -> Result<()> {
+    let key = serde_json::to_string(&envelope).context("failed to serialize channel envelope")?;
+    if seen.insert(key) {
+        envelopes.push(envelope);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -986,6 +1010,56 @@ mod tests {
             messages_output[0].text.as_deref(),
             Some("messages fallback")
         );
+
+        let card_array_output = parse_envelopes(
+            &json!([
+                {
+                    "renderedCard": {
+                        "type": "AdaptiveCard",
+                        "version": "1.5",
+                        "body": [{"type": "TextBlock", "text": "Card A"}]
+                    }
+                },
+                {
+                    "renderedCard": {
+                        "type": "AdaptiveCard",
+                        "version": "1.5",
+                        "body": [{"type": "TextBlock", "text": "Card B"}]
+                    }
+                }
+            ]),
+            &ingress,
+        )
+        .expect("card array output");
+        assert_eq!(card_array_output.len(), 2);
+        assert!(
+            card_array_output
+                .iter()
+                .all(|reply| reply.metadata.contains_key("adaptive_card"))
+        );
+        assert_eq!(card_array_output.len(), 2);
+
+        let duplicate_card_array_output = parse_envelopes(
+            &json!([
+                {
+                    "renderedCard": {
+                        "type": "AdaptiveCard",
+                        "version": "1.5",
+                        "body": [{"type": "TextBlock", "text": "Card A"}]
+                    }
+                },
+                {
+                    "renderedCard": {
+                        "type": "AdaptiveCard",
+                        "version": "1.5",
+                        "body": [{"type": "TextBlock", "text": "Card A"}]
+                    }
+                }
+            ]),
+            &ingress,
+        )
+        .expect("duplicate card array output");
+        assert_eq!(duplicate_card_array_output.len(), 1);
 
         let text_output = parse_envelopes(&json!({"payload": {"text": "payload text"}}), &ingress)
             .expect("text output");

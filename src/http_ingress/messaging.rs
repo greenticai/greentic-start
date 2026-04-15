@@ -89,6 +89,13 @@ pub(super) fn route_messaging_envelopes(
         };
 
         for mut out_envelope in outputs {
+            if let Some(team) = &ctx.team {
+                out_envelope
+                    .metadata
+                    .entry("team".to_string())
+                    .or_insert_with(|| team.clone());
+            }
+
             // Ensure i18n tokens are resolved in any adaptive card.  The WASM
             // component *should* resolve them, but when running through
             // greentic-runner-desktop the host resolver is not registered so the
@@ -102,6 +109,43 @@ pub(super) fn route_messaging_envelopes(
             // send_payload writes bot activities to the conversation state store for
             // client polling via DirectLine GET /activities.
             let message_value = serde_json::to_value(&out_envelope)?;
+            let has_adaptive_card = message_value
+                .get("metadata")
+                .and_then(|m| m.get("adaptive_card"))
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[demo messaging] pre-encode adaptive_card={} text_present={} session_id={} route={} tenant={} metadata_keys={}",
+                    has_adaptive_card,
+                    message_value
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false),
+                    message_value
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    message_value
+                        .get("metadata")
+                        .and_then(|m| m.get("route"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    message_value
+                        .get("metadata")
+                        .and_then(|m| m.get("tenant"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    message_value
+                        .get("metadata")
+                        .and_then(|v| v.as_object())
+                        .map(|o| o.keys().cloned().collect::<Vec<_>>().join(","))
+                        .unwrap_or_default()
+                ),
+            );
 
             let plan = match egress::render_plan(runner_host, ctx, provider, message_value.clone())
             {
