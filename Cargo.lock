@@ -7616,3 +7616,7 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "greentic-types"
+version = "0.4.59"
