@@ -65,3 +65,9 @@ zstd = "0.13"
 [dev-dependencies]
 criterion = "0.8"
 tempfile = "3"
+
+# === TEMPORARY: TASK-082 Bug 3 cross-submodule development ===
+# Points greentic-types to the local worktree so greentic-types changes
+# are picked up before they're published to crates.io. Revert before merge.
+[patch.crates-io]
+greentic-types = { path = "../greentic-types" }
