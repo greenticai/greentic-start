@@ -200,7 +200,11 @@ fn build_client_config(
             .context("add admin relay CA cert to root store")?;
     }
 
-    rustls::ClientConfig::builder()
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+    rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("set admin relay TLS protocol versions")?
         .with_root_certificates(root_store)
         .with_client_auth_cert(client_certs, client_key)
         .context("build admin relay client config")
