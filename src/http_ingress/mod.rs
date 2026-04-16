@@ -1,3 +1,4 @@
+mod admin_relay;
 mod helpers;
 mod messaging;
 mod static_handler;
@@ -31,6 +32,9 @@ use crate::static_routes::{
     ActiveRouteTable, ReservedRouteSet, RouteScopeSegment, StaticRouteMatch, discover_from_bundle,
 };
 
+use admin_relay::{
+    AdminRelayConfig, handle_admin_relay, load_admin_relay_config_from_env, relay_target_path,
+};
 use helpers::{
     build_http_response, collect_headers, collect_queries, cors_preflight_response, domain_name,
     error_response, handle_builtin_health_request, handle_oauth_token_exchange, parse_domain,
@@ -161,11 +165,13 @@ impl HttpIngressServer {
             HttpRouteTable::default()
         };
 
+        let admin_relay = load_admin_relay_config_from_env()?;
         let state = Arc::new(HttpIngressState {
             runner_host,
             domains,
             active_route_table,
             http_route_table,
+            admin_relay,
         });
 
         // Resolve an available port before spawning the server thread.
@@ -296,6 +302,7 @@ struct HttpIngressState {
     domains: Vec<Domain>,
     active_route_table: ActiveRouteTable,
     http_route_table: HttpRouteTable,
+    admin_relay: Option<Arc<AdminRelayConfig>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -362,6 +369,16 @@ where
 
     if let Some(response) = handle_builtin_health_request(req.method(), &path) {
         return Ok(response);
+    }
+
+    if let Some(target_path) = relay_target_path(&path) {
+        let Some(config) = state.admin_relay.clone() else {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "admin relay is not enabled for this runtime",
+            ));
+        };
+        return handle_admin_relay(req, target_path, config).await;
     }
 
     if path.starts_with("/api/onboard") {
@@ -1369,6 +1386,7 @@ mod tests {
             domains,
             active_route_table: ActiveRouteTable::default(),
             http_route_table: HttpRouteTable::default(),
+            admin_relay: None,
         })
     }
 
@@ -1718,6 +1736,7 @@ mod tests {
                 blocking_failures: vec![],
             }),
             http_route_table: HttpRouteTable::default(),
+            admin_relay: None,
         });
 
         let response = runtime
@@ -1795,6 +1814,7 @@ mod tests {
                 blocking_failures: vec![],
             }),
             http_route_table: HttpRouteTable::default(),
+            admin_relay: None,
         });
 
         let gui_secret_uri = canonical_secret_uri(
