@@ -339,32 +339,30 @@ fn resolve_placeholders(
     metadata: &std::collections::BTreeMap<String, String>,
 ) {
     match value {
-        serde_json::Value::String(text) => {
-            if text.contains("${") {
-                let mut output = String::with_capacity(text.len());
-                let mut rest = text.as_str();
-                loop {
-                    let Some(start) = rest.find("${") else {
-                        output.push_str(rest);
-                        break;
-                    };
-                    output.push_str(&rest[..start]);
-                    let after = &rest[start + 2..];
-                    let Some(end) = after.find('}') else {
-                        output.push_str(&rest[start..]);
-                        break;
-                    };
-                    let key = after[..end].trim();
-                    if let Some(val) = metadata.get(key) {
-                        output.push_str(val);
-                    } else {
-                        // Keep the original placeholder when no value is found
-                        output.push_str(&rest[start..start + 2 + end + 1]);
-                    }
-                    rest = &after[end + 1..];
+        serde_json::Value::String(text) if text.contains("${") => {
+            let mut output = String::with_capacity(text.len());
+            let mut rest = text.as_str();
+            loop {
+                let Some(start) = rest.find("${") else {
+                    output.push_str(rest);
+                    break;
+                };
+                output.push_str(&rest[..start]);
+                let after = &rest[start + 2..];
+                let Some(end) = after.find('}') else {
+                    output.push_str(&rest[start..]);
+                    break;
+                };
+                let key = after[..end].trim();
+                if let Some(val) = metadata.get(key) {
+                    output.push_str(val);
+                } else {
+                    // Keep the original placeholder when no value is found
+                    output.push_str(&rest[start..start + 2 + end + 1]);
                 }
-                *text = output;
+                rest = &after[end + 1..];
             }
+            *text = output;
         }
         serde_json::Value::Array(items) => {
             for item in items {
@@ -405,28 +403,26 @@ fn replace_tokens_recursive(
     bundle: &std::collections::HashMap<String, String>,
 ) {
     match value {
-        serde_json::Value::String(text) => {
-            if text.contains("{{i18n:") {
-                let mut output = String::with_capacity(text.len());
-                let mut rest = text.as_str();
-                loop {
-                    let Some(start) = rest.find("{{i18n:") else {
-                        output.push_str(rest);
-                        break;
-                    };
-                    output.push_str(&rest[..start]);
-                    let token_start = start + "{{i18n:".len();
-                    let after = &rest[token_start..];
-                    let Some(end) = after.find("}}") else {
-                        output.push_str(&rest[start..]);
-                        break;
-                    };
-                    let key = after[..end].trim();
-                    output.push_str(bundle.get(key).map(String::as_str).unwrap_or(key));
-                    rest = &after[end + 2..];
-                }
-                *text = output;
+        serde_json::Value::String(text) if text.contains("{{i18n:") => {
+            let mut output = String::with_capacity(text.len());
+            let mut rest = text.as_str();
+            loop {
+                let Some(start) = rest.find("{{i18n:") else {
+                    output.push_str(rest);
+                    break;
+                };
+                output.push_str(&rest[..start]);
+                let token_start = start + "{{i18n:".len();
+                let after = &rest[token_start..];
+                let Some(end) = after.find("}}") else {
+                    output.push_str(&rest[start..]);
+                    break;
+                };
+                let key = after[..end].trim();
+                output.push_str(bundle.get(key).map(String::as_str).unwrap_or(key));
+                rest = &after[end + 2..];
             }
+            *text = output;
         }
         serde_json::Value::Array(items) => {
             for item in items {
