@@ -57,8 +57,12 @@ pub fn discover_with_options(
     };
     for domain in [Domain::Messaging, Domain::Events, Domain::OAuth] {
         for path in &discovered_paths {
-            if !domains::provider_pack_matches_domain(root, path, &read_provider_id_hint(path), domain)
-            {
+            if !domains::provider_pack_matches_domain(
+                root,
+                path,
+                &read_provider_id_hint(path),
+                domain,
+            ) {
                 continue;
             }
             let (provider_id, id_source) = match if options.cbor_only {

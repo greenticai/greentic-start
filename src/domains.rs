@@ -271,7 +271,9 @@ pub fn discover_provider_packs(root: &Path, domain: Domain) -> anyhow::Result<Ve
         false,
         &mut cache,
     )?;
-    append_packs_from_root(root, &mut packs, &mut seen, &packs_dir, None, false, &mut cache)?;
+    append_packs_from_root(
+        root, &mut packs, &mut seen, &packs_dir, None, false, &mut cache,
+    )?;
     packs.sort_by(|a, b| a.file_name.cmp(&b.file_name));
     persist_pack_meta_cache(root, &cache)?;
     Ok(packs)
@@ -295,7 +297,9 @@ pub fn discover_provider_packs_cbor_only(
         true,
         &mut cache,
     )?;
-    append_packs_from_root(root, &mut packs, &mut seen, &packs_dir, None, true, &mut cache)?;
+    append_packs_from_root(
+        root, &mut packs, &mut seen, &packs_dir, None, true, &mut cache,
+    )?;
     packs.sort_by(|a, b| a.file_name.cmp(&b.file_name));
     persist_pack_meta_cache(root, &cache)?;
     Ok(packs)
