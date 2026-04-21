@@ -37,7 +37,8 @@ pub fn select_locale(cli_locale: Option<&str>) -> String {
 }
 
 pub fn set_locale(locale: impl Into<String>) {
-    let normalized = canonical_locale(&locale.into());
+    let raw = locale.into();
+    let normalized = normalize_locale_tag(&raw).unwrap_or(raw);
     if let Ok(mut guard) = CURRENT_LOCALE.write() {
         *guard = normalized;
     }
@@ -95,20 +96,15 @@ fn locale_candidates(locale: &str) -> Vec<String> {
     let trimmed = locale.trim();
     if !trimmed.is_empty() {
         push_candidate(format!("{}.json", trimmed));
-        let primary = canonical_locale(trimmed);
-        push_candidate(format!("{}.json", primary));
-        if let Some(base) = base_language(&primary) {
-            push_candidate(format!("{}.json", base));
+        if let Some(primary) = normalize_locale_tag(trimmed) {
+            push_candidate(format!("{}.json", primary));
+            if let Some(base) = base_language(&primary) {
+                push_candidate(format!("{}.json", base));
+            }
         }
     }
     push_candidate("en.json".to_string());
     out
-}
-
-fn canonical_locale(raw: &str) -> String {
-    greentic_i18n::normalize_tag(raw)
-        .map(|tag| tag.as_str().to_string())
-        .unwrap_or_else(|_| raw.trim().to_string())
 }
 
 fn normalize_locale_tag(raw: &str) -> Option<String> {

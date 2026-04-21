@@ -49,25 +49,26 @@ pub fn discover_with_options(
     options: DiscoveryOptions,
 ) -> anyhow::Result<DiscoveryResult> {
     let mut providers = Vec::new();
+    let providers_root = root.join("providers");
+    let discovered_paths = if providers_root.exists() {
+        collect_gtpacks(&providers_root)?
+    } else {
+        Vec::new()
+    };
     for domain in [Domain::Messaging, Domain::Events, Domain::OAuth] {
-        let cfg = domains::config(domain);
-        let providers_dir = root.join(cfg.providers_dir);
-        if !providers_dir.exists() {
-            continue;
-        }
-        for entry in std::fs::read_dir(&providers_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("gtpack") {
+        for path in &discovered_paths {
+            if !domains::provider_pack_matches_domain(
+                root,
+                path,
+                &read_provider_id_hint(path),
+                domain,
+            ) {
                 continue;
             }
             let (provider_id, id_source) = match if options.cbor_only {
-                read_pack_id_from_manifest_cbor_only(&path)?
+                read_pack_id_from_manifest_cbor_only(path)?
             } else {
-                read_pack_id_from_manifest(&path)?
+                read_pack_id_from_manifest(path)?
             } {
                 Some(pack_id) => (pack_id, ProviderIdSource::Manifest),
                 None => {
@@ -79,10 +80,13 @@ pub fn discover_with_options(
                     (stem, ProviderIdSource::Filename)
                 }
             };
+            if !domains::provider_pack_matches_domain(root, path, &provider_id, domain) {
+                continue;
+            }
             providers.push(DetectedProvider {
                 provider_id,
                 domain: domains::domain_name(domain).to_string(),
-                pack_path: path,
+                pack_path: path.clone(),
                 id_source,
             });
         }
@@ -96,6 +100,32 @@ pub fn discover_with_options(
         oauth: providers.iter().any(|provider| provider.domain == "oauth"),
     };
     Ok(DiscoveryResult { domains, providers })
+}
+
+fn collect_gtpacks(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut packs = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) == Some("gtpack") {
+                packs.push(path);
+            }
+        }
+    }
+    Ok(packs)
+}
+
+fn read_provider_id_hint(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub fn persist(root: &Path, tenant: &str, discovery: &DiscoveryResult) -> anyhow::Result<()> {
@@ -371,6 +401,30 @@ mod tests {
         let err = discover_with_options(dir.path(), DiscoveryOptions { cbor_only: true })
             .expect_err("cbor-only should fail");
         assert!(err.to_string().contains("CBOR-only"));
+    }
+
+    #[test]
+    fn discover_supports_provider_id_directories() {
+        let dir = tempdir().expect("tempdir");
+        let provider_dir = dir.path().join("providers").join("messaging-webchat-gui");
+        std::fs::create_dir_all(&provider_dir).expect("provider dir");
+        write_pack(
+            &provider_dir.join("messaging-webchat-gui.gtpack"),
+            &[(
+                "manifest.cbor",
+                serde_cbor::to_vec(&CborValue::Map(std::collections::BTreeMap::from([(
+                    CborValue::Text("pack_id".to_string()),
+                    CborValue::Text("messaging-webchat-gui".to_string()),
+                )])))
+                .expect("manifest"),
+            )],
+        );
+
+        let discovered = discover(dir.path()).expect("discover");
+        assert!(discovered.domains.messaging);
+        assert_eq!(discovered.providers.len(), 1);
+        assert_eq!(discovered.providers[0].provider_id, "messaging-webchat-gui");
+        assert_eq!(discovered.providers[0].domain, "messaging");
     }
 
     #[test]
