@@ -1,6 +1,6 @@
 [package]
 name = "greentic-start"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -24,12 +24,12 @@ clap = { version = "4.5", features = ["derive"] }
 dashmap = "6"
 flate2 = "1"
 hmac = "0.13"
-greentic-distributor-client = { version = ">=0.5.0, <0.6.0", default-features = false, features = ["pack-fetch"] }
-greentic-setup = { version = ">=0.4.28, <0.6.0" }
-greentic-runner-desktop = { version = ">=0.5.0, <0.6.0" }
-greentic-runner-host = { version = ">=0.5.0, <0.6.0" }
-greentic-secrets-lib = { version = ">=0.5.0, <0.6.0", features = ["providers-dev"] }
-greentic-types = { version = ">=0.5.0, <0.6.0", features = ["serde"] }
+greentic-distributor-client = { version = "0.5", default-features = false, features = ["pack-fetch"] }
+greentic-setup = { version = "0.5" }
+greentic-runner-desktop = { version = "0.5" }
+greentic-runner-host = { version = "0.5" }
+greentic-secrets-lib = { version = "0.5", features = ["providers-dev"] }
+greentic-types = { version = "0.5", features = ["serde"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = "0.1"
