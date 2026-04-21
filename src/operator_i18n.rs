@@ -96,11 +96,11 @@ fn locale_candidates(locale: &str) -> Vec<String> {
     let trimmed = locale.trim();
     if !trimmed.is_empty() {
         push_candidate(format!("{}.json", trimmed));
-        if let Some(primary) = normalize_locale_tag(trimmed)
-            .as_deref()
-            .and_then(base_language)
-        {
+        if let Some(primary) = normalize_locale_tag(trimmed) {
             push_candidate(format!("{}.json", primary));
+            if let Some(base) = base_language(&primary) {
+                push_candidate(format!("{}.json", base));
+            }
         }
     }
     push_candidate("en.json".to_string());

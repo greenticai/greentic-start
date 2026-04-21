@@ -456,7 +456,7 @@ dependencies = [
  "arrayvec",
  "cc",
  "cfg-if",
- "constant_time_eq",
+ "constant_time_eq 0.4.2",
  "cpufeatures 0.3.0",
 ]
 
@@ -798,7 +798,7 @@ checksum = "cf044036a9d87f059698002c11f72f0f46f1fcc3228b3bc1fd1a3a621653f2ff"
 dependencies = [
  "greentic-interfaces-guest",
  "greentic-types",
- "qa-spec 0.5.0",
+ "qa-spec",
  "serde",
  "serde_cbor",
  "serde_json",
@@ -843,6 +843,12 @@ name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a1ec0cfec728a79a5109075543131387f911cb4d07716436d7ae20533657a96"
 
 [[package]]
 name = "cookie"
@@ -1780,9 +1786,9 @@ dependencies = [
 
 [[package]]
 name = "fraction"
-version = "0.15.3"
+version = "0.15.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f158e3ff0a1b334408dc9fb811cd99b446986f4d8b741bb08f9df1604085ae7"
+checksum = "e076045bb43dac435333ed5f04caf35c7463631d0dae2deb2638d94dd0a5b872"
 dependencies = [
  "lazy_static",
  "num",
@@ -2061,9 +2067,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-flow"
-version = "0.5.0"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b613fa39df5e576c9a0e86a8697aa85730dc518aa44cf1f5aa7531839b1f9f60"
+checksum = "d8bf716686fd066ca3854f307e047d8e098a29854014a59bc5c8bff25bc2eaa6"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2083,7 +2089,7 @@ dependencies = [
  "jsonschema 0.46.2",
  "lazy_static",
  "pathdiff",
- "qa-spec 0.4.14",
+ "qa-spec",
  "regex",
  "reqwest 0.13.2",
  "semver",
@@ -2141,7 +2147,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2abe5ccec746bbeb0fbb291e0368096752e2ad31d5dbf70053638b12ec43c8d"
 dependencies = [
  "anyhow",
- "constant_time_eq",
+ "constant_time_eq 0.4.2",
  "greentic-types",
  "semver",
  "thiserror 2.0.18",
@@ -2196,15 +2202,15 @@ dependencies = [
 
 [[package]]
 name = "greentic-pack-lib"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31ec32a7cd5a71b9788d69f4d853b8c620806d4b65d4ed25050d16ca700d9f4f"
+checksum = "4e948ccd4d47190444afa6879694df46f2d102bba41b6a42b9bdbac16ec95f6d"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "blake3",
  "clap",
- "constant_time_eq",
+ "constant_time_eq 0.5.0",
  "ed25519-dalek",
  "getrandom 0.4.2",
  "greentic-flow",
@@ -2234,7 +2240,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f39af103bdff83a5db6852bded23317cc36aaa0134a9469f9ca1993743110740"
 dependencies = [
  "component-qa",
- "qa-spec 0.5.0",
+ "qa-spec",
  "serde",
  "serde_json",
  "tempfile",
@@ -2243,9 +2249,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "0.5.4"
+version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "689d76ce7990b27aae50af583586244b40371a0a11a78076468e90ba53d55ab4"
+checksum = "b5d4e5ff3f6e32ca224941fce765f9fdeb55ac2e675c8055169ccd3af371399f"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -2264,9 +2270,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "0.5.4"
+version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db11e9f4bccdeb0aa96fa5484c132b81f1ebdf51317bd1fbcfd2c40131b45b0e"
+checksum = "b50e65992ed8d98bcc951b0705e63992385e815fb2bb0c297b92bf0f63518429"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2426,9 +2432,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-setup"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9862b4bd6c2c9a6cfdb1938b5b9342c0091ca3065125db453049ae4a5bdef6f"
+checksum = "da3432c841987face6d2007d9a289852c03f26bed0f27e0c3dd82894940e641a"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
@@ -2443,7 +2449,7 @@ dependencies = [
  "greentic-types",
  "hmac 0.13.0",
  "open",
- "qa-spec 0.5.0",
+ "qa-spec",
  "rand 0.10.1",
  "regex",
  "rpassword",
@@ -2487,7 +2493,7 @@ dependencies = [
  "libc",
  "once_cell",
  "open",
- "qa-spec 0.5.0",
+ "qa-spec",
  "rand 0.10.1",
  "rpassword",
  "rustls 0.23.38",
@@ -2563,7 +2569,7 @@ dependencies = [
  "blake3",
  "chrono",
  "ciborium",
- "constant_time_eq",
+ "constant_time_eq 0.4.2",
  "fnv",
  "greentic-telemetry",
  "greentic-types-macros",
@@ -4297,22 +4303,6 @@ dependencies = [
 
 [[package]]
 name = "qa-spec"
-version = "0.4.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ac9b6da8cd0a630c37a7c35dad38a5f319bbb4c4dff3310d935bd0745add60b"
-dependencies = [
- "globset",
- "handlebars",
- "regex",
- "schemars 1.2.1",
- "serde",
- "serde_cbor",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "qa-spec"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d58ff0de754c99d39cbdaed94e1342f82dd5dc6d0ddf5dd0b482a7d0ccf4e47b"
@@ -4809,9 +4799,9 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "0.5.4"
+version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86ef79a0bd1675488e9255f03fc39b51079577feba1a8aa3d906092c80c2c47f"
+checksum = "4af723755e9986039eb30e8ca9af5959427c2a1bd36c8c5b5fead2a3dadfc1a1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7757,7 +7747,7 @@ checksum = "dcab981e19633ebcf0b001ddd37dd802996098bc1864f90b7c5d970ce76c1d59"
 dependencies = [
  "aes",
  "bzip2",
- "constant_time_eq",
+ "constant_time_eq 0.4.2",
  "crc32fast",
  "deflate64",
  "flate2",

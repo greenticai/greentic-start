@@ -1,10 +1,17 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Agent-specific repository guidance lives in [docs/coding-agents.md](docs/coding-agents.md).
 
-## What This Is
+Use that document for:
 
-greentic-start is the lifecycle runner for Greentic demo/app-pack execution. It owns `start`/`up`/`stop`/`restart` orchestration, exposed both as a library (`greentic_start::run_from_env`) and a thin CLI binary. `greentic-operator` owns wizard UX and delegates lifecycle execution here.
+- command and flag behavior
+- startup and restart semantics
+- tunnel defaults
+- admin API behavior
+- app-flow execution notes
+- validation expectations
+
+Keep the public-facing overview in [README.md](README.md) focused on humans.
 
 ## Build & Test
 
@@ -30,7 +37,7 @@ git config core.hooksPath .githooks
 
 Enables the pre-commit hook that runs `rustfmt` on staged Rust files and `cargo clippy --workspace -- -D warnings`. See `.githooks/README.md`.
 
-Rust 1.94.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is committed.
+Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is committed.
 
 ## Release Flow
 

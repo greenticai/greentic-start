@@ -1,101 +1,192 @@
 # greentic-start
 
-`greentic-start` is the lifecycle runner for Greentic demo/app-pack execution.
-It exposes lifecycle orchestration as a library (`greentic_start::run_from_env`) and a thin CLI binary.
+`greentic-start` is the program that opens a Greentic bundle and keeps it running on your machine.
 
-## Ownership
+If you are not a systems programmer, a good way to think about it is:
 
-- `greentic-start` owns lifecycle execution (`start`/`up`/`stop`/`restart`).
-- `greentic-start` also owns the runtime admin lifecycle surface when lifecycle control is exposed over mTLS.
-- `greentic-operator` (including Wizard) owns UX and planning, then delegates lifecycle execution to `greentic-start`.
-- Details: `docs/ownership.md`.
+- a **bundle** is a packaged Greentic app
+- `greentic-start` is the **launcher**
+- it starts the local services that bundle needs
+- it keeps logs and runtime state in the bundle folder
+- it can also stop or restart that running bundle later
 
-## CLI Surface
+## Who This README Is For
 
-Primary commands:
+This README is written for:
 
-- `greentic-start start`
-- `greentic-start restart`
-- `greentic-start stop`
+- people exploring Greentic for the first time
+- app builders who are comfortable editing YAML or JSON but do not want to learn the whole runtime internals
+- non-technical or lightly technical teammates who need to understand what `greentic-start` does
 
-Primary runtime inputs:
+If you are a coding agent, automation tool, or someone changing runtime behavior, do not use this README as your main source of truth.
 
-- `--config <path>` to point at the demo config
-- `--tenant <name>`
-- `--team <name>`
-- `--nats`, `--cloudflared`, `--ngrok`
-- `--log-dir`, `--verbose`, `--quiet`
+Read [docs/coding-agents.md](docs/coding-agents.md) instead.
 
-## Startup Contract
+That guide explains:
 
-`greentic-start` performs startup-time launch gating for bundles that declare
-`greentic.static-routes.v1`.
+- how `greentic-start` is expected to be used
+- what commands and options exist
+- what each option does
+- which behaviors are automatic
+- which settings come from the bundle versus the CLI
 
-- Bundles with no static routes behave as before.
-- Bundles with static routes fail before service boot if launch mode cannot
-  expose public HTTP, cannot support hosted assets, or cannot resolve
-  `PUBLIC_BASE_URL`.
-- Resolved startup values are passed forward through child-process env vars and
-  persisted runtime metadata (`startup_contract.json`).
+## What `greentic-start` Does
 
-For admin mTLS, `greentic-start` also logs which cert source was selected at
-startup:
+When you run `greentic-start`, it can:
 
-- `explicit_path`
-- `bundle_local`
-- `env_materialized`
-- `bundle_local_fallback`
+- find the bundle you want to run
+- load the bundle's runtime configuration
+- start local services such as the HTTP gateway
+- optionally start helper services such as NATS
+- optionally create a public tunnel with Cloudflare Tunnel or ngrok
+- expose an admin API over mTLS if you enable it
+- write logs so you can inspect what happened
+- keep runtime state under the bundle's `state/` area
 
-For production-oriented cloud deploys, deployers may also pass:
+In everyday terms, it is the part that turns “I have a bundle on disk” into “the app is now running locally.”
 
-- `GREENTIC_ADMIN_CA_SECRET_REF`
-- `GREENTIC_ADMIN_SERVER_CERT_SECRET_REF`
-- `GREENTIC_ADMIN_SERVER_KEY_SECRET_REF`
+## The Most Common Thing To Do
 
-These are diagnostics/trace variables. Runtime still boots from the PEM env
-payloads, not from raw secret-manager APIs directly.
-
-Admin lifecycle semantics:
-
-- `POST /admin/v1/stop` is implemented through a runtime stop-request file that
-  the foreground `greentic-start` loop observes and honors
-- `GET /admin/v1/status` and `GET /admin/v1/list` report `stopping` while that
-  stop request is pending
-- `POST /admin/v1/start` is intentionally not a remote process launcher through
-  the embedded admin endpoint; if the runtime is already active it returns an
-  idempotent success shape, and if the runtime is inactive it must be started
-  by an external `greentic-start` launcher or cloud supervisor
-
-## Extension pack roles
-
-- Core platform packs: runtime-critical packs such as messaging, events, oauth, telemetry, secrets, and state integrations.
-- Optional extension packs: packs exposing hooks, contracts, capabilities, subscriptions, or other feature extensions for app packs/components.
-
-`greentic-start` now classifies these roles explicitly so lifecycle boot can reason about platform services separately from optional extensions.
-
-## i18n
-
-- Source catalog: `i18n/en.json`.
-- Translator helper: `tools/i18n.sh` (defaults to `LANGS=all`, `BATCH_SIZE=200`).
-
-## CI and Releases
-
-Local validation:
+Most people only need one command:
 
 ```bash
-bash ci/local_check.sh
+greentic-start start --bundle /path/to/your-bundle
 ```
 
-Release flow:
+This starts the bundle using its own configuration files.
 
-1. Bump `version` in `Cargo.toml`.
-2. Create and push tag `vX.Y.Z` (must match `Cargo.toml`).
-3. Push tag to trigger `.github/workflows/publish.yml`.
+If your bundle is already the current folder, you will often see people use:
 
-Required secrets:
+```bash
+greentic-start start --bundle .
+```
 
-- `CARGO_REGISTRY_TOKEN` for crates.io publish.
+In some situations, `greentic-start` may choose a tunnel automatically for local development. That is normal behavior in this project.
 
-## Security
+## The Main Commands
 
-See [SECURITY.md](SECURITY.md) for vulnerability reporting and supported version policy.
+`greentic-start` has four main commands:
+
+- `start`
+  Starts the bundle.
+- `up`
+  Same meaning as `start`.
+- `stop`
+  Stops a running bundle.
+- `restart`
+  Starts again, and can also restart selected runtime services.
+
+Examples:
+
+```bash
+greentic-start start --bundle /tmp/my-bundle
+greentic-start stop --bundle /tmp/my-bundle
+greentic-start restart --bundle /tmp/my-bundle
+```
+
+## A Few Practical Examples
+
+### Start a bundle quietly
+
+```bash
+greentic-start start --bundle /tmp/my-bundle --quiet
+```
+
+This reduces log noise on the terminal.
+
+### Start a bundle and show more detail
+
+```bash
+greentic-start start --bundle /tmp/my-bundle --verbose
+```
+
+This is useful when something is not working and you want more clues.
+
+### Start with ngrok instead of Cloudflare Tunnel
+
+```bash
+greentic-start start --bundle /tmp/my-bundle --ngrok on
+```
+
+### Start with an external NATS server
+
+```bash
+greentic-start start \
+  --bundle /tmp/my-bundle \
+  --nats external \
+  --nats-url nats://127.0.0.1:4222
+```
+
+### Enable the admin API
+
+```bash
+greentic-start start --bundle /tmp/my-bundle --admin --admin-port 8443
+```
+
+This enables a protected admin endpoint intended for operational control.
+
+## What You Need Before Starting
+
+Usually you need:
+
+- a Greentic bundle on disk
+- any required local tools your bundle expects
+- setup answers or secrets already provided if the bundle depends on them
+
+Important detail:
+
+- `greentic-start` starts and hosts the bundle
+- it does **not** invent missing app configuration on its own
+- if your app flow needs explicit runtime config in a node, that config still has to come from the bundle design or runtime contract that supports it
+
+## Where Things Are Stored
+
+When the bundle runs, `greentic-start` writes data into the bundle area, especially:
+
+- `logs/`
+- `state/`
+- `.greentic/` for some persisted setup/runtime helpers
+
+This means the bundle folder is not just input; it also becomes the local runtime workspace.
+
+## Troubleshooting Basics
+
+If something seems wrong, check these first:
+
+- did you point `--bundle` at the right directory?
+- does the bundle have the expected config files?
+- are required secrets already provisioned?
+- are the ports already in use by another process?
+- did the logs in `logs/` show a startup or policy error?
+
+Good first debugging steps:
+
+```bash
+greentic-start start --bundle /tmp/my-bundle --verbose
+```
+
+Then inspect:
+
+- `logs/flow.log`
+- `logs/operator.log`
+- bundle `state/` output for the specific run
+
+## For Coding Agents And Maintainers
+
+If you are changing code, reviewing runtime behavior, or trying to automate `greentic-start`, go to [docs/coding-agents.md](docs/coding-agents.md).
+
+That document is the operational guide for:
+
+- command behavior
+- option-by-option meaning
+- bundle resolution
+- automatic tunnel behavior
+- restart semantics
+- admin API flags
+- logging and runtime expectations
+
+## Repository Notes
+
+This repository focuses on lifecycle execution for Greentic bundles. It is not the place for every product-level behavior in the broader platform.
+
+If you need deeper ownership boundaries, see [docs/ownership.md](docs/ownership.md).
