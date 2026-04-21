@@ -16,6 +16,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use greentic_runner_host::storage::{DynStateStore, new_state_store};
+use greentic_types::{StateKey, TenantCtx};
+use serde_json::Value as JsonValue;
 
 use crate::capabilities::{
     CAP_OAUTH_BROKER_V1, CapabilityBinding, CapabilityInstallRecord, CapabilityPackRecord,
@@ -132,6 +134,7 @@ impl DemoRunnerHost {
         for domain in [
             Domain::Messaging,
             Domain::Events,
+            Domain::Llm,
             Domain::Secrets,
             Domain::OAuth,
         ] {
@@ -185,6 +188,33 @@ impl DemoRunnerHost {
 
     pub fn debug_enabled(&self) -> bool {
         self.debug_enabled
+    }
+
+    pub fn state_store(&self) -> DynStateStore {
+        self.state_store.clone()
+    }
+
+    pub fn read_state_json(
+        &self,
+        tenant: &TenantCtx,
+        prefix: &str,
+        key: &StateKey,
+    ) -> anyhow::Result<Option<JsonValue>> {
+        self.state_store
+            .get_json(tenant, prefix, key, None)
+            .map_err(|err| anyhow::anyhow!(err.to_string()))
+    }
+
+    pub fn write_state_json(
+        &self,
+        tenant: &TenantCtx,
+        prefix: &str,
+        key: &StateKey,
+        value: &JsonValue,
+    ) -> anyhow::Result<()> {
+        self.state_store
+            .set_json(tenant, prefix, key, None, value, None)
+            .map_err(|err| anyhow::anyhow!(err.to_string()))
     }
 
     /// Return the canonical `provider_type` stored inside a provider pack manifest

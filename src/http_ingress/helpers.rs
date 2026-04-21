@@ -242,6 +242,7 @@ pub(super) fn parse_domain(value: &str) -> Option<Domain> {
     match value.to_lowercase().as_str() {
         "messaging" => Some(Domain::Messaging),
         "events" => Some(Domain::Events),
+        "llm" => Some(Domain::Llm),
         "secrets" => Some(Domain::Secrets),
         "oauth" => Some(Domain::OAuth),
         _ => None,
@@ -252,6 +253,7 @@ pub(super) fn domain_name(domain: Domain) -> &'static str {
     match domain {
         Domain::Messaging => "messaging",
         Domain::Events => "events",
+        Domain::Llm => "llm",
         Domain::Secrets => "secrets",
         Domain::OAuth => "oauth",
     }

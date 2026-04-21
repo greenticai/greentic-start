@@ -538,6 +538,7 @@ mod tests {
             domains: DetectedDomains {
                 messaging: false,
                 events: false,
+                llm: false,
                 oauth: false,
             },
             providers: Vec::new(),

@@ -202,6 +202,7 @@ pub fn run_app_flow(
     pack_id: &str,
     flow_id: &str,
     envelope: &ChannelMessageEnvelope,
+    messages: Option<JsonValue>,
 ) -> Result<Vec<ChannelMessageEnvelope>> {
     let request = RunRequest {
         root: bundle.to_path_buf(),
@@ -213,6 +214,7 @@ pub fn run_app_flow(
         team: ctx.team.clone(),
         input: json!({
             "input": envelope,
+            "messages": messages.unwrap_or_else(|| json!([])),
             "tenant": ctx.tenant,
             "team": ctx.team,
             "correlation_id": ctx.correlation_id,
@@ -423,8 +425,10 @@ fn collect_transcript_outputs(
         // prefer explicit target match, then the latest output.
         targeted.or(last.clone()).or(preferred).or(first)
     } else {
-        // Non-targeted flows should prefer envelope-compatible outputs for handoff.
-        targeted.or(preferred).or(last).or(first)
+        // Non-targeted flows should prefer the latest output. Earlier nodes may emit
+        // interim cards or placeholders, while the final node usually contains the
+        // actual assistant reply that should be handed back to messaging.
+        targeted.or(last).or(preferred).or(first)
     };
     Ok(selected)
 }
@@ -746,7 +750,41 @@ fn parse_envelope_array(
             push_unique_envelope(&mut envelopes, &mut seen, envelope)?;
         }
     }
-    Ok(envelopes)
+
+    let prefer_non_empty_text = envelopes.iter().any(|envelope| {
+        envelope
+            .text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+    });
+
+    envelopes.retain(|envelope| {
+        let has_card = envelope.metadata.contains_key("adaptive_card");
+        let has_non_empty_text = envelope
+            .text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty());
+        if prefer_non_empty_text {
+            has_non_empty_text
+        } else {
+            has_card || has_non_empty_text
+        }
+    });
+
+    let mut deduped = Vec::new();
+    for envelope in envelopes {
+        let duplicate = deduped.iter().any(|existing: &ChannelMessageEnvelope| {
+            existing.text == envelope.text && existing.metadata == envelope.metadata
+        });
+        if !duplicate {
+            deduped.push(envelope);
+        }
+    }
+
+    if deduped.is_empty() {
+        bail!("app flow output array contains invalid channel envelope");
+    }
+    Ok(deduped)
 }
 
 fn push_unique_envelope(
@@ -1006,6 +1044,29 @@ mod tests {
     }
 
     #[test]
+    fn collect_transcript_outputs_prefers_latest_output_for_non_targeted_flow() {
+        let dir = tempdir().expect("tempdir");
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"node_id\":\"welcome\",\"outputs\":{\"renderedCard\":{\"body\":[{\"text\":\"Greentic Domain AI Expert\"}]}}}\n",
+                "{\"node_id\":\"send_response\",\"outputs\":{\"text\":\"Greentic bundles package apps, providers, and setup into one deployable unit.\"}}\n"
+            ),
+        )
+        .expect("write transcript");
+
+        let selected = collect_transcript_outputs(dir.path(), None)
+            .expect("collect outputs")
+            .expect("selected output");
+        assert_eq!(
+            selected["text"],
+            "Greentic bundles package apps, providers, and setup into one deployable unit."
+        );
+        assert!(selected.get("renderedCard").is_none());
+    }
+
+    #[test]
     fn collect_transcript_outputs_with_retry_prefers_eventual_envelope() {
         let dir = tempdir().expect("tempdir");
         let transcript = dir.path().join("transcript.jsonl");
@@ -1228,6 +1289,37 @@ mod tests {
             !reply.extensions.contains_key(ext_keys::ADAPTIVE_CARD),
             "ADAPTIVE_CARD must NOT be lifted when ATTACHMENTS is present"
         );
+    }
+
+    #[test]
+    fn parse_envelopes_normalizes_fragment_arrays() {
+        let ingress = envelope();
+
+        let output = parse_envelopes(
+            &json!([
+                {
+                    "renderedCard": {
+                        "body": [
+                            {"text": "Welcome card"}
+                        ]
+                    }
+                },
+                {
+                    "text": "hello from llm"
+                },
+                {
+                    "text": "hello from llm"
+                },
+                {
+                    "text": ""
+                }
+            ]),
+            &ingress,
+        )
+        .expect("fragment array output");
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].text.as_deref(), Some("hello from llm"));
     }
 
     #[test]
