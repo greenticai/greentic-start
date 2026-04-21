@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Pre-commit hook: run rustfmt on staged Rust files + clippy on the workspace.
+# Enable once per clone:
+#   git config core.hooksPath .githooks
+set -euo pipefail
+
+red()   { printf "\033[0;31m%s\033[0m\n" "$*" >&2; }
+green() { printf "\033[0;32m%s\033[0m\n" "$*"; }
+blue()  { printf "\033[0;34m%s\033[0m\n" "$*"; }
+
+# --- 1. rustfmt on staged .rs files -----------------------------------------
+STAGED_RS=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs' || true)
+if [ -n "${STAGED_RS}" ]; then
+  blue "[pre-commit] rustfmt check on staged Rust files"
+  FMT_FAILED=0
+  while IFS= read -r file; do
+    [ -f "${file}" ] || continue
+    if ! rustfmt --check --edition 2024 "${file}" >/dev/null 2>&1; then
+      red "  ${file} is not formatted (run: cargo fmt)"
+      FMT_FAILED=1
+    fi
+  done <<< "${STAGED_RS}"
+  if [ "${FMT_FAILED}" -eq 1 ]; then
+    red "[pre-commit] rustfmt check failed — run 'cargo fmt --all' and re-stage"
+    exit 1
+  fi
+fi
+
+# --- 2. clippy on the workspace ---------------------------------------------
+if [ -n "${STAGED_RS}" ] || git diff --cached --name-only | grep -qE 'Cargo\.(toml|lock)$'; then
+  blue "[pre-commit] cargo clippy -- -D warnings"
+  if ! cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -n 20; then
+    red "[pre-commit] clippy failed — fix warnings before committing"
+    exit 1
+  fi
+  green "[pre-commit] clippy clean"
+fi
+
+green "[pre-commit] ok"

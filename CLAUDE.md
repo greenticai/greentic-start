@@ -22,6 +22,14 @@ cargo clippy -p greentic-start --all-targets --all-features -- -D warnings
 cargo test -p greentic-start -- test_name_here
 ```
 
+## One-time setup (new clones)
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Enables the pre-commit hook that runs `rustfmt` on staged Rust files and `cargo clippy --workspace -- -D warnings`. See `.githooks/README.md`.
+
 Rust 1.94.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is committed.
 
 ## Release Flow
