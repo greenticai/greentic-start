@@ -1,8 +1,8 @@
 [package]
 name = "greentic-start"
-version = "0.4.55"
+version = "0.5.0"
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
 license = "MIT"
 repository = "https://github.com/greenticai/greentic-start"
