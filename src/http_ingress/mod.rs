@@ -73,7 +73,7 @@ impl HttpIngressServer {
         let runner_host = config.runner_host;
 
         // Discover static routes if enabled
-        let mut ui_urls = Vec::new();
+        let mut ui_url_paths = Vec::new();
         let active_route_table = if config.enable_static_routes {
             let static_route_plan = discover_from_bundle(
                 runner_host.bundle_root(),
@@ -104,27 +104,12 @@ impl HttpIngressServer {
                             .join(", ")
                     ),
                 );
-                // Discover user-facing UI URLs from tenant-scoped static routes.
-                // When a public base URL is available (tunnel), use it so users
-                // get the externally-reachable address.
+                // Collect user-facing UI paths from tenant-scoped static routes.
+                // Final URLs are rendered after the actual bind port is known.
                 for route in table.routes() {
                     if route.tenant_scoped && route.spa_fallback.is_some() {
                         let url_path = route.public_path.replace("{tenant}", &config.tenant);
-                        let ui_url = if let Some(ref base) = config.public_base_url {
-                            format!(
-                                "{}/{}/",
-                                base.trim_end_matches('/'),
-                                url_path.trim_start_matches('/')
-                            )
-                        } else {
-                            format!(
-                                "http://{}/{}/",
-                                config.bind_addr,
-                                url_path.trim_start_matches('/')
-                            )
-                        };
-                        operator_log::info(module_path!(), format!("UI: {ui_url}"));
-                        ui_urls.push(ui_url);
+                        ui_url_paths.push(url_path);
                     }
                 }
             }
@@ -189,6 +174,28 @@ impl HttpIngressServer {
             );
         }
         let addr = SocketAddr::new(config.bind_addr.ip(), actual_port);
+        let ui_urls = ui_url_paths
+            .into_iter()
+            .map(|url_path| {
+                if let Some(ref base) = config.public_base_url {
+                    format!(
+                        "{}/{}/",
+                        base.trim_end_matches('/'),
+                        url_path.trim_start_matches('/')
+                    )
+                } else {
+                    format!(
+                        "http://{}:{}/{}/",
+                        config.bind_addr.ip(),
+                        actual_port,
+                        url_path.trim_start_matches('/')
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        for ui_url in &ui_urls {
+            operator_log::info(module_path!(), format!("UI: {ui_url}"));
+        }
 
         let (tx, rx) = oneshot::channel();
         let (startup_tx, startup_rx) = mpsc::channel();

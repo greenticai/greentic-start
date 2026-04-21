@@ -15,6 +15,11 @@ use greentic_runner_host::pack::{ComponentResolution, PackRuntime};
 use greentic_runner_host::runner::engine::{
     ExecutionObserver, FlowContext, FlowEngine, FlowStatus, NodeEvent,
 };
+use greentic_runner_host::runner::engine::CrossPackResolver;
+use greentic_runner_host::component_api::node::{
+    ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx,
+};
+use greentic_runner_host::provider::ProviderBinding;
 use greentic_runner_host::secrets::default_manager;
 use greentic_runner_host::storage::{new_session_store, new_state_store};
 use greentic_runner_host::trace::TraceConfig;
@@ -26,6 +31,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::domains::Domain;
+use crate::runner_host::primary_provider_type;
 use crate::secret_requirements::load_secret_keys_from_pack;
 use crate::secrets_client::SecretsClient;
 use crate::secrets_gate::canonical_secret_uri;
@@ -193,9 +199,13 @@ fn run_pack_flow_direct(request: &RunRequest, run_dir: &Path) -> anyhow::Result<
                 .with_context(|| format!("failed to load pack {}", request.pack_path.display()))?,
             );
 
-            let engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&host_config))
+            let mut engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&host_config))
                 .await
                 .context("failed to prime flow engine")?;
+            engine.set_cross_pack_resolver(Arc::new(BundleCrossPackResolver {
+                bundle_root: request.root.clone(),
+                host_config: Arc::clone(&host_config),
+            }));
             let retry_config = host_config.retry.clone().into();
             let team = request.team.as_deref().unwrap_or("default");
             let session_id = format!("{}:{}:{}", request.tenant, team, Uuid::new_v4());
@@ -330,6 +340,179 @@ fn build_demo_host_config(tenant: &str) -> HostConfig {
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
     }
+}
+
+struct BundleCrossPackResolver {
+    bundle_root: PathBuf,
+    host_config: Arc<HostConfig>,
+}
+
+impl CrossPackResolver for BundleCrossPackResolver {
+    fn invoke(
+        &self,
+        provider_id: &str,
+        provider_type: Option<&str>,
+        op: &str,
+        input: &[u8],
+        tenant: &str,
+        team: Option<&str>,
+    ) -> anyhow::Result<JsonValue> {
+        let provider_type = provider_type.unwrap_or(provider_id);
+        let domain = provider_domain(provider_type)?;
+        let pack_path = find_provider_pack(&self.bundle_root, domain, provider_id, provider_type)?;
+        let mut binding = load_provider_binding(&pack_path, provider_id, provider_type)?;
+        binding.config_json = load_provider_setup_answers(&self.bundle_root, &pack_path)?;
+        let payload = input.to_vec();
+        let host_config = Arc::clone(&self.host_config);
+        let tenant = tenant.to_string();
+        let team = team.map(ToOwned::to_owned);
+        let pack_id = binding
+            .pack_ref
+            .as_deref()
+            .and_then(|value| value.split('@').next())
+            .map(str::to_string);
+        make_runtime_or_thread_scope(|runtime| {
+            runtime.block_on(async {
+                let pack_runtime = PackRuntime::load(
+                    &pack_path,
+                    host_config,
+                    None,
+                    Some(&pack_path),
+                    None,
+                    Some(new_state_store()),
+                    Arc::new(RunnerWasiPolicy::default()),
+                    default_manager().context("failed to initialise secrets backend")?,
+                    None,
+                    false,
+                    ComponentResolution::default(),
+                )
+                .await
+                .with_context(|| format!("failed to load provider pack {}", pack_path.display()))?;
+                let exec_ctx = ComponentExecCtx {
+                    tenant: ComponentTenantCtx {
+                        tenant,
+                        team,
+                        i18n_id: None,
+                        user: None,
+                        trace_id: None,
+                        correlation_id: None,
+                        deadline_unix_ms: None,
+                        attempt: 1,
+                        idempotency_key: None,
+                    },
+                    i18n_id: None,
+                    flow_id: op.to_string(),
+                    node_id: Some(op.to_string()),
+                };
+                pack_runtime.invoke_provider(&binding, exec_ctx, op, payload).await
+            })
+        })
+        .with_context(|| {
+            let provider = pack_id.unwrap_or_else(|| provider_id.to_string());
+            format!("cross-pack provider invoke failed for {provider_type} via {provider}")
+        })
+    }
+}
+
+fn provider_domain(provider_type: &str) -> anyhow::Result<Domain> {
+    let Some(prefix) = provider_type.split('.').next() else {
+        anyhow::bail!("invalid provider type `{provider_type}`");
+    };
+    match prefix {
+        "messaging" => Ok(Domain::Messaging),
+        "events" => Ok(Domain::Events),
+        "llm" => Ok(Domain::Llm),
+        "oauth" => Ok(Domain::OAuth),
+        "secrets" => Ok(Domain::Secrets),
+        _ => anyhow::bail!("unsupported provider domain for type `{provider_type}`"),
+    }
+}
+
+fn find_provider_pack(
+    bundle_root: &Path,
+    domain: Domain,
+    provider_id: &str,
+    provider_type: &str,
+) -> anyhow::Result<PathBuf> {
+    for pack in crate::domains::discover_provider_packs(bundle_root, domain)? {
+        if pack.pack_id == provider_id || pack.pack_id == provider_type {
+            return Ok(pack.path);
+        }
+        if let Ok(canonical_type) = primary_provider_type(&pack.path)
+            && canonical_type == provider_type
+        {
+            return Ok(pack.path);
+        }
+    }
+    anyhow::bail!(
+        "provider pack not found for type `{provider_type}` in domain {:?}",
+        domain
+    )
+}
+
+fn load_provider_binding(
+    pack_path: &Path,
+    provider_id: &str,
+    provider_type: &str,
+) -> anyhow::Result<ProviderBinding> {
+    let file = std::fs::File::open(pack_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut manifest_entry = archive.by_name("manifest.cbor").map_err(|err| {
+        anyhow::anyhow!(
+            "failed to open manifest.cbor in {}: {err}",
+            pack_path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut manifest_entry, &mut bytes)?;
+    let manifest = greentic_types::decode_pack_manifest(&bytes)
+        .context("failed to decode provider pack manifest")?;
+    let provider_ext = manifest.provider_extension_inline().ok_or_else(|| {
+        anyhow::anyhow!(
+            "provider extension missing from {}",
+            pack_path.display()
+        )
+    })?;
+    let provider = provider_ext
+        .providers
+        .iter()
+        .find(|provider| {
+            provider.provider_type == provider_type
+                || provider.provider_type == provider_id
+                || manifest.pack_id.as_str() == provider_id
+        })
+        .or_else(|| provider_ext.providers.first())
+        .ok_or_else(|| anyhow::anyhow!("provider extension contains no providers"))?;
+    Ok(ProviderBinding {
+        provider_id: Some(provider.provider_type.clone()),
+        provider_type: provider.provider_type.clone(),
+        component_ref: provider.runtime.component_ref.clone(),
+        export: provider.runtime.export.clone(),
+        world: provider.runtime.world.clone(),
+        config_json: None,
+        pack_ref: Some(format!("{}@{}", manifest.pack_id, manifest.version)),
+    })
+}
+
+fn load_provider_setup_answers(bundle_root: &Path, pack_path: &Path) -> anyhow::Result<Option<String>> {
+    let pack_id = if let Some(stem) = pack_path.file_stem().and_then(|value| value.to_str()) {
+        stem.to_string()
+    } else {
+        return Ok(None);
+    };
+    let path = bundle_root
+        .join("state")
+        .join("config")
+        .join(pack_id)
+        .join("setup-answers.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let _: JsonValue = serde_json::from_str(&contents)
+        .with_context(|| format!("invalid json in {}", path.display()))?;
+    Ok(Some(contents))
 }
 
 fn write_transcript(run_dir: &Path, outputs: &JsonValue) -> anyhow::Result<()> {

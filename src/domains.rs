@@ -14,6 +14,7 @@ use zip::result::ZipError;
 pub enum Domain {
     Messaging,
     Events,
+    Llm,
     Secrets,
     OAuth,
 }
@@ -92,6 +93,12 @@ pub fn config(domain: Domain) -> DomainConfig {
             diagnostics_flow: "diagnostics",
             verify_flows: &["verify_subscriptions"],
         },
+        Domain::Llm => DomainConfig {
+            providers_dir: "providers/llm",
+            setup_flow: "setup_default",
+            diagnostics_flow: "diagnostics",
+            verify_flows: &[],
+        },
         Domain::Secrets => DomainConfig {
             providers_dir: "providers/secrets",
             setup_flow: "setup_default",
@@ -111,6 +118,7 @@ pub fn validator_pack_path(root: &Path, domain: Domain) -> Option<PathBuf> {
     let name = match domain {
         Domain::Messaging => "validators-messaging.gtpack",
         Domain::Events => "validators-events.gtpack",
+        Domain::Llm => "validators-llm.gtpack",
         Domain::Secrets => "validators-secrets.gtpack",
         Domain::OAuth => "validators-oauth.gtpack",
     };
@@ -971,6 +979,7 @@ pub(crate) fn domain_name(domain: Domain) -> &'static str {
     match domain {
         Domain::Messaging => "messaging",
         Domain::Events => "events",
+        Domain::Llm => "llm",
         Domain::Secrets => "secrets",
         Domain::OAuth => "oauth",
     }

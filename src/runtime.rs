@@ -1869,6 +1869,7 @@ mod tests {
             domains: DetectedDomains {
                 messaging: true,
                 events: true,
+                llm: false,
                 oauth: false,
             },
             providers: vec![

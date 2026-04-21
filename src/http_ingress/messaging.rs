@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use base64::Engine as _;
+use greentic_types::{EnvId, StateKey, TenantCtx, TenantId};
 use greentic_types::ChannelMessageEnvelope;
-use serde_json::json;
+use serde_json::{Value as JsonValue, json};
 
 use crate::domains::Domain;
 use crate::messaging_app as app;
@@ -81,12 +82,29 @@ pub(super) fn route_messaging_envelopes(
                             route_to_card
                         ),
                     );
-                    run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
+                    run_app_flow_safe(
+                        bundle,
+                        runner_host,
+                        ctx,
+                        &app_pack_path,
+                        &pack_info,
+                        flow,
+                        envelope,
+                    )
                 }
             }
         } else {
-            run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
+            run_app_flow_safe(
+                bundle,
+                runner_host,
+                ctx,
+                &app_pack_path,
+                &pack_info,
+                flow,
+                envelope,
+            )
         };
+        update_conversation_history(runner_host, ctx, envelope, &outputs);
 
         for mut out_envelope in outputs {
             if let Some(team) = &ctx.team {
@@ -245,12 +263,25 @@ fn read_card_from_pack(pack_path: &Path, card_key: &str) -> Option<serde_json::V
 
 fn run_app_flow_safe(
     bundle: &Path,
+    runner_host: &DemoRunnerHost,
     ctx: &OperatorContext,
     app_pack_path: &Path,
     pack_info: &app::AppPackInfo,
     flow: &app::AppFlowInfo,
     envelope: &ChannelMessageEnvelope,
 ) -> Vec<ChannelMessageEnvelope> {
+    if should_ignore_empty_envelope(envelope) {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[demo messaging] ignoring empty bootstrap envelope id={} session={}",
+                envelope.id, envelope.session_id
+            ),
+        );
+        return Vec::new();
+    }
+
+    let messages = conversation_messages_for_envelope(runner_host, ctx, envelope);
     match app::run_app_flow(
         bundle,
         ctx,
@@ -258,6 +289,7 @@ fn run_app_flow_safe(
         &pack_info.pack_id,
         &flow.id,
         envelope,
+        messages,
     ) {
         Ok(outputs) => outputs,
         Err(err) => {
@@ -270,7 +302,206 @@ fn run_app_flow_safe(
     }
 }
 
+fn should_ignore_empty_envelope(envelope: &ChannelMessageEnvelope) -> bool {
+    if !envelope.attachments.is_empty() {
+        return false;
+    }
+
+    let has_text = envelope
+        .text
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty());
+    if has_text {
+        return false;
+    }
+
+    let action_keys = [
+        "routeToCardId",
+        "toCardId",
+        "action_id",
+        "adaptive_card",
+        "mcp_wizard",
+        "mcp_operation",
+    ];
+    !action_keys.iter().any(|key| envelope.metadata.contains_key(*key))
+}
+
 use anyhow::Context;
+
+const CONVERSATION_MESSAGE_LIMIT: usize = 12;
+const CONVERSATION_HISTORY_LIMIT: usize = 24;
+const CONVERSATION_STATE_PREFIX: &str = "runner";
+
+fn conversation_history_state_key(team: &str, session_id: &str) -> StateKey {
+    StateKey::from(format!("messaging:history:{team}:{session_id}"))
+}
+
+fn conversation_messages_for_envelope(
+    runner_host: &DemoRunnerHost,
+    ctx: &OperatorContext,
+    envelope: &ChannelMessageEnvelope,
+) -> Option<JsonValue> {
+    let tenant_ctx = TenantCtx::new(
+        EnvId::new(crate::secrets_setup::resolve_env(None)).ok()?,
+        TenantId::new(ctx.tenant.clone()).ok()?,
+    );
+    let team = ctx
+        .team
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("_");
+    let session_id = envelope.session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    let env = crate::secrets_setup::resolve_env(None);
+    let history_key = conversation_history_state_key(team, session_id);
+    if let Some(messages) = runner_host
+        .read_state_json(&tenant_ctx, CONVERSATION_STATE_PREFIX, &history_key)
+        .ok()
+        .flatten()
+        .and_then(|value| value.get("messages").cloned())
+        .and_then(|value| value.as_array().cloned())
+        .filter(|messages| !messages.is_empty())
+    {
+        let start = messages.len().saturating_sub(CONVERSATION_MESSAGE_LIMIT);
+        return Some(JsonValue::Array(messages[start..].to_vec()));
+    }
+
+    let key = StateKey::from(format!(
+        "webchat:conv:{}:{}:{}:{}",
+        env,
+        ctx.tenant,
+        team,
+        session_id
+    ));
+    let value = runner_host.read_state_json(&tenant_ctx, "runner", &key).ok()??;
+    let activities = value.get("activities")?.as_array()?;
+    let current_user = envelope
+        .from
+        .as_ref()
+        .map(|from| from.id.as_str())
+        .unwrap_or("anonymous");
+
+    let messages = activities
+        .iter()
+        .filter(|activity| activity.get("type").and_then(JsonValue::as_str) == Some("message"))
+        .filter_map(|activity| {
+            let text = activity
+                .get("text")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let from_id = activity.get("from").and_then(JsonValue::as_str).unwrap_or("");
+            let role = if from_id == "bot" {
+                "assistant"
+            } else if from_id == current_user || !from_id.is_empty() {
+                "user"
+            } else {
+                return None;
+            };
+            Some(json!({
+                "role": role,
+                "content": text,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    if messages.is_empty() {
+        None
+    } else {
+        let start = messages.len().saturating_sub(CONVERSATION_MESSAGE_LIMIT);
+        Some(JsonValue::Array(messages[start..].to_vec()))
+    }
+}
+
+fn update_conversation_history(
+    runner_host: &DemoRunnerHost,
+    ctx: &OperatorContext,
+    envelope: &ChannelMessageEnvelope,
+    outputs: &[ChannelMessageEnvelope],
+) {
+    let session_id = envelope.session_id.trim();
+    if session_id.is_empty() {
+        return;
+    }
+    let env = match EnvId::new(crate::secrets_setup::resolve_env(None)) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let tenant = match TenantId::new(ctx.tenant.clone()) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let tenant_ctx = TenantCtx::new(env, tenant);
+    let team = ctx
+        .team
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("_");
+    let key = conversation_history_state_key(team, session_id);
+
+    let mut messages = runner_host
+        .read_state_json(&tenant_ctx, CONVERSATION_STATE_PREFIX, &key)
+        .ok()
+        .flatten()
+        .and_then(|value| value.get("messages").cloned())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+
+    if let Some(text) = envelope
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let entry = json!({
+            "role": "user",
+            "content": text,
+        });
+        if messages.last() != Some(&entry) {
+            messages.push(entry);
+        }
+    }
+
+    for output in outputs {
+        if let Some(text) = output
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let entry = json!({
+                "role": "assistant",
+                "content": text,
+            });
+            if messages.last() != Some(&entry) {
+                messages.push(entry);
+            }
+        }
+    }
+
+    if messages.is_empty() {
+        return;
+    }
+    let start = messages.len().saturating_sub(CONVERSATION_HISTORY_LIMIT);
+    let payload = json!({
+        "messages": messages[start..].to_vec(),
+    });
+    if let Err(err) =
+        runner_host.write_state_json(&tenant_ctx, CONVERSATION_STATE_PREFIX, &key, &payload)
+    {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "[demo messaging] failed to persist conversation history session={} err={err}",
+                session_id
+            ),
+        );
+    }
+}
 
 /// Keys that are part of the card routing protocol and should not be forwarded
 /// as user-supplied form data into action buttons.
@@ -586,12 +817,22 @@ mod tests {
         assert!(read_card_from_pack(&pack_path, "missing").is_none());
     }
 
+    fn demo_runner_host(bundle: &Path) -> DemoRunnerHost {
+        let discovery = crate::discovery::discover(bundle).expect("discovery");
+        let secrets_handle = secrets_gate::resolve_secrets_manager(bundle, "demo", Some("default"))
+            .expect("secrets");
+        DemoRunnerHost::new(bundle.to_path_buf(), &discovery, None, secrets_handle, false)
+            .expect("runner host")
+    }
+
     #[test]
     fn run_app_flow_safe_falls_back_to_original_envelope_on_errors() {
         let dir = tempdir().expect("tempdir");
         let original = envelope();
+        let runner_host = demo_runner_host(dir.path());
         let outputs = run_app_flow_safe(
             dir.path(),
+            &runner_host,
             &OperatorContext {
                 tenant: "demo".to_string(),
                 team: Some("default".to_string()),
@@ -612,6 +853,36 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].id, original.id);
         assert_eq!(outputs[0].text, original.text);
+    }
+
+    #[test]
+    fn run_app_flow_safe_ignores_blank_bootstrap_envelopes() {
+        let dir = tempdir().expect("tempdir");
+        let mut original = envelope();
+        original.text = Some("   ".to_string());
+        let runner_host = demo_runner_host(dir.path());
+
+        let outputs = run_app_flow_safe(
+            dir.path(),
+            &runner_host,
+            &OperatorContext {
+                tenant: "demo".to_string(),
+                team: Some("default".to_string()),
+                correlation_id: None,
+            },
+            &dir.path().join("missing.gtpack"),
+            &AppPackInfo {
+                pack_id: "app-pack".to_string(),
+                flows: vec![],
+            },
+            &AppFlowInfo {
+                id: "default".to_string(),
+                kind: "messaging".to_string(),
+            },
+            &original,
+        );
+
+        assert!(outputs.is_empty());
     }
 
     #[test]
