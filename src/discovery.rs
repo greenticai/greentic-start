@@ -50,7 +50,12 @@ pub fn discover_with_options(
     options: DiscoveryOptions,
 ) -> anyhow::Result<DiscoveryResult> {
     let mut providers = Vec::new();
-    for domain in [Domain::Messaging, Domain::Events, Domain::Llm, Domain::OAuth] {
+    for domain in [
+        Domain::Messaging,
+        Domain::Events,
+        Domain::Llm,
+        Domain::OAuth,
+    ] {
         let cfg = domains::config(domain);
         let providers_dir = root.join(cfg.providers_dir);
         if !providers_dir.exists() {

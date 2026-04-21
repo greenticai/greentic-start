@@ -7,19 +7,19 @@ use anyhow::Context;
 use chrono::Utc;
 use greentic_runner_desktop::{NodeFailure, NodeStatus, NodeSummary, RunResult, RunStatus};
 use greentic_runner_host::RunnerWasiPolicy;
+use greentic_runner_host::component_api::node::{
+    ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx,
+};
 use greentic_runner_host::config::{
     FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
     WebhookPolicy,
 };
 use greentic_runner_host::pack::{ComponentResolution, PackRuntime};
+use greentic_runner_host::provider::ProviderBinding;
+use greentic_runner_host::runner::engine::CrossPackResolver;
 use greentic_runner_host::runner::engine::{
     ExecutionObserver, FlowContext, FlowEngine, FlowStatus, NodeEvent,
 };
-use greentic_runner_host::runner::engine::CrossPackResolver;
-use greentic_runner_host::component_api::node::{
-    ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx,
-};
-use greentic_runner_host::provider::ProviderBinding;
 use greentic_runner_host::secrets::default_manager;
 use greentic_runner_host::storage::{new_session_store, new_state_store};
 use greentic_runner_host::trace::TraceConfig;
@@ -404,7 +404,9 @@ impl CrossPackResolver for BundleCrossPackResolver {
                     flow_id: op.to_string(),
                     node_id: Some(op.to_string()),
                 };
-                pack_runtime.invoke_provider(&binding, exec_ctx, op, payload).await
+                pack_runtime
+                    .invoke_provider(&binding, exec_ctx, op, payload)
+                    .await
             })
         })
         .with_context(|| {
@@ -468,10 +470,7 @@ fn load_provider_binding(
     let manifest = greentic_types::decode_pack_manifest(&bytes)
         .context("failed to decode provider pack manifest")?;
     let provider_ext = manifest.provider_extension_inline().ok_or_else(|| {
-        anyhow::anyhow!(
-            "provider extension missing from {}",
-            pack_path.display()
-        )
+        anyhow::anyhow!("provider extension missing from {}", pack_path.display())
     })?;
     let provider = provider_ext
         .providers
@@ -494,7 +493,10 @@ fn load_provider_binding(
     })
 }
 
-fn load_provider_setup_answers(bundle_root: &Path, pack_path: &Path) -> anyhow::Result<Option<String>> {
+fn load_provider_setup_answers(
+    bundle_root: &Path,
+    pack_path: &Path,
+) -> anyhow::Result<Option<String>> {
     let pack_id = if let Some(stem) = pack_path.file_stem().and_then(|value| value.to_str()) {
         stem.to_string()
     } else {

@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use base64::Engine as _;
-use greentic_types::{EnvId, StateKey, TenantCtx, TenantId};
 use greentic_types::ChannelMessageEnvelope;
+use greentic_types::{EnvId, StateKey, TenantCtx, TenantId};
 use serde_json::{Value as JsonValue, json};
 
 use crate::domains::Domain;
@@ -323,7 +323,9 @@ fn should_ignore_empty_envelope(envelope: &ChannelMessageEnvelope) -> bool {
         "mcp_wizard",
         "mcp_operation",
     ];
-    !action_keys.iter().any(|key| envelope.metadata.contains_key(*key))
+    !action_keys
+        .iter()
+        .any(|key| envelope.metadata.contains_key(*key))
 }
 
 use anyhow::Context;
@@ -371,12 +373,11 @@ fn conversation_messages_for_envelope(
 
     let key = StateKey::from(format!(
         "webchat:conv:{}:{}:{}:{}",
-        env,
-        ctx.tenant,
-        team,
-        session_id
+        env, ctx.tenant, team, session_id
     ));
-    let value = runner_host.read_state_json(&tenant_ctx, "runner", &key).ok()??;
+    let value = runner_host
+        .read_state_json(&tenant_ctx, "runner", &key)
+        .ok()??;
     let activities = value.get("activities")?.as_array()?;
     let current_user = envelope
         .from
@@ -393,7 +394,10 @@ fn conversation_messages_for_envelope(
                 .and_then(JsonValue::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())?;
-            let from_id = activity.get("from").and_then(JsonValue::as_str).unwrap_or("");
+            let from_id = activity
+                .get("from")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
             let role = if from_id == "bot" {
                 "assistant"
             } else if from_id == current_user || !from_id.is_empty() {
@@ -821,8 +825,14 @@ mod tests {
         let discovery = crate::discovery::discover(bundle).expect("discovery");
         let secrets_handle = secrets_gate::resolve_secrets_manager(bundle, "demo", Some("default"))
             .expect("secrets");
-        DemoRunnerHost::new(bundle.to_path_buf(), &discovery, None, secrets_handle, false)
-            .expect("runner host")
+        DemoRunnerHost::new(
+            bundle.to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )
+        .expect("runner host")
     }
 
     #[test]
