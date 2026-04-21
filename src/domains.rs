@@ -205,6 +205,7 @@ fn append_packs_from_root(
     packs: &mut Vec<ProviderPack>,
     seen: &mut BTreeSet<PathBuf>,
     root: &Path,
+    domain: Option<Domain>,
     cbor_only: bool,
     cache: &mut PackMetaCacheDocument,
 ) -> anyhow::Result<()> {
@@ -212,7 +213,7 @@ fn append_packs_from_root(
         return Ok(());
     }
     for path in collect_gtpacks(root)? {
-        append_pack(bundle_root, packs, seen, path, cbor_only, cache)?;
+        append_pack(bundle_root, packs, seen, path, domain, cbor_only, cache)?;
     }
     Ok(())
 }
@@ -222,6 +223,7 @@ fn append_pack(
     packs: &mut Vec<ProviderPack>,
     seen: &mut BTreeSet<PathBuf>,
     path: PathBuf,
+    domain: Option<Domain>,
     cbor_only: bool,
     cache: &mut PackMetaCacheDocument,
 ) -> anyhow::Result<()> {
@@ -237,6 +239,11 @@ fn append_pack(
         .ok_or_else(|| anyhow::anyhow!("invalid pack file name: {}", path.display()))?
         .to_string();
     let meta = read_pack_meta_cached(bundle_root, &path, cbor_only, cache)?;
+    if let Some(domain) = domain
+        && !provider_pack_matches_domain(bundle_root, &path, &meta.pack_id, domain)
+    {
+        return Ok(());
+    }
     packs.push(ProviderPack {
         pack_id: meta.pack_id,
         display_name: meta.display_name,
@@ -250,8 +257,7 @@ fn append_pack(
 }
 
 pub fn discover_provider_packs(root: &Path, domain: Domain) -> anyhow::Result<Vec<ProviderPack>> {
-    let cfg = config(domain);
-    let providers_dir = root.join(cfg.providers_dir);
+    let providers_dir = root.join("providers");
     let packs_dir = root.join("packs");
     let mut packs = Vec::new();
     let mut seen = BTreeSet::new();
@@ -261,10 +267,11 @@ pub fn discover_provider_packs(root: &Path, domain: Domain) -> anyhow::Result<Ve
         &mut packs,
         &mut seen,
         &providers_dir,
+        Some(domain),
         false,
         &mut cache,
     )?;
-    append_packs_from_root(root, &mut packs, &mut seen, &packs_dir, false, &mut cache)?;
+    append_packs_from_root(root, &mut packs, &mut seen, &packs_dir, None, false, &mut cache)?;
     packs.sort_by(|a, b| a.file_name.cmp(&b.file_name));
     persist_pack_meta_cache(root, &cache)?;
     Ok(packs)
@@ -274,8 +281,7 @@ pub fn discover_provider_packs_cbor_only(
     root: &Path,
     domain: Domain,
 ) -> anyhow::Result<Vec<ProviderPack>> {
-    let cfg = config(domain);
-    let providers_dir = root.join(cfg.providers_dir);
+    let providers_dir = root.join("providers");
     let packs_dir = root.join("packs");
     let mut packs = Vec::new();
     let mut seen = BTreeSet::new();
@@ -285,13 +291,41 @@ pub fn discover_provider_packs_cbor_only(
         &mut packs,
         &mut seen,
         &providers_dir,
+        Some(domain),
         true,
         &mut cache,
     )?;
-    append_packs_from_root(root, &mut packs, &mut seen, &packs_dir, true, &mut cache)?;
+    append_packs_from_root(root, &mut packs, &mut seen, &packs_dir, None, true, &mut cache)?;
     packs.sort_by(|a, b| a.file_name.cmp(&b.file_name));
     persist_pack_meta_cache(root, &cache)?;
     Ok(packs)
+}
+
+pub(crate) fn provider_pack_matches_domain(
+    bundle_root: &Path,
+    path: &Path,
+    pack_id: &str,
+    domain: Domain,
+) -> bool {
+    let domain_name = domain_name(domain);
+    let exact_dir = bundle_root.join(config(domain).providers_dir);
+    if path.starts_with(&exact_dir) {
+        return true;
+    }
+
+    if let Ok(relative) = path.strip_prefix(bundle_root.join("providers"))
+        && let Some(first) = relative.components().next()
+        && first.as_os_str() == std::ffi::OsStr::new(domain_name)
+    {
+        return true;
+    }
+
+    match domain {
+        Domain::Messaging => pack_id.starts_with("messaging-"),
+        Domain::Events => pack_id.starts_with("events-"),
+        Domain::Secrets => pack_id.starts_with("secrets-"),
+        Domain::OAuth => pack_id.starts_with("oauth-"),
+    }
 }
 
 pub fn plan_runs(
@@ -1022,6 +1056,19 @@ mod tests {
         let packs = discover_provider_packs(temp.path(), Domain::Messaging).expect("discover");
         assert_eq!(packs.len(), 1);
         assert_eq!(packs[0].pack_id, "messaging-webchat");
+    }
+
+    #[test]
+    fn discover_provider_packs_supports_provider_id_directories() {
+        let temp = tempdir().expect("tempdir");
+        let provider_dir = temp.path().join("providers").join("messaging-webchat-gui");
+        fs::create_dir_all(&provider_dir).expect("provider dir");
+        let pack_path = provider_dir.join("messaging-webchat-gui.gtpack");
+        write_test_gtpack(&pack_path, "messaging-webchat-gui", &["setup_default"]);
+
+        let packs = discover_provider_packs(temp.path(), Domain::Messaging).expect("discover");
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].pack_id, "messaging-webchat-gui");
     }
 
     #[test]

@@ -821,12 +821,6 @@ where
             .unwrap_or_else(|| "default".to_string())
     });
 
-    if !state.domains.contains(&Domain::Messaging) {
-        return Err(error_response(
-            StatusCode::NOT_FOUND,
-            "messaging domain disabled",
-        ));
-    }
     let provider = provider.ok_or_else(|| {
         error_response(
             StatusCode::BAD_REQUEST,
@@ -843,6 +837,13 @@ where
         || state
             .runner_host
             .supports_op(Domain::Messaging, &provider, "ingest-http");
+
+    if !(state.domains.contains(&Domain::Messaging) || has_directline || has_ingest) {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "messaging domain disabled",
+        ));
+    }
 
     let method = req.method().clone();
     if has_directline {
