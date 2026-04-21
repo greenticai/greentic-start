@@ -553,10 +553,14 @@ fn copy_directline_passthrough(output: &JsonValue, envelope: &mut ChannelMessage
         }
     }
 
-    // Lift an inline adaptive card from attachments[] if extensions doesn't
-    // already carry one. Keeps TierA render classification working even when
-    // the card only lives inside the DirectLine attachments array.
+    // Lift an inline adaptive card from attachments[] into
+    // extensions[ADAPTIVE_CARD] only when the attachments array itself is NOT
+    // being forwarded (i.e. the card lives inline without a DirectLine-shape
+    // wrapper). When `extensions[ATTACHMENTS]` is already set, the provider's
+    // send-payload path reads the card from there and lifting would cause the
+    // card to surface twice on the outbound DirectLine activity.
     if !envelope.extensions.contains_key(ext_keys::ADAPTIVE_CARD)
+        && !envelope.extensions.contains_key(ext_keys::ATTACHMENTS)
         && let Some(attachments) = output.get("attachments").and_then(JsonValue::as_array)
     {
         for attachment in attachments {
@@ -1217,15 +1221,13 @@ mod tests {
             reply.extensions.contains_key(ext_keys::ENTITIES),
             "expected ENTITIES in extensions"
         );
+        // ADAPTIVE_CARD is NOT lifted when ATTACHMENTS is already forwarded —
+        // the provider reads the card from the attachments array, and lifting
+        // would cause the same card to render twice on the outbound activity.
         assert!(
-            reply.extensions.contains_key(ext_keys::ADAPTIVE_CARD),
-            "expected ADAPTIVE_CARD lifted from attachments[]"
+            !reply.extensions.contains_key(ext_keys::ADAPTIVE_CARD),
+            "ADAPTIVE_CARD must NOT be lifted when ATTACHMENTS is present"
         );
-        let card = reply
-            .extensions
-            .get(ext_keys::ADAPTIVE_CARD)
-            .expect("adaptive card");
-        assert_eq!(card.get("version").and_then(JsonValue::as_str), Some("1.5"));
     }
 
     #[test]
@@ -1253,8 +1255,8 @@ mod tests {
             "expected ATTACHMENTS in extensions"
         );
         assert!(
-            reply.extensions.contains_key(ext_keys::ADAPTIVE_CARD),
-            "expected ADAPTIVE_CARD lifted from attachments[]"
+            !reply.extensions.contains_key(ext_keys::ADAPTIVE_CARD),
+            "ADAPTIVE_CARD must NOT be lifted when ATTACHMENTS is present"
         );
     }
 
