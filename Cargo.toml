@@ -26,8 +26,8 @@ flate2 = "1"
 hmac = "0.13"
 greentic-distributor-client = { version = "0.5", default-features = false, features = ["pack-fetch"] }
 greentic-setup = { version = "0.5" }
-greentic-runner-desktop = { path = "../greentic-runner/crates/greentic-runner-desktop", version = "0.5" }
-greentic-runner-host = { path = "../greentic-runner/crates/greentic-runner-host", version = "0.5" }
+greentic-runner-desktop = { version = "0.5" }
+greentic-runner-host = { version = "0.5" }
 greentic-secrets-lib = { version = "0.5", features = ["providers-dev"] }
 greentic-types = { version = "0.5", features = ["serde"] }
 http-body-util = "0.1"
