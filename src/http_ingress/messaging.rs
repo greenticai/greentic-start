@@ -60,6 +60,11 @@ pub(super) fn route_messaging_envelopes(
                         .map(String::as_str)
                         .unwrap_or("en");
                     resolve_i18n_tokens(&mut card_json, &app_pack_path, locale);
+                    // Replace ${key} placeholders and carry form data forward
+                    // through Action.Submit buttons so subsequent cards can
+                    // also access the original form values.
+                    resolve_placeholders(&mut card_json, &envelope.metadata);
+                    carry_form_data_to_actions(&mut card_json, &envelope.metadata);
                     let mut reply = envelope.clone();
                     reply.metadata.insert(
                         "adaptive_card".to_string(),
@@ -84,6 +89,13 @@ pub(super) fn route_messaging_envelopes(
         };
 
         for mut out_envelope in outputs {
+            if let Some(team) = &ctx.team {
+                out_envelope
+                    .metadata
+                    .entry("team".to_string())
+                    .or_insert_with(|| team.clone());
+            }
+
             // Ensure i18n tokens are resolved in any adaptive card.  The WASM
             // component *should* resolve them, but when running through
             // greentic-runner-desktop the host resolver is not registered so the
@@ -97,6 +109,43 @@ pub(super) fn route_messaging_envelopes(
             // send_payload writes bot activities to the conversation state store for
             // client polling via DirectLine GET /activities.
             let message_value = serde_json::to_value(&out_envelope)?;
+            let has_adaptive_card = message_value
+                .get("metadata")
+                .and_then(|m| m.get("adaptive_card"))
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[demo messaging] pre-encode adaptive_card={} text_present={} session_id={} route={} tenant={} metadata_keys={}",
+                    has_adaptive_card,
+                    message_value
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false),
+                    message_value
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    message_value
+                        .get("metadata")
+                        .and_then(|m| m.get("route"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    message_value
+                        .get("metadata")
+                        .and_then(|m| m.get("tenant"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    message_value
+                        .get("metadata")
+                        .and_then(|v| v.as_object())
+                        .map(|o| o.keys().cloned().collect::<Vec<_>>().join(","))
+                        .unwrap_or_default()
+                ),
+            );
 
             let plan = match egress::render_plan(runner_host, ctx, provider, message_value.clone())
             {
@@ -223,6 +272,112 @@ fn run_app_flow_safe(
 
 use anyhow::Context;
 
+/// Keys that are part of the card routing protocol and should not be forwarded
+/// as user-supplied form data into action buttons.
+const ROUTING_META_KEYS: &[&str] = &[
+    "routeToCardId",
+    "toCardId",
+    "action_id",
+    "adaptive_card",
+    "locale",
+    "autoStart",
+    "mcp_wizard",
+    "mcp_operation",
+];
+
+/// Inject form data from envelope metadata into every `Action.Submit` `data`
+/// object found in the card.  This ensures that when a user clicks a button on
+/// a display-only card (no input fields), the form data collected in a previous
+/// card is forwarded to the next card transition.
+fn carry_form_data_to_actions(
+    card: &mut serde_json::Value,
+    metadata: &std::collections::BTreeMap<String, String>,
+) {
+    let form_fields: Vec<(String, String)> = metadata
+        .iter()
+        .filter(|(k, _)| !ROUTING_META_KEYS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if form_fields.is_empty() {
+        return;
+    }
+    inject_form_data_recursive(card, &form_fields);
+}
+
+fn inject_form_data_recursive(value: &mut serde_json::Value, fields: &[(String, String)]) {
+    match value {
+        serde_json::Value::Object(map) => {
+            // If this is an Action.Submit, inject form data into its "data" object
+            if map.get("type").and_then(|v| v.as_str()) == Some("Action.Submit")
+                && let Some(data) = map.get_mut("data").and_then(|d| d.as_object_mut())
+            {
+                for (k, v) in fields {
+                    if !data.contains_key(k) {
+                        data.insert(k.clone(), serde_json::Value::String(v.clone()));
+                    }
+                }
+            }
+            for val in map.values_mut() {
+                inject_form_data_recursive(val, fields);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                inject_form_data_recursive(item, fields);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Replace `${key}` placeholders in card JSON strings with values looked up
+/// from the provided metadata map.  This is the lightweight binding pass used
+/// by the card-routing shortcut so that form data from a previous Action.Submit
+/// is visible in the next card (e.g. a review/confirmation screen).
+fn resolve_placeholders(
+    value: &mut serde_json::Value,
+    metadata: &std::collections::BTreeMap<String, String>,
+) {
+    match value {
+        serde_json::Value::String(text) if text.contains("${") => {
+            let mut output = String::with_capacity(text.len());
+            let mut rest = text.as_str();
+            loop {
+                let Some(start) = rest.find("${") else {
+                    output.push_str(rest);
+                    break;
+                };
+                output.push_str(&rest[..start]);
+                let after = &rest[start + 2..];
+                let Some(end) = after.find('}') else {
+                    output.push_str(&rest[start..]);
+                    break;
+                };
+                let key = after[..end].trim();
+                if let Some(val) = metadata.get(key) {
+                    output.push_str(val);
+                } else {
+                    // Keep the original placeholder when no value is found
+                    output.push_str(&rest[start..start + 2 + end + 1]);
+                }
+                rest = &after[end + 1..];
+            }
+            *text = output;
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                resolve_placeholders(item, metadata);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for val in map.values_mut() {
+                resolve_placeholders(val, metadata);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Read i18n bundle from pack and resolve `{{i18n:KEY}}` tokens in card JSON.
 fn resolve_i18n_tokens(card: &mut serde_json::Value, pack_path: &Path, locale: &str) {
     let bundle = read_i18n_bundle(pack_path, locale).or_else(|| read_i18n_bundle(pack_path, "en"));
@@ -248,28 +403,26 @@ fn replace_tokens_recursive(
     bundle: &std::collections::HashMap<String, String>,
 ) {
     match value {
-        serde_json::Value::String(text) => {
-            if text.contains("{{i18n:") {
-                let mut output = String::with_capacity(text.len());
-                let mut rest = text.as_str();
-                loop {
-                    let Some(start) = rest.find("{{i18n:") else {
-                        output.push_str(rest);
-                        break;
-                    };
-                    output.push_str(&rest[..start]);
-                    let token_start = start + "{{i18n:".len();
-                    let after = &rest[token_start..];
-                    let Some(end) = after.find("}}") else {
-                        output.push_str(&rest[start..]);
-                        break;
-                    };
-                    let key = after[..end].trim();
-                    output.push_str(bundle.get(key).map(String::as_str).unwrap_or(key));
-                    rest = &after[end + 2..];
-                }
-                *text = output;
+        serde_json::Value::String(text) if text.contains("{{i18n:") => {
+            let mut output = String::with_capacity(text.len());
+            let mut rest = text.as_str();
+            loop {
+                let Some(start) = rest.find("{{i18n:") else {
+                    output.push_str(rest);
+                    break;
+                };
+                output.push_str(&rest[..start]);
+                let token_start = start + "{{i18n:".len();
+                let after = &rest[token_start..];
+                let Some(end) = after.find("}}") else {
+                    output.push_str(&rest[start..]);
+                    break;
+                };
+                let key = after[..end].trim();
+                output.push_str(bundle.get(key).map(String::as_str).unwrap_or(key));
+                rest = &after[end + 2..];
             }
+            *text = output;
         }
         serde_json::Value::Array(items) => {
             for item in items {
@@ -557,4 +710,55 @@ mod tests {
     }
 
     use std::io::Write;
+
+    #[test]
+    fn resolve_placeholders_replaces_known_keys_and_preserves_unknown() {
+        let mut card = json!({
+            "body": [
+                { "type": "FactSet", "facts": [
+                    { "title": "Name", "value": "${full_name}" },
+                    { "title": "Email", "value": "${email}" },
+                    { "title": "Missing", "value": "${unknown_key}" }
+                ]}
+            ]
+        });
+        let mut meta = std::collections::BTreeMap::new();
+        meta.insert("full_name".to_string(), "Alice".to_string());
+        meta.insert("email".to_string(), "alice@example.com".to_string());
+
+        resolve_placeholders(&mut card, &meta);
+
+        assert_eq!(card["body"][0]["facts"][0]["value"], "Alice");
+        assert_eq!(card["body"][0]["facts"][1]["value"], "alice@example.com");
+        assert_eq!(card["body"][0]["facts"][2]["value"], "${unknown_key}");
+    }
+
+    #[test]
+    fn carry_form_data_injects_into_action_submit_and_skips_routing_keys() {
+        let mut card = json!({
+            "actions": [
+                {
+                    "type": "Action.Submit",
+                    "data": { "action_id": "next", "routeToCardId": "success" }
+                },
+                {
+                    "type": "Action.OpenUrl",
+                    "url": "https://example.com"
+                }
+            ]
+        });
+        let mut meta = std::collections::BTreeMap::new();
+        meta.insert("full_name".to_string(), "Alice".to_string());
+        meta.insert("routeToCardId".to_string(), "review".to_string());
+        meta.insert("action_id".to_string(), "goto_review".to_string());
+
+        carry_form_data_to_actions(&mut card, &meta);
+
+        // Action.Submit should have full_name injected but not routing keys
+        let data = &card["actions"][0]["data"];
+        assert_eq!(data["full_name"], "Alice");
+        assert_eq!(data["action_id"], "next"); // original preserved, not overwritten
+        // Action.OpenUrl should be untouched
+        assert!(card["actions"][1].get("data").is_none());
+    }
 }
