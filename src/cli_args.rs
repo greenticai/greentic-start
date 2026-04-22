@@ -73,6 +73,12 @@ pub(crate) struct StartArgs {
         help = "Comma-separated list of allowed client CNs (empty = allow all valid certs)"
     )]
     admin_allowed_clients: Vec<String>,
+    /// Read passphrase from stdin instead of prompting on the TTY (for CI/daemon mode).
+    #[arg(long = "passphrase-stdin", conflicts_with = "passphrase_file")]
+    passphrase_stdin: bool,
+    /// Read passphrase from the named file (must be mode 0600, owned by current user).
+    #[arg(long = "passphrase-file", value_name = "PATH")]
+    passphrase_file: Option<PathBuf>,
 }
 
 #[derive(Parser, Clone)]
@@ -152,6 +158,8 @@ pub struct StartRequest {
     /// Whether the user explicitly set `--cloudflared` or `--ngrok` on the CLI.
     /// When `false` and the terminal is interactive, we prompt for tunnel selection.
     pub tunnel_explicit: bool,
+    pub passphrase_stdin: bool,
+    pub passphrase_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -185,6 +193,8 @@ pub(crate) fn start_request_from_args(args: StartArgs, tunnel_explicit: bool) ->
         admin_certs_dir: args.admin_certs_dir,
         admin_allowed_clients: args.admin_allowed_clients,
         tunnel_explicit,
+        passphrase_stdin: args.passphrase_stdin,
+        passphrase_file: args.passphrase_file,
     }
 }
 

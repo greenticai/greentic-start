@@ -1,6 +1,6 @@
 [package]
 name = "greentic-start"
-version = "0.5.4"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -29,7 +29,12 @@ greentic-setup = { version = "0.5" }
 greentic-runner-desktop = { version = "0.5" }
 greentic-runner-host = { version = "0.5" }
 greentic-secrets-lib = { version = "0.5", features = ["providers-dev"] }
+greentic-secrets-cli = "0.6"
+greentic-secrets-passphrase = "0.6"
 greentic-types = { version = "0.5", features = ["serde"] }
+secrecy = { version = "0.10", default-features = false }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "getrandom"] }
+zeroize = { version = "1.8", default-features = false, features = ["derive"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = "0.1"
@@ -64,3 +69,14 @@ zstd = "0.13"
 [dev-dependencies]
 criterion = "0.8"
 tempfile = "3"
+
+# TEMPORARY: while greentic-secrets v0.6.0 + greentic-setup v0.6.0 are
+# awaiting publish, point at the local clones. Remove this entire
+# [patch.crates-io] block before merging this PR.
+[patch.crates-io]
+# greentic-secrets v0.6 introduces passphrase + cli helper crates as
+# additive new packages (no conflict with v0.5 of secrets-lib that
+# greentic-runner-host still consumes). Point at the local clone while
+# the upstream PR awaits publish; remove this block before merging.
+greentic-secrets-passphrase = { path = "../greentic-secrets/crates/greentic-secrets-passphrase" }
+greentic-secrets-cli = { path = "../greentic-secrets/crates/greentic-secrets-cli" }
