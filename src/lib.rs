@@ -146,6 +146,17 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         }
     }
 
+    // Some OpenAI-compatible runtimes still reject empty keys even on local Ollama.
+    // Seed deterministic process-level defaults so both embedded and subprocess
+    // runner paths inherit a non-empty API key unless the user already set one.
+    for key in ["OPENAI_API_KEY", "OLLAMA_API_KEY", "API_KEY"] {
+        if std::env::var(key).is_err() {
+            unsafe {
+                std::env::set_var(key, "ollama-placeholder");
+            }
+        }
+    }
+
     let restart: BTreeSet<String> = request.restart.iter().map(restart_name).collect();
     let log_level = if request.quiet {
         operator_log::Level::Warn

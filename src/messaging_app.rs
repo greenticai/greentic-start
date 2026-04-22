@@ -406,7 +406,7 @@ fn collect_transcript_outputs(
             if first.is_none() {
                 first = Some(outputs.clone());
             }
-            if preferred.is_none() && looks_like_envelope_output(outputs) {
+            if looks_like_envelope_output(outputs) {
                 preferred = Some(outputs.clone());
             }
             last = Some(outputs.clone());
@@ -423,8 +423,10 @@ fn collect_transcript_outputs(
         // prefer explicit target match, then the latest output.
         targeted.or(last.clone()).or(preferred).or(first)
     } else {
-        // Non-targeted flows should prefer envelope-compatible outputs for handoff.
-        targeted.or(preferred).or(last).or(first)
+        // Non-targeted flows should prefer the latest envelope-compatible
+        // output for handoff. The first envelope-like output is often the
+        // initial menu card, while later nodes render the actual result card.
+        targeted.or(last.clone()).or(preferred).or(first)
     };
     Ok(selected)
 }
@@ -622,7 +624,7 @@ fn parse_envelopes(
     if let Some(rendered_card) = value.get("renderedCard")
         && !rendered_card.is_null()
     {
-        let mut reply = ingress_envelope.clone();
+        let mut reply = base_reply_envelope(ingress_envelope);
         // Don't set text when adaptive card is present — the card renders
         // natively on TierA channels (Teams, WebChat) and the redundant text
         // bubble is distracting.  TierD providers already get a downsampled
@@ -681,7 +683,7 @@ fn parse_envelopes(
         .or_else(|| value.get("text").and_then(JsonValue::as_str))
         .or_else(|| value.as_str())
     {
-        let mut reply = ingress_envelope.clone();
+        let mut reply = base_reply_envelope(ingress_envelope);
         reply.text = Some(text.to_string());
         copy_directline_passthrough(value, &mut reply);
         operator_log::info(
@@ -704,7 +706,7 @@ fn parse_envelopes(
         || value.get("channel_data").is_some()
         || value.get("entities").is_some();
     if has_directline_only {
-        let mut reply = ingress_envelope.clone();
+        let mut reply = base_reply_envelope(ingress_envelope);
         reply.text = None;
         copy_directline_passthrough(value, &mut reply);
         operator_log::info(
@@ -726,6 +728,25 @@ fn parse_envelopes(
     Err(anyhow::anyhow!(
         "app flow output did not produce envelope(s)"
     ))
+}
+
+fn base_reply_envelope(ingress_envelope: &ChannelMessageEnvelope) -> ChannelMessageEnvelope {
+    let mut reply = ingress_envelope.clone();
+    reply.id = uuid::Uuid::new_v4().to_string();
+    reply.text = None;
+    reply.attachments.clear();
+    reply.correlation_id = None;
+    reply.reply_scope = None;
+    reply.from = None;
+
+    let mut clean_metadata = BTreeMap::new();
+    for key in ["env", "tenant", "team", "route", "locale", "universal", "autoStart"] {
+        if let Some(value) = reply.metadata.get(key).cloned() {
+            clean_metadata.insert(key.to_string(), value);
+        }
+    }
+    reply.metadata = clean_metadata;
+    reply
 }
 
 fn parse_envelope_array(
@@ -1003,6 +1024,26 @@ mod tests {
             .expect("targeted output");
         assert_eq!(targeted["ok"], true);
         assert!(targeted.get("renderedCard").is_none());
+    }
+
+    #[test]
+    fn collect_transcript_outputs_prefers_latest_envelope_output() {
+        let dir = tempdir().expect("tempdir");
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"node_id\":\"main_menu\",\"outputs\":{\"renderedCard\":{\"body\":[{\"text\":\"Main Menu\"}]}}}\n",
+                "{\"node_id\":\"research_planner\",\"outputs\":{\"completion\":\"plan\"}}\n",
+                "{\"node_id\":\"show_final_report\",\"outputs\":{\"renderedCard\":{\"body\":[{\"text\":\"Final Report\"}]}}}\n"
+            ),
+        )
+        .expect("write transcript");
+
+        let selected = collect_transcript_outputs(dir.path(), None)
+            .expect("collect outputs")
+            .expect("selected output");
+        assert_eq!(selected["renderedCard"]["body"][0]["text"], "Final Report");
     }
 
     #[test]
