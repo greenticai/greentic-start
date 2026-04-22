@@ -98,6 +98,8 @@ mod tests {
             admin_certs_dir: None,
             admin_allowed_clients: Vec::new(),
             tunnel_explicit: false,
+            passphrase_stdin: false,
+            passphrase_file: None,
         }
     }
 

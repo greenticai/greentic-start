@@ -37,6 +37,7 @@ mod offers;
 mod onboard;
 mod operator_i18n;
 mod operator_log;
+mod passphrase_unlock;
 #[doc(hidden)]
 pub mod perf_harness;
 mod port_utils;
@@ -172,6 +173,18 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     let config_path = demo_paths.config_path.clone();
     let config_dir = demo_paths.root_dir.clone();
     let state_dir = demo_paths.state_dir.clone();
+
+    // If the bundle's dev secret store is encrypted (v1 header), prompt
+    // for the passphrase, decrypt to a 0600-mode tempfile, and point
+    // GREENTIC_DEV_SECRETS_PATH at it. Held alive in `_unlocked_store`
+    // so the tempfile is cleaned up on shutdown via Drop.
+    let _unlocked_store = passphrase_unlock::unlock_dev_store(
+        &dev_store_path::default_path(&config_dir),
+        &passphrase_unlock::UnlockOptions {
+            passphrase_stdin: request.passphrase_stdin,
+            passphrase_file: request.passphrase_file.as_deref(),
+        },
+    )?;
     let log_dir = operator_log::init(
         request
             .log_dir
@@ -522,6 +535,8 @@ mod tests {
             admin_certs_dir: None,
             admin_allowed_clients: Vec::new(),
             tunnel_explicit: true,
+            passphrase_stdin: false,
+            passphrase_file: None,
         };
         apply_nats_overrides(&mut config, &args);
         assert!(!config.services.nats.enabled);
@@ -553,6 +568,8 @@ mod tests {
             admin_certs_dir: None,
             admin_allowed_clients: Vec::new(),
             tunnel_explicit: true,
+            passphrase_stdin: false,
+            passphrase_file: None,
         };
         apply_nats_overrides(&mut config, &args);
         assert!(config.services.nats.enabled);
@@ -592,6 +609,8 @@ mod tests {
             admin_certs_dir: None,
             admin_allowed_clients: Vec::new(),
             tunnel_explicit: true,
+            passphrase_stdin: false,
+            passphrase_file: None,
         }
     }
 
