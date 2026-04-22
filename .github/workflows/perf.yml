@@ -1,7 +1,12 @@
 name: Perf (lightweight)
+# Moved off pull_request onto a nightly schedule. See plans/binary-bifurcation.md
+# Phase A (heavy-job sweep). Manual runs remain via workflow_dispatch. push
+# trigger preserved so main-merge still catches regressions immediately.
 
 on:
-  pull_request:
+  schedule:
+    - cron: "39 3 * * *"
+  workflow_dispatch:
   push:
     branches: [main]
 
@@ -13,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.94.0
 
       - name: Run perf guard tests
         run: cargo test --test perf_scaling --test perf_timeout

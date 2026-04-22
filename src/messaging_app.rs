@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    collections::BTreeSet,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -8,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use greentic_types::ChannelMessageEnvelope;
+use greentic_types::messaging::extensions::ext_keys;
 use serde_cbor::Value as CborValue;
 use serde_json::{Value as JsonValue, json};
 use zip::ZipArchive;
@@ -508,6 +510,77 @@ fn summarize_output_shape(value: &JsonValue) -> String {
     )
 }
 
+/// Forward DirectLine / Bot Framework passthrough fields from the component
+/// output JSON into `envelope.extensions` so TierA providers (WebChat, Teams)
+/// can render them natively.
+///
+/// Each extension key is written at most once — existing values are preserved
+/// so that earlier pipeline stages (e.g. the `renderedCard` branch) remain
+/// authoritative when they have already populated a key.
+///
+/// Additionally, if the component emitted `attachments[]` with an adaptive
+/// card entry (`contentType == "application/vnd.microsoft.card.adaptive"`),
+/// its `content` is lifted into `extensions[ADAPTIVE_CARD]` so the render
+/// planner can classify the reply as TierA.
+fn copy_directline_passthrough(output: &JsonValue, envelope: &mut ChannelMessageEnvelope) {
+    // (ext_key, [json_aliases])
+    const PASSTHROUGH: &[(&str, &[&str])] = &[
+        (ext_keys::ATTACHMENTS, &["attachments"]),
+        (ext_keys::CHANNEL_DATA, &["channelData", "channel_data"]),
+        (ext_keys::ENTITIES, &["entities"]),
+        (
+            ext_keys::SUGGESTED_ACTIONS,
+            &["suggestedActions", "suggested_actions"],
+        ),
+        (ext_keys::SPEAK, &["speak"]),
+        (ext_keys::INPUT_HINT, &["inputHint", "input_hint"]),
+        (ext_keys::RAG, &["rag"]),
+    ];
+
+    for (ext_key, aliases) in PASSTHROUGH {
+        if envelope.extensions.contains_key(*ext_key) {
+            continue;
+        }
+        for alias in *aliases {
+            if let Some(value) = output.get(*alias)
+                && !value.is_null()
+            {
+                envelope
+                    .extensions
+                    .insert(ext_key.to_string(), value.clone());
+                break;
+            }
+        }
+    }
+
+    // Lift an inline adaptive card from attachments[] into
+    // extensions[ADAPTIVE_CARD] only when the attachments array itself is NOT
+    // being forwarded (i.e. the card lives inline without a DirectLine-shape
+    // wrapper). When `extensions[ATTACHMENTS]` is already set, the provider's
+    // send-payload path reads the card from there and lifting would cause the
+    // card to surface twice on the outbound DirectLine activity.
+    if !envelope.extensions.contains_key(ext_keys::ADAPTIVE_CARD)
+        && !envelope.extensions.contains_key(ext_keys::ATTACHMENTS)
+        && let Some(attachments) = output.get("attachments").and_then(JsonValue::as_array)
+    {
+        for attachment in attachments {
+            let is_adaptive_card = attachment
+                .get("contentType")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|ct| ct == "application/vnd.microsoft.card.adaptive");
+            if is_adaptive_card
+                && let Some(content) = attachment.get("content")
+                && !content.is_null()
+            {
+                envelope
+                    .extensions
+                    .insert(ext_keys::ADAPTIVE_CARD.to_string(), content.clone());
+                break;
+            }
+        }
+    }
+}
+
 fn parse_envelopes(
     value: &JsonValue,
     ingress_envelope: &ChannelMessageEnvelope,
@@ -521,7 +594,7 @@ fn parse_envelopes(
                 summarize_output_shape(value)
             ),
         );
-        return parse_envelope_array(v);
+        return parse_envelope_array(v, ingress_envelope);
     }
     if let Some(events) = value.get("events").and_then(|v| v.as_array()) {
         operator_log::info(
@@ -532,7 +605,7 @@ fn parse_envelopes(
                 summarize_output_shape(value)
             ),
         );
-        return parse_envelope_array(events);
+        return parse_envelope_array(events, ingress_envelope);
     }
     if let Some(envelope) = value.get("message") {
         operator_log::info(
@@ -558,6 +631,12 @@ fn parse_envelopes(
         if let Ok(ac_json) = serde_json::to_string(rendered_card) {
             reply.metadata.insert("adaptive_card".to_string(), ac_json);
         }
+        // Expose the adaptive card via extensions so consumers on the new
+        // extensions-based pipeline can read it without parsing metadata.
+        reply
+            .extensions
+            .insert(ext_keys::ADAPTIVE_CARD.to_string(), rendered_card.clone());
+        copy_directline_passthrough(value, &mut reply);
         operator_log::info(
             module_path!(),
             format!(
@@ -604,11 +683,34 @@ fn parse_envelopes(
     {
         let mut reply = ingress_envelope.clone();
         reply.text = Some(text.to_string());
+        copy_directline_passthrough(value, &mut reply);
         operator_log::info(
             module_path!(),
             format!(
                 "[messaging_app] parse_envelopes path=text_fallback text_len={} shape={}",
                 text.len(),
+                summarize_output_shape(value)
+            ),
+        );
+        return Ok(vec![reply]);
+    }
+
+    // Attachments/channelData/entities-only payloads have no text to classify
+    // against but still carry TierA-renderable native DirectLine fields. Build
+    // an empty-text reply and forward the passthrough so the webchat provider
+    // receives the attachments instead of silently dropping them.
+    let has_directline_only = value.get("attachments").is_some()
+        || value.get("channelData").is_some()
+        || value.get("channel_data").is_some()
+        || value.get("entities").is_some();
+    if has_directline_only {
+        let mut reply = ingress_envelope.clone();
+        reply.text = None;
+        copy_directline_passthrough(value, &mut reply);
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[messaging_app] parse_envelopes path=directline_passthrough shape={}",
                 summarize_output_shape(value)
             ),
         );
@@ -626,14 +728,37 @@ fn parse_envelopes(
     ))
 }
 
-fn parse_envelope_array(array: &[JsonValue]) -> Result<Vec<ChannelMessageEnvelope>> {
+fn parse_envelope_array(
+    array: &[JsonValue],
+    ingress_envelope: &ChannelMessageEnvelope,
+) -> Result<Vec<ChannelMessageEnvelope>> {
     let mut envelopes = Vec::new();
+    let mut seen = BTreeSet::new();
     for element in array {
-        let envelope: ChannelMessageEnvelope = serde_json::from_value(element.clone())
+        if let Ok(envelope) = serde_json::from_value::<ChannelMessageEnvelope>(element.clone()) {
+            push_unique_envelope(&mut envelopes, &mut seen, envelope)?;
+            continue;
+        }
+
+        let nested = parse_envelopes(element, ingress_envelope)
             .context("app flow output array contains invalid channel envelope")?;
-        envelopes.push(envelope);
+        for envelope in nested {
+            push_unique_envelope(&mut envelopes, &mut seen, envelope)?;
+        }
     }
     Ok(envelopes)
+}
+
+fn push_unique_envelope(
+    envelopes: &mut Vec<ChannelMessageEnvelope>,
+    seen: &mut BTreeSet<String>,
+    envelope: ChannelMessageEnvelope,
+) -> Result<()> {
+    let key = serde_json::to_string(&envelope).context("failed to serialize channel envelope")?;
+    if seen.insert(key) {
+        envelopes.push(envelope);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -987,6 +1112,56 @@ mod tests {
             Some("messages fallback")
         );
 
+        let card_array_output = parse_envelopes(
+            &json!([
+                {
+                    "renderedCard": {
+                        "type": "AdaptiveCard",
+                        "version": "1.5",
+                        "body": [{"type": "TextBlock", "text": "Card A"}]
+                    }
+                },
+                {
+                    "renderedCard": {
+                        "type": "AdaptiveCard",
+                        "version": "1.5",
+                        "body": [{"type": "TextBlock", "text": "Card B"}]
+                    }
+                }
+            ]),
+            &ingress,
+        )
+        .expect("card array output");
+        assert_eq!(card_array_output.len(), 2);
+        assert!(
+            card_array_output
+                .iter()
+                .all(|reply| reply.metadata.contains_key("adaptive_card"))
+        );
+        assert_eq!(card_array_output.len(), 2);
+
+        let duplicate_card_array_output = parse_envelopes(
+            &json!([
+                {
+                    "renderedCard": {
+                        "type": "AdaptiveCard",
+                        "version": "1.5",
+                        "body": [{"type": "TextBlock", "text": "Card A"}]
+                    }
+                },
+                {
+                    "renderedCard": {
+                        "type": "AdaptiveCard",
+                        "version": "1.5",
+                        "body": [{"type": "TextBlock", "text": "Card A"}]
+                    }
+                }
+            ]),
+            &ingress,
+        )
+        .expect("duplicate card array output");
+        assert_eq!(duplicate_card_array_output.len(), 1);
+
         let text_output = parse_envelopes(&json!({"payload": {"text": "payload text"}}), &ingress)
             .expect("text output");
         assert_eq!(text_output[0].text.as_deref(), Some("payload text"));
@@ -1007,6 +1182,82 @@ mod tests {
         let unknown = parse_envelopes(&json!({"payload": {"unknown": true}}), &ingress)
             .expect_err("unknown payload should fail");
         assert!(unknown.to_string().contains("did not produce envelope"));
+    }
+
+    #[test]
+    fn parse_envelopes_forwards_directline_fields_from_text_fallback() {
+        let ingress = envelope();
+        let output = json!({
+            "ok": true,
+            "text": "hello with card",
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": {
+                        "type": "AdaptiveCard",
+                        "version": "1.5",
+                        "body": [{"type": "TextBlock", "text": "card body"}]
+                    }
+                }
+            ],
+            "channelData": {"directline": {"conversationId": "c-1"}},
+            "entities": [{"type": "mention", "text": "@user"}]
+        });
+
+        let replies = parse_envelopes(&output, &ingress).expect("envelope");
+        assert_eq!(replies.len(), 1);
+        let reply = &replies[0];
+        assert_eq!(reply.text.as_deref(), Some("hello with card"));
+        assert!(
+            reply.extensions.contains_key(ext_keys::ATTACHMENTS),
+            "expected ATTACHMENTS in extensions, got keys: {:?}",
+            reply.extensions.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            reply.extensions.contains_key(ext_keys::CHANNEL_DATA),
+            "expected CHANNEL_DATA in extensions"
+        );
+        assert!(
+            reply.extensions.contains_key(ext_keys::ENTITIES),
+            "expected ENTITIES in extensions"
+        );
+        // ADAPTIVE_CARD is NOT lifted when ATTACHMENTS is already forwarded —
+        // the provider reads the card from the attachments array, and lifting
+        // would cause the same card to render twice on the outbound activity.
+        assert!(
+            !reply.extensions.contains_key(ext_keys::ADAPTIVE_CARD),
+            "ADAPTIVE_CARD must NOT be lifted when ATTACHMENTS is present"
+        );
+    }
+
+    #[test]
+    fn parse_envelopes_forwards_directline_fields_with_no_text() {
+        let ingress = envelope();
+        let output = json!({
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": {
+                        "type": "AdaptiveCard",
+                        "version": "1.5",
+                        "body": [{"type": "TextBlock", "text": "no-text card"}]
+                    }
+                }
+            ]
+        });
+
+        let replies = parse_envelopes(&output, &ingress).expect("envelope");
+        assert_eq!(replies.len(), 1);
+        let reply = &replies[0];
+        assert_eq!(reply.text, None);
+        assert!(
+            reply.extensions.contains_key(ext_keys::ATTACHMENTS),
+            "expected ATTACHMENTS in extensions"
+        );
+        assert!(
+            !reply.extensions.contains_key(ext_keys::ADAPTIVE_CARD),
+            "ADAPTIVE_CARD must NOT be lifted when ATTACHMENTS is present"
+        );
     }
 
     #[test]

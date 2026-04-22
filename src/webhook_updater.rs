@@ -85,13 +85,17 @@ pub fn update_webhooks_if_url_changed(
         return Ok(WebhookUpdateSummary::default());
     }
 
-    // Check if URL actually changed
+    // Log whether the URL changed (secrets are always refreshed so
+    // webhooks are re-registered on every start, ensuring the console
+    // always shows webhook status).
     if previous_url == Some(new_url) {
-        operator_log::debug(
+        operator_log::info(
             module_path!(),
-            "[webhook-updater] public URL unchanged, skipping webhook update",
+            format!(
+                "[webhook-updater] public URL unchanged ({}), re-registering webhooks",
+                new_url
+            ),
         );
-        return Ok(WebhookUpdateSummary::default());
     }
 
     operator_log::info(
@@ -188,15 +192,22 @@ pub fn update_webhooks_if_url_changed(
                         provider.provider_id
                     ),
                 );
+                summary
+                    .results
+                    .push((provider.provider_id.clone(), "skipped".to_string()));
             }
             Err(err) => {
+                let msg = format!("{err}");
                 operator_log::warn(
                     module_path!(),
                     format!(
                         "[webhook-updater] failed to update webhook for {}: {}",
-                        provider.provider_id, err
+                        provider.provider_id, msg
                     ),
                 );
+                summary
+                    .results
+                    .push((provider.provider_id.clone(), format!("Error: {msg}")));
             }
         }
 
@@ -361,7 +372,8 @@ fn update_provider_webhook(
                     .as_ref()
                     .and_then(|v| v.get("error"))
                     .and_then(Value::as_str)
-                    .unwrap_or("unknown");
+                    .unwrap_or("unknown")
+                    .to_string();
                 operator_log::warn(
                     module_path!(),
                     format!(
@@ -369,19 +381,19 @@ fn update_provider_webhook(
                         provider_id, err_msg
                     ),
                 );
-                Ok(false)
+                Err(anyhow::anyhow!("{err_msg}"))
             }
         }
         Ok(outcome) => {
+            let err_msg = outcome.error.as_deref().unwrap_or("unknown").to_string();
             operator_log::warn(
                 module_path!(),
                 format!(
                     "[webhook-updater] WASM setup_webhook failed for {}: {}",
-                    provider_id,
-                    outcome.error.as_deref().unwrap_or("unknown")
+                    provider_id, err_msg
                 ),
             );
-            Ok(false)
+            Err(anyhow::anyhow!("{err_msg}"))
         }
         Err(err) => {
             operator_log::debug(

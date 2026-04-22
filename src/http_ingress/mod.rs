@@ -1,3 +1,4 @@
+mod admin_relay;
 mod helpers;
 mod messaging;
 mod static_handler;
@@ -25,13 +26,15 @@ use crate::domains::Domain;
 use crate::http_routes::{HttpRouteTable, discover_http_routes_from_bundle};
 use crate::ingress_dispatch::{dispatch_http_ingress, dispatch_http_ingress_with_op};
 use crate::ingress_types::{IngressHttpResponse, IngressRequestV1};
-use crate::messaging_dto::HttpInV1;
 use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
 use crate::static_routes::{
     ActiveRouteTable, ReservedRouteSet, RouteScopeSegment, StaticRouteMatch, discover_from_bundle,
 };
 
+use admin_relay::{
+    AdminRelayConfig, handle_admin_relay, load_admin_relay_config_from_env, relay_target_path,
+};
 use helpers::{
     build_http_response, collect_headers, collect_queries, cors_preflight_response, domain_name,
     error_response, handle_builtin_health_request, handle_oauth_token_exchange, parse_domain,
@@ -162,11 +165,13 @@ impl HttpIngressServer {
             HttpRouteTable::default()
         };
 
+        let admin_relay = load_admin_relay_config_from_env()?;
         let state = Arc::new(HttpIngressState {
             runner_host,
             domains,
             active_route_table,
             http_route_table,
+            admin_relay,
         });
 
         // Resolve an available port before spawning the server thread.
@@ -297,6 +302,7 @@ struct HttpIngressState {
     domains: Vec<Domain>,
     active_route_table: ActiveRouteTable,
     http_route_table: HttpRouteTable,
+    admin_relay: Option<Arc<AdminRelayConfig>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -363,6 +369,16 @@ where
 
     if let Some(response) = handle_builtin_health_request(req.method(), &path) {
         return Ok(response);
+    }
+
+    if let Some(target_path) = relay_target_path(&path) {
+        let Some(config) = state.admin_relay.clone() else {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "admin relay is not enabled for this runtime",
+            ));
+        };
+        return handle_admin_relay(req, target_path, config).await;
     }
 
     if path.starts_with("/api/onboard") {
@@ -805,12 +821,6 @@ where
             .unwrap_or_else(|| "default".to_string())
     });
 
-    if !state.domains.contains(&Domain::Messaging) {
-        return Err(error_response(
-            StatusCode::NOT_FOUND,
-            "messaging domain disabled",
-        ));
-    }
     let provider = provider.ok_or_else(|| {
         error_response(
             StatusCode::BAD_REQUEST,
@@ -827,6 +837,13 @@ where
         || state
             .runner_host
             .supports_op(Domain::Messaging, &provider, "ingest-http");
+
+    if !(state.domains.contains(&Domain::Messaging) || has_directline || has_ingest) {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "messaging domain disabled",
+        ));
+    }
 
     let method = req.method().clone();
     if has_directline {
@@ -894,6 +911,9 @@ where
 {
     let (provider_method, provider_path) =
         normalize_directline_dispatch(request.method, request.path);
+    let provider_queries =
+        augment_directline_queries(request.queries, request.tenant, Some(request.team));
+    let provider_query_string = encode_directline_query_string(&provider_queries);
     let headers = collect_headers(req.headers());
     let body = req
         .into_body()
@@ -901,20 +921,20 @@ where
         .await
         .map(|collected| collected.to_bytes())
         .unwrap_or_default();
-    let payload = HttpInV1 {
-        v: 1,
-        provider: request.provider.to_string(),
-        route: request.route.map(str::to_string),
-        binding_id: None,
-        tenant_hint: Some(request.tenant.to_string()),
-        team_hint: Some(request.team.to_string()),
-        method: provider_method.as_str().to_string(),
-        path: provider_path,
-        query: request.queries.to_vec(),
-        headers,
-        body_b64: base64::engine::general_purpose::STANDARD.encode(&body),
-        config: None,
-    };
+    let payload = serde_json::json!({
+        "v": 1,
+        "provider": request.provider,
+        "route": request.route,
+        "binding_id": serde_json::Value::Null,
+        "tenant_hint": request.tenant,
+        "team_hint": request.team,
+        "method": provider_method.as_str(),
+        "path": provider_path,
+        "query": provider_query_string,
+        "headers": headers,
+        "body_b64": base64::engine::general_purpose::STANDARD.encode(&body),
+        "config": serde_json::Value::Null,
+    });
     let ctx = OperatorContext {
         tenant: request.tenant.to_string(),
         team: Some(request.team.to_string()),
@@ -967,6 +987,56 @@ fn normalize_directline_dispatch(method: &Method, path: &str) -> (Method, String
     (method.clone(), path.to_string())
 }
 
+fn augment_directline_queries(
+    queries: &[(String, String)],
+    tenant: &str,
+    team: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut augmented = queries.to_vec();
+    if !augmented.iter().any(|(name, _)| name == "tenant") {
+        augmented.push(("tenant".to_string(), tenant.to_string()));
+    }
+    if let Some(team) = team.filter(|value| !value.is_empty())
+        && !augmented.iter().any(|(name, _)| name == "team")
+    {
+        augmented.push(("team".to_string(), team.to_string()));
+    }
+    augmented
+}
+
+fn encode_directline_query_string(queries: &[(String, String)]) -> Option<String> {
+    if queries.is_empty() {
+        return None;
+    }
+    Some(
+        queries
+            .iter()
+            .map(|(name, value)| {
+                format!(
+                    "{}={}",
+                    percent_encode_query_component(name),
+                    percent_encode_query_component(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&"),
+    )
+}
+
+fn percent_encode_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            b' ' => encoded.push_str("%20"),
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    encoded
+}
+
 async fn dispatch_provider_directline_via_ingest_http<B>(
     req: Request<B>,
     request: ProviderDirectlineHttpRequest<'_>,
@@ -978,6 +1048,8 @@ where
 {
     let (provider_method, provider_path) =
         normalize_directline_dispatch(request.method, request.path);
+    let provider_queries =
+        augment_directline_queries(request.queries, request.tenant, Some(request.team));
     let headers = collect_headers(req.headers());
     let body = req
         .into_body()
@@ -999,7 +1071,7 @@ where
         team: Some(request.team.to_string()),
         method: provider_method.as_str().to_string(),
         path: provider_path,
-        query: request.queries.to_vec(),
+        query: provider_queries,
         headers,
         body,
         correlation_id: None,
@@ -1315,6 +1387,7 @@ mod tests {
             domains,
             active_route_table: ActiveRouteTable::default(),
             http_route_table: HttpRouteTable::default(),
+            admin_relay: None,
         })
     }
 
@@ -1664,6 +1737,7 @@ mod tests {
                 blocking_failures: vec![],
             }),
             http_route_table: HttpRouteTable::default(),
+            admin_relay: None,
         });
 
         let response = runtime
@@ -1741,6 +1815,7 @@ mod tests {
                 blocking_failures: vec![],
             }),
             http_route_table: HttpRouteTable::default(),
+            admin_relay: None,
         });
 
         let gui_secret_uri = canonical_secret_uri(
@@ -1888,5 +1963,76 @@ mod tests {
             normalize_directline_dispatch(&Method::POST, "/directline/conversations");
         assert_eq!(method, Method::POST);
         assert_eq!(path, "/v3/directline/conversations");
+    }
+
+    #[test]
+    fn augment_directline_queries_injects_tenant_and_team_when_missing() {
+        let augmented = augment_directline_queries(
+            &[("env".into(), "default".into())],
+            "demo",
+            Some("default"),
+        );
+        assert!(
+            augmented
+                .iter()
+                .any(|(name, value)| name == "env" && value == "default")
+        );
+        assert!(
+            augmented
+                .iter()
+                .any(|(name, value)| name == "tenant" && value == "demo")
+        );
+        assert!(
+            augmented
+                .iter()
+                .any(|(name, value)| name == "team" && value == "default")
+        );
+
+        let preserved = augment_directline_queries(
+            &[
+                ("tenant".into(), "custom".into()),
+                ("team".into(), "ops".into()),
+            ],
+            "demo",
+            Some("default"),
+        );
+        assert!(
+            preserved
+                .iter()
+                .any(|(name, value)| name == "tenant" && value == "custom")
+        );
+        assert!(
+            preserved
+                .iter()
+                .any(|(name, value)| name == "team" && value == "ops")
+        );
+        assert_eq!(
+            preserved
+                .iter()
+                .filter(|(name, _)| name == "tenant")
+                .count(),
+            1
+        );
+        assert_eq!(
+            preserved.iter().filter(|(name, _)| name == "team").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn encode_directline_query_string_serializes_pairs() {
+        assert_eq!(encode_directline_query_string(&[]), None);
+        assert_eq!(
+            encode_directline_query_string(&[
+                ("env".into(), "default".into()),
+                ("tenant".into(), "demo space".into()),
+                ("team".into(), "blue/ops".into()),
+            ]),
+            Some("env=default&tenant=demo%20space&team=blue%2Fops".to_string())
+        );
+        assert_eq!(
+            percent_encode_query_component("a+b&c=d"),
+            "a%2Bb%26c%3Dd".to_string()
+        );
     }
 }

@@ -501,11 +501,23 @@ pub fn demo_up(
         operator_log::info(
             module_path!(),
             format!(
-                "cloudflared ready url={} log={}",
+                "cloudflared url discovered url={} log={}",
                 handle.url,
                 handle.log_path.display()
             ),
         );
+        // Wait for the tunnel to become reachable before declaring it ready.
+        match cloudflared::wait_tunnel_ready(&handle.url, std::time::Duration::from_secs(30)) {
+            Ok(()) => {
+                operator_log::info(module_path!(), "cloudflared tunnel verified reachable");
+            }
+            Err(err) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!("cloudflared tunnel not yet reachable, continuing anyway: {err}"),
+                );
+            }
+        }
         if debug_enabled {
             operator_log::debug(
                 module_path!(),
@@ -838,6 +850,18 @@ pub fn demo_up_services(
                 format!("starting cloudflared log={}", cloudflared_log.display()),
             );
             let handle = cloudflared::start_quick_tunnel(&paths, &cfg, &cloudflared_log)?;
+            // Wait for the tunnel to become reachable before declaring it ready.
+            match cloudflared::wait_tunnel_ready(&handle.url, std::time::Duration::from_secs(30)) {
+                Ok(()) => {
+                    operator_log::info(module_path!(), "cloudflared tunnel verified reachable");
+                }
+                Err(err) => {
+                    operator_log::warn(
+                        module_path!(),
+                        format!("cloudflared tunnel not yet reachable, continuing anyway: {err}"),
+                    );
+                }
+            }
             let mut domain_labels = Vec::new();
             if discovery.domains.messaging {
                 domain_labels.push("messaging");

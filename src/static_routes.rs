@@ -309,7 +309,7 @@ pub fn fallback_asset_path(route_match: &StaticRouteMatch<'_>) -> Option<String>
 
 pub fn cache_control_value(strategy: &CacheStrategy) -> Option<String> {
     match strategy {
-        CacheStrategy::None => None,
+        CacheStrategy::None => Some("no-store".to_string()),
         CacheStrategy::PublicMaxAge { max_age_seconds } => {
             Some(format!("public, max-age={max_age_seconds}"))
         }
@@ -718,6 +718,15 @@ mod tests {
         assert_eq!(
             cache_control_value(&descriptor.cache_strategy),
             Some("public, max-age=300".to_string())
+        );
+
+        let none_descriptor = StaticRouteDescriptor {
+            cache_strategy: CacheStrategy::None,
+            ..descriptor
+        };
+        assert_eq!(
+            cache_control_value(&none_descriptor.cache_strategy),
+            Some("no-store".to_string())
         );
     }
 

@@ -90,6 +90,32 @@ pub fn start_quick_tunnel(
     })
 }
 
+/// Verify the tunnel is reachable by making HTTP requests until one succeeds
+/// or the timeout elapses.  Returns `Ok(())` on success, or an error if the
+/// tunnel never became reachable within the deadline.
+pub fn wait_tunnel_ready(url: &str, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match ureq::head(url).call() {
+            Ok(_) => return Ok(()),
+            Err(_) if Instant::now() < deadline => {
+                // Exponential backoff: 200ms, 400ms, 800ms, capped at 2s
+                let delay = Duration::from_millis(200 * 2u64.pow(attempt.min(3)));
+                std::thread::sleep(delay.min(deadline - Instant::now()));
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "tunnel at {} not reachable after {:.0}s: {err}",
+                    url,
+                    timeout.as_secs_f64()
+                ));
+            }
+        }
+    }
+}
+
 pub fn public_url_path(paths: &RuntimePaths) -> PathBuf {
     paths.runtime_root().join("public_base_url.txt")
 }
@@ -303,5 +329,12 @@ mod tests {
             err.to_string()
                 .contains("timed out waiting for cloudflared public URL")
         );
+    }
+
+    #[test]
+    fn wait_tunnel_ready_returns_error_for_unreachable_url() {
+        let err = wait_tunnel_ready("https://127.0.0.1:1", Duration::from_millis(200))
+            .expect_err("unreachable URL should fail");
+        assert!(err.to_string().contains("not reachable"));
     }
 }

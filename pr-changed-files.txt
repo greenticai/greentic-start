@@ -1,8 +1,4 @@
 Cargo.lock
 Cargo.toml
-src/bin_resolver.rs
-src/cloudflared.rs
+src/http_ingress/admin_relay.rs
 src/http_ingress/mod.rs
-src/lib.rs
-src/port_utils.rs
-src/runtime.rs
