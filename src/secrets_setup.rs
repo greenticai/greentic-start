@@ -150,13 +150,21 @@ fn seed_paths(bundle_root: &Path) -> [PathBuf; 2] {
 }
 
 fn placeholder_entry(uri: String) -> SeedEntry {
+    let text = placeholder_text_for_uri(&uri);
     SeedEntry {
         uri: uri.clone(),
         format: SecretFormat::Text,
-        value: SeedValue::Text {
-            text: format!("placeholder for {uri}"),
-        },
+        value: SeedValue::Text { text },
         description: Some("auto-applied placeholder".to_string()),
+    }
+}
+
+fn placeholder_text_for_uri(uri: &str) -> String {
+    let lower = uri.to_ascii_lowercase();
+    if matches!(lower.rsplit('/').next(), Some("api_key_secret")) {
+        "ollama-placeholder".to_string()
+    } else {
+        format!("placeholder for {uri}")
     }
 }
 
@@ -282,6 +290,27 @@ mod tests {
                 .expect("utf8")
                 .contains("placeholder for")
         );
+    }
+
+    #[test]
+    fn placeholder_entry_uses_dummy_value_for_api_key_secret_uri() {
+        let entry =
+            placeholder_entry("secrets://dev/demo/_/deep-research-demo/api_key_secret".to_string());
+        let SeedValue::Text { text } = entry.value else {
+            panic!("expected text seed value");
+        };
+        assert_eq!(text, "ollama-placeholder");
+    }
+
+    #[test]
+    fn placeholder_entry_keeps_generic_placeholder_for_other_api_key_uris() {
+        let entry =
+            placeholder_entry("secrets://dev/demo/_/deep-research-demo/api_key".to_string());
+        let SeedValue::Text { text } = entry.value else {
+            panic!("expected text seed value");
+        };
+        assert!(text.contains("placeholder for"));
+        assert!(text.contains("/api_key"));
     }
 
     #[tokio::test]
