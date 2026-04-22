@@ -294,9 +294,8 @@ mod tests {
 
     #[test]
     fn placeholder_entry_uses_dummy_value_for_api_key_secret_uri() {
-        let entry = placeholder_entry(
-            "secrets://dev/demo/_/deep-research-demo/api_key_secret".to_string(),
-        );
+        let entry =
+            placeholder_entry("secrets://dev/demo/_/deep-research-demo/api_key_secret".to_string());
         let SeedValue::Text { text } = entry.value else {
             panic!("expected text seed value");
         };
@@ -305,7 +304,8 @@ mod tests {
 
     #[test]
     fn placeholder_entry_keeps_generic_placeholder_for_other_api_key_uris() {
-        let entry = placeholder_entry("secrets://dev/demo/_/deep-research-demo/api_key".to_string());
+        let entry =
+            placeholder_entry("secrets://dev/demo/_/deep-research-demo/api_key".to_string());
         let SeedValue::Text { text } = entry.value else {
             panic!("expected text seed value");
         };

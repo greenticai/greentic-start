@@ -740,7 +740,15 @@ fn base_reply_envelope(ingress_envelope: &ChannelMessageEnvelope) -> ChannelMess
     reply.from = None;
 
     let mut clean_metadata = BTreeMap::new();
-    for key in ["env", "tenant", "team", "route", "locale", "universal", "autoStart"] {
+    for key in [
+        "env",
+        "tenant",
+        "team",
+        "route",
+        "locale",
+        "universal",
+        "autoStart",
+    ] {
         if let Some(value) = reply.metadata.get(key).cloned() {
             clean_metadata.insert(key.to_string(), value);
         }
@@ -775,11 +783,21 @@ fn push_unique_envelope(
     seen: &mut BTreeSet<String>,
     envelope: ChannelMessageEnvelope,
 ) -> Result<()> {
-    let key = serde_json::to_string(&envelope).context("failed to serialize channel envelope")?;
+    let key = unique_envelope_key(&envelope)?;
     if seen.insert(key) {
         envelopes.push(envelope);
     }
     Ok(())
+}
+
+fn unique_envelope_key(envelope: &ChannelMessageEnvelope) -> Result<String> {
+    let mut value =
+        serde_json::to_value(envelope).context("failed to serialize channel envelope")?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("id");
+        object.remove("correlation_id");
+    }
+    serde_json::to_string(&value).context("failed to serialize normalized channel envelope")
 }
 
 #[cfg(test)]
