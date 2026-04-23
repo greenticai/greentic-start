@@ -63,6 +63,12 @@ pub fn run_flow_with_options(
                 .arg(pack)
                 .args(["--flow", flow, "--input"])
                 .arg(&input_str);
+            if let Some(tenant) = options.tenant {
+                command.args(["--tenant", tenant]);
+            }
+            if let Some(team) = options.team {
+                command.args(["--team", team]);
+            }
             if options.dist_offline {
                 command.arg("--offline");
             }
@@ -169,5 +175,25 @@ mod tests {
         assert!(output.status.success());
         assert!(output.stdout.contains("run --pack"));
         assert!(output.stdout.contains("--flow default"));
+
+        let output = run_flow_with_options(
+            &runner,
+            &pack,
+            "default",
+            &serde_json::json!({"ok": true}),
+            RunFlowOptions {
+                dist_offline: true,
+                tenant: Some("demo"),
+                team: Some("ops"),
+                artifacts_dir: None,
+                runner_flavor: RunnerFlavor::RunSubcommand,
+            },
+        )
+        .expect("run subcommand with context");
+        assert!(output.status.success());
+        assert!(output.stdout.contains("run --pack"));
+        assert!(output.stdout.contains("--tenant demo"));
+        assert!(output.stdout.contains("--team ops"));
+        assert!(output.stdout.contains("--offline"));
     }
 }
