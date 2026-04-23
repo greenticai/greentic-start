@@ -7,6 +7,62 @@ use crate::StartRequest;
 use crate::bundle_ref;
 use crate::config;
 
+/// Effective tenant and team resolved from bundle configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleTarget {
+    pub tenant: String,
+    pub team: String,
+}
+
+/// Resolves the effective tenant and team for a bundle directory.
+///
+/// Reads bundle configuration (bundle.yaml, bundle-manifest.json, resolved/ directory)
+/// and applies optional CLI overrides. This replicates the same resolution logic used
+/// by `greentic-start` at runtime, allowing callers (e.g. `gtc`) to display accurate
+/// tenant/team values before launching the runtime process.
+///
+/// @param bundle_dir - Path to the resolved bundle directory
+/// @param tenant_override - Optional CLI tenant override (from --tenant flag)
+/// @param team_override - Optional CLI team override (from --team flag)
+/// @returns BundleTarget with resolved tenant and team
+///
+/// @example
+/// let target = resolve_bundle_target("./my-bundle", None, None)?;
+/// println!("tenant={} team={}", target.tenant, target.team);
+pub fn resolve_bundle_target(
+    bundle_dir: &str,
+    tenant_override: Option<&str>,
+    team_override: Option<&str>,
+) -> anyhow::Result<BundleTarget> {
+    let demo_paths = resolve_demo_paths(None, Some(bundle_dir))?;
+    let config = load_target_config(&demo_paths, tenant_override, team_override)?;
+    Ok(BundleTarget {
+        tenant: config.tenant,
+        team: config.team,
+    })
+}
+
+/// Loads demo config with only tenant/team overrides applied (no env var side effects).
+fn load_target_config(
+    demo_paths: &DemoPaths,
+    tenant_override: Option<&str>,
+    team_override: Option<&str>,
+) -> anyhow::Result<config::DemoConfig> {
+    let mut demo_config = match demo_paths.config_source {
+        DemoConfigSource::LegacyFile => config::load_demo_config(&demo_paths.config_path)?,
+        DemoConfigSource::NormalizedBundle => {
+            load_normalized_bundle_config(&demo_paths.config_path, &demo_paths.root_dir)?
+        }
+    };
+    if let Some(tenant) = tenant_override {
+        demo_config.tenant = tenant.to_string();
+    }
+    if let Some(team) = team_override {
+        demo_config.team = team.to_string();
+    }
+    Ok(demo_config)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct DemoPaths {
     pub(crate) config_path: PathBuf,
@@ -180,44 +236,48 @@ pub(crate) fn load_runtime_demo_config(
     let mut demo_config = match demo_paths.config_source {
         DemoConfigSource::LegacyFile => config::load_demo_config(&demo_paths.config_path)?,
         DemoConfigSource::NormalizedBundle => {
-            let mut config = config::DemoConfig::default();
-            let mut tenant_from_bundle = false;
-            let mut team_from_bundle = false;
-
-            // Try to load extended config from bundle.yaml (tenant, team, providers)
-            if let Some(extended) =
-                load_extended_bundle_config(&demo_paths.config_path, &demo_paths.root_dir)?
-            {
-                // Use tenant/team from bundle.yaml if present
-                if let Some(tenant) = extended.tenant {
-                    config.tenant = tenant;
-                    tenant_from_bundle = true;
-                }
-                if let Some(team) = extended.team {
-                    config.team = team;
-                    team_from_bundle = true;
-                }
-                // Load providers
-                if extended.providers.is_some() {
-                    config.providers = extended.providers;
-                }
-            }
-
-            // Fallback to inferred target from resolved/ directory if tenant/team not set in bundle.yaml
-            if !tenant_from_bundle
-                && let Some(target) = infer_normalized_bundle_target(&demo_paths.root_dir)?
-            {
-                config.tenant = target.tenant;
-                if !team_from_bundle && let Some(team) = target.team {
-                    config.team = team;
-                }
-            }
-
-            config
+            load_normalized_bundle_config(&demo_paths.config_path, &demo_paths.root_dir)?
         }
     };
     apply_target_overrides(&mut demo_config, request);
     Ok(demo_config)
+}
+
+/// Loads a DemoConfig from a normalized bundle (bundle.yaml + resolved/ directory).
+fn load_normalized_bundle_config(
+    config_path: &Path,
+    root_dir: &Path,
+) -> anyhow::Result<config::DemoConfig> {
+    let mut config = config::DemoConfig::default();
+    let mut tenant_from_bundle = false;
+    let mut team_from_bundle = false;
+
+    // Try to load extended config from bundle.yaml (tenant, team, providers)
+    if let Some(extended) = load_extended_bundle_config(config_path, root_dir)? {
+        if let Some(tenant) = extended.tenant {
+            config.tenant = tenant;
+            tenant_from_bundle = true;
+        }
+        if let Some(team) = extended.team {
+            config.team = team;
+            team_from_bundle = true;
+        }
+        if extended.providers.is_some() {
+            config.providers = extended.providers;
+        }
+    }
+
+    // Fallback to inferred target from resolved/ directory if tenant/team not set in bundle.yaml
+    if !tenant_from_bundle
+        && let Some(target) = infer_normalized_bundle_target(root_dir)?
+    {
+        config.tenant = target.tenant;
+        if !team_from_bundle && let Some(team) = target.team {
+            config.team = team;
+        }
+    }
+
+    Ok(config)
 }
 
 fn apply_target_overrides(config: &mut config::DemoConfig, request: &StartRequest) {
@@ -485,5 +545,75 @@ mod tests {
 
         assert_eq!(config.services.gateway.listen_addr, "0.0.0.0");
         assert_eq!(config.services.gateway.port, 18080);
+    }
+
+    #[test]
+    fn resolve_bundle_target_reads_from_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        std::fs::write(bundle.join("bundle.yaml"), "bundle_id: test-bundle\n").expect("bundle");
+        std::fs::write(
+            bundle.join("bundle-manifest.json"),
+            r#"{"resolved_targets":[{"tenant":"acme","team":"support"}]}"#,
+        )
+        .expect("manifest");
+
+        let target =
+            resolve_bundle_target(&bundle.display().to_string(), None, None).expect("target");
+        assert_eq!(target.tenant, "acme");
+        assert_eq!(target.team, "support");
+    }
+
+    #[test]
+    fn resolve_bundle_target_applies_overrides() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        std::fs::write(bundle.join("bundle.yaml"), "bundle_id: test-bundle\n").expect("bundle");
+        std::fs::write(
+            bundle.join("bundle-manifest.json"),
+            r#"{"resolved_targets":[{"tenant":"acme","team":"support"}]}"#,
+        )
+        .expect("manifest");
+
+        let target = resolve_bundle_target(
+            &bundle.display().to_string(),
+            Some("custom-tenant"),
+            Some("custom-team"),
+        )
+        .expect("target");
+        assert_eq!(target.tenant, "custom-tenant");
+        assert_eq!(target.team, "custom-team");
+    }
+
+    #[test]
+    fn resolve_bundle_target_defaults_without_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        std::fs::write(bundle.join("bundle.yaml"), "bundle_id: test-bundle\n").expect("bundle");
+        std::fs::create_dir_all(bundle.join("resolved")).expect("resolved dir");
+        std::fs::write(bundle.join("resolved/prod.yaml"), "tenant: prod\n").expect("resolved");
+
+        let target =
+            resolve_bundle_target(&bundle.display().to_string(), None, None).expect("target");
+        assert_eq!(target.tenant, "prod");
+        assert_eq!(target.team, DEMO_DEFAULT_TEAM);
+    }
+
+    #[test]
+    fn resolve_bundle_target_reads_tenant_from_bundle_yaml() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            "bundle_id: test-bundle\ntenant: from-yaml\nteam: yaml-team\n",
+        )
+        .expect("bundle");
+        std::fs::create_dir_all(bundle.join("resolved")).expect("resolved dir");
+        std::fs::write(bundle.join("resolved/other.yaml"), "tenant: other\n").expect("resolved");
+
+        let target =
+            resolve_bundle_target(&bundle.display().to_string(), None, None).expect("target");
+        assert_eq!(target.tenant, "from-yaml");
+        assert_eq!(target.team, "yaml-team");
     }
 }

@@ -72,6 +72,7 @@ mod webhook_updater;
 use cli_args::{
     Cli, Command, normalize_args, restart_name, start_request_from_args, stop_request_from_args,
 };
+pub use bundle_config::{BundleTarget, resolve_bundle_target};
 pub use cli_args::{
     CloudflaredModeArg, NatsModeArg, NgrokModeArg, RestartTarget, StartRequest, StopRequest,
 };
