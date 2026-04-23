@@ -146,6 +146,18 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         }
     }
 
+    // Temporary process-level API key fallback disabled while debugging the
+    // adaptive card/runtime path. Keep this block for quick re-enable if we
+    // need to revisit local Ollama compatibility.
+    //
+    // for key in ["OPENAI_API_KEY", "OLLAMA_API_KEY", "API_KEY"] {
+    //     if std::env::var(key).is_err() {
+    //         unsafe {
+    //             std::env::set_var(key, "ollama-placeholder");
+    //         }
+    //     }
+    // }
+
     let restart: BTreeSet<String> = request.restart.iter().map(restart_name).collect();
     let log_level = if request.quiet {
         operator_log::Level::Warn
