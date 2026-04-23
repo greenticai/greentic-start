@@ -1127,8 +1127,8 @@ mod tests {
         std::fs::write(
             &transcript,
             concat!(
-                "{\"node_id\":\"present_telco\",\"outputs\":{\"messages\":[{\"type\":\"adaptive_card\",\"card\":{\"type\":\"AdaptiveCard\",\"version\":\"1.5\",\"body\":[{\"type\":\"TextBlock\",\"text\":\"Card A\"}]}}]}}\n",
-                "{\"node_id\":\"other\",\"outputs\":{\"ok\":true}}\n"
+                "{\"node_id\":\"planner\",\"outputs\":{\"ok\":true}}\n",
+                "{\"node_id\":\"present_telco\",\"outputs\":{\"messages\":[{\"type\":\"adaptive_card\",\"card\":{\"type\":\"AdaptiveCard\",\"version\":\"1.5\",\"body\":[{\"type\":\"TextBlock\",\"text\":\"Card A\"}]}}]}}\n"
             ),
         )
         .expect("write transcript");
