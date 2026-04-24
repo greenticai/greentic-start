@@ -616,9 +616,9 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "cc"
-version = "1.2.60"
+version = "1.2.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43c5703da9466b66a946814e1adf53ea2c90f10063b86290cc9eb67ce3478a20"
+checksum = "d16d90359e986641506914ba71350897565610e87ce0ad9e6f28569db3dd5c6d"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1345,9 +1345,9 @@ dependencies = [
 
 [[package]]
 name = "data-encoding"
-version = "2.10.0"
+version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
+checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "debugid"
@@ -2067,9 +2067,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-flow"
-version = "0.5.5"
+version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b446830cfb00c30404b90d2bd118d542e9ba28b1ab5b69b06ffbf07aa3368cf"
+checksum = "39dc2f13a03fd5f722c13217afa99a222c15b79a646c8069be30ad7c1847d704"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2202,9 +2202,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-pack-lib"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e948ccd4d47190444afa6879694df46f2d102bba41b6a42b9bdbac16ec95f6d"
+checksum = "276d009e644b3c44f2e48585dc9f29aed7b117ef12af55a23c1fc71368e5a3e1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2249,9 +2249,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "0.5.9"
+version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad36042b7a933ea74e038d3aba39f79f4a225135cf3feadc6ed2065a25bcc178"
+checksum = "f568f04eec86cadabe2f31a01fe8128b904a0e1b5177c42a63cfcfa872f3257b"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -2270,9 +2270,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "0.5.9"
+version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e14203f507bf229d42e0c4b22e2ca5738602904bfdbc5c5850fe454e2d756262"
+checksum = "484d11e2eb70a6254d1187b0d8542467519935c1b21aa0bc6031ba8b1caca0c8"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2468,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-start"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2496,7 +2496,7 @@ dependencies = [
  "qa-spec",
  "rand 0.10.1",
  "rpassword",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "rustls-pemfile",
  "semver",
  "serde",
@@ -2852,7 +2852,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "tokio",
  "tokio-rustls 0.26.4",
  "tower-service",
@@ -3288,7 +3288,7 @@ dependencies = [
  "regex",
  "regex-syntax",
  "reqwest 0.13.2",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "serde",
  "serde_json",
  "unicode-general-category",
@@ -3317,7 +3317,7 @@ dependencies = [
  "regex",
  "regex-syntax",
  "reqwest 0.13.2",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "serde",
  "serde_json",
  "unicode-general-category",
@@ -3365,9 +3365,9 @@ checksum = "b3a6a8c165077efc8f3a971534c50ea6a1a18b329ef4a66e897a7e3a1494565f"
 
 [[package]]
 name = "libc"
-version = "0.2.185"
+version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "liblzma"
@@ -4329,7 +4329,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "socket2",
  "thiserror 2.0.18",
  "tokio",
@@ -4350,7 +4350,7 @@ dependencies = [
  "rand 0.9.4",
  "ring",
  "rustc-hash",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.18",
@@ -4701,7 +4701,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -4744,7 +4744,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "rustls-pki-types",
  "rustls-platform-verifier",
  "serde",
@@ -4799,9 +4799,9 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "0.5.9"
+version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ce473d0834b3d25b3ddd33acfd5f4eb62cf351cf476e234e805d7cdf9474eae"
+checksum = "5c61031f261a63dad6bb0e352404a9f950eb0a4993e7ba71e14fb1e3a4e8023e"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4900,9 +4900,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.38"
+version = "0.23.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
+checksum = "7c2c118cb077cca2822033836dfb1b975355dfb784b5e8da48f7b6c5db74e60e"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -4956,7 +4956,7 @@ dependencies = [
  "jni",
  "log",
  "once_cell",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "rustls-native-certs",
  "rustls-platform-verifier-android",
  "rustls-webpki 0.103.13",
@@ -5732,7 +5732,7 @@ version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "tokio",
 ]
 
@@ -6155,7 +6155,7 @@ dependencies = [
  "flate2",
  "log",
  "percent-encoding",
- "rustls 0.23.38",
+ "rustls 0.23.39",
  "rustls-pki-types",
  "serde",
  "serde_json",
