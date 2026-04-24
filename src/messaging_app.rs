@@ -434,6 +434,10 @@ fn collect_transcript_outputs(
 fn looks_like_envelope_output(value: &JsonValue) -> bool {
     value.is_array()
         || value.get("events").and_then(|v| v.as_array()).is_some()
+        || value
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .is_some_and(|messages| !messages.is_empty())
         || value.get("message").is_some()
         || value.get("renderedCard").is_some_and(|v| !v.is_null())
         || value
@@ -587,6 +591,47 @@ fn parse_envelopes(
     value: &JsonValue,
     ingress_envelope: &ChannelMessageEnvelope,
 ) -> Result<Vec<ChannelMessageEnvelope>> {
+    if let Some(message_type) = value.get("type").and_then(JsonValue::as_str) {
+        if message_type == "adaptive_card"
+            && let Some(card) = value.get("card").filter(|card| !card.is_null())
+        {
+            let mut reply = ingress_envelope.clone();
+            reply.text = None;
+            if let Ok(ac_json) = serde_json::to_string(card) {
+                reply.metadata.insert("adaptive_card".to_string(), ac_json);
+            }
+            reply
+                .extensions
+                .insert(ext_keys::ADAPTIVE_CARD.to_string(), card.clone());
+            copy_directline_passthrough(value, &mut reply);
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[messaging_app] parse_envelopes path=typed_adaptive_card shape={}",
+                    summarize_output_shape(value)
+                ),
+            );
+            return Ok(vec![reply]);
+        }
+
+        if message_type == "text"
+            && let Some(text) = value.get("text").and_then(JsonValue::as_str)
+        {
+            let mut reply = ingress_envelope.clone();
+            reply.text = Some(text.to_string());
+            copy_directline_passthrough(value, &mut reply);
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[messaging_app] parse_envelopes path=typed_text text_len={} shape={}",
+                    text.len(),
+                    summarize_output_shape(value)
+                ),
+            );
+            return Ok(vec![reply]);
+        }
+    }
+
     if let Some(v) = value.as_array() {
         operator_log::info(
             module_path!(),
@@ -597,6 +642,17 @@ fn parse_envelopes(
             ),
         );
         return parse_envelope_array(v, ingress_envelope);
+    }
+    if let Some(messages) = value.get("messages").and_then(|v| v.as_array()) {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[messaging_app] parse_envelopes path=messages len={} shape={}",
+                messages.len(),
+                summarize_output_shape(value)
+            ),
+        );
+        return parse_envelope_array(messages, ingress_envelope);
     }
     if let Some(events) = value.get("events").and_then(|v| v.as_array()) {
         operator_log::info(
@@ -1065,7 +1121,26 @@ mod tests {
     }
 
     #[test]
-    fn collect_transcript_outputs_with_retry_prefers_eventual_envelope() {
+    fn collect_transcript_outputs_treats_messages_as_envelope_compatible() {
+        let dir = tempdir().expect("tempdir");
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"node_id\":\"planner\",\"outputs\":{\"ok\":true}}\n",
+                "{\"node_id\":\"present_telco\",\"outputs\":{\"messages\":[{\"type\":\"adaptive_card\",\"card\":{\"type\":\"AdaptiveCard\",\"version\":\"1.5\",\"body\":[{\"type\":\"TextBlock\",\"text\":\"Card A\"}]}}]}}\n"
+            ),
+        )
+        .expect("write transcript");
+
+        let selected = collect_transcript_outputs(dir.path(), None)
+            .expect("collect outputs")
+            .expect("selected output");
+        assert!(selected.get("messages").is_some());
+    }
+
+    #[test]
+    fn collect_transcript_outputs_with_retry_returns_first_envelope_compatible_output() {
         let dir = tempdir().expect("tempdir");
         let transcript = dir.path().join("transcript.jsonl");
         std::fs::write(
@@ -1094,7 +1169,8 @@ mod tests {
             .expect("selected output");
 
         writer.join().expect("join writer");
-        assert!(selected.get("renderedCard").is_some());
+        assert!(selected.get("messages").is_some());
+        assert!(selected.get("renderedCard").is_none());
     }
 
     #[test]
@@ -1169,6 +1245,42 @@ mod tests {
         assert_eq!(
             messages_output[0].text.as_deref(),
             Some("messages fallback")
+        );
+
+        let card_messages_output = parse_envelopes(
+            &json!({
+                "messages": [
+                    {
+                        "type": "adaptive_card",
+                        "card": {
+                            "type": "AdaptiveCard",
+                            "version": "1.5",
+                            "body": [{"type": "TextBlock", "text": "Card 1"}]
+                        }
+                    },
+                    {
+                        "type": "adaptive_card",
+                        "card": {
+                            "type": "AdaptiveCard",
+                            "version": "1.5",
+                            "body": [{"type": "TextBlock", "text": "Card 2"}]
+                        }
+                    }
+                ]
+            }),
+            &ingress,
+        )
+        .expect("messages adaptive cards output");
+        assert_eq!(card_messages_output.len(), 2);
+        assert!(
+            card_messages_output[0]
+                .metadata
+                .contains_key("adaptive_card")
+        );
+        assert!(
+            card_messages_output[1]
+                .metadata
+                .contains_key("adaptive_card")
         );
 
         let card_array_output = parse_envelopes(
