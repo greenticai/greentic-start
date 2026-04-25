@@ -362,7 +362,8 @@ fn parse_messaging_envelopes(value: Option<&JsonValue>) -> Vec<ChannelMessageEnv
     let mut envelopes = Vec::new();
     for (i, entry) in array.iter().enumerate() {
         match serde_json::from_value::<ChannelMessageEnvelope>(entry.clone()) {
-            Ok(envelope) => {
+            Ok(mut envelope) => {
+                promote_metadata_extensions_string(&mut envelope);
                 envelopes.push(envelope);
             }
             Err(err) => {
@@ -379,6 +380,41 @@ fn parse_messaging_envelopes(value: Option<&JsonValue>) -> Vec<ChannelMessageEnv
         }
     }
     envelopes
+}
+
+/// Promote `metadata["extensions"]` JSON-stringified payload into the typed
+/// `envelope.extensions` field.
+///
+/// The published WASM messaging providers (built against `greentic-types`
+/// 0.4.x via the v0.4.84 "neutral presentation" refactor) serialize their
+/// extensions object as a JSON string under `metadata["extensions"]` rather
+/// than the typed `ChannelMessageEnvelope.extensions` field that
+/// `greentic-types` 0.5.x exposes. As a result the typed field arrives empty
+/// at greentic-start and the runner never sees DirectLine `channelData`,
+/// `attachments`, etc. — see TASK-082 Bug 3 regression notes.
+///
+/// This helper bridges the two shapes by parsing the stringified JSON and
+/// merging its keys into the typed `extensions` map. Values already present
+/// on the typed map win, so a properly populated provider keeps working.
+fn promote_metadata_extensions_string(envelope: &mut ChannelMessageEnvelope) {
+    let Some(raw) = envelope.metadata.get("extensions") else {
+        return;
+    };
+    let Ok(parsed) = serde_json::from_str::<JsonValue>(raw) else {
+        return;
+    };
+    let Some(object) = parsed.as_object() else {
+        return;
+    };
+    if object.is_empty() {
+        return;
+    }
+    for (key, value) in object {
+        envelope
+            .extensions
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
 }
 
 pub fn events_debug_json(events: &[EventEnvelopeV1]) -> JsonValue {
@@ -552,5 +588,63 @@ mod tests {
         assert_eq!(debug[0]["provider"], "events-webhook");
 
         log_invalid_event_warning(&anyhow::anyhow!("bad event"));
+    }
+
+    /// Regression: WASM messaging providers (TASK-082 Bug 3, v0.4.84+) emit
+    /// `metadata["extensions"]` as a JSON-encoded string because they pin
+    /// `greentic-types` 0.4.x which lacks the typed `extensions` field.
+    /// `parse_messaging_envelopes` must promote that string back into the
+    /// typed `envelope.extensions` field so the runner can surface
+    /// DirectLine `channel_data` (and friends) through to the flow input.
+    #[test]
+    fn parse_messaging_envelopes_promotes_metadata_extensions_string() {
+        let mut env_json = messaging_envelope();
+        env_json["metadata"] = json!({
+            "extensions": "{\"channel_data\":{\"r1_principals\":{\"country\":\"US\",\"industry\":\"telecom\"}}}",
+            "route": "conv-1"
+        });
+
+        let envelopes = parse_messaging_envelopes(Some(&json!([env_json])));
+        assert_eq!(envelopes.len(), 1);
+        let extensions = &envelopes[0].extensions;
+        let channel_data = extensions
+            .get("channel_data")
+            .and_then(JsonValue::as_object)
+            .expect("channel_data should be promoted into typed extensions");
+        let principals = channel_data
+            .get("r1_principals")
+            .and_then(JsonValue::as_object)
+            .expect("r1_principals should survive promotion");
+        assert_eq!(
+            principals.get("country").and_then(JsonValue::as_str),
+            Some("US")
+        );
+        assert_eq!(
+            principals.get("industry").and_then(JsonValue::as_str),
+            Some("telecom")
+        );
+    }
+
+    /// Promotion must not clobber an envelope that already exposes the typed
+    /// `extensions` field — providers built against newer `greentic-types`
+    /// keep working even after this guard runs.
+    #[test]
+    fn parse_messaging_envelopes_keeps_existing_typed_extensions() {
+        let mut env_json = messaging_envelope();
+        env_json["extensions"] = json!({
+            "channel_data": { "from": "typed" }
+        });
+        env_json["metadata"] = json!({
+            "extensions": "{\"channel_data\":{\"from\":\"metadata\"}}"
+        });
+
+        let envelopes = parse_messaging_envelopes(Some(&json!([env_json])));
+        assert_eq!(envelopes.len(), 1);
+        let cd = envelopes[0]
+            .extensions
+            .get("channel_data")
+            .and_then(JsonValue::as_object)
+            .expect("typed extensions must survive");
+        assert_eq!(cd.get("from").and_then(JsonValue::as_str), Some("typed"));
     }
 }
