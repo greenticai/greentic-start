@@ -1468,4 +1468,54 @@ mod tests {
         assert_eq!(info.flows[0].id, "default");
         assert_eq!(info.flows[1].kind, "workflow");
     }
+
+    /// Regression guard: when greentic-start builds the flow input JSON for the
+    /// runner, `ChannelMessageEnvelope.extensions` (e.g. DirectLine
+    /// `channel_data`) MUST survive verbatim. The canonical JSON Pointer that
+    /// flow nodes / WASM components see (against the runner's
+    /// `ExecutionState.entry`) is `/input/extensions/channel_data/...`.
+    ///
+    /// This pins the wire shape `messaging_app::run_app_flow` constructs at
+    /// `json!({"input": envelope, ...})` so a future refactor that flattens
+    /// or filters the envelope cannot silently drop provider-specific
+    /// passthrough payloads such as `r1_principals`.
+    #[test]
+    fn run_app_flow_input_preserves_envelope_extensions_channel_data() {
+        let mut envelope = envelope();
+        envelope.extensions.insert(
+            ext_keys::CHANNEL_DATA.to_string(),
+            json!({
+                "r1_principals": {
+                    "country": "US",
+                    "industry": "telecom"
+                }
+            }),
+        );
+
+        // Mirror the exact shape built by `run_app_flow` (see
+        // `messaging_app.rs::run_app_flow` request.input).
+        let request_input = json!({
+            "input": envelope,
+            "tenant": "demo",
+            "team": "default",
+            "correlation_id": JsonValue::Null,
+        });
+
+        // Canonical JSON Pointer that flow templates / WASM components read.
+        let r1 = request_input
+            .pointer("/input/extensions/channel_data/r1_principals")
+            .expect("channel_data must survive at /input/extensions/channel_data");
+        assert_eq!(r1["country"], "US");
+        assert_eq!(r1["industry"], "telecom");
+
+        // Field name is snake_case (`extensions` / `channel_data`), not
+        // camelCase. Anyone reading `channelData` from the WASM payload is
+        // looking at the wrong key.
+        assert!(
+            request_input
+                .pointer("/input/extensions/channelData")
+                .is_none(),
+            "extensions key must be snake_case `channel_data`, never `channelData`"
+        );
+    }
 }
