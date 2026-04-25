@@ -103,3 +103,57 @@ the host did its job.
   cannot verify the R1 demo's mapping from this repo. Worth confirming that
   the demo's `rag-direct` node mapping forwards the `channel_data` extension
   rather than only the envelope's top-level fields.
+
+## Follow-up: promote stringified `metadata.extensions` into typed extensions
+
+End-to-end testing on the morning of 2026-04-25 (script
+`greentic-e2e/scripts/regression/2026_04_25_extensions_passthrough.sh`)
+showed `r1_principals` STILL not reaching the WASM input even after the
+two fixes above. Layer-by-layer instrumentation between
+`http_ingress::messaging::route_messaging_envelopes` (Layer 1),
+`messaging_app::run_app_flow` (Layer 2), `engine::execute` (Layer 3),
+and the final WASM payload boundary (Layer 4) revealed why.
+
+Layer 1 captured envelope shape (from the published
+`messaging-webchat-gui:latest` provider WASM) was:
+```
+{
+  ...,
+  "metadata": {
+    ...,
+    "extensions": "{\"channel_data\":{\"r1_principals\":{...}}}"
+  }
+}
+```
+— a JSON-encoded string under `metadata`, not the typed
+`envelope.extensions` field. Root cause: the published WASM is built
+against `greentic-types` 0.4.x via the v0.4.84 "neutral presentation"
+refactor (see `greentic-messaging-providers` PR #132 commit message
+for full context). `greentic-types` 0.5.x — what greentic-start
+deserializes into — does have the typed field, but it arrives empty
+because the WASM never populated it.
+
+Net: `parse_messaging_envelopes` was handing the runner an envelope
+with empty typed extensions, and the runner had no way to look inside
+the metadata string.
+
+Fix (`src/ingress_dispatch.rs::promote_metadata_extensions_string`):
+After successful strict-decode of an inbound envelope, parse
+`metadata["extensions"]` as JSON. When it's an object, copy each key
+into `envelope.extensions` with `Entry::or_insert` semantics so
+already-typed envelopes (from compliant future providers) still win.
+
+Tests pinning the contract:
+- `parse_messaging_envelopes_promotes_metadata_extensions_string` —
+  regression for the WASM-side stringified shape.
+- `parse_messaging_envelopes_keeps_existing_typed_extensions` —
+  precedence guarantee.
+
+After the runner-side fix in `greentic-runner` (commit `dbd70ce`,
+fall-back to `scope.input.extensions` for the wrapped flow shape) the
+end-to-end script passes:
+```
+$ RUN_E2E=1 PORT=8080 ./scripts/regression/2026_04_25_extensions_passthrough.sh
+…
+PASS: extensions passthrough — extensions.channel_data.r1_principals reached WASM input
+```
