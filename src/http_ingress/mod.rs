@@ -449,6 +449,9 @@ where
                 "provider must be supplied by the route or query",
             ));
         }
+        if is_webchat_directline_stream_path(&path) {
+            return handle_websocket_upgrade(req, &path, &tenant, state).await;
+        }
         return handle_legacy_directline_request(
             req,
             &dl_path,
@@ -889,6 +892,22 @@ where
     ))
 }
 
+async fn handle_websocket_upgrade<B>(
+    _req: Request<B>,
+    _path: &str,
+    _tenant: &str,
+    _state: Arc<HttpIngressState>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    Err(error_response(
+        StatusCode::NOT_IMPLEMENTED,
+        "websocket upgrade not yet implemented",
+    ))
+}
+
 fn resolve_static_route_directline_request_from_match(
     path: &str,
     route_match: &StaticRouteMatch<'_>,
@@ -1321,6 +1340,29 @@ fn parse_webchat_directline_route(path: &str) -> Option<(String, String)> {
         return Some((tenant, format!("/{}", segments[4..].join("/"))));
     }
     None
+}
+
+/// True if the path is a webchat DirectLine stream endpoint:
+/// `/v1/{messaging,web}/webchat/{tenant}/v3/directline/conversations/{id}/stream`.
+fn is_webchat_directline_stream_path(path: &str) -> bool {
+    if let Some((_, dl_path)) = parse_webchat_directline_route(path) {
+        let segments: Vec<&str> = dl_path.trim_start_matches('/').split('/').collect();
+        return matches!(
+            segments.as_slice(),
+            ["v3", "directline", "conversations", _, "stream"]
+        );
+    }
+    false
+}
+
+#[allow(dead_code)] // wired up by Task 11 (handle_websocket_upgrade implementation)
+fn extract_stream_conversation_id(path: &str) -> Option<String> {
+    let (_, dl_path) = parse_webchat_directline_route(path)?;
+    let segments: Vec<&str> = dl_path.trim_start_matches('/').split('/').collect();
+    match segments.as_slice() {
+        ["v3", "directline", "conversations", conv_id, "stream"] => Some((*conv_id).to_string()),
+        _ => None,
+    }
 }
 
 fn is_legacy_directline_path(path: &str) -> bool {
