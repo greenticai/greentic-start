@@ -180,6 +180,11 @@ impl HttpIngressServer {
             webchat_provider: "messaging-webchat".to_string(),
         });
 
+        // Bridge successful webchat provider ops into the activity notifier so
+        // any WebSocket session subscribed to a conversation gets a wake-up
+        // event when new activities are persisted (Task 13).
+        register_webchat_post_op_notifier(&state);
+
         // Resolve an available port before spawning the server thread.
         let requested_port = config.bind_addr.port();
         let listen_addr_str = config.bind_addr.ip().to_string();
@@ -1497,6 +1502,76 @@ fn extract_scope_from_route_match(
     Some((tenant?, team))
 }
 
+/// Wire the post-op callback on the runner host so successful webchat provider
+/// invocations are forwarded to the activity notifier. Filters by provider id
+/// and op name; events without `_greentic` metadata are dropped.
+fn register_webchat_post_op_notifier(state: &Arc<HttpIngressState>) {
+    let notifier = state.notifier.clone();
+    state.runner_host.set_post_op_callback(std::sync::Arc::new(
+        move |_domain, provider, op_name, output| {
+            if provider != "messaging-webchat" && provider != "messaging-webchat-gui" {
+                return;
+            }
+            if op_name != "directline_http" && op_name != "send_payload" {
+                return;
+            }
+            let Some((tenant_id, conversation_id, new_watermark)) =
+                extract_greentic_metadata(output)
+            else {
+                return;
+            };
+            let notifier = notifier.clone();
+            // The callback is invoked from a synchronous code path that
+            // may or may not run inside a tokio runtime. Spawn into the
+            // current handle when available; otherwise fall back to a
+            // detached blocking thread so we never panic on missing
+            // runtime context.
+            let event = crate::notifier::NotifyEvent {
+                tenant_id,
+                conversation_id,
+                new_watermark,
+            };
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    notifier.publish(event).await;
+                });
+            } else {
+                std::thread::spawn(move || {
+                    if let Ok(rt) = tokio::runtime::Runtime::new() {
+                        rt.block_on(async move {
+                            notifier.publish(event).await;
+                        });
+                    }
+                });
+            }
+        },
+    ));
+}
+
+/// Extract `(tenant, conversation_id, watermark_bumped)` from a provider op
+/// output. Supports two shapes:
+///
+/// * `directline_http` returns an HTTP-shaped envelope whose JSON body lives
+///   in `body_b64` (base64-encoded). The DirectLine activity body carries a
+///   `_greentic` metadata block.
+/// * `send_payload` returns a structured envelope where the metadata is
+///   attached directly to the top-level output as `_greentic`.
+fn extract_greentic_metadata(output: &serde_json::Value) -> Option<(String, String, u64)> {
+    let metadata = if let Some(body_b64) = output.get("body_b64").and_then(|v| v.as_str()) {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body_b64.as_bytes())
+            .ok()?;
+        let body: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+        body.get("_greentic")?.clone()
+    } else {
+        output.get("_greentic")?.clone()
+    };
+    let tenant = metadata.get("tenant")?.as_str()?.to_string();
+    let conversation_id = metadata.get("conversation_id")?.as_str()?.to_string();
+    let watermark = metadata.get("watermark_bumped")?.as_u64()?;
+    Some((tenant, conversation_id, watermark))
+}
+
 #[cfg(test)]
 mod tests {
     use super::helpers::{handle_builtin_health_request, parse_route_segments};
@@ -2195,5 +2270,125 @@ mod tests {
             percent_encode_query_component("a+b&c=d"),
             "a%2Bb%26c%3Dd".to_string()
         );
+    }
+
+    #[test]
+    fn extract_greentic_metadata_reads_top_level_envelope() {
+        let output = serde_json::json!({
+            "_greentic": {
+                "tenant": "demo",
+                "conversation_id": "conv-1",
+                "watermark_bumped": 7
+            },
+            "ok": true,
+        });
+        let extracted = extract_greentic_metadata(&output).expect("metadata present");
+        assert_eq!(extracted.0, "demo");
+        assert_eq!(extracted.1, "conv-1");
+        assert_eq!(extracted.2, 7);
+    }
+
+    #[test]
+    fn extract_greentic_metadata_decodes_directline_body_b64() {
+        let body = serde_json::json!({
+            "_greentic": {
+                "tenant": "tenant-x",
+                "conversation_id": "conv-42",
+                "watermark_bumped": 12
+            }
+        });
+        let body_b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&body).unwrap());
+        let output = serde_json::json!({
+            "status": 200,
+            "body_b64": body_b64,
+        });
+        let extracted = extract_greentic_metadata(&output).expect("metadata present");
+        assert_eq!(extracted.0, "tenant-x");
+        assert_eq!(extracted.1, "conv-42");
+        assert_eq!(extracted.2, 12);
+    }
+
+    #[test]
+    fn extract_greentic_metadata_returns_none_when_missing() {
+        let output = serde_json::json!({"ok": true});
+        assert!(extract_greentic_metadata(&output).is_none());
+    }
+
+    #[test]
+    fn extract_greentic_metadata_returns_none_for_invalid_body_b64() {
+        let output = serde_json::json!({
+            "body_b64": "$$not-base64$$"
+        });
+        assert!(extract_greentic_metadata(&output).is_none());
+    }
+
+    #[tokio::test]
+    async fn webchat_post_op_callback_publishes_notify_event() {
+        let state = test_state(vec![Domain::Messaging]);
+        register_webchat_post_op_notifier(&state);
+
+        let mut stream = state
+            .notifier
+            .subscribe("demo", "conv-1")
+            .await
+            .expect("subscribe ok");
+
+        let callback = state
+            .runner_host
+            .post_op_callback_snapshot()
+            .expect("callback installed");
+        let output = serde_json::json!({
+            "_greentic": {
+                "tenant": "demo",
+                "conversation_id": "conv-1",
+                "watermark_bumped": 3
+            }
+        });
+        callback("messaging", "messaging-webchat", "send_payload", &output);
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            futures_util::StreamExt::next(&mut stream),
+        )
+        .await
+        .expect("event delivered in time")
+        .expect("event present");
+        assert_eq!(event.tenant_id, "demo");
+        assert_eq!(event.conversation_id, "conv-1");
+        assert_eq!(event.new_watermark, 3);
+    }
+
+    #[tokio::test]
+    async fn webchat_post_op_callback_filters_non_webchat_provider() {
+        let state = test_state(vec![Domain::Messaging]);
+        register_webchat_post_op_notifier(&state);
+
+        let mut stream = state
+            .notifier
+            .subscribe("demo", "conv-1")
+            .await
+            .expect("subscribe ok");
+
+        let callback = state
+            .runner_host
+            .post_op_callback_snapshot()
+            .expect("callback installed");
+        let output = serde_json::json!({
+            "_greentic": {
+                "tenant": "demo",
+                "conversation_id": "conv-1",
+                "watermark_bumped": 3
+            }
+        });
+        callback("messaging", "messaging-slack", "send_payload", &output);
+        callback("messaging", "messaging-webchat", "ingest_http", &output);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            futures_util::StreamExt::next(&mut stream),
+        )
+        .await;
+        assert!(result.is_err(), "no event should be delivered");
     }
 }
