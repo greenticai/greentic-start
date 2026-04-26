@@ -60,3 +60,23 @@ pub fn build_notifier(config: NotifierConfig) -> std::sync::Arc<dyn ActivityNoti
         NotifierConfig::Memory { capacity } => std::sync::Arc::new(InMemoryNotifier::new(capacity)),
     }
 }
+
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn build_default_returns_memory_backend() {
+        let notifier = build_notifier(NotifierConfig::default());
+        let mut stream = notifier.subscribe("t", "c").await.unwrap();
+        notifier
+            .publish(NotifyEvent {
+                tenant_id: "t".into(),
+                conversation_id: "c".into(),
+                new_watermark: 1,
+            })
+            .await;
+        let received = futures_util::StreamExt::next(&mut stream).await.unwrap();
+        assert_eq!(received.new_watermark, 1);
+    }
+}

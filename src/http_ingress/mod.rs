@@ -172,6 +172,7 @@ impl HttpIngressServer {
             active_route_table,
             http_route_table,
             admin_relay,
+            notifier: crate::notifier::build_notifier(crate::notifier::NotifierConfig::default()),
         });
 
         // Resolve an available port before spawning the server thread.
@@ -303,6 +304,9 @@ struct HttpIngressState {
     active_route_table: ActiveRouteTable,
     http_route_table: HttpRouteTable,
     admin_relay: Option<Arc<AdminRelayConfig>>,
+    // Used by future WebSocket session handlers (Task 11+) to subscribe to activity events.
+    #[allow(dead_code)]
+    pub notifier: std::sync::Arc<dyn crate::notifier::ActivityNotifier>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1388,6 +1392,7 @@ mod tests {
             active_route_table: ActiveRouteTable::default(),
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
+            notifier: crate::notifier::build_notifier(crate::notifier::NotifierConfig::default()),
         })
     }
 
@@ -1738,6 +1743,7 @@ mod tests {
             }),
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
+            notifier: crate::notifier::build_notifier(crate::notifier::NotifierConfig::default()),
         });
 
         let response = runtime
@@ -1816,6 +1822,7 @@ mod tests {
             }),
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
+            notifier: crate::notifier::build_notifier(crate::notifier::NotifierConfig::default()),
         });
 
         let gui_secret_uri = canonical_secret_uri(
