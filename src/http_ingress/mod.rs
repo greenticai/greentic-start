@@ -2,6 +2,7 @@ mod admin_relay;
 mod helpers;
 mod messaging;
 mod static_handler;
+pub mod websocket;
 
 use std::{
     convert::Infallible,
