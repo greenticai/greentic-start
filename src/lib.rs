@@ -33,6 +33,7 @@ mod messaging_app;
 mod messaging_dto;
 mod messaging_egress;
 mod ngrok;
+pub mod notifier;
 mod offers;
 mod onboard;
 mod operator_i18n;
