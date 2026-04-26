@@ -2512,6 +2512,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls 0.26.4",
+ "tokio-stream",
  "tracing",
  "unic-langid",
  "ureq",
@@ -5747,6 +5748,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

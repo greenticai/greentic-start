@@ -7,10 +7,9 @@ use async_trait::async_trait;
 use futures_util::Stream;
 use std::pin::Pin;
 
-// NOTE: `memory` module is added in Task 2. Re-exports below are commented out
-// until then so this module compiles in isolation.
-// pub mod memory;
-// pub use memory::InMemoryNotifier;
+pub mod memory;
+
+pub use memory::InMemoryNotifier;
 
 /// Identifies an activity-write event for a single conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,9 +55,8 @@ impl Default for NotifierConfig {
     }
 }
 
-pub fn build_notifier(_config: NotifierConfig) -> std::sync::Arc<dyn ActivityNotifier> {
-    // Task 2 will switch on `_config` and construct the in-memory backend. Until
-    // then this is unreachable — the public API is exposed for downstream tasks
-    // (HttpIngressState wiring) to depend on.
-    unimplemented!("InMemoryNotifier lands in Task 2")
+pub fn build_notifier(config: NotifierConfig) -> std::sync::Arc<dyn ActivityNotifier> {
+    match config {
+        NotifierConfig::Memory { capacity } => std::sync::Arc::new(InMemoryNotifier::new(capacity)),
+    }
 }
