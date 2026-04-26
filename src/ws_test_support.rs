@@ -308,8 +308,8 @@ fn conversation_id_from_stream_path(path: &str) -> Option<String> {
     Some(segments[stream_idx - 1].to_string())
 }
 
-/// Issue an HS256 JWT matching the production `verify_directline_token`
-/// expectations (`{ sub: conv, tenant, exp }` claims).
+/// Issue an HS256 JWT in the same shape the WASM webchat provider issues:
+/// `{ sub: <user_id>, exp, ctx: { env, tenant }, conv: <conversation_id> }`.
 pub fn issue_test_token(conversation_id: &str, tenant: &str, signing_key: &[u8]) -> String {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use hmac::{Hmac, KeyInit, Mac};
@@ -317,7 +317,9 @@ pub fn issue_test_token(conversation_id: &str, tenant: &str, signing_key: &[u8])
 
     let exp = chrono::Utc::now().timestamp() + 60;
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
-    let claims = format!(r#"{{"sub":"{conversation_id}","tenant":"{tenant}","exp":{exp}}}"#);
+    let claims = format!(
+        r#"{{"sub":"test-user","exp":{exp},"ctx":{{"env":"test","tenant":"{tenant}"}},"conv":"{conversation_id}"}}"#
+    );
     let payload = URL_SAFE_NO_PAD.encode(claims.as_bytes());
     let signing_input = format!("{header}.{payload}");
     let mut mac =

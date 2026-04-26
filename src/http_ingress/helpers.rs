@@ -425,16 +425,27 @@ mod tests {
     }
 }
 
-// Fields are read by tests today and by the WS upgrade handler (Task 9) tomorrow.
-// Suppress dead-code warnings until the upgrade handler is wired up.
-#[allow(dead_code)]
+/// Nested context block carried inside DirectLine JWTs issued by the
+/// `messaging-provider-webchat` WASM component.
 #[derive(Debug, Deserialize)]
-pub struct DirectLineTokenClaims {
-    pub sub: String, // conversation_id
+pub struct DirectLineTokenContext {
+    #[serde(default)]
+    pub env: Option<String>,
     pub tenant: String,
-    pub exp: i64,
     #[serde(default)]
     pub team: Option<String>,
+}
+
+/// DirectLine JWT claims as actually issued by the WASM provider.
+/// Mirror of `messaging_provider_webchat::directline::jwt::TokenClaims`:
+/// `{ iss, aud, sub: <user_id>, iat, nbf, exp, ctx: { env, tenant, team }, conv: <conv_id> }`.
+#[derive(Debug, Deserialize)]
+pub struct DirectLineTokenClaims {
+    pub sub: String, // user_id (NOT conversation_id; conversation lives in `conv`)
+    pub exp: i64,
+    pub ctx: DirectLineTokenContext,
+    #[serde(default)]
+    pub conv: Option<String>,
 }
 
 // Variants are surfaced by the WS upgrade handler (Task 9). Until that lands
@@ -498,10 +509,14 @@ pub fn verify_directline_token(
     if claims.exp < now {
         return Err(TokenVerifyError::Expired);
     }
-    if claims.sub != expected_conv_id {
+    let bound_conv = claims
+        .conv
+        .as_deref()
+        .ok_or(TokenVerifyError::ConversationMismatch)?;
+    if bound_conv != expected_conv_id {
         return Err(TokenVerifyError::ConversationMismatch);
     }
-    if claims.tenant != expected_tenant {
+    if claims.ctx.tenant != expected_tenant {
         return Err(TokenVerifyError::TenantMismatch);
     }
     Ok(claims)
@@ -524,12 +539,17 @@ mod token_tests {
         format!("{signing_input}.{sig}")
     }
 
+    fn make_claims(conv: &str, tenant: &str, exp: i64) -> String {
+        format!(
+            r#"{{"sub":"user1","exp":{exp},"ctx":{{"env":"prod","tenant":"{tenant}"}},"conv":"{conv}"}}"#
+        )
+    }
+
     #[test]
     fn valid_token_passes() {
         let key = b"test-key";
         let exp = chrono::Utc::now().timestamp() + 60;
-        let claims = format!(r#"{{"sub":"conv1","tenant":"t1","exp":{exp}}}"#);
-        let token = make_token(&claims, key);
+        let token = make_token(&make_claims("conv1", "t1", exp), key);
         let result = verify_directline_token(&token, "conv1", "t1", key);
         assert!(result.is_ok(), "got {:?}", result);
     }
@@ -538,8 +558,7 @@ mod token_tests {
     fn expired_token_rejected() {
         let key = b"test-key";
         let exp = chrono::Utc::now().timestamp() - 1;
-        let claims = format!(r#"{{"sub":"conv1","tenant":"t1","exp":{exp}}}"#);
-        let token = make_token(&claims, key);
+        let token = make_token(&make_claims("conv1", "t1", exp), key);
         assert!(matches!(
             verify_directline_token(&token, "conv1", "t1", key),
             Err(TokenVerifyError::Expired)
@@ -550,7 +569,20 @@ mod token_tests {
     fn wrong_conv_rejected() {
         let key = b"test-key";
         let exp = chrono::Utc::now().timestamp() + 60;
-        let claims = format!(r#"{{"sub":"convX","tenant":"t1","exp":{exp}}}"#);
+        let token = make_token(&make_claims("convX", "t1", exp), key);
+        assert!(matches!(
+            verify_directline_token(&token, "conv1", "t1", key),
+            Err(TokenVerifyError::ConversationMismatch)
+        ));
+    }
+
+    #[test]
+    fn missing_conv_rejected() {
+        let key = b"test-key";
+        let exp = chrono::Utc::now().timestamp() + 60;
+        // No `conv` field at all (e.g. an unbound bootstrap token).
+        let claims =
+            format!(r#"{{"sub":"user1","exp":{exp},"ctx":{{"env":"prod","tenant":"t1"}}}}"#);
         let token = make_token(&claims, key);
         assert!(matches!(
             verify_directline_token(&token, "conv1", "t1", key),
@@ -562,8 +594,7 @@ mod token_tests {
     fn wrong_tenant_rejected() {
         let key = b"test-key";
         let exp = chrono::Utc::now().timestamp() + 60;
-        let claims = format!(r#"{{"sub":"conv1","tenant":"tX","exp":{exp}}}"#);
-        let token = make_token(&claims, key);
+        let token = make_token(&make_claims("conv1", "tX", exp), key);
         assert!(matches!(
             verify_directline_token(&token, "conv1", "t1", key),
             Err(TokenVerifyError::TenantMismatch)
@@ -574,8 +605,7 @@ mod token_tests {
     fn invalid_signature_rejected() {
         let key = b"test-key";
         let exp = chrono::Utc::now().timestamp() + 60;
-        let claims = format!(r#"{{"sub":"conv1","tenant":"t1","exp":{exp}}}"#);
-        let token = make_token(&claims, key);
+        let token = make_token(&make_claims("conv1", "t1", exp), key);
         assert!(matches!(
             verify_directline_token(&token, "conv1", "t1", b"different-key"),
             Err(TokenVerifyError::InvalidSignature)
