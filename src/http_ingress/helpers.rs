@@ -4,6 +4,7 @@ use hyper::{
     body::Bytes,
     header::{CONTENT_TYPE, HeaderName, HeaderValue},
 };
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::ingress_types::IngressHttpResponse;
@@ -421,5 +422,163 @@ mod tests {
 
         assert!(String::from_utf8_lossy(&error_body).contains("\"bad request\""));
         assert!(String::from_utf8_lossy(&json_body).contains("\"status\":\"ok\""));
+    }
+}
+
+// Fields are read by tests today and by the WS upgrade handler (Task 9) tomorrow.
+// Suppress dead-code warnings until the upgrade handler is wired up.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct DirectLineTokenClaims {
+    pub sub: String, // conversation_id
+    pub tenant: String,
+    pub exp: i64,
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+// Variants are surfaced by the WS upgrade handler (Task 9). Until that lands
+// they are only consumed in tests, so silence dead_code warnings on the lib build.
+#[allow(dead_code)]
+#[derive(Debug, thiserror::Error)]
+pub enum TokenVerifyError {
+    #[error("malformed token")]
+    Malformed,
+    #[error("invalid signature")]
+    InvalidSignature,
+    #[error("token expired")]
+    Expired,
+    #[error("conversation mismatch")]
+    ConversationMismatch,
+    #[error("tenant mismatch")]
+    TenantMismatch,
+    #[error("missing signing key")]
+    MissingKey,
+}
+
+/// Verify a DirectLine JWT and check it matches the expected route context.
+/// Returns the parsed claims on success.
+///
+/// `signing_key` is the same shared secret the WASM provider uses to sign
+/// (loaded from secrets capability under `jwt_signing_key`).
+// Consumed by tests today; the WS upgrade handler (Task 9) will call it next.
+#[allow(dead_code)]
+pub fn verify_directline_token(
+    token: &str,
+    expected_conv_id: &str,
+    expected_tenant: &str,
+    signing_key: &[u8],
+) -> Result<DirectLineTokenClaims, TokenVerifyError> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(TokenVerifyError::Malformed);
+    }
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let signature_bytes = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|_| TokenVerifyError::Malformed)?;
+
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(signing_key)
+        .map_err(|_| TokenVerifyError::MissingKey)?;
+    mac.update(signing_input.as_bytes());
+    mac.verify_slice(&signature_bytes)
+        .map_err(|_| TokenVerifyError::InvalidSignature)?;
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| TokenVerifyError::Malformed)?;
+    let claims: DirectLineTokenClaims =
+        serde_json::from_slice(&payload_bytes).map_err(|_| TokenVerifyError::Malformed)?;
+
+    let now = chrono::Utc::now().timestamp();
+    if claims.exp < now {
+        return Err(TokenVerifyError::Expired);
+    }
+    if claims.sub != expected_conv_id {
+        return Err(TokenVerifyError::ConversationMismatch);
+    }
+    if claims.tenant != expected_tenant {
+        return Err(TokenVerifyError::TenantMismatch);
+    }
+    Ok(claims)
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+
+    fn make_token(claims_json: &str, key: &[u8]) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(claims_json.as_bytes());
+        let signing_input = format!("{header}.{payload}");
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key).unwrap();
+        mac.update(signing_input.as_bytes());
+        let sig = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("{signing_input}.{sig}")
+    }
+
+    #[test]
+    fn valid_token_passes() {
+        let key = b"test-key";
+        let exp = chrono::Utc::now().timestamp() + 60;
+        let claims = format!(r#"{{"sub":"conv1","tenant":"t1","exp":{exp}}}"#);
+        let token = make_token(&claims, key);
+        let result = verify_directline_token(&token, "conv1", "t1", key);
+        assert!(result.is_ok(), "got {:?}", result);
+    }
+
+    #[test]
+    fn expired_token_rejected() {
+        let key = b"test-key";
+        let exp = chrono::Utc::now().timestamp() - 1;
+        let claims = format!(r#"{{"sub":"conv1","tenant":"t1","exp":{exp}}}"#);
+        let token = make_token(&claims, key);
+        assert!(matches!(
+            verify_directline_token(&token, "conv1", "t1", key),
+            Err(TokenVerifyError::Expired)
+        ));
+    }
+
+    #[test]
+    fn wrong_conv_rejected() {
+        let key = b"test-key";
+        let exp = chrono::Utc::now().timestamp() + 60;
+        let claims = format!(r#"{{"sub":"convX","tenant":"t1","exp":{exp}}}"#);
+        let token = make_token(&claims, key);
+        assert!(matches!(
+            verify_directline_token(&token, "conv1", "t1", key),
+            Err(TokenVerifyError::ConversationMismatch)
+        ));
+    }
+
+    #[test]
+    fn wrong_tenant_rejected() {
+        let key = b"test-key";
+        let exp = chrono::Utc::now().timestamp() + 60;
+        let claims = format!(r#"{{"sub":"conv1","tenant":"tX","exp":{exp}}}"#);
+        let token = make_token(&claims, key);
+        assert!(matches!(
+            verify_directline_token(&token, "conv1", "t1", key),
+            Err(TokenVerifyError::TenantMismatch)
+        ));
+    }
+
+    #[test]
+    fn invalid_signature_rejected() {
+        let key = b"test-key";
+        let exp = chrono::Utc::now().timestamp() + 60;
+        let claims = format!(r#"{{"sub":"conv1","tenant":"t1","exp":{exp}}}"#);
+        let token = make_token(&claims, key);
+        assert!(matches!(
+            verify_directline_token(&token, "conv1", "t1", b"different-key"),
+            Err(TokenVerifyError::InvalidSignature)
+        ));
     }
 }
