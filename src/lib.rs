@@ -33,6 +33,7 @@ mod messaging_app;
 mod messaging_dto;
 mod messaging_egress;
 mod ngrok;
+pub mod notifier;
 mod offers;
 mod onboard;
 mod operator_i18n;
@@ -68,6 +69,8 @@ pub mod supervisor;
 mod timer_scheduler;
 mod tunnel_prompt;
 mod webhook_updater;
+#[doc(hidden)]
+pub mod ws_test_support;
 
 use cli_args::{
     Cli, Command, normalize_args, restart_name, start_request_from_args, stop_request_from_args,

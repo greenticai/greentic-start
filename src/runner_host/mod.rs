@@ -14,6 +14,7 @@ pub use types::{FlowOutcome, OperatorContext, RunnerExecutionMode};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use greentic_runner_host::storage::{DynStateStore, new_state_store};
 
@@ -37,6 +38,14 @@ use helpers::{
 use hooks::json_to_canonical_cbor;
 use types::{HookChainOutcome, OperationEnvelope, OperationStatus, RunnerMode};
 
+/// Callback fired after a successful provider op invocation.
+///
+/// Arguments: `(domain, provider_id, op_name, output_json)`. Used to bridge
+/// provider responses (e.g. webchat watermark metadata) into runtime services
+/// such as the WebSocket activity notifier without coupling them to the runner
+/// host implementation.
+pub type PostOpCallback = Arc<dyn Fn(&str, &str, &str, &serde_json::Value) + Send + Sync + 'static>;
+
 #[derive(Clone)]
 pub struct DemoRunnerHost {
     bundle_root: PathBuf,
@@ -48,6 +57,10 @@ pub struct DemoRunnerHost {
     card_renderer: CardRenderer,
     state_store: DynStateStore,
     debug_enabled: bool,
+    /// Optional callback fired after every successful provider op. Wrapped in
+    /// `Arc<RwLock<_>>` so the host can stay `Clone` while still allowing the
+    /// callback to be installed after construction.
+    post_op_callback: Arc<RwLock<Option<PostOpCallback>>>,
 }
 
 impl DemoRunnerHost {
@@ -180,11 +193,29 @@ impl DemoRunnerHost {
             card_renderer: CardRenderer::new(),
             state_store: new_state_store(),
             debug_enabled,
+            post_op_callback: Arc::new(RwLock::new(None)),
         })
     }
 
     pub fn debug_enabled(&self) -> bool {
         self.debug_enabled
+    }
+
+    /// Install (or replace) the post-op callback. Fired after every successful
+    /// `invoke_provider_op` invocation that produced structured output.
+    pub fn set_post_op_callback(&self, callback: PostOpCallback) {
+        if let Ok(mut slot) = self.post_op_callback.write() {
+            *slot = Some(callback);
+        }
+    }
+
+    /// Snapshot the currently-installed post-op callback (if any). Returns a
+    /// fresh `Arc` so the lock is not held while the callback fires.
+    pub(super) fn post_op_callback_snapshot(&self) -> Option<PostOpCallback> {
+        self.post_op_callback
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     /// Return the canonical `provider_type` stored inside a provider pack manifest

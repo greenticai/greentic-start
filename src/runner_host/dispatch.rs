@@ -92,6 +92,18 @@ impl DemoRunnerHost {
             &mut envelope,
         )?;
         self.emit_post_sub(&envelope);
+
+        // Fire post-op callback (e.g. WebSocket activity notifier) only on
+        // successful invocations that produced structured output. The callback
+        // is held under an `Arc<RwLock<_>>`; snapshot it first so the callback
+        // body is not run while holding the lock.
+        if let Some(callback) = self.post_op_callback_snapshot()
+            && outcome.success
+            && let Some(output) = outcome.output.as_ref()
+        {
+            callback(domain_name(domain), provider_type, op_id, output);
+        }
+
         Ok(outcome)
     }
 
