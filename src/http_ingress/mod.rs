@@ -174,6 +174,10 @@ impl HttpIngressServer {
             http_route_table,
             admin_relay,
             notifier: crate::notifier::build_notifier(crate::notifier::NotifierConfig::default()),
+            session_manager: Arc::new(websocket::SessionManager::new(
+                websocket::WsLimits::default(),
+            )),
+            webchat_provider: "messaging-webchat".to_string(),
         });
 
         // Resolve an available port before spawning the server thread.
@@ -305,9 +309,12 @@ struct HttpIngressState {
     active_route_table: ActiveRouteTable,
     http_route_table: HttpRouteTable,
     admin_relay: Option<Arc<AdminRelayConfig>>,
-    // Used by future WebSocket session handlers (Task 11+) to subscribe to activity events.
-    #[allow(dead_code)]
+    // Used by WebSocket session handlers (Task 11+) to subscribe to activity events.
     pub notifier: std::sync::Arc<dyn crate::notifier::ActivityNotifier>,
+    /// Bookkeeping for active WebSocket sessions (concurrency limits + per-conv guards).
+    pub session_manager: Arc<websocket::SessionManager>,
+    /// Provider id used to fan WS reads through the existing webchat provider WASM.
+    pub webchat_provider: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -893,19 +900,112 @@ where
 }
 
 async fn handle_websocket_upgrade<B>(
-    _req: Request<B>,
-    _path: &str,
-    _tenant: &str,
-    _state: Arc<HttpIngressState>,
+    mut req: Request<B>,
+    path: &str,
+    tenant: &str,
+    state: Arc<HttpIngressState>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
 {
-    Err(error_response(
-        StatusCode::NOT_IMPLEMENTED,
-        "websocket upgrade not yet implemented",
-    ))
+    use crate::runner_host::OperatorContext;
+    use crate::secrets_gate::canonical_secret_uri;
+    use crate::secrets_setup::resolve_env;
+    use websocket::{
+        ActivitySource, RunnerHostActivitySource, RunnerHostHandle, UpgradeError, refusal_response,
+        serve_session, validate_request_parts,
+    };
+
+    let conv_id = match extract_stream_conversation_id(path) {
+        Some(c) => c,
+        None => return Err(error_response(StatusCode::NOT_FOUND, "invalid stream path")),
+    };
+
+    // Read JWT signing key from the same secrets URI the WASM provider uses
+    // when issuing tokens. The webchat provider id is configurable on the
+    // ingress state so deployments that override the default still work.
+    let secret_ctx = OperatorContext {
+        tenant: tenant.to_string(),
+        team: Some("default".to_string()),
+        correlation_id: None,
+    };
+    let signing_key =
+        match state
+            .runner_host
+            .get_secret(&state.webchat_provider, "jwt_signing_key", &secret_ctx)
+        {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                // Fall back: try reading by canonical URI directly so we surface a
+                // helpful 500 instead of a silent unauthorized response.
+                let env = resolve_env(None);
+                let uri = canonical_secret_uri(
+                    &env,
+                    tenant,
+                    Some("default"),
+                    &state.webchat_provider,
+                    "jwt_signing_key",
+                );
+                return Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("missing jwt signing key (looked up {uri})"),
+                ));
+            }
+            Err(err) => {
+                return Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to read jwt signing key: {err}"),
+                ));
+            }
+        };
+
+    let ctx = match validate_request_parts(req.uri(), req.headers(), &conv_id, tenant, &signing_key)
+    {
+        Ok(c) => c,
+        Err(err) => return Ok(refusal_response(&err)),
+    };
+
+    let manager = state.session_manager.clone();
+    let guard = match manager.acquire(tenant, &conv_id) {
+        Ok(g) => g,
+        Err(err) => {
+            return Ok(refusal_response(&UpgradeError::LimitExceeded(
+                err.to_string(),
+            )));
+        }
+    };
+
+    let (response, websocket) = match hyper_tungstenite::upgrade(&mut req, None) {
+        Ok(pair) => pair,
+        Err(err) => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("websocket upgrade failed: {err}"),
+            ));
+        }
+    };
+
+    let notifier = state.notifier.clone();
+    let runner_host: Arc<dyn RunnerHostHandle> = state.runner_host.clone();
+    let source: Arc<dyn ActivitySource> = Arc::new(RunnerHostActivitySource {
+        runner_host,
+        provider: state.webchat_provider.clone(),
+        team: "default".to_string(),
+    });
+    let limits = manager.limits().clone();
+    tokio::spawn(serve_session(
+        websocket,
+        notifier,
+        source,
+        tenant.to_string(),
+        conv_id,
+        ctx.initial_watermark,
+        limits,
+        guard,
+    ));
+
+    Ok(response)
 }
 
 fn resolve_static_route_directline_request_from_match(
@@ -1355,7 +1455,6 @@ fn is_webchat_directline_stream_path(path: &str) -> bool {
     false
 }
 
-#[allow(dead_code)] // wired up by Task 11 (handle_websocket_upgrade implementation)
 fn extract_stream_conversation_id(path: &str) -> Option<String> {
     let (_, dl_path) = parse_webchat_directline_route(path)?;
     let segments: Vec<&str> = dl_path.trim_start_matches('/').split('/').collect();
@@ -1436,6 +1535,10 @@ mod tests {
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
             notifier: crate::notifier::build_notifier(crate::notifier::NotifierConfig::default()),
+            session_manager: Arc::new(websocket::SessionManager::new(
+                websocket::WsLimits::default(),
+            )),
+            webchat_provider: "messaging-webchat".to_string(),
         })
     }
 
@@ -1787,6 +1890,10 @@ mod tests {
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
             notifier: crate::notifier::build_notifier(crate::notifier::NotifierConfig::default()),
+            session_manager: Arc::new(websocket::SessionManager::new(
+                websocket::WsLimits::default(),
+            )),
+            webchat_provider: "messaging-webchat".to_string(),
         });
 
         let response = runtime
@@ -1866,6 +1973,10 @@ mod tests {
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
             notifier: crate::notifier::build_notifier(crate::notifier::NotifierConfig::default()),
+            session_manager: Arc::new(websocket::SessionManager::new(
+                websocket::WsLimits::default(),
+            )),
+            webchat_provider: "messaging-webchat".to_string(),
         });
 
         let gui_secret_uri = canonical_secret_uri(
