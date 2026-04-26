@@ -69,6 +69,8 @@ pub mod supervisor;
 mod timer_scheduler;
 mod tunnel_prompt;
 mod webhook_updater;
+#[doc(hidden)]
+pub mod ws_test_support;
 
 use cli_args::{
     Cli, Command, normalize_args, restart_name, start_request_from_args, stop_request_from_args,
