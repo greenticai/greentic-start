@@ -77,19 +77,19 @@ features = [
 version = ">=0.6.0-dev, <0.7.0-0"
 
 [dependencies.greentic-runner-desktop]
-version = ">=0.6.0-dev, <0.7.0-0"
+version = "0.5"
 
 [dependencies.greentic-runner-host]
-version = ">=0.6.0-dev, <0.7.0-0"
+version = "0.5"
 
 [dependencies.greentic-secrets-lib]
-version = ">=0.6.0-dev, <0.7.0-0"
+version = "0.5"
 features = [
     "providers-dev",
 ]
 
 [dependencies.greentic-types]
-version = ">=0.6.0-dev, <0.7.0-0"
+version = "0.5"
 features = [
     "serde",
 ]
