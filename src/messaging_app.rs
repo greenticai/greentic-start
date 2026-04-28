@@ -178,6 +178,18 @@ pub fn select_app_flow(info: &AppPackInfo) -> Result<&AppFlowInfo> {
     if let Some(flow) = info.flows.iter().find(|flow| flow.id == "default") {
         return Ok(flow);
     }
+    // Convention: when a pack ships multiple messaging flows but exposes one
+    // named `main` (the typical entry flow produced by gtbundle wizards),
+    // prefer it over erroring out as ambiguous. This unblocks app packs such
+    // as supply-chain-demo that ship a primary `main` flow alongside
+    // auxiliary helpers (`on_message`, sub-flows, etc.).
+    if let Some(flow) = info
+        .flows
+        .iter()
+        .find(|flow| flow.id == "main" && flow.kind.eq_ignore_ascii_case("messaging"))
+    {
+        return Ok(flow);
+    }
     let messaging_flows: Vec<_> = info
         .flows
         .iter()
@@ -979,6 +991,58 @@ mod tests {
                 .id,
             "notify"
         );
+    }
+
+    #[test]
+    fn select_app_flow_falls_back_to_main_messaging_flow_when_ambiguous() {
+        let info = AppPackInfo {
+            pack_id: "supply-chain".to_string(),
+            flows: vec![
+                AppFlowInfo {
+                    id: "main".to_string(),
+                    kind: "messaging".to_string(),
+                },
+                AppFlowInfo {
+                    id: "on_message".to_string(),
+                    kind: "messaging".to_string(),
+                },
+                AppFlowInfo {
+                    id: "order_tracking_flow".to_string(),
+                    kind: "messaging".to_string(),
+                },
+            ],
+        };
+        assert_eq!(
+            select_app_flow(&info)
+                .expect("should fall back to `main`")
+                .id,
+            "main",
+        );
+    }
+
+    #[test]
+    fn select_app_flow_main_fallback_requires_messaging_kind() {
+        // A non-messaging flow named `main` must not be picked.
+        let info = AppPackInfo {
+            pack_id: "pack".to_string(),
+            flows: vec![
+                AppFlowInfo {
+                    id: "main".to_string(),
+                    kind: "workflow".to_string(),
+                },
+                AppFlowInfo {
+                    id: "alpha".to_string(),
+                    kind: "messaging".to_string(),
+                },
+                AppFlowInfo {
+                    id: "beta".to_string(),
+                    kind: "messaging".to_string(),
+                },
+            ],
+        };
+        let err = select_app_flow(&info)
+            .expect_err("non-messaging `main` should not satisfy the fallback");
+        assert!(err.to_string().contains("alpha, beta"));
     }
 
     #[test]
