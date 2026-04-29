@@ -7,12 +7,10 @@ use greentic_secrets_lib::{
 };
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 pub struct SecretsClient {
-    store: Arc<DevStore>,
-    store_path: Option<PathBuf>,
+    store_path: PathBuf,
 }
 
 impl SecretsClient {
@@ -24,32 +22,28 @@ impl SecretsClient {
             return Self::open_with_path(path);
         }
         let store_path = dev_store_path::ensure_path(bundle_root)?;
-        let store = DevStore::with_path(store_path.clone())
-            .map_err(|err| anyhow!("failed to open dev secrets store: {err}"))?;
-        Ok(Self {
-            store: Arc::new(store),
-            store_path: Some(store_path),
-        })
+        Self::open_with_path(store_path)
     }
 
     pub fn open_with_path(path: PathBuf) -> AnyhowResult<Self> {
-        let store = DevStore::with_path(path.clone())
+        DevStore::with_path(path.clone())
             .map_err(|err| anyhow!("failed to open dev secrets store: {err}"))?;
-        Ok(Self {
-            store: Arc::new(store),
-            store_path: Some(path),
-        })
+        Ok(Self { store_path: path })
     }
 
     pub fn store_path(&self) -> Option<&Path> {
-        self.store_path.as_deref()
+        Some(self.store_path.as_path())
     }
 }
 
 #[async_trait]
 impl SecretsManager for SecretsClient {
     async fn read(&self, path: &str) -> SecretResult<Vec<u8>> {
-        let result = self.store.get(path).await;
+        // Re-open the persisted dev store on each read so runtime setup changes
+        // become visible without restarting the operator process.
+        let store = DevStore::with_path(self.store_path.clone())
+            .map_err(|err| SecretError::Backend(err.to_string().into()))?;
+        let result = store.get(path).await;
         match result {
             Ok(value) => Ok(value),
             Err(CoreError::NotFound { entity }) => Err(SecretError::NotFound(entity)),
@@ -103,6 +97,37 @@ mod tests {
         let value = runtime
             .block_on(async { client.read("secrets://demo/acme/_/mypack/my_secret").await })?;
         assert_eq!(value, b"hello world".to_vec());
+        Ok(())
+    }
+
+    #[test]
+    fn reads_secrets_written_after_client_startup() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let store_path = dir.path().join("secrets.env");
+        let store = DevStore::with_path(store_path.clone())?;
+        let client = SecretsClient::open_with_path(store_path.clone())?;
+        let runtime = Runtime::new()?;
+
+        let seed = SeedDoc {
+            entries: vec![SeedEntry {
+                uri: "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key".to_string(),
+                format: SecretFormat::Text,
+                value: SeedValue::Text {
+                    text: "after-startup".to_string(),
+                },
+                description: None,
+            }],
+        };
+        let report =
+            runtime.block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
+        assert_eq!(report.ok, 1);
+
+        let value = runtime.block_on(async {
+            client
+                .read("secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key")
+                .await
+        })?;
+        assert_eq!(value, b"after-startup".to_vec());
         Ok(())
     }
 }
