@@ -5,6 +5,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use greentic_types::ChannelMessageEnvelope;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
+use std::fs;
+use std::path::Path;
 
 use crate::domains::Domain;
 use crate::ingress_types::{
@@ -13,6 +15,7 @@ use crate::ingress_types::{
 use crate::messaging_dto::HttpInV1;
 use crate::operator_log;
 use crate::post_ingress_hooks::apply_post_ingress_hooks_dispatch;
+use crate::provider_config_envelope::read_provider_config_envelope;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
 use crate::secret_requirements::load_secret_keys_from_pack;
 
@@ -123,6 +126,19 @@ pub(crate) fn build_injected_config(
     // Get the pack path for this provider
     let pack_path = runner_host.get_provider_pack_path(domain, provider)?;
 
+    let mut config_map = serde_json::Map::new();
+
+    // Prefer already-materialized runtime config over live secret-store reads.
+    // This keeps hot ingress paths off the dev-store for cloud targets like AWS.
+    if let Some(envelope_config) =
+        load_provider_config_from_envelope(runner_host.bundle_root(), provider)
+    {
+        inject_config_values(&mut config_map, &envelope_config);
+    }
+    if let Some(setup_answers) = load_provider_setup_answers(runner_host.bundle_root(), provider) {
+        inject_config_values(&mut config_map, &setup_answers);
+    }
+
     // Load secret requirements from the pack
     let secret_keys = match load_secret_keys_from_pack(pack_path) {
         Ok(keys) => keys,
@@ -133,25 +149,23 @@ pub(crate) fn build_injected_config(
                     "failed to load secret requirements for {provider}: {err}, skipping injection"
                 ),
             );
-            return None;
+            return if config_map.is_empty() {
+                None
+            } else {
+                Some(JsonValue::Object(config_map))
+            };
         }
     };
 
-    if secret_keys.is_empty() {
-        return None;
-    }
-
-    // Fetch all required secrets and build the config
-    let mut config_map = serde_json::Map::new();
-    let mut any_found = false;
-
     for key in &secret_keys {
+        let key_b64 = format!("{key}_b64");
+        if config_map.contains_key(&key_b64) {
+            continue;
+        }
         match runner_host.get_secret(provider, key, ctx) {
             Ok(Some(bytes)) => {
                 // Store as base64-encoded value with _b64 suffix
-                let key_b64 = format!("{}_b64", key);
                 config_map.insert(key_b64, JsonValue::String(STANDARD.encode(&bytes)));
-                any_found = true;
             }
             Ok(None) => {
                 operator_log::debug(
@@ -172,10 +186,55 @@ pub(crate) fn build_injected_config(
         }
     }
 
-    if any_found {
+    if !config_map.is_empty() {
         Some(JsonValue::Object(config_map))
     } else {
         None
+    }
+}
+
+fn load_provider_config_from_envelope(bundle_root: &Path, provider: &str) -> Option<JsonValue> {
+    let providers_root = bundle_root.join(".providers");
+    read_provider_config_envelope(&providers_root, provider)
+        .ok()
+        .flatten()
+        .map(|envelope| envelope.config)
+}
+
+fn load_provider_setup_answers(bundle_root: &Path, provider: &str) -> Option<JsonValue> {
+    let path = bundle_root
+        .join("state")
+        .join("config")
+        .join(provider)
+        .join("setup-answers.json");
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn inject_config_values(config_map: &mut JsonMap<String, JsonValue>, value: &JsonValue) {
+    let Some(obj) = value.as_object() else {
+        return;
+    };
+
+    for (key, value) in obj {
+        if value.is_null() {
+            continue;
+        }
+        let encoded = match value {
+            JsonValue::String(text) if !text.is_empty() => STANDARD.encode(text.as_bytes()),
+            JsonValue::Bool(flag) => STANDARD.encode(flag.to_string().as_bytes()),
+            JsonValue::Number(number) => STANDARD.encode(number.to_string().as_bytes()),
+            JsonValue::Array(_) | JsonValue::Object(_) => {
+                let json = serde_json::to_vec(value).unwrap_or_default();
+                if json.is_empty() {
+                    continue;
+                }
+                STANDARD.encode(json)
+            }
+            JsonValue::String(_) => continue,
+            JsonValue::Null => continue,
+        };
+        config_map.insert(format!("{key}_b64"), JsonValue::String(encoded));
     }
 }
 
