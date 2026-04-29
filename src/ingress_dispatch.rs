@@ -114,7 +114,7 @@ pub fn dispatch_http_ingress_with_op(
 ///
 /// The function reads secret requirements from the provider's pack and fetches all required
 /// secrets, injecting them into the config as base64-encoded values with `_b64` suffix.
-fn build_injected_config(
+pub(crate) fn build_injected_config(
     runner_host: &DemoRunnerHost,
     domain: Domain,
     provider: &str,
