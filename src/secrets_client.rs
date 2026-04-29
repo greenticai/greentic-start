@@ -5,9 +5,7 @@ use greentic_secrets_lib::{
     Result as SecretResult, SecretError, SecretsManager, SecretsStore,
     core::{Error as CoreError, seed::DevStore},
 };
-use std::{
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 pub struct SecretsClient {
     store_path: PathBuf,
