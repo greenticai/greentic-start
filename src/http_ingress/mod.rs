@@ -25,7 +25,9 @@ use tokio::{net::TcpListener, runtime::Runtime, sync::oneshot};
 
 use crate::domains::Domain;
 use crate::http_routes::{HttpRouteTable, discover_http_routes_from_bundle};
-use crate::ingress_dispatch::{dispatch_http_ingress, dispatch_http_ingress_with_op};
+use crate::ingress_dispatch::{
+    build_injected_config, dispatch_http_ingress, dispatch_http_ingress_with_op,
+};
 use crate::ingress_types::{IngressHttpResponse, IngressRequestV1};
 use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
@@ -1050,6 +1052,11 @@ where
         .await
         .map(|collected| collected.to_bytes())
         .unwrap_or_default();
+    let ctx = OperatorContext {
+        tenant: request.tenant.to_string(),
+        team: Some(request.team.to_string()),
+        correlation_id: None,
+    };
     let payload = serde_json::json!({
         "v": 1,
         "provider": request.provider,
@@ -1062,13 +1069,13 @@ where
         "query": provider_query_string,
         "headers": headers,
         "body_b64": base64::engine::general_purpose::STANDARD.encode(&body),
-        "config": serde_json::Value::Null,
+        "config": build_injected_config(
+            &state.runner_host,
+            Domain::Messaging,
+            request.provider,
+            &ctx,
+        ).unwrap_or(serde_json::Value::Null),
     });
-    let ctx = OperatorContext {
-        tenant: request.tenant.to_string(),
-        team: Some(request.team.to_string()),
-        correlation_id: None,
-    };
     let payload_bytes = serde_json::to_vec(&payload).map_err(|err| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,

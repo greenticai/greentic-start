@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    io::Read,
+    path::Path,
+};
 
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
@@ -12,7 +17,11 @@ pub fn load_secret_keys_from_pack(pack_path: &Path) -> Result<Vec<String>> {
     if !keys.is_empty() {
         return Ok(keys);
     }
-    load_keys_from_manifest(pack_path)
+    let keys = load_keys_from_manifest(pack_path)?;
+    if !keys.is_empty() {
+        return Ok(keys);
+    }
+    load_keys_from_component_manifests(pack_path)
 }
 
 fn load_keys_from_assets(pack_path: &Path) -> Result<Vec<String>> {
@@ -55,6 +64,33 @@ fn load_keys_from_manifest(pack_path: &Path) -> Result<Vec<String>> {
         return extract_keys_from_manifest_map(map);
     }
     Ok(Vec::new())
+}
+
+fn load_keys_from_component_manifests(pack_path: &Path) -> Result<Vec<String>> {
+    let file = File::open(pack_path)?;
+    let mut archive = ZipArchive::new(file)?;
+    let mut keys = BTreeSet::new();
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let name = entry.name().to_string();
+        if !name.ends_with("component.manifest.json") {
+            continue;
+        }
+
+        let mut contents = String::new();
+        entry.read_to_string(&mut contents)?;
+        let manifest: ComponentManifest = serde_json::from_str(&contents)?;
+        for requirement in manifest.secret_requirements {
+            if requirement.required.unwrap_or(true)
+                && let Some(key) = requirement.key
+            {
+                keys.insert(key.to_lowercase());
+            }
+        }
+    }
+
+    Ok(keys.into_iter().collect())
 }
 
 fn extract_keys_from_manifest_map(map: &CborMap) -> Result<Vec<String>> {
@@ -146,6 +182,12 @@ struct AssetSecretRequirement {
     required: Option<bool>,
 }
 
+#[derive(Deserialize)]
+struct ComponentManifest {
+    #[serde(default)]
+    secret_requirements: Vec<AssetSecretRequirement>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +271,36 @@ mod tests {
                 "manifest.cbor",
                 serde_cbor::to_vec(&manifest).expect("manifest cbor"),
             )],
+        );
+
+        assert_eq!(
+            load_secret_keys_from_pack(&pack).expect("load keys"),
+            vec!["jwt_signing_key".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_secret_keys_falls_back_to_component_manifests() {
+        let dir = tempdir().expect("tempdir");
+        let pack = dir.path().join("pack.gtpack");
+        write_pack(
+            &pack,
+            &[
+                (
+                    "assets/secret-requirements.json",
+                    serde_json::to_vec(&serde_json::json!([])).expect("asset json"),
+                ),
+                (
+                    "components/provider/component.manifest.json",
+                    serde_json::to_vec(&serde_json::json!({
+                        "secret_requirements": [
+                            {"key": "JWT_SIGNING_KEY", "required": true},
+                            {"key": "OPTIONAL_TOKEN", "required": false}
+                        ]
+                    }))
+                    .expect("component json"),
+                ),
+            ],
         );
 
         assert_eq!(
