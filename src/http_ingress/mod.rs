@@ -57,6 +57,9 @@ pub struct HttpIngressConfig {
     pub tenant: String,
     /// When set, UI URLs use this base instead of the local bind address.
     pub public_base_url: Option<String>,
+    /// Notifier backend to use for WebChat push events.
+    /// Defaults to `NotifierConfig::Memory` when not specified.
+    pub notifier_config: crate::notifier::NotifierConfig,
 }
 
 pub struct HttpIngressServer {
@@ -170,7 +173,7 @@ impl HttpIngressServer {
 
         let admin_relay = load_admin_relay_config_from_env()?;
         let notifier = {
-            let fut = crate::notifier::build_notifier(crate::notifier::NotifierConfig::default());
+            let fut = crate::notifier::build_notifier(config.notifier_config.clone());
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
                 Err(_) => tokio::runtime::Builder::new_current_thread()
@@ -1918,6 +1921,7 @@ mod tests {
             enable_static_routes: false,
             tenant: "demo".to_string(),
             public_base_url: None,
+            notifier_config: crate::notifier::NotifierConfig::default(),
         })
         .expect("start ingress server");
 
@@ -1970,6 +1974,7 @@ mod tests {
             enable_static_routes: false,
             tenant: "demo".to_string(),
             public_base_url: None,
+            notifier_config: crate::notifier::NotifierConfig::default(),
         }) {
             Ok(_) => panic!("occupied port range should fail ingress startup"),
             Err(err) => err,
