@@ -105,8 +105,7 @@ impl RedisNotifier {
         let inner = Arc::new(InMemoryNotifier::new(capacity));
         let self_id = Uuid::new_v4();
 
-        let client = Client::open(url)
-            .with_context(|| format!("invalid redis url: {url}"))?;
+        let client = Client::open(url).with_context(|| format!("invalid redis url: {url}"))?;
 
         // Open the PUB connection (ConnectionManager auto-reconnects on use).
         let pub_conn = ConnectionManager::new(client.clone())
@@ -154,8 +153,7 @@ impl RedisNotifier {
                                 target: "notifier_redis",
                                 "background loop panicked; restarting after 500ms"
                             );
-                            *sub_state_clone.write().await =
-                                SubState::Reconnecting { attempt: 0 };
+                            *sub_state_clone.write().await = SubState::Reconnecting { attempt: 0 };
                             tokio::time::sleep(Duration::from_millis(500)).await;
                             if weak_clone.upgrade().is_none() {
                                 return;
@@ -180,10 +178,7 @@ impl RedisNotifier {
 }
 
 /// Open a fresh async pub/sub connection and subscribe to `channel`.
-async fn subscribe_once(
-    client: &Client,
-    channel: &str,
-) -> anyhow::Result<redis::aio::PubSub> {
+async fn subscribe_once(client: &Client, channel: &str) -> anyhow::Result<redis::aio::PubSub> {
     let mut pubsub = client.get_async_pubsub().await?;
     pubsub.subscribe(channel).await?;
     Ok(pubsub)
@@ -226,8 +221,9 @@ async fn background_sub_loop(
                         attempt,
                         "redis_reconnect_fail"
                     );
-                    *sub_state.write().await =
-                        SubState::Reconnecting { attempt: attempt + 1 };
+                    *sub_state.write().await = SubState::Reconnecting {
+                        attempt: attempt + 1,
+                    };
                     tokio::time::sleep(backoff_with_jitter(attempt)).await;
                 }
             }
