@@ -169,13 +169,25 @@ impl HttpIngressServer {
         };
 
         let admin_relay = load_admin_relay_config_from_env()?;
+        let notifier = {
+            let fut = crate::notifier::build_notifier(crate::notifier::NotifierConfig::default());
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+                Err(_) => tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to build temporary tokio runtime for notifier")?
+                    .block_on(fut),
+            }
+            .context("failed to build activity notifier")?
+        };
         let state = Arc::new(HttpIngressState {
             runner_host,
             domains,
             active_route_table,
             http_route_table,
             admin_relay,
-            notifier: crate::notifier::build_notifier(crate::notifier::NotifierConfig::default()),
+            notifier,
             session_manager: Arc::new(websocket::SessionManager::new(
                 websocket::WsLimits::default(),
             )),
@@ -1595,7 +1607,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::runtime::Runtime;
 
-    fn test_state(domains: Vec<Domain>) -> Arc<HttpIngressState> {
+    async fn test_state(domains: Vec<Domain>) -> Arc<HttpIngressState> {
         let dir = tempdir().unwrap();
         let discovery = crate::discovery::discover(dir.path()).unwrap();
         let secrets_handle =
@@ -1610,13 +1622,16 @@ mod tests {
             )
             .unwrap(),
         );
+        let notifier = crate::notifier::build_notifier(crate::notifier::NotifierConfig::default())
+            .await
+            .expect("build notifier");
         Arc::new(HttpIngressState {
             runner_host,
             domains,
             active_route_table: ActiveRouteTable::default(),
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
-            notifier: crate::notifier::build_notifier(crate::notifier::NotifierConfig::default()),
+            notifier,
             session_manager: Arc::new(websocket::SessionManager::new(
                 websocket::WsLimits::default(),
             )),
@@ -1676,7 +1691,7 @@ mod tests {
     #[test]
     fn handle_request_inner_rejects_options_and_invalid_methods() {
         let runtime = Runtime::new().unwrap();
-        let state = test_state(vec![Domain::Events]);
+        let state = runtime.block_on(test_state(vec![Domain::Events]));
 
         let options = runtime
             .block_on(handle_request_inner(
@@ -1699,10 +1714,14 @@ mod tests {
     fn handle_request_inner_covers_bad_route_disabled_domain_and_missing_handler() {
         let runtime = Runtime::new().unwrap();
 
+        let state_events = runtime.block_on(test_state(vec![Domain::Events]));
+        let state_messaging = runtime.block_on(test_state(vec![Domain::Messaging]));
+        let state_events2 = runtime.block_on(test_state(vec![Domain::Events]));
+
         let bad_route = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/v1/events/not-ingress"),
-                test_state(vec![Domain::Events]),
+                state_events,
             ))
             .unwrap_err();
         assert_eq!(bad_route.status(), StatusCode::BAD_REQUEST);
@@ -1710,7 +1729,7 @@ mod tests {
         let domain_disabled = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/v1/events/ingress/provider-a/demo"),
-                test_state(vec![Domain::Messaging]),
+                state_messaging,
             ))
             .unwrap_err();
         assert_eq!(domain_disabled.status(), StatusCode::NOT_FOUND);
@@ -1718,7 +1737,7 @@ mod tests {
         let no_handler = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/v1/events/ingress/provider-a/demo"),
-                test_state(vec![Domain::Events]),
+                state_events2,
             ))
             .unwrap_err();
         assert_eq!(no_handler.status(), StatusCode::NOT_FOUND);
@@ -1728,10 +1747,17 @@ mod tests {
     fn handle_request_inner_routes_onboard_oauth_and_directline_paths() {
         let runtime = Runtime::new().unwrap();
 
+        let state_messaging = runtime.block_on(test_state(vec![Domain::Messaging]));
+        let state_messaging2 = runtime.block_on(test_state(vec![Domain::Messaging]));
+        let state_messaging3 = runtime.block_on(test_state(vec![Domain::Messaging]));
+        let state_empty = runtime.block_on(test_state(vec![]));
+        let state_empty2 = runtime.block_on(test_state(vec![]));
+        let state_empty3 = runtime.block_on(test_state(vec![]));
+
         let onboard = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/api/onboard/unknown"),
-                test_state(vec![Domain::Messaging]),
+                state_messaging,
             ))
             .unwrap_err();
         assert_eq!(onboard.status(), StatusCode::NOT_FOUND);
@@ -1743,7 +1769,7 @@ mod tests {
                     "/v1/messaging/webchat/demo/oauth/token-exchange",
                     "{not-json",
                 ),
-                test_state(vec![Domain::Messaging]),
+                state_messaging2,
             ))
             .unwrap_err();
         assert_eq!(oauth_invalid_json.status(), StatusCode::BAD_REQUEST);
@@ -1755,7 +1781,7 @@ mod tests {
                     "/v1/messaging/webchat/demo/oauth/token-exchange",
                     "{}",
                 ),
-                test_state(vec![Domain::Messaging]),
+                state_messaging3,
             ))
             .unwrap_err();
         assert_eq!(oauth_missing_url.status(), StatusCode::BAD_REQUEST);
@@ -1765,7 +1791,7 @@ mod tests {
         let legacy_directline = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/token"),
-                test_state(vec![]),
+                state_empty,
             ))
             .unwrap_err();
         assert_eq!(legacy_directline.status(), StatusCode::NOT_FOUND);
@@ -1773,7 +1799,7 @@ mod tests {
         let webchat_directline = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/v1/messaging/webchat/demo/token"),
-                test_state(vec![]),
+                state_empty2,
             ))
             .unwrap_err();
         assert_eq!(webchat_directline.status(), StatusCode::BAD_REQUEST);
@@ -1781,7 +1807,7 @@ mod tests {
         let webchat_directline_web_route = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/v1/web/webchat/demo/token"),
-                test_state(vec![]),
+                state_empty3,
             ))
             .unwrap_err();
         assert_eq!(
@@ -1793,10 +1819,11 @@ mod tests {
     #[test]
     fn handle_request_wraps_errors_with_cors_headers() {
         let runtime = Runtime::new().unwrap();
+        let state = runtime.block_on(test_state(vec![Domain::Events]));
         let response = runtime
             .block_on(handle_request(
                 empty_request(Method::PUT, "/v1/events/ingress/provider-a/demo"),
-                test_state(vec![Domain::Events]),
+                state,
             ))
             .unwrap();
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
@@ -1807,10 +1834,11 @@ mod tests {
     #[test]
     fn handle_request_wraps_success_with_cors_headers() {
         let runtime = Runtime::new().unwrap();
+        let state = runtime.block_on(test_state(vec![Domain::Events]));
         let response = runtime
             .block_on(handle_request(
                 empty_request(Method::GET, "/healthz"),
-                test_state(vec![Domain::Events]),
+                state,
             ))
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1824,10 +1852,11 @@ mod tests {
     #[test]
     fn handle_request_inner_short_circuits_builtin_health_routes() {
         let runtime = Runtime::new().unwrap();
+        let state = runtime.block_on(test_state(vec![]));
         let response = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/readyz"),
-                test_state(vec![]),
+                state,
             ))
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1961,6 +1990,11 @@ mod tests {
             cache_strategy: CacheStrategy::None,
             route_segments: vec![RouteScopeSegment::Literal("web".to_string())],
         };
+        let notifier = runtime
+            .block_on(crate::notifier::build_notifier(
+                crate::notifier::NotifierConfig::default(),
+            ))
+            .expect("build notifier");
         let state = Arc::new(HttpIngressState {
             runner_host,
             domains: vec![],
@@ -1971,7 +2005,7 @@ mod tests {
             }),
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
-            notifier: crate::notifier::build_notifier(crate::notifier::NotifierConfig::default()),
+            notifier,
             session_manager: Arc::new(websocket::SessionManager::new(
                 websocket::WsLimits::default(),
             )),
@@ -2044,6 +2078,11 @@ mod tests {
                 RouteScopeSegment::Tenant,
             ],
         };
+        let notifier = runtime
+            .block_on(crate::notifier::build_notifier(
+                crate::notifier::NotifierConfig::default(),
+            ))
+            .expect("build notifier");
         let state = Arc::new(HttpIngressState {
             runner_host,
             domains: vec![Domain::Messaging],
@@ -2054,7 +2093,7 @@ mod tests {
             }),
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
-            notifier: crate::notifier::build_notifier(crate::notifier::NotifierConfig::default()),
+            notifier,
             session_manager: Arc::new(websocket::SessionManager::new(
                 websocket::WsLimits::default(),
             )),
@@ -2332,7 +2371,7 @@ mod tests {
 
     #[tokio::test]
     async fn webchat_post_op_callback_publishes_notify_event() {
-        let state = test_state(vec![Domain::Messaging]);
+        let state = test_state(vec![Domain::Messaging]).await;
         register_webchat_post_op_notifier(&state);
 
         let mut stream = state
@@ -2368,7 +2407,7 @@ mod tests {
 
     #[tokio::test]
     async fn webchat_post_op_callback_filters_non_webchat_provider() {
-        let state = test_state(vec![Domain::Messaging]);
+        let state = test_state(vec![Domain::Messaging]).await;
         register_webchat_post_op_notifier(&state);
 
         let mut stream = state
