@@ -20,7 +20,39 @@ pub struct Wire {
     pub instance_id: Uuid,
 }
 
-use crate::notifier::{ActivityNotifier, NotifyEvent};
+use crate::notifier::{
+    ActivityNotifier, EventStream, InMemoryNotifier, NotifierError, NotifyEvent,
+};
+use std::sync::Arc;
+
+/// Redis pub/sub backplane wrapping an `InMemoryNotifier` for local fan-out.
+///
+/// `build` (added in Task 10) fails fast if Redis is unreachable. Once running,
+/// publish-to-Redis is fire-and-forget and a background SUB task handles
+/// reconnect with exponential backoff.
+pub struct RedisNotifier {
+    inner: Arc<InMemoryNotifier>,
+    self_id: Uuid,
+    channel: String,
+    // pub_conn + background task fields land in Task 10.
+}
+
+#[async_trait::async_trait]
+impl ActivityNotifier for RedisNotifier {
+    async fn publish(&self, event: NotifyEvent) {
+        // Real Redis mirror lands in Task 10. For now, local-only.
+        self.inner.publish(event).await;
+    }
+
+    async fn subscribe(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+    ) -> Result<EventStream, NotifierError> {
+        // No Redis call per subscribe — delegate to the in-memory broadcast.
+        self.inner.subscribe(tenant_id, conversation_id).await
+    }
+}
 
 /// Decode a payload received over the Redis SUB stream and dispatch it
 /// to the inner notifier, dropping self-echoes and unknown versions.
