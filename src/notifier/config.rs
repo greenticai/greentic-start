@@ -2,8 +2,10 @@
 //! state-redis URL when `backend: redis` is selected without an explicit URL.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
+use greentic_secrets_lib::SecretsManager;
 
 use crate::config::OperatorConfig;
 use crate::notifier::NotifierConfig;
@@ -70,6 +72,28 @@ pub trait SecretResolver: Send + Sync {
     /// If `raw` is a literal URL, return it as-is. If it's a `secret://` URI,
     /// resolve to the underlying value.
     async fn resolve(&self, raw: &str) -> Result<String>;
+}
+
+/// Production adapter that wraps `Arc<dyn SecretsManager>` so the notifier
+/// auto-detect path can resolve `secret://` URIs without requiring callers
+/// to know the full secrets-manager surface.
+pub struct SecretsManagerResolver {
+    pub manager: Arc<dyn SecretsManager>,
+}
+
+#[async_trait::async_trait]
+impl SecretResolver for SecretsManagerResolver {
+    async fn resolve(&self, raw: &str) -> Result<String> {
+        if !raw.starts_with("secret://") {
+            return Ok(raw.to_string());
+        }
+        let bytes = self
+            .manager
+            .read(raw)
+            .await
+            .map_err(|err| anyhow!("resolve secret URI {raw}: {err}"))?;
+        String::from_utf8(bytes).with_context(|| format!("secret {raw} is not valid UTF-8"))
+    }
 }
 
 #[cfg(test)]

@@ -789,6 +789,28 @@ pub fn demo_up_services(
         secrets_handle.clone(),
         debug_enabled,
     )?);
+    let operator_config = crate::config::load_operator_config(config_dir)
+        .context("load operator config")?
+        .unwrap_or_default();
+    let notifier_config = {
+        let resolver = crate::notifier::config::SecretsManagerResolver {
+            manager: secrets_handle.manager(),
+        };
+        let fut = crate::notifier::config::resolve_notifier_config(
+            config_dir,
+            &operator_config,
+            &resolver,
+        );
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to build temporary tokio runtime for notifier config")?
+                .block_on(fut),
+        }
+        .context("failed to resolve notifier config")?
+    };
     let ingress_domains = detect_http_ingress_domains(&discovery, runner_host.as_ref());
     // Enable static routes if bundle declares them - no longer requires NATS mode
     let enable_static_routes = static_routes.bundle_has_static_routes();
@@ -798,6 +820,7 @@ pub fn demo_up_services(
         runner_host.clone(),
         enable_static_routes,
         None, // public URL not yet known; UI URLs rewritten below after tunnel starts
+        notifier_config,
     )
     .with_context(|| "failed to start local HTTP ingress server")?;
     let run_gsm_services = config.services.nats.enabled;
@@ -1291,6 +1314,7 @@ fn start_http_ingress_server(
     runner_host: Arc<DemoRunnerHost>,
     enable_static_routes: bool,
     public_base_url: Option<String>,
+    notifier_config: crate::notifier::NotifierConfig,
 ) -> anyhow::Result<Option<HttpIngressServer>> {
     // In cloud deploys we may need a public listener only for health probes.
     let health_probe_listener_required = std::env::var("GREENTIC_HEALTH_LIVENESS_PATH")
@@ -1317,6 +1341,7 @@ fn start_http_ingress_server(
         enable_static_routes,
         tenant: config.tenant.clone(),
         public_base_url,
+        notifier_config,
     })?;
     operator_log::info(
         module_path!(),
@@ -1909,8 +1934,15 @@ mod tests {
 
         let config = DemoConfig::default();
         assert!(
-            start_http_ingress_server(&config, &[], Arc::new(runner_host.clone()), false, None)?
-                .is_none()
+            start_http_ingress_server(
+                &config,
+                &[],
+                Arc::new(runner_host.clone()),
+                false,
+                None,
+                crate::notifier::NotifierConfig::default(),
+            )?
+            .is_none()
         );
 
         let invalid_config = DemoConfig {
@@ -1929,6 +1961,7 @@ mod tests {
             Arc::new(runner_host),
             false,
             None,
+            crate::notifier::NotifierConfig::default(),
         ) {
             Ok(_) => panic!("expected invalid bind address to fail"),
             Err(err) => err,
