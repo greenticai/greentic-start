@@ -81,11 +81,17 @@ impl Default for NotifierConfig {
     }
 }
 
-pub fn build_notifier(config: NotifierConfig) -> std::sync::Arc<dyn ActivityNotifier> {
+pub async fn build_notifier(
+    config: NotifierConfig,
+) -> anyhow::Result<std::sync::Arc<dyn ActivityNotifier>> {
     match config {
-        NotifierConfig::Memory { capacity } => std::sync::Arc::new(InMemoryNotifier::new(capacity)),
+        NotifierConfig::Memory { capacity } => {
+            Ok(std::sync::Arc::new(InMemoryNotifier::new(capacity)))
+        }
         NotifierConfig::Redis { .. } => {
-            todo!("Redis notifier backend: wired in Task 7")
+            anyhow::bail!(
+                "Redis notifier backend not yet implemented in this build (Phase C in progress)"
+            )
         }
     }
 }
@@ -96,7 +102,9 @@ mod build_tests {
 
     #[tokio::test]
     async fn build_default_returns_memory_backend() {
-        let notifier = build_notifier(NotifierConfig::default());
+        let notifier = build_notifier(NotifierConfig::default())
+            .await
+            .expect("build");
         let mut stream = notifier.subscribe("t", "c").await.unwrap();
         notifier
             .publish(NotifyEvent {
