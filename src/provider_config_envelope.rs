@@ -20,7 +20,7 @@ use zip::ZipArchive;
 
 use crate::runtime_state::atomic_write;
 
-const ABI_VERSION: &str = "greentic:component@0.6.0";
+pub(crate) const ABI_VERSION: &str = "greentic:component@0.6.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigEnvelope {
@@ -102,9 +102,33 @@ pub fn read_provider_config_envelope(
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = std::fs::read(&path)?;
-    let envelope: ConfigEnvelope = serde_cbor::from_slice(&bytes)?;
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let envelope: ConfigEnvelope = canonical::from_cbor(&bytes)
+        .map_err(|err| anyhow!("decode envelope at {}: {err}", path.display()))?;
     Ok(Some(envelope))
+}
+
+/// Read the `ConfigEnvelope` for a single provider, decoding from canonical CBOR.
+///
+/// Returns `Err` when the envelope file is absent (unlike `read_provider_config_envelope`
+/// which returns `Ok(None)`).  Use this when the provider config is expected to exist.
+pub fn require_provider_config_envelope(
+    providers_root: &Path,
+    provider_id: &str,
+) -> anyhow::Result<ConfigEnvelope> {
+    let path = providers_root
+        .join(provider_id)
+        .join("config.envelope.cbor");
+    let bytes = std::fs::read(&path).with_context(|| {
+        format!(
+            "provider config envelope not found for {provider_id} at {}",
+            path.display()
+        )
+    })?;
+    let envelope: ConfigEnvelope = canonical::from_cbor(&bytes)
+        .map_err(|err| anyhow!("decode envelope at {}: {err}", path.display()))?;
+    Ok(envelope)
 }
 
 pub fn resolved_describe_hash(
@@ -305,7 +329,7 @@ mod tests {
 
         assert!(path.ends_with("messaging-telegram/config.envelope.cbor"));
         let bytes = std::fs::read(path).unwrap();
-        let decoded: ConfigEnvelope = serde_cbor::from_slice(&bytes).unwrap();
+        let decoded: ConfigEnvelope = greentic_types::cbor::canonical::from_cbor(&bytes).unwrap();
         assert_eq!(decoded.component_id, "messaging-telegram");
         assert_eq!(decoded.operation_id, "setup_default");
         assert_eq!(decoded.abi_version, ABI_VERSION);
@@ -386,5 +410,53 @@ mod tests {
         zip.write_all(&bytes)?;
         zip.finish()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod read_envelope_tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    #[test]
+    fn read_envelope_roundtrip() {
+        let dir = tempdir().unwrap();
+        let providers_root = dir.path().join("providers");
+        std::fs::create_dir_all(&providers_root).unwrap();
+
+        // Write a minimal envelope by hand using canonical CBOR.
+        let envelope = ConfigEnvelope {
+            config: json!({"url": "redis://example:6379"}),
+            component_id: "state-redis".into(),
+            abi_version: ABI_VERSION.to_string(),
+            resolved_digest: "sha256:0".into(),
+            describe_hash: "h".into(),
+            schema_hash: None,
+            operation_id: "configure".into(),
+            updated_at: None,
+        };
+        let bytes = greentic_types::cbor::canonical::to_canonical_cbor(&envelope).unwrap();
+        // Canonical on-disk path: <providers_root>/<provider_id>/config.envelope.cbor
+        let path = providers_root
+            .join("state-redis")
+            .join("config.envelope.cbor");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+
+        let read = require_provider_config_envelope(&providers_root, "state-redis").expect("read");
+        assert_eq!(
+            read.config.get("url").and_then(|v| v.as_str()),
+            Some("redis://example:6379")
+        );
+    }
+
+    #[test]
+    fn read_envelope_missing_provider_errors() {
+        let dir = tempdir().unwrap();
+        let providers_root = dir.path().join("providers");
+        std::fs::create_dir_all(&providers_root).unwrap();
+        let err = require_provider_config_envelope(&providers_root, "state-redis").unwrap_err();
+        assert!(format!("{err:#}").contains("state-redis"));
     }
 }
