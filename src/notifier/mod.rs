@@ -88,10 +88,19 @@ pub async fn build_notifier(
         NotifierConfig::Memory { capacity } => {
             Ok(std::sync::Arc::new(InMemoryNotifier::new(capacity)))
         }
-        NotifierConfig::Redis { .. } => {
-            anyhow::bail!(
-                "Redis notifier backend not yet implemented in this build (Phase C in progress)"
-            )
+        NotifierConfig::Redis {
+            url,
+            channel,
+            capacity,
+        } => {
+            let url = url.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Redis notifier built without a URL — call resolve_notifier_config first"
+                )
+            })?;
+            let notifier =
+                crate::notifier::redis::RedisNotifier::build(&url, channel, capacity).await?;
+            Ok(notifier as std::sync::Arc<dyn ActivityNotifier>)
         }
     }
 }
