@@ -596,7 +596,7 @@ mod read_envelope_tests {
             updated_at: None,
         };
         let bytes = greentic_types::cbor::canonical::to_canonical_cbor(&envelope).unwrap();
-        let path = providers_root.join("state-redis").join("config.cbor");
+        let path = providers_root.join("state-redis").join("config.envelope.cbor");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, bytes).unwrap();
 
@@ -623,13 +623,13 @@ Expected: compile error "function not found: `read_provider_config_envelope`".
 
 - [ ] **Step 3: First, confirm the on-disk path layout used by `write_provider_config_envelope`**
 
-The plan assumes the envelope file is stored at `<providers_root>/<provider_id>/config.cbor`. The existing `write_provider_config_envelope` function writes the envelope CBOR — read its body to confirm this path shape and adjust both the new helper AND the test above to match. Run:
+The plan assumes the envelope file is stored at `<providers_root>/<provider_id>/config.envelope.cbor`. The existing `write_provider_config_envelope` function writes the envelope CBOR — read its body to confirm this path shape and adjust both the new helper AND the test above to match. Run:
 
 ```
-grep -n "providers_root\|envelope\|config.cbor" src/provider_config_envelope.rs | head -30
+grep -n "providers_root\|envelope\|config.envelope.cbor" src/provider_config_envelope.rs | head -30
 ```
 
-Use the actual path scheme (likely involves `atomic_write` from `runtime_state`). If the layout differs from `<root>/<id>/config.cbor`, update both the test and the helper consistently. **Do not invent a layout — match what `write_provider_config_envelope` produces.**
+Use the actual path scheme (likely involves `atomic_write` from `runtime_state`). If the layout differs from `<root>/<id>/config.envelope.cbor`, update both the test and the helper consistently. **Do not invent a layout — match what `write_provider_config_envelope` produces.**
 
 - [ ] **Step 4: Implement `read_provider_config_envelope`** in `src/provider_config_envelope.rs`, mirroring the write helper:
 
@@ -640,7 +640,7 @@ pub fn read_provider_config_envelope(
     provider_id: &str,
 ) -> anyhow::Result<ConfigEnvelope> {
     // ADJUST path construction to match write_provider_config_envelope's layout.
-    let path = providers_root.join(provider_id).join("config.cbor");
+    let path = providers_root.join(provider_id).join("config.envelope.cbor");
     let mut file = File::open(&path)
         .with_context(|| format!("provider config envelope not found at {}", path.display()))?;
     let mut bytes = Vec::new();
@@ -687,7 +687,7 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::config::OperatorConfig;
 use crate::notifier::NotifierConfig;
-use crate::provider_config_envelope::{ConfigEnvelope, read_provider_config_envelope};
+use crate::provider_config_envelope::{ConfigEnvelope, require_provider_config_envelope};
 
 /// Resolve the effective notifier configuration.
 ///
@@ -712,7 +712,7 @@ pub async fn resolve_notifier_config(
         NotifierConfig::Redis { url: None, channel, capacity } => {
             let providers_root = operator_root.join("providers");
             let envelope: ConfigEnvelope =
-                read_provider_config_envelope(&providers_root, "state-redis").with_context(|| {
+                require_provider_config_envelope(&providers_root, "state-redis").with_context(|| {
                     "Redis notifier backend selected but the state-redis provider is not \
                      configured. Run `gtc setup --provider state-redis` first, or set \
                      webchat.notifier.url explicitly in greentic.yaml."
@@ -801,7 +801,7 @@ mod tests {
 
     fn write_state_redis_envelope(operator_root: &std::path::Path, url_field: &str) {
         let providers_root = operator_root.join("providers");
-        let path = providers_root.join("state-redis").join("config.cbor");
+        let path = providers_root.join("state-redis").join("config.envelope.cbor");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let env = ConfigEnvelope {
             config: json!({"url": url_field}),
@@ -1666,7 +1666,7 @@ async fn subscribe_after_disconnect_recovers() {
 #[tokio::test]
 async fn notifier_config_yaml_end_to_end() {
     // No Redis required: this test exercises resolve_notifier_config only.
-    // It writes a fake state-redis ConfigEnvelope under <root>/providers/state-redis/config.cbor
+    // It writes a fake state-redis ConfigEnvelope under <root>/providers/state-redis/config.envelope.cbor
     // and asserts that resolve_notifier_config returns Redis with the literal URL.
     use greentic_start::config::OperatorConfig;
     use greentic_start::notifier::NotifierConfig;
@@ -1696,7 +1696,7 @@ async fn notifier_config_yaml_end_to_end() {
         updated_at: None,
     };
     let bytes = greentic_types::cbor::canonical::to_canonical_cbor(&env).unwrap();
-    std::fs::write(providers_root.join("state-redis").join("config.cbor"), bytes).unwrap();
+    std::fs::write(providers_root.join("state-redis").join("config.envelope.cbor"), bytes).unwrap();
 
     let yaml = "\
 webchat:
