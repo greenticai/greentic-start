@@ -20,7 +20,7 @@ use zip::ZipArchive;
 
 use crate::runtime_state::atomic_write;
 
-pub(crate) const ABI_VERSION: &str = "greentic:component@0.6.0";
+pub const ABI_VERSION: &str = "greentic:component@0.6.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigEnvelope {
