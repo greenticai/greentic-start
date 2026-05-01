@@ -63,7 +63,7 @@ tracing = "0.1"
 unic-langid = "0.9"
 ureq = { version = "3", features = ["json"] }
 urlencoding = "2"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 zip = "8"
 zstd = "0.13"
 
