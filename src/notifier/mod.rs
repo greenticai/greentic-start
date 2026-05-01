@@ -8,6 +8,7 @@ use futures_util::Stream;
 use std::pin::Pin;
 
 pub mod memory;
+pub mod redis;
 
 pub use memory::InMemoryNotifier;
 
