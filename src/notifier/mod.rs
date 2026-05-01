@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use futures_util::Stream;
 use std::pin::Pin;
 
+pub mod config;
 pub mod memory;
 pub mod redis;
 
