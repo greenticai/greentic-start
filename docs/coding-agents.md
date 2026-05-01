@@ -171,6 +171,49 @@ Logging initialization happens in [src/lib.rs](/projects/ai/greentic-ng/greentic
 
 The admin server is started from [src/lib.rs](/projects/ai/greentic-ng/greentic-start/src/lib.rs:337) and implemented in [src/admin_server.rs](/projects/ai/greentic-ng/greentic-start/src/admin_server.rs:77).
 
+## WebChat WebSocket Notifier
+
+The WebChat DirectLine WebSocket endpoint (`/v3/directline/conversations/{id}/stream`)
+delivers activities to connected clients through a notifier. Two backends are
+supported, selected via the optional `webchat.notifier` section in
+`greentic.yaml`:
+
+```yaml
+webchat:
+  notifier:
+    backend: redis    # "memory" (default) | "redis"
+    url: redis://localhost:6379          # optional override; defaults to state-redis URL
+    channel: greentic:webchat:notify     # optional override
+    capacity: 64                         # optional; see note below
+```
+
+**Memory** — process-local broadcast. No external dependency. Suitable for
+single-replica deployments and local development. This is the default when
+the `webchat` section is absent.
+
+**Redis** — pub/sub backplane that fans activities out across operator
+replicas. URL is auto-detected from the `state-redis` provider's
+`ConfigEnvelope` (run `gtc setup --provider state-redis` first to configure
+the shared Redis URL). An explicit `url` field overrides auto-detect.
+
+Field notes:
+
+- `url` — Redis connection string. Examples: `redis://localhost:6379` (no auth),
+  `rediss://user:pass@host:6380/0` (TLS + auth + database 0). Defaults to the
+  `state-redis` provider's configured URL if not specified.
+- `channel` — Redis pub/sub channel name. Defaults to `greentic:webchat:notify`.
+- `capacity` — Number of buffered events per subscriber. Older events are dropped
+  on overflow. Defaults to 64. Lower values reduce memory under high load; higher
+  values allow brief Redis outages to recover without dropping messages.
+
+Failure modes:
+
+- Redis configured but unreachable at boot → `gtc start` exits with a clear error.
+- Redis disconnects after boot → same-replica sessions keep working; cross-replica
+  fan-out resumes on reconnect (exponential backoff up to 5 seconds).
+- `state-redis` not configured + `backend: redis` selected → boot error pointing
+  at the `gtc setup --provider state-redis` command.
+
 ## `stop` Options
 
 The `stop` command supports the flags defined in [src/cli_args.rs](/projects/ai/greentic-ng/greentic-start/src/cli_args.rs:64).
