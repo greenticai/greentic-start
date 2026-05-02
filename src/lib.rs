@@ -323,6 +323,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         request.runner_binary.clone(),
         &log_dir,
         request.verbose,
+        request.no_browser,
     )?;
 
     let _admin_server = if request.admin {
@@ -517,6 +518,7 @@ mod tests {
             log_dir: None,
             verbose: false,
             quiet: false,
+            no_browser: false,
             admin: false,
             admin_port: 9443,
             admin_certs_dir: None,
@@ -548,6 +550,7 @@ mod tests {
             log_dir: None,
             verbose: false,
             quiet: false,
+            no_browser: false,
             admin: false,
             admin_port: 9443,
             admin_certs_dir: None,
@@ -587,6 +590,7 @@ mod tests {
             log_dir: None,
             verbose: false,
             quiet: false,
+            no_browser: false,
             admin: false,
             admin_port: 9443,
             admin_certs_dir: None,
