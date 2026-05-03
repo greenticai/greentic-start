@@ -57,6 +57,8 @@ pub(crate) struct StartArgs {
     verbose: bool,
     #[arg(long, conflicts_with = "verbose")]
     quiet: bool,
+    #[arg(long, help = "Do not open the first web UI URL in the default browser")]
+    no_browser: bool,
     #[arg(long, help = "Enable mTLS admin API endpoint")]
     admin: bool,
     #[arg(long, default_value = "8443", help = "Port for the admin API endpoint")]
@@ -145,6 +147,7 @@ pub struct StartRequest {
     pub log_dir: Option<PathBuf>,
     pub verbose: bool,
     pub quiet: bool,
+    pub no_browser: bool,
     pub admin: bool,
     pub admin_port: u16,
     pub admin_certs_dir: Option<PathBuf>,
@@ -180,6 +183,7 @@ pub(crate) fn start_request_from_args(args: StartArgs, tunnel_explicit: bool) ->
         log_dir: args.log_dir,
         verbose: args.verbose,
         quiet: args.quiet,
+        no_browser: args.no_browser,
         admin: args.admin,
         admin_port: args.admin_port,
         admin_certs_dir: args.admin_certs_dir,
