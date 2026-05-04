@@ -2,6 +2,7 @@ mod admin_relay;
 mod helpers;
 mod messaging;
 mod static_handler;
+pub mod websocket;
 
 use std::{
     convert::Infallible,
@@ -56,6 +57,9 @@ pub struct HttpIngressConfig {
     pub tenant: String,
     /// When set, UI URLs use this base instead of the local bind address.
     pub public_base_url: Option<String>,
+    /// Notifier backend to use for WebChat push events.
+    /// Defaults to `NotifierConfig::Memory` when not specified.
+    pub notifier_config: crate::notifier::NotifierConfig,
 }
 
 pub struct HttpIngressServer {
@@ -168,13 +172,35 @@ impl HttpIngressServer {
         };
 
         let admin_relay = load_admin_relay_config_from_env()?;
+        let notifier = {
+            let fut = crate::notifier::build_notifier(config.notifier_config.clone());
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+                Err(_) => tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to build temporary tokio runtime for notifier")?
+                    .block_on(fut),
+            }
+            .context("failed to build activity notifier")?
+        };
         let state = Arc::new(HttpIngressState {
             runner_host,
             domains,
             active_route_table,
             http_route_table,
             admin_relay,
+            notifier,
+            session_manager: Arc::new(websocket::SessionManager::new(
+                websocket::WsLimits::default(),
+            )),
+            webchat_provider: "messaging-webchat".to_string(),
         });
+
+        // Bridge successful webchat provider ops into the activity notifier so
+        // any WebSocket session subscribed to a conversation gets a wake-up
+        // event when new activities are persisted (Task 13).
+        register_webchat_post_op_notifier(&state);
 
         // Resolve an available port before spawning the server thread.
         let requested_port = config.bind_addr.port();
@@ -305,6 +331,12 @@ struct HttpIngressState {
     active_route_table: ActiveRouteTable,
     http_route_table: HttpRouteTable,
     admin_relay: Option<Arc<AdminRelayConfig>>,
+    // Used by WebSocket session handlers (Task 11+) to subscribe to activity events.
+    pub notifier: std::sync::Arc<dyn crate::notifier::ActivityNotifier>,
+    /// Bookkeeping for active WebSocket sessions (concurrency limits + per-conv guards).
+    pub session_manager: Arc<websocket::SessionManager>,
+    /// Provider id used to fan WS reads through the existing webchat provider WASM.
+    pub webchat_provider: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -445,6 +477,9 @@ where
                 StatusCode::BAD_REQUEST,
                 "provider must be supplied by the route or query",
             ));
+        }
+        if is_webchat_directline_stream_path(&path) {
+            return handle_websocket_upgrade(req, &path, &tenant, state).await;
         }
         return handle_legacy_directline_request(
             req,
@@ -884,6 +919,115 @@ where
         StatusCode::NOT_FOUND,
         "provider does not implement directline_http or ingest_http",
     ))
+}
+
+async fn handle_websocket_upgrade<B>(
+    mut req: Request<B>,
+    path: &str,
+    tenant: &str,
+    state: Arc<HttpIngressState>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    use crate::runner_host::OperatorContext;
+    use crate::secrets_gate::canonical_secret_uri;
+    use crate::secrets_setup::resolve_env;
+    use websocket::{
+        ActivitySource, RunnerHostActivitySource, RunnerHostHandle, UpgradeError, refusal_response,
+        serve_session, validate_request_parts,
+    };
+
+    let conv_id = match extract_stream_conversation_id(path) {
+        Some(c) => c,
+        None => return Err(error_response(StatusCode::NOT_FOUND, "invalid stream path")),
+    };
+
+    // Read JWT signing key from the same secrets URI the WASM provider uses
+    // when issuing tokens. The webchat provider id is configurable on the
+    // ingress state so deployments that override the default still work.
+    let secret_ctx = OperatorContext {
+        tenant: tenant.to_string(),
+        team: Some("default".to_string()),
+        correlation_id: None,
+    };
+    let signing_key =
+        match state
+            .runner_host
+            .get_secret(&state.webchat_provider, "jwt_signing_key", &secret_ctx)
+        {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                // Fall back: try reading by canonical URI directly so we surface a
+                // helpful 500 instead of a silent unauthorized response.
+                let env = resolve_env(None);
+                let uri = canonical_secret_uri(
+                    &env,
+                    tenant,
+                    Some("default"),
+                    &state.webchat_provider,
+                    "jwt_signing_key",
+                );
+                return Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("missing jwt signing key (looked up {uri})"),
+                ));
+            }
+            Err(err) => {
+                return Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to read jwt signing key: {err}"),
+                ));
+            }
+        };
+
+    let ctx = match validate_request_parts(req.uri(), req.headers(), &conv_id, tenant, &signing_key)
+    {
+        Ok(c) => c,
+        Err(err) => return Ok(refusal_response(&err)),
+    };
+
+    let manager = state.session_manager.clone();
+    let guard = match manager.acquire(tenant, &conv_id) {
+        Ok(g) => g,
+        Err(err) => {
+            return Ok(refusal_response(&UpgradeError::LimitExceeded(
+                err.to_string(),
+            )));
+        }
+    };
+
+    let (response, websocket) = match hyper_tungstenite::upgrade(&mut req, None) {
+        Ok(pair) => pair,
+        Err(err) => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("websocket upgrade failed: {err}"),
+            ));
+        }
+    };
+
+    let notifier = state.notifier.clone();
+    let runner_host: Arc<dyn RunnerHostHandle> = state.runner_host.clone();
+    let source: Arc<dyn ActivitySource> = Arc::new(RunnerHostActivitySource {
+        runner_host,
+        provider: state.webchat_provider.clone(),
+        team: "default".to_string(),
+    });
+    let limits = manager.limits().clone();
+    tokio::spawn(serve_session(
+        websocket,
+        notifier,
+        source,
+        tenant.to_string(),
+        conv_id,
+        ctx.initial_watermark,
+        limits,
+        guard,
+    ));
+
+    Ok(response)
 }
 
 fn resolve_static_route_directline_request_from_match(
@@ -1355,6 +1499,28 @@ fn parse_webchat_directline_route(path: &str) -> Option<(String, String)> {
     None
 }
 
+/// True if the path is a webchat DirectLine stream endpoint:
+/// `/v1/{messaging,web}/webchat/{tenant}/v3/directline/conversations/{id}/stream`.
+fn is_webchat_directline_stream_path(path: &str) -> bool {
+    if let Some((_, dl_path)) = parse_webchat_directline_route(path) {
+        let segments: Vec<&str> = dl_path.trim_start_matches('/').split('/').collect();
+        return matches!(
+            segments.as_slice(),
+            ["v3", "directline", "conversations", _, "stream"]
+        );
+    }
+    false
+}
+
+fn extract_stream_conversation_id(path: &str) -> Option<String> {
+    let (_, dl_path) = parse_webchat_directline_route(path)?;
+    let segments: Vec<&str> = dl_path.trim_start_matches('/').split('/').collect();
+    match segments.as_slice() {
+        ["v3", "directline", "conversations", conv_id, "stream"] => Some((*conv_id).to_string()),
+        _ => None,
+    }
+}
+
 fn is_legacy_directline_path(path: &str) -> bool {
     path == "/token" || path.starts_with("/v3/directline") || path.starts_with("/directline")
 }
@@ -1388,6 +1554,76 @@ fn extract_scope_from_route_match(
     Some((tenant?, team))
 }
 
+/// Wire the post-op callback on the runner host so successful webchat provider
+/// invocations are forwarded to the activity notifier. Filters by provider id
+/// and op name; events without `_greentic` metadata are dropped.
+fn register_webchat_post_op_notifier(state: &Arc<HttpIngressState>) {
+    let notifier = state.notifier.clone();
+    state.runner_host.set_post_op_callback(std::sync::Arc::new(
+        move |_domain, provider, op_name, output| {
+            if provider != "messaging-webchat" && provider != "messaging-webchat-gui" {
+                return;
+            }
+            if op_name != "directline_http" && op_name != "send_payload" {
+                return;
+            }
+            let Some((tenant_id, conversation_id, new_watermark)) =
+                extract_greentic_metadata(output)
+            else {
+                return;
+            };
+            let notifier = notifier.clone();
+            // The callback is invoked from a synchronous code path that
+            // may or may not run inside a tokio runtime. Spawn into the
+            // current handle when available; otherwise fall back to a
+            // detached blocking thread so we never panic on missing
+            // runtime context.
+            let event = crate::notifier::NotifyEvent {
+                tenant_id,
+                conversation_id,
+                new_watermark,
+            };
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    notifier.publish(event).await;
+                });
+            } else {
+                std::thread::spawn(move || {
+                    if let Ok(rt) = tokio::runtime::Runtime::new() {
+                        rt.block_on(async move {
+                            notifier.publish(event).await;
+                        });
+                    }
+                });
+            }
+        },
+    ));
+}
+
+/// Extract `(tenant, conversation_id, watermark_bumped)` from a provider op
+/// output. Supports two shapes:
+///
+/// * `directline_http` returns an HTTP-shaped envelope whose JSON body lives
+///   in `body_b64` (base64-encoded). The DirectLine activity body carries a
+///   `_greentic` metadata block.
+/// * `send_payload` returns a structured envelope where the metadata is
+///   attached directly to the top-level output as `_greentic`.
+fn extract_greentic_metadata(output: &serde_json::Value) -> Option<(String, String, u64)> {
+    let metadata = if let Some(body_b64) = output.get("body_b64").and_then(|v| v.as_str()) {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body_b64.as_bytes())
+            .ok()?;
+        let body: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+        body.get("_greentic")?.clone()
+    } else {
+        output.get("_greentic")?.clone()
+    };
+    let tenant = metadata.get("tenant")?.as_str()?.to_string();
+    let conversation_id = metadata.get("conversation_id")?.as_str()?.to_string();
+    let watermark = metadata.get("watermark_bumped")?.as_u64()?;
+    Some((tenant, conversation_id, watermark))
+}
+
 #[cfg(test)]
 mod tests {
     use super::helpers::{handle_builtin_health_request, parse_route_segments};
@@ -1404,7 +1640,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::runtime::Runtime;
 
-    fn test_state(domains: Vec<Domain>) -> Arc<HttpIngressState> {
+    async fn test_state(domains: Vec<Domain>) -> Arc<HttpIngressState> {
         let dir = tempdir().unwrap();
         let discovery = crate::discovery::discover(dir.path()).unwrap();
         let secrets_handle =
@@ -1419,12 +1655,20 @@ mod tests {
             )
             .unwrap(),
         );
+        let notifier = crate::notifier::build_notifier(crate::notifier::NotifierConfig::default())
+            .await
+            .expect("build notifier");
         Arc::new(HttpIngressState {
             runner_host,
             domains,
             active_route_table: ActiveRouteTable::default(),
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
+            notifier,
+            session_manager: Arc::new(websocket::SessionManager::new(
+                websocket::WsLimits::default(),
+            )),
+            webchat_provider: "messaging-webchat".to_string(),
         })
     }
 
@@ -1480,7 +1724,7 @@ mod tests {
     #[test]
     fn handle_request_inner_rejects_options_and_invalid_methods() {
         let runtime = Runtime::new().unwrap();
-        let state = test_state(vec![Domain::Events]);
+        let state = runtime.block_on(test_state(vec![Domain::Events]));
 
         let options = runtime
             .block_on(handle_request_inner(
@@ -1503,10 +1747,14 @@ mod tests {
     fn handle_request_inner_covers_bad_route_disabled_domain_and_missing_handler() {
         let runtime = Runtime::new().unwrap();
 
+        let state_events = runtime.block_on(test_state(vec![Domain::Events]));
+        let state_messaging = runtime.block_on(test_state(vec![Domain::Messaging]));
+        let state_events2 = runtime.block_on(test_state(vec![Domain::Events]));
+
         let bad_route = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/v1/events/not-ingress"),
-                test_state(vec![Domain::Events]),
+                state_events,
             ))
             .unwrap_err();
         assert_eq!(bad_route.status(), StatusCode::BAD_REQUEST);
@@ -1514,7 +1762,7 @@ mod tests {
         let domain_disabled = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/v1/events/ingress/provider-a/demo"),
-                test_state(vec![Domain::Messaging]),
+                state_messaging,
             ))
             .unwrap_err();
         assert_eq!(domain_disabled.status(), StatusCode::NOT_FOUND);
@@ -1522,7 +1770,7 @@ mod tests {
         let no_handler = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/v1/events/ingress/provider-a/demo"),
-                test_state(vec![Domain::Events]),
+                state_events2,
             ))
             .unwrap_err();
         assert_eq!(no_handler.status(), StatusCode::NOT_FOUND);
@@ -1532,10 +1780,17 @@ mod tests {
     fn handle_request_inner_routes_onboard_oauth_and_directline_paths() {
         let runtime = Runtime::new().unwrap();
 
+        let state_messaging = runtime.block_on(test_state(vec![Domain::Messaging]));
+        let state_messaging2 = runtime.block_on(test_state(vec![Domain::Messaging]));
+        let state_messaging3 = runtime.block_on(test_state(vec![Domain::Messaging]));
+        let state_empty = runtime.block_on(test_state(vec![]));
+        let state_empty2 = runtime.block_on(test_state(vec![]));
+        let state_empty3 = runtime.block_on(test_state(vec![]));
+
         let onboard = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/api/onboard/unknown"),
-                test_state(vec![Domain::Messaging]),
+                state_messaging,
             ))
             .unwrap_err();
         assert_eq!(onboard.status(), StatusCode::NOT_FOUND);
@@ -1547,7 +1802,7 @@ mod tests {
                     "/v1/messaging/webchat/demo/oauth/token-exchange",
                     "{not-json",
                 ),
-                test_state(vec![Domain::Messaging]),
+                state_messaging2,
             ))
             .unwrap_err();
         assert_eq!(oauth_invalid_json.status(), StatusCode::BAD_REQUEST);
@@ -1559,7 +1814,7 @@ mod tests {
                     "/v1/messaging/webchat/demo/oauth/token-exchange",
                     "{}",
                 ),
-                test_state(vec![Domain::Messaging]),
+                state_messaging3,
             ))
             .unwrap_err();
         assert_eq!(oauth_missing_url.status(), StatusCode::BAD_REQUEST);
@@ -1569,7 +1824,7 @@ mod tests {
         let legacy_directline = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/token"),
-                test_state(vec![]),
+                state_empty,
             ))
             .unwrap_err();
         assert_eq!(legacy_directline.status(), StatusCode::NOT_FOUND);
@@ -1577,7 +1832,7 @@ mod tests {
         let webchat_directline = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/v1/messaging/webchat/demo/token"),
-                test_state(vec![]),
+                state_empty2,
             ))
             .unwrap_err();
         assert_eq!(webchat_directline.status(), StatusCode::BAD_REQUEST);
@@ -1585,7 +1840,7 @@ mod tests {
         let webchat_directline_web_route = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/v1/web/webchat/demo/token"),
-                test_state(vec![]),
+                state_empty3,
             ))
             .unwrap_err();
         assert_eq!(
@@ -1597,10 +1852,11 @@ mod tests {
     #[test]
     fn handle_request_wraps_errors_with_cors_headers() {
         let runtime = Runtime::new().unwrap();
+        let state = runtime.block_on(test_state(vec![Domain::Events]));
         let response = runtime
             .block_on(handle_request(
                 empty_request(Method::PUT, "/v1/events/ingress/provider-a/demo"),
-                test_state(vec![Domain::Events]),
+                state,
             ))
             .unwrap();
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
@@ -1611,10 +1867,11 @@ mod tests {
     #[test]
     fn handle_request_wraps_success_with_cors_headers() {
         let runtime = Runtime::new().unwrap();
+        let state = runtime.block_on(test_state(vec![Domain::Events]));
         let response = runtime
             .block_on(handle_request(
                 empty_request(Method::GET, "/healthz"),
-                test_state(vec![Domain::Events]),
+                state,
             ))
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1628,10 +1885,11 @@ mod tests {
     #[test]
     fn handle_request_inner_short_circuits_builtin_health_routes() {
         let runtime = Runtime::new().unwrap();
+        let state = runtime.block_on(test_state(vec![]));
         let response = runtime
             .block_on(handle_request_inner(
                 empty_request(Method::GET, "/readyz"),
-                test_state(vec![]),
+                state,
             ))
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1663,6 +1921,7 @@ mod tests {
             enable_static_routes: false,
             tenant: "demo".to_string(),
             public_base_url: None,
+            notifier_config: crate::notifier::NotifierConfig::default(),
         })
         .expect("start ingress server");
 
@@ -1715,6 +1974,7 @@ mod tests {
             enable_static_routes: false,
             tenant: "demo".to_string(),
             public_base_url: None,
+            notifier_config: crate::notifier::NotifierConfig::default(),
         }) {
             Ok(_) => panic!("occupied port range should fail ingress startup"),
             Err(err) => err,
@@ -1765,6 +2025,11 @@ mod tests {
             cache_strategy: CacheStrategy::None,
             route_segments: vec![RouteScopeSegment::Literal("web".to_string())],
         };
+        let notifier = runtime
+            .block_on(crate::notifier::build_notifier(
+                crate::notifier::NotifierConfig::default(),
+            ))
+            .expect("build notifier");
         let state = Arc::new(HttpIngressState {
             runner_host,
             domains: vec![],
@@ -1775,6 +2040,11 @@ mod tests {
             }),
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
+            notifier,
+            session_manager: Arc::new(websocket::SessionManager::new(
+                websocket::WsLimits::default(),
+            )),
+            webchat_provider: "messaging-webchat".to_string(),
         });
 
         let response = runtime
@@ -1843,6 +2113,11 @@ mod tests {
                 RouteScopeSegment::Tenant,
             ],
         };
+        let notifier = runtime
+            .block_on(crate::notifier::build_notifier(
+                crate::notifier::NotifierConfig::default(),
+            ))
+            .expect("build notifier");
         let state = Arc::new(HttpIngressState {
             runner_host,
             domains: vec![Domain::Messaging],
@@ -1853,6 +2128,11 @@ mod tests {
             }),
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
+            notifier,
+            session_manager: Arc::new(websocket::SessionManager::new(
+                websocket::WsLimits::default(),
+            )),
+            webchat_provider: "messaging-webchat".to_string(),
         });
 
         let gui_secret_uri = canonical_secret_uri(
@@ -2071,5 +2351,125 @@ mod tests {
             percent_encode_query_component("a+b&c=d"),
             "a%2Bb%26c%3Dd".to_string()
         );
+    }
+
+    #[test]
+    fn extract_greentic_metadata_reads_top_level_envelope() {
+        let output = serde_json::json!({
+            "_greentic": {
+                "tenant": "demo",
+                "conversation_id": "conv-1",
+                "watermark_bumped": 7
+            },
+            "ok": true,
+        });
+        let extracted = extract_greentic_metadata(&output).expect("metadata present");
+        assert_eq!(extracted.0, "demo");
+        assert_eq!(extracted.1, "conv-1");
+        assert_eq!(extracted.2, 7);
+    }
+
+    #[test]
+    fn extract_greentic_metadata_decodes_directline_body_b64() {
+        let body = serde_json::json!({
+            "_greentic": {
+                "tenant": "tenant-x",
+                "conversation_id": "conv-42",
+                "watermark_bumped": 12
+            }
+        });
+        let body_b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&body).unwrap());
+        let output = serde_json::json!({
+            "status": 200,
+            "body_b64": body_b64,
+        });
+        let extracted = extract_greentic_metadata(&output).expect("metadata present");
+        assert_eq!(extracted.0, "tenant-x");
+        assert_eq!(extracted.1, "conv-42");
+        assert_eq!(extracted.2, 12);
+    }
+
+    #[test]
+    fn extract_greentic_metadata_returns_none_when_missing() {
+        let output = serde_json::json!({"ok": true});
+        assert!(extract_greentic_metadata(&output).is_none());
+    }
+
+    #[test]
+    fn extract_greentic_metadata_returns_none_for_invalid_body_b64() {
+        let output = serde_json::json!({
+            "body_b64": "$$not-base64$$"
+        });
+        assert!(extract_greentic_metadata(&output).is_none());
+    }
+
+    #[tokio::test]
+    async fn webchat_post_op_callback_publishes_notify_event() {
+        let state = test_state(vec![Domain::Messaging]).await;
+        register_webchat_post_op_notifier(&state);
+
+        let mut stream = state
+            .notifier
+            .subscribe("demo", "conv-1")
+            .await
+            .expect("subscribe ok");
+
+        let callback = state
+            .runner_host
+            .post_op_callback_snapshot()
+            .expect("callback installed");
+        let output = serde_json::json!({
+            "_greentic": {
+                "tenant": "demo",
+                "conversation_id": "conv-1",
+                "watermark_bumped": 3
+            }
+        });
+        callback("messaging", "messaging-webchat", "send_payload", &output);
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            futures_util::StreamExt::next(&mut stream),
+        )
+        .await
+        .expect("event delivered in time")
+        .expect("event present");
+        assert_eq!(event.tenant_id, "demo");
+        assert_eq!(event.conversation_id, "conv-1");
+        assert_eq!(event.new_watermark, 3);
+    }
+
+    #[tokio::test]
+    async fn webchat_post_op_callback_filters_non_webchat_provider() {
+        let state = test_state(vec![Domain::Messaging]).await;
+        register_webchat_post_op_notifier(&state);
+
+        let mut stream = state
+            .notifier
+            .subscribe("demo", "conv-1")
+            .await
+            .expect("subscribe ok");
+
+        let callback = state
+            .runner_host
+            .post_op_callback_snapshot()
+            .expect("callback installed");
+        let output = serde_json::json!({
+            "_greentic": {
+                "tenant": "demo",
+                "conversation_id": "conv-1",
+                "watermark_bumped": 3
+            }
+        });
+        callback("messaging", "messaging-slack", "send_payload", &output);
+        callback("messaging", "messaging-webchat", "ingest_http", &output);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            futures_util::StreamExt::next(&mut stream),
+        )
+        .await;
+        assert!(result.is_err(), "no event should be delivered");
     }
 }

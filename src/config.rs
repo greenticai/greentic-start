@@ -11,6 +11,14 @@ pub struct OperatorConfig {
     pub services: Option<OperatorServicesConfig>,
     #[serde(default)]
     pub binaries: BTreeMap<String, String>,
+    #[serde(default)]
+    pub webchat: Option<WebchatConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct WebchatConfig {
+    #[serde(default)]
+    pub notifier: crate::notifier::NotifierConfig,
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -408,4 +416,33 @@ fn default_msgraph_mode() -> String {
 
 pub(crate) fn default_events_components() -> Vec<ServiceComponentConfig> {
     Vec::new()
+}
+
+#[cfg(test)]
+mod webchat_config_tests {
+    use super::*;
+
+    #[test]
+    fn operator_config_parses_webchat_notifier_redis() {
+        let yaml = "\
+binaries:
+  some_binary: /usr/bin/foo
+webchat:
+  notifier:
+    backend: redis
+";
+        let cfg: OperatorConfig = serde_yaml_bw::from_str(yaml).expect("parse");
+        let webchat = cfg.webchat.expect("webchat section present");
+        match webchat.notifier {
+            crate::notifier::NotifierConfig::Redis { url, .. } => assert!(url.is_none()),
+            _ => panic!("expected Redis notifier"),
+        }
+    }
+
+    #[test]
+    fn operator_config_webchat_absent_is_none() {
+        let yaml = "binaries: {}\n";
+        let cfg: OperatorConfig = serde_yaml_bw::from_str(yaml).expect("parse");
+        assert!(cfg.webchat.is_none());
+    }
 }
