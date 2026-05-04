@@ -248,6 +248,18 @@ pub async fn serve_session(
     });
 
     let idle = Duration::from_secs(limits.idle_timeout_secs);
+    // Send a WebSocket ping at half the idle window (clamped to a sane
+    // minimum) so a chat session that's idle waiting for a bot reply
+    // doesn't get reaped after `idle_timeout_secs`. The peer's pong
+    // arrives on the receive arm and resets the timeout naturally;
+    // if the peer is genuinely dead, no pong arrives and the receive
+    // arm's `idle` timeout still fires, breaking the loop.
+    let ping_period = Duration::from_secs((limits.idle_timeout_secs / 2).max(30));
+    let mut ping_ticker = tokio::time::interval(ping_period);
+    ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // First tick fires immediately by default; consume it so we don't
+    // ping at t=0 before the client has finished its handshake setup.
+    ping_ticker.tick().await;
     loop {
         tokio::select! {
             maybe_frame = frame_rx.recv() => {
@@ -276,6 +288,11 @@ pub async fn serve_session(
                     Err(_) | Ok(None) | Ok(Some(Ok(Message::Close(_)))) => break,
                     Ok(Some(Ok(_))) => continue,
                     Ok(Some(Err(_))) => break,
+                }
+            }
+            _ = ping_ticker.tick() => {
+                if ws.send(Message::Ping(Default::default())).await.is_err() {
+                    break;
                 }
             }
         }
