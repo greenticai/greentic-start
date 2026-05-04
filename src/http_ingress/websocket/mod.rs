@@ -32,7 +32,9 @@ use tokio::sync::mpsc;
 /// the full demo host.
 pub trait RunnerHostHandle: Send + Sync + 'static {
     /// Synchronously invoke `directline_http` GET on the named provider and
-    /// return the parsed JSON body.
+    /// return the parsed JSON body. `auth_token` is forwarded as the
+    /// `Authorization: Bearer <token>` header so the WASM provider's JWT
+    /// guard accepts the call.
     fn invoke_directline_get_activities(
         &self,
         tenant: &str,
@@ -40,6 +42,7 @@ pub trait RunnerHostHandle: Send + Sync + 'static {
         provider: &str,
         conversation_id: &str,
         watermark: u64,
+        auth_token: Option<&str>,
     ) -> Result<Value, String>;
 }
 
@@ -51,7 +54,14 @@ impl RunnerHostHandle for DemoRunnerHost {
         provider: &str,
         conversation_id: &str,
         watermark: u64,
+        auth_token: Option<&str>,
     ) -> Result<Value, String> {
+        let headers: Vec<serde_json::Value> = match auth_token {
+            Some(token) if !token.is_empty() => {
+                vec![serde_json::json!(["Authorization", format!("Bearer {token}")])]
+            }
+            _ => Vec::new(),
+        };
         let payload = serde_json::json!({
             "v": 1,
             "provider": provider,
@@ -62,7 +72,7 @@ impl RunnerHostHandle for DemoRunnerHost {
             "method": "GET",
             "path": format!("/v3/directline/conversations/{conversation_id}/activities"),
             "query": format!("watermark={watermark}&tenant={tenant}&team={team}"),
-            "headers": [],
+            "headers": headers,
             "body_b64": "",
             "config": serde_json::Value::Null,
         });
@@ -126,6 +136,10 @@ pub struct RunnerHostActivitySource {
     pub runner_host: Arc<dyn RunnerHostHandle>,
     pub provider: String,
     pub team: String,
+    /// Bearer token captured at WS upgrade time. Forwarded as the
+    /// `Authorization` header on every `fetch_since` so the WASM provider's
+    /// JWT guard accepts internal pump calls.
+    pub auth_token: Option<String>,
 }
 
 #[async_trait]
@@ -141,8 +155,16 @@ impl pump::ActivitySource for RunnerHostActivitySource {
         let provider = self.provider.clone();
         let tenant = tenant_id.to_string();
         let conv = conversation_id.to_string();
+        let auth_token = self.auth_token.clone();
         let value = tokio::task::spawn_blocking(move || {
-            host.invoke_directline_get_activities(&tenant, &team, &provider, &conv, since_watermark)
+            host.invoke_directline_get_activities(
+                &tenant,
+                &team,
+                &provider,
+                &conv,
+                since_watermark,
+                auth_token.as_deref(),
+            )
         })
         .await
         .map_err(|err| format!("join error: {err}"))??;

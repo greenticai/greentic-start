@@ -1053,12 +1053,28 @@ where
         }
     };
 
+    // Extract the conv-bound JWT from the streamUrl `?t=` param so the pump
+    // can authenticate its internal `ingest-http` GET /activities calls. The
+    // WASM provider rejects unauthenticated requests with 401, which would
+    // make every fetch_since return an empty activities list. JWT chars are
+    // URL-safe (base64url + `.`), so a literal extract is sufficient — no
+    // percent-decoding required.
+    let auth_token = req.uri().query().and_then(|q| {
+        q.split('&').find_map(|kv| {
+            let mut parts = kv.splitn(2, '=');
+            let k = parts.next()?;
+            let v = parts.next()?;
+            if k == "t" { Some(v.to_string()) } else { None }
+        })
+    });
+
     let notifier = state.notifier.clone();
     let runner_host: Arc<dyn RunnerHostHandle> = state.runner_host.clone();
     let source: Arc<dyn ActivitySource> = Arc::new(RunnerHostActivitySource {
         runner_host,
         provider: state.webchat_provider.clone(),
         team: "default".to_string(),
+        auth_token,
     });
     let limits = manager.limits().clone();
     tokio::spawn(serve_session(
