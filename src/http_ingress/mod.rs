@@ -294,8 +294,15 @@ impl HttpIngressServer {
                                         });
                                         let http = Http1Builder::new();
                                         let stream = TokioIo::new(stream);
+                                        // `with_upgrades` is required so the
+                                        // WebSocket handshake completes — without
+                                        // it hyper closes the TCP right after the
+                                        // 101 response and hyper-tungstenite's
+                                        // `websocket.await` errors out with
+                                        // "Handshake not finished".
                                         if let Err(err) = http
                                             .serve_connection(stream, service)
+                                            .with_upgrades()
                                             .await
                                         {
                                             operator_log::error(
