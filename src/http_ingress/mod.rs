@@ -184,6 +184,26 @@ impl HttpIngressServer {
             }
             .context("failed to build activity notifier")?
         };
+        // Resolve which webchat provider variant is actually loaded. Cloud
+        // deploys typically only ship one of the two (`messaging-webchat-gui`
+        // for the hosted SPA flow, `messaging-webchat` for embed/headless),
+        // and the WS upgrade path needs to fetch the JWT signing key from the
+        // matching provider's secret namespace.
+        let webchat_provider = if runner_host
+            .get_provider_pack_path(Domain::Messaging, "messaging-webchat")
+            .is_some()
+        {
+            "messaging-webchat".to_string()
+        } else if runner_host
+            .get_provider_pack_path(Domain::Messaging, "messaging-webchat-gui")
+            .is_some()
+        {
+            "messaging-webchat-gui".to_string()
+        } else {
+            // Neither installed; keep the historical default so error surfaces
+            // are deterministic.
+            "messaging-webchat".to_string()
+        };
         let state = Arc::new(HttpIngressState {
             runner_host,
             domains,
@@ -194,7 +214,7 @@ impl HttpIngressServer {
             session_manager: Arc::new(websocket::SessionManager::new(
                 websocket::WsLimits::default(),
             )),
-            webchat_provider: "messaging-webchat".to_string(),
+            webchat_provider,
         });
 
         // Bridge successful webchat provider ops into the activity notifier so
@@ -945,42 +965,60 @@ where
     };
 
     // Read JWT signing key from the same secrets URI the WASM provider uses
-    // when issuing tokens. The webchat provider id is configurable on the
-    // ingress state so deployments that override the default still work.
+    // when issuing tokens. Try the configured webchat provider first, then
+    // fall back to the GUI variant — operators commonly install one or the
+    // other (or both) and the secret namespace is provider-scoped.
     let secret_ctx = OperatorContext {
         tenant: tenant.to_string(),
         team: Some("default".to_string()),
         correlation_id: None,
     };
-    let signing_key =
+    let provider_candidates: &[&str] = if state.webchat_provider == "messaging-webchat-gui" {
+        &["messaging-webchat-gui", "messaging-webchat"]
+    } else {
+        &["messaging-webchat", "messaging-webchat-gui"]
+    };
+    let mut signing_key: Option<Vec<u8>> = None;
+    let mut last_err: Option<anyhow::Error> = None;
+    for provider in provider_candidates {
         match state
             .runner_host
-            .get_secret(&state.webchat_provider, "jwt_signing_key", &secret_ctx)
+            .get_secret(provider, "jwt_signing_key", &secret_ctx)
         {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => {
-                // Fall back: try reading by canonical URI directly so we surface a
-                // helpful 500 instead of a silent unauthorized response.
-                let env = resolve_env(None);
-                let uri = canonical_secret_uri(
-                    &env,
-                    tenant,
-                    Some("default"),
-                    &state.webchat_provider,
-                    "jwt_signing_key",
-                );
-                return Err(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("missing jwt signing key (looked up {uri})"),
-                ));
+            Ok(Some(bytes)) => {
+                signing_key = Some(bytes);
+                break;
             }
+            Ok(None) => continue,
             Err(err) => {
+                last_err = Some(err);
+                continue;
+            }
+        }
+    }
+    let signing_key = match signing_key {
+        Some(bytes) => bytes,
+        None => {
+            if let Some(err) = last_err {
                 return Err(error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("failed to read jwt signing key: {err}"),
                 ));
             }
-        };
+            let env = resolve_env(None);
+            let uris: Vec<String> = provider_candidates
+                .iter()
+                .map(|p| canonical_secret_uri(&env, tenant, Some("default"), p, "jwt_signing_key"))
+                .collect();
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "missing jwt signing key (tried providers: {})",
+                    uris.join(", ")
+                ),
+            ));
+        }
+    };
 
     let ctx = match validate_request_parts(req.uri(), req.headers(), &conv_id, tenant, &signing_key)
     {
