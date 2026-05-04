@@ -24,8 +24,22 @@ impl ActivityNotifier for InMemoryNotifier {
     async fn publish(&self, event: NotifyEvent) {
         let key = (event.tenant_id.clone(), event.conversation_id.clone());
         if let Some(sender) = self.channels.get(&key) {
+            let receiver_count = sender.receiver_count();
             // send returns Err(SendError) if no receivers — drop silently.
-            let _ = sender.send(event);
+            let send_result = sender.send(event.clone());
+            eprintln!(
+                "[ws notifier:memory] publish tenant={} conv={} watermark={} subscribers={} send_ok={}",
+                event.tenant_id,
+                event.conversation_id,
+                event.new_watermark,
+                receiver_count,
+                send_result.is_ok(),
+            );
+        } else {
+            eprintln!(
+                "[ws notifier:memory] publish tenant={} conv={} watermark={} no_channel_for_key",
+                event.tenant_id, event.conversation_id, event.new_watermark,
+            );
         }
     }
 

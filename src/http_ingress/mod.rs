@@ -1610,13 +1610,25 @@ fn register_webchat_post_op_notifier(state: &Arc<HttpIngressState>) {
                 return;
             }
             if op_name != "directline_http" && op_name != "send_payload" {
+                eprintln!(
+                    "[ws post-op-notifier] op={} provider={} skipped (not directline_http or send_payload)",
+                    op_name, provider,
+                );
                 return;
             }
             let Some((tenant_id, conversation_id, new_watermark)) =
                 extract_greentic_metadata(output)
             else {
+                eprintln!(
+                    "[ws post-op-notifier] op={} provider={} skipped (no _greentic metadata)",
+                    op_name, provider,
+                );
                 return;
             };
+            eprintln!(
+                "[ws post-op-notifier] publishing event tenant={} conv={} watermark={}",
+                tenant_id, conversation_id, new_watermark,
+            );
             let notifier = notifier.clone();
             // The callback is invoked from a synchronous code path that
             // may or may not run inside a tokio runtime. Spawn into the
