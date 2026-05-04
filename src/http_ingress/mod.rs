@@ -1251,6 +1251,27 @@ where
         }
     }
     if !result.messaging_envelopes.is_empty() {
+        // The webchat client forwards the picker locale via X-Greentic-Locale on
+        // POST /v3/directline/conversations because that request has no activity
+        // body to carry `locale` natively. Inject it into the autoStart envelope
+        // so the welcome card renders in the right language. POST /activities
+        // already carries `locale` in the BotFramework activity body, so this
+        // only matters for the conversation-create path.
+        let header_locale = ingress_request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-greentic-locale"))
+            .map(|(_, value)| value.trim().to_string())
+            .filter(|s| !s.is_empty());
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[locale-inject] path={} header_locale={:?} envelopes={}",
+                request.path,
+                header_locale,
+                result.messaging_envelopes.len()
+            ),
+        );
         let envelopes: Vec<_> = result
             .messaging_envelopes
             .iter()
@@ -1261,6 +1282,15 @@ where
                     .unwrap_or(true)
             })
             .cloned()
+            .map(|mut env| {
+                if let Some(locale) = header_locale.as_deref()
+                    && !env.metadata.contains_key("locale")
+                {
+                    env.metadata
+                        .insert("locale".to_string(), locale.to_string());
+                }
+                env
+            })
             .collect();
         if !envelopes.is_empty() {
             let bundle = state.runner_host.bundle_root().to_path_buf();
