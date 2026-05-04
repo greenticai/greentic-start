@@ -438,6 +438,45 @@ fn replace_tokens_recursive(
     }
 }
 
+/// Walk a JSON tree and substitute every string field whose verbatim value
+/// matches a key in the `en_to_target` map with the corresponding target-locale
+/// value.
+///
+/// This is the workhorse of the safety net's reverse-lookup path: when the
+/// WASM adaptive-card component has rendered cards using the pack's English
+/// bundle (because the runner-desktop path doesn't wire a host i18n resolver
+/// that the component can ask), we reverse the mapping host-side. For each
+/// English string in the card, we look up which i18n key produced it, then
+/// substitute the matching target-locale value.
+///
+/// We only mutate string values that are an exact match. Non-string values,
+/// numbers, structural keys, etc. are left untouched. Strings that don't appear
+/// in `en_to_target` are left as-is so we never accidentally corrupt
+/// non-translatable content.
+fn translate_string_fields_recursive(
+    value: &mut serde_json::Value,
+    en_to_target: &std::collections::HashMap<String, String>,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(translated) = en_to_target.get(text.as_str()) {
+                *text = translated.clone();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                translate_string_fields_recursive(item, en_to_target);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for val in map.values_mut() {
+                translate_string_fields_recursive(val, en_to_target);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Re-read the adaptive card from the pack and apply i18n when the card has
 /// empty text fields.  This compensates for the WASM component not having a
 /// host asset resolver for `i18n_bundle_path` when running through the desktop
@@ -446,9 +485,45 @@ fn ensure_card_i18n_resolved(envelope: &mut ChannelMessageEnvelope, pack_path: &
     let Some(ac_str) = envelope.metadata.get("adaptive_card") else {
         return;
     };
-    let Ok(card) = serde_json::from_str::<serde_json::Value>(ac_str) else {
+    let Ok(mut card) = serde_json::from_str::<serde_json::Value>(ac_str) else {
         return;
     };
+
+    // En-to-target reverse lookup. The WASM adaptive-card component renders
+    // every card using the pack's `en.json` bundle when the runner-desktop
+    // path is in use (no host i18n resolver is wired). Walk the rendered card
+    // and swap text values that match an `en.json` entry with the
+    // corresponding target-locale value, looking up by english string. Runs
+    // before the cardId-based safety net below so it covers cards that don't
+    // declare `greentic.cardId`.
+    let locale = envelope
+        .metadata
+        .get("locale")
+        .map(String::as_str)
+        .unwrap_or("en");
+    if locale != "en"
+        && locale != "en-GB"
+        && locale != "en-US"
+        && let Some(en_bundle) = read_i18n_bundle(pack_path, "en")
+        && let Some(target_bundle) = read_i18n_bundle(pack_path, locale)
+    {
+        let mut en_to_target = std::collections::HashMap::<String, String>::new();
+        for (key, en_value) in &en_bundle {
+            if let Some(target_value) = target_bundle.get(key)
+                && target_value != en_value
+            {
+                en_to_target.insert(en_value.clone(), target_value.clone());
+            }
+        }
+        if !en_to_target.is_empty() {
+            translate_string_fields_recursive(&mut card, &en_to_target);
+            if let Ok(resolved) = serde_json::to_string(&card) {
+                envelope
+                    .metadata
+                    .insert("adaptive_card".to_string(), resolved);
+            }
+        }
+    }
     // Only act if the card has a greentic.cardId (cards2pack-generated).
     let card_id = card
         .pointer("/greentic/cardId")
@@ -760,5 +835,62 @@ mod tests {
         assert_eq!(data["action_id"], "next"); // original preserved, not overwritten
         // Action.OpenUrl should be untouched
         assert!(card["actions"][1].get("data").is_none());
+    }
+
+    #[test]
+    fn translate_string_fields_recursive_swaps_matching_strings() {
+        let mut card = json!({
+            "type": "AdaptiveCard",
+            "body": [
+                { "type": "TextBlock", "text": "Hello world" },
+                { "type": "TextBlock", "text": "Untranslated string" },
+                {
+                    "type": "Container",
+                    "items": [
+                        { "type": "Input.Text", "label": "Question", "placeholder": "Type" }
+                    ]
+                }
+            ],
+            "actions": [
+                { "type": "Action.Submit", "title": "Send" }
+            ]
+        });
+        let mut map = std::collections::HashMap::new();
+        map.insert("Hello world".to_string(), "こんにちは世界".to_string());
+        map.insert("Question".to_string(), "質問".to_string());
+        map.insert("Send".to_string(), "送信".to_string());
+        // Note: "Type" not in map → should remain
+        // Note: "Untranslated string" not in map → should remain
+
+        translate_string_fields_recursive(&mut card, &map);
+
+        assert_eq!(card["body"][0]["text"], "こんにちは世界");
+        assert_eq!(card["body"][1]["text"], "Untranslated string");
+        assert_eq!(card["body"][2]["items"][0]["label"], "質問");
+        assert_eq!(card["body"][2]["items"][0]["placeholder"], "Type");
+        assert_eq!(card["actions"][0]["title"], "送信");
+        // Structural keys ("type", etc.) must not be substituted by accident
+        assert_eq!(card["type"], "AdaptiveCard");
+        assert_eq!(card["body"][0]["type"], "TextBlock");
+    }
+
+    #[test]
+    fn translate_string_fields_recursive_only_substitutes_exact_matches() {
+        let mut value = json!({
+            "a": "foo",
+            "b": "foo bar",       // contains "foo" but NOT exact match — must not substitute
+            "c": "FOO",           // case-different — must not substitute
+            "d": ["foo", "baz"]
+        });
+        let mut map = std::collections::HashMap::new();
+        map.insert("foo".to_string(), "FOO_TR".to_string());
+
+        translate_string_fields_recursive(&mut value, &map);
+
+        assert_eq!(value["a"], "FOO_TR");
+        assert_eq!(value["b"], "foo bar");
+        assert_eq!(value["c"], "FOO");
+        assert_eq!(value["d"][0], "FOO_TR");
+        assert_eq!(value["d"][1], "baz");
     }
 }

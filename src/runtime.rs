@@ -749,6 +749,7 @@ pub fn demo_up_services(
     runner_binary: Option<PathBuf>,
     log_dir: &Path,
     debug_enabled: bool,
+    no_browser: bool,
 ) -> anyhow::Result<ForegroundRuntimeHandles> {
     let config_dir = config_path
         .parent()
@@ -1229,8 +1230,9 @@ pub fn demo_up_services(
     };
     info.print();
 
-    // Auto-open the first webchat UI URL in the default browser.
-    if let Some(url) = static_route_urls.first()
+    // Auto-open the first webchat UI URL in the default browser unless disabled.
+    if !no_browser
+        && let Some(url) = static_route_urls.first()
         && let Err(err) = open::that(url)
     {
         operator_log::warn(module_path!(), format!("failed to open browser: {err}"));
@@ -2022,6 +2024,7 @@ mod tests {
             None,
             &log_dir,
             true,
+            false,
         )?;
         assert!(handles.ingress_server.is_none());
 
