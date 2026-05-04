@@ -58,7 +58,10 @@ impl RunnerHostHandle for DemoRunnerHost {
     ) -> Result<Value, String> {
         let headers: Vec<serde_json::Value> = match auth_token {
             Some(token) if !token.is_empty() => {
-                vec![serde_json::json!(["Authorization", format!("Bearer {token}")])]
+                vec![serde_json::json!([
+                    "Authorization",
+                    format!("Bearer {token}")
+                ])]
             }
             _ => Vec::new(),
         };
