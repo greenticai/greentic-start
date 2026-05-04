@@ -72,20 +72,33 @@ impl RunnerHostHandle for DemoRunnerHost {
             team: Some(team.to_string()),
             correlation_id: None,
         };
+        // The webchat provider exposes its directline routing under the
+        // generic `ingest_http` op (with hyphen alias). Try the canonical
+        // name first, then fall back to the underscore alias used by older
+        // pack builds.
         let outcome = self
             .invoke_provider_op(
                 Domain::Messaging,
                 provider,
-                "directline_http",
+                "ingest-http",
                 &payload_bytes,
                 &ctx,
             )
+            .or_else(|_| {
+                self.invoke_provider_op(
+                    Domain::Messaging,
+                    provider,
+                    "ingest_http",
+                    &payload_bytes,
+                    &ctx,
+                )
+            })
             .map_err(|err| err.to_string())?;
         if !outcome.success {
             return Err(outcome
                 .error
                 .or(outcome.raw)
-                .unwrap_or_else(|| "provider directline_http failed".to_string()));
+                .unwrap_or_else(|| "provider ingest_http failed".to_string()));
         }
         let value = outcome
             .output
