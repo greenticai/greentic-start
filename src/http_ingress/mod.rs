@@ -1290,7 +1290,7 @@ where
         remote_addr: None,
     };
 
-    let result = match dispatch_http_ingress_with_op(
+    let mut result = match dispatch_http_ingress_with_op(
         &state.runner_host,
         Domain::Messaging,
         &ingress_request,
@@ -1308,6 +1308,43 @@ where
             error_response(StatusCode::BAD_GATEWAY, primary_err.to_string())
         })?,
     };
+
+    // POST /v3/directline/conversations response carries `streamUrl` as a
+    // site-relative path (the WASM provider has no host info). DirectLineJS
+    // requires an absolute `ws://`/`wss://` URL on the WebSocket constructor —
+    // a relative path makes the SDK fall back to HTTP polling. Rewrite the
+    // body here using the request's Host header so the SPA's directlinejs
+    // dials the right endpoint.
+    if request.method == &Method::POST
+        && (request.path == "/v3/directline/conversations"
+            || request.path.ends_with("/conversations"))
+        && (200..300).contains(&result.response.status)
+        && let Some(body_bytes) = result.response.body.clone()
+        && let Ok(mut body_json) = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        && body_json
+            .get("streamUrl")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| s.starts_with('/'))
+    {
+        if let Some(host) = ingress_request
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+            .map(|(_, v)| v.clone())
+        {
+            // Use ws:// when the original request was HTTP — operator
+            // doesn't terminate TLS today; if a proxy ahead does, the
+            // browser will negotiate wss:// against the same origin.
+            let scheme = "ws";
+            let relative = body_json["streamUrl"].as_str().unwrap_or("").to_string();
+            let absolute = format!("{scheme}://{host}{relative}");
+            body_json["streamUrl"] = serde_json::Value::String(absolute);
+            if let Ok(rewritten) = serde_json::to_vec(&body_json) {
+                result.response.body = Some(rewritten);
+            }
+        }
+    }
+
     if request.path == "/token" && (200..300).contains(&result.response.status) {
         let body = result.response.body.as_deref().unwrap_or_default();
         let token_ok = serde_json::from_slice::<serde_json::Value>(body)
