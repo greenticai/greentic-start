@@ -138,6 +138,7 @@ pub(crate) fn build_injected_config(
     if let Some(setup_answers) = load_provider_setup_answers(runner_host.bundle_root(), provider) {
         inject_config_values(&mut config_map, &setup_answers);
     }
+    inject_runtime_env_config(&mut config_map, provider);
 
     // Load secret requirements from the pack
     let secret_keys = match load_secret_keys_from_pack(pack_path) {
@@ -191,6 +192,50 @@ pub(crate) fn build_injected_config(
     } else {
         None
     }
+}
+
+fn inject_runtime_env_config(config_map: &mut JsonMap<String, JsonValue>, provider: &str) {
+    match provider {
+        "messaging-webchat" | "messaging-webchat-gui" => {
+            inject_env_string(config_map, "public_base_url", "PUBLIC_BASE_URL", true);
+            inject_env_string(config_map, "mode", "GREENTIC_WEBCHAT_MODE", true);
+            inject_env_string(config_map, "route", "GREENTIC_WEBCHAT_ROUTE", true);
+            inject_env_string(
+                config_map,
+                "tenant_channel_id",
+                "GREENTIC_WEBCHAT_TENANT_CHANNEL_ID",
+                true,
+            );
+            inject_env_string(config_map, "base_url", "GREENTIC_WEBCHAT_BASE_URL", true);
+        }
+        "state-redis" => {
+            inject_env_string(config_map, "redis_url", "REDIS_URL", true);
+        }
+        _ => {}
+    }
+}
+
+fn inject_env_string(
+    config_map: &mut JsonMap<String, JsonValue>,
+    key: &str,
+    env_key: &str,
+    overwrite: bool,
+) {
+    let target_key = format!("{key}_b64");
+    if !overwrite && config_map.contains_key(&target_key) {
+        return;
+    }
+    let Ok(value) = std::env::var(env_key) else {
+        return;
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    config_map.insert(
+        target_key,
+        JsonValue::String(STANDARD.encode(trimmed.as_bytes())),
+    );
 }
 
 fn load_provider_config_from_envelope(bundle_root: &Path, provider: &str) -> Option<JsonValue> {
@@ -611,5 +656,50 @@ mod tests {
         assert_eq!(debug[0]["provider"], "events-webhook");
 
         log_invalid_event_warning(&anyhow::anyhow!("bad event"));
+    }
+
+    #[test]
+    fn inject_runtime_env_config_populates_webchat_and_redis_from_env() {
+        let mut webchat = JsonMap::new();
+        unsafe {
+            std::env::set_var("PUBLIC_BASE_URL", "https://example.com");
+            std::env::set_var("GREENTIC_WEBCHAT_MODE", "websocket");
+            std::env::set_var("GREENTIC_WEBCHAT_ROUTE", "webchat");
+            std::env::set_var("GREENTIC_WEBCHAT_TENANT_CHANNEL_ID", "demo:webchat");
+            std::env::set_var("GREENTIC_WEBCHAT_BASE_URL", "https://example.com");
+            std::env::set_var("REDIS_URL", "redis://shared.example.com:6379/0");
+        }
+
+        inject_runtime_env_config(&mut webchat, "messaging-webchat-gui");
+        assert_eq!(
+            webchat.get("public_base_url_b64"),
+            Some(&JsonValue::String(STANDARD.encode("https://example.com")))
+        );
+        assert_eq!(
+            webchat.get("mode_b64"),
+            Some(&JsonValue::String(STANDARD.encode("websocket")))
+        );
+        assert_eq!(
+            webchat.get("tenant_channel_id_b64"),
+            Some(&JsonValue::String(STANDARD.encode("demo:webchat")))
+        );
+
+        let mut redis = JsonMap::new();
+        inject_runtime_env_config(&mut redis, "state-redis");
+        assert_eq!(
+            redis.get("redis_url_b64"),
+            Some(&JsonValue::String(
+                STANDARD.encode("redis://shared.example.com:6379/0")
+            ))
+        );
+
+        unsafe {
+            std::env::remove_var("PUBLIC_BASE_URL");
+            std::env::remove_var("GREENTIC_WEBCHAT_MODE");
+            std::env::remove_var("GREENTIC_WEBCHAT_ROUTE");
+            std::env::remove_var("GREENTIC_WEBCHAT_TENANT_CHANNEL_ID");
+            std::env::remove_var("GREENTIC_WEBCHAT_BASE_URL");
+            std::env::remove_var("REDIS_URL");
+        }
     }
 }
