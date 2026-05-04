@@ -178,10 +178,23 @@ pub async fn serve_session(
     limits: WsLimits,
     _guard: SessionGuard,
 ) {
+    eprintln!(
+        "[ws serve_session] entered tenant={} conv={} initial_watermark={}",
+        tenant_id, conversation_id, initial_watermark,
+    );
     let mut ws = match websocket.await {
-        Ok(stream) => stream,
+        Ok(stream) => {
+            eprintln!(
+                "[ws serve_session] handshake completed tenant={} conv={}",
+                tenant_id, conversation_id,
+            );
+            stream
+        }
         Err(err) => {
-            tracing::warn!(?err, "websocket handshake failed");
+            eprintln!(
+                "[ws serve_session] handshake FAILED tenant={} conv={} err={}",
+                tenant_id, conversation_id, err,
+            );
             return;
         }
     };
@@ -189,9 +202,24 @@ pub async fn serve_session(
     let (frame_tx, mut frame_rx) = mpsc::channel::<PumpFrame>(16);
     let pump = Pump::new(source, notifier, limits.max_replay_size);
 
+    let pump_tenant = tenant_id.clone();
+    let pump_conv = conversation_id.clone();
     let pump_handle = tokio::spawn(async move {
-        pump.run(tenant_id, conversation_id, initial_watermark, frame_tx)
-            .await
+        let result = pump
+            .run(tenant_id, conversation_id, initial_watermark, frame_tx)
+            .await;
+        if let Err(ref err) = result {
+            eprintln!(
+                "[ws pump] run errored tenant={} conv={} err={:?}",
+                pump_tenant, pump_conv, err,
+            );
+        } else {
+            eprintln!(
+                "[ws pump] run ended Ok tenant={} conv={}",
+                pump_tenant, pump_conv,
+            );
+        }
+        result
     });
 
     let idle = Duration::from_secs(limits.idle_timeout_secs);
