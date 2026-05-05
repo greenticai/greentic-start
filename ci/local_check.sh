@@ -18,6 +18,13 @@ cargo clippy -p greentic-start --all-targets --all-features -- -D warnings
 echo "[local_check] cargo test -p greentic-start --all-features"
 cargo test -p greentic-start --all-features
 
+# Optional: integration tests that need a real Redis. Skipped silently when
+# GREENTIC_TEST_REDIS_URL is not set (the test fns themselves print "skipping").
+if [ -n "${GREENTIC_TEST_REDIS_URL:-}" ]; then
+    echo "==> Running notifier Redis integration tests against $GREENTIC_TEST_REDIS_URL"
+    cargo test -p greentic-start --test notifier_redis -- --nocapture
+fi
+
 echo "[local_check] cargo build -p greentic-start --all-features"
 cargo build -p greentic-start --all-features
 
