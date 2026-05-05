@@ -71,19 +71,46 @@ impl Pump {
         initial_watermark: u64,
         tx: tokio::sync::mpsc::Sender<PumpFrame>,
     ) -> Result<(), PumpError> {
+        eprintln!(
+            "[ws pump] run start tenant={} conv={} initial_watermark={}",
+            tenant_id, conversation_id, initial_watermark,
+        );
         // 1. Subscribe FIRST so we don't miss events that fire during replay.
         let mut events: EventStream = self
             .notifier
             .subscribe(&tenant_id, &conversation_id)
             .await
-            .map_err(|e| PumpError::Notifier(e.to_string()))?;
+            .map_err(|e| {
+                eprintln!(
+                    "[ws pump] notifier subscribe FAILED tenant={} conv={} err={}",
+                    tenant_id, conversation_id, e,
+                );
+                PumpError::Notifier(e.to_string())
+            })?;
 
+        eprintln!(
+            "[ws pump] subscribed, calling fetch_since (replay) tenant={} conv={}",
+            tenant_id, conversation_id,
+        );
         // 2. Replay.
         let (replay_activities, mut cursor) = self
             .source
             .fetch_since(&tenant_id, &conversation_id, initial_watermark)
             .await
-            .map_err(PumpError::Source)?;
+            .map_err(|e| {
+                eprintln!(
+                    "[ws pump] fetch_since FAILED tenant={} conv={} err={}",
+                    tenant_id, conversation_id, e,
+                );
+                PumpError::Source(e)
+            })?;
+        eprintln!(
+            "[ws pump] replay completed tenant={} conv={} activity_count={} cursor={}",
+            tenant_id,
+            conversation_id,
+            replay_activities.len(),
+            cursor,
+        );
 
         if replay_activities.len() > self.max_replay_size {
             return Err(PumpError::ReplayTooLarge {
@@ -105,7 +132,15 @@ impl Pump {
         }
 
         // 3. Live loop.
+        eprintln!(
+            "[ws pump] entering live loop tenant={} conv={} cursor={}",
+            tenant_id, conversation_id, cursor,
+        );
         while let Some(event) = events.next().await {
+            eprintln!(
+                "[ws pump] live event recv tenant={} conv={} event_watermark={} cursor={}",
+                tenant_id, conversation_id, event.new_watermark, cursor,
+            );
             // Only act on events that advance the cursor.
             if event.new_watermark < cursor {
                 continue;
@@ -120,6 +155,7 @@ impl Pump {
                 .await
             {
                 Ok((activities, new_cursor)) => {
+                    let raw_count = activities.len();
                     let to_send: Vec<Value> = activities
                         .into_iter()
                         .filter(|a| {
@@ -130,6 +166,15 @@ impl Pump {
                                 .unwrap_or(true)
                         })
                         .collect();
+                    eprintln!(
+                        "[ws pump] live fetch ok tenant={} conv={} raw={} after_filter={} new_cursor={} cursor_was={}",
+                        tenant_id,
+                        conversation_id,
+                        raw_count,
+                        to_send.len(),
+                        new_cursor,
+                        cursor,
+                    );
                     if !to_send.is_empty() {
                         cursor = new_cursor;
                         if tx
@@ -140,17 +185,29 @@ impl Pump {
                             .await
                             .is_err()
                         {
+                            eprintln!(
+                                "[ws pump] tx.send failed (client gone) tenant={} conv={}",
+                                tenant_id, conversation_id,
+                            );
                             return Ok(());
                         }
                     }
                 }
                 Err(err) => {
+                    eprintln!(
+                        "[ws pump] live fetch FAILED tenant={} conv={} err={}",
+                        tenant_id, conversation_id, err,
+                    );
                     let _ = tx.send(PumpFrame::Error(err)).await;
                     // Transient: keep the session alive; next event retries.
                 }
             }
         }
 
+        eprintln!(
+            "[ws pump] events stream ended tenant={} conv={}",
+            tenant_id, conversation_id,
+        );
         Ok(())
     }
 }

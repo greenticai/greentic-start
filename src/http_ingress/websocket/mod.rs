@@ -32,7 +32,9 @@ use tokio::sync::mpsc;
 /// the full demo host.
 pub trait RunnerHostHandle: Send + Sync + 'static {
     /// Synchronously invoke `directline_http` GET on the named provider and
-    /// return the parsed JSON body.
+    /// return the parsed JSON body. `auth_token` is forwarded as the
+    /// `Authorization: Bearer <token>` header so the WASM provider's JWT
+    /// guard accepts the call.
     fn invoke_directline_get_activities(
         &self,
         tenant: &str,
@@ -40,6 +42,7 @@ pub trait RunnerHostHandle: Send + Sync + 'static {
         provider: &str,
         conversation_id: &str,
         watermark: u64,
+        auth_token: Option<&str>,
     ) -> Result<Value, String>;
 }
 
@@ -51,7 +54,17 @@ impl RunnerHostHandle for DemoRunnerHost {
         provider: &str,
         conversation_id: &str,
         watermark: u64,
+        auth_token: Option<&str>,
     ) -> Result<Value, String> {
+        let headers: Vec<serde_json::Value> = match auth_token {
+            Some(token) if !token.is_empty() => {
+                vec![serde_json::json!([
+                    "Authorization",
+                    format!("Bearer {token}")
+                ])]
+            }
+            _ => Vec::new(),
+        };
         let payload = serde_json::json!({
             "v": 1,
             "provider": provider,
@@ -62,7 +75,7 @@ impl RunnerHostHandle for DemoRunnerHost {
             "method": "GET",
             "path": format!("/v3/directline/conversations/{conversation_id}/activities"),
             "query": format!("watermark={watermark}&tenant={tenant}&team={team}"),
-            "headers": [],
+            "headers": headers,
             "body_b64": "",
             "config": serde_json::Value::Null,
         });
@@ -72,20 +85,33 @@ impl RunnerHostHandle for DemoRunnerHost {
             team: Some(team.to_string()),
             correlation_id: None,
         };
+        // The webchat provider exposes its directline routing under the
+        // generic `ingest_http` op (with hyphen alias). Try the canonical
+        // name first, then fall back to the underscore alias used by older
+        // pack builds.
         let outcome = self
             .invoke_provider_op(
                 Domain::Messaging,
                 provider,
-                "directline_http",
+                "ingest-http",
                 &payload_bytes,
                 &ctx,
             )
+            .or_else(|_| {
+                self.invoke_provider_op(
+                    Domain::Messaging,
+                    provider,
+                    "ingest_http",
+                    &payload_bytes,
+                    &ctx,
+                )
+            })
             .map_err(|err| err.to_string())?;
         if !outcome.success {
             return Err(outcome
                 .error
                 .or(outcome.raw)
-                .unwrap_or_else(|| "provider directline_http failed".to_string()));
+                .unwrap_or_else(|| "provider ingest_http failed".to_string()));
         }
         let value = outcome
             .output
@@ -113,6 +139,10 @@ pub struct RunnerHostActivitySource {
     pub runner_host: Arc<dyn RunnerHostHandle>,
     pub provider: String,
     pub team: String,
+    /// Bearer token captured at WS upgrade time. Forwarded as the
+    /// `Authorization` header on every `fetch_since` so the WASM provider's
+    /// JWT guard accepts internal pump calls.
+    pub auth_token: Option<String>,
 }
 
 #[async_trait]
@@ -128,8 +158,16 @@ impl pump::ActivitySource for RunnerHostActivitySource {
         let provider = self.provider.clone();
         let tenant = tenant_id.to_string();
         let conv = conversation_id.to_string();
+        let auth_token = self.auth_token.clone();
         let value = tokio::task::spawn_blocking(move || {
-            host.invoke_directline_get_activities(&tenant, &team, &provider, &conv, since_watermark)
+            host.invoke_directline_get_activities(
+                &tenant,
+                &team,
+                &provider,
+                &conv,
+                since_watermark,
+                auth_token.as_deref(),
+            )
         })
         .await
         .map_err(|err| format!("join error: {err}"))??;
@@ -165,10 +203,23 @@ pub async fn serve_session(
     limits: WsLimits,
     _guard: SessionGuard,
 ) {
+    eprintln!(
+        "[ws serve_session] entered tenant={} conv={} initial_watermark={}",
+        tenant_id, conversation_id, initial_watermark,
+    );
     let mut ws = match websocket.await {
-        Ok(stream) => stream,
+        Ok(stream) => {
+            eprintln!(
+                "[ws serve_session] handshake completed tenant={} conv={}",
+                tenant_id, conversation_id,
+            );
+            stream
+        }
         Err(err) => {
-            tracing::warn!(?err, "websocket handshake failed");
+            eprintln!(
+                "[ws serve_session] handshake FAILED tenant={} conv={} err={}",
+                tenant_id, conversation_id, err,
+            );
             return;
         }
     };
@@ -176,12 +227,39 @@ pub async fn serve_session(
     let (frame_tx, mut frame_rx) = mpsc::channel::<PumpFrame>(16);
     let pump = Pump::new(source, notifier, limits.max_replay_size);
 
+    let pump_tenant = tenant_id.clone();
+    let pump_conv = conversation_id.clone();
     let pump_handle = tokio::spawn(async move {
-        pump.run(tenant_id, conversation_id, initial_watermark, frame_tx)
-            .await
+        let result = pump
+            .run(tenant_id, conversation_id, initial_watermark, frame_tx)
+            .await;
+        if let Err(ref err) = result {
+            eprintln!(
+                "[ws pump] run errored tenant={} conv={} err={:?}",
+                pump_tenant, pump_conv, err,
+            );
+        } else {
+            eprintln!(
+                "[ws pump] run ended Ok tenant={} conv={}",
+                pump_tenant, pump_conv,
+            );
+        }
+        result
     });
 
     let idle = Duration::from_secs(limits.idle_timeout_secs);
+    // Send a WebSocket ping at half the idle window (clamped to a sane
+    // minimum) so a chat session that's idle waiting for a bot reply
+    // doesn't get reaped after `idle_timeout_secs`. The peer's pong
+    // arrives on the receive arm and resets the timeout naturally;
+    // if the peer is genuinely dead, no pong arrives and the receive
+    // arm's `idle` timeout still fires, breaking the loop.
+    let ping_period = Duration::from_secs((limits.idle_timeout_secs / 2).max(30));
+    let mut ping_ticker = tokio::time::interval(ping_period);
+    ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // First tick fires immediately by default; consume it so we don't
+    // ping at t=0 before the client has finished its handshake setup.
+    ping_ticker.tick().await;
     loop {
         tokio::select! {
             maybe_frame = frame_rx.recv() => {
@@ -210,6 +288,11 @@ pub async fn serve_session(
                     Err(_) | Ok(None) | Ok(Some(Ok(Message::Close(_)))) => break,
                     Ok(Some(Ok(_))) => continue,
                     Ok(Some(Err(_))) => break,
+                }
+            }
+            _ = ping_ticker.tick() => {
+                if ws.send(Message::Ping(Default::default())).await.is_err() {
+                    break;
                 }
             }
         }
