@@ -21,6 +21,20 @@ pub(crate) enum Command {
     Up(StartArgs),
     Stop(StopArgs),
     Restart(StartArgs),
+    Warmup(WarmupArgs),
+}
+
+#[derive(Parser, Clone)]
+pub(crate) struct WarmupArgs {
+    /// Path to a setup-resolved bundle directory whose components should be precompiled.
+    #[arg(long)]
+    pub(crate) bundle: PathBuf,
+    /// Cache root directory. Defaults to `${GREENTIC_CACHE_DIR}` or `.greentic/cache/components`.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) cache_dir: Option<PathBuf>,
+    /// Fail on the first compile error instead of counting it as skipped.
+    #[arg(long)]
+    pub(crate) strict: bool,
 }
 
 #[derive(Parser, Clone)]
@@ -229,7 +243,7 @@ pub(crate) fn normalize_args(raw_tail: Vec<String>) -> Vec<String> {
         return out;
     }
 
-    let known = ["start", "up", "stop", "restart"];
+    let known = ["start", "up", "stop", "restart", "warmup"];
     let mut first_pos = None;
     let mut skip_next_value = false;
     for arg in out.iter().skip(1) {
