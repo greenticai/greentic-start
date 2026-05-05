@@ -203,6 +203,9 @@ pub fn run_app_flow(
     flow_id: &str,
     envelope: &ChannelMessageEnvelope,
 ) -> Result<Vec<ChannelMessageEnvelope>> {
+    let mut envelope_for_flow = envelope.clone();
+    inject_pack_setup_answers(bundle, pack_id, &mut envelope_for_flow.metadata);
+
     let request = RunRequest {
         root: bundle.to_path_buf(),
         domain: crate::domains::Domain::Messaging,
@@ -212,7 +215,7 @@ pub fn run_app_flow(
         tenant: ctx.tenant.clone(),
         team: ctx.team.clone(),
         input: json!({
-            "input": envelope,
+            "input": &envelope_for_flow,
             "tenant": ctx.tenant,
             "team": ctx.team,
             "correlation_id": ctx.correlation_id,
@@ -221,10 +224,10 @@ pub fn run_app_flow(
     };
 
     let output = runner_exec::run_provider_pack_flow(request)?;
-    let target_node = envelope
+    let target_node = envelope_for_flow
         .metadata
         .get("routeToCardId")
-        .or_else(|| envelope.metadata.get("toCardId"));
+        .or_else(|| envelope_for_flow.metadata.get("toCardId"));
     operator_log::info(
         module_path!(),
         format!(
@@ -240,6 +243,56 @@ pub fn run_app_flow(
     )?
     .ok_or_else(|| anyhow::anyhow!("app flow produced no outputs"))?;
     parse_envelopes(&value, envelope)
+}
+
+/// Merge top-level keys from `<bundle>/state/config/<pack_id>/setup-answers.json`
+/// into `metadata` so flow templates can reference pack-level config (LLM url,
+/// model, api_key_secret, etc.) via `entry.input.metadata.*`. Existing keys
+/// from the inbound envelope take precedence — user-supplied form data is
+/// never overwritten by pack defaults.
+fn inject_pack_setup_answers(
+    bundle: &Path,
+    pack_id: &str,
+    metadata: &mut BTreeMap<String, String>,
+) {
+    let path = bundle
+        .join("state")
+        .join("config")
+        .join(pack_id)
+        .join("setup-answers.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let Ok(JsonValue::Object(answers)) = serde_json::from_slice::<JsonValue>(&bytes) else {
+        return;
+    };
+    let mut injected: Vec<&str> = Vec::new();
+    for (key, value) in &answers {
+        if metadata.contains_key(key) {
+            continue;
+        }
+        let coerced = match value {
+            JsonValue::String(text) => text.clone(),
+            JsonValue::Bool(flag) => flag.to_string(),
+            JsonValue::Number(num) => num.to_string(),
+            JsonValue::Null => continue,
+            JsonValue::Array(_) | JsonValue::Object(_) => match serde_json::to_string(value) {
+                Ok(s) => s,
+                Err(_) => continue,
+            },
+        };
+        metadata.insert(key.clone(), coerced);
+        injected.push(key.as_str());
+    }
+    if !injected.is_empty() {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[messaging_app] injected pack setup-answers pack_id={pack_id} keys=[{}]",
+                injected.join(",")
+            ),
+        );
+    }
 }
 
 fn extract_text_or_symbol(value: &CborValue, key: &str, symbol_table: &str) -> Option<String> {
@@ -1467,5 +1520,76 @@ mod tests {
         assert_eq!(info.flows.len(), 2);
         assert_eq!(info.flows[0].id, "default");
         assert_eq!(info.flows[1].kind, "workflow");
+    }
+
+    #[test]
+    fn inject_pack_setup_answers_merges_strings_without_overwriting_existing() {
+        let dir = tempdir().expect("tempdir");
+        let pack_id = "demo-pack";
+        let cfg_dir = dir.path().join("state").join("config").join(pack_id);
+        std::fs::create_dir_all(&cfg_dir).expect("create cfg dir");
+        std::fs::write(
+            cfg_dir.join("setup-answers.json"),
+            r#"{
+                "url": "https://api.openai.com/v1",
+                "model": "gpt-4o-mini",
+                "provider": "openai",
+                "api_key_secret": "secrets://openai/key",
+                "user_question": "should-not-overwrite",
+                "max_tokens": 1024,
+                "stream": true,
+                "tools": ["web_search"],
+                "extra_null": null
+            }"#,
+        )
+        .expect("write setup-answers");
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("user_question".to_string(), "What is 2+2?".to_string());
+
+        inject_pack_setup_answers(dir.path(), pack_id, &mut metadata);
+
+        // pack values present
+        assert_eq!(
+            metadata.get("url").map(String::as_str),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(
+            metadata.get("model").map(String::as_str),
+            Some("gpt-4o-mini")
+        );
+        assert_eq!(metadata.get("provider").map(String::as_str), Some("openai"));
+        assert_eq!(
+            metadata.get("api_key_secret").map(String::as_str),
+            Some("secrets://openai/key")
+        );
+        // numbers and bools are stringified
+        assert_eq!(metadata.get("max_tokens").map(String::as_str), Some("1024"));
+        assert_eq!(metadata.get("stream").map(String::as_str), Some("true"));
+        // arrays are JSON-encoded
+        assert_eq!(
+            metadata.get("tools").map(String::as_str),
+            Some("[\"web_search\"]")
+        );
+        // null skipped
+        assert!(!metadata.contains_key("extra_null"));
+        // existing user input is preserved
+        assert_eq!(
+            metadata.get("user_question").map(String::as_str),
+            Some("What is 2+2?")
+        );
+    }
+
+    #[test]
+    fn inject_pack_setup_answers_is_noop_when_file_missing() {
+        let dir = tempdir().expect("tempdir");
+        let mut metadata = BTreeMap::new();
+        metadata.insert("user_question".to_string(), "hello".to_string());
+        inject_pack_setup_answers(dir.path(), "nonexistent-pack", &mut metadata);
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(
+            metadata.get("user_question").map(String::as_str),
+            Some("hello")
+        );
     }
 }
