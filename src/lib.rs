@@ -68,6 +68,7 @@ mod subscriptions_universal;
 pub mod supervisor;
 mod timer_scheduler;
 mod tunnel_prompt;
+mod warmup;
 mod webhook_updater;
 #[doc(hidden)]
 pub mod ws_test_support;
@@ -129,6 +130,11 @@ pub fn run_from_env() -> anyhow::Result<()> {
             run_restart_request(start_request_from_args(args, tunnel_explicit))
         }
         Command::Stop(args) => run_stop_request(stop_request_from_args(args)),
+        Command::Warmup(args) => crate::warmup::run_warmup_request(crate::warmup::WarmupRequest {
+            bundle: args.bundle,
+            cache_dir: args.cache_dir,
+            strict: args.strict,
+        }),
     }
 }
 
@@ -175,6 +181,8 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     let config_path = demo_paths.config_path.clone();
     let config_dir = demo_paths.root_dir.clone();
     let state_dir = demo_paths.state_dir.clone();
+
+    crate::warmup::adopt_bundle_cache_dir(&config_dir);
     let log_dir = operator_log::init(
         request
             .log_dir

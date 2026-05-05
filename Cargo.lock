@@ -2306,7 +2306,7 @@ dependencies = [
  "greentic-pack-lib",
  "greentic-runner-host",
  "parking_lot",
- "runner-core",
+ "runner-core 0.5.12",
  "serde",
  "serde_json",
  "serde_yaml_gtc",
@@ -2319,9 +2319,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "0.5.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e98f74125051db10aa6d22628edef16b03d78805aca6c9c7e4612aa9c9af088c"
+version = "0.5.14"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2358,7 +2356,7 @@ dependencies = [
  "parking_lot",
  "rand 0.10.1",
  "reqwest 0.13.3",
- "runner-core",
+ "runner-core 0.5.14",
  "serde",
  "serde_cbor",
  "serde_json",
@@ -2517,7 +2515,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-start"
-version = "0.5.17"
+version = "0.5.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2570,6 +2568,7 @@ dependencies = [
  "ureq",
  "urlencoding",
  "uuid",
+ "wasmtime",
  "zip",
  "zstd",
 ]
@@ -4913,6 +4912,25 @@ name = "runner-core"
 version = "0.5.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93736f18cb918fc42275570483569c65bc1f4d5b36fd18ea7336b4e66eff7134"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "blake3",
+ "ed25519-dalek",
+ "greentic-config-types",
+ "greentic-pack-lib",
+ "reqwest 0.13.3",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "url",
+]
+
+[[package]]
+name = "runner-core"
+version = "0.5.14"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
