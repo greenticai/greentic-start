@@ -58,6 +58,7 @@ thiserror = "2"
 tracing = "0.1"
 unic-langid = "0.9"
 urlencoding = "2"
+wasmtime = { version = "43", default-features = false, features = ["component-model", "cranelift", "runtime"] }
 zip = "8"
 zstd = "0.13"
 
