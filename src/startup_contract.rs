@@ -172,9 +172,7 @@ fn collect_gtpacks(root: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
                 stack.push(path);
                 continue;
             }
-            if path.extension().and_then(|ext| ext.to_str()) == Some("gtpack")
-                && domains::is_runtime_bundle_pack_path(&path)
-            {
+            if path.extension().and_then(|ext| ext.to_str()) == Some("gtpack") {
                 out.push(path);
             }
         }
@@ -265,25 +263,6 @@ mod tests {
         write_pack(&pack_path, true)?;
         std::fs::write(
             dir.path().join("packs").join("terraform.gtpack"),
-            b"not-a-zip",
-        )?;
-        let inspection = inspect_bundle(dir.path())?;
-        assert!(inspection.bundle_has_static_routes());
-        assert_eq!(inspection.pack_paths, vec![pack_path]);
-        Ok(())
-    }
-
-    #[test]
-    fn inspect_bundle_ignores_deployer_packs_under_provider_tree() -> anyhow::Result<()> {
-        let dir = tempdir()?;
-        let pack_path = dir.path().join("packs").join("default.gtpack");
-        write_pack(&pack_path, true)?;
-        std::fs::create_dir_all(dir.path().join("providers").join("deployer"))?;
-        std::fs::write(
-            dir.path()
-                .join("providers")
-                .join("deployer")
-                .join("aws.gtpack"),
             b"not-a-zip",
         )?;
         let inspection = inspect_bundle(dir.path())?;

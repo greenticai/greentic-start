@@ -113,9 +113,7 @@ fn collect_gtpacks(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
                 stack.push(path);
                 continue;
             }
-            if path.extension().and_then(|ext| ext.to_str()) == Some("gtpack")
-                && domains::is_runtime_bundle_pack_path(&path)
-            {
+            if path.extension().and_then(|ext| ext.to_str()) == Some("gtpack") {
                 packs.push(path);
             }
         }
@@ -427,33 +425,6 @@ mod tests {
         assert_eq!(discovered.providers.len(), 1);
         assert_eq!(discovered.providers[0].provider_id, "messaging-webchat-gui");
         assert_eq!(discovered.providers[0].domain, "messaging");
-    }
-
-    #[test]
-    fn discover_ignores_deployer_packs_under_provider_tree() {
-        let dir = tempdir().expect("tempdir");
-        let messaging_dir = dir.path().join("providers").join("messaging");
-        let deployer_dir = dir.path().join("providers").join("deployer");
-        std::fs::create_dir_all(&messaging_dir).expect("messaging dir");
-        std::fs::create_dir_all(&deployer_dir).expect("deployer dir");
-
-        write_pack(
-            &messaging_dir.join("alpha.gtpack"),
-            &[(
-                "manifest.cbor",
-                serde_cbor::to_vec(&CborValue::Map(std::collections::BTreeMap::from([(
-                    CborValue::Text("pack_id".to_string()),
-                    CborValue::Text("messaging-alpha".to_string()),
-                )])))
-                .expect("manifest"),
-            )],
-        );
-        std::fs::write(deployer_dir.join("aws.gtpack"), b"not-a-zip").expect("fake deployer");
-
-        let discovered = discover(dir.path()).expect("discover");
-        assert!(discovered.domains.messaging);
-        assert_eq!(discovered.providers.len(), 1);
-        assert_eq!(discovered.providers[0].provider_id, "messaging-alpha");
     }
 
     #[test]
