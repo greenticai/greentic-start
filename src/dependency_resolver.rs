@@ -17,7 +17,7 @@ use anyhow::Context;
 use greentic_types::decode_pack_manifest;
 use zip::ZipArchive;
 
-use crate::operator_log;
+use crate::{domains, operator_log};
 
 /// Result of dependency checking across all packs in the bundle.
 #[derive(Debug, Default)]
@@ -120,7 +120,9 @@ fn collect_all_gtpacks(bundle_root: &Path) -> Vec<PathBuf> {
             {
                 for sub in sub_entries.flatten() {
                     let p = sub.path();
-                    if p.extension().is_some_and(|e| e == "gtpack") {
+                    if p.extension().is_some_and(|e| e == "gtpack")
+                        && domains::is_runtime_bundle_pack_path(&p)
+                    {
                         paths.push(p);
                     }
                 }
@@ -131,7 +133,9 @@ fn collect_all_gtpacks(bundle_root: &Path) -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(&packs_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.extension().is_some_and(|e| e == "gtpack") {
+            if p.extension().is_some_and(|e| e == "gtpack")
+                && domains::is_runtime_bundle_pack_path(&p)
+            {
                 paths.push(p);
             }
         }
@@ -185,8 +189,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("providers/messaging")).unwrap();
+        std::fs::create_dir_all(root.join("providers/deployer")).unwrap();
         std::fs::create_dir_all(root.join("packs")).unwrap();
         std::fs::write(root.join("providers/messaging/a.gtpack"), b"").unwrap();
+        std::fs::write(root.join("providers/deployer/aws.gtpack"), b"").unwrap();
         std::fs::write(root.join("packs/b.gtpack"), b"").unwrap();
         std::fs::write(root.join("packs/not-a-pack.txt"), b"").unwrap();
 
@@ -194,6 +200,7 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(paths.iter().any(|p| p.ends_with("a.gtpack")));
         assert!(paths.iter().any(|p| p.ends_with("b.gtpack")));
+        assert!(!paths.iter().any(|p| p.ends_with("aws.gtpack")));
     }
 
     #[test]

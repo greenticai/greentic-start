@@ -182,7 +182,9 @@ fn collect_gtpacks(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
                 stack.push(path);
                 continue;
             }
-            if path.extension().and_then(|ext| ext.to_str()) == Some("gtpack") {
+            if path.extension().and_then(|ext| ext.to_str()) == Some("gtpack")
+                && is_runtime_bundle_pack_path(&path)
+            {
                 packs.push(path);
             }
         }
@@ -198,6 +200,21 @@ pub(crate) fn supports_runtime_pack_loading(path: &Path) -> bool {
         return false;
     };
     zip::ZipArchive::new(file).is_ok()
+}
+
+pub(crate) fn is_runtime_bundle_pack_path(path: &Path) -> bool {
+    !is_deployer_pack_path(path)
+}
+
+fn is_deployer_pack_path(path: &Path) -> bool {
+    let mut previous_was_providers = false;
+    for component in path.iter() {
+        if previous_was_providers && component == std::ffi::OsStr::new("deployer") {
+            return true;
+        }
+        previous_was_providers = component == std::ffi::OsStr::new("providers");
+    }
+    false
 }
 
 fn append_packs_from_root(
@@ -1056,6 +1073,22 @@ mod tests {
         let pack_path = providers_dir.join("messaging-webchat.gtpack");
         write_test_gtpack(&pack_path, "messaging-webchat", &["setup_default"]);
         fs::write(packs_dir.join("terraform.gtpack"), b"not-a-zip").expect("fake deployer pack");
+
+        let packs = discover_provider_packs(temp.path(), Domain::Messaging).expect("discover");
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].pack_id, "messaging-webchat");
+    }
+
+    #[test]
+    fn discover_provider_packs_skips_deployer_packs_under_provider_tree() {
+        let temp = tempdir().expect("tempdir");
+        let providers_dir = temp.path().join("providers").join("messaging");
+        let deployer_dir = temp.path().join("providers").join("deployer");
+        fs::create_dir_all(&providers_dir).expect("providers dir");
+        fs::create_dir_all(&deployer_dir).expect("deployer dir");
+        let pack_path = providers_dir.join("messaging-webchat.gtpack");
+        write_test_gtpack(&pack_path, "messaging-webchat", &["setup_default"]);
+        fs::write(deployer_dir.join("aws.gtpack"), b"not-a-zip").expect("fake deployer pack");
 
         let packs = discover_provider_packs(temp.path(), Domain::Messaging).expect("discover");
         assert_eq!(packs.len(), 1);
