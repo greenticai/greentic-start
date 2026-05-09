@@ -107,7 +107,7 @@ impl DemoRunnerHost {
                         // Check if it's a "not found" error
                         let err_str = err.to_string();
                         if err_str.contains("not found") || err_str.contains("NotFound") {
-                            Ok(None)
+                            Ok(load_setup_answer_secret(&self.bundle_root, provider, key))
                         } else {
                             Err(anyhow::anyhow!("secret read failed: {}", err))
                         }
@@ -436,6 +436,23 @@ impl DemoRunnerHost {
     }
 }
 
+fn load_setup_answer_secret(bundle_root: &Path, provider: &str, key: &str) -> Option<Vec<u8>> {
+    let path = bundle_root
+        .join("state")
+        .join("config")
+        .join(provider)
+        .join("setup-answers.json");
+    let bytes = std::fs::read(path).ok()?;
+    let json = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
+    let value = json.get(key)?;
+    match value {
+        serde_json::Value::String(text) if !text.is_empty() => Some(text.as_bytes().to_vec()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string().into_bytes()),
+        serde_json::Value::Number(number) => Some(number.to_string().into_bytes()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +522,38 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn get_secret_falls_back_to_setup_answers_when_store_has_no_secret() {
+        let dir = tempdir().unwrap();
+        let config_dir = dir
+            .path()
+            .join("state")
+            .join("config")
+            .join("messaging-webchat-gui");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("setup-answers.json"),
+            r#"{"jwt_signing_key":"from-setup-answers"}"#,
+        )
+        .unwrap();
+
+        let discovery = discovery::discover(dir.path()).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
+        let host =
+            DemoRunnerHost::new(dir.keep(), &discovery, None, secrets_handle, false).unwrap();
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            correlation_id: None,
+        };
+
+        let value = host
+            .get_secret("messaging-webchat-gui", "jwt_signing_key", &ctx)
+            .unwrap();
+        assert_eq!(value, Some(b"from-setup-answers".to_vec()));
     }
 
     #[test]
