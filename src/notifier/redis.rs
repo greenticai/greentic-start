@@ -16,6 +16,7 @@ use crate::notifier::{
 };
 
 const DEFAULT_CHANNEL: &str = "greentic:webchat:notify";
+const BOOT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Wire payload exchanged over the global pub/sub channel.
 ///
@@ -108,16 +109,20 @@ impl RedisNotifier {
         let client = Client::open(url).with_context(|| format!("invalid redis url: {url}"))?;
 
         // Open the PUB connection (ConnectionManager auto-reconnects on use).
-        let pub_conn = ConnectionManager::new(client.clone())
-            .await
-            .with_context(|| format!("failed to open redis PUB connection to {url}"))?;
+        let pub_conn =
+            tokio::time::timeout(BOOT_CONNECT_TIMEOUT, ConnectionManager::new(client.clone()))
+                .await
+                .with_context(|| format!("timed out opening redis PUB connection to {url}"))?
+                .with_context(|| format!("failed to open redis PUB connection to {url}"))?;
 
         // Verify SUB connectivity once at boot by opening and immediately
         // dropping a probe connection.
         {
-            let probe = subscribe_once(&client, &channel)
-                .await
-                .with_context(|| format!("failed to open redis SUB connection to {url}"))?;
+            let probe =
+                tokio::time::timeout(BOOT_CONNECT_TIMEOUT, subscribe_once(&client, &channel))
+                    .await
+                    .with_context(|| format!("timed out opening redis SUB connection to {url}"))?
+                    .with_context(|| format!("failed to open redis SUB connection to {url}"))?;
             drop(probe);
         }
 

@@ -20,6 +20,7 @@ mod demo_qa_bridge;
 mod dependency_resolver;
 mod dev_store_path;
 mod discovery;
+mod doctor;
 mod domains;
 mod event_router;
 pub(crate) mod flow_log;
@@ -135,6 +136,13 @@ pub fn run_from_env() -> anyhow::Result<()> {
             cache_dir: args.cache_dir,
             strict: args.strict,
         }),
+        Command::Doctor(args) => {
+            let has_errors = crate::doctor::run_doctor(args)?;
+            if has_errors {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
     }
 }
 
