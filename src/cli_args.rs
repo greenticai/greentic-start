@@ -22,6 +22,41 @@ pub(crate) enum Command {
     Stop(StopArgs),
     Restart(StartArgs),
     Warmup(WarmupArgs),
+    Doctor(DoctorArgs),
+}
+
+#[derive(Parser, Clone)]
+pub(crate) struct DoctorArgs {
+    /// Bundle reference or extracted bundle directory to inspect.
+    pub(crate) bundle: String,
+    /// Emit stable machine-readable JSON.
+    #[arg(long)]
+    pub(crate) json: bool,
+    /// Promote drift/tag/cache warnings to errors.
+    #[arg(long)]
+    pub(crate) strict: bool,
+    /// Include longer remediation hints in human output.
+    #[arg(long)]
+    pub(crate) fix_hints: bool,
+    /// Include informational checks in output.
+    #[arg(long)]
+    pub(crate) show_info: bool,
+    /// Restrict checks to one diagnostic stage.
+    #[arg(long, value_enum, default_value_t = DoctorStageArg::All)]
+    pub(crate) stage: DoctorStageArg,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum DoctorStageArg {
+    All,
+    Setup,
+    Cache,
+    Locks,
+    Answers,
+    Runtime,
+    Routes,
+    Provider,
+    Secrets,
 }
 
 #[derive(Parser, Clone)]
@@ -243,7 +278,7 @@ pub(crate) fn normalize_args(raw_tail: Vec<String>) -> Vec<String> {
         return out;
     }
 
-    let known = ["start", "up", "stop", "restart", "warmup"];
+    let known = ["start", "up", "stop", "restart", "warmup", "doctor"];
     let mut first_pos = None;
     let mut skip_next_value = false;
     for arg in out.iter().skip(1) {
@@ -314,6 +349,7 @@ fn arg_takes_value(arg: &str) -> bool {
             | "--runner-binary"
             | "--restart"
             | "--log-dir"
+            | "--stage"
             | "--state-dir"
             | "--admin-port"
             | "--admin-certs-dir"
@@ -361,6 +397,14 @@ mod tests {
         assert_eq!(args[1], "stop");
         assert_eq!(args[2], "--tenant");
         assert_eq!(args[3], "demo");
+    }
+
+    #[test]
+    fn normalize_args_keeps_explicit_doctor() {
+        let args = normalize_args(vec!["doctor".into(), ".".into(), "--json".into()]);
+        assert_eq!(args[0], "greentic-start");
+        assert_eq!(args[1], "doctor");
+        assert_eq!(args[2], ".");
     }
 
     #[test]
