@@ -815,6 +815,10 @@ pub fn demo_up_services(
     let ingress_domains = detect_http_ingress_domains(&discovery, runner_host.as_ref());
     // Enable static routes if bundle declares them - no longer requires NATS mode
     let enable_static_routes = static_routes.bundle_has_static_routes();
+    if enable_static_routes || ingress_domains.contains(&Domain::Messaging) {
+        validate_messaging_app_route(config_dir, tenant, Some(team))
+            .with_context(|| "messaging app route validation failed")?;
+    }
     let ingress_server = start_http_ingress_server(
         config,
         &ingress_domains,
@@ -1262,6 +1266,74 @@ pub fn demo_up_services(
     }
 
     Ok(ForegroundRuntimeHandles { ingress_server })
+}
+
+fn validate_messaging_app_route(
+    bundle_root: &Path,
+    tenant: &str,
+    team: Option<&str>,
+) -> anyhow::Result<()> {
+    let app_pack_path = match crate::messaging_app::resolve_app_pack_path(
+        bundle_root,
+        tenant,
+        team,
+        None,
+    ) {
+        Ok(path) => path,
+        Err(err) => {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "APP_PACK_NOT_RESOLVED: greentic-start cannot choose which app pack to invoke for tenant={} team={}. \
+Expected bundle.yaml app_packs, packs/{tenant}/{}/default.gtpack, packs/{tenant}/default.gtpack, or packs/default.gtpack. \
+Details: {err:#}",
+                    tenant,
+                    team.unwrap_or("_"),
+                    team.unwrap_or("_")
+                ),
+            );
+            return Err(err).context("unable to resolve messaging app pack");
+        }
+    };
+    let pack_info = match crate::messaging_app::load_app_pack_info(&app_pack_path) {
+        Ok(info) => info,
+        Err(err) => {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "APP_PACK_MANIFEST_INVALID: greentic-start found app pack {} but could not read its manifest. Details: {err:#}",
+                    app_pack_path.display()
+                ),
+            );
+            return Err(err).context("unable to read messaging app pack manifest");
+        }
+    };
+    match crate::messaging_app::select_app_flow(&pack_info) {
+        Ok(flow) => {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "messaging app route resolved: pack={} pack_id={} flow={} kind={}",
+                    app_pack_path.display(),
+                    pack_info.pack_id,
+                    flow.id,
+                    flow.kind
+                ),
+            );
+            Ok(())
+        }
+        Err(err) => {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "{} pack={}",
+                    crate::messaging_app::app_flow_resolution_error(&pack_info),
+                    app_pack_path.display()
+                ),
+            );
+            Err(err).context("unable to resolve messaging app flow")
+        }
+    }
 }
 
 fn detect_http_ingress_domains(
