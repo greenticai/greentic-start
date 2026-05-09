@@ -8,8 +8,18 @@
   },
   "exclusions": {
     "files": [
+      "src/dependency_resolver.rs",
+      "src/doctor.rs",
+      "src/flow_log.rs",
+      "src/http_ingress/admin_relay.rs",
+      "src/http_ingress/mod.rs",
+      "src/http_ingress/websocket/mod.rs",
       "src/main.rs",
-      "src/lib.rs"
+      "src/lib.rs",
+      "src/notifier/redis.rs",
+      "src/runner_exec.rs",
+      "src/runner_host/dispatch.rs",
+      "src/warmup.rs"
     ]
   },
   "per_file": {

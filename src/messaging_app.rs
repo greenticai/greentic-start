@@ -186,13 +186,34 @@ pub fn select_app_flow(info: &AppPackInfo) -> Result<&AppFlowInfo> {
     if messaging_flows.len() == 1 {
         return Ok(messaging_flows[0]);
     }
-    let available = info
+    bail!("{}", app_flow_resolution_error(info));
+}
+
+pub fn app_flow_resolution_error(info: &AppPackInfo) -> String {
+    let messaging_count = info
         .flows
         .iter()
-        .map(|flow| flow.id.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    bail!("APP_FLOW_NOT_RESOLVED; available flows: {available}");
+        .filter(|flow| flow.kind.eq_ignore_ascii_case("messaging"))
+        .count();
+    let available = if info.flows.is_empty() {
+        "<none>".to_string()
+    } else {
+        info.flows
+            .iter()
+            .map(|flow| format!("{} (kind={})", flow.id, flow.kind))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "APP_FLOW_NOT_RESOLVED: greentic-start cannot choose which flow to invoke for app pack `{}`. \
+Expected either a flow with id `default`, or exactly one flow with kind `messaging`. \
+Found {} flow(s), {} messaging flow(s): {}. \
+Fix the pack manifest by marking one flow as id `default`, or by making exactly one flow kind `messaging`.",
+        info.pack_id,
+        info.flows.len(),
+        messaging_count,
+        available
+    )
 }
 
 pub fn run_app_flow(
@@ -1051,7 +1072,11 @@ mod tests {
         };
 
         let err = select_app_flow(&info).expect_err("ambiguous flow should fail");
-        assert!(err.to_string().contains("one, two"));
+        let message = err.to_string();
+        assert!(message.contains("APP_FLOW_NOT_RESOLVED"));
+        assert!(message.contains("cannot choose which flow to invoke"));
+        assert!(message.contains("one (kind=messaging), two (kind=messaging)"));
+        assert!(message.contains("flow with id `default`"));
     }
 
     #[test]
