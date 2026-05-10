@@ -96,6 +96,10 @@ impl DemoRunnerHost {
         use crate::secrets_gate::canonical_secret_uri;
         use crate::secrets_setup::resolve_env;
 
+        if let Some(bytes) = load_setup_answer_secret(&self.bundle_root, provider, key) {
+            return Ok(Some(bytes));
+        }
+
         let env = resolve_env(None);
         let uri = canonical_secret_uri(&env, &ctx.tenant, ctx.team.as_deref(), provider, key);
 
@@ -104,10 +108,13 @@ impl DemoRunnerHost {
                 match self.secrets_handle.manager().read(&uri).await {
                     Ok(bytes) => Ok(Some(bytes)),
                     Err(err) => {
-                        // Check if it's a "not found" error
                         let err_str = err.to_string();
-                        if err_str.contains("not found") || err_str.contains("NotFound") {
-                            Ok(load_setup_answer_secret(&self.bundle_root, provider, key))
+                        if err_str.contains("not found")
+                            || err_str.contains("NotFound")
+                            || err_str.contains("not-found")
+                            || err_str.contains("not provisioned")
+                        {
+                            Ok(None)
                         } else {
                             Err(anyhow::anyhow!("secret read failed: {}", err))
                         }
@@ -525,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn get_secret_falls_back_to_setup_answers_when_store_has_no_secret() {
+    fn get_secret_prefers_setup_answers_when_present() {
         let dir = tempdir().unwrap();
         let config_dir = dir
             .path()
