@@ -25,6 +25,7 @@ pub enum SelectedKind {
     TenantTeam,
     Tenant,
     Default,
+    EnvImplicit,
     Override,
     None,
 }
@@ -38,6 +39,9 @@ impl SecretsManagerSelection {
     }
 
     pub fn kind(&self) -> Result<SecretsBackendKind> {
+        if self.scope == SelectedKind::EnvImplicit {
+            return Ok(SecretsBackendKind::Env);
+        }
         if let Some(pack_path) = &self.pack_path {
             secrets_backend::backend_kind_from_pack(pack_path)
         } else {
@@ -99,10 +103,26 @@ pub fn select_secrets_manager(
         }
     }
 
+    if has_env_secret_vars() {
+        return Ok(SecretsManagerSelection {
+            scope: SelectedKind::EnvImplicit,
+            pack_path: None,
+            reason: "environment secrets detected in process environment".to_string(),
+        });
+    }
+
     Ok(SecretsManagerSelection {
         scope: SelectedKind::None,
         pack_path: None,
         reason: "no secrets manager pack found".to_string(),
+    })
+}
+
+fn has_env_secret_vars() -> bool {
+    env::vars_os().any(|(key, _)| {
+        key.to_str()
+            .map(|name| name.starts_with("GREENTIC_SECRET__"))
+            .unwrap_or(false)
     })
 }
 
@@ -215,6 +235,27 @@ mod tests {
         }
         assert_eq!(selection.scope, SelectedKind::Override);
         assert_eq!(selection.pack_path.unwrap(), alt);
+    }
+
+    #[test]
+    fn auto_selects_env_backend_when_greentic_secret_vars_exist() {
+        let _env_guard = crate::test_env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        unsafe {
+            env::set_var(
+                "GREENTIC_SECRET__DEMO__ACME_____MESSAGING_WEBCHAT_GUI__JWT_SIGNING_KEY",
+                "x",
+            );
+        }
+        let selection = select_secrets_manager(dir.path(), "tenant", "team").unwrap();
+        unsafe {
+            env::remove_var(
+                "GREENTIC_SECRET__DEMO__ACME_____MESSAGING_WEBCHAT_GUI__JWT_SIGNING_KEY",
+            );
+        }
+        assert_eq!(selection.scope, SelectedKind::EnvImplicit);
+        assert!(selection.pack_path.is_none());
+        assert_eq!(selection.kind().unwrap(), SecretsBackendKind::Env);
     }
 
     #[test]
