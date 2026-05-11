@@ -12,10 +12,12 @@ BATCH_SIZE="${BATCH_SIZE:-200}"
 I18N_TRANSLATOR_MANIFEST="${I18N_TRANSLATOR_MANIFEST:-../greentic-i18n/Cargo.toml}"
 
 if [[ -z "${EN_PATH:-}" ]]; then
-  if [[ -f "i18n/en.json" ]]; then
+  if [[ -f "i18n/operator_cli/en.json" ]]; then
+    EN_PATH="i18n/operator_cli/en.json"
+  elif [[ -f "i18n/en.json" ]]; then
     EN_PATH="i18n/en.json"
   else
-    echo "Could not infer EN_PATH (expected i18n/en.json). Set EN_PATH explicitly." >&2
+    echo "Could not infer EN_PATH (expected i18n/operator_cli/en.json). Set EN_PATH explicitly." >&2
     exit 2
   fi
 fi
@@ -25,7 +27,7 @@ usage() {
 Usage: tools/i18n.sh [translate|validate|status|all]
 
 Environment overrides:
-  EN_PATH=...                     English source file path (default: i18n/en.json)
+  EN_PATH=...                     English source file path (default: i18n/operator_cli/en.json)
   LANGS=...                       Language list for translator (default: all)
   BATCH_SIZE=...                  Translation batch size (default: 200)
   AUTH_MODE=...                   Translator auth mode for translate (default: auto)
@@ -35,7 +37,7 @@ Environment overrides:
 Examples:
   tools/i18n.sh all
   AUTH_MODE=api-key tools/i18n.sh translate
-  LANGS=all EN_PATH=i18n/en.json tools/i18n.sh validate
+  LANGS=all EN_PATH=i18n/operator_cli/en.json tools/i18n.sh validate
 EOF
 }
 

@@ -230,7 +230,7 @@ fn append_pack(
     if !seen.insert(path.clone()) {
         return Ok(());
     }
-    if path.starts_with(bundle_root.join("packs")) && !supports_runtime_pack_loading(&path) {
+    if !supports_runtime_pack_loading(&path) {
         return Ok(());
     }
     let file_name = path

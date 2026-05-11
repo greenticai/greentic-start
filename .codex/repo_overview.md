@@ -18,9 +18,10 @@ The repo is centered on startup/runtime concerns rather than setup UX. It integr
 - **Path:** `src/main.rs`, `src/lib.rs`
   - **Role:** Main CLI entrypoint and command normalization layer.
   - **Key functionality:**
-    - Exposes `start`, `up`, `restart`, and `stop`.
+    - Exposes `start`, `up`, `restart`, `stop`, `warmup`, and `doctor`.
     - Normalizes legacy `demo ...` style invocations into the current CLI.
     - Resolves bundle/config/state paths, logging, tunnel binaries, and runtime launch flags before delegating into `runtime`.
+    - Provides a read-only `doctor <bundle>` path that reuses existing bundle, config, provider, setup-output, static-route, and runtime metadata validators to produce human or JSON diagnostics.
     - On the current branch, inspects bundles for static-route declarations and passes startup contract inputs into the runtime path.
     - Re-exports `config`, `runtime`, `runtime_state`, and `supervisor` as public modules so downstream integration tests can keep using the documented helper types/functions.
   - **Key dependencies / integration points:** `src/runtime.rs`, `src/config.rs`, `src/bundle_ref.rs`, `src/startup_contract.rs`.
@@ -148,6 +149,10 @@ The repo is centered on startup/runtime concerns rather than setup UX. It integr
 - **Location:** Current worktree state
   - **Evidence:** Uncommitted changes exist in `Cargo.toml`, `Cargo.lock`, `README.md`, `src/lib.rs`, `src/runtime.rs`, and new `src/startup_contract.rs`; `.codex/` is also untracked.
   - **Likely cause / nature of issue:** The repository is mid-change. Any overview or validation result should be interpreted as a snapshot of the current worktree, not only the last committed `master` state.
+
+- **Location:** `.codex/PR-DOCTOR-01-doctor-commands.md`
+  - **Evidence:** New audit/proposal file for `greentic-setup doctor <bundle>` and `greentic-start doctor <bundle>`.
+  - **Likely cause / nature of issue:** Requested audit and staged implementation plan. The current branch now includes the first read-only `greentic-start doctor <bundle>` implementation slice; the setup command remains external to this repo.
 
 ## 5. Notes for Future Work
 

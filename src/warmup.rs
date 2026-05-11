@@ -77,7 +77,10 @@ pub fn run_warmup_request(request: WarmupRequest) -> Result<()> {
     for entry in &collected {
         let digest = sha256_hex(&entry.bytes);
         let key = ArtifactKey::new(profile.id().to_string(), format!("sha256:{digest}"));
-        items.push(WarmupItem { key });
+        items.push(WarmupItem {
+            key,
+            bytes: entry.bytes.clone(),
+        });
     }
 
     let mode = if request.strict {
