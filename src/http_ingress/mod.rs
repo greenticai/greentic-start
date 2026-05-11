@@ -1,4 +1,5 @@
 mod admin_relay;
+mod directline_session;
 mod helpers;
 mod messaging;
 mod static_handler;
@@ -172,6 +173,7 @@ impl HttpIngressServer {
             active_route_table,
             http_route_table,
             admin_relay,
+            directline_sessions: Arc::new(directline_session::DirectLineSessions::from_env()),
         });
 
         // Resolve an available port before spawning the server thread.
@@ -303,6 +305,10 @@ struct HttpIngressState {
     active_route_table: ActiveRouteTable,
     http_route_table: HttpRouteTable,
     admin_relay: Option<Arc<AdminRelayConfig>>,
+    /// Sliding-window registry of active DirectLine conversations, used to
+    /// re-mint session tokens on activity so long-running chats don't 401 once
+    /// the original 1800 s JWT lapses. See [`directline_session`].
+    directline_sessions: Arc<directline_session::DirectLineSessions>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -914,13 +920,30 @@ where
     let provider_queries =
         augment_directline_queries(request.queries, request.tenant, Some(request.team));
     let provider_query_string = encode_directline_query_string(&provider_queries);
-    let headers = collect_headers(req.headers());
+    let mut headers = collect_headers(req.headers());
     let body = req
         .into_body()
         .collect()
         .await
         .map(|collected| collected.to_bytes())
         .unwrap_or_default();
+    let ctx = OperatorContext {
+        tenant: request.tenant.to_string(),
+        team: Some(request.team.to_string()),
+        correlation_id: None,
+    };
+    // DirectLine session-token renewal: extend the conversation's sliding
+    // window on activity, re-mint a fresh-TTL bearer for the upstream call, and
+    // surface a renewed token to the client (or short-circuit on auth failure /
+    // `/tokens/refresh`). See `directline_session`.
+    let forward_plan = directline_session_preflight(
+        state,
+        request.provider,
+        &provider_method,
+        &provider_path,
+        &mut headers,
+        &ctx,
+    )?;
     let payload = serde_json::json!({
         "v": 1,
         "provider": request.provider,
@@ -935,11 +958,6 @@ where
         "body_b64": base64::engine::general_purpose::STANDARD.encode(&body),
         "config": serde_json::Value::Null,
     });
-    let ctx = OperatorContext {
-        tenant: request.tenant.to_string(),
-        team: Some(request.team.to_string()),
-        correlation_id: None,
-    };
     let payload_bytes = serde_json::to_vec(&payload).map_err(|err| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -964,14 +982,72 @@ where
         return Err(error_response(StatusCode::BAD_GATEWAY, message));
     }
     let value = outcome.output.unwrap_or_else(|| serde_json::json!({}));
-    let response = parse_provider_directline_http_response(&value).map_err(|err| {
+    let mut response = parse_provider_directline_http_response(&value).map_err(|err| {
         error_response(
             StatusCode::BAD_GATEWAY,
             format!("invalid directline_http response: {err}"),
         )
     })?;
+    apply_directline_forward_plan(state, &forward_plan, &mut response);
     build_http_response(&response)
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err))
+}
+
+#[allow(clippy::result_large_err)]
+/// Run the DirectLine token-renewal preflight for a request that is about to be
+/// forwarded to a webchat provider. Returns the [`directline_session::ForwardPlan`]
+/// to apply to the response, or `Err(response)` to short-circuit (auth failure,
+/// `/tokens/refresh`).
+fn directline_session_preflight(
+    state: &Arc<HttpIngressState>,
+    provider: &str,
+    method: &Method,
+    provider_path: &str,
+    headers: &mut Vec<(String, String)>,
+    ctx: &OperatorContext,
+) -> Result<directline_session::ForwardPlan, Response<Full<Bytes>>> {
+    let signing_key = state
+        .runner_host
+        .get_secret(provider, "jwt_signing_key", ctx)
+        .ok()
+        .flatten();
+    match directline_session::preflight(
+        method,
+        provider_path,
+        headers,
+        signing_key.as_deref(),
+        &state.directline_sessions,
+    ) {
+        directline_session::Preflight::Respond(response) => Err(response),
+        directline_session::Preflight::Forward(plan) => {
+            if let Some(authorization) = plan.rewrite_authorization.as_deref() {
+                directline_session::apply_authorization_rewrite(headers, authorization);
+            }
+            Ok(plan)
+        }
+    }
+}
+
+/// Apply the post-response side of a [`directline_session::ForwardPlan`]: seed
+/// the sliding window from a `POST /conversations` response and/or inject
+/// `_directline.renewed_token` into the body.
+fn apply_directline_forward_plan(
+    state: &Arc<HttpIngressState>,
+    plan: &directline_session::ForwardPlan,
+    response: &mut IngressHttpResponse,
+) {
+    if plan.seed_from_response
+        && let Some(conv) = directline_session::conversation_id_from_response(response)
+    {
+        state.directline_sessions.touch(&conv);
+    }
+    if let Some(renewed) = plan.inject_renewed_token.as_deref() {
+        directline_session::inject_renewed_token(
+            response,
+            renewed,
+            state.directline_sessions.ttl_secs(),
+        );
+    }
 }
 
 fn normalize_directline_dispatch(method: &Method, path: &str) -> (Method, String) {
@@ -1050,7 +1126,7 @@ where
         normalize_directline_dispatch(request.method, request.path);
     let provider_queries =
         augment_directline_queries(request.queries, request.tenant, Some(request.team));
-    let headers = collect_headers(req.headers());
+    let mut headers = collect_headers(req.headers());
     let body = req
         .into_body()
         .collect()
@@ -1062,6 +1138,15 @@ where
         team: Some(request.team.to_string()),
         correlation_id: None,
     };
+    // DirectLine session-token renewal (see the `directline_http` variant above).
+    let forward_plan = directline_session_preflight(
+        state,
+        request.provider,
+        &provider_method,
+        &provider_path,
+        &mut headers,
+        &ctx,
+    )?;
     let ingress_request = IngressRequestV1 {
         v: 1,
         domain: domain_name(Domain::Messaging).to_string(),
@@ -1078,7 +1163,7 @@ where
         remote_addr: None,
     };
 
-    let result = match dispatch_http_ingress_with_op(
+    let mut result = match dispatch_http_ingress_with_op(
         &state.runner_host,
         Domain::Messaging,
         &ingress_request,
@@ -1096,6 +1181,7 @@ where
             error_response(StatusCode::BAD_GATEWAY, primary_err.to_string())
         })?,
     };
+    apply_directline_forward_plan(state, &forward_plan, &mut result.response);
     if request.path == "/token" && (200..300).contains(&result.response.status) {
         let body = result.response.body.as_deref().unwrap_or_default();
         let token_ok = serde_json::from_slice::<serde_json::Value>(body)
@@ -1388,6 +1474,7 @@ mod tests {
             active_route_table: ActiveRouteTable::default(),
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
+            directline_sessions: Arc::new(directline_session::DirectLineSessions::from_env()),
         })
     }
 
@@ -1738,6 +1825,7 @@ mod tests {
             }),
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
+            directline_sessions: Arc::new(directline_session::DirectLineSessions::from_env()),
         });
 
         let response = runtime
@@ -1816,6 +1904,7 @@ mod tests {
             }),
             http_route_table: HttpRouteTable::default(),
             admin_relay: None,
+            directline_sessions: Arc::new(directline_session::DirectLineSessions::from_env()),
         });
 
         let gui_secret_uri = canonical_secret_uri(
