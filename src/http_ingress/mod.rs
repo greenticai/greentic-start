@@ -225,20 +225,27 @@ impl HttpIngressServer {
         // event when new activities are persisted (Task 13).
         register_webchat_post_op_notifier(&state);
 
-        // Resolve an available port before spawning the server thread.
+        // Strict bind: refuse to silently fall back to a neighbouring port.
+        // The Public/Routes URLs displayed at startup are hardcoded to the
+        // requested port; silently rebinding leaves the user's browser
+        // pointing at whatever else owns the requested port — most commonly
+        // an orphaned greentic-start from a previous run, which produces
+        // confusing "secret_error" / stale-state symptoms that look like a
+        // runtime bug. Operators who want side-by-side instances must pass
+        // distinct ports via the bundle's bind_addr config.
         let requested_port = config.bind_addr.port();
         let listen_addr_str = config.bind_addr.ip().to_string();
         let actual_port =
-            crate::port_utils::find_available_port(&listen_addr_str, requested_port, 10)
-                .context("failed to find available port for HTTP ingress")?;
-        if actual_port != requested_port {
-            operator_log::warn(
-                module_path!(),
-                format!(
-                    "requested port {requested_port} is in use; using port {actual_port} instead"
-                ),
-            );
-        }
+            crate::port_utils::find_available_port(&listen_addr_str, requested_port, 0)
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "port {requested_port} on {listen_addr_str} is already in use.\n\
+                         Likely cause: an orphaned greentic-start (or other process) from a previous run.\n\
+                         Diagnose:  ss -tlnp 2>/dev/null | grep ':{requested_port} '\n\
+                         Resolve:   kill the listener PID and re-run gtc start\n\
+                         (underlying error: {err})"
+                    )
+                })?;
         let addr = SocketAddr::new(config.bind_addr.ip(), actual_port);
 
         let (tx, rx) = oneshot::channel();
