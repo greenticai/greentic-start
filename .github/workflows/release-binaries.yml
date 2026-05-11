@@ -20,6 +20,7 @@ jobs:
     with:
       package: greentic-start
       binary: greentic-start
+      windows-archive-format: zip
       extra-files: |
         README.md
         LICENSE
