@@ -936,14 +936,17 @@ where
     // window on activity, re-mint a fresh-TTL bearer for the upstream call, and
     // surface a renewed token to the client (or short-circuit on auth failure /
     // `/tokens/refresh`). See `directline_session`.
-    let forward_plan = directline_session_preflight(
+    let forward_plan = match directline_session_preflight(
         state,
         request.provider,
         &provider_method,
         &provider_path,
         &mut headers,
         &ctx,
-    )?;
+    ) {
+        directline_session::Preflight::Respond(response) => return Err(response),
+        directline_session::Preflight::Forward(plan) => plan,
+    };
     let payload = serde_json::json!({
         "v": 1,
         "provider": request.provider,
@@ -995,9 +998,11 @@ where
 
 #[allow(clippy::result_large_err)]
 /// Run the DirectLine token-renewal preflight for a request that is about to be
-/// forwarded to a webchat provider. Returns the [`directline_session::ForwardPlan`]
-/// to apply to the response, or `Err(response)` to short-circuit (auth failure,
-/// `/tokens/refresh`).
+/// forwarded to a webchat provider. Loads the provider's `jwt_signing_key`,
+/// applies any `Authorization`-header rewrite the plan calls for, and returns
+/// the [`directline_session::Preflight`] outcome — `Forward(plan)` for the
+/// dispatcher to carry through, or `Respond(response)` to short-circuit (auth
+/// failure, or a locally-served endpoint like `/tokens/refresh`).
 fn directline_session_preflight(
     state: &Arc<HttpIngressState>,
     provider: &str,
@@ -1005,27 +1010,25 @@ fn directline_session_preflight(
     provider_path: &str,
     headers: &mut Vec<(String, String)>,
     ctx: &OperatorContext,
-) -> Result<directline_session::ForwardPlan, Response<Full<Bytes>>> {
+) -> directline_session::Preflight {
     let signing_key = state
         .runner_host
         .get_secret(provider, "jwt_signing_key", ctx)
         .ok()
         .flatten();
-    match directline_session::preflight(
+    let outcome = directline_session::preflight(
         method,
         provider_path,
         headers,
         signing_key.as_deref(),
         &state.directline_sessions,
-    ) {
-        directline_session::Preflight::Respond(response) => Err(response),
-        directline_session::Preflight::Forward(plan) => {
-            if let Some(authorization) = plan.rewrite_authorization.as_deref() {
-                directline_session::apply_authorization_rewrite(headers, authorization);
-            }
-            Ok(plan)
-        }
+    );
+    if let directline_session::Preflight::Forward(plan) = &outcome
+        && let Some(authorization) = plan.rewrite_authorization.as_deref()
+    {
+        directline_session::apply_authorization_rewrite(headers, authorization);
     }
+    outcome
 }
 
 /// Apply the post-response side of a [`directline_session::ForwardPlan`]: seed
@@ -1139,14 +1142,17 @@ where
         correlation_id: None,
     };
     // DirectLine session-token renewal (see the `directline_http` variant above).
-    let forward_plan = directline_session_preflight(
+    let forward_plan = match directline_session_preflight(
         state,
         request.provider,
         &provider_method,
         &provider_path,
         &mut headers,
         &ctx,
-    )?;
+    ) {
+        directline_session::Preflight::Respond(response) => return Err(response),
+        directline_session::Preflight::Forward(plan) => plan,
+    };
     let ingress_request = IngressRequestV1 {
         v: 1,
         domain: domain_name(Domain::Messaging).to_string(),

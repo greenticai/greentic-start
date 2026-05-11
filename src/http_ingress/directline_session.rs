@@ -2,15 +2,16 @@
 //!
 //! greentic-start proxies DirectLine traffic (`/v3/directline/...`) to the
 //! `messaging-webchat` / `messaging-webchat-gui` WASM provider. That provider
-//! mints session JWTs with a fixed TTL (1800 s by default) and validates them
-//! with a strict `exp` check — so a chat surface left open longer than the TTL
-//! gets `401 {"error":"unauthorized","message":"invalid token: Expired"}` on its
-//! next `POST /v3/directline/conversations/<id>/activities`, even mid-conversation.
+//! mints session JWTs with a fixed lifetime and validates them with a strict
+//! `exp` check, and never extends that lifetime while a conversation is active —
+//! so a chat surface left open longer than the token's lifetime gets
+//! `401 {"error":"unauthorized","message":"invalid token: Expired"}` on its next
+//! `POST /v3/directline/conversations/<id>/activities`, even mid-conversation.
 //!
 //! This module keeps an in-memory, bounded, per-process sliding window of active
 //! conversations (`conversation_id -> expires_at` only — never tokens, never the
 //! signing key). On every accepted activity (or reconnect, or `/tokens/refresh`)
-//! the conversation's lifetime is extended to `now + ttl`, and a fresh-TTL JWT
+//! the conversation's lifetime is extended to `now + ttl`, and a fresh JWT
 //! carrying the same `conv`/`ctx` is re-minted: it is swapped into the upstream
 //! `Authorization` header (so the provider's strict `exp` check is always
 //! satisfied) and, when the caller's own token is getting old, surfaced back in
@@ -18,8 +19,14 @@
 //! never `touch`ed, so they still lapse after `ttl` — this is a sliding window,
 //! not an infinite session.
 //!
-//! The base TTL is the `GREENTIC_DIRECTLINE_TOKEN_TTL_SECS` env var (clamped to
-//! `[60, 604800]`, default 1800). See `docs/directline-token-renewal.md`.
+//! The base `ttl` greentic-start uses (both the lifetime it stamps on re-minted
+//! tokens and the sliding-window length) comes from
+//! `GREENTIC_DIRECTLINE_TOKEN_TTL_SECS`, clamped to `[60, 604800]`, with a
+//! built-in fallback when unset. The provider's own token lifetime is
+//! configurable on its side, so this code never assumes a particular value —
+//! every re-mint hands the provider a fresh, full-lifetime token, which is what
+//! makes the window work regardless of how the provider is tuned. See
+//! `docs/directline-token-renewal.md`.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -38,9 +45,13 @@ use sha2::Sha256;
 
 use crate::ingress_types::IngressHttpResponse;
 
-/// Env var that overrides the base DirectLine token TTL (seconds). Documented in
-/// `docs/coding-agents.md`.
+/// Env var that overrides the base DirectLine token lifetime (seconds).
+/// Documented in `docs/coding-agents.md`.
 pub const TTL_ENV: &str = "GREENTIC_DIRECTLINE_TOKEN_TTL_SECS";
+/// Base lifetime used when `GREENTIC_DIRECTLINE_TOKEN_TTL_SECS` is unset. This
+/// is only a fallback for re-minted tokens and the sliding window — the webchat
+/// provider's own token lifetime is configured separately and is not assumed
+/// here.
 const DEFAULT_TTL_SECS: u64 = 1800;
 const MIN_TTL_SECS: u64 = 60;
 const MAX_TTL_SECS: u64 = 604_800;
@@ -49,9 +60,15 @@ const MAX_TTL_SECS: u64 = 604_800;
 /// `MAX_ENTRIES` discipline).
 const MAX_TRACKED_CONVERSATIONS: usize = 16_384;
 
-/// Resolve the base DirectLine token TTL in seconds from
-/// `GREENTIC_DIRECTLINE_TOKEN_TTL_SECS`, clamped to `[60, 604800]`. Defaults to
-/// 1800 (the value the WASM provider has historically used).
+/// Resolve the base DirectLine token lifetime in seconds — the lifetime
+/// greentic-start stamps on re-minted tokens and uses for the conversation
+/// sliding window. From `GREENTIC_DIRECTLINE_TOKEN_TTL_SECS`, clamped to
+/// `[60, 604800]`; falls back to [`DEFAULT_TTL_SECS`] when unset.
+///
+/// The webchat provider has its own, separately-configurable token lifetime; we
+/// don't depend on it — each re-minted token gets a fresh full lifetime, so
+/// renewal works whatever the provider is tuned to (we just account for "it can
+/// differ / change" by always re-issuing rather than reusing the caller's `exp`).
 pub fn token_ttl_secs() -> u64 {
     std::env::var(TTL_ENV)
         .ok()
@@ -991,5 +1008,184 @@ mod tests {
                 .iter()
                 .any(|(n, v)| n == "Authorization" && v == "Bearer new")
         );
+    }
+
+    /// Headline scenario: a conversation that posts an activity every minute for
+    /// well over the token's lifetime. We can't actually wait half an hour, so we
+    /// model "time has moved on" by handing in tokens whose `iat`/`exp` are in the
+    /// past while the in-process sliding window — `touch`ed on every accepted post
+    /// — stays alive. This mirrors the `repro-slow.sh --activity-heartbeat` flow:
+    /// before the fix the post at t ≈ 1801 s 401s; after it, every post is renewed
+    /// and forwarded with a fresh, non-expired bearer.
+    #[test]
+    fn renewal_keeps_a_busy_conversation_alive_past_the_original_ttl() {
+        let ttl: i64 = 1800;
+        let sessions = DirectLineSessions::with_ttl_secs(ttl as u64);
+        let conv = "conv-busy";
+        let path = format!("/v3/directline/conversations/{conv}/activities");
+
+        // t = 0: conversation created -> window seeded.
+        sessions.touch(conv);
+
+        // The client keeps presenting the *same* bearer it was issued at t = 0
+        // (i.e. it never adopts the renewed token), so by minute 31 it is
+        // wall-clock-expired. Each accepted post must still succeed.
+        for minute in 1..=35_i64 {
+            let elapsed = minute * 60;
+            let now = now_secs();
+            // Modelled as "the t = 0 bearer, observed `elapsed` seconds later".
+            let original = make_token("alice", Some(conv), now - elapsed, now - elapsed + ttl, KEY);
+            match preflight(&Method::POST, &path, &auth(&original), Some(KEY), &sessions) {
+                Preflight::Forward(plan) => {
+                    let renewed = plan
+                        .rewrite_authorization
+                        .as_deref()
+                        .and_then(|h| h.strip_prefix("Bearer "))
+                        .expect("renewed bearer forwarded upstream");
+                    let claims = parse_token(renewed, KEY).expect("renewed token verifies");
+                    assert_eq!(claims.conv.as_deref(), Some(conv));
+                    assert!(
+                        claims.exp > now_secs(),
+                        "minute {minute}: forwarded bearer must be in the future, got exp={} now={}",
+                        claims.exp,
+                        now_secs()
+                    );
+                    // POST always echoes the renewed token to the client.
+                    assert!(plan.inject_renewed_token.is_some());
+                }
+                Preflight::Respond(resp) => panic!(
+                    "minute {minute}: post should be accepted, got status {}",
+                    resp.status()
+                ),
+            }
+            assert!(
+                sessions.is_alive(conv),
+                "minute {minute}: window must stay alive"
+            );
+        }
+
+        // Sanity: an unrelated, untouched conversation with the same expired
+        // token *is* rejected — the window is what keeps the busy one alive.
+        let stale = make_token(
+            "alice",
+            Some("conv-idle"),
+            now_secs() - 5000,
+            now_secs() - 3600,
+            KEY,
+        );
+        assert!(matches!(
+            preflight(
+                &Method::POST,
+                "/v3/directline/conversations/conv-idle/activities",
+                &auth(&stale),
+                Some(KEY),
+                &sessions,
+            ),
+            Preflight::Respond(_)
+        ));
+    }
+
+    #[test]
+    fn get_poll_with_fresh_token_renews_upstream_but_does_not_bloat_response() {
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        sessions.touch("conv-1");
+        let now = now_secs();
+        let fresh = make_token("alice", Some("conv-1"), now, now + 1800, KEY);
+        let Preflight::Forward(plan) = preflight(
+            &Method::GET,
+            "/v3/directline/conversations/conv-1/activities",
+            &auth(&fresh),
+            Some(KEY),
+            &sessions,
+        ) else {
+            panic!("expected forward");
+        };
+        assert!(plan.rewrite_authorization.is_some());
+        assert!(plan.inject_renewed_token.is_none());
+        assert!(sessions.is_alive("conv-1"));
+    }
+
+    #[test]
+    fn get_poll_with_stale_token_echoes_renewed_token() {
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        sessions.touch("conv-1");
+        let now = now_secs();
+        // Token is past 50 % of its life (remaining 800 of 1800).
+        let stale = make_token("alice", Some("conv-1"), now - 1000, now + 800, KEY);
+        let Preflight::Forward(plan) = preflight(
+            &Method::GET,
+            "/v3/directline/conversations/conv-1/activities",
+            &auth(&stale),
+            Some(KEY),
+            &sessions,
+        ) else {
+            panic!("expected forward");
+        };
+        assert!(plan.rewrite_authorization.is_some());
+        assert!(plan.inject_renewed_token.is_some());
+    }
+
+    #[test]
+    fn reconnect_accepts_unbound_token_and_keeps_window_alive() {
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        let now = now_secs();
+        let unbound = make_token("alice", None, now, now + 1800, KEY);
+        let Preflight::Forward(plan) = preflight(
+            &Method::GET,
+            "/v3/directline/conversations/conv-7",
+            &auth(&unbound),
+            Some(KEY),
+            &sessions,
+        ) else {
+            panic!("expected forward");
+        };
+        let renewed = plan
+            .rewrite_authorization
+            .as_deref()
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .expect("reconnect rewrites to a conv-bound bearer");
+        assert_eq!(
+            parse_token(renewed, KEY).unwrap().conv.as_deref(),
+            Some("conv-7")
+        );
+        assert!(sessions.is_alive("conv-7"));
+    }
+
+    #[test]
+    fn activities_missing_authorization_is_401() {
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        let Preflight::Respond(resp) = preflight(
+            &Method::POST,
+            "/v3/directline/conversations/conv-1/activities",
+            &[],
+            Some(KEY),
+            &sessions,
+        ) else {
+            panic!("expected reject");
+        };
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let (_, body) = body_of(resp);
+        assert_eq!(body["code"], "Unauthorized");
+    }
+
+    #[test]
+    fn response_helpers_ignore_non_2xx() {
+        let mut not_found = IngressHttpResponse {
+            status: 404,
+            headers: vec![],
+            body: Some(serde_json::to_vec(&json!({ "conversationId": "c" })).unwrap()),
+        };
+        let before = not_found.body.clone();
+        inject_renewed_token(&mut not_found, "tok", 1800);
+        assert_eq!(not_found.body, before, "must not touch a 404 body");
+        assert_eq!(conversation_id_from_response(&not_found), None);
+
+        let mut server_error = IngressHttpResponse {
+            status: 500,
+            headers: vec![],
+            body: Some(b"not json".to_vec()),
+        };
+        inject_renewed_token(&mut server_error, "tok", 1800);
+        assert_eq!(server_error.body.as_deref(), Some(b"not json".as_ref()));
     }
 }
