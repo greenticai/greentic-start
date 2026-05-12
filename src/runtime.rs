@@ -1002,7 +1002,10 @@ pub fn demo_up_services(
             // Fallback: derive from local HTTP listener if static routes are enabled
             if ingress_server.is_some() && enable_static_routes {
                 let host = &config.services.gateway.listen_addr;
-                let port = config.services.gateway.port;
+                let port = ingress_server
+                    .as_ref()
+                    .map(|server| server.actual_port)
+                    .unwrap_or(config.services.gateway.port);
                 Some(format!("http://{}:{}", host, port))
             } else {
                 None
@@ -1197,7 +1200,10 @@ pub fn demo_up_services(
         public_base_url: startup_contract.public_base_url.clone(),
         nats_url,
         gateway_listen_addr: config.services.gateway.listen_addr.clone(),
-        gateway_port: config.services.gateway.port,
+        gateway_port: ingress_server
+            .as_ref()
+            .map(|server| server.actual_port)
+            .unwrap_or(config.services.gateway.port),
     };
     write_json(&paths.runtime_root().join("endpoints.json"), &endpoints)?;
 
@@ -1784,8 +1790,19 @@ mod tests {
     use crate::discovery::{DetectedDomains, DetectedProvider, DiscoveryResult, ProviderIdSource};
     use crate::domains::Domain;
     use crate::secrets_gate;
+    use greentic_types::{
+        ExtensionInline, ExtensionRef, Flow, FlowId, FlowKind, PackFlowEntry, PackId, PackKind,
+        PackManifest, PackSignatures,
+    };
+    use semver::Version;
+    use serde_json::json;
     use std::fs;
+    use std::fs::File;
+    use std::io::Write;
+    use std::net::{Ipv4Addr, TcpListener};
     use tempfile::tempdir;
+    use zip::ZipWriter;
+    use zip::write::FileOptions;
 
     #[test]
     fn helper_types_cover_stop_describe_and_service_tracker_manifest_updates() -> anyhow::Result<()>
@@ -2153,6 +2170,82 @@ mod tests {
     }
 
     #[test]
+    fn demo_up_services_derives_local_public_base_url_from_actual_ingress_port()
+    -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let bundle_root = dir.path().join("bundle");
+        let config_path = bundle_root.join("greentic-demo.yaml");
+        let log_dir = bundle_root.join("logs");
+        fs::create_dir_all(&bundle_root)?;
+        fs::create_dir_all(&log_dir)?;
+        fs::write(&config_path, "tenant: demo\nteam: default\n")?;
+        write_default_app_pack(&bundle_root.join("packs/default.gtpack"))?;
+        let static_pack_path = bundle_root.join("providers/messaging/messaging-webchat-gui.gtpack");
+        write_static_route_provider_pack(&static_pack_path)?;
+
+        let port_holder = bind_available_nonterminal_port()?;
+        let requested_port = port_holder.local_addr()?.port();
+        let static_routes = BundleStaticRoutesInspection {
+            pack_paths: vec![static_pack_path],
+        };
+        let mut config = DemoConfig {
+            tenant: "demo".to_string(),
+            team: "default".to_string(),
+            services: crate::config::DemoServicesConfig {
+                nats: crate::config::DemoNatsConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            providers: None,
+        };
+        config.services.gateway.listen_addr = "127.0.0.1".to_string();
+        config.services.gateway.port = requested_port;
+        let restart = BTreeSet::new();
+
+        let handles = demo_up_services(
+            &config_path,
+            &config,
+            &static_routes,
+            None,
+            None,
+            None,
+            &restart,
+            None,
+            &log_dir,
+            false,
+            true,
+        )?;
+        let actual_port = handles
+            .ingress_server
+            .as_ref()
+            .expect("ingress server")
+            .actual_port;
+        assert_ne!(actual_port, requested_port);
+
+        let runtime_root =
+            RuntimePaths::new(bundle_root.join("state"), "demo", "default").runtime_root();
+        let expected_public_base_url = format!("http://127.0.0.1:{actual_port}");
+        let startup_contract: StartupContract =
+            serde_json::from_slice(&fs::read(runtime_root.join("startup_contract.json"))?)?;
+        assert_eq!(
+            startup_contract.public_base_url.as_deref(),
+            Some(expected_public_base_url.as_str())
+        );
+
+        let endpoints: serde_json::Value =
+            serde_json::from_slice(&fs::read(runtime_root.join("endpoints.json"))?)?;
+        assert_eq!(endpoints["public_base_url"], expected_public_base_url);
+        assert_eq!(endpoints["gateway_port"], actual_port);
+        assert_ne!(endpoints["gateway_port"], requested_port);
+
+        drop(port_holder);
+        handles.stop()?;
+        Ok(())
+    }
+
+    #[test]
     fn supervised_spawn_helpers_cover_running_and_summary_paths() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let state_dir = dir.path().join("state");
@@ -2206,6 +2299,115 @@ mod tests {
 
         supervisor::stop_service(&paths, &spec.id, 100)?;
         supervisor::stop_service(&paths, &spec2.id, 100)?;
+        Ok(())
+    }
+
+    fn bind_available_nonterminal_port() -> anyhow::Result<TcpListener> {
+        for _ in 0..32 {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+            if listener.local_addr()?.port() <= u16::MAX - 10 {
+                return Ok(listener);
+            }
+        }
+        anyhow::bail!("failed to allocate test port with fallback range")
+    }
+
+    fn write_static_route_provider_pack(path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut extensions = BTreeMap::new();
+        extensions.insert(
+            crate::static_routes::EXT_STATIC_ROUTES_V1.to_string(),
+            ExtensionRef {
+                kind: crate::static_routes::EXT_STATIC_ROUTES_V1.to_string(),
+                version: "1.0.0".to_string(),
+                digest: None,
+                location: None,
+                inline: Some(ExtensionInline::Other(json!({
+                    "schema_version": 1,
+                    "routes": [{
+                        "id": "webchat-gui",
+                        "public_path": "/v1/web/webchat/{tenant}",
+                        "source_root": "assets/webchat",
+                        "index_file": "index.html",
+                        "spa_fallback": "index.html",
+                        "tenant": true
+                    }]
+                }))),
+            },
+        );
+        let manifest = PackManifest {
+            schema_version: "pack-v1".to_string(),
+            pack_id: PackId::new("messaging-webchat-gui")?,
+            name: Some("messaging-webchat-gui".to_string()),
+            version: Version::parse("0.1.0")?,
+            kind: PackKind::Provider,
+            publisher: "demo".to_string(),
+            components: Vec::new(),
+            flows: Vec::new(),
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            secret_requirements: Vec::new(),
+            signatures: PackSignatures::default(),
+            bootstrap: None,
+            extensions: Some(extensions),
+        };
+        write_pack_with_manifest(path, manifest, &[("assets/webchat/index.html", b"webchat")])
+    }
+
+    fn write_default_app_pack(path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let flow = Flow {
+            schema_version: "flow-v1".to_string(),
+            id: FlowId::new("default")?,
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([("default".to_string(), serde_json::Value::Null)]),
+            nodes: Default::default(),
+            metadata: Default::default(),
+        };
+        let manifest = PackManifest {
+            schema_version: "pack-v1".to_string(),
+            pack_id: PackId::new("demo-app")?,
+            name: Some("demo-app".to_string()),
+            version: Version::parse("0.1.0")?,
+            kind: PackKind::Application,
+            publisher: "demo".to_string(),
+            components: Vec::new(),
+            flows: vec![PackFlowEntry {
+                id: FlowId::new("default")?,
+                kind: FlowKind::Messaging,
+                flow,
+                tags: vec!["default".to_string()],
+                entrypoints: vec!["default".to_string()],
+            }],
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            secret_requirements: Vec::new(),
+            signatures: PackSignatures::default(),
+            bootstrap: None,
+            extensions: None,
+        };
+        write_pack_with_manifest(path, manifest, &[])
+    }
+
+    fn write_pack_with_manifest(
+        path: &Path,
+        manifest: PackManifest,
+        files: &[(&str, &[u8])],
+    ) -> anyhow::Result<()> {
+        let bytes = greentic_types::encode_pack_manifest(&manifest)?;
+        let file = File::create(path)?;
+        let mut zip = ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())?;
+        zip.write_all(&bytes)?;
+        for (name, contents) in files {
+            zip.start_file(*name, FileOptions::<()>::default())?;
+            zip.write_all(contents)?;
+        }
+        zip.finish()?;
         Ok(())
     }
 }
