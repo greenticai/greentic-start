@@ -63,7 +63,7 @@ pub fn run_warmup_request(request: WarmupRequest) -> Result<()> {
     }
 
     let engine = Engine::default();
-    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let profile = warmup_engine_profile(&engine);
     let cache_config = match request.cache_dir.as_ref() {
         Some(dir) => CacheConfig {
             root: dir.clone(),
@@ -183,6 +183,35 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex
 }
 
+fn warmup_engine_profile(engine: &Engine) -> EngineProfile {
+    let profile = EngineProfile::from_engine(engine, CpuPolicy::Native, "default".to_string());
+    warmup_engine_profile_for_platform(profile, cfg!(windows))
+}
+
+fn warmup_engine_profile_for_platform(mut profile: EngineProfile, windows: bool) -> EngineProfile {
+    if windows {
+        profile.engine_profile_id = windows_safe_cache_segment(profile.id());
+    }
+    profile
+}
+
+fn windows_safe_cache_segment(segment: &str) -> String {
+    segment
+        .chars()
+        .map(|ch| {
+            if is_windows_invalid_path_char(ch) {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn is_windows_invalid_path_char(ch: char) -> bool {
+    matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || ch.is_control()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +265,22 @@ mod tests {
                 "/explicit/from/user"
             );
         });
+    }
+
+    #[test]
+    fn warmup_engine_profile_id_is_windows_path_safe() {
+        let engine = Engine::default();
+        let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+        assert!(
+            profile.id().contains(':'),
+            "the upstream profile id currently includes a digest algorithm separator"
+        );
+
+        let profile = warmup_engine_profile_for_platform(profile, true);
+
+        assert!(
+            !profile.id().chars().any(is_windows_invalid_path_char),
+            "warmup cache profile id must be valid as a Windows path segment"
+        );
     }
 }
