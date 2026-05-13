@@ -104,6 +104,36 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
         .team
         .clone()
         .unwrap_or_else(|| "default".to_string());
+    // Derive a stable session_id from the inbound envelope so the desktop
+    // runner can persist/restore the engine's `FlowSnapshot` between
+    // activities. Conversational messaging flows rely on this to resume
+    // at the card the user paused on instead of restarting at the entry.
+    //
+    // We compose `{pack}:{flow}:{envelope.session_id}` so two flows or
+    // packs sharing the same conversation id stay isolated.
+    let envelope_session_id = request
+        .input
+        .pointer("/input/session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let session_id = envelope_session_id.as_deref().map(|conv| {
+        format!(
+            "{pack}:{flow}:{conv}",
+            pack = request.pack_label,
+            flow = request.flow_id,
+        )
+    });
+    let session_state_dir = Some(
+        request
+            .root
+            .join("state")
+            .join("sessions")
+            .join(&request.tenant)
+            .join(&team)
+            .join(&request.pack_label)
+            .join(&request.flow_id),
+    );
     let opts = RunOptions {
         profile: Profile::Dev(DevProfile {
             tenant_id: request.tenant.clone(),
@@ -117,7 +147,7 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
             tenant_id: Some(request.tenant),
             team_id: Some(team),
             user_id: Some("developer".to_string()),
-            session_id: None,
+            session_id: session_id.clone(),
         },
         mocks: MocksConfig {
             net_allowlist: vec!["127.0.0.1".to_string(), "localhost".to_string()],
@@ -128,6 +158,7 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
         dist_offline: request.dist_offline,
         allow_missing_hash: false,
         secrets_manager: Some(secrets_handle.runtime_manager(Some(&request.pack_label))),
+        session_state_dir,
         ..RunOptions::default()
     };
 
