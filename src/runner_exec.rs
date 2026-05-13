@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -134,6 +135,7 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
             .join(&request.pack_label)
             .join(&request.flow_id),
     );
+    let components_map = component_overrides_from_env();
     let opts = RunOptions {
         profile: Profile::Dev(DevProfile {
             tenant_id: request.tenant.clone(),
@@ -159,6 +161,7 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
         allow_missing_hash: false,
         secrets_manager: Some(secrets_handle.runtime_manager(Some(&request.pack_label))),
         session_state_dir,
+        components_map,
         ..RunOptions::default()
     };
 
@@ -188,6 +191,51 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
 
     Ok(RunOutput { result, run_dir })
 }
+/// Collect component WASM override paths from environment variables.
+///
+/// Supports two forms:
+/// - `GREENTIC_COMPONENT_ADAPTIVE_CARD_WASM=/path/to/component_adaptive_card.wasm`
+///   for the shipped adaptive-card component
+///   (id `ai.greentic.component-adaptive-card`).
+/// - `GREENTIC_COMPONENT_OVERRIDES=id1=/path1,id2=/path2` for arbitrary
+///   component overrides keyed by component spec id.
+///
+/// Missing files are skipped silently; existence is enforced by the runner
+/// host at pack load time.
+fn component_overrides_from_env() -> HashMap<String, PathBuf> {
+    let mut map = HashMap::new();
+
+    if let Ok(path) = std::env::var("GREENTIC_COMPONENT_ADAPTIVE_CARD_WASM") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            map.insert(
+                "ai.greentic.component-adaptive-card".to_string(),
+                PathBuf::from(trimmed),
+            );
+        }
+    }
+
+    if let Ok(list) = std::env::var("GREENTIC_COMPONENT_OVERRIDES") {
+        for entry in list.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let Some((id, path)) = entry.split_once('=') else {
+                continue;
+            };
+            let id = id.trim();
+            let path = path.trim();
+            if id.is_empty() || path.is_empty() {
+                continue;
+            }
+            map.insert(id.to_string(), PathBuf::from(path));
+        }
+    }
+
+    map
+}
+
 fn write_run_artifacts(run_dir: &Path, result: &RunResult) -> anyhow::Result<()> {
     let run_json = run_dir.join("run.json");
     let summary_path = run_dir.join("summary.txt");
