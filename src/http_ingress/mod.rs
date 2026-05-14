@@ -1,5 +1,6 @@
 mod admin_relay;
 mod conv_dedup;
+mod directline_session;
 mod helpers;
 mod messaging;
 mod static_handler;
@@ -218,6 +219,7 @@ impl HttpIngressServer {
             )),
             webchat_provider,
             conversation_dedup: Arc::new(ConversationDedupCache::new()),
+            directline_sessions: Arc::new(directline_session::DirectLineSessions::from_env()),
         });
 
         // Bridge successful webchat provider ops into the activity notifier so
@@ -378,6 +380,10 @@ struct HttpIngressState {
     /// Prevents racy double-calls from clients (e.g. SPA effect re-fires) from
     /// minting two independent conversations for the same browser session.
     pub conversation_dedup: Arc<ConversationDedupCache>,
+    /// Sliding-window registry of active DirectLine conversations, used to
+    /// re-mint session tokens on activity so long-running chats don't 401 once
+    /// the original session JWT lapses. See [`directline_session`].
+    directline_sessions: Arc<directline_session::DirectLineSessions>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1133,7 +1139,7 @@ where
     let provider_queries =
         augment_directline_queries(request.queries, request.tenant, Some(request.team));
     let provider_query_string = encode_directline_query_string(&provider_queries);
-    let headers = collect_headers(req.headers());
+    let mut headers = collect_headers(req.headers());
     let body = req
         .into_body()
         .collect()
@@ -1144,6 +1150,21 @@ where
         tenant: request.tenant.to_string(),
         team: Some(request.team.to_string()),
         correlation_id: None,
+    };
+    // DirectLine session-token renewal: extend the conversation's sliding
+    // window on activity, re-mint a fresh-TTL bearer for the upstream call, and
+    // surface a renewed token to the client (or short-circuit on auth failure /
+    // `/tokens/refresh`). See `directline_session`.
+    let forward_plan = match directline_session_preflight(
+        state,
+        request.provider,
+        &provider_method,
+        &provider_path,
+        &mut headers,
+        &ctx,
+    ) {
+        directline_session::Preflight::Respond(response) => return Err(response),
+        directline_session::Preflight::Forward(plan) => plan,
     };
     let payload = serde_json::json!({
         "v": 1,
@@ -1188,14 +1209,71 @@ where
         return Err(error_response(StatusCode::BAD_GATEWAY, message));
     }
     let value = outcome.output.unwrap_or_else(|| serde_json::json!({}));
-    let response = parse_provider_directline_http_response(&value).map_err(|err| {
+    let mut response = parse_provider_directline_http_response(&value).map_err(|err| {
         error_response(
             StatusCode::BAD_GATEWAY,
             format!("invalid directline_http response: {err}"),
         )
     })?;
+    apply_directline_forward_plan(state, &forward_plan, &mut response);
     build_http_response(&response)
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err))
+}
+
+/// Run the DirectLine token-renewal preflight for a request that is about to be
+/// forwarded to a webchat provider. Loads the provider's `jwt_signing_key`,
+/// applies any `Authorization`-header rewrite the plan calls for, and returns
+/// the [`directline_session::Preflight`] outcome — `Forward(plan)` for the
+/// dispatcher to carry through, or `Respond(response)` to short-circuit (auth
+/// failure, or a locally-served endpoint like `/tokens/refresh`).
+fn directline_session_preflight(
+    state: &Arc<HttpIngressState>,
+    provider: &str,
+    method: &Method,
+    provider_path: &str,
+    headers: &mut Vec<(String, String)>,
+    ctx: &OperatorContext,
+) -> directline_session::Preflight {
+    let signing_key = state
+        .runner_host
+        .get_secret(provider, "jwt_signing_key", ctx)
+        .ok()
+        .flatten();
+    let outcome = directline_session::preflight(
+        method,
+        provider_path,
+        headers,
+        signing_key.as_deref(),
+        &state.directline_sessions,
+    );
+    if let directline_session::Preflight::Forward(plan) = &outcome
+        && let Some(authorization) = plan.rewrite_authorization.as_deref()
+    {
+        directline_session::apply_authorization_rewrite(headers, authorization);
+    }
+    outcome
+}
+
+/// Apply the post-response side of a [`directline_session::ForwardPlan`]: seed
+/// the sliding window from a `POST /conversations` response and/or inject
+/// `_directline.renewed_token` into the body.
+fn apply_directline_forward_plan(
+    state: &Arc<HttpIngressState>,
+    plan: &directline_session::ForwardPlan,
+    response: &mut IngressHttpResponse,
+) {
+    if plan.seed_from_response
+        && let Some(conv) = directline_session::conversation_id_from_response(response)
+    {
+        state.directline_sessions.touch(&conv);
+    }
+    if let Some(renewed) = plan.inject_renewed_token.as_deref() {
+        directline_session::inject_renewed_token(
+            response,
+            renewed,
+            state.directline_sessions.ttl_secs(),
+        );
+    }
 }
 
 fn normalize_directline_dispatch(method: &Method, path: &str) -> (Method, String) {
@@ -1274,7 +1352,7 @@ where
         normalize_directline_dispatch(request.method, request.path);
     let provider_queries =
         augment_directline_queries(request.queries, request.tenant, Some(request.team));
-    let headers = collect_headers(req.headers());
+    let mut headers = collect_headers(req.headers());
     let body = req
         .into_body()
         .collect()
@@ -1285,6 +1363,18 @@ where
         tenant: request.tenant.to_string(),
         team: Some(request.team.to_string()),
         correlation_id: None,
+    };
+    // DirectLine session-token renewal (see the `directline_http` variant above).
+    let forward_plan = match directline_session_preflight(
+        state,
+        request.provider,
+        &provider_method,
+        &provider_path,
+        &mut headers,
+        &ctx,
+    ) {
+        directline_session::Preflight::Respond(response) => return Err(response),
+        directline_session::Preflight::Forward(plan) => plan,
     };
 
     // Idempotency for `POST /v3/directline/conversations`: a Direct Line
@@ -1307,7 +1397,7 @@ where
         None
     };
     if let Some(key) = dedup_key.as_ref()
-        && let Some(cached) = state.conversation_dedup.get(key)
+        && let Some(mut cached) = state.conversation_dedup.get(key)
     {
         operator_log::info(
             module_path!(),
@@ -1316,6 +1406,9 @@ where
                 key.tenant, key.team, key.user_id, cached.status,
             ),
         );
+        // Still a client activity on this conversation — keep the sliding
+        // window alive even when the create response is replayed from cache.
+        apply_directline_forward_plan(state, &forward_plan, &mut cached);
         return build_http_response(&cached)
             .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err));
     }
@@ -1354,6 +1447,7 @@ where
             error_response(StatusCode::BAD_GATEWAY, primary_err.to_string())
         })?,
     };
+    apply_directline_forward_plan(state, &forward_plan, &mut result.response);
 
     // POST /v3/directline/conversations response carries `streamUrl` as a
     // site-relative path (the WASM provider has no host info). DirectLineJS
@@ -1841,6 +1935,7 @@ mod tests {
             )),
             webchat_provider: "messaging-webchat".to_string(),
             conversation_dedup: Arc::new(ConversationDedupCache::new()),
+            directline_sessions: Arc::new(directline_session::DirectLineSessions::from_env()),
         })
     }
 
@@ -2218,6 +2313,7 @@ mod tests {
             )),
             webchat_provider: "messaging-webchat".to_string(),
             conversation_dedup: Arc::new(ConversationDedupCache::new()),
+            directline_sessions: Arc::new(directline_session::DirectLineSessions::from_env()),
         });
 
         let response = runtime
@@ -2307,6 +2403,7 @@ mod tests {
             )),
             webchat_provider: "messaging-webchat".to_string(),
             conversation_dedup: Arc::new(ConversationDedupCache::new()),
+            directline_sessions: Arc::new(directline_session::DirectLineSessions::from_env()),
         });
 
         let gui_secret_uri = canonical_secret_uri(

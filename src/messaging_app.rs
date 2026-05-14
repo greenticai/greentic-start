@@ -186,13 +186,34 @@ pub fn select_app_flow(info: &AppPackInfo) -> Result<&AppFlowInfo> {
     if messaging_flows.len() == 1 {
         return Ok(messaging_flows[0]);
     }
-    let available = info
+    bail!("{}", app_flow_resolution_error(info));
+}
+
+pub fn app_flow_resolution_error(info: &AppPackInfo) -> String {
+    let messaging_count = info
         .flows
         .iter()
-        .map(|flow| flow.id.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    bail!("APP_FLOW_NOT_RESOLVED; available flows: {available}");
+        .filter(|flow| flow.kind.eq_ignore_ascii_case("messaging"))
+        .count();
+    let available = if info.flows.is_empty() {
+        "<none>".to_string()
+    } else {
+        info.flows
+            .iter()
+            .map(|flow| format!("{} (kind={})", flow.id, flow.kind))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "APP_FLOW_NOT_RESOLVED: greentic-start cannot choose which flow to invoke for app pack `{}`. \
+Expected either a flow with id `default`, or exactly one flow with kind `messaging`. \
+Found {} flow(s), {} messaging flow(s): {}. \
+Fix the pack manifest by marking one flow as id `default`, or by making exactly one flow kind `messaging`.",
+        info.pack_id,
+        info.flows.len(),
+        messaging_count,
+        available
+    )
 }
 
 pub fn run_app_flow(
@@ -476,10 +497,12 @@ fn collect_transcript_outputs(
         // prefer explicit target match, then the latest output.
         targeted.or(last.clone()).or(preferred).or(first)
     } else {
-        // Non-targeted flows should prefer the latest envelope-compatible
-        // output for handoff. The first envelope-like output is often the
-        // initial menu card, while later nodes render the actual result card.
-        targeted.or(last.clone()).or(preferred).or(first)
+        // Non-targeted flows: prefer an envelope-compatible output (e.g. the
+        // rendered welcome card) over a trailing non-envelope record. autoStart
+        // can run downstream nodes whose outputs are diagnostic objects like
+        // `{error: AC_BINDING_EVAL_ERROR}` — those would otherwise displace the
+        // envelope-shaped reply the user actually needs to see.
+        targeted.or(preferred).or(last.clone()).or(first)
     };
     Ok(selected)
 }
@@ -1051,7 +1074,11 @@ mod tests {
         };
 
         let err = select_app_flow(&info).expect_err("ambiguous flow should fail");
-        assert!(err.to_string().contains("one, two"));
+        let message = err.to_string();
+        assert!(message.contains("APP_FLOW_NOT_RESOLVED"));
+        assert!(message.contains("cannot choose which flow to invoke"));
+        assert!(message.contains("one (kind=messaging), two (kind=messaging)"));
+        assert!(message.contains("flow with id `default`"));
     }
 
     #[test]
@@ -1171,6 +1198,37 @@ mod tests {
             .expect("collect outputs")
             .expect("selected output");
         assert_eq!(selected["renderedCard"]["body"][0]["text"], "Final Report");
+    }
+
+    #[test]
+    fn collect_transcript_outputs_prefers_envelope_over_trailing_error_record() {
+        // Regression: autoStart can execute downstream nodes whose outputs are
+        // diagnostic objects (e.g. `{error: AC_BINDING_EVAL_ERROR}`). Those
+        // must NOT displace an earlier envelope-shaped reply that the user is
+        // expecting to see (the rendered welcome card).
+        let dir = tempdir().expect("tempdir");
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"node_id\":\"welcome\",\"outputs\":{\"renderedCard\":{\"body\":[{\"text\":\"Welcome\"}]}}}\n",
+                "{\"node_id\":\"midway\",\"outputs\":{\"ok\":true}}\n",
+                "{\"node_id\":\"booking_complete\",\"outputs\":{\"error\":\"AC_BINDING_EVAL_ERROR\",\"missing\":[\"consultType\"]}}\n"
+            ),
+        )
+        .expect("write transcript");
+
+        let selected = collect_transcript_outputs(dir.path(), None)
+            .expect("collect outputs")
+            .expect("selected output");
+        assert_eq!(
+            selected["renderedCard"]["body"][0]["text"], "Welcome",
+            "envelope-shaped welcome card must win over trailing error record"
+        );
+        assert!(
+            selected.get("error").is_none(),
+            "diagnostic error output must not be surfaced to the channel"
+        );
     }
 
     #[test]

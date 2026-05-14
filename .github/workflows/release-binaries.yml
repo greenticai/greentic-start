@@ -15,16 +15,19 @@ concurrency:
 
 jobs:
   release:
+    if: github.ref_type == 'tag'
     uses: greenticai/.github/.github/workflows/release-binaries.yml@main
     with:
       package: greentic-start
       binary: greentic-start
+      windows-archive-format: zip
       extra-files: |
         README.md
         LICENSE
     secrets: inherit
 
   publish_crates:
+    if: github.ref_type == 'tag'
     name: Publish to crates.io
     needs: [release]
     permissions:
