@@ -132,7 +132,12 @@ async fn loop_suppression_no_duplicate_on_self_publish() {
 async fn boot_fails_when_redis_unreachable() {
     // Use a port that is overwhelmingly likely to be closed.
     let bogus = "redis://127.0.0.1:1";
-    let result = RedisNotifier::build(bogus, Some(unique_channel()), 8).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        RedisNotifier::build(bogus, Some(unique_channel()), 8),
+    )
+    .await
+    .expect("redis notifier boot should fail fast, not hang");
     assert!(
         result.is_err(),
         "expected build to fail against unreachable redis"

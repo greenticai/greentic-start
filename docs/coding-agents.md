@@ -243,6 +243,31 @@ At startup, [src/lib.rs](/projects/ai/greentic-ng/greentic-start/src/lib.rs:115)
 
 Do not accidentally break these unless the contract is intentionally changing.
 
+### DirectLine session-token renewal
+
+The HTTP ingress fronts the webchat provider's `/v3/directline/...` endpoints and
+keeps an in-memory sliding window of active conversations: on every accepted
+`POST /v3/directline/conversations/<id>/activities` it extends the conversation's
+lifetime, re-mints a fresh, correctly-signed bearer (same `conv`/`ctx`), swaps it
+into the upstream `Authorization` header, and returns it to the client as
+`_directline.renewed_token` — so a long-running chat never hits the 30-minute
+`401 invalid token: Expired`. Idle conversations still lapse after the TTL.
+`POST /v3/directline/tokens/refresh` is served locally (the WASM provider 404s
+it) and returns a full-fresh-TTL token with the same `conversationId`. Auth
+failures on these endpoints carry a machine-readable `code`
+(`TokenExpired` / `InvalidToken` / `WrongConversation`) plus a `Link` header to
+`/tokens/refresh` on the `401`s.
+
+- Base TTL: `GREENTIC_DIRECTLINE_TOKEN_TTL_SECS` (seconds, clamped `[60, 604800]`,
+  default `1800`). The activity-driven renewal is the actual fix; this env var is
+  only the base-lifetime knob.
+- Implementation: [src/http_ingress/directline_session.rs](/projects/ai/greentic-ng/greentic-start/src/http_ingress/directline_session.rs)
+  and the `directline_session_preflight` / `apply_directline_forward_plan` hooks
+  in [src/http_ingress/mod.rs](/projects/ai/greentic-ng/greentic-start/src/http_ingress/mod.rs).
+  Background: [docs/directline-token-renewal.md](/projects/ai/greentic-ng/greentic-start/docs/directline-token-renewal.md).
+- WebSocket `/stream` keepalive (re-mint the pump's internal token, `touch` the
+  window while connected) is not wired yet — follow-up.
+
 ### Setup-derived tunnel behavior
 
 App startup currently consumes setup-derived tunnel configuration from `.greentic/tunnel.json`, but that does not mean all setup answers are automatically merged into app-flow runtime config.
