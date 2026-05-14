@@ -497,10 +497,12 @@ fn collect_transcript_outputs(
         // prefer explicit target match, then the latest output.
         targeted.or(last.clone()).or(preferred).or(first)
     } else {
-        // Non-targeted flows should prefer the latest envelope-compatible
-        // output for handoff. The first envelope-like output is often the
-        // initial menu card, while later nodes render the actual result card.
-        targeted.or(last.clone()).or(preferred).or(first)
+        // Non-targeted flows: prefer an envelope-compatible output (e.g. the
+        // rendered welcome card) over a trailing non-envelope record. autoStart
+        // can run downstream nodes whose outputs are diagnostic objects like
+        // `{error: AC_BINDING_EVAL_ERROR}` — those would otherwise displace the
+        // envelope-shaped reply the user actually needs to see.
+        targeted.or(preferred).or(last.clone()).or(first)
     };
     Ok(selected)
 }
@@ -1196,6 +1198,37 @@ mod tests {
             .expect("collect outputs")
             .expect("selected output");
         assert_eq!(selected["renderedCard"]["body"][0]["text"], "Final Report");
+    }
+
+    #[test]
+    fn collect_transcript_outputs_prefers_envelope_over_trailing_error_record() {
+        // Regression: autoStart can execute downstream nodes whose outputs are
+        // diagnostic objects (e.g. `{error: AC_BINDING_EVAL_ERROR}`). Those
+        // must NOT displace an earlier envelope-shaped reply that the user is
+        // expecting to see (the rendered welcome card).
+        let dir = tempdir().expect("tempdir");
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"node_id\":\"welcome\",\"outputs\":{\"renderedCard\":{\"body\":[{\"text\":\"Welcome\"}]}}}\n",
+                "{\"node_id\":\"midway\",\"outputs\":{\"ok\":true}}\n",
+                "{\"node_id\":\"booking_complete\",\"outputs\":{\"error\":\"AC_BINDING_EVAL_ERROR\",\"missing\":[\"consultType\"]}}\n"
+            ),
+        )
+        .expect("write transcript");
+
+        let selected = collect_transcript_outputs(dir.path(), None)
+            .expect("collect outputs")
+            .expect("selected output");
+        assert_eq!(
+            selected["renderedCard"]["body"][0]["text"], "Welcome",
+            "envelope-shaped welcome card must win over trailing error record"
+        );
+        assert!(
+            selected.get("error").is_none(),
+            "diagnostic error output must not be surfaced to the channel"
+        );
     }
 
     #[test]
