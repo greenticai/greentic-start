@@ -6,8 +6,10 @@ use hyper::{
     body::Bytes,
     header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE},
 };
+use serde_json::Value as JsonValue;
 
 use crate::operator_log;
+use crate::provider_config_envelope::read_provider_config_envelope;
 use crate::static_routes::{
     StaticRouteDescriptor, StaticRouteMatch, cache_control_value, content_type_for_path,
     fallback_asset_path, normalize_relative_asset_path, read_pack_asset_bytes, resolve_asset_path,
@@ -54,6 +56,15 @@ pub(super) fn serve_static_route(
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
             }
         }
+    }
+    // Synthesize per-tenant webchat client config from the provider envelope when
+    // neither the bundle overlay nor the pack ships an explicit
+    // `config/tenants/<tenant>.json`. Without this branch the request would fall
+    // through to `spa_fallback` and serve `index.html`, returning HTML where the
+    // client expects JSON — silently downgrading the active skin to the built-in
+    // fallback even when wizard answers asked for something else.
+    if let Some(response) = try_serve_synthesized_tenant_config(route_match, bundle_root) {
+        return response;
     }
     if let Some(asset_path) = fallback_asset_path(route_match) {
         match serve_static_asset(route_match.descriptor, &asset_path, bundle_root) {
@@ -176,6 +187,116 @@ fn enumerate_pack_locale_codes(pack_path: &Path) -> Vec<String> {
         codes.insert(code.to_string());
     }
     codes.into_iter().collect()
+}
+
+/// Synthesize a per-tenant webchat client config (`config/tenants/<tenant>.json`)
+/// from the provider envelope when no overlay or pack file ships one for that
+/// tenant. The pack-shipped `default.json` is loaded as a base template and the
+/// envelope's `config` object overlays tenant-specific fields (`tenant_id`,
+/// `skin`, `nav_links`, OAuth provider enable flags) so wizard answers reach the
+/// browser without forcing authors to commit a JSON file per tenant.
+///
+/// Returns `None` when the request does not match the tenant-config URL shape,
+/// when the pack has no `default.json` template, or when no provider envelope
+/// exists at `bundle_root/.providers/<pack_id>/config.envelope.cbor`. The caller
+/// then proceeds to its existing fallbacks.
+fn try_serve_synthesized_tenant_config(
+    route_match: &StaticRouteMatch<'_>,
+    bundle_root: &Path,
+) -> Option<Response<Full<Bytes>>> {
+    let tenant_id = match_tenant_config_asset_path(&route_match.asset_path)?;
+
+    // The pack ships `default.json` as a literal template — defer to the file
+    // path serve so the byte-identical version is returned when requested.
+    if tenant_id == "default" {
+        return None;
+    }
+
+    let template_asset_path = format!(
+        "{}/config/tenants/default.json",
+        route_match.descriptor.source_root
+    );
+    let template_bytes =
+        read_pack_asset_bytes(&route_match.descriptor.pack_path, &template_asset_path).ok()??;
+    let mut template: JsonValue = serde_json::from_slice(&template_bytes).ok()?;
+
+    let providers_root = bundle_root.join(".providers");
+    let envelope =
+        read_provider_config_envelope(&providers_root, &route_match.descriptor.pack_id).ok()??;
+
+    apply_envelope_tenant_overrides(&mut template, tenant_id, &envelope.config);
+
+    let body = serde_json::to_vec(&template).ok()?;
+    operator_log::info(
+        module_path!(),
+        format!(
+            "[static] synthesized tenant config tenant={tenant_id} pack={}",
+            route_match.descriptor.pack_id
+        ),
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .header(CACHE_CONTROL, "no-cache")
+        .body(Full::from(Bytes::from(body)))
+        .ok()
+}
+
+/// Match an asset path of the exact shape `config/tenants/<id>.json` and return
+/// `<id>`. Returns `None` for nested directories under `config/tenants/` and for
+/// any other extension so synthesis stays scoped to the canonical client URL.
+fn match_tenant_config_asset_path(asset_path: &str) -> Option<&str> {
+    let rest = asset_path.strip_prefix("config/tenants/")?;
+    let id = rest.strip_suffix(".json")?;
+    if id.is_empty() || id.contains('/') {
+        return None;
+    }
+    Some(id)
+}
+
+/// Overlay envelope fields onto the `default.json` template in place. Missing
+/// envelope fields leave the template value untouched so the pack-author's
+/// defaults remain authoritative for anything the wizard did not configure.
+fn apply_envelope_tenant_overrides(
+    template: &mut JsonValue,
+    tenant_id: &str,
+    envelope_config: &JsonValue,
+) {
+    template["tenant_id"] = JsonValue::String(tenant_id.to_string());
+
+    if let Some(skin) = envelope_config.get("skin").and_then(|v| v.as_str())
+        && !skin.is_empty()
+    {
+        template["skin"] = JsonValue::String(skin.to_string());
+    }
+    if let Some(nav_links) = envelope_config.get("nav_links")
+        && !nav_links.is_null()
+    {
+        template["nav_links"] = nav_links.clone();
+    }
+
+    // Map `oauth_enable_<id>` envelope booleans onto each declared provider's
+    // `enabled` flag. Providers absent from the envelope keep the template
+    // value (typically the pack-author's safe default of `false`).
+    if let Some(providers) = template
+        .pointer_mut("/auth/providers")
+        .and_then(|v| v.as_array_mut())
+    {
+        for provider in providers.iter_mut() {
+            let Some(provider_id) = provider
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+            else {
+                continue;
+            };
+            let key = format!("oauth_enable_{provider_id}");
+            if let Some(enabled) = envelope_config.get(&key).and_then(|v| v.as_bool()) {
+                provider["enabled"] = JsonValue::Bool(enabled);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -398,5 +519,311 @@ mod tests {
         assert!(
             try_serve_i18n_manifest("/v1/web/webchat/demo/index.html", bundle.path()).is_none()
         );
+    }
+
+    // ── Synthesized tenant config ─────────────────────────────────────────────
+
+    use crate::provider_config_envelope::{ABI_VERSION, ConfigEnvelope};
+    use greentic_types::cbor::canonical;
+    use serde_json::json;
+
+    /// Default `assets/webchat-gui/config/tenants/default.json` shipped by the
+    /// real `messaging-webchat-gui` pack (truncated to fields the synth touches).
+    const PACK_DEFAULT_TENANT_TEMPLATE: &str = r##"{
+        "tenant_id": "default",
+        "legacy_skin": "_template",
+        "branding": {
+            "company_name": "AI Assistant",
+            "logo": "/skins/_template/assets/logo.svg"
+        },
+        "webchat": {
+            "directline": {},
+            "style_options": {"accent": "#059669"},
+            "adaptive_cards_host_config": {"fontFamily": "Poppins"},
+            "locale": "en-US"
+        },
+        "auth": {
+            "providers": [
+                {"id": "guest", "label": "Continue as Guest", "type": "dummy", "enabled": true},
+                {"id": "google", "label": "Sign in with Google", "type": "oidc", "enabled": false},
+                {"id": "microsoft", "label": "Sign in with Microsoft", "type": "oidc", "enabled": false}
+            ]
+        }
+    }"##;
+
+    fn write_webchat_pack_with_default_tenant(path: &Path) {
+        use std::io::Write;
+        let file = std::fs::File::create(path).expect("create pack");
+        let mut writer = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("assets/webchat-gui/config/tenants/default.json", opts)
+            .expect("start default.json");
+        writer
+            .write_all(PACK_DEFAULT_TENANT_TEMPLATE.as_bytes())
+            .expect("write default.json");
+        writer.finish().expect("finish pack");
+    }
+
+    fn write_test_envelope(providers_root: &Path, provider_id: &str, config: JsonValue) {
+        let provider_dir = providers_root.join(provider_id);
+        std::fs::create_dir_all(&provider_dir).expect("create provider dir");
+        let envelope = ConfigEnvelope {
+            config,
+            component_id: provider_id.to_string(),
+            abi_version: ABI_VERSION.to_string(),
+            resolved_digest: "test-digest".to_string(),
+            describe_hash: "test-describe".to_string(),
+            schema_hash: None,
+            operation_id: "setup-input".to_string(),
+            updated_at: None,
+        };
+        let bytes = canonical::to_canonical_cbor(&envelope).expect("encode envelope");
+        std::fs::write(provider_dir.join("config.envelope.cbor"), bytes).expect("write envelope");
+    }
+
+    fn webchat_descriptor(pack_path: &Path) -> StaticRouteDescriptor {
+        StaticRouteDescriptor {
+            route_id: "webchat-gui".to_string(),
+            pack_id: "messaging-webchat-gui".to_string(),
+            pack_path: pack_path.to_path_buf(),
+            public_path: "/v1/web/webchat/{tenant}".to_string(),
+            source_root: "assets/webchat-gui".to_string(),
+            index_file: Some("index.html".to_string()),
+            spa_fallback: Some("index.html".to_string()),
+            tenant_scoped: true,
+            team_scoped: false,
+            cache_strategy: CacheStrategy::None,
+            route_segments: vec![
+                RouteScopeSegment::Literal("v1".into()),
+                RouteScopeSegment::Literal("web".into()),
+                RouteScopeSegment::Literal("webchat".into()),
+                RouteScopeSegment::Tenant,
+            ],
+        }
+    }
+
+    #[test]
+    fn match_tenant_config_extracts_id() {
+        assert_eq!(
+            match_tenant_config_asset_path("config/tenants/demo.json"),
+            Some("demo")
+        );
+        assert_eq!(
+            match_tenant_config_asset_path("config/tenants/3aigent.json"),
+            Some("3aigent")
+        );
+    }
+
+    #[test]
+    fn match_tenant_config_rejects_other_paths() {
+        assert!(match_tenant_config_asset_path("index.html").is_none());
+        assert!(match_tenant_config_asset_path("config/tenants/").is_none());
+        assert!(match_tenant_config_asset_path("config/tenants/.json").is_none());
+        assert!(match_tenant_config_asset_path("config/tenants/nested/x.json").is_none());
+        assert!(match_tenant_config_asset_path("skins/3aigent/skin.json").is_none());
+    }
+
+    #[test]
+    fn synthesize_overlays_skin_nav_links_and_oauth() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let bundle = tempdir().expect("tempdir");
+        let pack_path = bundle.path().join("messaging-webchat-gui.gtpack");
+        write_webchat_pack_with_default_tenant(&pack_path);
+        write_test_envelope(
+            &bundle.path().join(".providers"),
+            "messaging-webchat-gui",
+            json!({
+                "skin": "3aigent",
+                "nav_links": [
+                    {"num": "M1", "label": "Playground", "url": "https://example.test"}
+                ],
+                "oauth_enabled": false,
+                "oauth_enable_google": true,
+                "oauth_enable_microsoft": false,
+            }),
+        );
+
+        let descriptor = webchat_descriptor(&pack_path);
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: "config/tenants/demo.json".to_string(),
+            request_is_directory: false,
+        };
+
+        let response = serve_static_route(
+            &route_match,
+            bundle.path(),
+            "/v1/web/webchat/demo/config/tenants/demo.json",
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+        let body = runtime.block_on(async {
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+        });
+        let parsed: JsonValue = serde_json::from_slice(&body).expect("parse json");
+
+        assert_eq!(parsed["tenant_id"], json!("demo"));
+        assert_eq!(parsed["skin"], json!("3aigent"));
+        assert_eq!(parsed["legacy_skin"], json!("_template"));
+        assert_eq!(parsed["nav_links"][0]["num"], json!("M1"));
+
+        let providers = parsed["auth"]["providers"]
+            .as_array()
+            .expect("providers array");
+        let google = providers
+            .iter()
+            .find(|p| p["id"] == "google")
+            .expect("google");
+        assert_eq!(google["enabled"], json!(true));
+        let microsoft = providers
+            .iter()
+            .find(|p| p["id"] == "microsoft")
+            .expect("microsoft");
+        assert_eq!(microsoft["enabled"], json!(false));
+    }
+
+    #[test]
+    fn synthesize_falls_through_when_no_envelope_present() {
+        // No envelope written → synthesizer returns None → SPA fallback (index.html
+        // shipped by pack) takes over per the existing chain.
+        use std::io::Write;
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let bundle = tempdir().expect("tempdir");
+        let pack_path = bundle.path().join("messaging-webchat-gui.gtpack");
+        // Pack ships both default.json and index.html so the fallback succeeds.
+        let file = std::fs::File::create(&pack_path).expect("create pack");
+        let mut writer = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("assets/webchat-gui/config/tenants/default.json", opts)
+            .unwrap();
+        writer
+            .write_all(PACK_DEFAULT_TENANT_TEMPLATE.as_bytes())
+            .unwrap();
+        writer
+            .start_file("assets/webchat-gui/index.html", opts)
+            .unwrap();
+        writer.write_all(b"<html>spa</html>").unwrap();
+        writer.finish().unwrap();
+
+        let descriptor = webchat_descriptor(&pack_path);
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: "config/tenants/demo.json".to_string(),
+            request_is_directory: false,
+        };
+
+        let response = serve_static_route(
+            &route_match,
+            bundle.path(),
+            "/v1/web/webchat/demo/config/tenants/demo.json",
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        // Confirms SPA fallback ran (HTML, not JSON).
+        assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
+        let body = runtime.block_on(async {
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+        });
+        assert!(String::from_utf8_lossy(&body).contains("<html>spa</html>"));
+    }
+
+    #[test]
+    fn synthesize_skips_default_tenant_so_pack_file_serves_directly() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let bundle = tempdir().expect("tempdir");
+        let pack_path = bundle.path().join("messaging-webchat-gui.gtpack");
+        write_webchat_pack_with_default_tenant(&pack_path);
+        write_test_envelope(
+            &bundle.path().join(".providers"),
+            "messaging-webchat-gui",
+            json!({"skin": "3aigent"}),
+        );
+
+        let descriptor = webchat_descriptor(&pack_path);
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: "config/tenants/default.json".to_string(),
+            request_is_directory: false,
+        };
+
+        let response = serve_static_route(
+            &route_match,
+            bundle.path(),
+            "/v1/web/webchat/demo/config/tenants/default.json",
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = runtime.block_on(async {
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+        });
+        let parsed: JsonValue = serde_json::from_slice(&body).expect("parse json");
+        // Pack file served verbatim — synth would have set tenant_id="default" and
+        // overridden skin to "3aigent"; the pack file has tenant_id "default" and
+        // no `skin` field at all.
+        assert_eq!(parsed["tenant_id"], json!("default"));
+        assert!(parsed.get("skin").is_none());
+    }
+
+    #[test]
+    fn synthesize_preserves_overlay_when_present() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let bundle = tempdir().expect("tempdir");
+        let pack_path = bundle.path().join("messaging-webchat-gui.gtpack");
+        write_webchat_pack_with_default_tenant(&pack_path);
+        write_test_envelope(
+            &bundle.path().join(".providers"),
+            "messaging-webchat-gui",
+            json!({"skin": "3aigent"}),
+        );
+        // Workspace overlay supplies an explicit demo.json — synth must NOT shadow
+        // it (overlay is the author's deliberate override).
+        let overlay_dir = bundle.path().join("assets/webchat-gui/config/tenants");
+        std::fs::create_dir_all(&overlay_dir).unwrap();
+        std::fs::write(
+            overlay_dir.join("demo.json"),
+            r#"{"tenant_id":"demo","skin":"overlay-wins"}"#,
+        )
+        .unwrap();
+
+        let descriptor = webchat_descriptor(&pack_path);
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: "config/tenants/demo.json".to_string(),
+            request_is_directory: false,
+        };
+
+        let response = serve_static_route(
+            &route_match,
+            bundle.path(),
+            "/v1/web/webchat/demo/config/tenants/demo.json",
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = runtime.block_on(async {
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+        });
+        let parsed: JsonValue = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(parsed["skin"], json!("overlay-wins"));
     }
 }
