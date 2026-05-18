@@ -1,9 +1,21 @@
+//! Provider configuration envelope reader/writer for greentic-start.
+//!
+//! # DEPRECATED (Phase B / B12a)
+//!
+//! `config.envelope.cbor` is a transitional on-disk sink for non-secret provider
+//! configuration. It's kept alive for runtime compatibility until `pack-config.v1`
+//! ships and B12a migrates secret material into the env's secrets backend.
+//! Readers in greentic-start consult this envelope on hot paths — once the
+//! migration lands they should switch to `pack-config.v1` + `SecretsBackend`
+//! and this module can be deleted.
+
 #![allow(dead_code)]
 
 use std::fs::File;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use anyhow::{Context, anyhow};
 use chrono::Utc;
@@ -19,6 +31,33 @@ use serde_json::{Value as JsonValue, json};
 use zip::ZipArchive;
 
 use crate::runtime_state::atomic_write;
+
+// DEPRECATED (Phase B / B12a): once-per-process deprecation warnings for the
+// envelope reader paths. See callers below.
+static WARN_READ_ENVELOPE: Once = Once::new();
+static WARN_REQUIRE_ENVELOPE: Once = Once::new();
+
+fn warn_envelope_read_deprecated(path: &Path) {
+    WARN_READ_ENVELOPE.call_once(|| {
+        tracing::warn!(
+            target: "greentic_start::deprecated",
+            path = %path.display(),
+            "reading .providers/<provider>/config.envelope.cbor — deprecated sink, \
+             migrate to pack-config.v1 (Phase B / B12a)"
+        );
+    });
+}
+
+fn warn_envelope_require_deprecated(path: &Path) {
+    WARN_REQUIRE_ENVELOPE.call_once(|| {
+        tracing::warn!(
+            target: "greentic_start::deprecated",
+            path = %path.display(),
+            "require_provider_config_envelope reads .providers/<provider>/config.envelope.cbor — \
+             deprecated sink, migrate to pack-config.v1 (Phase B / B12a)"
+        );
+    });
+}
 
 pub const ABI_VERSION: &str = "greentic:component@0.6.0";
 
@@ -102,6 +141,7 @@ pub fn read_provider_config_envelope(
     if !path.exists() {
         return Ok(None);
     }
+    warn_envelope_read_deprecated(&path);
     let bytes =
         std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let envelope: ConfigEnvelope = canonical::from_cbor(&bytes)
@@ -120,6 +160,7 @@ pub fn require_provider_config_envelope(
     let path = providers_root
         .join(provider_id)
         .join("config.envelope.cbor");
+    warn_envelope_require_deprecated(&path);
     let bytes = std::fs::read(&path).with_context(|| {
         format!(
             "provider config envelope not found for {provider_id} at {}",

@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    sync::Once,
     time::Duration,
 };
 
@@ -271,11 +272,15 @@ pub fn run_app_flow(
 /// model, api_key_secret, etc.) via `entry.input.metadata.*`. Existing keys
 /// from the inbound envelope take precedence — user-supplied form data is
 /// never overwritten by pack defaults.
+///
+/// DEPRECATED (Phase B / B12a): reads from the transitional `setup-answers.json`
+/// sink. Migration target is `pack-config.v1` + the env's secrets backend.
 fn inject_pack_setup_answers(
     bundle: &Path,
     pack_id: &str,
     metadata: &mut BTreeMap<String, String>,
 ) {
+    static WARN: Once = Once::new();
     let path = bundle
         .join("state")
         .join("config")
@@ -284,6 +289,14 @@ fn inject_pack_setup_answers(
     let Ok(bytes) = std::fs::read(&path) else {
         return;
     };
+    WARN.call_once(|| {
+        tracing::warn!(
+            target: "greentic_start::deprecated",
+            path = %path.display(),
+            "reading state/config/<pack>/setup-answers.json via inject_pack_setup_answers — \
+             deprecated sink, migrate to pack-config.v1 (Phase B / B12a)"
+        );
+    });
     let Ok(JsonValue::Object(answers)) = serde_json::from_slice::<JsonValue>(&bytes) else {
         return;
     };
