@@ -190,16 +190,17 @@ fn enumerate_pack_locale_codes(pack_path: &Path) -> Vec<String> {
 }
 
 /// Synthesize a per-tenant webchat client config (`config/tenants/<tenant>.json`)
-/// from the provider envelope when no overlay or pack file ships one for that
+/// from provider setup config when no overlay or pack file ships one for that
 /// tenant. The pack-shipped `default.json` is loaded as a base template and the
-/// envelope's `config` object overlays tenant-specific fields (`tenant_id`,
-/// `skin`, `nav_links`, OAuth provider enable flags) so wizard answers reach the
-/// browser without forcing authors to commit a JSON file per tenant.
+/// provider config object overlays tenant-specific fields (`tenant_id`, `skin`,
+/// `nav_links`, OAuth provider enable flags) so wizard answers reach the browser
+/// without forcing authors to commit a JSON file per tenant.
 ///
 /// Returns `None` when the request does not match the tenant-config URL shape,
-/// when the pack has no `default.json` template, or when no provider envelope
-/// exists at `bundle_root/.providers/<pack_id>/config.envelope.cbor`. The caller
-/// then proceeds to its existing fallbacks.
+/// when the pack has no `default.json` template, or when no provider setup config
+/// exists in `.providers/<pack_id>/config.envelope.cbor` or
+/// `state/config/<pack_id>/setup-answers.json`. The caller then proceeds to its
+/// existing fallbacks.
 fn try_serve_synthesized_tenant_config(
     route_match: &StaticRouteMatch<'_>,
     bundle_root: &Path,
@@ -221,10 +222,16 @@ fn try_serve_synthesized_tenant_config(
     let mut template: JsonValue = serde_json::from_slice(&template_bytes).ok()?;
 
     let providers_root = bundle_root.join(".providers");
-    let envelope =
-        read_provider_config_envelope(&providers_root, &route_match.descriptor.pack_id).ok()??;
+    let provider_config =
+        read_provider_config_envelope(&providers_root, &route_match.descriptor.pack_id)
+            .ok()
+            .flatten()
+            .map(|envelope| envelope.config)
+            .or_else(|| {
+                read_provider_setup_answers(bundle_root, &route_match.descriptor.pack_id)
+            })?;
 
-    apply_envelope_tenant_overrides(&mut template, tenant_id, &envelope.config);
+    apply_envelope_tenant_overrides(&mut template, tenant_id, &provider_config);
 
     let body = serde_json::to_vec(&template).ok()?;
     operator_log::info(
@@ -241,6 +248,16 @@ fn try_serve_synthesized_tenant_config(
         .header(CACHE_CONTROL, "no-cache")
         .body(Full::from(Bytes::from(body)))
         .ok()
+}
+
+fn read_provider_setup_answers(bundle_root: &Path, provider_id: &str) -> Option<JsonValue> {
+    let path = bundle_root
+        .join("state")
+        .join("config")
+        .join(provider_id)
+        .join("setup-answers.json");
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Match an asset path of the exact shape `config/tenants/<id>.json` and return
@@ -690,14 +707,11 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_falls_through_when_no_envelope_present() {
-        // No envelope written → synthesizer returns None → SPA fallback (index.html
-        // shipped by pack) takes over per the existing chain.
+    fn synthesize_uses_setup_answers_when_envelope_missing() {
         use std::io::Write;
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let bundle = tempdir().expect("tempdir");
         let pack_path = bundle.path().join("messaging-webchat-gui.gtpack");
-        // Pack ships both default.json and index.html so the fallback succeeds.
         let file = std::fs::File::create(&pack_path).expect("create pack");
         let mut writer = zip::ZipWriter::new(file);
         let opts: zip::write::FileOptions<'_, ()> =
@@ -714,6 +728,24 @@ mod tests {
         writer.write_all(b"<html>spa</html>").unwrap();
         writer.finish().unwrap();
 
+        let setup_answers_dir = bundle
+            .path()
+            .join("state")
+            .join("config")
+            .join("messaging-webchat-gui");
+        std::fs::create_dir_all(&setup_answers_dir).expect("create setup answers dir");
+        std::fs::write(
+            setup_answers_dir.join("setup-answers.json"),
+            serde_json::to_vec(&json!({
+                "skin": "3aigent",
+                "nav_links": [
+                    {"num": "M1", "label": "Playground", "url": "https://example.test"}
+                ]
+            }))
+            .expect("encode setup answers"),
+        )
+        .expect("write setup answers");
+
         let descriptor = webchat_descriptor(&pack_path);
         let route_match = StaticRouteMatch {
             descriptor: &descriptor,
@@ -727,8 +759,7 @@ mod tests {
             "/v1/web/webchat/demo/config/tenants/demo.json",
         );
         assert_eq!(response.status(), StatusCode::OK);
-        // Confirms SPA fallback ran (HTML, not JSON).
-        assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
         let body = runtime.block_on(async {
             response
                 .into_body()
@@ -737,7 +768,15 @@ mod tests {
                 .expect("body")
                 .to_bytes()
         });
-        assert!(String::from_utf8_lossy(&body).contains("<html>spa</html>"));
+        let parsed: JsonValue = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(parsed["tenant_id"], json!("demo"));
+        assert_eq!(parsed["skin"], json!("3aigent"));
+        assert_eq!(
+            parsed["nav_links"],
+            json!([
+                {"num": "M1", "label": "Playground", "url": "https://example.test"}
+            ])
+        );
     }
 
     #[test]
