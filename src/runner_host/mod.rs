@@ -14,7 +14,7 @@ pub use types::{FlowOutcome, OperatorContext, RunnerExecutionMode};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Once, RwLock};
 
 use greentic_runner_host::storage::{DynStateStore, new_state_store};
 
@@ -443,13 +443,27 @@ impl DemoRunnerHost {
     }
 }
 
+// DEPRECATED (Phase B / B12a): reads non-secret config from the transitional
+// `setup-answers.json` sink. Kept alive until `pack-config.v1` ships and B12a
+// migrates secret material to the env's secrets backend. Once both land, this
+// helper should be deleted.
+static WARN_SETUP_ANSWERS_READ: Once = Once::new();
+
 fn load_setup_answer_secret(bundle_root: &Path, provider: &str, key: &str) -> Option<Vec<u8>> {
     let path = bundle_root
         .join("state")
         .join("config")
         .join(provider)
         .join("setup-answers.json");
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = std::fs::read(&path).ok()?;
+    WARN_SETUP_ANSWERS_READ.call_once(|| {
+        tracing::warn!(
+            target: "greentic_start::deprecated",
+            path = %path.display(),
+            "reading state/config/<provider>/setup-answers.json — deprecated sink, \
+             migrate to secrets backend (Phase B / B12a)"
+        );
+    });
     let json = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
     let value = json.get(key)?;
     match value {
