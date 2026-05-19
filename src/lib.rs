@@ -84,6 +84,105 @@ pub use cli_args::{
 const DEMO_DEFAULT_TENANT: &str = "demo";
 const DEMO_DEFAULT_TEAM: &str = "default";
 
+/// Default environment id when nothing is set. Flipped from `"dev"` to
+/// `"local"` as part of A4b — the `local` env is what `gtc setup` and
+/// `gtc start` auto-create per A4.
+pub const DEFAULT_ENV_ID: &str = "local";
+
+/// Legacy env id this crate accepts via the compat alias. Resolved values
+/// that match this string are remapped to [`DEFAULT_ENV_ID`] with a
+/// once-per-process warning, unless the operator disables the alias.
+pub const LEGACY_ENV_ID: &str = "dev";
+
+/// Env-var that disables the [`LEGACY_ENV_ID`] → [`DEFAULT_ENV_ID`] compat
+/// alias. Set to `1`, `true`, `yes`, or `on` (case-insensitive) to make
+/// any resolved value of `dev` hard-fail with a remediation hint.
+pub const DISABLE_ALIAS_ENV_VAR: &str = "GREENTIC_DISABLE_DEV_ALIAS";
+
+/// Resolve the effective environment string.
+///
+/// Priority: explicit override > `$GREENTIC_ENV` > [`DEFAULT_ENV_ID`]
+/// (`"local"`). After resolution, applies the [`LEGACY_ENV_ID`] →
+/// [`DEFAULT_ENV_ID`] compat alias: any value of `dev` is remapped to
+/// `local` with a once-per-process `tracing::warn!` unless
+/// [`DISABLE_ALIAS_ENV_VAR`] is set, in which case the resolution panics
+/// with a remediation hint.
+///
+/// This is the canonical helper for the `runner_host`, `secrets_setup`,
+/// and `qa_persist` paths. Mirrors `greentic_setup::resolve_env` (A4b
+/// PR2 in `greentic-setup`). If the duplication ever proves load-bearing,
+/// fold both into a shared helper in `greentic-deployer::cli::bootstrap`
+/// or similar.
+pub fn resolve_env(override_env: Option<&str>) -> String {
+    let raw = override_env
+        .map(|v| v.to_string())
+        .or_else(|| std::env::var("GREENTIC_ENV").ok())
+        .unwrap_or_else(|| DEFAULT_ENV_ID.to_string());
+    compat_alias::apply_dev_alias(&raw)
+}
+
+mod compat_alias {
+    //! `dev` → `local` compatibility alias (A4b).
+    //!
+    //! Mirrors `greentic_setup::compat_alias`. Centralizing into a shared
+    //! crate is deferred until the duplication starts mattering — the
+    //! logic is ~30 lines and the two crates have distinct test surfaces.
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{DEFAULT_ENV_ID, DISABLE_ALIAS_ENV_VAR, LEGACY_ENV_ID};
+
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    /// Apply the `dev` → `local` compat alias. Returns the remapped value
+    /// for any input equal to [`LEGACY_ENV_ID`]; returns the input
+    /// unchanged for any other value. Panics if the alias is disabled via
+    /// [`DISABLE_ALIAS_ENV_VAR`] and the input is the legacy id.
+    pub fn apply_dev_alias(env: &str) -> String {
+        if env != LEGACY_ENV_ID {
+            return env.to_string();
+        }
+        if alias_disabled() {
+            // Hard-fail expiry gate. The panic message is the remediation —
+            // tracing may not be wired in every binary that consumes
+            // `resolve_env`, and `process::exit()` bypasses test harnesses.
+            panic!(
+                "environment `{LEGACY_ENV_ID}` is no longer accepted (set via {DISABLE_ALIAS_ENV_VAR}=1). \
+                 Migrate to `{DEFAULT_ENV_ID}` via `gtc op env migrate-dev {DEFAULT_ENV_ID} --check` then `--apply`, \
+                 or pass `--env {DEFAULT_ENV_ID}` / unset $GREENTIC_ENV.",
+            );
+        }
+        if !WARNED.swap(true, Ordering::SeqCst) {
+            tracing::warn!(
+                target: "greentic_start::compat_alias",
+                legacy = LEGACY_ENV_ID,
+                target_env = DEFAULT_ENV_ID,
+                "env `{LEGACY_ENV_ID}` is deprecated; resolving as `{DEFAULT_ENV_ID}` for this process. \
+                 Plan the migration with `gtc op env migrate-dev {DEFAULT_ENV_ID} --check`; \
+                 set {DISABLE_ALIAS_ENV_VAR}=1 to hard-fail on `{LEGACY_ENV_ID}` in CI.",
+            );
+        }
+        DEFAULT_ENV_ID.to_string()
+    }
+
+    fn alias_disabled() -> bool {
+        std::env::var(DISABLE_ALIAS_ENV_VAR)
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    }
+
+    /// Reset the warning latch. Test-only so multiple `apply_dev_alias`
+    /// invocations can each verify the once-per-process behavior.
+    #[cfg(test)]
+    pub(super) fn reset_warning_latch_for_tests() {
+        WARNED.store(false, Ordering::SeqCst);
+    }
+}
+
 pub fn run_start_request(request: StartRequest) -> anyhow::Result<()> {
     run_start(request)
 }
@@ -154,12 +253,15 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         std::env::set_var("GREENTIC_PROVIDER_CORE_ONLY", "0");
     }
 
-    // Set GREENTIC_ENV to "dev" if not already set. Secrets are persisted with env="dev"
-    // (see providers.rs, onboard/wizard.rs), so the runtime must match when reading.
+    // Set GREENTIC_ENV to the A4b default (`local`) if not already set.
+    // A4's `bootstrap_local_environment` (below) creates `~/.greentic/environments/local/`
+    // and downstream secret resolution keys off this env. If the user already exported
+    // `GREENTIC_ENV=dev`, the A4b compat alias inside `resolve_env` remaps it to
+    // `local` with a once-per-process warning until the alias is disabled.
     // SAFETY: This is called early in single-threaded startup before spawning workers.
     if std::env::var("GREENTIC_ENV").is_err() {
         unsafe {
-            std::env::set_var("GREENTIC_ENV", "dev");
+            std::env::set_var("GREENTIC_ENV", DEFAULT_ENV_ID);
         }
     }
 
@@ -839,5 +941,138 @@ mod tests {
             .join("local")
             .join("environment.json");
         assert!(env_file.exists());
+    }
+
+    // ---- A4b compat-alias tests ------------------------------------------
+    //
+    // `GREENTIC_ENV` and `GREENTIC_DISABLE_DEV_ALIAS` are process-global;
+    // serialize via the shared `test_env_lock`. Each test snapshots and
+    // restores both vars + the warning latch so neighbors stay clean.
+
+    struct EnvVarsOverride {
+        prev_env: Option<std::ffi::OsString>,
+        prev_disable: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarsOverride {
+        fn clean() -> Self {
+            let prev_env = std::env::var_os("GREENTIC_ENV");
+            let prev_disable = std::env::var_os(DISABLE_ALIAS_ENV_VAR);
+            // SAFETY: tests holding `test_env_lock` serialize env mutations.
+            unsafe {
+                std::env::remove_var("GREENTIC_ENV");
+                std::env::remove_var(DISABLE_ALIAS_ENV_VAR);
+            }
+            super::compat_alias::reset_warning_latch_for_tests();
+            Self {
+                prev_env,
+                prev_disable,
+            }
+        }
+    }
+
+    impl Drop for EnvVarsOverride {
+        fn drop(&mut self) {
+            // SAFETY: tests holding `test_env_lock` serialize env mutations.
+            unsafe {
+                match self.prev_env.take() {
+                    Some(v) => std::env::set_var("GREENTIC_ENV", v),
+                    None => std::env::remove_var("GREENTIC_ENV"),
+                }
+                match self.prev_disable.take() {
+                    Some(v) => std::env::set_var(DISABLE_ALIAS_ENV_VAR, v),
+                    None => std::env::remove_var(DISABLE_ALIAS_ENV_VAR),
+                }
+            }
+        }
+    }
+
+    fn set_env_var(key: &str, value: &str) {
+        // SAFETY: tests holding `test_env_lock` serialize env mutations.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    #[test]
+    fn resolve_env_returns_local_by_default() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarsOverride::clean();
+        assert_eq!(resolve_env(None), "local");
+    }
+
+    #[test]
+    fn resolve_env_passes_through_non_legacy_override() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarsOverride::clean();
+        assert_eq!(resolve_env(Some("staging")), "staging");
+        assert_eq!(resolve_env(Some("prod")), "prod");
+        assert_eq!(resolve_env(Some("local")), "local");
+    }
+
+    #[test]
+    fn resolve_env_remaps_dev_override_to_local() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarsOverride::clean();
+        assert_eq!(resolve_env(Some("dev")), "local");
+    }
+
+    #[test]
+    fn resolve_env_remaps_dev_env_var_to_local() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarsOverride::clean();
+        set_env_var("GREENTIC_ENV", "dev");
+        assert_eq!(resolve_env(None), "local");
+    }
+
+    #[test]
+    fn alias_warning_latches_once_until_reset() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarsOverride::clean();
+        // First two calls remap; only the first fires warn. We can't count
+        // tracing events without wiring a subscriber, so we exercise the
+        // latch state by re-resetting and re-calling.
+        assert_eq!(compat_alias::apply_dev_alias("dev"), "local");
+        assert_eq!(compat_alias::apply_dev_alias("dev"), "local");
+        compat_alias::reset_warning_latch_for_tests();
+        assert_eq!(compat_alias::apply_dev_alias("dev"), "local");
+    }
+
+    #[test]
+    fn disable_alias_env_var_panics_on_dev() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarsOverride::clean();
+        set_env_var(DISABLE_ALIAS_ENV_VAR, "1");
+        let result = std::panic::catch_unwind(|| resolve_env(Some("dev")));
+        assert!(
+            result.is_err(),
+            "resolve_env should panic when alias is disabled and input is `dev`"
+        );
+    }
+
+    #[test]
+    fn disable_alias_accepts_truthy_strings() {
+        for value in ["1", "true", "TRUE", "yes", "YES", "on", " true "] {
+            let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+            let _env = EnvVarsOverride::clean();
+            set_env_var(DISABLE_ALIAS_ENV_VAR, value);
+            let result = std::panic::catch_unwind(|| resolve_env(Some("dev")));
+            assert!(
+                result.is_err(),
+                "DISABLE value `{value}` should hard-fail on dev resolution"
+            );
+        }
+    }
+
+    #[test]
+    fn disable_alias_does_not_panic_on_non_legacy_values() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarsOverride::clean();
+        set_env_var(DISABLE_ALIAS_ENV_VAR, "1");
+        // Non-legacy values pass through unaffected even when the alias is
+        // disabled — the gate only fires on `dev`.
+        assert_eq!(resolve_env(Some("local")), "local");
+        assert_eq!(resolve_env(Some("staging")), "staging");
+        assert_eq!(resolve_env(None), "local");
     }
 }
