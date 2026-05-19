@@ -12,7 +12,6 @@ pub use helpers::primary_provider_type;
 pub use types::{FlowOutcome, OperatorContext, RunnerExecutionMode};
 
 use std::collections::{BTreeMap, HashMap};
-use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once, RwLock};
 
@@ -258,7 +257,7 @@ impl DemoRunnerHost {
 
     pub fn capability_setup_plan(&self, ctx: &OperatorContext) -> Vec<CapabilityBinding> {
         let scope = ResolveScope {
-            env: Some(env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string())),
+            env: Some(crate::resolve_env(None)),
             tenant: Some(ctx.tenant.clone()),
             team: ctx.team.clone(),
         };
@@ -342,7 +341,7 @@ impl DemoRunnerHost {
             }
         }
         let scope = ResolveScope {
-            env: Some(env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string())),
+            env: Some(crate::resolve_env(None)),
             tenant: Some(ctx.tenant.clone()),
             team: ctx.team.clone(),
         };
