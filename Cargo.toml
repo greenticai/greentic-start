@@ -76,6 +76,10 @@ features = [
     "pack-fetch",
 ]
 
+[dependencies.greentic-deployer]
+version = ">=1.1.0-dev, <1.2.0-0"
+default-features = false
+
 [dependencies.greentic-setup]
 version = ">=1.1.0-dev, <1.2.0-0"
 
