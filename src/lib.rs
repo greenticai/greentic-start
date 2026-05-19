@@ -163,6 +163,8 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         }
     }
 
+    bootstrap_local_environment()?;
+
     // Temporary process-level API key fallback disabled while debugging the
     // adaptive card/runtime path. Keep this block for quick re-enable if we
     // need to revisit local Ollama compatibility.
@@ -417,6 +419,34 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Idempotently auto-create the `local` Environment on first `gtc start`.
+///
+/// Per A4 of `plans/next-gen-deployment.md`: every `gtc start`, `gtc up`, or
+/// `gtc restart` invocation guarantees a `local` Environment exists with the
+/// five default capability-slot bindings (deployer / secrets / telemetry /
+/// sessions / state) before any runner work runs. Subsequent calls find the
+/// env on disk and stay silent.
+fn bootstrap_local_environment() -> anyhow::Result<()> {
+    use greentic_deployer::cli::bootstrap::{LocalEnvOutcome, ensure_local_environment};
+    use greentic_deployer::environment::LocalFsStore;
+
+    let root = LocalFsStore::default_root()
+        .context("Cannot determine default environment store root (no home directory).")?;
+    let store = LocalFsStore::new(root.clone());
+    let (_env, outcome) = ensure_local_environment(&store)
+        .with_context(|| format!("Bootstrapping `local` environment at {}", root.display()))?;
+    if outcome == LocalEnvOutcome::Created {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "bootstrapped `local` environment with default capability bindings at {}",
+                root.display()
+            ),
+        );
+    }
+    Ok(())
+}
+
 fn apply_nats_overrides(config: &mut config::DemoConfig, args: &StartRequest) {
     let nats_mode = if args.no_nats {
         NatsModeArg::Off
@@ -627,6 +657,37 @@ mod tests {
         .expect("write demo config");
     }
 
+    /// RAII guard that points `$HOME` at the given tempdir for the lifetime of
+    /// the returned value, restoring the previous value on drop. Used to keep
+    /// `bootstrap_local_environment` (and any other HOME-rooted state) from
+    /// writing into the host's real `~/.greentic` during tests.
+    struct HomeOverride {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl HomeOverride {
+        fn set(home: &Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            // SAFETY: tests holding `test_env_lock` serialize env mutations.
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for HomeOverride {
+        fn drop(&mut self) {
+            // SAFETY: tests holding `test_env_lock` serialize env mutations.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
     fn request_runtime_stop(bundle: &Path) -> thread::JoinHandle<()> {
         let runtime_paths =
             runtime_state::RuntimePaths::new(bundle.join("state"), "demo", "default");
@@ -650,6 +711,7 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         crate::operator_log::reset_for_tests();
         let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::set(temp.path());
         let bundle = temp.path().join("bundle");
         write_demo_bundle(&bundle);
         let stop_thread = request_runtime_stop(&bundle);
@@ -674,6 +736,7 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         crate::operator_log::reset_for_tests();
         let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::set(temp.path());
         let bundle = temp.path().join("bundle");
         write_demo_bundle(&bundle);
         let stop_thread = request_runtime_stop(&bundle);
@@ -699,6 +762,7 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         crate::operator_log::reset_for_tests();
         let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::set(temp.path());
         let missing_bundle = temp.path().join("missing-bundle");
         let mut request = make_start_request(&missing_bundle);
         request.quiet = true;
@@ -740,5 +804,40 @@ mod tests {
             !candidates.is_empty(),
             "bundle with terraform.gtpack should detect deployer"
         );
+    }
+
+    #[test]
+    fn bootstrap_creates_local_env_under_default_root() {
+        let _env_guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::set(temp.path());
+        super::bootstrap_local_environment().expect("first bootstrap");
+        let env_file = temp
+            .path()
+            .join(".greentic")
+            .join("environments")
+            .join("local")
+            .join("environment.json");
+        assert!(env_file.exists(), "expected env file at {env_file:?}");
+    }
+
+    #[test]
+    fn bootstrap_is_idempotent_across_calls() {
+        let _env_guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::set(temp.path());
+        super::bootstrap_local_environment().expect("first bootstrap");
+        super::bootstrap_local_environment().expect("second bootstrap");
+        let env_file = temp
+            .path()
+            .join(".greentic")
+            .join("environments")
+            .join("local")
+            .join("environment.json");
+        assert!(env_file.exists());
     }
 }
