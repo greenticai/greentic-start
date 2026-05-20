@@ -50,6 +50,11 @@ type HmacSha256 = Hmac<Sha256>;
 /// Sum of basis points across a deployment's revisions. Mirrors deploy-spec §5.3.
 const TOTAL_WEIGHT_BPS: u32 = 10_000;
 
+/// Hard cap on the in-memory session-hint pin map. Mirrors the
+/// `directline_session::MAX_TRACKED_CONVERSATIONS` discipline so rotating-hint
+/// public traffic cannot grow the map without bound.
+const MAX_PINS: usize = 16_384;
+
 /// Cookie name prefix; full name is `_gt_rev_<deployment_id>`.
 pub const COOKIE_PREFIX: &str = "_gt_rev_";
 
@@ -137,6 +142,10 @@ struct CookiePayload {
 #[derive(Clone, Debug)]
 struct PinEntry {
     revision_id: RevisionId,
+    /// Deployment generation at the time of pin creation. Stale pins (whose
+    /// generation no longer matches the current split) are dropped on lookup,
+    /// matching the cookie invalidation contract.
+    generation: u64,
     expires_at: Instant,
 }
 
@@ -166,6 +175,9 @@ pub struct RevisionDispatcher {
     pin_ttl: Duration,
     snapshot: ArcSwap<Snapshot>,
     pins: Mutex<HashMap<(DeploymentId, String, String), PinEntry>>,
+    /// Serializes `apply_traffic_split` so the load → validate → store
+    /// sequence is race-free. Reads remain lock-free through `snapshot`.
+    write_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for RevisionDispatcher {
@@ -188,6 +200,7 @@ impl RevisionDispatcher {
             pin_ttl: cfg.pin_ttl,
             snapshot: ArcSwap::from_pointee(Snapshot::default()),
             pins: Mutex::new(HashMap::new()),
+            write_lock: Mutex::new(()),
         }
     }
 
@@ -272,15 +285,26 @@ impl RevisionDispatcher {
             );
         }
 
+        // Serialize the load → validate → store sequence: without it, two
+        // concurrent callers with the same `expected_generation` both observe
+        // the pre-update snapshot and the second `store` clobbers the first
+        // (also losing unrelated deployment updates in the clone).
+        let _w = self.write_lock.lock().expect("write lock poisoned");
+
         let prev = self.snapshot.load_full();
-        let current_gen = prev
-            .deployments
-            .get(&deployment_id)
-            .map(|d| d.generation)
-            .unwrap_or(0);
+        let existing = prev.deployments.get(&deployment_id);
+        let current_gen = existing.map(|d| d.generation).unwrap_or(0);
         if current_gen != expected_generation {
             bail!(
                 "stale generation for deployment `{deployment_id}`: caller has {expected_generation}, current is {current_gen}"
+            );
+        }
+        if let Some(d) = existing
+            && d.bundle_id != bundle_id
+        {
+            bail!(
+                "deployment `{deployment_id}` is bound to bundle `{}`; cannot rebind to `{bundle_id}` via apply_traffic_split",
+                d.bundle_id
             );
         }
 
@@ -348,7 +372,11 @@ impl RevisionDispatcher {
             let pinned = {
                 let mut pins = self.pins.lock().expect("pin mutex poisoned");
                 match pins.get(&pin_key) {
-                    Some(p) if p.expires_at > now_inst && has_revision(entry, p.revision_id) => {
+                    Some(p)
+                        if p.expires_at > now_inst
+                            && p.generation == entry.generation
+                            && has_revision(entry, p.revision_id) =>
+                    {
                         Some(p.revision_id)
                     }
                     Some(_) => {
@@ -371,14 +399,7 @@ impl RevisionDispatcher {
         let selected = weighted_pick(&entry.revisions, rng)?;
         if let Some(hint) = req.session_hint {
             let pin_key = (req.deployment_id, req.tenant.to_string(), hint.to_string());
-            let mut pins = self.pins.lock().expect("pin mutex poisoned");
-            pins.insert(
-                pin_key,
-                PinEntry {
-                    revision_id: selected,
-                    expires_at: Instant::now() + self.pin_ttl,
-                },
-            );
+            self.insert_pin(pin_key, selected, entry.generation);
         }
         Ok(DispatchOutcome {
             revision_id: selected,
@@ -386,6 +407,39 @@ impl RevisionDispatcher {
             reason: SelectionReason::Weighted,
             set_cookie: Some(self.build_set_cookie(req, entry, selected, now)),
         })
+    }
+
+    /// Bounded pin insert. Sweeps expired entries when at capacity, then
+    /// evicts the soonest-to-expire entry if still at cap. Same eviction
+    /// discipline as the DirectLine conversation cache in this crate, so a
+    /// rotating-session-hint client cannot grow the map without bound.
+    fn insert_pin(
+        &self,
+        key: (DeploymentId, String, String),
+        revision_id: RevisionId,
+        generation: u64,
+    ) {
+        let now = Instant::now();
+        let mut pins = self.pins.lock().expect("pin mutex poisoned");
+        if pins.len() >= MAX_PINS && !pins.contains_key(&key) {
+            pins.retain(|_, e| e.expires_at > now);
+            if pins.len() >= MAX_PINS
+                && let Some(victim) = pins
+                    .iter()
+                    .min_by_key(|(_, e)| e.expires_at)
+                    .map(|(k, _)| k.clone())
+            {
+                pins.remove(&victim);
+            }
+        }
+        pins.insert(
+            key,
+            PinEntry {
+                revision_id,
+                generation,
+                expires_at: now + self.pin_ttl,
+            },
+        );
     }
 
     fn build_set_cookie(
@@ -1104,5 +1158,173 @@ mod tests {
     fn cookie_name_uses_deployment_prefix() {
         let id = DeploymentId(Ulid::from_string("01F8MECHZX3TBDSZ7XR8KZ9V8K").unwrap());
         assert_eq!(cookie_name(id), "_gt_rev_01F8MECHZX3TBDSZ7XR8KZ9V8K");
+    }
+
+    #[test]
+    fn apply_traffic_split_rejects_rebinding_bundle() {
+        let d = RevisionDispatcher::new(cfg("local"));
+        let dep_id = dep();
+        d.apply_traffic_split(dep_id, vec![entry(rev(), 10_000)], bundle(), 0)
+            .unwrap();
+        let other_bundle = BundleId::new("other.app");
+        let other_entry = RevisionEntry {
+            revision_id: rev(),
+            bundle_id: other_bundle.clone(),
+            weight_bps: 10_000,
+        };
+        let err = d
+            .apply_traffic_split(dep_id, vec![other_entry], other_bundle, 1)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("bound to bundle"), "{msg}");
+        assert!(msg.contains("cannot rebind"), "{msg}");
+    }
+
+    #[test]
+    fn apply_traffic_split_is_serialized_under_concurrent_writers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let d = Arc::new(RevisionDispatcher::new(cfg("local")));
+        let dep_id = dep();
+        let successes = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let d = Arc::clone(&d);
+            let successes = Arc::clone(&successes);
+            handles.push(std::thread::spawn(move || {
+                // Every thread races with expected_generation = 0; without the
+                // write lock several threads could TOCTOU-validate and clobber
+                // each other, so we'd see > 1 success.
+                let r = entry(rev(), 10_000);
+                if d.apply_traffic_split(dep_id, vec![r], bundle(), 0).is_ok() {
+                    successes.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(successes.load(Ordering::SeqCst), 1);
+        let snap = d.snapshot.load();
+        assert_eq!(snap.deployments[&dep_id].generation, 1);
+    }
+
+    #[test]
+    fn apply_traffic_split_preserves_unrelated_deployments_across_writers() {
+        use std::sync::Arc;
+
+        // Pre-load two deployments at gen=0 → after apply they sit at gen=1.
+        let d = Arc::new(RevisionDispatcher::new(cfg("local")));
+        let dep_a = dep();
+        let dep_b = dep();
+        let r_a0 = rev();
+        let r_b0 = rev();
+        d.apply_traffic_split(dep_a, vec![entry(r_a0, 10_000)], bundle(), 0)
+            .unwrap();
+        d.apply_traffic_split(dep_b, vec![entry(r_b0, 10_000)], bundle(), 0)
+            .unwrap();
+
+        // Race: T1 updates A from gen=1; T2 updates B from gen=1. Both must
+        // land (different deployments). Pre-fix, the clone-from-snapshot model
+        // could drop one because the second store overwrites the first using a
+        // pre-T1 clone.
+        let d_a = Arc::clone(&d);
+        let d_b = Arc::clone(&d);
+        let r_a1 = rev();
+        let r_b1 = rev();
+        let t1 = std::thread::spawn(move || {
+            d_a.apply_traffic_split(dep_a, vec![entry(r_a1, 10_000)], bundle(), 1)
+                .unwrap();
+        });
+        let t2 = std::thread::spawn(move || {
+            d_b.apply_traffic_split(dep_b, vec![entry(r_b1, 10_000)], bundle(), 1)
+                .unwrap();
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let snap = d.snapshot.load();
+        assert_eq!(snap.deployments[&dep_a].generation, 2);
+        assert_eq!(snap.deployments[&dep_b].generation, 2);
+        assert_eq!(snap.deployments[&dep_a].revisions[0].revision_id, r_a1);
+        assert_eq!(snap.deployments[&dep_b].revisions[0].revision_id, r_b1);
+    }
+
+    #[test]
+    fn pin_invalidated_when_generation_bumps_even_if_revision_still_present() {
+        let d = RevisionDispatcher::new(cfg("local"));
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        d.apply_traffic_split(dep_id, vec![entry(r1, 5000), entry(r2, 5000)], bundle(), 0)
+            .unwrap();
+        // First dispatch pins to whichever revision wins.
+        let mut rng = StdRng::seed_from_u64(11);
+        let first = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: Some("sess-K"),
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .unwrap();
+        assert_eq!(first.reason, SelectionReason::Weighted);
+
+        // Operator bumps the split (gen 1 → 2) keeping BOTH revisions present
+        // but with different weights. Without the per-pin generation check the
+        // stale pin would still hit; with the check it must be discarded.
+        d.apply_traffic_split(dep_id, vec![entry(r1, 9000), entry(r2, 1000)], bundle(), 1)
+            .unwrap();
+
+        let second = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: Some("sess-K"),
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .unwrap();
+        assert_eq!(second.reason, SelectionReason::Weighted);
+    }
+
+    #[test]
+    fn pin_map_stays_bounded_under_rotating_session_hints() {
+        let dep_id = dep();
+        let d = dispatcher_with(dep_id, vec![entry(rev(), 10_000)]);
+        let mut rng = StdRng::seed_from_u64(0);
+        // Drive 2x the cap through unique hints. Without the bound the map
+        // would hold 32_768 entries; with it, it must stay ≤ MAX_PINS.
+        for i in 0..(MAX_PINS * 2) {
+            let hint = format!("sess-{i}");
+            d.dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: Some(&hint),
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .unwrap();
+        }
+        let len = d.pins.lock().unwrap().len();
+        assert!(len <= MAX_PINS, "pin map grew to {len}");
     }
 }
