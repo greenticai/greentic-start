@@ -92,7 +92,7 @@ Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is commi
 - **YAML**: Uses `serde_yaml_gtc` (imported as `serde_yaml_bw`), not `serde_yaml`
 - **Error handling**: `anyhow::Result<T>` with `.context()`
 - **i18n**: Source catalog at `i18n/en.json`. Translate via `tools/i18n.sh` (defaults: `LANGS=all`, `BATCH_SIZE=200`). Never hardcode user-facing strings.
-- **Docker**: `Dockerfile.distroless` builds a musl static binary into a Chainguard distroless image
+- **Docker**: `Dockerfile.distroless` builds a musl-static binary into a `gcr.io/distroless/static-debian12:nonroot` image (uid 65532, no shell; Chainguard is the optional hardened upgrade)
 
 ## Git Conventions
 
