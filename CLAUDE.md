@@ -92,7 +92,7 @@ Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is commi
 - **YAML**: Uses `serde_yaml_gtc` (imported as `serde_yaml_bw`), not `serde_yaml`
 - **Error handling**: `anyhow::Result<T>` with `.context()`
 - **i18n**: Source catalog at `i18n/en.json`. Translate via `tools/i18n.sh` (defaults: `LANGS=all`, `BATCH_SIZE=200`). Never hardcode user-facing strings.
-- **Docker**: `Dockerfile.distroless` builds a musl-static binary into a `gcr.io/distroless/static-debian12:nonroot` image (uid 65532, no shell; Chainguard is the optional hardened upgrade)
+- **Docker**: `Dockerfile.distroless` builds a musl-static binary into a `gcr.io/distroless/static-debian12:nonroot` image (uid 65532, no shell; Chainguard is the optional hardened upgrade). The image is **ELF-only**: it ships no shell or interpreters, so bundle-supplied service helpers (gateway/egress/subscriptions/runner) must be statically-linked ELF binaries, not `#!`-scripts. `build_service_spec` preflights helper shebangs and fails with an actionable error when the interpreter is absent.
 
 ## Git Conventions
 
