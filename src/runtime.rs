@@ -1725,6 +1725,44 @@ fn nats_started_marker(paths: &RuntimePaths) -> PathBuf {
     paths.runtime_root().join("nats.started")
 }
 
+// Hardened distroless host images ship no shell or interpreters. A script
+// helper (one with a `#!` shebang) cannot exec if its interpreter is absent,
+// and the kernel reports the missing *interpreter* as a "No such file" error
+// against the script itself — opaque to operators. Preflight the shebang and
+// fail with the ELF-only contract spelled out. No-op for ELF helpers and on
+// hosts that do have the interpreter, so normal dev runs are unaffected.
+fn preflight_interpreter(binary: &Path) -> anyhow::Result<()> {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(binary) else {
+        return Ok(());
+    };
+    let mut magic = [0u8; 2];
+    if file.read(&mut magic).unwrap_or(0) < 2 || &magic != b"#!" {
+        return Ok(());
+    }
+    let mut rest = Vec::new();
+    let mut byte = [0u8; 1];
+    while rest.len() < 256 {
+        match file.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => rest.push(byte[0]),
+            Err(_) => return Ok(()),
+        }
+    }
+    let line = String::from_utf8_lossy(&rest);
+    let interpreter = line.split_whitespace().next().unwrap_or("");
+    if interpreter.is_empty() || Path::new(interpreter).exists() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "service helper {} needs interpreter `{interpreter}`, which is not present. \
+         The hardened distroless runtime image ships no shell or interpreters — supply a \
+         statically-linked ELF helper, or run a runtime variant that includes `{interpreter}`.",
+        binary.display()
+    )
+}
+
 fn build_service_spec(
     config_dir: &Path,
     service_id: &str,
@@ -1749,6 +1787,7 @@ fn build_service_spec(
             explicit_path: explicit,
         },
     )?;
+    preflight_interpreter(&path)?;
     let mut argv = vec![path.to_string_lossy().to_string()];
     argv.extend(args.iter().cloned());
     Ok(supervisor::ServiceSpec {
@@ -1948,6 +1987,21 @@ mod tests {
         )?;
         assert_eq!(absolute.argv[0], binary.display().to_string());
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_service_spec_rejects_script_with_missing_interpreter() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().expect("tempdir");
+        let helper = dir.path().join("runner.sh");
+        fs::write(&helper, "#!/nonexistent/xyz-interp\necho hi\n").expect("write helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let err = build_service_spec(dir.path(), "runner", "./runner.sh", &[], &BTreeMap::new())
+            .expect_err("missing interpreter must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("interpreter"), "got: {msg}");
+        assert!(msg.contains("distroless"), "got: {msg}");
     }
 
     #[test]

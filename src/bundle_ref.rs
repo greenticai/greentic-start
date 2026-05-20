@@ -333,10 +333,16 @@ fn extract_zip(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
         }
         assert_no_existing_symlink(&destination)
             .with_context(|| format!("validate destination for {normalized}"))?;
+        let executable = entry
+            .unix_mode()
+            .map(|mode| mode & 0o111 != 0)
+            .unwrap_or(false);
         let mut target = File::create(&destination)
             .with_context(|| format!("create file {}", destination.display()))?;
         std::io::copy(&mut entry, &mut target)
             .with_context(|| format!("extract zip entry {normalized}"))?;
+        mark_executable_if(&destination, executable)
+            .with_context(|| format!("set mode for {normalized}"))?;
     }
     Ok(())
 }
@@ -388,7 +394,10 @@ fn extract_tar_reader<R: Read>(
         }
         let destination = safe_output_path(out_dir, &normalized)?;
         let header = entry.header();
-        match header.entry_type() {
+        let entry_type = header.entry_type();
+        // Capture the archived mode before the body mutably borrows `entry`.
+        let executable = header.mode().map(|mode| mode & 0o111 != 0).unwrap_or(false);
+        match entry_type {
             tar::EntryType::Directory => {
                 safe_create_dir_all(out_dir, &destination)
                     .with_context(|| format!("create directory {}", destination.display()))?;
@@ -404,6 +413,8 @@ fn extract_tar_reader<R: Read>(
                     .with_context(|| format!("create file {}", destination.display()))?;
                 std::io::copy(&mut entry, &mut target)
                     .with_context(|| format!("extract tar entry {normalized}"))?;
+                mark_executable_if(&destination, executable)
+                    .with_context(|| format!("set mode for {normalized}"))?;
             }
             tar::EntryType::Symlink => {
                 let link = entry
@@ -478,6 +489,8 @@ fn extract_squashfs(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
                     .with_context(|| format!("create file {}", destination.display()))?;
                 std::io::copy(&mut source, &mut target)
                     .with_context(|| format!("extract squashfs entry {normalized}"))?;
+                mark_executable_if(&destination, node.header.permissions & 0o111 != 0)
+                    .with_context(|| format!("set mode for {normalized}"))?;
             }
             InnerNode::Symlink(symlink) => {
                 if let Some(parent) = destination.parent() {
@@ -693,7 +706,14 @@ fn normalize_extracted_permissions(root: &Path) -> anyhow::Result<()> {
                 apply(&entry.path())?;
             }
         } else if file_type.is_file() {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+            // Preserve the executable bit so bundle helpers stay spawnable;
+            // collapse everything else to a readable, owner-independent mode.
+            let target_mode = if metadata.permissions().mode() & 0o111 != 0 {
+                0o755
+            } else {
+                0o644
+            };
+            fs::set_permissions(path, fs::Permissions::from_mode(target_mode))
                 .with_context(|| format!("chmod file {}", path.display()))?;
         }
         Ok(())
@@ -704,6 +724,25 @@ fn normalize_extracted_permissions(root: &Path) -> anyhow::Result<()> {
 
 #[cfg(not(unix))]
 fn normalize_extracted_permissions(_root: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+// `File::create` drops the archive's executable bit; restore it for entries
+// the archive marked executable so `bin/*` helpers stay spawnable. This is
+// the behavior `tar::Archive::unpack` gave before the hardened per-entry
+// extractors replaced it.
+#[cfg(unix)]
+fn mark_executable_if(dest: &Path, executable: bool) -> anyhow::Result<()> {
+    if executable {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dest, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("set executable mode on {}", dest.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn mark_executable_if(_dest: &Path, _executable: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -1177,6 +1216,87 @@ mod tests {
         let out = dir.path().join("out");
         let err = extract_tar(&tar_path, &out).expect_err("must reject duplicate");
         assert!(format!("{err:#}").contains("duplicate tar entry"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_tar_preserves_executable_bit_for_helpers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().expect("tempdir");
+        let tar_path = dir.path().join("helpers.tar");
+        {
+            let file = fs::File::create(&tar_path).expect("tar");
+            let mut tar = TarBuilder::new(file);
+            let exe = b"#!/bin/sh\necho hi\n";
+            let mut h = tar::Header::new_gnu();
+            h.set_size(exe.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            tar.append_data(&mut h, "bin/helper", &exe[..])
+                .expect("append exe");
+            let data = b"data";
+            let mut h2 = tar::Header::new_gnu();
+            h2.set_size(data.len() as u64);
+            h2.set_mode(0o644);
+            h2.set_cksum();
+            tar.append_data(&mut h2, "data/value.txt", &data[..])
+                .expect("append data");
+            tar.finish().expect("finish");
+        }
+        let out = dir.path().join("out");
+        extract_tar(&tar_path, &out).expect("extract");
+        let helper_mode = fs::metadata(out.join("bin/helper"))
+            .expect("meta helper")
+            .permissions()
+            .mode();
+        assert!(
+            helper_mode & 0o111 != 0,
+            "helper must stay executable, got {helper_mode:o}"
+        );
+        let data_mode = fs::metadata(out.join("data/value.txt"))
+            .expect("meta data")
+            .permissions()
+            .mode();
+        assert_eq!(
+            data_mode & 0o111,
+            0,
+            "data file must not be executable, got {data_mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_zip_preserves_executable_bit_for_helpers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().expect("tempdir");
+        let zip_path = dir.path().join("helpers.zip");
+        {
+            let file = fs::File::create(&zip_path).expect("zip");
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file(
+                "bin/helper",
+                FileOptions::<()>::default().unix_permissions(0o755),
+            )
+            .expect("start exe");
+            zip.write_all(b"#!/bin/sh\necho hi\n").expect("write exe");
+            zip.start_file(
+                "data/value.txt",
+                FileOptions::<()>::default().unix_permissions(0o644),
+            )
+            .expect("start data");
+            zip.write_all(b"data").expect("write data");
+            zip.finish().expect("finish");
+        }
+        let out = dir.path().join("out");
+        extract_zip(&zip_path, &out).expect("extract");
+        let helper_mode = fs::metadata(out.join("bin/helper"))
+            .expect("meta helper")
+            .permissions()
+            .mode();
+        assert!(
+            helper_mode & 0o111 != 0,
+            "helper must stay executable, got {helper_mode:o}"
+        );
     }
 
     #[cfg(unix)]
