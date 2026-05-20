@@ -80,6 +80,9 @@ features = [
 version = ">=1.1.0-dev, <1.2.0-0"
 default-features = false
 
+[dependencies.greentic-deploy-spec]
+version = ">=0.1, <0.2"
+
 [dependencies.greentic-setup]
 version = ">=1.1.0-dev, <1.2.0-0"
 

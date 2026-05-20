@@ -50,6 +50,7 @@ mod runner_exec;
 mod runner_host;
 mod runner_integration;
 pub mod runtime;
+mod runtime_config;
 pub mod runtime_state;
 mod secret_name;
 mod secret_requirements;
@@ -266,6 +267,32 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     }
 
     bootstrap_local_environment()?;
+
+    // B0: when launched without a `--bundle` root (and no explicit demo config),
+    // boot from the operator-materialized `runtime-config.v1` for the active env,
+    // if one exists. Pack activation from the resolved revision refs lands in B2
+    // (`ActivePacks::load_revision`) and per-revision routing in B3, so for now we
+    // validate the materialized config and fail loud rather than silently ignoring
+    // it. No producer writes the file yet, so this path is dormant in practice.
+    if request.bundle.is_none() && request.config.is_none() {
+        let env_id = resolve_env(None);
+        if let Some(rc) = runtime_config::load(&env_id)? {
+            let deployments: Vec<&str> = rc
+                .revisions
+                .iter()
+                .map(|r| r.deployment_id.as_str())
+                .collect();
+            anyhow::bail!(
+                "runtime-config for env `{}` declares {} revision(s) across deployment(s) {:?}, \
+                 but booting from a materialized runtime-config is not yet runnable: pack \
+                 activation lands in Phase B / B2 (ActivePacks::load_revision) and per-revision \
+                 routing in B3. Pass `--bundle <path>` to boot a single bundle directory for now.",
+                rc.env_id,
+                rc.revisions.len(),
+                deployments,
+            );
+        }
+    }
 
     // Temporary process-level API key fallback disabled while debugging the
     // adaptive card/runtime path. Keep this block for quick re-enable if we
@@ -875,6 +902,58 @@ mod tests {
             message.contains("bundle config not found")
                 || message.contains("bundle path does not exist")
                 || message.contains("unsupported bundle reference"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn run_start_errors_when_runtime_config_present_without_bundle() {
+        use greentic_deploy_spec::{
+            BundleId, DeploymentId, EnvId as SpecEnvId, RevisionId, RevisionRuntimeBlock,
+            RuntimeConfig, SchemaVersion,
+        };
+        let _env_guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        crate::operator_log::reset_for_tests();
+        let _vars = EnvVarsOverride::clean();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::set(temp.path());
+
+        let env_dir = temp
+            .path()
+            .join(".greentic")
+            .join("environments")
+            .join("local");
+        std::fs::create_dir_all(env_dir.join("revisions/r1")).expect("revision dir");
+        std::fs::write(env_dir.join("revisions/r1/pack.lock"), "lock").expect("pack lock");
+        let cfg = RuntimeConfig {
+            schema: SchemaVersion::new(SchemaVersion::RUNTIME_CONFIG_V1),
+            env_id: SpecEnvId::new("local").unwrap(),
+            revisions: vec![RevisionRuntimeBlock {
+                deployment_id: DeploymentId::new(),
+                revision_id: RevisionId::new(),
+                bundle_id: BundleId::from("bundle1"),
+                pack_list_refs: vec!["revisions/r1/pack.lock".into()],
+                pack_config_refs: vec![],
+                weight_bps: 10_000,
+            }],
+        };
+        std::fs::write(
+            env_dir.join("runtime-config.json"),
+            serde_json::to_string(&cfg).expect("serialize runtime-config"),
+        )
+        .expect("write runtime-config");
+
+        let mut request = make_start_request(temp.path());
+        request.bundle = None;
+        request.config = None;
+        request.quiet = true;
+
+        let err = run_start_request(request).expect_err("runtime-config boot should error");
+        let message = err.to_string();
+        assert!(
+            message.contains("not yet runnable") && message.contains("B2"),
             "unexpected error: {message}"
         );
     }
