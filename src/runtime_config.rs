@@ -15,6 +15,7 @@
 //! `crate::runtime` already owns an unrelated `RuntimeConfig` (the public-base-URL
 //! flavour).
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -110,6 +111,13 @@ fn validate_and_resolve(
         bail!("runtime-config for env `{env_id}` declares no revisions");
     }
 
+    // Canonicalize the env dir once so ref containment is checked against the
+    // fully symlink-resolved root (the env dir exists: we just read the config
+    // from it).
+    let canon_env_dir = env_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalizing environment dir {}", env_dir.display()))?;
+
     let mut revisions = Vec::with_capacity(cfg.revisions.len());
     for block in cfg.revisions {
         let deployment_id = block.deployment_id.to_string();
@@ -122,12 +130,14 @@ fn validate_and_resolve(
             );
         }
         let pack_list_refs = resolve_refs(
+            &canon_env_dir,
             env_dir,
             &block.pack_list_refs,
             "pack_list_ref",
             &revision_id,
         )?;
         let pack_config_refs = resolve_refs(
+            &canon_env_dir,
             env_dir,
             &block.pack_config_refs,
             "pack_config_ref",
@@ -143,6 +153,8 @@ fn validate_and_resolve(
         });
     }
 
+    validate_traffic_invariants(&revisions)?;
+
     Ok(LoadedRuntimeConfig {
         env_id: env_id.to_string(),
         env_dir: env_dir.to_path_buf(),
@@ -150,20 +162,70 @@ fn validate_and_resolve(
     })
 }
 
+/// Enforces the per-deployment `TrafficSplit` invariants (deploy-spec §5.3) on
+/// the materialized revision blocks: one bundle per deployment, no duplicate
+/// revision ids within a deployment, and weights summing to exactly 10,000 bps.
+/// B3 routing trusts this, so a partially-materialized config must fail here.
+fn validate_traffic_invariants(revisions: &[ResolvedRevisionBlock]) -> anyhow::Result<()> {
+    struct Deployment<'a> {
+        bundle_id: &'a str,
+        revision_ids: Vec<&'a str>,
+        weight_sum: u64,
+    }
+    let mut by_deployment: BTreeMap<&str, Deployment> = BTreeMap::new();
+    for block in revisions {
+        let entry = by_deployment
+            .entry(&block.deployment_id)
+            .or_insert_with(|| Deployment {
+                bundle_id: &block.bundle_id,
+                revision_ids: Vec::new(),
+                weight_sum: 0,
+            });
+        if entry.bundle_id != block.bundle_id {
+            bail!(
+                "deployment `{}` mixes bundles `{}` and `{}`; one deployment binds a single bundle",
+                block.deployment_id,
+                entry.bundle_id,
+                block.bundle_id
+            );
+        }
+        if entry.revision_ids.contains(&block.revision_id.as_str()) {
+            bail!(
+                "deployment `{}` lists revision `{}` more than once",
+                block.deployment_id,
+                block.revision_id
+            );
+        }
+        entry.revision_ids.push(&block.revision_id);
+        entry.weight_sum += u64::from(block.weight_bps);
+    }
+    for (deployment_id, deployment) in &by_deployment {
+        if deployment.weight_sum != u64::from(MAX_WEIGHT_BPS) {
+            bail!(
+                "deployment `{deployment_id}` revision weights sum to {} bps, must equal {MAX_WEIGHT_BPS}",
+                deployment.weight_sum
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Resolves a list of env-relative refs to absolute paths under `env_dir`,
 /// rejecting any ref that is absolute, escapes the env directory, or is missing.
 fn resolve_refs(
+    canon_env_dir: &Path,
     env_dir: &Path,
     refs: &[PathBuf],
     label: &str,
     revision_id: &str,
 ) -> anyhow::Result<Vec<PathBuf>> {
     refs.iter()
-        .map(|rel| resolve_ref(env_dir, rel, label, revision_id))
+        .map(|rel| resolve_ref(canon_env_dir, env_dir, rel, label, revision_id))
         .collect()
 }
 
 fn resolve_ref(
+    canon_env_dir: &Path,
     env_dir: &Path,
     rel: &Path,
     label: &str,
@@ -183,7 +245,21 @@ fn resolve_ref(
             abs.display()
         );
     }
-    Ok(abs)
+    // `is_file` follows symlinks, so a symlinked file (or symlinked parent dir)
+    // can resolve outside the env dir even when `rel` itself has no `..`.
+    // Canonicalize and require the real target to live under the env dir; return
+    // the resolved path so B2 opens a path proven to be contained.
+    let canon = abs
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {label} {}", abs.display()))?;
+    if !canon.starts_with(canon_env_dir) {
+        bail!(
+            "revision `{revision_id}` {label} `{}` resolves outside the environment directory ({})",
+            rel.display(),
+            canon.display()
+        );
+    }
+    Ok(canon)
 }
 
 /// True when `rel` is a non-empty relative path whose components stay at or below
@@ -241,13 +317,14 @@ mod tests {
         assert_eq!(block.revision_id, expected_rev);
         assert_eq!(block.bundle_id, "bundle1");
         assert_eq!(block.weight_bps, 10_000);
+        let canon = env_dir.canonicalize().unwrap();
         assert_eq!(
             block.pack_list_refs,
-            vec![env_dir.join("revisions/r1/pack.lock")]
+            vec![canon.join("revisions/r1/pack.lock")]
         );
         assert_eq!(
             block.pack_config_refs,
-            vec![env_dir.join("revisions/r1/pack-config.json")]
+            vec![canon.join("revisions/r1/pack-config.json")]
         );
     }
 
@@ -332,5 +409,146 @@ mod tests {
         assert!(env_dir("..").is_err());
         assert!(env_dir(".").is_err());
         assert!(env_dir("a/b").is_err());
+    }
+
+    // ---- symlink containment (finding #1) --------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_file_escaping_env() {
+        let tmp = TempDir::new().unwrap();
+        let env_dir = tmp.path().join("env");
+        fs::create_dir_all(env_dir.join("revisions/r1")).unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("secret.txt"),
+            env_dir.join("revisions/r1/pack.lock"),
+        )
+        .unwrap();
+
+        let mut cfg = one_revision_cfg();
+        cfg.revisions[0].pack_config_refs.clear();
+        let err = validate_and_resolve(cfg, "local", &env_dir).unwrap_err();
+        assert!(err.to_string().contains("resolves outside"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_parent_escaping_env() {
+        let tmp = TempDir::new().unwrap();
+        let env_dir = tmp.path().join("env");
+        fs::create_dir_all(env_dir.join("revisions")).unwrap();
+        let outside = tmp.path().join("outside/r1");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("pack.lock"), "secret").unwrap();
+        // `revisions/r1` is a symlink to a directory outside the env.
+        std::os::unix::fs::symlink(tmp.path().join("outside/r1"), env_dir.join("revisions/r1"))
+            .unwrap();
+
+        let mut cfg = one_revision_cfg();
+        cfg.revisions[0].pack_config_refs.clear();
+        let err = validate_and_resolve(cfg, "local", &env_dir).unwrap_err();
+        assert!(err.to_string().contains("resolves outside"), "{err}");
+    }
+
+    // ---- per-deployment traffic invariants (finding #2) ------------------
+
+    fn block(
+        deployment_id: DeploymentId,
+        revision_id: RevisionId,
+        bundle_id: &str,
+        weight_bps: u32,
+    ) -> RevisionRuntimeBlock {
+        RevisionRuntimeBlock {
+            deployment_id,
+            revision_id,
+            bundle_id: BundleId::from(bundle_id),
+            pack_list_refs: vec![],
+            pack_config_refs: vec![],
+            weight_bps,
+        }
+    }
+
+    fn cfg_with(revisions: Vec<RevisionRuntimeBlock>) -> MaterializedRuntimeConfig {
+        MaterializedRuntimeConfig {
+            schema: SchemaVersion::new(SchemaVersion::RUNTIME_CONFIG_V1),
+            env_id: EnvId::new("local").unwrap(),
+            revisions,
+        }
+    }
+
+    #[test]
+    fn accepts_two_revisions_summing_to_full_split() {
+        let tmp = TempDir::new().unwrap();
+        let dep = DeploymentId::new();
+        let cfg = cfg_with(vec![
+            block(dep, RevisionId::new(), "bundle1", 9_900),
+            block(dep, RevisionId::new(), "bundle1", 100),
+        ]);
+        let loaded = validate_and_resolve(cfg, "local", tmp.path()).unwrap();
+        assert_eq!(loaded.revisions.len(), 2);
+    }
+
+    #[test]
+    fn accepts_multiple_deployments_each_full() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_with(vec![
+            block(DeploymentId::new(), RevisionId::new(), "bundle1", 10_000),
+            block(DeploymentId::new(), RevisionId::new(), "bundle2", 10_000),
+        ]);
+        let loaded = validate_and_resolve(cfg, "local", tmp.path()).unwrap();
+        assert_eq!(loaded.revisions.len(), 2);
+    }
+
+    #[test]
+    fn rejects_weight_sum_below_full() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_with(vec![block(
+            DeploymentId::new(),
+            RevisionId::new(),
+            "bundle1",
+            5_000,
+        )]);
+        let err = validate_and_resolve(cfg, "local", tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("sum to 5000 bps"), "{err}");
+    }
+
+    #[test]
+    fn rejects_weight_sum_above_full() {
+        let tmp = TempDir::new().unwrap();
+        let dep = DeploymentId::new();
+        let cfg = cfg_with(vec![
+            block(dep, RevisionId::new(), "bundle1", 10_000),
+            block(dep, RevisionId::new(), "bundle1", 10_000),
+        ]);
+        let err = validate_and_resolve(cfg, "local", tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("sum to 20000 bps"), "{err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_revision_in_deployment() {
+        let tmp = TempDir::new().unwrap();
+        let dep = DeploymentId::new();
+        let rev = RevisionId::new();
+        let cfg = cfg_with(vec![
+            block(dep, rev, "bundle1", 5_000),
+            block(dep, rev, "bundle1", 5_000),
+        ]);
+        let err = validate_and_resolve(cfg, "local", tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn rejects_mixed_bundle_in_deployment() {
+        let tmp = TempDir::new().unwrap();
+        let dep = DeploymentId::new();
+        let cfg = cfg_with(vec![
+            block(dep, RevisionId::new(), "bundle1", 5_000),
+            block(dep, RevisionId::new(), "bundle2", 5_000),
+        ]);
+        let err = validate_and_resolve(cfg, "local", tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("mixes bundles"), "{err}");
     }
 }
