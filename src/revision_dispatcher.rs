@@ -329,11 +329,14 @@ impl RevisionDispatcher {
         req: &DispatchRequest<'_>,
         rng: &mut R,
     ) -> anyhow::Result<DispatchOutcome> {
-        let snap = self.snapshot.load_full();
+        let snap = self.snapshot.load();
         let entry = snap.deployments.get(&req.deployment_id).with_context(|| {
             format!("deployment `{}` not known to dispatcher", req.deployment_id)
         })?;
         let now = now_secs();
+        let pin_key = req
+            .session_hint
+            .map(|hint| (req.deployment_id, req.tenant.to_string(), hint.to_string()));
 
         if req.trusted
             && let Some(rev) = req.header_revision
@@ -366,12 +369,11 @@ impl RevisionDispatcher {
             });
         }
 
-        if let Some(hint) = req.session_hint {
-            let pin_key = (req.deployment_id, req.tenant.to_string(), hint.to_string());
+        if let Some(key) = pin_key.as_ref() {
             let now_inst = Instant::now();
             let pinned = {
                 let mut pins = self.pins.lock().expect("pin mutex poisoned");
-                match pins.get(&pin_key) {
+                match pins.get(key) {
                     Some(p)
                         if p.expires_at > now_inst
                             && p.generation == entry.generation
@@ -380,7 +382,7 @@ impl RevisionDispatcher {
                         Some(p.revision_id)
                     }
                     Some(_) => {
-                        pins.remove(&pin_key);
+                        pins.remove(key);
                         None
                     }
                     None => None,
@@ -397,9 +399,8 @@ impl RevisionDispatcher {
         }
 
         let selected = weighted_pick(&entry.revisions, rng)?;
-        if let Some(hint) = req.session_hint {
-            let pin_key = (req.deployment_id, req.tenant.to_string(), hint.to_string());
-            self.insert_pin(pin_key, selected, entry.generation);
+        if let Some(key) = pin_key {
+            self.insert_pin(key, selected, entry.generation);
         }
         Ok(DispatchOutcome {
             revision_id: selected,
@@ -514,7 +515,7 @@ impl RevisionDispatcher {
         if payload.e != env_id || payload.t != tenant {
             return None;
         }
-        if payload.d != deployment_id.to_string() {
+        if Ulid::from_string(&payload.d).ok() != Some(deployment_id.0) {
             return None;
         }
         if payload.g != expected_generation {
@@ -523,8 +524,7 @@ impl RevisionDispatcher {
         if payload.x <= now_secs {
             return None;
         }
-        let rev_ulid = Ulid::from_string(&payload.r).ok()?;
-        Some(RevisionId(rev_ulid))
+        Some(RevisionId(Ulid::from_string(&payload.r).ok()?))
     }
 }
 
