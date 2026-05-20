@@ -16,7 +16,7 @@
 //! flavour).
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use greentic_deploy_spec::{RuntimeConfig as MaterializedRuntimeConfig, SchemaVersion};
@@ -42,12 +42,11 @@ pub(crate) struct ResolvedRevisionBlock {
 }
 
 /// A loaded and validated `runtime-config.v1`, ready to hand to revision
-/// activation (B2). All ref paths are absolute and confirmed to live under
-/// `env_dir`.
+/// activation (B2). Every pack ref is an absolute, canonicalized path proven to
+/// live under the environment directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LoadedRuntimeConfig {
     pub(crate) env_id: String,
-    pub(crate) env_dir: PathBuf,
     pub(crate) revisions: Vec<ResolvedRevisionBlock>,
 }
 
@@ -111,13 +110,6 @@ fn validate_and_resolve(
         bail!("runtime-config for env `{env_id}` declares no revisions");
     }
 
-    // Canonicalize the env dir once so ref containment is checked against the
-    // fully symlink-resolved root (the env dir exists: we just read the config
-    // from it).
-    let canon_env_dir = env_dir
-        .canonicalize()
-        .with_context(|| format!("canonicalizing environment dir {}", env_dir.display()))?;
-
     let mut revisions = Vec::with_capacity(cfg.revisions.len());
     for block in cfg.revisions {
         let deployment_id = block.deployment_id.to_string();
@@ -130,14 +122,12 @@ fn validate_and_resolve(
             );
         }
         let pack_list_refs = resolve_refs(
-            &canon_env_dir,
             env_dir,
             &block.pack_list_refs,
             "pack_list_ref",
             &revision_id,
         )?;
         let pack_config_refs = resolve_refs(
-            &canon_env_dir,
             env_dir,
             &block.pack_config_refs,
             "pack_config_ref",
@@ -157,7 +147,6 @@ fn validate_and_resolve(
 
     Ok(LoadedRuntimeConfig {
         env_id: env_id.to_string(),
-        env_dir: env_dir.to_path_buf(),
         revisions,
     })
 }
@@ -210,66 +199,45 @@ fn validate_traffic_invariants(revisions: &[ResolvedRevisionBlock]) -> anyhow::R
     Ok(())
 }
 
-/// Resolves a list of env-relative refs to absolute paths under `env_dir`,
-/// rejecting any ref that is absolute, escapes the env directory, or is missing.
+/// Resolves a list of env-relative refs to canonical paths proven to live under
+/// `env_dir`, rejecting any ref that is absolute, escapes the env directory, or
+/// is missing.
 fn resolve_refs(
-    canon_env_dir: &Path,
     env_dir: &Path,
     refs: &[PathBuf],
     label: &str,
     revision_id: &str,
 ) -> anyhow::Result<Vec<PathBuf>> {
     refs.iter()
-        .map(|rel| resolve_ref(canon_env_dir, env_dir, rel, label, revision_id))
+        .map(|rel| resolve_ref(env_dir, rel, label, revision_id))
         .collect()
 }
 
 fn resolve_ref(
-    canon_env_dir: &Path,
     env_dir: &Path,
     rel: &Path,
     label: &str,
     revision_id: &str,
 ) -> anyhow::Result<PathBuf> {
-    if !is_contained_relative(rel) {
-        bail!(
-            "revision `{revision_id}` {label} `{}` must be a relative path that stays inside the environment directory",
-            rel.display()
-        );
-    }
-    let abs = env_dir.join(rel);
-    if !abs.is_file() {
+    // `normalize_under_root` rejects absolute paths and canonicalizes the joined
+    // path, so a `..` or a symlinked file/parent that escapes the env dir fails
+    // closed (and a missing ref fails to canonicalize). B2 trusts the returned
+    // path, so we additionally require it to be a regular file, not a directory.
+    let canon =
+        greentic_deployer::path_safety::normalize_under_root(env_dir, rel).with_context(|| {
+            format!(
+                "revision `{revision_id}` {label} `{}` is not a valid pack ref",
+                rel.display()
+            )
+        })?;
+    if !canon.is_file() {
         bail!(
             "revision `{revision_id}` {label} `{}` does not resolve to a file ({})",
-            rel.display(),
-            abs.display()
-        );
-    }
-    // `is_file` follows symlinks, so a symlinked file (or symlinked parent dir)
-    // can resolve outside the env dir even when `rel` itself has no `..`.
-    // Canonicalize and require the real target to live under the env dir; return
-    // the resolved path so B2 opens a path proven to be contained.
-    let canon = abs
-        .canonicalize()
-        .with_context(|| format!("canonicalizing {label} {}", abs.display()))?;
-    if !canon.starts_with(canon_env_dir) {
-        bail!(
-            "revision `{revision_id}` {label} `{}` resolves outside the environment directory ({})",
             rel.display(),
             canon.display()
         );
     }
     Ok(canon)
-}
-
-/// True when `rel` is a non-empty relative path whose components stay at or below
-/// the joining root (no `RootDir`, `Prefix`, or `ParentDir` components).
-fn is_contained_relative(rel: &Path) -> bool {
-    if rel.as_os_str().is_empty() {
-        return false;
-    }
-    rel.components()
-        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
 #[cfg(test)]
@@ -366,22 +334,39 @@ mod tests {
     #[test]
     fn rejects_missing_pack_ref() {
         let tmp = TempDir::new().unwrap();
-        // No pack files written; refs cannot resolve to files.
+        // No pack files written; refs cannot canonicalize.
         let err = validate_and_resolve(one_revision_cfg(), "local", tmp.path()).unwrap_err();
         assert!(
+            err.to_string().contains("is not a valid pack ref"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_directory_pack_ref() {
+        let tmp = TempDir::new().unwrap();
+        write_pack_files(tmp.path());
+        let mut cfg = one_revision_cfg();
+        // `revisions/r1` exists but is a directory, not a file.
+        cfg.revisions[0].pack_list_refs = vec![PathBuf::from("revisions/r1")];
+        let err = validate_and_resolve(cfg, "local", tmp.path()).unwrap_err();
+        assert!(
             err.to_string().contains("does not resolve to a file"),
-            "{err}"
+            "{err:#}"
         );
     }
 
     #[test]
     fn rejects_escaping_pack_ref() {
         let tmp = TempDir::new().unwrap();
-        write_pack_files(tmp.path());
+        let env_dir = tmp.path().join("env");
+        write_pack_files(&env_dir);
+        // The target exists, but outside the env dir, so containment must reject it.
+        fs::write(tmp.path().join("escape.lock"), "secret").unwrap();
         let mut cfg = one_revision_cfg();
         cfg.revisions[0].pack_list_refs = vec![PathBuf::from("../escape.lock")];
-        let err = validate_and_resolve(cfg, "local", tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("stays inside"), "{err}");
+        let err = validate_and_resolve(cfg, "local", &env_dir).unwrap_err();
+        assert!(format!("{err:#}").contains("escapes root"), "{err:#}");
     }
 
     #[test]
@@ -391,17 +376,7 @@ mod tests {
         let mut cfg = one_revision_cfg();
         cfg.revisions[0].pack_config_refs = vec![PathBuf::from("/etc/passwd")];
         let err = validate_and_resolve(cfg, "local", tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("stays inside"), "{err}");
-    }
-
-    #[test]
-    fn is_contained_relative_rules() {
-        assert!(is_contained_relative(Path::new("a/b.lock")));
-        assert!(is_contained_relative(Path::new("./a/b.lock")));
-        assert!(!is_contained_relative(Path::new("")));
-        assert!(!is_contained_relative(Path::new("../a")));
-        assert!(!is_contained_relative(Path::new("a/../../b")));
-        assert!(!is_contained_relative(Path::new("/abs")));
+        assert!(format!("{err:#}").contains("absolute paths"), "{err:#}");
     }
 
     #[test]
@@ -411,7 +386,7 @@ mod tests {
         assert!(env_dir("a/b").is_err());
     }
 
-    // ---- symlink containment (finding #1) --------------------------------
+    // ---- symlink containment ---------------------------------------------
 
     #[cfg(unix)]
     #[test]
@@ -431,7 +406,7 @@ mod tests {
         let mut cfg = one_revision_cfg();
         cfg.revisions[0].pack_config_refs.clear();
         let err = validate_and_resolve(cfg, "local", &env_dir).unwrap_err();
-        assert!(err.to_string().contains("resolves outside"), "{err}");
+        assert!(format!("{err:#}").contains("escapes root"), "{err:#}");
     }
 
     #[cfg(unix)]
@@ -450,10 +425,10 @@ mod tests {
         let mut cfg = one_revision_cfg();
         cfg.revisions[0].pack_config_refs.clear();
         let err = validate_and_resolve(cfg, "local", &env_dir).unwrap_err();
-        assert!(err.to_string().contains("resolves outside"), "{err}");
+        assert!(format!("{err:#}").contains("escapes root"), "{err:#}");
     }
 
-    // ---- per-deployment traffic invariants (finding #2) ------------------
+    // ---- per-deployment traffic invariants -------------------------------
 
     fn block(
         deployment_id: DeploymentId,
