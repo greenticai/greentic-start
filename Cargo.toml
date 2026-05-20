@@ -25,6 +25,7 @@ categories = [
 
 [dependencies]
 anyhow = "1.0"
+arc-swap = "1"
 async-trait = "0.1"
 backhand = "0.25"
 base64 = "0.22"
@@ -57,6 +58,7 @@ tokio-tungstenite = "0.29"
 tar = "0.4"
 thiserror = "2"
 tracing = "0.1"
+ulid = "1"
 unic-langid = "0.9"
 urlencoding = "2"
 wasmtime = { version = "43", default-features = false, features = ["component-model", "cranelift", "runtime"] }

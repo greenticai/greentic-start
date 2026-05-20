@@ -46,6 +46,7 @@ mod post_ingress_hooks;
 mod project;
 pub mod provider_config_envelope;
 mod qa_persist;
+mod revision_dispatcher;
 mod runner_exec;
 mod runner_host;
 mod runner_integration;
