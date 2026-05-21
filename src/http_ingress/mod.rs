@@ -691,7 +691,11 @@ where
                 header_revision: None,
                 cookie: cookie.as_deref(),
             };
-            match select_revision_route(
+            // Fail closed: once a request is bound to a deployment, revision
+            // routing is authoritative. A route miss or dispatch error must NOT
+            // fall through to the legacy single-bundle path, which would bypass
+            // the traffic split and serve the request from the wrong pack.
+            match dispatch_bound_deployment(
                 dispatcher,
                 &state.http_route_table,
                 &dispatch_req,
@@ -699,16 +703,11 @@ where
                 method.as_str(),
                 &mut rand::rng(),
             ) {
-                Ok(Some((route, set_cookie))) => {
+                Ok((route, set_cookie)) => {
                     pending_set_cookie = set_cookie;
                     break 'resolve route;
                 }
-                // No route for the selected revision — fall through to legacy.
-                Ok(None) => {}
-                Err(err) => operator_log::warn(
-                    module_path!(),
-                    format!("revision dispatch for deployment `{deployment_id}` failed: {err:#}"),
-                ),
+                Err(response) => return Err(*response),
             }
         }
 
@@ -932,8 +931,9 @@ fn resolve_deployment(_state: &HttpIngressState, _path: &str) -> Option<(Deploym
 }
 
 /// Pick a revision via the dispatcher, then resolve the request to that
-/// revision's route. Returns `Ok(None)` when the selected revision declares no
-/// route for this path so the caller can fall back to the legacy table.
+/// revision's route, keyed on the full `(deployment, bundle, revision)` scope.
+/// Returns `Ok(None)` when the selected revision declares no route for this
+/// path. Pure (no HTTP types) so the fail-closed policy lives in the wrapper.
 fn select_revision_route<R: Rng + ?Sized>(
     dispatcher: &RevisionDispatcher,
     table: &HttpRouteTable,
@@ -943,8 +943,12 @@ fn select_revision_route<R: Rng + ?Sized>(
     rng: &mut R,
 ) -> anyhow::Result<Option<(helpers::ParsedIngressRoute, Option<SetCookieDirective>)>> {
     let outcome = dispatcher.dispatch(req, rng)?;
-    let Some(route_match) = table.match_request_for_revision(path, method, outcome.revision_id)
-    else {
+    let scope = crate::http_routes::RevisionScope {
+        deployment_id: req.deployment_id,
+        bundle_id: outcome.bundle_id.clone(),
+        revision_id: outcome.revision_id,
+    };
+    let Some(route_match) = table.match_request_for_revision(path, method, &scope) else {
         return Ok(None);
     };
     let parsed = helpers::ParsedIngressRoute {
@@ -955,6 +959,42 @@ fn select_revision_route<R: Rng + ?Sized>(
         handler: None,
     };
     Ok(Some((parsed, outcome.set_cookie)))
+}
+
+/// Fail-closed revision routing for a request already bound to a deployment.
+/// Maps the pure [`select_revision_route`] result to either the resolved route
+/// or an error response — never a fall-through to legacy routing:
+/// - selected revision serves no route for this path → `404`;
+/// - dispatch error (e.g. a resolver/dispatcher config mismatch) → `500`.
+#[allow(clippy::type_complexity)]
+fn dispatch_bound_deployment<R: Rng + ?Sized>(
+    dispatcher: &RevisionDispatcher,
+    table: &HttpRouteTable,
+    req: &DispatchRequest<'_>,
+    path: &str,
+    method: &str,
+    rng: &mut R,
+) -> Result<(helpers::ParsedIngressRoute, Option<SetCookieDirective>), Box<Response<Full<Bytes>>>> {
+    match select_revision_route(dispatcher, table, req, path, method, rng) {
+        Ok(Some(routed)) => Ok(routed),
+        Ok(None) => Err(Box::new(error_response(
+            StatusCode::NOT_FOUND,
+            "no route for the selected revision in this deployment",
+        ))),
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "revision dispatch for deployment `{}` failed: {err:#}",
+                    req.deployment_id
+                ),
+            );
+            Err(Box::new(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "revision dispatch failed",
+            )))
+        }
+    }
 }
 
 /// Look up a single cookie value by name from the `Cookie` request header.
@@ -2983,28 +3023,79 @@ mod tests {
             assert!(outcome.is_none(), "no route for the selected revision");
         }
 
-        #[test]
-        fn select_revision_route_errors_for_unknown_deployment() {
-            let dispatcher =
-                RevisionDispatcher::new(RevisionDispatcherConfig::new("demo", [7u8; 32]));
-            let req = DispatchRequest {
+        fn bound_request(deployment_id: DeploymentId) -> DispatchRequest<'static> {
+            DispatchRequest {
                 env_id: "demo",
                 tenant: "acme",
-                deployment_id: DeploymentId::new(),
+                deployment_id,
                 session_hint: None,
                 trusted: false,
                 header_revision: None,
                 cookie: None,
-            };
-            let result = select_revision_route(
+            }
+        }
+
+        #[test]
+        fn dispatch_bound_deployment_routes_on_match() {
+            let deployment_id = DeploymentId::new();
+            let bundle_id = BundleId::new("acme-bundle");
+            let revision_id = RevisionId::new();
+            let dispatcher =
+                dispatcher_with_single_revision(deployment_id, bundle_id.clone(), revision_id);
+            let table = HttpRouteTable::from_descriptors(vec![descriptor_for_test(
+                "/v1/messaging/webchat/{tenant}/token",
+                &["GET"],
+                Domain::Messaging,
+                Some(RevisionScope {
+                    deployment_id,
+                    bundle_id,
+                    revision_id,
+                }),
+            )]);
+            let result = dispatch_bound_deployment(
                 &dispatcher,
-                &HttpRouteTable::default(),
-                &req,
+                &table,
+                &bound_request(deployment_id),
                 "/v1/messaging/webchat/acme/token",
                 "GET",
                 &mut StdRng::seed_from_u64(0),
             );
-            assert!(result.is_err(), "unknown deployment is an error");
+            assert!(result.is_ok(), "matching route resolves");
+        }
+
+        #[test]
+        fn dispatch_bound_deployment_fails_closed_on_route_miss() {
+            let deployment_id = DeploymentId::new();
+            let bundle_id = BundleId::new("acme-bundle");
+            let revision_id = RevisionId::new();
+            let dispatcher = dispatcher_with_single_revision(deployment_id, bundle_id, revision_id);
+            // No route declared for the selected revision.
+            let err = dispatch_bound_deployment(
+                &dispatcher,
+                &HttpRouteTable::default(),
+                &bound_request(deployment_id),
+                "/v1/messaging/webchat/acme/token",
+                "GET",
+                &mut StdRng::seed_from_u64(0),
+            )
+            .expect_err("a bound deployment must not fall through on a route miss");
+            assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[test]
+        fn dispatch_bound_deployment_fails_closed_on_unknown_deployment() {
+            let dispatcher =
+                RevisionDispatcher::new(RevisionDispatcherConfig::new("demo", [7u8; 32]));
+            let err = dispatch_bound_deployment(
+                &dispatcher,
+                &HttpRouteTable::default(),
+                &bound_request(DeploymentId::new()),
+                "/v1/messaging/webchat/acme/token",
+                "GET",
+                &mut StdRng::seed_from_u64(0),
+            )
+            .expect_err("a dispatch error must not fall through to legacy");
+            assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         }
 
         #[test]

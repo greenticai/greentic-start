@@ -24,11 +24,7 @@ pub const EXT_HTTP_ROUTES_V1: &str = "greentic.http-routes.v1";
 /// matching the `Option = legacy` discipline used by B2's `RuntimeKey`.
 #[derive(Clone, Debug)]
 pub struct RevisionScope {
-    /// Provenance read by telemetry stamping (B11), not by the matcher.
-    #[allow(dead_code)]
     pub deployment_id: DeploymentId,
-    /// Provenance read by telemetry stamping (B11), not by the matcher.
-    #[allow(dead_code)]
     pub bundle_id: BundleId,
     pub revision_id: RevisionId,
 }
@@ -139,19 +135,26 @@ impl HttpRouteTable {
     }
 
     /// Match an incoming request against routes belonging to a specific
-    /// resolved revision. Used by the ingress dispatcher seam once a
+    /// resolved scope. Used by the ingress dispatcher seam once a
     /// [`crate::revision_dispatcher::RevisionDispatcher`] picks a revision.
+    ///
+    /// Matches on the **full** `(deployment_id, bundle_id, revision_id)`, not
+    /// just the revision: a shared route table can hold entries for several
+    /// deployments, and matching on revision alone could route a dispatch
+    /// outcome for one deployment to a route stamped for another under id
+    /// reuse or stale entries.
     pub fn match_request_for_revision(
         &self,
         path: &str,
         method: &str,
-        revision_id: RevisionId,
+        scope: &RevisionScope,
     ) -> Option<HttpRouteMatch<'_>> {
         self.match_first(path, method, |route| {
-            route
-                .scope
-                .as_ref()
-                .is_some_and(|s| s.revision_id == revision_id)
+            route.scope.as_ref().is_some_and(|s| {
+                s.deployment_id == scope.deployment_id
+                    && s.bundle_id == scope.bundle_id
+                    && s.revision_id == scope.revision_id
+            })
         })
     }
 
@@ -573,9 +576,9 @@ mod tests {
         assert_eq!(m.team, "support");
     }
 
-    fn scope_for(revision_id: RevisionId) -> RevisionScope {
+    fn scope_for(deployment_id: DeploymentId, revision_id: RevisionId) -> RevisionScope {
         RevisionScope {
-            deployment_id: DeploymentId::new(),
+            deployment_id,
             bundle_id: BundleId::new("acme-bundle"),
             revision_id,
         }
@@ -588,7 +591,7 @@ mod tests {
             "/v1/messaging/webchat/{tenant}/token",
             &["GET"],
             Domain::Messaging,
-            Some(scope_for(rev)),
+            Some(scope_for(DeploymentId::new(), rev)),
         )]);
 
         // Legacy matcher ignores scoped routes.
@@ -601,27 +604,31 @@ mod tests {
 
     #[test]
     fn match_request_for_revision_only_matches_that_revision() {
-        let rev_a = RevisionId::new();
-        let rev_b = RevisionId::new();
+        let deployment = DeploymentId::new();
+        let scope_a = scope_for(deployment, RevisionId::new());
+        let scope_b = scope_for(deployment, RevisionId::new());
         let table = HttpRouteTable::from_descriptors(vec![
             make_scoped_route(
                 "/v1/messaging/webchat/{tenant}/token",
                 &["GET"],
                 Domain::Messaging,
-                Some(scope_for(rev_a)),
+                Some(scope_a.clone()),
             ),
             make_scoped_route(
                 "/v1/messaging/webchat/{tenant}/token",
                 &["GET"],
                 Domain::Messaging,
-                Some(scope_for(rev_b)),
+                Some(scope_b.clone()),
             ),
         ]);
 
         let m = table
-            .match_request_for_revision("/v1/messaging/webchat/demo/token", "GET", rev_a)
+            .match_request_for_revision("/v1/messaging/webchat/demo/token", "GET", &scope_a)
             .expect("should match revision A's route");
-        assert_eq!(m.descriptor.scope.as_ref().unwrap().revision_id, rev_a);
+        assert_eq!(
+            m.descriptor.scope.as_ref().unwrap().revision_id,
+            scope_a.revision_id
+        );
 
         // No legacy route exists, so the unscoped matcher finds nothing.
         assert!(
@@ -630,15 +637,41 @@ mod tests {
                 .is_none()
         );
 
-        // A revision with no routes matches nothing.
+        // A scope for a revision with no routes matches nothing.
+        let unknown = scope_for(deployment, RevisionId::new());
         assert!(
             table
-                .match_request_for_revision(
-                    "/v1/messaging/webchat/demo/token",
-                    "GET",
-                    RevisionId::new()
-                )
+                .match_request_for_revision("/v1/messaging/webchat/demo/token", "GET", &unknown)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn match_request_for_revision_distinguishes_deployments() {
+        // Same revision id stamped under two different deployments. Matching on
+        // the full scope must not route one deployment's request to the other's
+        // route (regression for revision-only matching).
+        let revision = RevisionId::new();
+        let scope_a = scope_for(DeploymentId::new(), revision);
+        let scope_b = scope_for(DeploymentId::new(), revision);
+        let table = HttpRouteTable::from_descriptors(vec![make_scoped_route(
+            "/v1/messaging/webchat/{tenant}/token",
+            &["GET"],
+            Domain::Messaging,
+            Some(scope_a.clone()),
+        )]);
+
+        assert!(
+            table
+                .match_request_for_revision("/v1/messaging/webchat/demo/token", "GET", &scope_a)
+                .is_some(),
+            "deployment A's scope matches its own route"
+        );
+        assert!(
+            table
+                .match_request_for_revision("/v1/messaging/webchat/demo/token", "GET", &scope_b)
+                .is_none(),
+            "deployment B's scope must not match deployment A's route despite equal revision id"
         );
     }
 
@@ -650,13 +683,10 @@ mod tests {
             Domain::Messaging,
         )]);
 
+        let scope = scope_for(DeploymentId::new(), RevisionId::new());
         assert!(
             table
-                .match_request_for_revision(
-                    "/v1/messaging/webchat/demo/token",
-                    "GET",
-                    RevisionId::new()
-                )
+                .match_request_for_revision("/v1/messaging/webchat/demo/token", "GET", &scope)
                 .is_none()
         );
     }
