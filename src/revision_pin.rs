@@ -10,9 +10,13 @@
 //!   discipline B1 shipped (`MAX_PINS = 16_384`, soonest-expiry eviction,
 //!   generation-aware drop on lookup).
 //! - [`RedisPinStore`] — one key per pin under `gt:rev_pin:{env}:{deployment_id}:{tenant}:{hint}`
-//!   with `SET NX EX` for race-safe create + Redis-native TTL. Matches the
-//!   plan's literal key spelling and works on any Redis ≥ 2.6 (no `HEXPIRE`
-//!   dependency).
+//!   inserted by a Lua script that atomically (a) returns the existing pin
+//!   when one is live, (b) enforces a per-`(env, deployment, tenant)`
+//!   cardinality cap, (c) writes the pin + tracks it in a TTL'd set, all in
+//!   one round-trip. The Lua script collapses what would otherwise be a
+//!   SET-NX-then-GET race (where a stale-generation delete + retry could
+//!   silently drop the new pin) and is the only safe shape on a shared
+//!   Redis. Works on any Redis ≥ 2.6.
 //!
 //! Selection between backends is a caller concern. Default
 //! [`RevisionDispatcher::new`](crate::revision_dispatcher::RevisionDispatcher::new)
@@ -26,13 +30,11 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use greentic_deploy_spec::{DeploymentId, RevisionId};
-use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use ulid::Ulid;
 
@@ -40,7 +42,26 @@ use ulid::Ulid;
 /// single-process fallback keeps the same shape as the pre-extraction map.
 pub const MAX_PINS: usize = 16_384;
 
+/// Cap on the number of live pins per `(env, deployment, tenant)` on the
+/// Redis backend. Mirrors the in-memory `MAX_PINS` shape but per-tenant
+/// rather than per-process, so one tenant's rotating-hint client can't
+/// exhaust shared Redis memory (Codex F3). Phase D will revisit this with
+/// a rate-budget once session-aware ingress actually wires hints through
+/// the dispatcher.
+pub const MAX_PINS_PER_TENANT: usize = 4_096;
+
+/// Cap on caller-supplied scope strings (tenant, hint) at the trait
+/// boundary. Defends against pathological clients that would otherwise
+/// produce unbounded Redis keys (Codex F3).
+const MAX_SCOPE_BYTES: usize = 256;
+
+/// Default deadline for a single Redis operation in the dispatch path
+/// (Codex F2). On timeout, the backend soft-falls through to no-pin
+/// behavior rather than queueing dispatch behind a slow Redis.
+const REDIS_OP_TIMEOUT: Duration = Duration::from_millis(50);
+
 const REDIS_KEY_PREFIX: &str = "gt:rev_pin";
+const REDIS_TRACKING_PREFIX: &str = "gt:rev_pin_set";
 
 /// Routing-stickiness storage for `(env, deployment_id, tenant, session_hint)`.
 ///
@@ -220,15 +241,66 @@ impl RevisionPinStore for InMemoryPinStore {
 
 // ── Redis backend ───────────────────────────────────────────────────────
 
-/// Shared `Arc<ConnectionManager>` storage for [`RedisPinStore`]. The manager
-/// handles reconnect + pipelining internally so we don't need a Mutex.
+/// Lua script that atomically performs the `try_pin` contract:
+///
+/// 1. If `KEYS[1]` already holds a pin AND it parses as a current-generation
+///    value, return `{1, value}` (caller gets `Existing`).
+/// 2. Otherwise — including stale-generation values — delete the existing
+///    key, check the tracking-set cardinality, and if under cap, write the
+///    new pin + add it to the tracking set + refresh the set's TTL. Return
+///    `{0, value}` (caller gets `Inserted`).
+/// 3. If the tracking set is at cap, return `{2}` (caller gets a no-pin
+///    fallthrough that becomes `Inserted` with the caller's own
+///    revision_id — see `RedisPinStore::try_pin`).
+///
+/// Inputs:
+///   KEYS[1] = pin key
+///   KEYS[2] = tracking-set key (per-(env, deployment, tenant) scope)
+///   ARGV[1] = current_generation (string-encoded u64)
+///   ARGV[2] = new value (`revision_id|generation|expires_at_unix_secs`)
+///   ARGV[3] = ttl_secs (string-encoded u64)
+///   ARGV[4] = cardinality cap (string-encoded usize)
+///
+/// Why Lua: SET NX EX + GET is racy across stale generations (Codex F1).
+/// SCAN-based after-the-fact pruning is racy across cardinality (Codex F3).
+/// One atomic script collapses both into a single round-trip.
+const TRY_PIN_SCRIPT: &str = r#"
+local existing = redis.call('GET', KEYS[1])
+if existing then
+  local _, gen = string.match(existing, '^([^|]+)|([^|]+)|')
+  if gen == ARGV[1] then
+    return {1, existing}
+  end
+  redis.call('DEL', KEYS[1])
+  redis.call('SREM', KEYS[2], KEYS[1])
+end
+local card = redis.call('SCARD', KEYS[2])
+local cap = tonumber(ARGV[4])
+if card >= cap then
+  return {2}
+end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
+redis.call('SADD', KEYS[2], KEYS[1])
+redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
+return {0, ARGV[2]}
+"#;
+
 pub struct RedisPinStore {
-    conn: Arc<tokio::sync::Mutex<ConnectionManager>>,
+    /// `ConnectionManager` is `Clone` and internally pipelines/multiplexes
+    /// commands across a shared connection, so we hold it bare — no Mutex
+    /// (Codex F2). Each operation gets its own clone of the cheap
+    /// (`Arc<Inner>`) handle.
+    conn: ConnectionManager,
+    op_timeout: Duration,
+    cardinality_cap: usize,
 }
 
 impl std::fmt::Debug for RedisPinStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RedisPinStore").finish_non_exhaustive()
+        f.debug_struct("RedisPinStore")
+            .field("op_timeout", &self.op_timeout)
+            .field("cardinality_cap", &self.cardinality_cap)
+            .finish_non_exhaustive()
     }
 }
 
@@ -242,8 +314,26 @@ impl RedisPinStore {
             .await
             .context("redis ConnectionManager init failed")?;
         Ok(Self {
-            conn: Arc::new(tokio::sync::Mutex::new(manager)),
+            conn: manager,
+            op_timeout: REDIS_OP_TIMEOUT,
+            cardinality_cap: MAX_PINS_PER_TENANT,
         })
+    }
+
+    /// Override the per-op timeout. Defaults to [`REDIS_OP_TIMEOUT`] (50ms);
+    /// loosened in integration tests so a cold connection-manager handshake
+    /// or a Docker-on-VPN'd developer machine doesn't false-fail.
+    pub fn with_op_timeout(mut self, timeout: Duration) -> Self {
+        self.op_timeout = timeout;
+        self
+    }
+
+    /// Override the per-`(env, deployment, tenant)` pin cap. Defaults to
+    /// [`MAX_PINS_PER_TENANT`]; test-only knob for the cardinality test.
+    #[cfg(test)]
+    pub fn with_cardinality_cap(mut self, cap: usize) -> Self {
+        self.cardinality_cap = cap;
+        self
     }
 }
 
@@ -272,8 +362,27 @@ fn decode_value(raw: &str) -> Option<(RevisionId, u64, u64)> {
     Some((RevisionId(rid), generation, expires_at))
 }
 
+/// Build a Redis pin key. Tenant + hint are URL-encoded (Codex F4) so a
+/// colon in either value cannot collide with the structural delimiter.
+/// `env_id` is from a typed [`greentic_deploy_spec::EnvId`] upstream (no
+/// colons allowed) and `deployment_id` is a ULID, so neither needs
+/// escaping today.
 fn redis_key(env_id: &str, deployment_id: DeploymentId, tenant: &str, hint: &str) -> String {
-    format!("{REDIS_KEY_PREFIX}:{env_id}:{deployment_id}:{tenant}:{hint}")
+    format!(
+        "{REDIS_KEY_PREFIX}:{env_id}:{deployment_id}:{}:{}",
+        urlencoding::encode(tenant),
+        urlencoding::encode(hint),
+    )
+}
+
+/// Tracking-set key for cardinality enforcement: one set per
+/// `(env, deployment, tenant)`. Holds the live pin keys for that scope so
+/// the Lua script can `SCARD`-bound new inserts.
+fn redis_tracking_key(env_id: &str, deployment_id: DeploymentId, tenant: &str) -> String {
+    format!(
+        "{REDIS_TRACKING_PREFIX}:{env_id}:{deployment_id}:{}",
+        urlencoding::encode(tenant),
+    )
 }
 
 fn now_secs() -> u64 {
@@ -281,6 +390,14 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Refuse caller-supplied scope strings over [`MAX_SCOPE_BYTES`]. This is
+/// the Redis-side mirror of the in-memory `MAX_PINS` self-protection: long
+/// values consume bandwidth + storage, and the trait's contract permits
+/// soft-miss on unsafe inputs.
+fn scope_within_bounds(tenant: &str, hint: &str) -> bool {
+    tenant.len() <= MAX_SCOPE_BYTES && hint.len() <= MAX_SCOPE_BYTES
 }
 
 #[async_trait::async_trait]
@@ -295,32 +412,72 @@ impl RevisionPinStore for RedisPinStore {
         generation: u64,
         ttl: Duration,
     ) -> PinOutcome {
-        let key = redis_key(env_id, deployment_id, tenant, hint);
+        if !scope_within_bounds(tenant, hint) {
+            tracing::warn!(
+                target: "greentic_start::revision_pin",
+                tenant_len = tenant.len(),
+                hint_len = hint.len(),
+                "rejecting pin: tenant/hint exceeds MAX_SCOPE_BYTES",
+            );
+            return PinOutcome::Inserted { revision_id };
+        }
+        let pin_key = redis_key(env_id, deployment_id, tenant, hint);
+        let set_key = redis_tracking_key(env_id, deployment_id, tenant);
         let ttl_secs = ttl.as_secs().max(1);
         let value = encode_value(revision_id, generation, SystemTime::now() + ttl);
 
-        // SET NX EX is the race-safe single-step `try_pin`. On success we
-        // own the pin; on collision someone else won, so we fetch the
-        // current value and return Existing. Net cost: 1 round-trip on
-        // success, 2 on collision (collision = rare, by construction).
-        match try_set_nx(&self.conn, &key, &value, ttl_secs).await {
-            Ok(true) => PinOutcome::Inserted { revision_id },
-            Ok(false) => match get_and_decode(&self.conn, &key, generation).await {
-                Some(existing) => PinOutcome::Existing {
-                    revision_id: existing,
+        let script = redis::Script::new(TRY_PIN_SCRIPT);
+        let mut invocation = script.prepare_invoke();
+        invocation
+            .key(&pin_key)
+            .key(&set_key)
+            .arg(generation.to_string())
+            .arg(&value)
+            .arg(ttl_secs.to_string())
+            .arg(self.cardinality_cap.to_string());
+        let mut conn = self.conn.clone();
+        let fut = invocation.invoke_async::<(i64, Option<String>)>(&mut conn);
+
+        match tokio::time::timeout(self.op_timeout, fut).await {
+            Ok(Ok((0, _))) => PinOutcome::Inserted { revision_id },
+            Ok(Ok((1, Some(existing)))) => match decode_value(&existing) {
+                Some((existing_rev, _, _)) => PinOutcome::Existing {
+                    revision_id: existing_rev,
                 },
                 None => PinOutcome::Inserted { revision_id },
             },
-            Err(err) => {
-                // Soft-fail: report Inserted so the dispatcher keeps routing.
-                // The next request just re-runs the weighted-random branch
-                // (identical behavior to a generation bump), avoiding hard
-                // 5xx on transient Redis blips.
+            Ok(Ok((2, _))) => {
+                tracing::warn!(
+                    target: "greentic_start::revision_pin",
+                    cap = self.cardinality_cap,
+                    pin_key = %pin_key,
+                    "rejecting pin: cardinality cap reached for (env, deployment, tenant)",
+                );
+                PinOutcome::Inserted { revision_id }
+            }
+            Ok(Ok(other)) => {
+                tracing::warn!(
+                    target: "greentic_start::revision_pin",
+                    response = ?other,
+                    "redis try_pin script returned unexpected shape; soft-falling through",
+                );
+                PinOutcome::Inserted { revision_id }
+            }
+            Ok(Err(err)) => {
                 tracing::warn!(
                     target: "greentic_start::revision_pin",
                     error = %err,
-                    key = %key,
-                    "redis SET NX failed; soft-falling-through to no-pin path",
+                    pin_key = %pin_key,
+                    "redis try_pin script failed; soft-falling through to no-pin path",
+                );
+                PinOutcome::Inserted { revision_id }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "greentic_start::revision_pin",
+                    timeout_ms = self.op_timeout.as_millis() as u64,
+                    pin_key = %pin_key,
+                    "redis try_pin timed out; soft-falling through to no-pin path",
                 );
                 PinOutcome::Inserted { revision_id }
             }
@@ -335,62 +492,56 @@ impl RevisionPinStore for RedisPinStore {
         hint: &str,
         current_generation: u64,
     ) -> Option<RevisionId> {
-        let key = redis_key(env_id, deployment_id, tenant, hint);
-        let revision = get_and_decode(&self.conn, &key, current_generation).await?;
-        Some(revision)
-    }
-}
+        if !scope_within_bounds(tenant, hint) {
+            return None;
+        }
+        let pin_key = redis_key(env_id, deployment_id, tenant, hint);
+        let set_key = redis_tracking_key(env_id, deployment_id, tenant);
+        let mut conn = self.conn.clone();
 
-async fn try_set_nx(
-    conn: &Arc<tokio::sync::Mutex<ConnectionManager>>,
-    key: &str,
-    value: &str,
-    ttl_secs: u64,
-) -> Result<bool> {
-    let mut guard = conn.lock().await;
-    let opts = redis::SetOptions::default()
-        .conditional_set(redis::ExistenceCheck::NX)
-        .with_expiration(redis::SetExpiry::EX(ttl_secs));
-    let resp: redis::Value = guard
-        .set_options(key, value, opts)
-        .await
-        .context("redis SET NX EX failed")?;
-    match resp {
-        redis::Value::Okay => Ok(true),
-        redis::Value::Nil => Ok(false),
-        other => Err(anyhow!("unexpected redis SET response: {:?}", other)),
-    }
-}
-
-async fn get_and_decode(
-    conn: &Arc<tokio::sync::Mutex<ConnectionManager>>,
-    key: &str,
-    expected_generation: u64,
-) -> Option<RevisionId> {
-    let raw: Option<String> = {
-        let mut guard = conn.lock().await;
-        match guard.get(key).await {
-            Ok(v) => v,
-            Err(err) => {
+        let mut get_cmd = redis::cmd("GET");
+        get_cmd.arg(&pin_key);
+        let get_fut = get_cmd.query_async::<Option<String>>(&mut conn);
+        let raw = match tokio::time::timeout(self.op_timeout, get_fut).await {
+            Ok(Ok(v)) => v?,
+            Ok(Err(err)) => {
                 tracing::warn!(
                     target: "greentic_start::revision_pin",
                     error = %err,
-                    key = %key,
+                    pin_key = %pin_key,
                     "redis GET failed; treating as cache miss",
                 );
                 return None;
             }
+            Err(_) => {
+                tracing::warn!(
+                    target: "greentic_start::revision_pin",
+                    timeout_ms = self.op_timeout.as_millis() as u64,
+                    pin_key = %pin_key,
+                    "redis GET timed out; treating as cache miss",
+                );
+                return None;
+            }
+        };
+        let (revision_id, generation, expires_at) = decode_value(&raw)?;
+        if generation != current_generation || expires_at <= now_secs() {
+            // Stale (generation bumped or clock-skew-expired): drop the key
+            // + its tracking-set membership best-effort. Bounded by the
+            // same timeout so a hung Redis can't deadline the request.
+            let _ = tokio::time::timeout(self.op_timeout, async {
+                let mut c = self.conn.clone();
+                let mut del_cmd = redis::cmd("DEL");
+                del_cmd.arg(&pin_key);
+                let _: redis::RedisResult<()> = del_cmd.query_async(&mut c).await;
+                let mut srem_cmd = redis::cmd("SREM");
+                srem_cmd.arg(&set_key).arg(&pin_key);
+                let _: redis::RedisResult<()> = srem_cmd.query_async(&mut c).await;
+            })
+            .await;
+            return None;
         }
-    };
-    let raw = raw?;
-    let (revision_id, generation, expires_at) = decode_value(&raw)?;
-    if generation != expected_generation || expires_at <= now_secs() {
-        // Stale (generation bumped or clock-skew-expired): delete and miss.
-        let mut guard = conn.lock().await;
-        let _: redis::RedisResult<()> = guard.del(key).await;
-        return None;
+        Some(revision_id)
     }
-    Some(revision_id)
 }
 
 #[cfg(test)]
@@ -539,6 +690,30 @@ mod tests {
         );
     }
 
+    /// Codex F4 regression: `(tenant="a", hint="b:c")` and
+    /// `(tenant="a:b", hint="c")` must produce distinct Redis keys. The
+    /// pre-fix `format!(...)` collided across these scopes; URL-encoding
+    /// the components fixes it.
+    #[test]
+    fn redis_key_is_injective_across_tenant_and_hint_with_colons() {
+        let id = DeploymentId(Ulid::from_string("01F8MECHZX3TBDSZ7XR8KZ9V8K").unwrap());
+        let k1 = redis_key("local", id, "a", "b:c");
+        let k2 = redis_key("local", id, "a:b", "c");
+        assert_ne!(k1, k2);
+        // The literal forms are also debuggable in redis-cli.
+        assert_eq!(k1, "gt:rev_pin:local:01F8MECHZX3TBDSZ7XR8KZ9V8K:a:b%3Ac");
+        assert_eq!(k2, "gt:rev_pin:local:01F8MECHZX3TBDSZ7XR8KZ9V8K:a%3Ab:c");
+    }
+
+    #[test]
+    fn redis_tracking_key_scopes_by_env_deployment_tenant() {
+        let id = DeploymentId(Ulid::from_string("01F8MECHZX3TBDSZ7XR8KZ9V8K").unwrap());
+        assert_eq!(
+            redis_tracking_key("local", id, "tenant-a"),
+            "gt:rev_pin_set:local:01F8MECHZX3TBDSZ7XR8KZ9V8K:tenant-a"
+        );
+    }
+
     // ── Redis integration tests ───────────────────────────────────────
     //
     // Gated by `GREENTIC_TEST_REDIS_URL` (mirrors `tests/notifier_redis.rs`).
@@ -627,5 +802,204 @@ mod tests {
         // Wait past TTL.
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(store.lookup("local", dep_id, "t", &hint, 1).await, None);
+    }
+
+    /// Codex F1 regression: a stale-generation key must be REPLACED by the
+    /// new pin, not silently deleted-and-reported-as-Inserted. The pre-fix
+    /// path returned `Inserted` while the new pin was never written —
+    /// subsequent lookups missed and the next request re-weighted.
+    #[tokio::test]
+    async fn redis_replaces_stale_generation_entry_on_try_pin() {
+        let Some(url) = redis_url_or_skip() else {
+            return;
+        };
+        let store = RedisPinStore::from_url(&url).await.expect("redis open");
+        let dep_id = dep();
+        let hint = unique_hint("stale-replace");
+        let r1 = rev();
+        store
+            .try_pin("local", dep_id, "t", &hint, r1, 1, Duration::from_secs(60))
+            .await;
+        assert_eq!(store.lookup("local", dep_id, "t", &hint, 1).await, Some(r1));
+
+        // Operator bumps generation: caller now writes gen=2 for the same
+        // hint. The atomic Lua script must DEL + SET in one round-trip so
+        // the new pin is persisted, not just the deletion.
+        let r2 = rev();
+        let out = store
+            .try_pin("local", dep_id, "t", &hint, r2, 2, Duration::from_secs(60))
+            .await;
+        assert_eq!(out, PinOutcome::Inserted { revision_id: r2 });
+        // The persistence check — without F1 fix this would be `None`
+        // because the stale-handler deleted gen=1 but didn't write gen=2.
+        assert_eq!(store.lookup("local", dep_id, "t", &hint, 2).await, Some(r2));
+    }
+
+    /// Codex F1 regression: concurrent re-pinners against a stale-generation
+    /// key must converge on a single winner; everyone else sees `Existing`.
+    /// Without the atomic script + retry, two callers could both observe
+    /// the stale-delete and produce divergent `Inserted` outcomes.
+    #[tokio::test]
+    async fn redis_concurrent_repinners_converge_on_one_winner() {
+        let Some(url) = redis_url_or_skip() else {
+            return;
+        };
+        let store = std::sync::Arc::new(RedisPinStore::from_url(&url).await.expect("redis open"));
+        let dep_id = dep();
+        let hint = unique_hint("concurrent");
+
+        let r_stale = rev();
+        store
+            .try_pin(
+                "local",
+                dep_id,
+                "t",
+                &hint,
+                r_stale,
+                1,
+                Duration::from_secs(60),
+            )
+            .await;
+
+        // 8 concurrent gen=2 writers race against the gen=1 stale entry.
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = std::sync::Arc::clone(&store);
+            let hint = hint.clone();
+            handles.push(tokio::spawn(async move {
+                let r = rev();
+                let out = store
+                    .try_pin("local", dep_id, "t", &hint, r, 2, Duration::from_secs(60))
+                    .await;
+                (r, out)
+            }));
+        }
+        let mut inserted_count = 0;
+        let mut existing_revs = std::collections::HashSet::new();
+        for h in handles {
+            let (own_r, out) = h.await.unwrap();
+            match out {
+                PinOutcome::Inserted { revision_id } => {
+                    assert_eq!(revision_id, own_r);
+                    inserted_count += 1;
+                }
+                PinOutcome::Existing { revision_id } => {
+                    existing_revs.insert(revision_id);
+                }
+            }
+        }
+        // Exactly one winner inserts; everyone else sees the same winner.
+        assert_eq!(inserted_count, 1, "exactly one writer should insert");
+        assert!(
+            existing_revs.len() <= 1,
+            "racing writers must observe a single winning revision, saw {existing_revs:?}",
+        );
+        // And the winner is durably persisted.
+        let after = store.lookup("local", dep_id, "t", &hint, 2).await;
+        assert!(after.is_some(), "winner must survive the race");
+    }
+
+    /// Codex F3 regression: a rotating-hint client cannot grow Redis state
+    /// past [`MAX_PINS_PER_TENANT`] for a single `(env, deployment, tenant)`.
+    /// Inserts past the cap are rejected (logged) — the caller still gets
+    /// the no-pin fallthrough so dispatch keeps routing.
+    #[tokio::test]
+    async fn redis_cardinality_cap_bounds_rotating_hints() {
+        let Some(url) = redis_url_or_skip() else {
+            return;
+        };
+        let store = RedisPinStore::from_url(&url)
+            .await
+            .expect("redis open")
+            .with_cardinality_cap(4);
+        let dep_id = dep();
+        let tenant = format!("tenant-card-{}", Ulid::new());
+
+        // Pre-fill the cap with 4 distinct hints.
+        for i in 0..4 {
+            let hint = format!("h-{i}");
+            store
+                .try_pin(
+                    "local",
+                    dep_id,
+                    &tenant,
+                    &hint,
+                    rev(),
+                    1,
+                    Duration::from_secs(60),
+                )
+                .await;
+        }
+        // A 5th distinct hint must be rejected — but the caller's outcome
+        // is still `Inserted` (no-pin fallthrough so dispatch keeps going).
+        let r5 = rev();
+        let out = store
+            .try_pin(
+                "local",
+                dep_id,
+                &tenant,
+                "h-5",
+                r5,
+                1,
+                Duration::from_secs(60),
+            )
+            .await;
+        assert_eq!(out, PinOutcome::Inserted { revision_id: r5 });
+        // The pin must NOT actually exist in Redis (cap-rejected, not persisted).
+        assert_eq!(
+            store.lookup("local", dep_id, &tenant, "h-5", 1).await,
+            None,
+            "5th distinct hint must not be persisted past the cap",
+        );
+    }
+
+    /// Codex F4 regression (live): two scopes that pre-fix collided to the
+    /// same Redis key (`a:b:c`) must now route to independent pins.
+    #[tokio::test]
+    async fn redis_tenant_and_hint_scopes_do_not_collide() {
+        let Some(url) = redis_url_or_skip() else {
+            return;
+        };
+        let store = RedisPinStore::from_url(&url).await.expect("redis open");
+        let dep_id = dep();
+        // Disambiguate test runs.
+        let suffix = Ulid::new().to_string();
+        let tenant_a = format!("a-{suffix}");
+        let tenant_ab = format!("a-{suffix}:b");
+        let hint_bc = "b:c";
+        let hint_c = "c";
+
+        let r1 = rev();
+        let r2 = rev();
+        store
+            .try_pin(
+                "local",
+                dep_id,
+                &tenant_a,
+                hint_bc,
+                r1,
+                1,
+                Duration::from_secs(60),
+            )
+            .await;
+        store
+            .try_pin(
+                "local",
+                dep_id,
+                &tenant_ab,
+                hint_c,
+                r2,
+                1,
+                Duration::from_secs(60),
+            )
+            .await;
+        assert_eq!(
+            store.lookup("local", dep_id, &tenant_a, hint_bc, 1).await,
+            Some(r1),
+        );
+        assert_eq!(
+            store.lookup("local", dep_id, &tenant_ab, hint_c, 1).await,
+            Some(r2),
+        );
     }
 }
