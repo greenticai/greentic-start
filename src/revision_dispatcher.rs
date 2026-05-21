@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use arc_swap::ArcSwap;
@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use ulid::Ulid;
 
-use crate::revision_pin::{InMemoryPinStore, PinOutcome, RevisionPinStore};
+use crate::revision_pin::{InMemoryPinStore, PinKey, PinOutcome, RevisionPinStore, now_secs};
 use crate::runtime_config::LoadedRuntimeConfig;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -160,7 +160,7 @@ pub struct RevisionDispatcher {
     cookie_ttl: Duration,
     pin_ttl: Duration,
     snapshot: ArcSwap<Snapshot>,
-    /// Session-hint pin store (B6). Defaults to in-memory; Redis-backed
+    /// Session-hint pin store. Defaults to in-memory; Redis-backed
     /// implementations swap in via [`Self::with_pin_store`] so a horizontally
     /// scaled router (Phase D K8s slice) can share pins across pods.
     pin_store: Arc<dyn RevisionPinStore>,
@@ -380,13 +380,7 @@ impl RevisionDispatcher {
         if let Some(hint) = req.session_hint
             && let Some(rev) = self
                 .pin_store
-                .lookup(
-                    req.env_id,
-                    req.deployment_id,
-                    req.tenant,
-                    hint,
-                    entry.generation,
-                )
+                .lookup(self.pin_key(req, hint), entry.generation)
                 .await
             && has_revision(entry, rev)
         {
@@ -403,22 +397,23 @@ impl RevisionDispatcher {
             // Race-safe: if a concurrent dispatch lost the lookup race but
             // already installed a pin, honor it so two requests with the same
             // hint don't flap to different revisions. `try_pin` returns
-            // either the value we just inserted (`Inserted`) or the value
-            // that beat us (`Existing`); either way we serve what's pinned.
+            // either the value we just inserted (`Inserted`), the value
+            // that beat us (`Existing`), or `Skipped` when the backend
+            // soft-failed (timeout / cap / scope-reject) — in the last
+            // case nothing is persisted but we still route this request.
             match self
                 .pin_store
                 .try_pin(
-                    req.env_id,
-                    req.deployment_id,
-                    req.tenant,
-                    hint,
+                    self.pin_key(req, hint),
                     selected,
                     entry.generation,
                     self.pin_ttl,
                 )
                 .await
             {
-                PinOutcome::Inserted { revision_id } => revision_id,
+                PinOutcome::Inserted { revision_id } | PinOutcome::Skipped { revision_id } => {
+                    revision_id
+                }
                 PinOutcome::Existing { revision_id } if has_revision(entry, revision_id) => {
                     revision_id
                 }
@@ -433,6 +428,18 @@ impl RevisionDispatcher {
             reason: SelectionReason::Weighted,
             set_cookie: Some(self.build_set_cookie(req, entry, revision_id, now)),
         })
+    }
+
+    /// Build a borrowed [`PinKey`] from a dispatch request + the resolved
+    /// session hint. Centralizes the three borrow plumbings so the lookup
+    /// and try_pin sites can't drift on field order or selection.
+    fn pin_key<'a>(&self, req: &'a DispatchRequest<'_>, hint: &'a str) -> PinKey<'a> {
+        PinKey {
+            env_id: req.env_id,
+            deployment_id: req.deployment_id,
+            tenant: req.tenant,
+            hint,
+        }
     }
 
     fn build_set_cookie(
@@ -552,13 +559,6 @@ fn weighted_pick<R: Rng + ?Sized>(
 
 fn parse_ulid(s: &str, label: &str) -> anyhow::Result<Ulid> {
     Ulid::from_string(s).with_context(|| format!("invalid {label} `{s}` (expected ULID)"))
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

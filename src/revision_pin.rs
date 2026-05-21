@@ -30,7 +30,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -38,52 +38,62 @@ use greentic_deploy_spec::{DeploymentId, RevisionId};
 use redis::aio::ConnectionManager;
 use ulid::Ulid;
 
-/// Hard cap on the [`InMemoryPinStore`] map. Mirrors B1's `MAX_PINS` so the
-/// single-process fallback keeps the same shape as the pre-extraction map.
-pub const MAX_PINS: usize = 16_384;
+/// Hard cap on the [`InMemoryPinStore`] map. This is a process-global cap
+/// (not per-tenant), acceptable for single-process / `local` deployments
+/// where one tenant is unlikely to exhaust the dispatcher's memory.
+/// Horizontally scaled deployments use [`RedisPinStore`], which enforces
+/// per-`(env, deployment, tenant)` isolation via [`MAX_PINS_PER_TENANT`].
+pub(crate) const MAX_PINS: usize = 16_384;
 
 /// Cap on the number of live pins per `(env, deployment, tenant)` on the
-/// Redis backend. Mirrors the in-memory `MAX_PINS` shape but per-tenant
-/// rather than per-process, so one tenant's rotating-hint client can't
-/// exhaust shared Redis memory (Codex F3). Phase D will revisit this with
-/// a rate-budget once session-aware ingress actually wires hints through
-/// the dispatcher.
-pub const MAX_PINS_PER_TENANT: usize = 4_096;
+/// Redis backend. One tenant's rotating-hint client can't exhaust shared
+/// Redis memory because the cap is scoped, not global. A rate-budget per
+/// tenant is Phase D once session-aware ingress wires hints through.
+pub(crate) const MAX_PINS_PER_TENANT: usize = 4_096;
 
 /// Cap on caller-supplied scope strings (tenant, hint) at the trait
 /// boundary. Defends against pathological clients that would otherwise
-/// produce unbounded Redis keys (Codex F3).
+/// produce unbounded Redis keys.
 const MAX_SCOPE_BYTES: usize = 256;
 
-/// Default deadline for a single Redis operation in the dispatch path
-/// (Codex F2). On timeout, the backend soft-falls through to no-pin
-/// behavior rather than queueing dispatch behind a slow Redis.
+/// Default deadline for a single Redis operation in the dispatch path.
+/// On timeout, the backend soft-falls through to no-pin behavior rather
+/// than queueing dispatch behind a slow Redis.
 const REDIS_OP_TIMEOUT: Duration = Duration::from_millis(50);
 
 const REDIS_KEY_PREFIX: &str = "gt:rev_pin";
 const REDIS_TRACKING_PREFIX: &str = "gt:rev_pin_set";
 
+/// Identity of a pinned session: `(env, deployment, tenant, hint)`. Borrowed
+/// from the caller's request data so the trait surface stays alloc-free at
+/// the trait boundary; implementations own the cloning decision (in-memory
+/// builds a `String` HashMap key; Redis URL-encodes into a Redis key).
+#[derive(Clone, Copy, Debug)]
+pub struct PinKey<'a> {
+    pub env_id: &'a str,
+    pub deployment_id: DeploymentId,
+    pub tenant: &'a str,
+    pub hint: &'a str,
+}
+
 /// Routing-stickiness storage for `(env, deployment_id, tenant, session_hint)`.
 ///
-/// All four methods are infallible-by-design at the trait level for the
-/// happy path: the in-memory impl never errors, and the Redis impl downgrades
+/// All methods are infallible-by-design at the trait level for the happy
+/// path: the in-memory impl never errors, and the Redis impl downgrades
 /// transient connection failures to soft misses (logged via `tracing::warn!`)
 /// rather than bubbling them up to the dispatch path. A hard miss is always a
 /// safe answer — selection falls through to the weighted-random branch and
 /// re-pins, exactly as it does after a generation bump.
 #[async_trait::async_trait]
 pub trait RevisionPinStore: Send + Sync {
-    /// Insert a pin **only if** none exists for `(env, deployment_id, tenant, hint)`,
-    /// returning the persisted entry on either branch (existing or newly inserted).
-    /// Implementations MUST be race-safe — two concurrent callers with the same
-    /// key see exactly one inserted value.
-    #[allow(clippy::too_many_arguments)]
+    /// Insert a pin **only if** none exists for `key`. Returns either the
+    /// persisted entry (`Inserted` / `Existing`) or `Skipped` when the
+    /// backend declined to persist (Redis timeout / cap / scope-reject).
+    /// Implementations MUST be race-safe — two concurrent callers with the
+    /// same key see exactly one inserted value.
     async fn try_pin(
         &self,
-        env_id: &str,
-        deployment_id: DeploymentId,
-        tenant: &str,
-        hint: &str,
+        key: PinKey<'_>,
         revision_id: RevisionId,
         generation: u64,
         ttl: Duration,
@@ -96,14 +106,7 @@ pub trait RevisionPinStore: Send + Sync {
     ///   implementations MUST also evict it, matching B1's drop-on-mismatch
     ///   behavior), or
     /// - the pin has expired.
-    async fn lookup(
-        &self,
-        env_id: &str,
-        deployment_id: DeploymentId,
-        tenant: &str,
-        hint: &str,
-        current_generation: u64,
-    ) -> Option<RevisionId>;
+    async fn lookup(&self, key: PinKey<'_>, current_generation: u64) -> Option<RevisionId>;
 }
 
 /// Outcome of [`RevisionPinStore::try_pin`].
@@ -113,13 +116,19 @@ pub enum PinOutcome {
     Inserted { revision_id: RevisionId },
     /// A pin already existed; the value returned is what's now live.
     Existing { revision_id: RevisionId },
+    /// The pin was NOT persisted (Redis timeout/error, cardinality cap
+    /// reached, or unsafe scope strings refused). The caller's
+    /// `revision_id` is still returned so dispatch can route this request,
+    /// but the next request with the same hint will not find a pin.
+    Skipped { revision_id: RevisionId },
 }
 
 impl PinOutcome {
     pub fn revision_id(&self) -> RevisionId {
         match self {
-            Self::Inserted { revision_id } => *revision_id,
-            Self::Existing { revision_id } => *revision_id,
+            Self::Inserted { revision_id }
+            | Self::Existing { revision_id }
+            | Self::Skipped { revision_id } => *revision_id,
         }
     }
 }
@@ -155,30 +164,34 @@ impl InMemoryPinStore {
     }
 }
 
+/// Build the owned-String key the in-memory map uses. Centralizes the
+/// `(deployment_id, env, tenant, hint)` shape so the two impl methods
+/// can't drift.
+fn owned_key(key: PinKey<'_>) -> (DeploymentId, String, String, String) {
+    (
+        key.deployment_id,
+        key.env_id.to_string(),
+        key.tenant.to_string(),
+        key.hint.to_string(),
+    )
+}
+
 #[async_trait::async_trait]
 impl RevisionPinStore for InMemoryPinStore {
     async fn try_pin(
         &self,
-        env_id: &str,
-        deployment_id: DeploymentId,
-        tenant: &str,
-        hint: &str,
+        key: PinKey<'_>,
         revision_id: RevisionId,
         generation: u64,
         ttl: Duration,
     ) -> PinOutcome {
-        let key = (
-            deployment_id,
-            env_id.to_string(),
-            tenant.to_string(),
-            hint.to_string(),
-        );
+        let map_key = owned_key(key);
         let now = SystemTime::now();
         let mut guard = self.inner.lock().expect("pin mutex poisoned");
 
         // Drop stale entry first so it doesn't block insert + so we honor the
         // generation-mismatch eviction contract.
-        if let Some(existing) = guard.get(&key)
+        if let Some(existing) = guard.get(&map_key)
             && existing.expires_at > now
             && existing.generation == generation
         {
@@ -186,7 +199,7 @@ impl RevisionPinStore for InMemoryPinStore {
                 revision_id: existing.revision_id,
             };
         }
-        guard.remove(&key);
+        guard.remove(&map_key);
 
         if guard.len() >= MAX_PINS {
             guard.retain(|_, e| e.expires_at > now);
@@ -200,7 +213,7 @@ impl RevisionPinStore for InMemoryPinStore {
             }
         }
         guard.insert(
-            key,
+            map_key,
             InMemoryEntry {
                 revision_id,
                 generation,
@@ -210,28 +223,16 @@ impl RevisionPinStore for InMemoryPinStore {
         PinOutcome::Inserted { revision_id }
     }
 
-    async fn lookup(
-        &self,
-        env_id: &str,
-        deployment_id: DeploymentId,
-        tenant: &str,
-        hint: &str,
-        current_generation: u64,
-    ) -> Option<RevisionId> {
-        let key = (
-            deployment_id,
-            env_id.to_string(),
-            tenant.to_string(),
-            hint.to_string(),
-        );
+    async fn lookup(&self, key: PinKey<'_>, current_generation: u64) -> Option<RevisionId> {
+        let map_key = owned_key(key);
         let now = SystemTime::now();
         let mut guard = self.inner.lock().expect("pin mutex poisoned");
-        match guard.get(&key) {
+        match guard.get(&map_key) {
             Some(entry) if entry.expires_at > now && entry.generation == current_generation => {
                 Some(entry.revision_id)
             }
             Some(_) => {
-                guard.remove(&key);
+                guard.remove(&map_key);
                 None
             }
             None => None,
@@ -261,8 +262,8 @@ impl RevisionPinStore for InMemoryPinStore {
 ///   ARGV[3] = ttl_secs (string-encoded u64)
 ///   ARGV[4] = cardinality cap (string-encoded usize)
 ///
-/// Why Lua: SET NX EX + GET is racy across stale generations (Codex F1).
-/// SCAN-based after-the-fact pruning is racy across cardinality (Codex F3).
+/// Why Lua: SET NX EX + GET is racy across stale generations.
+/// SCAN-based after-the-fact pruning is racy across cardinality.
 /// One atomic script collapses both into a single round-trip.
 const TRY_PIN_SCRIPT: &str = r#"
 local existing = redis.call('GET', KEYS[1])
@@ -285,10 +286,16 @@ redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
 return {0, ARGV[2]}
 "#;
 
+/// Pre-computed `redis::Script` for [`TRY_PIN_SCRIPT`]. Computing the SHA1
+/// once per process (rather than per call) matches the sibling pattern in
+/// `greentic-state/src/redis_store.rs`.
+static TRY_PIN_SCRIPT_HANDLE: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(TRY_PIN_SCRIPT));
+
 pub struct RedisPinStore {
     /// `ConnectionManager` is `Clone` and internally pipelines/multiplexes
     /// commands across a shared connection, so we hold it bare — no Mutex
-    /// (Codex F2). Each operation gets its own clone of the cheap
+    ///. Each operation gets its own clone of the cheap
     /// (`Arc<Inner>`) handle.
     conn: ConnectionManager,
     op_timeout: Duration,
@@ -329,8 +336,8 @@ impl RedisPinStore {
     }
 
     /// Override the per-`(env, deployment, tenant)` pin cap. Defaults to
-    /// [`MAX_PINS_PER_TENANT`]; test-only knob for the cardinality test.
-    #[cfg(test)]
+    /// [`MAX_PINS_PER_TENANT`]. Phase D operators tune this when one
+    /// tenant's session churn pushes against the default 4_096 ceiling.
     pub fn with_cardinality_cap(mut self, cap: usize) -> Self {
         self.cardinality_cap = cap;
         self
@@ -362,30 +369,34 @@ fn decode_value(raw: &str) -> Option<(RevisionId, u64, u64)> {
     Some((RevisionId(rid), generation, expires_at))
 }
 
-/// Build a Redis pin key. Tenant + hint are URL-encoded (Codex F4) so a
-/// colon in either value cannot collide with the structural delimiter.
-/// `env_id` is from a typed [`greentic_deploy_spec::EnvId`] upstream (no
-/// colons allowed) and `deployment_id` is a ULID, so neither needs
-/// escaping today.
+/// Tenant + hint are URL-encoded so a colon in either value cannot collide
+/// with the structural delimiter. `env_id` is from a typed
+/// [`greentic_deploy_spec::EnvId`] upstream (no colons allowed) and
+/// `deployment_id` is a ULID, so neither needs escaping today.
 fn redis_key(env_id: &str, deployment_id: DeploymentId, tenant: &str, hint: &str) -> String {
-    format!(
-        "{REDIS_KEY_PREFIX}:{env_id}:{deployment_id}:{}:{}",
-        urlencoding::encode(tenant),
-        urlencoding::encode(hint),
-    )
+    let mut k = scope_prefix(REDIS_KEY_PREFIX, env_id, deployment_id, tenant);
+    k.push(':');
+    k.push_str(&urlencoding::encode(hint));
+    k
 }
 
 /// Tracking-set key for cardinality enforcement: one set per
 /// `(env, deployment, tenant)`. Holds the live pin keys for that scope so
 /// the Lua script can `SCARD`-bound new inserts.
 fn redis_tracking_key(env_id: &str, deployment_id: DeploymentId, tenant: &str) -> String {
+    scope_prefix(REDIS_TRACKING_PREFIX, env_id, deployment_id, tenant)
+}
+
+/// Shared `{prefix}:{env}:{deployment}:{urlenc tenant}` builder so the two
+/// key constructors can't drift in their escaping discipline.
+fn scope_prefix(prefix: &str, env_id: &str, deployment_id: DeploymentId, tenant: &str) -> String {
     format!(
-        "{REDIS_TRACKING_PREFIX}:{env_id}:{deployment_id}:{}",
+        "{prefix}:{env_id}:{deployment_id}:{}",
         urlencoding::encode(tenant),
     )
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -404,30 +415,26 @@ fn scope_within_bounds(tenant: &str, hint: &str) -> bool {
 impl RevisionPinStore for RedisPinStore {
     async fn try_pin(
         &self,
-        env_id: &str,
-        deployment_id: DeploymentId,
-        tenant: &str,
-        hint: &str,
+        key: PinKey<'_>,
         revision_id: RevisionId,
         generation: u64,
         ttl: Duration,
     ) -> PinOutcome {
-        if !scope_within_bounds(tenant, hint) {
+        if !scope_within_bounds(key.tenant, key.hint) {
             tracing::warn!(
                 target: "greentic_start::revision_pin",
-                tenant_len = tenant.len(),
-                hint_len = hint.len(),
+                tenant_len = key.tenant.len(),
+                hint_len = key.hint.len(),
                 "rejecting pin: tenant/hint exceeds MAX_SCOPE_BYTES",
             );
-            return PinOutcome::Inserted { revision_id };
+            return PinOutcome::Skipped { revision_id };
         }
-        let pin_key = redis_key(env_id, deployment_id, tenant, hint);
-        let set_key = redis_tracking_key(env_id, deployment_id, tenant);
+        let pin_key = redis_key(key.env_id, key.deployment_id, key.tenant, key.hint);
+        let set_key = redis_tracking_key(key.env_id, key.deployment_id, key.tenant);
         let ttl_secs = ttl.as_secs().max(1);
         let value = encode_value(revision_id, generation, SystemTime::now() + ttl);
 
-        let script = redis::Script::new(TRY_PIN_SCRIPT);
-        let mut invocation = script.prepare_invoke();
+        let mut invocation = TRY_PIN_SCRIPT_HANDLE.prepare_invoke();
         invocation
             .key(&pin_key)
             .key(&set_key)
@@ -444,7 +451,7 @@ impl RevisionPinStore for RedisPinStore {
                 Some((existing_rev, _, _)) => PinOutcome::Existing {
                     revision_id: existing_rev,
                 },
-                None => PinOutcome::Inserted { revision_id },
+                None => PinOutcome::Skipped { revision_id },
             },
             Ok(Ok((2, _))) => {
                 tracing::warn!(
@@ -453,7 +460,7 @@ impl RevisionPinStore for RedisPinStore {
                     pin_key = %pin_key,
                     "rejecting pin: cardinality cap reached for (env, deployment, tenant)",
                 );
-                PinOutcome::Inserted { revision_id }
+                PinOutcome::Skipped { revision_id }
             }
             Ok(Ok(other)) => {
                 tracing::warn!(
@@ -461,7 +468,7 @@ impl RevisionPinStore for RedisPinStore {
                     response = ?other,
                     "redis try_pin script returned unexpected shape; soft-falling through",
                 );
-                PinOutcome::Inserted { revision_id }
+                PinOutcome::Skipped { revision_id }
             }
             Ok(Err(err)) => {
                 tracing::warn!(
@@ -470,7 +477,7 @@ impl RevisionPinStore for RedisPinStore {
                     pin_key = %pin_key,
                     "redis try_pin script failed; soft-falling through to no-pin path",
                 );
-                PinOutcome::Inserted { revision_id }
+                PinOutcome::Skipped { revision_id }
             }
             Err(_) => {
                 tracing::warn!(
@@ -479,24 +486,16 @@ impl RevisionPinStore for RedisPinStore {
                     pin_key = %pin_key,
                     "redis try_pin timed out; soft-falling through to no-pin path",
                 );
-                PinOutcome::Inserted { revision_id }
+                PinOutcome::Skipped { revision_id }
             }
         }
     }
 
-    async fn lookup(
-        &self,
-        env_id: &str,
-        deployment_id: DeploymentId,
-        tenant: &str,
-        hint: &str,
-        current_generation: u64,
-    ) -> Option<RevisionId> {
-        if !scope_within_bounds(tenant, hint) {
+    async fn lookup(&self, key: PinKey<'_>, current_generation: u64) -> Option<RevisionId> {
+        if !scope_within_bounds(key.tenant, key.hint) {
             return None;
         }
-        let pin_key = redis_key(env_id, deployment_id, tenant, hint);
-        let set_key = redis_tracking_key(env_id, deployment_id, tenant);
+        let pin_key = redis_key(key.env_id, key.deployment_id, key.tenant, key.hint);
         let mut conn = self.conn.clone();
 
         let mut get_cmd = redis::cmd("GET");
@@ -526,8 +525,10 @@ impl RevisionPinStore for RedisPinStore {
         let (revision_id, generation, expires_at) = decode_value(&raw)?;
         if generation != current_generation || expires_at <= now_secs() {
             // Stale (generation bumped or clock-skew-expired): drop the key
-            // + its tracking-set membership best-effort. Bounded by the
-            // same timeout so a hung Redis can't deadline the request.
+            // + its tracking-set membership best-effort. The Lua script in
+            // `try_pin` covers the re-pin path; this branch handles the
+            // narrow case of a lookup that's never followed by a re-pin.
+            let set_key = redis_tracking_key(key.env_id, key.deployment_id, key.tenant);
             let _ = tokio::time::timeout(self.op_timeout, async {
                 let mut c = self.conn.clone();
                 let mut del_cmd = redis::cmd("DEL");
@@ -562,11 +563,31 @@ mod tests {
         let dep_id = dep();
         let r = rev();
         let out1 = store
-            .try_pin("local", dep_id, "t", "h", r, 1, Duration::from_secs(60))
+            .try_pin(
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: "t",
+                    hint: "h",
+                },
+                r,
+                1,
+                Duration::from_secs(60),
+            )
             .await;
         assert_eq!(out1, PinOutcome::Inserted { revision_id: r });
         let out2 = store
-            .try_pin("local", dep_id, "t", "h", rev(), 1, Duration::from_secs(60))
+            .try_pin(
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: "t",
+                    hint: "h",
+                },
+                rev(),
+                1,
+                Duration::from_secs(60),
+            )
             .await;
         // Second call observes the existing pin — returns its revision_id,
         // not the caller's.
@@ -579,13 +600,62 @@ mod tests {
         let dep_id = dep();
         let r = rev();
         store
-            .try_pin("local", dep_id, "t", "h", r, 1, Duration::from_secs(60))
+            .try_pin(
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: "t",
+                    hint: "h",
+                },
+                r,
+                1,
+                Duration::from_secs(60),
+            )
             .await;
-        assert_eq!(store.lookup("local", dep_id, "t", "h", 1).await, Some(r));
+        assert_eq!(
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: "t",
+                        hint: "h"
+                    },
+                    1
+                )
+                .await,
+            Some(r)
+        );
         // Generation bump invalidates the pin AND evicts it.
-        assert_eq!(store.lookup("local", dep_id, "t", "h", 2).await, None);
+        assert_eq!(
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: "t",
+                        hint: "h"
+                    },
+                    2
+                )
+                .await,
+            None
+        );
         // Eviction confirmed: same-generation lookup also misses.
-        assert_eq!(store.lookup("local", dep_id, "t", "h", 1).await, None);
+        assert_eq!(
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: "t",
+                        hint: "h"
+                    },
+                    1
+                )
+                .await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -594,10 +664,33 @@ mod tests {
         let dep_id = dep();
         let r = rev();
         store
-            .try_pin("local", dep_id, "t", "h", r, 1, Duration::from_millis(10))
+            .try_pin(
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: "t",
+                    hint: "h",
+                },
+                r,
+                1,
+                Duration::from_millis(10),
+            )
             .await;
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(store.lookup("local", dep_id, "t", "h", 1).await, None);
+        assert_eq!(
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: "t",
+                        hint: "h"
+                    },
+                    1
+                )
+                .await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -606,16 +699,49 @@ mod tests {
         let dep_id = dep();
         let r1 = rev();
         store
-            .try_pin("local", dep_id, "t", "h", r1, 1, Duration::from_secs(60))
+            .try_pin(
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: "t",
+                    hint: "h",
+                },
+                r1,
+                1,
+                Duration::from_secs(60),
+            )
             .await;
         let r2 = rev();
         // Same key, new generation → stale entry MUST be replaced (it would
         // never be lookup-able anyway, but the slot should be reused).
         let out = store
-            .try_pin("local", dep_id, "t", "h", r2, 2, Duration::from_secs(60))
+            .try_pin(
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: "t",
+                    hint: "h",
+                },
+                r2,
+                2,
+                Duration::from_secs(60),
+            )
             .await;
         assert_eq!(out, PinOutcome::Inserted { revision_id: r2 });
-        assert_eq!(store.lookup("local", dep_id, "t", "h", 2).await, Some(r2));
+        assert_eq!(
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: "t",
+                        hint: "h"
+                    },
+                    2
+                )
+                .await,
+            Some(r2)
+        );
     }
 
     #[tokio::test]
@@ -626,10 +752,12 @@ mod tests {
             let hint = format!("sess-{i}");
             store
                 .try_pin(
-                    "local",
-                    dep_id,
-                    "t",
-                    &hint,
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: "t",
+                        hint: &hint,
+                    },
                     rev(),
                     1,
                     Duration::from_secs(60),
@@ -648,13 +776,59 @@ mod tests {
         let r_b = rev();
         // Same env+tenant+hint, different deployments.
         store
-            .try_pin("local", dep_a, "t", "h", r_a, 1, Duration::from_secs(60))
+            .try_pin(
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_a,
+                    tenant: "t",
+                    hint: "h",
+                },
+                r_a,
+                1,
+                Duration::from_secs(60),
+            )
             .await;
         store
-            .try_pin("local", dep_b, "t", "h", r_b, 1, Duration::from_secs(60))
+            .try_pin(
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_b,
+                    tenant: "t",
+                    hint: "h",
+                },
+                r_b,
+                1,
+                Duration::from_secs(60),
+            )
             .await;
-        assert_eq!(store.lookup("local", dep_a, "t", "h", 1).await, Some(r_a));
-        assert_eq!(store.lookup("local", dep_b, "t", "h", 1).await, Some(r_b));
+        assert_eq!(
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_a,
+                        tenant: "t",
+                        hint: "h"
+                    },
+                    1
+                )
+                .await,
+            Some(r_a)
+        );
+        assert_eq!(
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_b,
+                        tenant: "t",
+                        hint: "h"
+                    },
+                    1
+                )
+                .await,
+            Some(r_b)
+        );
     }
 
     #[test]
@@ -690,7 +864,7 @@ mod tests {
         );
     }
 
-    /// Codex F4 regression: `(tenant="a", hint="b:c")` and
+    /// Regression: `(tenant="a", hint="b:c")` and
     /// `(tenant="a:b", hint="c")` must produce distinct Redis keys. The
     /// pre-fix `format!(...)` collided across these scopes; URL-encoding
     /// the components fixes it.
@@ -748,16 +922,28 @@ mod tests {
         let r = rev();
 
         let out1 = store
-            .try_pin("local", dep_id, "t", &hint, r, 1, Duration::from_secs(60))
+            .try_pin(
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: "t",
+                    hint: &hint,
+                },
+                r,
+                1,
+                Duration::from_secs(60),
+            )
             .await;
         assert_eq!(out1, PinOutcome::Inserted { revision_id: r });
 
         let out2 = store
             .try_pin(
-                "local",
-                dep_id,
-                "t",
-                &hint,
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: "t",
+                    hint: &hint,
+                },
                 rev(),
                 1,
                 Duration::from_secs(60),
@@ -777,13 +963,62 @@ mod tests {
         let r = rev();
 
         store
-            .try_pin("local", dep_id, "t", &hint, r, 1, Duration::from_secs(60))
+            .try_pin(
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: "t",
+                    hint: &hint,
+                },
+                r,
+                1,
+                Duration::from_secs(60),
+            )
             .await;
-        assert_eq!(store.lookup("local", dep_id, "t", &hint, 1).await, Some(r));
+        assert_eq!(
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: "t",
+                        hint: &hint
+                    },
+                    1
+                )
+                .await,
+            Some(r)
+        );
         // Generation bump → eviction.
-        assert_eq!(store.lookup("local", dep_id, "t", &hint, 2).await, None);
+        assert_eq!(
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: "t",
+                        hint: &hint
+                    },
+                    2
+                )
+                .await,
+            None
+        );
         // After eviction, same-generation lookup also misses.
-        assert_eq!(store.lookup("local", dep_id, "t", &hint, 1).await, None);
+        assert_eq!(
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: "t",
+                        hint: &hint
+                    },
+                    1
+                )
+                .await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -797,14 +1032,37 @@ mod tests {
         let r = rev();
         // Redis EXpire is whole-second granularity; min TTL is 1s.
         store
-            .try_pin("local", dep_id, "t", &hint, r, 1, Duration::from_secs(1))
+            .try_pin(
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: "t",
+                    hint: &hint,
+                },
+                r,
+                1,
+                Duration::from_secs(1),
+            )
             .await;
         // Wait past TTL.
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert_eq!(store.lookup("local", dep_id, "t", &hint, 1).await, None);
+        assert_eq!(
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: "t",
+                        hint: &hint
+                    },
+                    1
+                )
+                .await,
+            None
+        );
     }
 
-    /// Codex F1 regression: a stale-generation key must be REPLACED by the
+    /// Regression: a stale-generation key must be REPLACED by the
     /// new pin, not silently deleted-and-reported-as-Inserted. The pre-fix
     /// path returned `Inserted` while the new pin was never written —
     /// subsequent lookups missed and the next request re-weighted.
@@ -818,24 +1076,70 @@ mod tests {
         let hint = unique_hint("stale-replace");
         let r1 = rev();
         store
-            .try_pin("local", dep_id, "t", &hint, r1, 1, Duration::from_secs(60))
+            .try_pin(
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: "t",
+                    hint: &hint,
+                },
+                r1,
+                1,
+                Duration::from_secs(60),
+            )
             .await;
-        assert_eq!(store.lookup("local", dep_id, "t", &hint, 1).await, Some(r1));
+        assert_eq!(
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: "t",
+                        hint: &hint
+                    },
+                    1
+                )
+                .await,
+            Some(r1)
+        );
 
         // Operator bumps generation: caller now writes gen=2 for the same
         // hint. The atomic Lua script must DEL + SET in one round-trip so
         // the new pin is persisted, not just the deletion.
         let r2 = rev();
         let out = store
-            .try_pin("local", dep_id, "t", &hint, r2, 2, Duration::from_secs(60))
+            .try_pin(
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: "t",
+                    hint: &hint,
+                },
+                r2,
+                2,
+                Duration::from_secs(60),
+            )
             .await;
         assert_eq!(out, PinOutcome::Inserted { revision_id: r2 });
         // The persistence check — without F1 fix this would be `None`
         // because the stale-handler deleted gen=1 but didn't write gen=2.
-        assert_eq!(store.lookup("local", dep_id, "t", &hint, 2).await, Some(r2));
+        assert_eq!(
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: "t",
+                        hint: &hint
+                    },
+                    2
+                )
+                .await,
+            Some(r2)
+        );
     }
 
-    /// Codex F1 regression: concurrent re-pinners against a stale-generation
+    /// Regression: concurrent re-pinners against a stale-generation
     /// key must converge on a single winner; everyone else sees `Existing`.
     /// Without the atomic script + retry, two callers could both observe
     /// the stale-delete and produce divergent `Inserted` outcomes.
@@ -851,10 +1155,12 @@ mod tests {
         let r_stale = rev();
         store
             .try_pin(
-                "local",
-                dep_id,
-                "t",
-                &hint,
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: "t",
+                    hint: &hint,
+                },
                 r_stale,
                 1,
                 Duration::from_secs(60),
@@ -869,7 +1175,17 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let r = rev();
                 let out = store
-                    .try_pin("local", dep_id, "t", &hint, r, 2, Duration::from_secs(60))
+                    .try_pin(
+                        PinKey {
+                            env_id: "local",
+                            deployment_id: dep_id,
+                            tenant: "t",
+                            hint: &hint,
+                        },
+                        r,
+                        2,
+                        Duration::from_secs(60),
+                    )
                     .await;
                 (r, out)
             }));
@@ -886,6 +1202,9 @@ mod tests {
                 PinOutcome::Existing { revision_id } => {
                     existing_revs.insert(revision_id);
                 }
+                PinOutcome::Skipped { .. } => {
+                    panic!("no soft-fail expected under non-overloaded Redis");
+                }
             }
         }
         // Exactly one winner inserts; everyone else sees the same winner.
@@ -895,11 +1214,21 @@ mod tests {
             "racing writers must observe a single winning revision, saw {existing_revs:?}",
         );
         // And the winner is durably persisted.
-        let after = store.lookup("local", dep_id, "t", &hint, 2).await;
+        let after = store
+            .lookup(
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: "t",
+                    hint: &hint,
+                },
+                2,
+            )
+            .await;
         assert!(after.is_some(), "winner must survive the race");
     }
 
-    /// Codex F3 regression: a rotating-hint client cannot grow Redis state
+    /// Regression: a rotating-hint client cannot grow Redis state
     /// past [`MAX_PINS_PER_TENANT`] for a single `(env, deployment, tenant)`.
     /// Inserts past the cap are rejected (logged) — the caller still gets
     /// the no-pin fallthrough so dispatch keeps routing.
@@ -920,40 +1249,56 @@ mod tests {
             let hint = format!("h-{i}");
             store
                 .try_pin(
-                    "local",
-                    dep_id,
-                    &tenant,
-                    &hint,
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: &tenant,
+                        hint: &hint,
+                    },
                     rev(),
                     1,
                     Duration::from_secs(60),
                 )
                 .await;
         }
-        // A 5th distinct hint must be rejected — but the caller's outcome
-        // is still `Inserted` (no-pin fallthrough so dispatch keeps going).
+        // A 5th distinct hint must be rejected with `Skipped` so the
+        // caller (dispatcher) sees an honest "no-op, but here's your
+        // revision_id for routing" signal instead of a misleading
+        // `Inserted` that lies about persistence.
         let r5 = rev();
         let out = store
             .try_pin(
-                "local",
-                dep_id,
-                &tenant,
-                "h-5",
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: &tenant,
+                    hint: "h-5",
+                },
                 r5,
                 1,
                 Duration::from_secs(60),
             )
             .await;
-        assert_eq!(out, PinOutcome::Inserted { revision_id: r5 });
+        assert_eq!(out, PinOutcome::Skipped { revision_id: r5 });
         // The pin must NOT actually exist in Redis (cap-rejected, not persisted).
         assert_eq!(
-            store.lookup("local", dep_id, &tenant, "h-5", 1).await,
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: &tenant,
+                        hint: "h-5"
+                    },
+                    1
+                )
+                .await,
             None,
             "5th distinct hint must not be persisted past the cap",
         );
     }
 
-    /// Codex F4 regression (live): two scopes that pre-fix collided to the
+    /// Regression (live): two scopes that pre-fix collided to the
     /// same Redis key (`a:b:c`) must now route to independent pins.
     #[tokio::test]
     async fn redis_tenant_and_hint_scopes_do_not_collide() {
@@ -973,10 +1318,12 @@ mod tests {
         let r2 = rev();
         store
             .try_pin(
-                "local",
-                dep_id,
-                &tenant_a,
-                hint_bc,
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: &tenant_a,
+                    hint: hint_bc,
+                },
                 r1,
                 1,
                 Duration::from_secs(60),
@@ -984,21 +1331,43 @@ mod tests {
             .await;
         store
             .try_pin(
-                "local",
-                dep_id,
-                &tenant_ab,
-                hint_c,
+                PinKey {
+                    env_id: "local",
+                    deployment_id: dep_id,
+                    tenant: &tenant_ab,
+                    hint: hint_c,
+                },
                 r2,
                 1,
                 Duration::from_secs(60),
             )
             .await;
         assert_eq!(
-            store.lookup("local", dep_id, &tenant_a, hint_bc, 1).await,
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: &tenant_a,
+                        hint: hint_bc
+                    },
+                    1
+                )
+                .await,
             Some(r1),
         );
         assert_eq!(
-            store.lookup("local", dep_id, &tenant_ab, hint_c, 1).await,
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: &tenant_ab,
+                        hint: hint_c
+                    },
+                    1
+                )
+                .await,
             Some(r2),
         );
     }
