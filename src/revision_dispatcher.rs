@@ -245,6 +245,12 @@ impl RevisionDispatcher {
         self.snapshot.load().deployments.len()
     }
 
+    /// Env this dispatcher routes for. The ingress seam uses it to build the
+    /// [`DispatchRequest`] so cookie validation binds to the right env.
+    pub fn env_id(&self) -> &str {
+        &self.env_id
+    }
+
     /// Atomic per-deployment traffic-split swap. Enforces `expected_generation`
     /// for optimistic concurrency, that all entries belong to the deployment's
     /// bundle, that no revision id repeats, and that weights sum to 10,000.
