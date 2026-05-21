@@ -715,13 +715,7 @@ where
         // which URL patterns they handle, and the ingress server dispatches to them
         // via the generic `dispatch_http_ingress` pipeline.
         if let Some(route_match) = state.http_route_table.match_request(&path, method.as_str()) {
-            break 'resolve helpers::ParsedIngressRoute {
-                domain: route_match.descriptor.domain,
-                provider: route_match.descriptor.pack_id.clone(),
-                tenant: route_match.tenant,
-                team: route_match.team,
-                handler: None,
-            };
+            break 'resolve route_match.into();
         }
 
         // Static route handling — serve assets from .gtpack files
@@ -930,6 +924,9 @@ fn resolve_deployment(_state: &HttpIngressState, _path: &str) -> Option<(Deploym
     None
 }
 
+/// A resolved revision route plus the optional stickiness cookie to emit.
+type RoutedRevision = (helpers::ParsedIngressRoute, Option<SetCookieDirective>);
+
 /// Pick a revision via the dispatcher, then resolve the request to that
 /// revision's route, keyed on the full `(deployment, bundle, revision)` scope.
 /// Returns `Ok(None)` when the selected revision declares no route for this
@@ -941,7 +938,7 @@ fn select_revision_route<R: Rng + ?Sized>(
     path: &str,
     method: &str,
     rng: &mut R,
-) -> anyhow::Result<Option<(helpers::ParsedIngressRoute, Option<SetCookieDirective>)>> {
+) -> anyhow::Result<Option<RoutedRevision>> {
     let outcome = dispatcher.dispatch(req, rng)?;
     let scope = crate::http_routes::RevisionScope {
         deployment_id: req.deployment_id,
@@ -951,14 +948,7 @@ fn select_revision_route<R: Rng + ?Sized>(
     let Some(route_match) = table.match_request_for_revision(path, method, &scope) else {
         return Ok(None);
     };
-    let parsed = helpers::ParsedIngressRoute {
-        domain: route_match.descriptor.domain,
-        provider: route_match.descriptor.pack_id.clone(),
-        tenant: route_match.tenant,
-        team: route_match.team,
-        handler: None,
-    };
-    Ok(Some((parsed, outcome.set_cookie)))
+    Ok(Some((route_match.into(), outcome.set_cookie)))
 }
 
 /// Fail-closed revision routing for a request already bound to a deployment.
@@ -966,7 +956,6 @@ fn select_revision_route<R: Rng + ?Sized>(
 /// or an error response — never a fall-through to legacy routing:
 /// - selected revision serves no route for this path → `404`;
 /// - dispatch error (e.g. a resolver/dispatcher config mismatch) → `500`.
-#[allow(clippy::type_complexity)]
 fn dispatch_bound_deployment<R: Rng + ?Sized>(
     dispatcher: &RevisionDispatcher,
     table: &HttpRouteTable,
@@ -974,7 +963,7 @@ fn dispatch_bound_deployment<R: Rng + ?Sized>(
     path: &str,
     method: &str,
     rng: &mut R,
-) -> Result<(helpers::ParsedIngressRoute, Option<SetCookieDirective>), Box<Response<Full<Bytes>>>> {
+) -> Result<RoutedRevision, Box<Response<Full<Bytes>>>> {
     match select_revision_route(dispatcher, table, req, path, method, rng) {
         Ok(Some(routed)) => Ok(routed),
         Ok(None) => Err(Box::new(error_response(
@@ -997,13 +986,18 @@ fn dispatch_bound_deployment<R: Rng + ?Sized>(
     }
 }
 
-/// Look up a single cookie value by name from the `Cookie` request header.
+/// Look up a single cookie value by name across all `Cookie` request headers
+/// (RFC 6265 permits more than one).
 fn extract_cookie(headers: &hyper::HeaderMap, name: &str) -> Option<String> {
-    let header = headers.get(hyper::header::COOKIE)?.to_str().ok()?;
-    header.split(';').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k.trim() == name).then(|| v.trim().to_string())
-    })
+    headers
+        .get_all(hyper::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|header| header.split(';'))
+        .find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k.trim() == name).then(|| v.trim().to_string())
+        })
 }
 
 /// Attach a `Set-Cookie` header for the revision stickiness directive. Cookie
@@ -1020,10 +1014,21 @@ fn apply_set_cookie(
             directive.value,
             directive.max_age.as_secs()
         );
-        if let Ok(value) = hyper::header::HeaderValue::from_str(&header) {
-            response
-                .headers_mut()
-                .append(hyper::header::SET_COOKIE, value);
+        match hyper::header::HeaderValue::from_str(&header) {
+            Ok(value) => {
+                response
+                    .headers_mut()
+                    .append(hyper::header::SET_COOKIE, value);
+            }
+            // The value is base64 (URL_SAFE_NO_PAD), so this should never fire;
+            // log rather than silently drop the stickiness cookie if it does.
+            Err(err) => operator_log::warn(
+                module_path!(),
+                format!(
+                    "failed to encode revision Set-Cookie `{}`: {err}",
+                    directive.name
+                ),
+            ),
         }
     }
     response

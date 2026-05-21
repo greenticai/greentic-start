@@ -21,7 +21,7 @@ pub const EXT_HTTP_ROUTES_V1: &str = "greentic.http-routes.v1";
 /// Deployment provenance of a route. Present only for routes discovered from a
 /// materialized runtime-config (multi-revision deployments, produced in B4).
 /// Routes discovered from a single bundle have no scope (`None` = legacy),
-/// matching the `Option = legacy` discipline used by B2's `RuntimeKey`.
+/// matching the `Option = legacy` discipline used by `RuntimeKey`.
 #[derive(Clone, Debug)]
 pub struct RevisionScope {
     pub deployment_id: DeploymentId,
