@@ -132,6 +132,7 @@ features = [
     "signal",
     "sync",
     "net",
+    "macros",
 ]
 
 [dependencies.tokio-stream]

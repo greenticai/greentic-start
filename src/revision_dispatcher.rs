@@ -29,8 +29,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use arc_swap::ArcSwap;
@@ -43,17 +43,13 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use ulid::Ulid;
 
+use crate::revision_pin::{InMemoryPinStore, PinOutcome, RevisionPinStore};
 use crate::runtime_config::LoadedRuntimeConfig;
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// Sum of basis points across a deployment's revisions. Mirrors deploy-spec §5.3.
 const TOTAL_WEIGHT_BPS: u32 = 10_000;
-
-/// Hard cap on the in-memory session-hint pin map. Mirrors the
-/// `directline_session::MAX_TRACKED_CONVERSATIONS` discipline so rotating-hint
-/// public traffic cannot grow the map without bound.
-const MAX_PINS: usize = 16_384;
 
 /// Cookie name prefix; full name is `_gt_rev_<deployment_id>`.
 pub const COOKIE_PREFIX: &str = "_gt_rev_";
@@ -139,16 +135,6 @@ struct CookiePayload {
     x: u64,    // expires_at (seconds since UNIX_EPOCH)
 }
 
-#[derive(Clone, Debug)]
-struct PinEntry {
-    revision_id: RevisionId,
-    /// Deployment generation at the time of pin creation. Stale pins (whose
-    /// generation no longer matches the current split) are dropped on lookup,
-    /// matching the cookie invalidation contract.
-    generation: u64,
-    expires_at: Instant,
-}
-
 pub struct RevisionDispatcherConfig {
     pub env_id: String,
     pub signing_key: [u8; 32],
@@ -174,7 +160,10 @@ pub struct RevisionDispatcher {
     cookie_ttl: Duration,
     pin_ttl: Duration,
     snapshot: ArcSwap<Snapshot>,
-    pins: Mutex<HashMap<(DeploymentId, String, String), PinEntry>>,
+    /// Session-hint pin store (B6). Defaults to in-memory; Redis-backed
+    /// implementations swap in via [`Self::with_pin_store`] so a horizontally
+    /// scaled router (Phase D K8s slice) can share pins across pods.
+    pin_store: Arc<dyn RevisionPinStore>,
     /// Serializes `apply_traffic_split` so the load → validate → store
     /// sequence is race-free. Reads remain lock-free through `snapshot`.
     write_lock: Mutex<()>,
@@ -193,13 +182,24 @@ impl std::fmt::Debug for RevisionDispatcher {
 
 impl RevisionDispatcher {
     pub fn new(cfg: RevisionDispatcherConfig) -> Self {
+        Self::with_pin_store(cfg, Arc::new(InMemoryPinStore::new()))
+    }
+
+    /// Build a dispatcher with a custom pin store. Production deployments
+    /// inject a [`crate::revision_pin::RedisPinStore`] so session stickiness
+    /// is shared across router pods; tests + single-process / `local` fall
+    /// back to [`InMemoryPinStore`] via [`Self::new`].
+    pub fn with_pin_store(
+        cfg: RevisionDispatcherConfig,
+        pin_store: Arc<dyn RevisionPinStore>,
+    ) -> Self {
         Self {
             env_id: cfg.env_id,
             signing_key: cfg.signing_key,
             cookie_ttl: cfg.cookie_ttl,
             pin_ttl: cfg.pin_ttl,
             snapshot: ArcSwap::from_pointee(Snapshot::default()),
-            pins: Mutex::new(HashMap::new()),
+            pin_store,
             write_lock: Mutex::new(()),
         }
     }
@@ -328,9 +328,14 @@ impl RevisionDispatcher {
         Ok(new_generation)
     }
 
-    /// Pick a revision per §P3 priority order. Mutates internal pin state when a
+    /// Pick a revision per §P3 priority order. Mutates the pin store when a
     /// new session_hint binds to a revision. RNG is injected so tests can seed.
-    pub fn dispatch<R: Rng + ?Sized>(
+    ///
+    /// Async because B6 backs the pin map by a trait that may resolve via
+    /// Redis (`gt:rev_pin:{env}:{deployment_id}:{tenant}:{hint}`). The local
+    /// [`InMemoryPinStore`] is still effectively synchronous; only Redis
+    /// adds the await points.
+    pub async fn dispatch<R: Rng + ?Sized>(
         &self,
         req: &DispatchRequest<'_>,
         rng: &mut R,
@@ -340,9 +345,6 @@ impl RevisionDispatcher {
             format!("deployment `{}` not known to dispatcher", req.deployment_id)
         })?;
         let now = now_secs();
-        let pin_key = req
-            .session_hint
-            .map(|hint| (req.deployment_id, req.tenant.to_string(), hint.to_string()));
 
         if req.trusted
             && let Some(rev) = req.header_revision
@@ -375,78 +377,62 @@ impl RevisionDispatcher {
             });
         }
 
-        if let Some(key) = pin_key.as_ref() {
-            let now_inst = Instant::now();
-            let pinned = {
-                let mut pins = self.pins.lock().expect("pin mutex poisoned");
-                match pins.get(key) {
-                    Some(p)
-                        if p.expires_at > now_inst
-                            && p.generation == entry.generation
-                            && has_revision(entry, p.revision_id) =>
-                    {
-                        Some(p.revision_id)
-                    }
-                    Some(_) => {
-                        pins.remove(key);
-                        None
-                    }
-                    None => None,
-                }
-            };
-            if let Some(rev) = pinned {
-                return Ok(DispatchOutcome {
-                    revision_id: rev,
-                    bundle_id: entry.bundle_id.clone(),
-                    reason: SelectionReason::Pin,
-                    set_cookie: Some(self.build_set_cookie(req, entry, rev, now)),
-                });
-            }
+        if let Some(hint) = req.session_hint
+            && let Some(rev) = self
+                .pin_store
+                .lookup(
+                    req.env_id,
+                    req.deployment_id,
+                    req.tenant,
+                    hint,
+                    entry.generation,
+                )
+                .await
+            && has_revision(entry, rev)
+        {
+            return Ok(DispatchOutcome {
+                revision_id: rev,
+                bundle_id: entry.bundle_id.clone(),
+                reason: SelectionReason::Pin,
+                set_cookie: Some(self.build_set_cookie(req, entry, rev, now)),
+            });
         }
 
         let selected = weighted_pick(&entry.revisions, rng)?;
-        if let Some(key) = pin_key {
-            self.insert_pin(key, selected, entry.generation);
-        }
+        let revision_id = if let Some(hint) = req.session_hint {
+            // Race-safe: if a concurrent dispatch lost the lookup race but
+            // already installed a pin, honor it so two requests with the same
+            // hint don't flap to different revisions. `try_pin` returns
+            // either the value we just inserted (`Inserted`) or the value
+            // that beat us (`Existing`); either way we serve what's pinned.
+            match self
+                .pin_store
+                .try_pin(
+                    req.env_id,
+                    req.deployment_id,
+                    req.tenant,
+                    hint,
+                    selected,
+                    entry.generation,
+                    self.pin_ttl,
+                )
+                .await
+            {
+                PinOutcome::Inserted { revision_id } => revision_id,
+                PinOutcome::Existing { revision_id } if has_revision(entry, revision_id) => {
+                    revision_id
+                }
+                PinOutcome::Existing { .. } => selected,
+            }
+        } else {
+            selected
+        };
         Ok(DispatchOutcome {
-            revision_id: selected,
+            revision_id,
             bundle_id: entry.bundle_id.clone(),
             reason: SelectionReason::Weighted,
-            set_cookie: Some(self.build_set_cookie(req, entry, selected, now)),
+            set_cookie: Some(self.build_set_cookie(req, entry, revision_id, now)),
         })
-    }
-
-    /// Bounded pin insert. Sweeps expired entries when at capacity, then
-    /// evicts the soonest-to-expire entry if still at cap. Same eviction
-    /// discipline as the DirectLine conversation cache in this crate, so a
-    /// rotating-session-hint client cannot grow the map without bound.
-    fn insert_pin(
-        &self,
-        key: (DeploymentId, String, String),
-        revision_id: RevisionId,
-        generation: u64,
-    ) {
-        let now = Instant::now();
-        let mut pins = self.pins.lock().expect("pin mutex poisoned");
-        if pins.len() >= MAX_PINS && !pins.contains_key(&key) {
-            pins.retain(|_, e| e.expires_at > now);
-            if pins.len() >= MAX_PINS
-                && let Some(victim) = pins
-                    .iter()
-                    .min_by_key(|(_, e)| e.expires_at)
-                    .map(|(k, _)| k.clone())
-            {
-                pins.remove(&victim);
-            }
-        }
-        pins.insert(
-            key,
-            PinEntry {
-                revision_id,
-                generation,
-                expires_at: now + self.pin_ttl,
-            },
-        );
     }
 
     fn build_set_cookie(
@@ -735,8 +721,8 @@ mod tests {
         assert!(format!("{err:#}").contains("stale generation"));
     }
 
-    #[test]
-    fn dispatch_unknown_deployment_errors() {
+    #[tokio::test]
+    async fn dispatch_unknown_deployment_errors() {
         let d = RevisionDispatcher::new(cfg("local"));
         let mut rng = StdRng::seed_from_u64(0);
         let err = d
@@ -752,12 +738,13 @@ mod tests {
                 },
                 &mut rng,
             )
+            .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("not known to dispatcher"));
     }
 
-    #[test]
-    fn dispatch_weighted_respects_basis_points() {
+    #[tokio::test]
+    async fn dispatch_weighted_respects_basis_points() {
         let dep_id = dep();
         let r_a = rev();
         let r_b = rev();
@@ -779,6 +766,7 @@ mod tests {
                     },
                     &mut rng,
                 )
+                .await
                 .unwrap();
             if out.revision_id == r_a {
                 a += 1;
@@ -791,8 +779,8 @@ mod tests {
         assert!((800..=1200).contains(&b), "b={b}");
     }
 
-    #[test]
-    fn dispatch_weighted_isolates_deployments() {
+    #[tokio::test]
+    async fn dispatch_weighted_isolates_deployments() {
         let d = RevisionDispatcher::new(cfg("local"));
         let dep_a = dep();
         let dep_b = dep();
@@ -817,6 +805,7 @@ mod tests {
                     },
                     &mut rng,
                 )
+                .await
                 .unwrap();
             let out_b = d
                 .dispatch(
@@ -831,14 +820,15 @@ mod tests {
                     },
                     &mut rng,
                 )
+                .await
                 .unwrap();
             assert_eq!(out_a.revision_id, r_a);
             assert_eq!(out_b.revision_id, r_b);
         }
     }
 
-    #[test]
-    fn dispatch_trusted_header_overrides_when_revision_ready() {
+    #[tokio::test]
+    async fn dispatch_trusted_header_overrides_when_revision_ready() {
         let dep_id = dep();
         let r1 = rev();
         let r2 = rev();
@@ -857,14 +847,15 @@ mod tests {
                 },
                 &mut rng,
             )
+            .await
             .unwrap();
         assert_eq!(out.revision_id, r2);
         assert_eq!(out.reason, SelectionReason::Header);
         assert!(out.set_cookie.is_none());
     }
 
-    #[test]
-    fn dispatch_header_ignored_when_untrusted() {
+    #[tokio::test]
+    async fn dispatch_header_ignored_when_untrusted() {
         let dep_id = dep();
         let r1 = rev();
         let d = dispatcher_with(dep_id, vec![entry(r1, 10_000)]);
@@ -883,13 +874,14 @@ mod tests {
                 },
                 &mut rng,
             )
+            .await
             .unwrap();
         assert_eq!(out.revision_id, r1);
         assert_eq!(out.reason, SelectionReason::Weighted);
     }
 
-    #[test]
-    fn dispatch_header_ignored_when_revision_not_in_split() {
+    #[tokio::test]
+    async fn dispatch_header_ignored_when_revision_not_in_split() {
         let dep_id = dep();
         let r1 = rev();
         let d = dispatcher_with(dep_id, vec![entry(r1, 10_000)]);
@@ -908,6 +900,7 @@ mod tests {
                 },
                 &mut rng,
             )
+            .await
             .unwrap();
         assert_eq!(out.revision_id, r1);
         assert_eq!(out.reason, SelectionReason::Weighted);
@@ -981,8 +974,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dispatch_honors_valid_cookie() {
+    #[tokio::test]
+    async fn dispatch_honors_valid_cookie() {
         let dep_id = dep();
         let r1 = rev();
         let r2 = rev();
@@ -1003,14 +996,15 @@ mod tests {
                 },
                 &mut rng,
             )
+            .await
             .unwrap();
         assert_eq!(out.revision_id, r2);
         assert_eq!(out.reason, SelectionReason::Cookie);
         assert!(out.set_cookie.is_none());
     }
 
-    #[test]
-    fn dispatch_ignores_cookie_after_generation_bump() {
+    #[tokio::test]
+    async fn dispatch_ignores_cookie_after_generation_bump() {
         let d = RevisionDispatcher::new(cfg("local"));
         let dep_id = dep();
         let r1 = rev();
@@ -1037,13 +1031,14 @@ mod tests {
                 },
                 &mut rng,
             )
+            .await
             .unwrap();
         assert_eq!(out.reason, SelectionReason::Weighted);
         assert!(out.set_cookie.is_some());
     }
 
-    #[test]
-    fn pin_is_established_on_weighted_and_honored_next_request() {
+    #[tokio::test]
+    async fn pin_is_established_on_weighted_and_honored_next_request() {
         let dep_id = dep();
         let r1 = rev();
         let r2 = rev();
@@ -1062,6 +1057,7 @@ mod tests {
                 },
                 &mut rng,
             )
+            .await
             .unwrap();
         assert_eq!(first.reason, SelectionReason::Weighted);
         let second = d
@@ -1077,13 +1073,14 @@ mod tests {
                 },
                 &mut rng,
             )
+            .await
             .unwrap();
         assert_eq!(second.reason, SelectionReason::Pin);
         assert_eq!(second.revision_id, first.revision_id);
     }
 
-    #[test]
-    fn pin_falls_through_to_weighted_when_revision_archived() {
+    #[tokio::test]
+    async fn pin_falls_through_to_weighted_when_revision_archived() {
         let dep_id = dep();
         let r1 = rev();
         let r2 = rev();
@@ -1103,6 +1100,7 @@ mod tests {
                 },
                 &mut rng,
             )
+            .await
             .unwrap();
         let pinned = first.revision_id;
         // Operator removes the pinned revision from the split (replaces it with a fresh one).
@@ -1129,13 +1127,14 @@ mod tests {
                 },
                 &mut rng,
             )
+            .await
             .unwrap();
         assert_ne!(again.revision_id, pinned);
         assert_eq!(again.reason, SelectionReason::Weighted);
     }
 
-    #[test]
-    fn weighted_skips_zero_weight_revisions() {
+    #[tokio::test]
+    async fn weighted_skips_zero_weight_revisions() {
         let dep_id = dep();
         let r_active = rev();
         let r_zero = rev();
@@ -1155,6 +1154,7 @@ mod tests {
                     },
                     &mut rng,
                 )
+                .await
                 .unwrap();
             assert_eq!(out.revision_id, r_active);
         }
@@ -1258,8 +1258,8 @@ mod tests {
         assert_eq!(snap.deployments[&dep_b].revisions[0].revision_id, r_b1);
     }
 
-    #[test]
-    fn pin_invalidated_when_generation_bumps_even_if_revision_still_present() {
+    #[tokio::test]
+    async fn pin_invalidated_when_generation_bumps_even_if_revision_still_present() {
         let d = RevisionDispatcher::new(cfg("local"));
         let dep_id = dep();
         let r1 = rev();
@@ -1281,6 +1281,7 @@ mod tests {
                 },
                 &mut rng,
             )
+            .await
             .unwrap();
         assert_eq!(first.reason, SelectionReason::Weighted);
 
@@ -1303,34 +1304,8 @@ mod tests {
                 },
                 &mut rng,
             )
+            .await
             .unwrap();
         assert_eq!(second.reason, SelectionReason::Weighted);
-    }
-
-    #[test]
-    fn pin_map_stays_bounded_under_rotating_session_hints() {
-        let dep_id = dep();
-        let d = dispatcher_with(dep_id, vec![entry(rev(), 10_000)]);
-        let mut rng = StdRng::seed_from_u64(0);
-        // Drive 2x the cap through unique hints. Without the bound the map
-        // would hold 32_768 entries; with it, it must stay ≤ MAX_PINS.
-        for i in 0..(MAX_PINS * 2) {
-            let hint = format!("sess-{i}");
-            d.dispatch(
-                &DispatchRequest {
-                    env_id: "local",
-                    tenant: "t",
-                    deployment_id: dep_id,
-                    session_hint: Some(&hint),
-                    trusted: false,
-                    header_revision: None,
-                    cookie: None,
-                },
-                &mut rng,
-            )
-            .unwrap();
-        }
-        let len = d.pins.lock().unwrap().len();
-        assert!(len <= MAX_PINS, "pin map grew to {len}");
     }
 }

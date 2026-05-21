@@ -695,14 +695,21 @@ where
             // routing is authoritative. A route miss or dispatch error must NOT
             // fall through to the legacy single-bundle path, which would bypass
             // the traffic split and serve the request from the wrong pack.
+            // `ThreadRng` is `!Send`, so it can't survive the `.await` in the
+            // async dispatcher (B6 made `dispatch` async). `SmallRng` seeded
+            // from the OS is Send + matches the existing
+            // `revision_dispatcher` test fixture's RNG choice.
+            let mut rng: rand::rngs::SmallRng = rand::make_rng();
             match dispatch_bound_deployment(
                 dispatcher,
                 &state.http_route_table,
                 &dispatch_req,
                 &path,
                 method.as_str(),
-                &mut rand::rng(),
-            ) {
+                &mut rng,
+            )
+            .await
+            {
                 Ok((route, set_cookie)) => {
                     pending_set_cookie = set_cookie;
                     break 'resolve route;
@@ -931,7 +938,7 @@ type RoutedRevision = (helpers::ParsedIngressRoute, Option<SetCookieDirective>);
 /// revision's route, keyed on the full `(deployment, bundle, revision)` scope.
 /// Returns `Ok(None)` when the selected revision declares no route for this
 /// path. Pure (no HTTP types) so the fail-closed policy lives in the wrapper.
-fn select_revision_route<R: Rng + ?Sized>(
+async fn select_revision_route<R: Rng + ?Sized>(
     dispatcher: &RevisionDispatcher,
     table: &HttpRouteTable,
     req: &DispatchRequest<'_>,
@@ -939,7 +946,7 @@ fn select_revision_route<R: Rng + ?Sized>(
     method: &str,
     rng: &mut R,
 ) -> anyhow::Result<Option<RoutedRevision>> {
-    let outcome = dispatcher.dispatch(req, rng)?;
+    let outcome = dispatcher.dispatch(req, rng).await?;
     let scope = crate::http_routes::RevisionScope {
         deployment_id: req.deployment_id,
         bundle_id: outcome.bundle_id.clone(),
@@ -956,7 +963,7 @@ fn select_revision_route<R: Rng + ?Sized>(
 /// or an error response — never a fall-through to legacy routing:
 /// - selected revision serves no route for this path → `404`;
 /// - dispatch error (e.g. a resolver/dispatcher config mismatch) → `500`.
-fn dispatch_bound_deployment<R: Rng + ?Sized>(
+async fn dispatch_bound_deployment<R: Rng + ?Sized>(
     dispatcher: &RevisionDispatcher,
     table: &HttpRouteTable,
     req: &DispatchRequest<'_>,
@@ -964,7 +971,7 @@ fn dispatch_bound_deployment<R: Rng + ?Sized>(
     method: &str,
     rng: &mut R,
 ) -> Result<RoutedRevision, Box<Response<Full<Bytes>>>> {
-    match select_revision_route(dispatcher, table, req, path, method, rng) {
+    match select_revision_route(dispatcher, table, req, path, method, rng).await {
         Ok(Some(routed)) => Ok(routed),
         Ok(None) => Err(Box::new(error_response(
             StatusCode::NOT_FOUND,
@@ -2942,8 +2949,8 @@ mod tests {
             dispatcher
         }
 
-        #[test]
-        fn select_revision_route_routes_to_selected_revisions_route() {
+        #[tokio::test]
+        async fn select_revision_route_routes_to_selected_revisions_route() {
             let deployment_id = DeploymentId::new();
             let bundle_id = BundleId::new("acme-bundle");
             let revision_id = RevisionId::new();
@@ -2978,6 +2985,7 @@ mod tests {
                 "GET",
                 &mut StdRng::seed_from_u64(0),
             )
+            .await
             .expect("dispatch ok")
             .expect("route matched");
 
@@ -2988,8 +2996,8 @@ mod tests {
             assert_eq!(directive.name, cookie_name(deployment_id));
         }
 
-        #[test]
-        fn select_revision_route_returns_none_when_revision_has_no_route() {
+        #[tokio::test]
+        async fn select_revision_route_returns_none_when_revision_has_no_route() {
             let deployment_id = DeploymentId::new();
             let bundle_id = BundleId::new("acme-bundle");
             let revision_id = RevisionId::new();
@@ -3024,6 +3032,7 @@ mod tests {
                 "GET",
                 &mut StdRng::seed_from_u64(0),
             )
+            .await
             .expect("dispatch ok");
             assert!(outcome.is_none(), "no route for the selected revision");
         }
@@ -3040,8 +3049,8 @@ mod tests {
             }
         }
 
-        #[test]
-        fn dispatch_bound_deployment_routes_on_match() {
+        #[tokio::test]
+        async fn dispatch_bound_deployment_routes_on_match() {
             let deployment_id = DeploymentId::new();
             let bundle_id = BundleId::new("acme-bundle");
             let revision_id = RevisionId::new();
@@ -3064,12 +3073,13 @@ mod tests {
                 "/v1/messaging/webchat/acme/token",
                 "GET",
                 &mut StdRng::seed_from_u64(0),
-            );
+            )
+            .await;
             assert!(result.is_ok(), "matching route resolves");
         }
 
-        #[test]
-        fn dispatch_bound_deployment_fails_closed_on_route_miss() {
+        #[tokio::test]
+        async fn dispatch_bound_deployment_fails_closed_on_route_miss() {
             let deployment_id = DeploymentId::new();
             let bundle_id = BundleId::new("acme-bundle");
             let revision_id = RevisionId::new();
@@ -3083,12 +3093,13 @@ mod tests {
                 "GET",
                 &mut StdRng::seed_from_u64(0),
             )
+            .await
             .expect_err("a bound deployment must not fall through on a route miss");
             assert_eq!(err.status(), StatusCode::NOT_FOUND);
         }
 
-        #[test]
-        fn dispatch_bound_deployment_fails_closed_on_unknown_deployment() {
+        #[tokio::test]
+        async fn dispatch_bound_deployment_fails_closed_on_unknown_deployment() {
             let dispatcher =
                 RevisionDispatcher::new(RevisionDispatcherConfig::new("demo", [7u8; 32]));
             let err = dispatch_bound_deployment(
@@ -3099,6 +3110,7 @@ mod tests {
                 "GET",
                 &mut StdRng::seed_from_u64(0),
             )
+            .await
             .expect_err("a dispatch error must not fall through to legacy");
             assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         }
