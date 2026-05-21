@@ -1662,9 +1662,9 @@ dependencies = [
 
 [[package]]
 name = "either"
-version = "1.15.0"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "email_address"
@@ -2371,9 +2371,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "1.1.0-dev.25852863942"
+version = "1.1.0-dev.26207211164"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83ed50c3fb05ac6d4a5e98b364749ba8755320a16bf47da1458be7698d1861b5"
+checksum = "e74f3964cdde1d2c93f5dea4fdd6cbb1c8af4f161684dfc80c39edace9213ada"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -2392,9 +2392,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "1.1.0-dev.25852863942"
+version = "1.1.0-dev.26207211164"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2a7221f3c6279290d94a53ab6807e96c3ec647b5fdc438a6386fecf8d351794"
+checksum = "83b782d9164eff60eb73c22e063bf71f8e7f8ff91cbc34323e38b1d81efc1f37"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2409,6 +2409,7 @@ dependencies = [
  "futures",
  "greentic-config",
  "greentic-config-types",
+ "greentic-deploy-spec",
  "greentic-distributor-client",
  "greentic-flow",
  "greentic-interfaces",
@@ -3692,11 +3693,11 @@ checksum = "90071f8077f8e40adfc4b7fe9cd495ce316263f19e75c2211eeff3fdf475a3d9"
 
 [[package]]
 name = "lzma-rust2"
-version = "0.16.2"
+version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47bb1e988e6fb779cf720ad431242d3f03167c1b3f2b1aae7f1a94b2495b36ae"
+checksum = "5e9ceaec84b54518262de7cf06b8b43e83c808349960f1610b21b0bfc9640f20"
 dependencies = [
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -5040,9 +5041,9 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "1.1.0-dev.25852863942"
+version = "1.1.0-dev.26207211164"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a18aa7d83d9bbb1087af318dbef7118dbde52550ea0c82e0d6c9c8410c6d5ca"
+checksum = "6b481ebd143f2eb5e63fff4bb59ace31474718302a6ccb7ece65dd7c61e77bc1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
