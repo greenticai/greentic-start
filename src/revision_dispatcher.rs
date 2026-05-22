@@ -28,7 +28,7 @@
 // once route binding lands.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -74,6 +74,11 @@ pub struct DeploymentEntry {
     pub bundle_id: BundleId,
     pub generation: u64,
     pub revisions: Vec<RevisionEntry>,
+    /// Revisions flagged by [`RevisionDispatcher::mark_draining`]. Weighted
+    /// selection skips them and `try_pin` is suppressed for them, but
+    /// existing pin/cookie/header bindings still route through so in-flight
+    /// HTTP sessions can finish during the drain window.
+    pub draining: HashSet<RevisionId>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -232,6 +237,7 @@ impl RevisionDispatcher {
                     bundle_id,
                     generation: 0,
                     revisions: vec![entry],
+                    draining: HashSet::new(),
                 });
         }
         let dispatcher = Self::new(cfg);
@@ -249,6 +255,124 @@ impl RevisionDispatcher {
     /// [`DispatchRequest`] so cookie validation binds to the right env.
     pub fn env_id(&self) -> &str {
         &self.env_id
+    }
+
+    /// Flag `revision_id` as draining under `deployment_id`. Weighted picks
+    /// will skip it and `try_pin` writes against it are suppressed, but
+    /// existing pin / valid cookie / trusted-header overrides still route to
+    /// it so in-flight HTTP and cookie sessions can finish during the drain
+    /// window. Returns `true` if the flag was newly added, `false` if it was
+    /// already set or the deployment / revision is unknown — idempotent.
+    pub fn mark_draining(&self, deployment_id: DeploymentId, revision_id: RevisionId) -> bool {
+        self.mutate_deployment(deployment_id, |entry| {
+            if !has_revision_any_weight(entry, revision_id) {
+                return false;
+            }
+            entry.draining.insert(revision_id)
+        })
+    }
+
+    /// Clear the draining flag for `(deployment_id, revision_id)`. Returns
+    /// `true` if the flag was set and is now cleared, `false` otherwise.
+    /// Idempotent; provided for rollback symmetry with [`mark_draining`].
+    pub fn unmark_draining(&self, deployment_id: DeploymentId, revision_id: RevisionId) -> bool {
+        self.mutate_deployment(deployment_id, |entry| entry.draining.remove(&revision_id))
+    }
+
+    /// Remove `revision_id` from the deployment's routing table entirely —
+    /// the **post-drain** state, distinct from the soft-draining flag set by
+    /// [`mark_draining`]. After eviction `has_revision` returns `false`, so
+    /// every selection path (cookie, pin, weighted) skips it: a client that
+    /// still holds a cookie or session pin for this revision re-dispatches to
+    /// a healthy revision via the weighted fallback instead of selecting a
+    /// runtime that is about to be (or already) torn down.
+    ///
+    /// The drain coordinator calls this **after** `drain_seconds` and
+    /// **before** tearing the runtime down, closing the gap between the
+    /// short drain window and the much longer cookie / pin TTL. Returns
+    /// `true` if the revision was present (and is now gone) or was flagged
+    /// draining, `false` if it was already absent — idempotent.
+    ///
+    /// **Bumps the deployment generation** when it removes a revision, exactly
+    /// as [`apply_traffic_split`](Self::apply_traffic_split) does. This is
+    /// load-bearing, not cosmetic: cookie validation and pin lookup are both
+    /// generation-scoped, so a session pinned to the evicted revision would
+    /// otherwise keep resolving to it (the pin's generation still matches),
+    /// fail `has_revision`, and re-roll a *fresh* weighted pick on every
+    /// request — flapping across the surviving revisions for the entire pin
+    /// TTL (cookie-less hint-only clients, i.e. every messaging connector,
+    /// have no cookie to re-anchor them). Bumping the generation invalidates
+    /// the stale cookie/pin so the next request re-pins to one surviving
+    /// revision and *stays* there. The cost — every session re-picks once —
+    /// is the same one-time blip any `gtc op traffic set` already imposes,
+    /// and session state lives in the shared session store, so a re-pick
+    /// never loses conversation state.
+    ///
+    /// The surviving revisions' weights no longer sum to 10,000 bps until the
+    /// operator's next `gtc op traffic set` re-materializes the split, but
+    /// [`weighted_pick_healthy`] picks proportionally over whatever total
+    /// remains, so routing stays correct in the interim.
+    pub fn evict_revision(&self, deployment_id: DeploymentId, revision_id: RevisionId) -> bool {
+        self.mutate_deployment(deployment_id, |entry| {
+            let had_revision = entry.revisions.iter().any(|r| r.revision_id == revision_id);
+            entry.revisions.retain(|r| r.revision_id != revision_id);
+            let was_draining = entry.draining.remove(&revision_id);
+            let changed = had_revision || was_draining;
+            if changed {
+                // Re-anchor stale generation-scoped cookies/pins (see doc).
+                entry.generation += 1;
+            }
+            changed
+        })
+    }
+
+    /// `true` if the revision is currently flagged draining under the
+    /// deployment. Lock-free read off the snapshot.
+    pub fn is_draining(&self, deployment_id: DeploymentId, revision_id: RevisionId) -> bool {
+        self.snapshot
+            .load()
+            .deployments
+            .get(&deployment_id)
+            .map(|d| d.draining.contains(&revision_id))
+            .unwrap_or(false)
+    }
+
+    /// Snapshot of all draining revisions under a deployment. Returns an
+    /// empty `Vec` if the deployment is unknown or nothing is draining.
+    /// The drain coordinator uses this to iterate teardown work.
+    pub fn draining_revisions(&self, deployment_id: DeploymentId) -> Vec<RevisionId> {
+        self.snapshot
+            .load()
+            .deployments
+            .get(&deployment_id)
+            .map(|d| d.draining.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Serialize a per-deployment entry mutation under `write_lock`. `f`
+    /// returns whether a change actually occurred — we only store the new
+    /// snapshot when something changed, so a no-op call doesn't churn the
+    /// `ArcSwap`. The lock keeps a concurrent `apply_traffic_split` from
+    /// racing with a drain mark or eviction.
+    fn mutate_deployment<F>(&self, deployment_id: DeploymentId, f: F) -> bool
+    where
+        F: FnOnce(&mut DeploymentEntry) -> bool,
+    {
+        let _w = self.write_lock.lock().expect("write lock poisoned");
+        let prev = self.snapshot.load_full();
+        if !prev.deployments.contains_key(&deployment_id) {
+            return false;
+        }
+        let mut next = (*prev).clone();
+        let entry = next
+            .deployments
+            .get_mut(&deployment_id)
+            .expect("checked above");
+        let changed = f(entry);
+        if changed {
+            self.snapshot.store(std::sync::Arc::new(next));
+        }
+        changed
     }
 
     /// Atomic per-deployment traffic-split swap. Enforces `expected_generation`
@@ -314,6 +438,22 @@ impl RevisionDispatcher {
             );
         }
 
+        // Preserve drain flags for revisions still in the new split; revisions
+        // that disappear lose their flag (they're gone from the route table
+        // anyway, so the flag has no observable effect). Revisions that appear
+        // anew start non-draining — the sensible default.
+        let preserved_draining = existing
+            .map(|d| {
+                let new_ids: HashSet<RevisionId> =
+                    new_revisions.iter().map(|r| r.revision_id).collect();
+                d.draining
+                    .iter()
+                    .copied()
+                    .filter(|rev| new_ids.contains(rev))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut next = (*prev).clone();
         let new_generation = current_gen + 1;
         next.deployments.insert(
@@ -322,6 +462,7 @@ impl RevisionDispatcher {
                 bundle_id,
                 generation: new_generation,
                 revisions: new_revisions,
+                draining: preserved_draining,
             },
         );
         self.snapshot.store(std::sync::Arc::new(next));
@@ -388,11 +529,20 @@ impl RevisionDispatcher {
                 revision_id: rev,
                 bundle_id: entry.bundle_id.clone(),
                 reason: SelectionReason::Pin,
-                set_cookie: Some(self.build_set_cookie(req, entry, rev, now)),
+                // Suppress fresh Set-Cookie on a route to a draining
+                // revision so the cookie naturally expires and the next
+                // request re-picks among healthy revisions. Cookie/pin TTL
+                // bounds how long a draining revision keeps holding
+                // existing sessions.
+                set_cookie: if entry.draining.contains(&rev) {
+                    None
+                } else {
+                    Some(self.build_set_cookie(req, entry, rev, now))
+                },
             });
         }
 
-        let selected = weighted_pick(&entry.revisions, rng)?;
+        let selected = weighted_pick_healthy(&entry.revisions, &entry.draining, rng)?;
         let revision_id = if let Some(hint) = req.session_hint {
             // Race-safe: if a concurrent dispatch lost the lookup race but
             // already installed a pin, honor it so two requests with the same
@@ -401,23 +551,36 @@ impl RevisionDispatcher {
             // that beat us (`Existing`), or `Skipped` when the backend
             // soft-failed (timeout / cap / scope-reject) — in the last
             // case nothing is persisted but we still route this request.
-            match self
-                .pin_store
-                .try_pin(
-                    self.pin_key(req, hint),
-                    selected,
-                    entry.generation,
-                    self.pin_ttl,
-                )
-                .await
-            {
-                PinOutcome::Inserted { revision_id } | PinOutcome::Skipped { revision_id } => {
-                    revision_id
+            //
+            // Defense in depth: `weighted_pick_healthy` already excludes
+            // draining revisions, so `selected` is non-draining today and
+            // this guard never fires. It's kept so that if the picker is
+            // ever relaxed (e.g. draining-as-last-resort fallback), a fresh
+            // session still won't be pinned to a doomed revision.
+            if entry.draining.contains(&selected) {
+                selected
+            } else {
+                match self
+                    .pin_store
+                    .try_pin(
+                        self.pin_key(req, hint),
+                        selected,
+                        entry.generation,
+                        self.pin_ttl,
+                    )
+                    .await
+                {
+                    PinOutcome::Inserted { revision_id } | PinOutcome::Skipped { revision_id } => {
+                        revision_id
+                    }
+                    PinOutcome::Existing { revision_id }
+                        if has_revision(entry, revision_id)
+                            && !entry.draining.contains(&revision_id) =>
+                    {
+                        revision_id
+                    }
+                    PinOutcome::Existing { .. } => selected,
                 }
-                PinOutcome::Existing { revision_id } if has_revision(entry, revision_id) => {
-                    revision_id
-                }
-                PinOutcome::Existing { .. } => selected,
             }
         } else {
             selected
@@ -426,7 +589,11 @@ impl RevisionDispatcher {
             revision_id,
             bundle_id: entry.bundle_id.clone(),
             reason: SelectionReason::Weighted,
-            set_cookie: Some(self.build_set_cookie(req, entry, revision_id, now)),
+            set_cookie: if entry.draining.contains(&revision_id) {
+                None
+            } else {
+                Some(self.build_set_cookie(req, entry, revision_id, now))
+            },
         })
     }
 
@@ -534,26 +701,45 @@ fn has_revision(entry: &DeploymentEntry, revision: RevisionId) -> bool {
         .any(|r| r.revision_id == revision && r.weight_bps > 0)
 }
 
-fn weighted_pick<R: Rng + ?Sized>(
+/// Membership check that ignores weight — used by [`RevisionDispatcher::mark_draining`]
+/// so an admin can drain a revision whose weight has already been rolled to 0
+/// via `gtc op traffic set`.
+fn has_revision_any_weight(entry: &DeploymentEntry, revision: RevisionId) -> bool {
+    entry.revisions.iter().any(|r| r.revision_id == revision)
+}
+
+/// Drain-aware weighted pick: skip any revision in `draining` so new sessions
+/// never land on a revision the coordinator is about to tear down.
+fn weighted_pick_healthy<R: Rng + ?Sized>(
     revisions: &[RevisionEntry],
+    draining: &HashSet<RevisionId>,
     rng: &mut R,
 ) -> anyhow::Result<RevisionId> {
-    let total: u64 = revisions.iter().map(|r| r.weight_bps as u64).sum();
+    let total: u64 = revisions
+        .iter()
+        .filter(|r| !draining.contains(&r.revision_id))
+        .map(|r| r.weight_bps as u64)
+        .sum();
     if total == 0 {
-        bail!("no non-zero-weight revisions available");
+        bail!("no non-zero-weight, non-draining revisions available");
     }
     let mut pick = rng.random_range(0..total);
     for r in revisions {
+        if draining.contains(&r.revision_id) {
+            continue;
+        }
         let w = r.weight_bps as u64;
         if pick < w {
             return Ok(r.revision_id);
         }
         pick -= w;
     }
-    // Unreachable: pick < total and sum(w) == total.
+    // Unreachable: pick < total and sum(non-draining w) == total.
     Ok(revisions
-        .last()
-        .expect("non-empty checked above")
+        .iter()
+        .rev()
+        .find(|r| !draining.contains(&r.revision_id))
+        .expect("at least one non-draining checked above")
         .revision_id)
 }
 
@@ -1307,5 +1493,404 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.reason, SelectionReason::Weighted);
+    }
+
+    // ── B7 drain semantics ────────────────────────────────────────────
+
+    #[test]
+    fn mark_draining_returns_false_for_unknown_deployment() {
+        let d = RevisionDispatcher::new(cfg("local"));
+        assert!(!d.mark_draining(dep(), rev()));
+    }
+
+    #[test]
+    fn mark_draining_returns_false_for_unknown_revision() {
+        let dep_id = dep();
+        let r1 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 10_000)]);
+        let ghost = rev();
+        assert!(!d.mark_draining(dep_id, ghost));
+        assert!(!d.is_draining(dep_id, ghost));
+    }
+
+    #[test]
+    fn mark_draining_is_idempotent() {
+        let dep_id = dep();
+        let r1 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 10_000)]);
+        assert!(d.mark_draining(dep_id, r1));
+        assert!(d.is_draining(dep_id, r1));
+        assert!(!d.mark_draining(dep_id, r1));
+        assert!(d.is_draining(dep_id, r1));
+    }
+
+    #[test]
+    fn unmark_draining_clears_the_flag() {
+        let dep_id = dep();
+        let r1 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 10_000)]);
+        d.mark_draining(dep_id, r1);
+        assert!(d.unmark_draining(dep_id, r1));
+        assert!(!d.is_draining(dep_id, r1));
+        assert!(!d.unmark_draining(dep_id, r1));
+    }
+
+    #[test]
+    fn mark_draining_accepts_zero_weight_revision() {
+        // Operator usually rolls weight to 0 first then drains. The flag
+        // must apply to a present-but-zero-weight revision; `has_revision`
+        // (which filters by weight > 0) would have rejected it.
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 10_000), entry(r2, 0)]);
+        assert!(d.mark_draining(dep_id, r2));
+        assert!(d.is_draining(dep_id, r2));
+    }
+
+    #[test]
+    fn draining_revisions_lists_marked_only() {
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        d.mark_draining(dep_id, r1);
+        let listed = d.draining_revisions(dep_id);
+        assert_eq!(listed, vec![r1]);
+    }
+
+    #[test]
+    fn draining_flag_preserved_across_apply_traffic_split() {
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 9000), entry(r2, 1000)]);
+        d.mark_draining(dep_id, r2);
+        // Replay with a different split that still references r2 — flag survives.
+        d.apply_traffic_split(dep_id, vec![entry(r1, 9500), entry(r2, 500)], bundle(), 1)
+            .expect("apply");
+        assert!(d.is_draining(dep_id, r2));
+    }
+
+    #[test]
+    fn draining_flag_dropped_when_revision_disappears_from_split() {
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 9000), entry(r2, 1000)]);
+        d.mark_draining(dep_id, r2);
+        // r2 vanishes from the new split — flag has no observable target,
+        // so it's cleaned up.
+        d.apply_traffic_split(dep_id, vec![entry(r1, 10_000)], bundle(), 1)
+            .expect("apply");
+        assert!(!d.is_draining(dep_id, r2));
+    }
+
+    #[tokio::test]
+    async fn weighted_pick_skips_draining_revision() {
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        // 50/50 normally — but r2 is draining, so 100% should land on r1.
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        d.mark_draining(dep_id, r2);
+        let mut rng = StdRng::seed_from_u64(0);
+        for _ in 0..200 {
+            let outcome = d
+                .dispatch(
+                    &DispatchRequest {
+                        env_id: "local",
+                        tenant: "t",
+                        deployment_id: dep_id,
+                        session_hint: None,
+                        trusted: false,
+                        header_revision: None,
+                        cookie: None,
+                    },
+                    &mut rng,
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.revision_id, r1);
+            assert_eq!(outcome.reason, SelectionReason::Weighted);
+        }
+    }
+
+    #[tokio::test]
+    async fn weighted_pick_bails_when_all_revisions_draining() {
+        let dep_id = dep();
+        let r1 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 10_000)]);
+        d.mark_draining(dep_id, r1);
+        let mut rng = StdRng::seed_from_u64(0);
+        let err = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: None,
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("non-draining"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn cookie_still_routes_to_draining_revision_but_skips_set_cookie() {
+        // "Soft drain" semantics: existing cookie sessions finish on the
+        // draining revision; no fresh Set-Cookie is issued so the cookie
+        // naturally expires and the next request re-picks a healthy
+        // revision.
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        // Mint a fresh cookie bound to r2 (gen 1) BEFORE we mark r2 draining.
+        let cookie = d.seal_cookie("local", "t", dep_id, r2, 1, now_secs() + 3600);
+        d.mark_draining(dep_id, r2);
+        let mut rng = StdRng::seed_from_u64(0);
+        let outcome = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: None,
+                    trusted: false,
+                    header_revision: None,
+                    cookie: Some(&cookie),
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.revision_id, r2);
+        assert_eq!(outcome.reason, SelectionReason::Cookie);
+        assert!(
+            outcome.set_cookie.is_none(),
+            "no refresh cookie on a draining route",
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_header_still_routes_to_draining_revision() {
+        // Admin override: even when a revision is draining, the trusted
+        // header still routes there (useful for forced retry / debug).
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        d.mark_draining(dep_id, r2);
+        let mut rng = StdRng::seed_from_u64(0);
+        let outcome = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: None,
+                    trusted: true,
+                    header_revision: Some(r2),
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.revision_id, r2);
+        assert_eq!(outcome.reason, SelectionReason::Header);
+        // Header path never sets cookies regardless of drain state.
+        assert!(outcome.set_cookie.is_none());
+    }
+
+    #[tokio::test]
+    async fn weighted_pick_with_session_hint_skips_pin_write_on_draining() {
+        // r2 is draining; r1 receives all new weighted traffic. The session
+        // hint MUST NOT create a pin against the draining target (it'd be a
+        // doomed pin), and the route MUST still succeed via r1.
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        d.mark_draining(dep_id, r2);
+        let mut rng = StdRng::seed_from_u64(0);
+        let first = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: Some("sess-drain"),
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.revision_id, r1, "weighted-pick must skip draining");
+        // Second call with the same hint should also hit r1 — pin written for
+        // r1, NOT r2 (which is draining).
+        let second = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: Some("sess-drain"),
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.revision_id, r1);
+        assert_eq!(second.reason, SelectionReason::Pin);
+    }
+
+    // ── B7 post-drain eviction ────────────────────────────────────────
+
+    #[test]
+    fn evict_revision_returns_false_for_unknown() {
+        let dep_id = dep();
+        let r1 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 10_000)]);
+        assert!(!d.evict_revision(dep_id, rev()));
+        assert!(!d.evict_revision(dep(), r1));
+    }
+
+    #[test]
+    fn evict_revision_clears_draining_flag() {
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        d.mark_draining(dep_id, r2);
+        assert!(d.evict_revision(dep_id, r2));
+        assert!(!d.is_draining(dep_id, r2));
+        // Idempotent: a second evict finds nothing left.
+        assert!(!d.evict_revision(dep_id, r2));
+    }
+
+    #[tokio::test]
+    async fn evicted_revision_is_skipped_by_weighted_pick() {
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        d.evict_revision(dep_id, r2);
+        let mut rng = StdRng::seed_from_u64(0);
+        for _ in 0..200 {
+            let out = d
+                .dispatch(
+                    &DispatchRequest {
+                        env_id: "local",
+                        tenant: "t",
+                        deployment_id: dep_id,
+                        session_hint: None,
+                        trusted: false,
+                        header_revision: None,
+                        cookie: None,
+                    },
+                    &mut rng,
+                )
+                .await
+                .unwrap();
+            assert_eq!(out.revision_id, r1);
+        }
+    }
+
+    #[tokio::test]
+    async fn evicted_revision_cookie_falls_through_to_weighted() {
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        let cookie = d.seal_cookie("local", "t", dep_id, r2, 1, now_secs() + 3600);
+        d.evict_revision(dep_id, r2);
+        let mut rng = StdRng::seed_from_u64(0);
+        let out = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: None,
+                    trusted: false,
+                    header_revision: None,
+                    cookie: Some(&cookie),
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        // Cookie for the evicted revision no longer routes there.
+        assert_eq!(out.revision_id, r1);
+        assert_eq!(out.reason, SelectionReason::Weighted);
+    }
+
+    #[tokio::test]
+    async fn evicted_revision_trusted_header_falls_through() {
+        // Even the admin override can't route to an evicted (gone) revision —
+        // unlike soft-draining, where the trusted header still hits it.
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        d.evict_revision(dep_id, r2);
+        let mut rng = StdRng::seed_from_u64(0);
+        let out = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: None,
+                    trusted: true,
+                    header_revision: Some(r2),
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.revision_id, r1);
+        assert_eq!(out.reason, SelectionReason::Weighted);
+    }
+
+    #[tokio::test]
+    async fn evicting_last_revision_makes_dispatch_fail_closed() {
+        // Draining the only revision leaves nothing healthy to fall to — a
+        // dispatch error (→ B3 fails closed 500) is the correct end state.
+        let dep_id = dep();
+        let r1 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 10_000)]);
+        d.evict_revision(dep_id, r1);
+        let mut rng = StdRng::seed_from_u64(0);
+        let err = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: None,
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("non-draining"), "{err:#}");
     }
 }
