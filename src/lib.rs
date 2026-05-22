@@ -48,6 +48,7 @@ pub mod provider_config_envelope;
 mod qa_persist;
 mod revision_dispatcher;
 mod revision_drain;
+pub mod revision_health_gate;
 mod revision_pin;
 mod runner_exec;
 mod runner_host;
