@@ -159,17 +159,31 @@ impl RevisionDrainCoordinator {
         //    Phase D wires that in.
         tokio::time::sleep(Duration::from_secs(u64::from(drain_seconds))).await;
 
-        // 3. Close remaining WebSockets via the trait seam. The default
+        // 3. Evict the revision from the dispatcher BEFORE teardown. The
+        //    soft-draining flag (step 1) deliberately keeps cookie- and
+        //    pin-bound sessions routing here during the window so HTTP
+        //    finishes — but those bindings outlive the window (cookie/pin
+        //    TTL is ~1h vs the default 30s drain). Without this transition a
+        //    client holding a cookie/pin would keep selecting the revision
+        //    after step 5 removed its runtime → 404/500 instead of a
+        //    re-dispatch. Eviction makes `has_revision` false, so every
+        //    selection path (cookie, pin, weighted) skips it and the holder
+        //    re-dispatches to a healthy revision with a fresh cookie.
+        let evicted = self.dispatcher.evict_revision(deployment_id, revision_id);
+
+        // 4. Close remaining WebSockets via the trait seam. Ordered after
+        //    eviction so a reconnecting client re-dispatches to a healthy
+        //    revision rather than re-selecting this one. The default
         //    NoopWsRevisionCloser is a no-op — a real registry lands in
         //    Phase D once `serve_session` threads `(deployment, revision)`.
         self.ws_closer
             .close_revision(deployment_id, revision_id)
             .await;
 
-        // 4. Tear down the TenantRuntime. The runner-host's
+        // 5. Tear down the TenantRuntime. The runner-host's
         //    `ActivePacks::remove_revision` returns the Arc; we let it
         //    drop here, which aborts the tenant's timer handles via
-        //    `TenantRuntime::drop`.
+        //    `TenantRuntime::drop`. Safe now: nothing routes here anymore.
         let removed = self
             .teardown
             .remove_revision(tenant, deployment_id, bundle_id, revision_id);
@@ -185,6 +199,7 @@ impl RevisionDrainCoordinator {
 
         Ok(DrainReport {
             newly_marked,
+            evicted_from_dispatch: evicted,
             removed_runtime: removed,
         })
     }
@@ -198,6 +213,11 @@ pub struct DrainReport {
     /// this run; `false` if it was already set or the dispatcher didn't
     /// know about the revision.
     pub newly_marked: bool,
+    /// `true` if [`RevisionDispatcher::evict_revision`] removed the revision
+    /// from the routing table at the end of the drain window; `false` if it
+    /// was already absent. After this, cookie/pin holders re-dispatch to a
+    /// healthy revision instead of the torn-down runtime.
+    pub evicted_from_dispatch: bool,
     /// `true` if `ActivePacks::remove_revision` popped an entry; `false`
     /// if no runtime was present (already torn down or never warmed).
     pub removed_runtime: bool,
@@ -311,8 +331,12 @@ mod tests {
             .expect("drain ran");
 
         assert!(report.newly_marked);
+        assert!(report.evicted_from_dispatch);
         assert!(report.removed_runtime);
-        assert!(dispatcher.is_draining(dep_id, r2));
+        // Eviction (step 3) cleared the draining flag and removed r2 from the
+        // routing table, so it is no longer "draining" — it is gone.
+        assert!(!dispatcher.is_draining(dep_id, r2));
+        assert!(dispatcher.draining_revisions(dep_id).is_empty());
         assert_eq!(ws_closer.closes.load(Ordering::SeqCst), 1);
         let calls = teardown.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 1);
@@ -352,9 +376,11 @@ mod tests {
             .await
             .unwrap();
 
-        // First run flips the flag; second run finds it already set.
+        // First run flips the flag and evicts; second run finds nothing left.
         assert!(first.newly_marked);
+        assert!(first.evicted_from_dispatch);
         assert!(!second.newly_marked);
+        assert!(!second.evicted_from_dispatch);
         // Teardown returns `false` (no entry) but both runs still complete
         // cleanly — the drain dance is safe to replay.
         assert!(!first.removed_runtime);
@@ -388,6 +414,7 @@ mod tests {
             .unwrap();
 
         assert!(!report.newly_marked); // dispatcher rejected the unknown rev
+        assert!(!report.evicted_from_dispatch); // nothing to evict
         assert!(report.removed_runtime); // teardown still fired
         assert_eq!(teardown.calls.lock().unwrap().len(), 1);
     }
@@ -422,5 +449,181 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         let _ = handle.await.unwrap().unwrap();
         assert!(start.elapsed() >= Duration::from_secs(2));
+    }
+
+    // Regression for the Codex no-ship: a client holding a cookie/pin issued
+    // before the drain must re-dispatch to a HEALTHY revision after the drain
+    // window — not keep selecting the torn-down revision until the (much
+    // longer) cookie/pin TTL expires.
+
+    #[tokio::test]
+    async fn drain_then_stale_cookie_reselects_healthy_revision() {
+        use crate::revision_dispatcher::{DispatchRequest, SelectionReason};
+        use crate::revision_pin::now_secs;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        let dep_id = DeploymentId::new();
+        let r1 = RevisionId::new();
+        let r2 = RevisionId::new();
+        let dispatcher = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        // Cookie minted while r2 was healthy (generation 1).
+        let cookie = dispatcher.seal_cookie("local", "t", dep_id, r2, 1, now_secs() + 3600);
+        let mut rng = StdRng::seed_from_u64(0);
+
+        // Pre-drain: the cookie sticks the session to r2.
+        let pre = dispatcher
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: None,
+                    trusted: false,
+                    header_revision: None,
+                    cookie: Some(&cookie),
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pre.revision_id, r2);
+        assert_eq!(pre.reason, SelectionReason::Cookie);
+
+        // Drain r2.
+        let teardown = Arc::new(RecordingTeardown::new(true));
+        let coord =
+            RevisionDrainCoordinator::with_noop_ws(Arc::clone(&dispatcher), teardown.clone());
+        coord
+            .run(DrainRequest {
+                tenant: "acme",
+                deployment_id: dep_id,
+                bundle_id: bundle(),
+                revision_id: r2,
+                drain_seconds: 0,
+            })
+            .await
+            .unwrap();
+
+        // Post-drain: the same cookie no longer selects r2 — it falls through
+        // to a weighted pick over the surviving healthy revision (r1) and a
+        // fresh cookie is issued so the session migrates.
+        let post = dispatcher
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: None,
+                    trusted: false,
+                    header_revision: None,
+                    cookie: Some(&cookie),
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            post.revision_id, r1,
+            "stale cookie must re-dispatch to healthy r1"
+        );
+        assert_eq!(post.reason, SelectionReason::Weighted);
+        assert!(
+            post.set_cookie.is_some(),
+            "fresh cookie migrates the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_then_stale_pin_reselects_healthy_revision() {
+        use crate::revision_dispatcher::{DispatchRequest, SelectionReason};
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        let dep_id = DeploymentId::new();
+        let r1 = RevisionId::new();
+        let r2 = RevisionId::new();
+        // r1 weight 0 so the first weighted pick deterministically lands on r2
+        // and establishes the pin there; after drain, r1 is the only survivor.
+        let dispatcher = dispatcher_with(dep_id, vec![entry(r1, 0), entry(r2, 10_000)]);
+        let mut rng = StdRng::seed_from_u64(0);
+
+        // Establish a pin on r2 via a weighted pick.
+        let pre = dispatcher
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: Some("sess-pin"),
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pre.revision_id, r2);
+
+        // Before draining r2, give r1 some weight so it's a valid fallback.
+        dispatcher
+            .apply_traffic_split(dep_id, vec![entry(r1, 5000), entry(r2, 5000)], bundle(), 1)
+            .unwrap();
+        // The pin survives the generation bump? No — generation bump
+        // invalidates the pin (B1 semantics). Re-establish under gen 2.
+        let _ = dispatcher
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: Some("sess-pin"),
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+
+        // Drain r2.
+        let teardown = Arc::new(RecordingTeardown::new(true));
+        let coord =
+            RevisionDrainCoordinator::with_noop_ws(Arc::clone(&dispatcher), teardown.clone());
+        coord
+            .run(DrainRequest {
+                tenant: "acme",
+                deployment_id: dep_id,
+                bundle_id: bundle(),
+                revision_id: r2,
+                drain_seconds: 0,
+            })
+            .await
+            .unwrap();
+
+        // Post-drain: a request with the same hint must land on r1 — the pin
+        // to the evicted r2 is no longer honored.
+        let post = dispatcher
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: Some("sess-pin"),
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            post.revision_id, r1,
+            "stale pin must re-dispatch to healthy r1"
+        );
+        assert_eq!(post.reason, SelectionReason::Weighted);
     }
 }

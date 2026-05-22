@@ -264,7 +264,7 @@ impl RevisionDispatcher {
     /// window. Returns `true` if the flag was newly added, `false` if it was
     /// already set or the deployment / revision is unknown — idempotent.
     pub fn mark_draining(&self, deployment_id: DeploymentId, revision_id: RevisionId) -> bool {
-        self.modify_draining(deployment_id, |entry| {
+        self.mutate_deployment(deployment_id, |entry| {
             if !has_revision_any_weight(entry, revision_id) {
                 return false;
             }
@@ -276,7 +276,36 @@ impl RevisionDispatcher {
     /// `true` if the flag was set and is now cleared, `false` otherwise.
     /// Idempotent; provided for rollback symmetry with [`mark_draining`].
     pub fn unmark_draining(&self, deployment_id: DeploymentId, revision_id: RevisionId) -> bool {
-        self.modify_draining(deployment_id, |entry| entry.draining.remove(&revision_id))
+        self.mutate_deployment(deployment_id, |entry| entry.draining.remove(&revision_id))
+    }
+
+    /// Remove `revision_id` from the deployment's routing table entirely —
+    /// the **post-drain** state, distinct from the soft-draining flag set by
+    /// [`mark_draining`]. After eviction `has_revision` returns `false`, so
+    /// every selection path (cookie, pin, weighted) skips it: a client that
+    /// still holds a cookie or session pin for this revision re-dispatches to
+    /// a healthy revision via the weighted fallback instead of selecting a
+    /// runtime that is about to be (or already) torn down.
+    ///
+    /// The drain coordinator calls this **after** `drain_seconds` and
+    /// **before** tearing the runtime down, closing the gap between the
+    /// short drain window and the much longer cookie / pin TTL. Returns
+    /// `true` if the revision was present (and is now gone) or was flagged
+    /// draining, `false` if it was already absent — idempotent.
+    ///
+    /// Targeted by design: it does **not** bump the deployment generation, so
+    /// sessions pinned to *healthy* revisions keep their stickiness. The
+    /// surviving revisions' weights no longer sum to 10,000 bps until the
+    /// operator's next `gtc op traffic set` re-materializes the split, but
+    /// [`weighted_pick_healthy`] picks proportionally over whatever total
+    /// remains, so routing stays correct in the interim.
+    pub fn evict_revision(&self, deployment_id: DeploymentId, revision_id: RevisionId) -> bool {
+        self.mutate_deployment(deployment_id, |entry| {
+            let had_revision = entry.revisions.iter().any(|r| r.revision_id == revision_id);
+            entry.revisions.retain(|r| r.revision_id != revision_id);
+            let was_draining = entry.draining.remove(&revision_id);
+            had_revision || was_draining
+        })
     }
 
     /// `true` if the revision is currently flagged draining under the
@@ -302,12 +331,12 @@ impl RevisionDispatcher {
             .unwrap_or_default()
     }
 
-    /// Serialize a per-deployment draining-flag mutation under `write_lock`.
-    /// `f` returns whether a change actually occurred — we only store the new
+    /// Serialize a per-deployment entry mutation under `write_lock`. `f`
+    /// returns whether a change actually occurred — we only store the new
     /// snapshot when something changed, so a no-op call doesn't churn the
     /// `ArcSwap`. The lock keeps a concurrent `apply_traffic_split` from
-    /// racing with a drain mark.
-    fn modify_draining<F>(&self, deployment_id: DeploymentId, f: F) -> bool
+    /// racing with a drain mark or eviction.
+    fn mutate_deployment<F>(&self, deployment_id: DeploymentId, f: F) -> bool
     where
         F: FnOnce(&mut DeploymentEntry) -> bool,
     {
@@ -1710,5 +1739,142 @@ mod tests {
             .unwrap();
         assert_eq!(second.revision_id, r1);
         assert_eq!(second.reason, SelectionReason::Pin);
+    }
+
+    // ── B7 post-drain eviction ────────────────────────────────────────
+
+    #[test]
+    fn evict_revision_returns_false_for_unknown() {
+        let dep_id = dep();
+        let r1 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 10_000)]);
+        assert!(!d.evict_revision(dep_id, rev()));
+        assert!(!d.evict_revision(dep(), r1));
+    }
+
+    #[test]
+    fn evict_revision_clears_draining_flag() {
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        d.mark_draining(dep_id, r2);
+        assert!(d.evict_revision(dep_id, r2));
+        assert!(!d.is_draining(dep_id, r2));
+        // Idempotent: a second evict finds nothing left.
+        assert!(!d.evict_revision(dep_id, r2));
+    }
+
+    #[tokio::test]
+    async fn evicted_revision_is_skipped_by_weighted_pick() {
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        d.evict_revision(dep_id, r2);
+        let mut rng = StdRng::seed_from_u64(0);
+        for _ in 0..200 {
+            let out = d
+                .dispatch(
+                    &DispatchRequest {
+                        env_id: "local",
+                        tenant: "t",
+                        deployment_id: dep_id,
+                        session_hint: None,
+                        trusted: false,
+                        header_revision: None,
+                        cookie: None,
+                    },
+                    &mut rng,
+                )
+                .await
+                .unwrap();
+            assert_eq!(out.revision_id, r1);
+        }
+    }
+
+    #[tokio::test]
+    async fn evicted_revision_cookie_falls_through_to_weighted() {
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        let cookie = d.seal_cookie("local", "t", dep_id, r2, 1, now_secs() + 3600);
+        d.evict_revision(dep_id, r2);
+        let mut rng = StdRng::seed_from_u64(0);
+        let out = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: None,
+                    trusted: false,
+                    header_revision: None,
+                    cookie: Some(&cookie),
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        // Cookie for the evicted revision no longer routes there.
+        assert_eq!(out.revision_id, r1);
+        assert_eq!(out.reason, SelectionReason::Weighted);
+    }
+
+    #[tokio::test]
+    async fn evicted_revision_trusted_header_falls_through() {
+        // Even the admin override can't route to an evicted (gone) revision —
+        // unlike soft-draining, where the trusted header still hits it.
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        d.evict_revision(dep_id, r2);
+        let mut rng = StdRng::seed_from_u64(0);
+        let out = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: None,
+                    trusted: true,
+                    header_revision: Some(r2),
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.revision_id, r1);
+        assert_eq!(out.reason, SelectionReason::Weighted);
+    }
+
+    #[tokio::test]
+    async fn evicting_last_revision_makes_dispatch_fail_closed() {
+        // Draining the only revision leaves nothing healthy to fall to — a
+        // dispatch error (→ B3 fails closed 500) is the correct end state.
+        let dep_id = dep();
+        let r1 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 10_000)]);
+        d.evict_revision(dep_id, r1);
+        let mut rng = StdRng::seed_from_u64(0);
+        let err = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: None,
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("non-draining"), "{err:#}");
     }
 }
