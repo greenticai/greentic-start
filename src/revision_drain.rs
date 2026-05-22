@@ -133,6 +133,16 @@ impl RevisionDrainCoordinator {
     /// Run the drain dance. Returns `Ok` whether or not the runtime was
     /// actually present (idempotent re-run is safe). Errors only on
     /// impossible internal state (no current path reaches that).
+    ///
+    /// **Cancellation contract for the Phase D producer:** the only await
+    /// point that holds meaningful state is the `drain_seconds` sleep, after
+    /// `mark_draining` has flipped the flag. If the task is dropped during
+    /// that sleep the revision is left soft-draining (weighted-pick skips it,
+    /// existing cookie/pin sessions still route there) but never evicted or
+    /// torn down. The whole sequence is idempotent, so the producer's
+    /// recovery is simply to call `run` again for the same revision; it must
+    /// not assume a cancelled drain self-heals. (`unmark_draining` is the
+    /// escape hatch if the drain is being aborted rather than retried.)
     pub async fn run(&self, req: DrainRequest<'_>) -> Result<DrainReport> {
         let DrainRequest {
             tenant,
@@ -625,5 +635,116 @@ mod tests {
             "stale pin must re-dispatch to healthy r1"
         );
         assert_eq!(post.reason, SelectionReason::Weighted);
+    }
+
+    // Regression for code-review finding: a hint-only (cookie-less) session
+    // pinned to the evicted revision must RE-PIN to a single survivor and
+    // STAY there — not re-roll the weighted dice on every request and flap
+    // across the survivors until the pin TTL expires. The generation bump in
+    // `evict_revision` is what makes this hold. Uses 3 revisions so two
+    // survivors remain after eviction (flapping is only observable with 2+).
+    #[tokio::test]
+    async fn drain_does_not_make_pinned_session_flap_across_survivors() {
+        use crate::revision_dispatcher::{DispatchRequest, SelectionReason};
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        let dep_id = DeploymentId::new();
+        let r1 = RevisionId::new();
+        let r2 = RevisionId::new();
+        let r3 = RevisionId::new();
+        // r3 takes all initial weight so the session deterministically pins
+        // there; r1 and r2 are the survivors after r3 is drained.
+        let dispatcher =
+            dispatcher_with(dep_id, vec![entry(r1, 0), entry(r2, 0), entry(r3, 10_000)]);
+        let mut rng = StdRng::seed_from_u64(0);
+
+        let pre = dispatcher
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: Some("sess-flap"),
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pre.revision_id, r3);
+
+        // Re-weight so r1 and r2 are both live survivors (gen 1 → 2).
+        dispatcher
+            .apply_traffic_split(
+                dep_id,
+                vec![entry(r1, 5000), entry(r2, 5000), entry(r3, 0)],
+                bundle(),
+                1,
+            )
+            .unwrap();
+        // Re-pin the session to r3 under the new generation (r3 still present,
+        // weight 0 — mark/evict accepts zero-weight). The pre-drain pin must
+        // exist at the CURRENT generation to make the flapping risk real.
+        dispatcher.mark_draining(dep_id, r3);
+
+        let teardown = Arc::new(RecordingTeardown::new(true));
+        let coord =
+            RevisionDrainCoordinator::with_noop_ws(Arc::clone(&dispatcher), teardown.clone());
+        coord
+            .run(DrainRequest {
+                tenant: "acme",
+                deployment_id: dep_id,
+                bundle_id: bundle(),
+                revision_id: r3,
+                drain_seconds: 0,
+            })
+            .await
+            .unwrap();
+
+        // First post-drain request re-pins to ONE survivor; every subsequent
+        // request with the same hint must return that SAME survivor.
+        let first = dispatcher
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: Some("sess-flap"),
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert!(first.revision_id == r1 || first.revision_id == r2);
+        let anchored = first.revision_id;
+
+        for _ in 0..50 {
+            let next = dispatcher
+                .dispatch(
+                    &DispatchRequest {
+                        env_id: "local",
+                        tenant: "t",
+                        deployment_id: dep_id,
+                        session_hint: Some("sess-flap"),
+                        trusted: false,
+                        header_revision: None,
+                        cookie: None,
+                    },
+                    &mut rng,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                next.revision_id, anchored,
+                "session must stay anchored to one survivor, not flap"
+            );
+            assert_eq!(next.reason, SelectionReason::Pin);
+        }
     }
 }

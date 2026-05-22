@@ -293,9 +293,22 @@ impl RevisionDispatcher {
     /// `true` if the revision was present (and is now gone) or was flagged
     /// draining, `false` if it was already absent — idempotent.
     ///
-    /// Targeted by design: it does **not** bump the deployment generation, so
-    /// sessions pinned to *healthy* revisions keep their stickiness. The
-    /// surviving revisions' weights no longer sum to 10,000 bps until the
+    /// **Bumps the deployment generation** when it removes a revision, exactly
+    /// as [`apply_traffic_split`](Self::apply_traffic_split) does. This is
+    /// load-bearing, not cosmetic: cookie validation and pin lookup are both
+    /// generation-scoped, so a session pinned to the evicted revision would
+    /// otherwise keep resolving to it (the pin's generation still matches),
+    /// fail `has_revision`, and re-roll a *fresh* weighted pick on every
+    /// request — flapping across the surviving revisions for the entire pin
+    /// TTL (cookie-less hint-only clients, i.e. every messaging connector,
+    /// have no cookie to re-anchor them). Bumping the generation invalidates
+    /// the stale cookie/pin so the next request re-pins to one surviving
+    /// revision and *stays* there. The cost — every session re-picks once —
+    /// is the same one-time blip any `gtc op traffic set` already imposes,
+    /// and session state lives in the shared session store, so a re-pick
+    /// never loses conversation state.
+    ///
+    /// The surviving revisions' weights no longer sum to 10,000 bps until the
     /// operator's next `gtc op traffic set` re-materializes the split, but
     /// [`weighted_pick_healthy`] picks proportionally over whatever total
     /// remains, so routing stays correct in the interim.
@@ -304,7 +317,12 @@ impl RevisionDispatcher {
             let had_revision = entry.revisions.iter().any(|r| r.revision_id == revision_id);
             entry.revisions.retain(|r| r.revision_id != revision_id);
             let was_draining = entry.draining.remove(&revision_id);
-            had_revision || was_draining
+            let changed = had_revision || was_draining;
+            if changed {
+                // Re-anchor stale generation-scoped cookies/pins (see doc).
+                entry.generation += 1;
+            }
+            changed
         })
     }
 
@@ -534,13 +552,11 @@ impl RevisionDispatcher {
             // soft-failed (timeout / cap / scope-reject) — in the last
             // case nothing is persisted but we still route this request.
             //
-            // Skip the pin write entirely when the selected revision is
-            // draining: the revision is about to be torn down, so pinning
-            // a fresh session to it would just expire on its own minutes
-            // later. weighted_pick_healthy already excludes draining from
-            // the random pick, so this only fires when a single-revision
-            // deployment is fully drained and the next branch's
-            // bail-on-empty has not yet kicked in — defense in depth.
+            // Defense in depth: `weighted_pick_healthy` already excludes
+            // draining revisions, so `selected` is non-draining today and
+            // this guard never fires. It's kept so that if the picker is
+            // ever relaxed (e.g. draining-as-last-resort fallback), a fresh
+            // session still won't be pinned to a doomed revision.
             if entry.draining.contains(&selected) {
                 selected
             } else {
