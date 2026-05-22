@@ -50,22 +50,26 @@ pub(crate) struct LoadedRuntimeConfig {
     pub(crate) revisions: Vec<ResolvedRevisionBlock>,
 }
 
-/// Resolves the environment directory for `env_id` under the default store root.
+/// Resolves the environment directory for `env_id` under `root`.
 ///
 /// `EnvId` construction rejects path separators (`/`, `\`, `:`, NUL) and any
 /// non-identifier character, but [`greentic_types::validate_identifier`] permits
 /// bare `.` and `..` (they are all-dots). `LocalFsStore::safe_env_segment` guards
 /// that gap on the deployer side; we mirror it here because that helper is not
 /// public and `greentic-start` consumes the deployer as a registry crate.
-fn env_dir(env_id: &str) -> anyhow::Result<PathBuf> {
+fn env_dir_in(root: &Path, env_id: &str) -> anyhow::Result<PathBuf> {
     if env_id == "." || env_id == ".." {
         bail!("environment id `{env_id}` is not a safe directory segment");
     }
     // Validates the segment (separators, NUL, charset) and gives a typed id.
     EnvId::new(env_id).with_context(|| format!("invalid environment id `{env_id}`"))?;
+    Ok(root.join(env_id))
+}
+
+fn env_dir(env_id: &str) -> anyhow::Result<PathBuf> {
     let root = LocalFsStore::default_root()
         .context("cannot determine the default environment store root (no home directory)")?;
-    Ok(root.join(env_id))
+    env_dir_in(&root, env_id)
 }
 
 /// Loads and validates the materialized runtime-config for `env_id`.
@@ -77,6 +81,22 @@ fn env_dir(env_id: &str) -> anyhow::Result<PathBuf> {
 /// or are missing.
 pub(crate) fn load(env_id: &str) -> anyhow::Result<Option<LoadedRuntimeConfig>> {
     let dir = env_dir(env_id)?;
+    load_in_dir(&dir, env_id)
+}
+
+/// Same as [`load`], but resolves the env directory under `env_root` instead
+/// of [`LocalFsStore::default_root`]. Used by [`crate::revision_health_gate`]
+/// (B9b) so the gate can target an arbitrary store root — required for in-
+/// process tests that don't want to write to the operator's real home dir.
+pub(crate) fn load_in(
+    env_root: &Path,
+    env_id: &str,
+) -> anyhow::Result<Option<LoadedRuntimeConfig>> {
+    let dir = env_dir_in(env_root, env_id)?;
+    load_in_dir(&dir, env_id)
+}
+
+fn load_in_dir(dir: &Path, env_id: &str) -> anyhow::Result<Option<LoadedRuntimeConfig>> {
     let path = dir.join(RUNTIME_CONFIG_FILE);
     if !path.is_file() {
         return Ok(None);
@@ -85,7 +105,7 @@ pub(crate) fn load(env_id: &str) -> anyhow::Result<Option<LoadedRuntimeConfig>> 
         .with_context(|| format!("reading runtime-config at {}", path.display()))?;
     let parsed: MaterializedRuntimeConfig = serde_json::from_str(&raw)
         .with_context(|| format!("parsing runtime-config at {}", path.display()))?;
-    validate_and_resolve(parsed, env_id, &dir).map(Some)
+    validate_and_resolve(parsed, env_id, dir).map(Some)
 }
 
 fn validate_and_resolve(
