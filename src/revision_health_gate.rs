@@ -142,27 +142,41 @@ impl RevisionHealthGate for StartRevisionHealthGate {
         // `starts_with` containment test — canonicalization resolves
         // symlinks, so escape-via-symlink is caught too. Future DSSE
         // verification slots in after this resolution.
-        let env_dir = self.env_root.join(env_id);
-        match greentic_deployer::path_safety::normalize_under_root(
-            &env_dir,
-            &revision.signature_sidecar_ref,
-        ) {
-            // `normalize_under_root` returns Ok only when the path
-            // canonicalizes (i.e. exists) and stays under `env_dir`; the
-            // residual `is_file` guard rejects a contained directory.
-            Ok(sig_path) if sig_path.is_file() => {}
-            Ok(sig_path) => {
-                failed_checks.push(HealthCheckId::SignatureStatus);
-                messages.push(format!(
-                    "signature_sidecar_ref resolves to `{}`, which is not a regular file",
-                    sig_path.display()
-                ));
-            }
+        //
+        // The containment root is resolved through `env_dir_in` (NOT a raw
+        // `self.env_root.join(env_id)`) so it shares the same `.`/`..`
+        // reject + charset validation the RuntimeConfig check gets via
+        // `load_in`. `validate_identifier` permits all-dot ids, so a `..`
+        // env id would otherwise widen the containment root to the parent
+        // of `env_root` for this check alone.
+        match crate::runtime_config::env_dir_in(&self.env_root, env_id) {
+            Ok(env_dir) => match greentic_deployer::path_safety::normalize_under_root(
+                &env_dir,
+                &revision.signature_sidecar_ref,
+            ) {
+                // `normalize_under_root` returns Ok only when the path
+                // canonicalizes (i.e. exists) and stays under `env_dir`;
+                // the residual `is_file` guard rejects a contained directory.
+                Ok(sig_path) if sig_path.is_file() => {}
+                Ok(sig_path) => {
+                    failed_checks.push(HealthCheckId::SignatureStatus);
+                    messages.push(format!(
+                        "signature_sidecar_ref resolves to `{}`, which is not a regular file",
+                        sig_path.display()
+                    ));
+                }
+                Err(e) => {
+                    failed_checks.push(HealthCheckId::SignatureStatus);
+                    messages.push(format!(
+                        "signature_sidecar_ref `{}` is not a contained, existing sidecar: {e:#}",
+                        revision.signature_sidecar_ref.display()
+                    ));
+                }
+            },
             Err(e) => {
                 failed_checks.push(HealthCheckId::SignatureStatus);
                 messages.push(format!(
-                    "signature_sidecar_ref `{}` is not a contained, existing sidecar: {e:#}",
-                    revision.signature_sidecar_ref.display()
+                    "environment id `{env_id}` is not a safe directory segment: {e:#}"
                 ));
             }
         }
@@ -401,6 +415,36 @@ mod tests {
             err.failed_checks.contains(&HealthCheckId::SignatureStatus),
             "expected SignatureStatus failure, got {:?}",
             err.failed_checks
+        );
+    }
+
+    /// `/code-review` finding: a `..` (or `.`) `environment_id` must not let
+    /// the signature check widen its containment root to the parent of
+    /// `env_root`. `validate_identifier` permits all-dot ids, so `EnvId("..")`
+    /// is constructible; the gate must reject it on BOTH env-dir-dependent
+    /// checks (RuntimeConfig via `load_in`, SignatureStatus via `env_dir_in`),
+    /// not lean on aggregation from a single check.
+    #[test]
+    fn start_rejects_dotdot_env_id_on_both_dependent_checks() {
+        let (_tmp, env_root, revision) = seed_env(true);
+        let mut env = make_env();
+        env.environment_id = EnvId::try_from("..").unwrap();
+        let gate = StartRevisionHealthGate::new(env_root);
+        let err = gate.check(&env, &revision).unwrap_err();
+        assert!(
+            err.failed_checks.contains(&HealthCheckId::SignatureStatus),
+            "signature check must reject `..` env_id, got {:?}",
+            err.failed_checks
+        );
+        assert!(
+            err.failed_checks.contains(&HealthCheckId::RuntimeConfig),
+            "runtime-config check must reject `..` env_id, got {:?}",
+            err.failed_checks
+        );
+        assert!(
+            err.message.contains("not a safe directory segment"),
+            "msg: {}",
+            err.message
         );
     }
 

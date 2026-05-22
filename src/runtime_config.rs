@@ -57,7 +57,7 @@ pub(crate) struct LoadedRuntimeConfig {
 /// bare `.` and `..` (they are all-dots). `LocalFsStore::safe_env_segment` guards
 /// that gap on the deployer side; we mirror it here because that helper is not
 /// public and `greentic-start` consumes the deployer as a registry crate.
-fn env_dir_in(root: &Path, env_id: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn env_dir_in(root: &Path, env_id: &str) -> anyhow::Result<PathBuf> {
     if env_id == "." || env_id == ".." {
         bail!("environment id `{env_id}` is not a safe directory segment");
     }
