@@ -132,16 +132,39 @@ impl RevisionHealthGate for StartRevisionHealthGate {
         }
 
         // 2. Signature status (placeholder for Phase-C2 DSSE verify):
-        // `signature_sidecar_ref` is an env-relative path that MUST exist
-        // on disk when warming. Future DSSE verification slots in here.
+        // `signature_sidecar_ref` is an env-relative path that MUST resolve
+        // to a regular file CONTAINED in the environment directory. The
+        // ref is a plain `PathBuf` copied verbatim from the stage payload
+        // (deploy-spec only schema-validates it), so an absolute ref, a
+        // `..` escape, or a symlink escape could otherwise satisfy this
+        // check with a file outside the store. `normalize_under_root`
+        // rejects absolute paths and canonicalizes both sides before a
+        // `starts_with` containment test — canonicalization resolves
+        // symlinks, so escape-via-symlink is caught too. Future DSSE
+        // verification slots in after this resolution.
         let env_dir = self.env_root.join(env_id);
-        let sig_path = env_dir.join(&revision.signature_sidecar_ref);
-        if !sig_path.is_file() {
-            failed_checks.push(HealthCheckId::SignatureStatus);
-            messages.push(format!(
-                "signature_sidecar_ref `{}` does not exist or is not a regular file",
-                sig_path.display()
-            ));
+        match greentic_deployer::path_safety::normalize_under_root(
+            &env_dir,
+            &revision.signature_sidecar_ref,
+        ) {
+            // `normalize_under_root` returns Ok only when the path
+            // canonicalizes (i.e. exists) and stays under `env_dir`; the
+            // residual `is_file` guard rejects a contained directory.
+            Ok(sig_path) if sig_path.is_file() => {}
+            Ok(sig_path) => {
+                failed_checks.push(HealthCheckId::SignatureStatus);
+                messages.push(format!(
+                    "signature_sidecar_ref resolves to `{}`, which is not a regular file",
+                    sig_path.display()
+                ));
+            }
+            Err(e) => {
+                failed_checks.push(HealthCheckId::SignatureStatus);
+                messages.push(format!(
+                    "signature_sidecar_ref `{}` is not a contained, existing sidecar: {e:#}",
+                    revision.signature_sidecar_ref.display()
+                ));
+            }
         }
 
         // 3. Route table — Phase-D stub.
@@ -312,6 +335,93 @@ mod tests {
         assert!(err.message.contains("signature_sidecar_ref"));
         // Joiner is "; " so the message reads as two clauses.
         assert!(err.message.contains("; "));
+    }
+
+    /// Codex adversarial finding (high): an ABSOLUTE `signature_sidecar_ref`
+    /// must not satisfy the check — `join` would otherwise discard `env_dir`
+    /// and resolve the absolute path directly, accepting any existing file
+    /// outside the store.
+    #[test]
+    fn start_fails_signature_status_on_absolute_sidecar_ref() {
+        let (_tmp, env_root, mut revision) = seed_env(true);
+        // Point at a real, existing absolute file outside the env dir.
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        assert!(outside.path().is_absolute());
+        revision.signature_sidecar_ref = outside.path().to_path_buf();
+        let env = make_env();
+        let gate = StartRevisionHealthGate::new(env_root);
+        let err = gate.check(&env, &revision).unwrap_err();
+        assert!(
+            err.failed_checks.contains(&HealthCheckId::SignatureStatus),
+            "expected SignatureStatus failure, got {:?}",
+            err.failed_checks
+        );
+    }
+
+    /// Codex adversarial finding (high): a `..` parent-traversal
+    /// `signature_sidecar_ref` must not satisfy the check even though the
+    /// target file exists — it lives outside the environment directory.
+    #[test]
+    fn start_fails_signature_status_on_parent_traversal_sidecar_ref() {
+        let (_tmp, env_root, mut revision) = seed_env(true);
+        // A real file in env_root (the PARENT of env_dir = env_root/local),
+        // reachable from env_dir only via `..`.
+        std::fs::write(env_root.join("outside.sig"), b"escaped").unwrap();
+        revision.signature_sidecar_ref = PathBuf::from("../outside.sig");
+        let env = make_env();
+        let gate = StartRevisionHealthGate::new(env_root);
+        let err = gate.check(&env, &revision).unwrap_err();
+        assert!(
+            err.failed_checks.contains(&HealthCheckId::SignatureStatus),
+            "expected SignatureStatus failure, got {:?}",
+            err.failed_checks
+        );
+    }
+
+    /// Codex adversarial finding (high): a SYMLINK inside the env dir that
+    /// points OUTSIDE the env root must not satisfy the check.
+    /// `normalize_under_root` canonicalizes (resolving the symlink) before
+    /// the containment test, so the escape is caught.
+    #[cfg(unix)]
+    #[test]
+    fn start_fails_signature_status_on_symlink_escape() {
+        let (_tmp, env_root, mut revision) = seed_env(false);
+        // Real sidecar-shaped file in a directory outside the env root.
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("real.sig");
+        std::fs::write(&outside_file, b"escaped").unwrap();
+        // Symlink inside env_dir pointing at the outside file.
+        let env_dir = env_root.join(ENV_ID);
+        std::os::unix::fs::symlink(&outside_file, env_dir.join("rev.sig")).unwrap();
+        revision.signature_sidecar_ref = PathBuf::from("rev.sig");
+        let env = make_env();
+        let gate = StartRevisionHealthGate::new(env_root);
+        let err = gate.check(&env, &revision).unwrap_err();
+        assert!(
+            err.failed_checks.contains(&HealthCheckId::SignatureStatus),
+            "expected SignatureStatus failure, got {:?}",
+            err.failed_checks
+        );
+    }
+
+    /// Containment is about ESCAPE, not symlinks per se: a symlink that
+    /// stays INSIDE the env dir resolves cleanly and still passes. Guards
+    /// against an over-broad fix that rejects all symlinks.
+    #[cfg(unix)]
+    #[test]
+    fn start_passes_on_contained_symlink_sidecar() {
+        let (_tmp, env_root, mut revision) = seed_env(false);
+        let env_dir = env_root.join(ENV_ID);
+        // Real file inside the env dir + a symlink (also inside) to it.
+        std::fs::write(env_dir.join("actual.sig"), b"ok").unwrap();
+        std::os::unix::fs::symlink(env_dir.join("actual.sig"), env_dir.join("rev.sig")).unwrap();
+        revision.signature_sidecar_ref = PathBuf::from("rev.sig");
+        let env = make_env();
+        let gate = StartRevisionHealthGate::new(env_root);
+        assert!(
+            gate.check(&env, &revision).is_ok(),
+            "a symlink contained within the env dir should pass"
+        );
     }
 
     #[test]
