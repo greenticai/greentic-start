@@ -17,7 +17,7 @@ use zip::ZipArchive;
 use crate::operator_log;
 use crate::runner_exec::{self, RunRequest};
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
-use crate::secret_requirements::load_secret_keys_from_pack;
+use crate::secret_requirements::{answer_key_is_secret, secret_answer_keys_for_pack};
 
 #[derive(Clone, Debug)]
 pub struct AppPackInfo {
@@ -301,19 +301,13 @@ fn inject_pack_setup_answers(
     ctx: &OperatorContext,
     metadata: &mut BTreeMap<String, String>,
 ) {
-    let secret_keys: BTreeSet<String> = match load_secret_keys_from_pack(pack_path) {
-        Ok(keys) => keys.into_iter().collect(),
-        Err(err) => {
-            operator_log::debug(
-                module_path!(),
-                format!(
-                    "[messaging_app] failed to load secret requirements for pack_id={pack_id}: \
-                     {err}, treating pack as having no secret keys"
-                ),
-            );
-            BTreeSet::new()
-        }
-    };
+    // Derive the secret-marked key set from the SAME source the producer
+    // redacts from (greentic-setup `pack_to_form_spec`: form `secret:true`
+    // questions + secret-requirements, canonicalized). Using the narrower
+    // `load_secret_keys_from_pack` here would miss form-declared-only and
+    // optional secrets, which the producer strips from disk but the reader
+    // would then never fetch from SecretsManager.
+    let secret_keys = secret_answer_keys_for_pack(pack_path, pack_id);
 
     let mut injected: Vec<String> = Vec::new();
 
@@ -330,9 +324,10 @@ fn inject_pack_setup_answers(
                 continue;
             }
             // Skip secret-marked keys — they come from SecretsManager below.
-            // Defense in depth: even if the producer regresses and ships
-            // plaintext, the runtime never picks it up.
-            if secret_keys.contains(&key.to_lowercase()) {
+            // Defense in depth: even if a stale bundle still ships plaintext,
+            // the runtime never picks it up. Canonical + forward-suffix match
+            // mirrors the producer's redaction.
+            if answer_key_is_secret(key, &secret_keys) {
                 continue;
             }
             let coerced = match value {
