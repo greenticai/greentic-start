@@ -7,7 +7,6 @@ use greentic_types::ChannelMessageEnvelope;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::fs;
 use std::path::Path;
-use std::sync::Once;
 
 use crate::domains::Domain;
 use crate::ingress_types::{
@@ -18,7 +17,8 @@ use crate::operator_log;
 use crate::post_ingress_hooks::apply_post_ingress_hooks_dispatch;
 use crate::provider_config_envelope::read_provider_config_envelope;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
-use crate::secret_requirements::load_secret_keys_from_pack;
+use crate::secret_requirements::{answer_key_is_secret, secret_answer_keys_for_pack};
+use std::collections::BTreeSet;
 
 pub fn dispatch_http_ingress(
     runner_host: &DemoRunnerHost,
@@ -129,35 +129,27 @@ pub(crate) fn build_injected_config(
 
     let mut config_map = serde_json::Map::new();
 
+    // Secret-marked keys, derived from the SAME source the producer redacts
+    // from (form `secret:true` + secret-requirements). Computed up front so
+    // the config-value injection below can SKIP them: after B12a the envelope
+    // carries `secrets://` URI references for secret keys, and a stale bundle
+    // may still carry plaintext in setup-answers.json. Either way we must NOT
+    // base64-encode that into `<key>_b64` — the contains_key guard on the
+    // fetch loop would then skip the real `get_secret` and hand the component
+    // a base64'd URI (or stale plaintext) instead of the resolved secret.
+    let secret_keys = secret_answer_keys_for_pack(pack_path, provider);
+
     // Prefer already-materialized runtime config over live secret-store reads.
     // This keeps hot ingress paths off the dev-store for cloud targets like AWS.
     if let Some(envelope_config) =
         load_provider_config_from_envelope(runner_host.bundle_root(), provider)
     {
-        inject_config_values(&mut config_map, &envelope_config);
+        inject_config_values(&mut config_map, &envelope_config, &secret_keys);
     }
     if let Some(setup_answers) = load_provider_setup_answers(runner_host.bundle_root(), provider) {
-        inject_config_values(&mut config_map, &setup_answers);
+        inject_config_values(&mut config_map, &setup_answers, &secret_keys);
     }
     inject_runtime_env_config(&mut config_map, provider);
-
-    // Load secret requirements from the pack
-    let secret_keys = match load_secret_keys_from_pack(pack_path) {
-        Ok(keys) => keys,
-        Err(err) => {
-            operator_log::debug(
-                module_path!(),
-                format!(
-                    "failed to load secret requirements for {provider}: {err}, skipping injection"
-                ),
-            );
-            return if config_map.is_empty() {
-                None
-            } else {
-                Some(JsonValue::Object(config_map))
-            };
-        }
-    };
 
     for key in &secret_keys {
         let key_b64 = format!("{key}_b64");
@@ -247,34 +239,37 @@ fn load_provider_config_from_envelope(bundle_root: &Path, provider: &str) -> Opt
         .map(|envelope| envelope.config)
 }
 
-/// DEPRECATED (Phase B / B12a): reads from the transitional `setup-answers.json`
-/// sink. Migration target is `pack-config.v1` + the env's secrets backend.
+/// After B12a, `setup-answers.json` carries **non-secret** provider config only.
+/// Secret material is fetched from `SecretsManager` in `build_injected_config`
+/// via `runner_host.get_secret`. The file remains a transitional sink for
+/// non-secret runtime config until `pack-config.v1` ships.
 fn load_provider_setup_answers(bundle_root: &Path, provider: &str) -> Option<JsonValue> {
-    static WARN: Once = Once::new();
     let path = bundle_root
         .join("state")
         .join("config")
         .join(provider)
         .join("setup-answers.json");
     let bytes = fs::read(&path).ok()?;
-    WARN.call_once(|| {
-        tracing::warn!(
-            target: "greentic_start::deprecated",
-            path = %path.display(),
-            "reading state/config/<provider>/setup-answers.json via load_provider_setup_answers — \
-             deprecated sink, migrate to pack-config.v1 (Phase B / B12a)"
-        );
-    });
     serde_json::from_slice(&bytes).ok()
 }
 
-fn inject_config_values(config_map: &mut JsonMap<String, JsonValue>, value: &JsonValue) {
+fn inject_config_values(
+    config_map: &mut JsonMap<String, JsonValue>,
+    value: &JsonValue,
+    secret_keys: &BTreeSet<String>,
+) {
     let Some(obj) = value.as_object() else {
         return;
     };
 
     for (key, value) in obj {
         if value.is_null() {
+            continue;
+        }
+        // Secret-marked keys are populated from SecretsManager by the fetch
+        // loop in build_injected_config — never from the envelope/setup-answers
+        // value (which is a `secrets://` URI ref or stale plaintext).
+        if answer_key_is_secret(key, secret_keys) {
             continue;
         }
         let encoded = match value {
@@ -569,6 +564,59 @@ mod tests {
             },
             "payload": {"id": "1"}
         })
+    }
+
+    // xhigh review C2 regression. After B12a the config envelope carries
+    // `secrets://` URI refs for secret-marked keys. inject_config_values must
+    // NOT base64-encode those into `<key>_b64` — otherwise the contains_key
+    // guard in build_injected_config skips the real get_secret and the
+    // component receives base64("secrets://…") instead of the credential.
+    #[test]
+    fn inject_config_values_skips_secret_marked_keys() {
+        use base64::engine::general_purpose::STANDARD;
+
+        let mut secret_keys = BTreeSet::new();
+        secret_keys.insert("api_key".to_string());
+
+        let envelope = json!({
+            "model": "gpt-4o-mini",
+            "api_key": "secrets://dev/demo/_/openai-llm/api_key"
+        });
+
+        let mut config_map = JsonMap::new();
+        inject_config_values(&mut config_map, &envelope, &secret_keys);
+
+        // Non-secret key is injected (base64'd).
+        assert_eq!(
+            config_map.get("model_b64").and_then(|v| v.as_str()),
+            Some(STANDARD.encode("gpt-4o-mini").as_str()),
+        );
+        // Secret key is NOT injected from the envelope — the fetch loop
+        // populates api_key_b64 from SecretsManager instead.
+        assert!(
+            !config_map.contains_key("api_key_b64"),
+            "secret key must not be base64-injected from the envelope URI ref: {config_map:?}",
+        );
+        // And the raw URI never reaches the config map under any key.
+        let dump = serde_json::to_string(&config_map).unwrap();
+        assert!(
+            !dump.contains("secrets://"),
+            "URI ref leaked into config: {dump}"
+        );
+    }
+
+    #[test]
+    fn inject_config_values_skips_aliased_secret_keys() {
+        // Forward-suffix alias: requirement webex_bot_token, answer bot_token.
+        let mut secret_keys = BTreeSet::new();
+        secret_keys.insert("webex_bot_token".to_string());
+        let envelope = json!({"bot_token": "secrets://dev/demo/_/messaging-webex/bot_token"});
+        let mut config_map = JsonMap::new();
+        inject_config_values(&mut config_map, &envelope, &secret_keys);
+        assert!(
+            !config_map.contains_key("bot_token_b64"),
+            "aliased secret key must be skipped: {config_map:?}",
+        );
     }
 
     #[test]

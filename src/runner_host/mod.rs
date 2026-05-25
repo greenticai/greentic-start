@@ -13,7 +13,7 @@ pub use types::{FlowOutcome, OperatorContext, RunnerExecutionMode};
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Once, RwLock};
+use std::sync::{Arc, RwLock};
 
 use greentic_runner_host::storage::{DynStateStore, new_state_store};
 
@@ -94,10 +94,6 @@ impl DemoRunnerHost {
     ) -> anyhow::Result<Option<Vec<u8>>> {
         use crate::secrets_gate::canonical_secret_uri;
         use crate::secrets_setup::resolve_env;
-
-        if let Some(bytes) = load_setup_answer_secret(&self.bundle_root, provider, key) {
-            return Ok(Some(bytes));
-        }
 
         let env = resolve_env(None);
         let uri = canonical_secret_uri(&env, &ctx.tenant, ctx.team.as_deref(), provider, key);
@@ -442,37 +438,6 @@ impl DemoRunnerHost {
     }
 }
 
-// DEPRECATED (Phase B / B12a): reads non-secret config from the transitional
-// `setup-answers.json` sink. Kept alive until `pack-config.v1` ships and B12a
-// migrates secret material to the env's secrets backend. Once both land, this
-// helper should be deleted.
-static WARN_SETUP_ANSWERS_READ: Once = Once::new();
-
-fn load_setup_answer_secret(bundle_root: &Path, provider: &str, key: &str) -> Option<Vec<u8>> {
-    let path = bundle_root
-        .join("state")
-        .join("config")
-        .join(provider)
-        .join("setup-answers.json");
-    let bytes = std::fs::read(&path).ok()?;
-    WARN_SETUP_ANSWERS_READ.call_once(|| {
-        tracing::warn!(
-            target: "greentic_start::deprecated",
-            path = %path.display(),
-            "reading state/config/<provider>/setup-answers.json — deprecated sink, \
-             migrate to secrets backend (Phase B / B12a)"
-        );
-    });
-    let json = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
-    let value = json.get(key)?;
-    match value {
-        serde_json::Value::String(text) if !text.is_empty() => Some(text.as_bytes().to_vec()),
-        serde_json::Value::Bool(flag) => Some(flag.to_string().into_bytes()),
-        serde_json::Value::Number(number) => Some(number.to_string().into_bytes()),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,8 +510,15 @@ mod tests {
     }
 
     #[test]
-    fn get_secret_prefers_setup_answers_when_present() {
+    fn get_secret_reads_from_secrets_manager() {
+        use crate::secrets_gate::canonical_secret_uri;
+        use crate::secrets_setup::resolve_env;
+        use greentic_secrets_lib::{DevStore, SecretFormat, SecretsStore};
+        use tokio::runtime::Runtime;
+
         let dir = tempdir().unwrap();
+        // A stale plaintext value at the legacy sink MUST be ignored — B12a
+        // closed that reader path.
         let config_dir = dir
             .path()
             .join("state")
@@ -555,15 +527,40 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
             config_dir.join("setup-answers.json"),
-            r#"{"jwt_signing_key":"from-setup-answers"}"#,
+            r#"{"jwt_signing_key":"STALE-PLAINTEXT-MUST-NOT-LEAK"}"#,
         )
         .unwrap();
 
         let discovery = discovery::discover(dir.path()).unwrap();
         let secrets_handle =
             secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
-        let host =
-            DemoRunnerHost::new(dir.keep(), &discovery, None, secrets_handle, false).unwrap();
+        let dev_store_path = secrets_handle
+            .dev_store_path
+            .clone()
+            .expect("dev store path");
+        let host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )
+        .unwrap();
+
+        let env = resolve_env(None);
+        let uri = canonical_secret_uri(
+            &env,
+            "demo",
+            Some("default"),
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
+        let store = DevStore::with_path(dev_store_path).unwrap();
+        let runtime = Runtime::new().unwrap();
+        runtime
+            .block_on(store.put(&uri, SecretFormat::Text, b"from-secrets-manager"))
+            .unwrap();
+
         let ctx = OperatorContext {
             tenant: "demo".to_string(),
             team: Some("default".to_string()),
@@ -573,7 +570,7 @@ mod tests {
         let value = host
             .get_secret("messaging-webchat-gui", "jwt_signing_key", &ctx)
             .unwrap();
-        assert_eq!(value, Some(b"from-setup-answers".to_vec()));
+        assert_eq!(value, Some(b"from-secrets-manager".to_vec()));
     }
 
     #[test]
