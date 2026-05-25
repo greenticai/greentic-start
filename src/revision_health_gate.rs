@@ -143,9 +143,33 @@ impl StartRevisionHealthGate {
     /// `trust-root.json` yields an empty `TrustRoot`, so verification fails
     /// closed because no signing key matches.
     fn verify_signature_status(&self, env_id: &str, revision: &Revision) -> Result<(), String> {
+        // Reject a degenerate/empty bundle digest before any I/O. An empty
+        // expected digest would match an envelope whose subject pins an empty
+        // sha256, binding the signature to NO artifact. `verify_artifact_dsse`
+        // strips a `sha256:` prefix on both sides, so "", "sha256:" and
+        // "SHA256:" are all equivalently empty here; mirror that strip so the
+        // guard can't be sidestepped by the prefix.
+        let digest_hex = revision
+            .bundle_digest
+            .strip_prefix("sha256:")
+            .or_else(|| revision.bundle_digest.strip_prefix("SHA256:"))
+            .unwrap_or(revision.bundle_digest.as_str());
+        if digest_hex.is_empty() {
+            return Err(format!(
+                "revision bundle_digest `{}` carries no digest to verify the signature against",
+                revision.bundle_digest
+            ));
+        }
+
         let env_dir = crate::runtime_config::env_dir_in(&self.env_root, env_id).map_err(|e| {
             format!("environment id `{env_id}` is not a safe directory segment: {e:#}")
         })?;
+
+        // Establish trust before touching the artifact: load the env's
+        // closed-by-default trust root first, so a missing/malformed trust
+        // root fails the gate without reading the attacker-influenced sidecar.
+        let trust_root = greentic_deployer::environment::load_trust_root(&env_dir)
+            .map_err(|e| format!("trust root for env `{env_id}` could not be loaded: {e}"))?;
 
         let sig_path = greentic_deployer::path_safety::normalize_under_root(
             &env_dir,
@@ -203,9 +227,6 @@ impl StartRevisionHealthGate {
                 sig_path.display()
             ));
         }
-
-        let trust_root = greentic_deployer::environment::load_trust_root(&env_dir)
-            .map_err(|e| format!("trust root for env `{env_id}` could not be loaded: {e}"))?;
 
         greentic_distributor_client::signing::verify_artifact_dsse(
             &envelope_bytes,
@@ -704,16 +725,68 @@ mod tests {
     }
 
     /// A present-but-not-a-DSSE-envelope sidecar (the legacy placeholder)
-    /// must now fail: the existence-only check is gone.
+    /// must now fail: the existence-only check is gone. A trust root IS seeded
+    /// here so the sole failure reason is the unparseable content, not the
+    /// closed-by-default empty-trust-root path (covered separately above).
     #[test]
     fn start_fails_signature_status_when_sidecar_not_an_envelope() {
-        let (_tmp, env_root, revision) = seed_env(true); // writes b"placeholder"
+        let tmp = tempfile::tempdir().unwrap();
+        let env_dir = tmp.path().join(ENV_ID);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::write(env_dir.join("rev.sig"), b"placeholder").unwrap();
+        let (_priv_pem, pub_pem, key_id) = keypair(1);
+        greentic_deployer::environment::add_trusted_key(
+            &env_dir,
+            TrustedKey {
+                key_id,
+                public_key_pem: pub_pem,
+            },
+        )
+        .unwrap();
+        let revision = make_revision(PathBuf::from("rev.sig"));
+        let env = make_env();
+        let gate = StartRevisionHealthGate::new(tmp.path().to_path_buf());
+        let err = gate.check(&env, &revision).unwrap_err();
+        assert_eq!(err.failed_checks, vec![HealthCheckId::SignatureStatus]);
+        assert!(
+            err.message.contains("DSSE signature verification failed"),
+            "msg: {}",
+            err.message
+        );
+    }
+
+    /// A degenerate `bundle_digest` (empty, or just the `sha256:` prefix) must
+    /// be rejected before verification — otherwise a trusted signer could bind
+    /// an empty-subject envelope to a revision that pins no real digest.
+    #[test]
+    fn start_fails_signature_status_on_empty_bundle_digest() {
+        let (_tmp, env_root, mut revision) = seed_signed_env();
+        revision.bundle_digest = "sha256:".to_string();
         let env = make_env();
         let gate = StartRevisionHealthGate::new(env_root);
         let err = gate.check(&env, &revision).unwrap_err();
         assert_eq!(err.failed_checks, vec![HealthCheckId::SignatureStatus]);
         assert!(
-            err.message.contains("DSSE signature verification failed"),
+            err.message.contains("carries no digest"),
+            "msg: {}",
+            err.message
+        );
+    }
+
+    /// A `signature_sidecar_ref` that resolves (contained) to a DIRECTORY must
+    /// be rejected by the `is_file` guard, not stat'd-and-read as if a file.
+    #[test]
+    fn start_fails_signature_status_on_contained_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_dir = tmp.path().join(ENV_ID);
+        std::fs::create_dir_all(env_dir.join("rev.sig")).unwrap();
+        let revision = make_revision(PathBuf::from("rev.sig"));
+        let env = make_env();
+        let gate = StartRevisionHealthGate::new(tmp.path().to_path_buf());
+        let err = gate.check(&env, &revision).unwrap_err();
+        assert_eq!(err.failed_checks, vec![HealthCheckId::SignatureStatus]);
+        assert!(
+            err.message.contains("not a regular file"),
             "msg: {}",
             err.message
         );
