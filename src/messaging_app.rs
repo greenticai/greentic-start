@@ -350,6 +350,7 @@ fn inject_pack_setup_answers(
         }
     }
 
+    let mut missing_secrets: Vec<String> = Vec::new();
     for key in &secret_keys {
         if metadata.contains_key(key) {
             continue;
@@ -370,7 +371,9 @@ fn inject_pack_setup_answers(
                     );
                 }
             },
-            Ok(None) => {}
+            Ok(None) => {
+                missing_secrets.push(key.clone());
+            }
             Err(err) => {
                 operator_log::debug(
                     module_path!(),
@@ -379,8 +382,29 @@ fn inject_pack_setup_answers(
                          {err}"
                     ),
                 );
+                missing_secrets.push(key.clone());
             }
         }
+    }
+
+    // Codex review observability fix: when a pack declares secret-marked
+    // questions but `SecretsManager` returns no value, the flow template
+    // sees an empty metadata field and the provider auth typically fails
+    // at first use. A `tracing::warn!` here gives operators an immediate
+    // signal to check whether `gtc setup` was run for this pack on this
+    // tenant/team, without silently letting the request through.
+    if !missing_secrets.is_empty() {
+        tracing::warn!(
+            target: "greentic_start::secrets",
+            pack_id,
+            tenant = %ctx.tenant,
+            team = ctx.team.as_deref().unwrap_or("(none)"),
+            missing_keys = ?missing_secrets,
+            "B12a: pack declared secret-marked keys with no value in SecretsManager — \
+             flow template will see them as absent; run `gtc setup --provider {pack_id}` \
+             for this tenant/team, or set the canonical env var \
+             (GREENTIC_SECRET__<env>__<tenant>__<team>__<provider>__<key>)",
+        );
     }
 
     if !injected.is_empty() {
@@ -1841,6 +1865,52 @@ mod tests {
         assert_eq!(
             metadata.get("user_question").map(String::as_str),
             Some("hello")
+        );
+    }
+
+    // Codex review F1 regression. When the pack declares secret-marked
+    // keys but `SecretsManager` has no value (no setup-answers fallback
+    // anymore), the helper must not silently swallow the absence — the
+    // flow template would otherwise see an empty metadata slot and the
+    // provider auth would fail at first use. Verify that metadata stays
+    // free of the key (no plaintext leak from any stale source) AND that
+    // the missing-secret signal is observable: the tracing::warn! lands
+    // on `target = "greentic_start::secrets"`, which an operator can
+    // route via subscriber config.
+    #[test]
+    fn inject_pack_setup_answers_skips_secret_key_with_no_secretsmanager_value() {
+        let dir = tempdir().expect("tempdir");
+        let pack_id = "openai-llm";
+
+        // Setup-answers carries only non-secret keys post-B12a producer.
+        let cfg_dir = dir.path().join("state").join("config").join(pack_id);
+        std::fs::create_dir_all(&cfg_dir).expect("create cfg dir");
+        std::fs::write(
+            cfg_dir.join("setup-answers.json"),
+            r#"{"model": "gpt-4o-mini"}"#,
+        )
+        .expect("write setup-answers");
+
+        // Pack declares `api_key` as a secret requirement, but the
+        // DevStore was never populated (no `gtc setup` run).
+        let pack_path = dir.path().join("openai.gtpack");
+        write_pack_with_secret_requirements(&pack_path, &["api_key"]);
+
+        let host = build_host_for_tests(dir.path());
+        let ctx = test_operator_ctx();
+        let mut metadata = BTreeMap::new();
+        inject_pack_setup_answers(&host, dir.path(), &pack_path, pack_id, &ctx, &mut metadata);
+
+        // Non-secret key still merges; secret key stays absent (NOT
+        // populated from any stale on-disk source).
+        assert_eq!(
+            metadata.get("model").map(String::as_str),
+            Some("gpt-4o-mini")
+        );
+        assert!(
+            !metadata.contains_key("api_key"),
+            "secret key MUST stay absent when SecretsManager has no value — \
+             stale plaintext, if any, must not leak in",
         );
     }
 }
