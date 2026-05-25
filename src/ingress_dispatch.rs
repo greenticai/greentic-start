@@ -7,7 +7,6 @@ use greentic_types::ChannelMessageEnvelope;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::fs;
 use std::path::Path;
-use std::sync::Once;
 
 use crate::domains::Domain;
 use crate::ingress_types::{
@@ -247,24 +246,17 @@ fn load_provider_config_from_envelope(bundle_root: &Path, provider: &str) -> Opt
         .map(|envelope| envelope.config)
 }
 
-/// DEPRECATED (Phase B / B12a): reads from the transitional `setup-answers.json`
-/// sink. Migration target is `pack-config.v1` + the env's secrets backend.
+/// After B12a, `setup-answers.json` carries **non-secret** provider config only.
+/// Secret material is fetched from `SecretsManager` in `build_injected_config`
+/// via `runner_host.get_secret`. The file remains a transitional sink for
+/// non-secret runtime config until `pack-config.v1` ships.
 fn load_provider_setup_answers(bundle_root: &Path, provider: &str) -> Option<JsonValue> {
-    static WARN: Once = Once::new();
     let path = bundle_root
         .join("state")
         .join("config")
         .join(provider)
         .join("setup-answers.json");
     let bytes = fs::read(&path).ok()?;
-    WARN.call_once(|| {
-        tracing::warn!(
-            target: "greentic_start::deprecated",
-            path = %path.display(),
-            "reading state/config/<provider>/setup-answers.json via load_provider_setup_answers — \
-             deprecated sink, migrate to pack-config.v1 (Phase B / B12a)"
-        );
-    });
     serde_json::from_slice(&bytes).ok()
 }
 
