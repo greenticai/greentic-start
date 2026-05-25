@@ -35,10 +35,19 @@
 //! preserving Phase-A/B behavior for non-HTTP callers until Phase-D
 //! flips the operator handler to `warm_with_health_gate(..., gate)`.
 
+use std::io::Read;
 use std::path::PathBuf;
 
 use greentic_deploy_spec::{Environment, Revision};
 use greentic_deployer::environment::{HealthCheckId, HealthGateFailure};
+
+/// Upper bound on bytes read for a DSSE signature sidecar. A real
+/// single-signature in-toto/DSSE envelope is a few KB; this cap lets the gate
+/// fail fast on a malformed or hostile oversized sidecar *before* allocating,
+/// since `verify_signature_status` may run while the env transaction lock is
+/// held (`warm_with_health_gate`) — an unbounded read there would block that
+/// env's recovery operations.
+const MAX_SIDECAR_BYTES: u64 = 1 << 20; // 1 MiB
 
 /// A gate that decides whether a revision is ready to transition to
 /// `Ready` (or to be admitted to live traffic on apply-time gates).
@@ -152,19 +161,48 @@ impl StartRevisionHealthGate {
         // `normalize_under_root` returns Ok only when the path canonicalizes
         // (i.e. exists) and stays under `env_dir`; the residual `is_file`
         // guard rejects a contained directory.
-        if !sig_path.is_file() {
+        let meta = std::fs::metadata(&sig_path).map_err(|e| {
+            format!(
+                "signature sidecar `{}` could not be stat'd: {e}",
+                sig_path.display()
+            )
+        })?;
+        if !meta.is_file() {
             return Err(format!(
                 "signature_sidecar_ref resolves to `{}`, which is not a regular file",
                 sig_path.display()
             ));
         }
-
-        let envelope_bytes = std::fs::read(&sig_path).map_err(|e| {
-            format!(
-                "signature sidecar `{}` could not be read: {e}",
+        // Bounded read (Codex hardening): reject oversized sidecars on the
+        // cheap stat'd length, then read through a `take` cap so a file that
+        // grows after the stat (TOCTOU) still can't drive allocation past the
+        // limit. See `MAX_SIDECAR_BYTES`.
+        if meta.len() > MAX_SIDECAR_BYTES {
+            return Err(format!(
+                "signature sidecar `{}` is {} bytes, which exceeds the {MAX_SIDECAR_BYTES}-byte limit",
+                sig_path.display(),
+                meta.len()
+            ));
+        }
+        let mut envelope_bytes = Vec::with_capacity(meta.len() as usize);
+        std::fs::File::open(&sig_path)
+            .and_then(|f| {
+                f.take(MAX_SIDECAR_BYTES + 1)
+                    .read_to_end(&mut envelope_bytes)
+                    .map(|_| ())
+            })
+            .map_err(|e| {
+                format!(
+                    "signature sidecar `{}` could not be read: {e}",
+                    sig_path.display()
+                )
+            })?;
+        if envelope_bytes.len() as u64 > MAX_SIDECAR_BYTES {
+            return Err(format!(
+                "signature sidecar `{}` exceeds the {MAX_SIDECAR_BYTES}-byte limit",
                 sig_path.display()
-            )
-        })?;
+            ));
+        }
 
         let trust_root = greentic_deployer::environment::load_trust_root(&env_dir)
             .map_err(|e| format!("trust root for env `{env_id}` could not be loaded: {e}"))?;
@@ -676,6 +714,41 @@ mod tests {
         assert_eq!(err.failed_checks, vec![HealthCheckId::SignatureStatus]);
         assert!(
             err.message.contains("DSSE signature verification failed"),
+            "msg: {}",
+            err.message
+        );
+    }
+
+    /// Codex hardening: an oversized sidecar must be rejected on the size cap
+    /// before allocation/parse, even with a valid trust root present — the
+    /// gate may run while holding the env transaction lock.
+    #[test]
+    fn start_fails_signature_status_on_oversized_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_dir = tmp.path().join(ENV_ID);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        // Trust root present + a real key, so the ONLY failure is the size cap.
+        let (_priv_pem, pub_pem, key_id) = keypair(1);
+        std::fs::write(
+            env_dir.join("rev.sig"),
+            vec![b'x'; (MAX_SIDECAR_BYTES + 1) as usize],
+        )
+        .unwrap();
+        greentic_deployer::environment::add_trusted_key(
+            &env_dir,
+            TrustedKey {
+                key_id,
+                public_key_pem: pub_pem,
+            },
+        )
+        .unwrap();
+        let revision = make_revision(PathBuf::from("rev.sig"));
+        let env = make_env();
+        let gate = StartRevisionHealthGate::new(tmp.path().to_path_buf());
+        let err = gate.check(&env, &revision).unwrap_err();
+        assert_eq!(err.failed_checks, vec![HealthCheckId::SignatureStatus]);
+        assert!(
+            err.message.contains("exceeds the") && err.message.contains("limit"),
             "msg: {}",
             err.message
         );

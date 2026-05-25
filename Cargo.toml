@@ -71,19 +71,26 @@ features = [
     "derive",
 ]
 
+# Lower bound pinned to the first dev build exposing the `signing` module
+# (verify_artifact_dsse / TrustRoot); earlier 1.1.0-dev builds lack it.
 [dependencies.greentic-distributor-client]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-dev.26402898736, <1.2.0-0"
 default-features = false
 features = [
     "pack-fetch",
 ]
 
+# Lower bound pinned to the first dev build re-exporting `load_trust_root`
+# (per-env trust root + operator key, deployer #226).
 [dependencies.greentic-deployer]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-dev.26414195396, <1.2.0-0"
 default-features = false
 
+# Matches the deploy-spec the pinned deployer was built against; `Environment`
+# / `Revision` cross the deployer boundary, so resolution must not pick an
+# older deploy-spec.
 [dependencies.greentic-deploy-spec]
-version = ">=0.1, <0.2"
+version = ">=0.1.26414195396, <0.2"
 
 [dependencies.greentic-setup]
 version = ">=1.1.0-dev, <1.2.0-0"
