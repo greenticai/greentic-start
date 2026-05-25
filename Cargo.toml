@@ -158,3 +158,4 @@ features = [
 criterion = "0.8"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }

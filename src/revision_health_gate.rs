@@ -17,7 +17,7 @@
 //! ships the trait, the no-op default for tests, and a real
 //! [`StartRevisionHealthGate`] that exercises the checks whose producers
 //! land at or before B9 (runtime-config loader from B0; signature_sidecar
-//! _ref existence as a placeholder for Phase-C2 DSSE verification).
+//! _ref DSSE verification against the env trust root, Phase-C2).
 //!
 //! The remaining two checks — `RouteTable` and `ProviderHealth` — are
 //! Phase-D `Ok(())` stubs in [`StartRevisionHealthGate`]. The
@@ -77,9 +77,11 @@ impl RevisionHealthGate for NoopRevisionHealthGate {
 ///   config.json` exists, it must load and validate through the B0 loader
 ///   ([`crate::runtime_config::load_in`]). Absent runtime-config is OK
 ///   (the common case until Phase-D producers materialize the file).
-/// - [`HealthCheckId::SignatureStatus`] — `<env_root>/<env_id>/<revision.
-///   signature_sidecar_ref>` must exist on disk. Phase-C2 will replace
-///   this existence check with real DSSE verification.
+/// - [`HealthCheckId::SignatureStatus`] — the revision's
+///   `signature_sidecar_ref` must resolve (contained under the env dir) to a
+///   DSSE envelope that verifies against this env's closed-by-default trust
+///   root and whose in-toto subject pins `revision.bundle_digest`. See
+///   [`StartRevisionHealthGate::verify_signature_status`].
 /// - [`HealthCheckId::RouteTable`] — Phase-D stub (always Ok). The
 ///   static-route validator (B8) lives behind `pub(crate)` in
 ///   `greentic-operator`; lifting it across the crate boundary belongs
@@ -113,6 +115,69 @@ impl StartRevisionHealthGate {
             })?;
         Ok(Self { env_root })
     }
+
+    /// Verify the revision's DSSE signature sidecar (Phase-C2).
+    ///
+    /// Returns the rejection reason on any failure; `Ok(())` only when the
+    /// sidecar is a contained regular file holding a DSSE envelope that
+    /// verifies against this env's closed-by-default trust root and whose
+    /// in-toto subject pins `revision.bundle_digest`.
+    ///
+    /// The containment root is resolved through `env_dir_in` (NOT a raw
+    /// `self.env_root.join(env_id)`) so a `.`/`..` env id is rejected here
+    /// too — `validate_identifier` permits all-dot ids, which would
+    /// otherwise widen the root to the parent of `env_root` for this check
+    /// alone. `normalize_under_root` then rejects absolute refs and
+    /// canonicalizes (resolving symlinks) before a containment test, so an
+    /// absolute / `..` / symlink-escape ref cannot pull in a file outside the
+    /// store. The trust root is closed-by-default: a missing or empty
+    /// `trust-root.json` yields an empty `TrustRoot`, so verification fails
+    /// closed because no signing key matches.
+    fn verify_signature_status(&self, env_id: &str, revision: &Revision) -> Result<(), String> {
+        let env_dir = crate::runtime_config::env_dir_in(&self.env_root, env_id).map_err(|e| {
+            format!("environment id `{env_id}` is not a safe directory segment: {e:#}")
+        })?;
+
+        let sig_path = greentic_deployer::path_safety::normalize_under_root(
+            &env_dir,
+            &revision.signature_sidecar_ref,
+        )
+        .map_err(|e| {
+            format!(
+                "signature_sidecar_ref `{}` is not a contained, existing sidecar: {e:#}",
+                revision.signature_sidecar_ref.display()
+            )
+        })?;
+
+        // `normalize_under_root` returns Ok only when the path canonicalizes
+        // (i.e. exists) and stays under `env_dir`; the residual `is_file`
+        // guard rejects a contained directory.
+        if !sig_path.is_file() {
+            return Err(format!(
+                "signature_sidecar_ref resolves to `{}`, which is not a regular file",
+                sig_path.display()
+            ));
+        }
+
+        let envelope_bytes = std::fs::read(&sig_path).map_err(|e| {
+            format!(
+                "signature sidecar `{}` could not be read: {e}",
+                sig_path.display()
+            )
+        })?;
+
+        let trust_root = greentic_deployer::environment::load_trust_root(&env_dir)
+            .map_err(|e| format!("trust root for env `{env_id}` could not be loaded: {e}"))?;
+
+        greentic_distributor_client::signing::verify_artifact_dsse(
+            &envelope_bytes,
+            &revision.bundle_digest,
+            &trust_root,
+        )
+        .map_err(|e| format!("DSSE signature verification failed: {e}"))?;
+
+        Ok(())
+    }
 }
 
 impl RevisionHealthGate for StartRevisionHealthGate {
@@ -131,54 +196,15 @@ impl RevisionHealthGate for StartRevisionHealthGate {
             }
         }
 
-        // 2. Signature status (placeholder for Phase-C2 DSSE verify):
-        // `signature_sidecar_ref` is an env-relative path that MUST resolve
-        // to a regular file CONTAINED in the environment directory. The
-        // ref is a plain `PathBuf` copied verbatim from the stage payload
-        // (deploy-spec only schema-validates it), so an absolute ref, a
-        // `..` escape, or a symlink escape could otherwise satisfy this
-        // check with a file outside the store. `normalize_under_root`
-        // rejects absolute paths and canonicalizes both sides before a
-        // `starts_with` containment test — canonicalization resolves
-        // symlinks, so escape-via-symlink is caught too. Future DSSE
-        // verification slots in after this resolution.
-        //
-        // The containment root is resolved through `env_dir_in` (NOT a raw
-        // `self.env_root.join(env_id)`) so it shares the same `.`/`..`
-        // reject + charset validation the RuntimeConfig check gets via
-        // `load_in`. `validate_identifier` permits all-dot ids, so a `..`
-        // env id would otherwise widen the containment root to the parent
-        // of `env_root` for this check alone.
-        match crate::runtime_config::env_dir_in(&self.env_root, env_id) {
-            Ok(env_dir) => match greentic_deployer::path_safety::normalize_under_root(
-                &env_dir,
-                &revision.signature_sidecar_ref,
-            ) {
-                // `normalize_under_root` returns Ok only when the path
-                // canonicalizes (i.e. exists) and stays under `env_dir`;
-                // the residual `is_file` guard rejects a contained directory.
-                Ok(sig_path) if sig_path.is_file() => {}
-                Ok(sig_path) => {
-                    failed_checks.push(HealthCheckId::SignatureStatus);
-                    messages.push(format!(
-                        "signature_sidecar_ref resolves to `{}`, which is not a regular file",
-                        sig_path.display()
-                    ));
-                }
-                Err(e) => {
-                    failed_checks.push(HealthCheckId::SignatureStatus);
-                    messages.push(format!(
-                        "signature_sidecar_ref `{}` is not a contained, existing sidecar: {e:#}",
-                        revision.signature_sidecar_ref.display()
-                    ));
-                }
-            },
-            Err(e) => {
-                failed_checks.push(HealthCheckId::SignatureStatus);
-                messages.push(format!(
-                    "environment id `{env_id}` is not a safe directory segment: {e:#}"
-                ));
-            }
+        // 2. Signature status (Phase-C2 DSSE verification): the revision's
+        // `signature_sidecar_ref` must resolve (contained under the env dir)
+        // to a DSSE envelope that verifies against this env's
+        // closed-by-default trust root and pins `revision.bundle_digest`.
+        // See `verify_signature_status` for the path-containment + verify
+        // contract.
+        if let Err(msg) = self.verify_signature_status(env_id, revision) {
+            failed_checks.push(HealthCheckId::SignatureStatus);
+            messages.push(msg);
         }
 
         // 3. Route table — Phase-D stub.
@@ -203,9 +229,78 @@ mod tests {
         BundleId, DeploymentId, EnvId, EnvironmentHostConfig, PackId, PackListEntry, Revision,
         RevisionId, RevisionLifecycle, SchemaVersion, SemVer,
     };
+    use greentic_distributor_client::signing::{
+        InTotoStatement, SlsaProvenance, TrustedKey, key_id_for_public_key_pem, sign_statement,
+    };
+    use std::path::Path;
     use tempfile::TempDir;
 
     const ENV_ID: &str = "local";
+
+    /// Bare-hex sha256 the fixture revision's bundle is pinned to; signed
+    /// sidecars pin this same digest so a valid signature verifies.
+    const BUNDLE_DIGEST_HEX: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// Deterministic Ed25519 keypair from a seed byte:
+    /// `(pkcs8 private PEM, spki public PEM, key_id)`.
+    fn keypair(seed: u8) -> (String, String, String) {
+        use ed25519_dalek::SigningKey;
+        use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+        use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let vk = sk.verifying_key();
+        let priv_pem = sk.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+        let pub_pem = vk.to_public_key_pem(LineEnding::LF).unwrap();
+        let key_id = key_id_for_public_key_pem(&pub_pem).unwrap();
+        (priv_pem, pub_pem, key_id)
+    }
+
+    /// Serialized DSSE envelope signing a statement that pins `digest_hex`
+    /// (bare hex), signed by `priv_pem`/`key_id`.
+    fn envelope_bytes(digest_hex: &str, priv_pem: &str, key_id: &str) -> Vec<u8> {
+        let stmt = InTotoStatement::provenance(
+            "revision.bundle",
+            digest_hex,
+            SlsaProvenance {
+                builder_id: "greentic-start/test".into(),
+                build_type: "gtbundle".into(),
+                built_at: None,
+                tlog_entry_id: None,
+            },
+        );
+        let env = sign_statement(&stmt, priv_pem, key_id).unwrap();
+        serde_json::to_vec(&env).unwrap()
+    }
+
+    /// Writes a valid signed sidecar to `<env_dir>/<sig_name>` pinning the
+    /// fixture bundle digest, then seeds `trust-root.json` (via the deployer's
+    /// production writer) trusting the signer.
+    fn write_signed_sidecar_and_trust(env_dir: &Path, sig_name: &str) {
+        let (priv_pem, pub_pem, key_id) = keypair(1);
+        let bytes = envelope_bytes(BUNDLE_DIGEST_HEX, &priv_pem, &key_id);
+        std::fs::write(env_dir.join(sig_name), &bytes).unwrap();
+        greentic_deployer::environment::add_trusted_key(
+            env_dir,
+            TrustedKey {
+                key_id,
+                public_key_pem: pub_pem,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Seeds `<tmp>/local/` with a VALID signed sidecar at `rev.sig` plus a
+    /// trust root trusting the signer — the happy-path layout the gate accepts.
+    fn seed_signed_env() -> (TempDir, PathBuf, Revision) {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_dir = tmp.path().join(ENV_ID);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        write_signed_sidecar_and_trust(&env_dir, "rev.sig");
+        let revision = make_revision(PathBuf::from("rev.sig"));
+        let env_root = tmp.path().to_path_buf();
+        (tmp, env_root, revision)
+    }
 
     fn fixed_now() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 5, 22, 12, 0, 0).unwrap()
@@ -245,7 +340,7 @@ mod tests {
             deployment_id: DeploymentId::new(),
             sequence: 1,
             created_at: fixed_now(),
-            bundle_digest: "sha256:00".to_string(),
+            bundle_digest: format!("sha256:{BUNDLE_DIGEST_HEX}"),
             pack_list: vec![PackListEntry {
                 pack_id: PackId::new("greentic.test.pack"),
                 version: SemVer::new(1, 0, 0),
@@ -289,8 +384,8 @@ mod tests {
     }
 
     #[test]
-    fn start_passes_when_signature_present_and_no_runtime_config() {
-        let (_tmp, env_root, revision) = seed_env(true);
+    fn start_passes_when_signature_verifies_and_no_runtime_config() {
+        let (_tmp, env_root, revision) = seed_signed_env();
         let env = make_env();
         let gate = StartRevisionHealthGate::new(env_root);
         let result = gate.check(&env, &revision);
@@ -313,7 +408,8 @@ mod tests {
 
     #[test]
     fn start_fails_runtime_config_when_file_malformed() {
-        let (_tmp, env_root, revision) = seed_env(true);
+        // Signature must verify so only RuntimeConfig is left to fail.
+        let (_tmp, env_root, revision) = seed_signed_env();
         // Drop a malformed runtime-config.json into the env dir.
         let env_dir = env_root.join(ENV_ID);
         std::fs::write(
@@ -454,27 +550,29 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn start_passes_on_contained_symlink_sidecar() {
-        let (_tmp, env_root, mut revision) = seed_env(false);
-        let env_dir = env_root.join(ENV_ID);
-        // Real file inside the env dir + a symlink (also inside) to it.
-        std::fs::write(env_dir.join("actual.sig"), b"ok").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let env_dir = tmp.path().join(ENV_ID);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        // Real signed envelope inside the env dir + a symlink (also inside)
+        // to it; the symlink resolves cleanly and the envelope verifies.
+        write_signed_sidecar_and_trust(&env_dir, "actual.sig");
         std::os::unix::fs::symlink(env_dir.join("actual.sig"), env_dir.join("rev.sig")).unwrap();
-        revision.signature_sidecar_ref = PathBuf::from("rev.sig");
+        let revision = make_revision(PathBuf::from("rev.sig"));
         let env = make_env();
-        let gate = StartRevisionHealthGate::new(env_root);
+        let gate = StartRevisionHealthGate::new(tmp.path().to_path_buf());
         assert!(
             gate.check(&env, &revision).is_ok(),
-            "a symlink contained within the env dir should pass"
+            "a contained symlink to a valid envelope should pass"
         );
     }
 
     #[test]
-    fn start_passes_with_absent_runtime_config_and_present_signature() {
-        // The common case today: nothing materializes runtime-config.json
-        // until Phase-D producers land, but the revision's signature
-        // sidecar must exist. The gate must NOT flag a missing
-        // runtime-config as a failure.
-        let (_tmp, env_root, revision) = seed_env(true);
+    fn start_passes_with_absent_runtime_config_and_verifying_signature() {
+        // The common case once a producer signs revisions: nothing
+        // materializes runtime-config.json until Phase-D producers land, but
+        // the revision's signature must verify. The gate must NOT flag a
+        // missing runtime-config as a failure.
+        let (_tmp, env_root, revision) = seed_signed_env();
         // Confirm runtime-config.json is absent in our fixture.
         assert!(!env_root.join(ENV_ID).join("runtime-config.json").exists());
         let env = make_env();
@@ -482,12 +580,113 @@ mod tests {
         assert!(gate.check(&env, &revision).is_ok());
     }
 
+    /// Closed-by-default: a valid envelope present but NO `trust-root.json`
+    /// must fail — `load_trust_root` yields an empty `TrustRoot`, which
+    /// matches no signing key.
+    #[test]
+    fn start_fails_signature_status_when_trust_root_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_dir = tmp.path().join(ENV_ID);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        let (priv_pem, _pub_pem, key_id) = keypair(1);
+        let bytes = envelope_bytes(BUNDLE_DIGEST_HEX, &priv_pem, &key_id);
+        std::fs::write(env_dir.join("rev.sig"), &bytes).unwrap();
+        // Deliberately NO add_trusted_key → no trust-root.json.
+        let revision = make_revision(PathBuf::from("rev.sig"));
+        let env = make_env();
+        let gate = StartRevisionHealthGate::new(tmp.path().to_path_buf());
+        let err = gate.check(&env, &revision).unwrap_err();
+        assert_eq!(err.failed_checks, vec![HealthCheckId::SignatureStatus]);
+        assert!(
+            err.message.contains("DSSE signature verification failed"),
+            "msg: {}",
+            err.message
+        );
+    }
+
+    /// A signature from a key NOT in the trust root must fail closed.
+    #[test]
+    fn start_fails_signature_status_when_signed_by_untrusted_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_dir = tmp.path().join(ENV_ID);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        // Sign with key 2 but trust only key 1.
+        let (signer_priv, _signer_pub, signer_id) = keypair(2);
+        let (_trusted_priv, trusted_pub, trusted_id) = keypair(1);
+        let bytes = envelope_bytes(BUNDLE_DIGEST_HEX, &signer_priv, &signer_id);
+        std::fs::write(env_dir.join("rev.sig"), &bytes).unwrap();
+        greentic_deployer::environment::add_trusted_key(
+            &env_dir,
+            TrustedKey {
+                key_id: trusted_id,
+                public_key_pem: trusted_pub,
+            },
+        )
+        .unwrap();
+        let revision = make_revision(PathBuf::from("rev.sig"));
+        let env = make_env();
+        let gate = StartRevisionHealthGate::new(tmp.path().to_path_buf());
+        let err = gate.check(&env, &revision).unwrap_err();
+        assert!(
+            err.failed_checks.contains(&HealthCheckId::SignatureStatus),
+            "expected SignatureStatus failure, got {:?}",
+            err.failed_checks
+        );
+    }
+
+    /// An envelope whose subject pins a DIFFERENT digest than the revision's
+    /// `bundle_digest` must fail (subject-digest mismatch), even when signed
+    /// by a trusted key.
+    #[test]
+    fn start_fails_signature_status_on_digest_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_dir = tmp.path().join(ENV_ID);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        let (priv_pem, pub_pem, key_id) = keypair(1);
+        let other_digest = "2222222222222222222222222222222222222222222222222222222222222222";
+        let bytes = envelope_bytes(other_digest, &priv_pem, &key_id);
+        std::fs::write(env_dir.join("rev.sig"), &bytes).unwrap();
+        greentic_deployer::environment::add_trusted_key(
+            &env_dir,
+            TrustedKey {
+                key_id,
+                public_key_pem: pub_pem,
+            },
+        )
+        .unwrap();
+        let revision = make_revision(PathBuf::from("rev.sig"));
+        let env = make_env();
+        let gate = StartRevisionHealthGate::new(tmp.path().to_path_buf());
+        let err = gate.check(&env, &revision).unwrap_err();
+        assert!(
+            err.failed_checks.contains(&HealthCheckId::SignatureStatus),
+            "expected SignatureStatus failure, got {:?}",
+            err.failed_checks
+        );
+    }
+
+    /// A present-but-not-a-DSSE-envelope sidecar (the legacy placeholder)
+    /// must now fail: the existence-only check is gone.
+    #[test]
+    fn start_fails_signature_status_when_sidecar_not_an_envelope() {
+        let (_tmp, env_root, revision) = seed_env(true); // writes b"placeholder"
+        let env = make_env();
+        let gate = StartRevisionHealthGate::new(env_root);
+        let err = gate.check(&env, &revision).unwrap_err();
+        assert_eq!(err.failed_checks, vec![HealthCheckId::SignatureStatus]);
+        assert!(
+            err.message.contains("DSSE signature verification failed"),
+            "msg: {}",
+            err.message
+        );
+    }
+
     /// Trait-object usage: a Phase-D operator handler holds an `Arc<dyn
     /// RevisionHealthGate>` and dispatches via dynamic call. Verify both
     /// concrete impls work behind a trait object.
     #[test]
     fn dyn_trait_object_dispatch_works_for_both_impls() {
-        let (_tmp, env_root, revision) = seed_env(true);
+        let (_tmp, env_root, revision) = seed_signed_env();
         let env = make_env();
 
         let gates: Vec<std::sync::Arc<dyn RevisionHealthGate>> = vec![
@@ -506,7 +705,7 @@ mod tests {
     /// smoke test confirms the wiring shape Phase-D consumers will use.
     #[test]
     fn adapts_to_warm_with_health_gate_closure_shape() {
-        let (_tmp, env_root, revision) = seed_env(true);
+        let (_tmp, env_root, revision) = seed_signed_env();
         let env = make_env();
         let gate: std::sync::Arc<dyn RevisionHealthGate> =
             std::sync::Arc::new(StartRevisionHealthGate::new(env_root));
