@@ -2123,9 +2123,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deploy-spec"
-version = "0.1.26325018340"
+version = "0.1.26414195396"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4058dec275f62e40664852c2cf1843e66f921a138b55714be8efd4d1435eb2a0"
+checksum = "285d29cf3415d111d6aa956d403722ff148becc89b8923dc591ad8deaa049584"
 dependencies = [
  "chrono",
  "greentic-config-types",
@@ -2142,14 +2142,15 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.1.0-dev.26325018340"
+version = "1.1.0-dev.26414195396"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96f04be929035363905cde1d284cfde14c2db176435cc5d820e81d231556e6cc"
+checksum = "1e2a3c2436a1e24501bd768cd402c8080d4b99903b49fc09750f1de4d5444aa2"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
  "clap",
+ "ed25519-dalek",
  "fs4",
  "greentic-config",
  "greentic-config-types",
@@ -2161,8 +2162,10 @@ dependencies = [
  "hex",
  "indexmap 2.14.0",
  "jsonschema 0.46.5",
+ "libc",
  "once_cell",
- "reqwest 0.13.3",
+ "rand 0.9.4",
+ "reqwest 0.13.4",
  "rustix 1.1.4",
  "semver",
  "serde",
@@ -2178,25 +2181,29 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "url",
+ "zeroize",
  "zip",
 ]
 
 [[package]]
 name = "greentic-distributor-client"
-version = "1.1.0-dev.26324852725"
+version = "1.1.0-dev.26402898736"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d8dc8d54c47eaa9a200e87098794964ae730458ce97c6c298979bc99a897fd7"
+checksum = "c7fc3fda206850778beb638a046ddfe7efe9e222e252da09e271e2ac6d3060c9"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "clap",
  "dirs-next",
+ "ed25519-dalek",
  "greentic-config-types",
  "greentic-interfaces-guest",
  "greentic-secrets-lib",
  "greentic-types 1.1.0-dev.26386264344",
+ "hex",
  "oci-distribution",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rpassword",
  "semver",
  "serde",
@@ -2205,6 +2212,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2233,7 +2241,7 @@ dependencies = [
  "pathdiff",
  "qa-spec",
  "regex",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "semver",
  "serde",
  "serde_json",
@@ -2431,7 +2439,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "rand 0.10.1",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "runner-core",
  "serde",
  "serde_cbor",
@@ -2483,7 +2491,7 @@ dependencies = [
  "lru 0.17.0",
  "once_cell",
  "rand 0.10.1",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "ring",
  "serde",
  "serde_json",
@@ -2555,9 +2563,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-setup"
-version = "1.1.0-dev.26325028080"
+version = "1.1.0-dev.26399161269"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2f6975b55115d24e064eb5c6ec8c00efef02d7d38fdd13af154a9d6d0bd9499"
+checksum = "cb3c1acabcb27c8ea176c34ebe6ec221324de50ea1027792cc2c06a21e1d28bf"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
@@ -2602,6 +2610,7 @@ dependencies = [
  "clap",
  "criterion",
  "dashmap",
+ "ed25519-dalek",
  "flate2",
  "futures-util",
  "greentic-deploy-spec",
@@ -2675,9 +2684,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-telemetry"
-version = "0.5.2"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d48786a2dd1d8a6c7169b2ca83cbc528c78aaaf67bff7fa6e53caad46f12ba8"
+checksum = "6afcdc8584859dce6e44eb89914bc779936406bf30a89a0f6740dd353a9fe24d"
 dependencies = [
  "anyhow",
  "once_cell",
@@ -2727,7 +2736,7 @@ dependencies = [
  "ciborium",
  "constant_time_eq 0.4.2",
  "fnv",
- "greentic-telemetry 0.5.2",
+ "greentic-telemetry 0.5.4",
  "greentic-types-macros 0.5.2",
  "indexmap 2.14.0",
  "opentelemetry-otlp",
@@ -3504,7 +3513,7 @@ dependencies = [
  "referencing 0.45.1",
  "regex",
  "regex-syntax",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rustls 0.23.40",
  "serde",
  "serde_json",
@@ -3533,7 +3542,7 @@ dependencies = [
  "referencing 0.46.5",
  "regex",
  "regex-syntax",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rustls 0.23.40",
  "serde",
  "serde_json",
@@ -4963,9 +4972,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.3"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62e0021ea2c22aed41653bc7e1419abb2c97e038ff2c33d0e1309e49a97deec0"
+checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5051,7 +5060,7 @@ dependencies = [
  "ed25519-dalek",
  "greentic-config-types",
  "greentic-pack-lib",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "semver",
  "serde",
  "serde_json",
