@@ -50,6 +50,7 @@ mod revision_dispatcher;
 mod revision_drain;
 pub mod revision_health_gate;
 mod revision_pin;
+mod rollout_telemetry;
 mod runner_exec;
 mod runner_host;
 mod runner_integration;

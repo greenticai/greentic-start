@@ -107,6 +107,12 @@ features = [
     "providers-dev",
 ]
 
+[dependencies.greentic-telemetry]
+# Floor pinned to the first dev publish that exposes `RolloutEvent` +
+# `emit_rollout_event` (C5.1); lower versions in the same range satisfy
+# `>=1.1.0-dev` but lack the rollout module.
+version = ">=1.1.0-dev.26432434860, <1.2.0-0"
+
 [dependencies.greentic-types]
 version = ">=1.1.0-dev, <1.2.0-0"
 features = [

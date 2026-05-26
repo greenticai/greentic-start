@@ -270,8 +270,20 @@ impl RevisionHealthGate for StartRevisionHealthGate {
         // 4. Provider health — Phase-D stub.
 
         if failed_checks.is_empty() {
+            // C5.3: gate passed — emit before returning so the lifecycle
+            // event rides the same call.
+            crate::rollout_telemetry::emit_health_gate_transition(
+                greentic_telemetry::RolloutEvent::HealthGatePassed,
+                env,
+                revision,
+            );
             Ok(())
         } else {
+            crate::rollout_telemetry::emit_health_gate_transition(
+                greentic_telemetry::RolloutEvent::HealthGateFailed,
+                env,
+                revision,
+            );
             Err(HealthGateFailure {
                 failed_checks,
                 message: messages.join("; "),

@@ -46,6 +46,8 @@ use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
 use tracing::{info, warn};
 
 use crate::revision_dispatcher::RevisionDispatcher;
+use crate::rollout_telemetry::emit_drain_transition;
+use greentic_telemetry::RolloutEvent;
 
 /// Close handle for live WebSocket sessions bound to a `(deployment, revision)`.
 /// The default impl is a no-op so this seam can land without a registry.
@@ -155,7 +157,19 @@ impl RevisionDrainCoordinator {
         // 1. Stop new session pins. Existing pins / valid cookies /
         //    trusted-header overrides still route there for the window.
         let newly_marked = self.dispatcher.mark_draining(deployment_id, revision_id);
-        if !newly_marked {
+        if newly_marked {
+            // C5.3: emit only on the state-transitioning call; an idempotent
+            // re-run that finds the flag already set must not double-count
+            // the transition (mirrors the mark_draining contract).
+            emit_drain_transition(
+                RolloutEvent::RevisionDraining,
+                tenant,
+                self.dispatcher.env_id(),
+                deployment_id,
+                &bundle_id,
+                revision_id,
+            );
+        } else {
             info!(
                 deployment_id = %deployment_id,
                 revision_id = %revision_id,
@@ -180,6 +194,19 @@ impl RevisionDrainCoordinator {
         //    selection path (cookie, pin, weighted) skips it and the holder
         //    re-dispatches to a healthy revision with a fresh cookie.
         let evicted = self.dispatcher.evict_revision(deployment_id, revision_id);
+        if evicted {
+            // C5.3: emit only when the call actually removed the revision —
+            // an idempotent re-run on an already-evicted revision must not
+            // double-count the transition.
+            emit_drain_transition(
+                RolloutEvent::RevisionEvicted,
+                tenant,
+                self.dispatcher.env_id(),
+                deployment_id,
+                &bundle_id,
+                revision_id,
+            );
+        }
 
         // 4. Close remaining WebSockets via the trait seam. Ordered after
         //    eviction so a reconnecting client re-dispatches to a healthy
