@@ -2620,6 +2620,7 @@ dependencies = [
  "greentic-runner-host",
  "greentic-secrets-lib",
  "greentic-setup",
+ "greentic-telemetry 1.1.0-dev.26432434860",
  "greentic-types 1.1.0-dev.26386264344",
  "hmac 0.13.0",
  "http-body-util",
