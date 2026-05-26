@@ -1170,6 +1170,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2289,9 +2298,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "0.5.17"
+version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43d8ae80e52a47c384a897f1b6659fe113b214d060901b1e9a1ec4264cd6adde"
+checksum = "f852ae1e4a2910ff68eb28266761cfce79fdfa9cc673b83890201a658abb07ea"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -2310,9 +2319,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "0.5.17"
+version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cfd49e8788c191e7a58f3db875c4273844ae8ee2ec479357ee4f7054c991924"
+checksum = "37837fbeffa37134bd0983b34e4bf604e45a841ae43a405785123fd5c122266c"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2557,6 +2566,8 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite",
  "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
  "unic-langid",
  "ureq",
  "urlencoding",
@@ -5515,6 +5526,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "symlink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
+
+[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6003,6 +6020,19 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-appender"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
+dependencies = [
+ "crossbeam-channel",
+ "symlink",
+ "thiserror 2.0.18",
+ "time",
+ "tracing-subscriber",
 ]
 
 [[package]]

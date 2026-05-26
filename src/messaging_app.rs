@@ -252,11 +252,45 @@ pub fn run_app_flow(
     operator_log::info(
         module_path!(),
         format!(
-            "[messaging_app] run_app_flow completed run_dir={} target_node={}",
+            "[messaging_app] run_app_flow completed run_dir={} target_node={} status={:?} failures={}",
             output.run_dir.display(),
-            target_node.map(String::as_str).unwrap_or("<none>")
+            target_node.map(String::as_str).unwrap_or("<none>"),
+            output.result.status,
+            output.result.failures.len(),
         ),
     );
+
+    // Flow-failure short-circuit: when a node failed, the transcript.jsonl
+    // contains only the last *successful* node's output (since failed nodes
+    // never write a transcript entry). Reading transcript here would return
+    // a stale envelope from an earlier node (e.g. the menu card), causing
+    // the chat to "loop" instead of surfacing the error. Build a metadata-only
+    // value from result.failures so parse_envelopes routes through the
+    // flow_error categorization branch instead.
+    //
+    // Skip the synthetic `_runtime` failure that the desktop runner injects
+    // when a Waiting status (e.g. "awaiting user submit at node ...") is
+    // converted into an Err. That isn't a real failure: the flow rendered
+    // the welcome card and is paused for the next inbound activity. Reading
+    // transcript in that case correctly returns the welcome card.
+    let real_failure = output
+        .result
+        .failures
+        .iter()
+        .find(|(node_id, _)| node_id.as_str() != "_runtime");
+    if !matches!(output.result.status, greentic_runner_desktop::RunStatus::Success)
+        && let Some((failed_node_id, failure)) = real_failure
+    {
+        let error_value = json!({
+            "metadata": {
+                "error_kind": "flow_node_failed",
+                "error_message": failure.message,
+                "node_id": failed_node_id,
+            }
+        });
+        return parse_envelopes(&error_value, envelope);
+    }
+
     let value = collect_transcript_outputs_with_retry(
         &output.run_dir,
         target_node.map(|s| s.as_str()),
@@ -850,6 +884,65 @@ fn parse_envelopes(
         );
         return Ok(vec![reply]);
     }
+    // Last-resort: runner lifts node failures onto metadata.error_kind/error_message
+    // when ending a user-facing flow at the failure point. Reply text is a generic
+    // categorized message; raw fields preserved on metadata for logs and TierA cards.
+    if let Some(metadata) = value.get("metadata").and_then(JsonValue::as_object) {
+        let error_kind = metadata
+            .get("error_kind")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let error_message = metadata
+            .get("error_message")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let (Some(kind), Some(message)) = (error_kind, error_message) {
+            let categorization = categorize_flow_error(kind, message);
+            let mut reply = base_reply_envelope(ingress_envelope);
+            reply.text = Some(categorization.user_message.clone());
+            reply
+                .metadata
+                .insert("error_kind".to_string(), kind.to_string());
+            reply
+                .metadata
+                .insert("error_message".to_string(), message.to_string());
+            reply.metadata.insert(
+                "error_category".to_string(),
+                categorization.category.to_string(),
+            );
+            reply.metadata.insert(
+                "error_user_message".to_string(),
+                categorization.user_message.clone(),
+            );
+            reply
+                .metadata
+                .insert("error_fault".to_string(), categorization.fault.to_string());
+            if let Some(node_id) = metadata
+                .get("node_id")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                reply
+                    .metadata
+                    .insert("error_node_id".to_string(), node_id.to_string());
+            }
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[messaging_app] parse_envelopes path=flow_error kind={} category={} fault={} shape={}",
+                    kind,
+                    categorization.category,
+                    categorization.fault,
+                    summarize_output_shape(value)
+                ),
+            );
+            return Ok(vec![reply]);
+        }
+    }
+
     operator_log::warn(
         module_path!(),
         format!(
@@ -860,6 +953,122 @@ fn parse_envelopes(
     Err(anyhow::anyhow!(
         "app flow output did not produce envelope(s)"
     ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ErrorFault {
+    BundleProvider,
+    UpstreamService,
+    Greentic,
+}
+
+impl std::fmt::Display for ErrorFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            ErrorFault::BundleProvider => "bundle_provider",
+            ErrorFault::UpstreamService => "upstream_service",
+            ErrorFault::Greentic => "greentic",
+        };
+        f.write_str(label)
+    }
+}
+
+struct FlowErrorCategorization {
+    category: &'static str,
+    user_message: String,
+    fault: ErrorFault,
+}
+
+/// Map a raw `(error_kind, error_message)` from the engine onto a stable
+/// category and a generic, service-name-free user message. Pattern-matches on
+/// known shapes (MCP tool errors, HTTP status hints, timeout / auth keywords)
+/// and falls back to a generic message so the user never sees raw engine text.
+fn categorize_flow_error(error_kind: &str, error_message: &str) -> FlowErrorCategorization {
+    let lower = error_message.to_ascii_lowercase();
+    let status = extract_http_status(error_message);
+
+    let auth_signal = status == Some(401)
+        || status == Some(403)
+        || lower.contains("api key")
+        || lower.contains("apikey")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("authentication");
+    if auth_signal {
+        return FlowErrorCategorization {
+            category: "service_auth",
+            user_message: "There's an authentication problem with this service. Please contact your service provider so they can refresh the credentials.".to_string(),
+            fault: ErrorFault::BundleProvider,
+        };
+    }
+
+    let timeout_signal = lower.contains("timeout") || lower.contains("timed out");
+    if timeout_signal {
+        return FlowErrorCategorization {
+            category: "service_timeout",
+            user_message: "This service didn't respond in time. Please try again in a moment."
+                .to_string(),
+            fault: ErrorFault::UpstreamService,
+        };
+    }
+
+    if let Some(status) = status {
+        if (500..600).contains(&status) {
+            return FlowErrorCategorization {
+                category: "service_unavailable",
+                user_message: "This service is temporarily unavailable. Please try again in a few minutes.".to_string(),
+                fault: ErrorFault::UpstreamService,
+            };
+        }
+        if (400..500).contains(&status) {
+            return FlowErrorCategorization {
+                category: "service_bad_request",
+                user_message: "This service couldn't process the request. Please contact your service provider if this keeps happening.".to_string(),
+                fault: ErrorFault::BundleProvider,
+            };
+        }
+    }
+
+    if error_kind == "flow_execution_failed" {
+        return FlowErrorCategorization {
+            category: "flow_internal",
+            user_message: "Something went wrong while processing your request. Please try again.".to_string(),
+            fault: ErrorFault::Greentic,
+        };
+    }
+
+    FlowErrorCategorization {
+        category: "service_error",
+        user_message: "Something went wrong with this service. Please try again, and contact your service provider if it persists.".to_string(),
+        fault: ErrorFault::BundleProvider,
+    }
+}
+
+/// Extract the first 3-digit HTTP status code mentioned in the error message.
+/// Recognises both bare numbers (" 401 ", " status 500 ") and JSON shapes
+/// (`"status":401`). Returns None when no plausible status is found.
+fn extract_http_status(message: &str) -> Option<u16> {
+    let bytes = message.as_bytes();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        if bytes[i].is_ascii_digit()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+        {
+            let preceded_by_digit = i > 0 && bytes[i - 1].is_ascii_digit();
+            let followed_by_digit = i + 3 < bytes.len() && bytes[i + 3].is_ascii_digit();
+            if !preceded_by_digit && !followed_by_digit {
+                let n: u16 = (bytes[i] - b'0') as u16 * 100
+                    + (bytes[i + 1] - b'0') as u16 * 10
+                    + (bytes[i + 2] - b'0') as u16;
+                if (100..600).contains(&n) {
+                    return Some(n);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn base_reply_envelope(ingress_envelope: &ChannelMessageEnvelope) -> ChannelMessageEnvelope {
@@ -1464,6 +1673,141 @@ mod tests {
         let unknown = parse_envelopes(&json!({"payload": {"unknown": true}}), &ingress)
             .expect_err("unknown payload should fail");
         assert!(unknown.to_string().contains("did not produce envelope"));
+    }
+
+    #[test]
+    fn categorize_flow_error_detects_auth_signals() {
+        let cases = [
+            ("flow_node_failed", "component x failed: MCP_TOOL_ERROR: 401 API key required"),
+            ("flow_node_failed", "tool returned an error (status 403)"),
+            ("flow_node_failed", "Authentication denied"),
+            ("flow_node_failed", "apikey rejected"),
+        ];
+        for (kind, msg) in cases {
+            let cat = categorize_flow_error(kind, msg);
+            assert_eq!(cat.category, "service_auth", "msg={msg}");
+            assert_eq!(cat.fault, ErrorFault::BundleProvider, "msg={msg}");
+            assert!(
+                !cat.user_message.contains("MCP")
+                    && !cat.user_message.contains("401")
+                    && !cat.user_message.contains("API key"),
+                "user message must be generic: {}",
+                cat.user_message
+            );
+        }
+    }
+
+    #[test]
+    fn categorize_flow_error_detects_timeout() {
+        let cat = categorize_flow_error("flow_node_failed", "upstream request timed out");
+        assert_eq!(cat.category, "service_timeout");
+        assert_eq!(cat.fault, ErrorFault::UpstreamService);
+    }
+
+    #[test]
+    fn categorize_flow_error_detects_5xx_unavailable() {
+        let cat = categorize_flow_error(
+            "flow_node_failed",
+            "component x returned tool error: tool_error: upstream blew up (status 502)",
+        );
+        assert_eq!(cat.category, "service_unavailable");
+        assert_eq!(cat.fault, ErrorFault::UpstreamService);
+    }
+
+    #[test]
+    fn categorize_flow_error_detects_4xx_bad_request_non_auth() {
+        let cat = categorize_flow_error(
+            "flow_node_failed",
+            "component x returned tool error (status 422 unprocessable)",
+        );
+        assert_eq!(cat.category, "service_bad_request");
+        assert_eq!(cat.fault, ErrorFault::BundleProvider);
+    }
+
+    #[test]
+    fn categorize_flow_error_flow_execution_failed_maps_to_greentic() {
+        let cat = categorize_flow_error("flow_execution_failed", "panic in dispatch_node");
+        assert_eq!(cat.category, "flow_internal");
+        assert_eq!(cat.fault, ErrorFault::Greentic);
+    }
+
+    #[test]
+    fn categorize_flow_error_defaults_to_generic_bundle_provider() {
+        let cat = categorize_flow_error("flow_node_failed", "some unrecognized failure");
+        assert_eq!(cat.category, "service_error");
+        assert_eq!(cat.fault, ErrorFault::BundleProvider);
+    }
+
+    #[test]
+    fn extract_http_status_recognises_common_shapes() {
+        assert_eq!(extract_http_status("status 401 unauthorized"), Some(401));
+        assert_eq!(extract_http_status("(status 502)"), Some(502));
+        assert_eq!(extract_http_status("\"status\":401,"), Some(401));
+        assert_eq!(extract_http_status("HTTP 404 not found"), Some(404));
+        assert_eq!(extract_http_status("nothing here"), None);
+        assert_eq!(extract_http_status("1234"), None);
+        assert_eq!(extract_http_status("9999"), None);
+    }
+
+    #[test]
+    fn parse_envelopes_flow_error_branch_emits_generic_text_and_metadata() {
+        let ingress = envelope();
+        let output = json!({
+            "metadata": {
+                "error_kind": "flow_node_failed",
+                "error_message": "component weatherapi_current failed: MCP_TOOL_ERROR: 401 API key required",
+                "node_id": "call_weather",
+            }
+        });
+        let replies = parse_envelopes(&output, &ingress).expect("flow_error branch");
+        assert_eq!(replies.len(), 1);
+        let reply = &replies[0];
+        let text = reply.text.as_deref().expect("text fallback present");
+        assert!(
+            !text.contains("MCP")
+                && !text.contains("API key")
+                && !text.contains("weatherapi_current"),
+            "text must be generic: {text}"
+        );
+        assert_eq!(
+            reply.metadata.get("error_category").map(String::as_str),
+            Some("service_auth")
+        );
+        assert_eq!(
+            reply.metadata.get("error_fault").map(String::as_str),
+            Some("bundle_provider")
+        );
+        assert!(reply.metadata.get("error_user_message").is_some());
+        assert!(reply.metadata.get("error_message").is_some());
+        assert_eq!(
+            reply.metadata.get("error_node_id").map(String::as_str),
+            Some("call_weather")
+        );
+    }
+
+    #[test]
+    fn parse_envelopes_flow_error_branch_ignored_when_rendered_card_present() {
+        let ingress = envelope();
+        let output = json!({
+            "renderedCard": {
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [{"type": "TextBlock", "text": "hello"}]
+            },
+            "metadata": {
+                "error_kind": "flow_node_failed",
+                "error_message": "should not preempt rendered card",
+            }
+        });
+        let replies = parse_envelopes(&output, &ingress).expect("renderedCard branch");
+        assert_eq!(replies.len(), 1);
+        assert!(
+            replies[0]
+                .metadata
+                .get("error_category")
+                .is_none(),
+            "error_category must not be set when a card branch already produced the reply"
+        );
     }
 
     #[test]
