@@ -81,16 +81,17 @@ features = [
 ]
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
-# (per-env trust root + operator key, deployer #226).
+# (per-env trust root + operator key, deployer #226). Floor bumped to the PR-2
+# publish that emits `pack_list_refs` in the materialized runtime-config.
 [dependencies.greentic-deployer]
-version = ">=1.1.0-dev.26414195396, <1.2.0-0"
+version = ">=1.1.0-dev.26491802730, <1.2.0-0"
 default-features = false
 
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
 # / `Revision` cross the deployer boundary, so resolution must not pick an
-# older deploy-spec.
+# older deploy-spec. Floor bumped to the PR-2 publish that adds `PackListLock`.
 [dependencies.greentic-deploy-spec]
-version = ">=0.1.26414195396, <0.2"
+version = ">=0.1.26491802730, <0.2"
 
 [dependencies.greentic-setup]
 version = ">=1.1.0-dev, <1.2.0-0"
@@ -98,8 +99,10 @@ version = ">=1.1.0-dev, <1.2.0-0"
 [dependencies.greentic-runner-desktop]
 version = ">=1.1.0-dev, <1.2.0-0"
 
+# Floor bumped to the PR-1 publish that adds the revision pack-loading API
+# (`ActivePacks::{load,insert}_revision`, `RevisionPackRef`).
 [dependencies.greentic-runner-host]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-dev.26465681124, <1.2.0-0"
 
 [dependencies.greentic-secrets-lib]
 version = ">=1.1.0-dev, <1.2.0-0"

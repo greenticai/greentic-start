@@ -46,6 +46,7 @@ mod post_ingress_hooks;
 mod project;
 pub mod provider_config_envelope;
 mod qa_persist;
+mod revision_boot;
 mod revision_dispatcher;
 mod revision_drain;
 pub mod revision_health_gate;
@@ -273,28 +274,34 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
 
     bootstrap_local_environment()?;
 
-    // B0: when launched without a `--bundle` root (and no explicit demo config),
-    // boot from the operator-materialized `runtime-config.v1` for the active env,
-    // if one exists. Pack activation from the resolved revision refs lands in B2
-    // (`ActivePacks::load_revision`) and per-revision routing in B3, so for now we
-    // validate the materialized config and fail loud rather than silently ignoring
-    // it. No producer writes the file yet, so this path is dormant in practice.
+    // B0/B2: when launched without a `--bundle` root (and no explicit demo
+    // config), boot from the operator-materialized `runtime-config.v1` for the
+    // active env, if one exists. B0 loads + validates it; B2 (here) activates it
+    // — loading every revision's pinned packs into an embedded runner host and
+    // building the revision dispatcher. Serving traffic from the populated host
+    // (the ingress consumer) lands in B3, so for now we activate and fail loud
+    // rather than pretend to serve. No producer writes the file yet, so this
+    // path is dormant in practice.
     if request.bundle.is_none() && request.config.is_none() {
         let env_id = resolve_env(None);
         if let Some(rc) = runtime_config::load(&env_id)? {
-            let deployments: Vec<&str> = rc
-                .revisions
-                .iter()
-                .map(|r| r.deployment_id.as_str())
-                .collect();
+            let store_root = greentic_deployer::environment::LocalFsStore::default_root().context(
+                "cannot determine the default environment store root (no home directory)",
+            )?;
+            let activation_rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building runtime for revision activation")?;
+            let activation =
+                activation_rt.block_on(revision_boot::activate_runtime_config(&store_root, &rc))?;
             anyhow::bail!(
-                "runtime-config for env `{}` declares {} revision(s) across deployment(s) {:?}, \
-                 but booting from a materialized runtime-config is not yet runnable: pack \
-                 activation lands in Phase B / B2 (ActivePacks::load_revision) and per-revision \
-                 routing in B3. Pass `--bundle <path>` to boot a single bundle directory for now.",
+                "activated {} revision(s) for env `{}` across {} deployment(s) into the runner \
+                 host, but serving from a materialized runtime-config is not yet wired: the \
+                 ingress consumer lands in B3. Pass `--bundle <path>` to boot a single bundle \
+                 directory for now.",
+                activation.revision_count,
                 rc.env_id,
-                rc.revisions.len(),
-                deployments,
+                activation.dispatcher.deployment_count(),
             );
         }
     }
@@ -911,57 +918,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_start_errors_when_runtime_config_present_without_bundle() {
-        use greentic_deploy_spec::{
-            BundleId, DeploymentId, EnvId as SpecEnvId, RevisionId, RevisionRuntimeBlock,
-            RuntimeConfig, SchemaVersion,
-        };
-        let _env_guard = crate::test_env_lock()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        crate::operator_log::reset_for_tests();
-        let _vars = EnvVarsOverride::clean();
-        let temp = tempfile::tempdir().expect("tempdir");
-        let _home = HomeOverride::set(temp.path());
-
-        let env_dir = temp
-            .path()
-            .join(".greentic")
-            .join("environments")
-            .join("local");
-        std::fs::create_dir_all(env_dir.join("revisions/r1")).expect("revision dir");
-        std::fs::write(env_dir.join("revisions/r1/pack.lock"), "lock").expect("pack lock");
-        let cfg = RuntimeConfig {
-            schema: SchemaVersion::new(SchemaVersion::RUNTIME_CONFIG_V1),
-            env_id: SpecEnvId::new("local").unwrap(),
-            revisions: vec![RevisionRuntimeBlock {
-                deployment_id: DeploymentId::new(),
-                revision_id: RevisionId::new(),
-                bundle_id: BundleId::from("bundle1"),
-                pack_list_refs: vec!["revisions/r1/pack.lock".into()],
-                pack_config_refs: vec![],
-                weight_bps: 10_000,
-            }],
-        };
-        std::fs::write(
-            env_dir.join("runtime-config.json"),
-            serde_json::to_string(&cfg).expect("serialize runtime-config"),
-        )
-        .expect("write runtime-config");
-
-        let mut request = make_start_request(temp.path());
-        request.bundle = None;
-        request.config = None;
-        request.quiet = true;
-
-        let err = run_start_request(request).expect_err("runtime-config boot should error");
-        let message = err.to_string();
-        assert!(
-            message.contains("not yet runnable") && message.contains("B2"),
-            "unexpected error: {message}"
-        );
-    }
+    // The no-bundle runtime-config boot path (B0 load → B2 activation → fail
+    // loud until B3 serving) is covered by the fully-isolated
+    // `revision_boot::tests::activate_*` unit tests, which exercise
+    // `activate_runtime_config` directly against an explicit store root. A
+    // `run_start`-level test is deliberately omitted here: it must override
+    // `HOME`/env while activation runs, which reliably trips a pre-existing
+    // isolation gap in the lock-free `messaging_app` secrets tests (they read
+    // env-derived paths without `test_env_lock`).
 
     #[test]
     fn auto_enables_cloudflared_when_no_deployer_packs() {

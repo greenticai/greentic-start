@@ -1,0 +1,604 @@
+//! Phase B / B2 — activate a materialized `runtime-config.v1` into loaded
+//! revision runtimes.
+//!
+//! B0 ([`crate::runtime_config`]) loads + validates the materialized config and
+//! resolves every pack-list-lock ref to an existing file under the env dir.
+//! This module takes that validated [`LoadedRuntimeConfig`] and:
+//!
+//! 1. loads the env's [`Environment`] to resolve each revision's `deployment_id`
+//!    to the tenant (`route_binding.tenant_selector.tenant`) and `customer_id`
+//!    it was deployed under — the runtime-config itself carries no tenant;
+//! 2. builds an embedded [`RunnerHost`] with one [`HostConfig`] per distinct
+//!    tenant;
+//! 3. reads each revision's `pack-list.lock`, turns its pinned packs into
+//!    [`RevisionPackRef`]s (env-relative path + `sha256:<hex>` digest), and
+//!    loads + digest-verifies them via [`TenantRuntime::load_revision`], keying
+//!    each into the host's
+//!    [`ActivePacks`](greentic_runner_host::runtime::ActivePacks);
+//! 4. builds the [`RevisionDispatcher`] from the same config under a stable
+//!    per-env HMAC signing key.
+//!
+//! Serving traffic from the populated host + dispatcher (the ingress consumer,
+//! `resolve_deployment`) is the next step (B3); for now the caller activates and
+//! then fails loud that serving is not yet wired. The activation is therefore a
+//! self-contained, testable unit that B3 plugs into the ingress state.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, anyhow, bail};
+use greentic_deploy_spec::{BundleId, DeploymentId, Environment, PackListLock, RevisionId};
+use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
+use greentic_deployer::path_safety::normalize_under_root;
+use greentic_runner_host::runtime::{RevisionPackRef, TenantRuntime};
+use greentic_runner_host::{HostBuilder, HostConfig, RunnerHost, TenantBindings};
+use greentic_types::EnvId;
+use ulid::Ulid;
+
+use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
+use crate::runtime_config::{LoadedRuntimeConfig, env_dir_in};
+
+/// Filename of the per-env revision-dispatcher HMAC signing key, kept under the
+/// env directory so cookie/pin stickiness survives restarts. 32 raw bytes,
+/// mode `0600`.
+const SIGNING_KEY_FILE: &str = "revision-signing.key";
+
+/// The outcome of activating a runtime-config: a host with every active
+/// revision loaded into its `ActivePacks`, plus the dispatcher that routes
+/// across them. B2 hands this back to the caller; B3 will thread it into the
+/// ingress state instead of dropping it.
+pub(crate) struct RuntimeConfigActivation {
+    /// Embedded host holding the loaded revision runtimes. Consumed by the B3
+    /// ingress wiring; until then the caller activates and drops it.
+    #[allow(dead_code)]
+    pub(crate) host: RunnerHost,
+    pub(crate) dispatcher: RevisionDispatcher,
+    /// Number of revisions loaded into [`RunnerHost::active_packs`].
+    pub(crate) revision_count: usize,
+}
+
+/// Tenant + customer a deployment was deployed under, resolved from the
+/// `Environment`'s `BundleDeployment` so revision runtimes key under the same
+/// tenant the ingress will later resolve.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeploymentMeta {
+    tenant: String,
+    customer_id: Option<String>,
+}
+
+/// Activate `rc` under `store_root`: load every active revision's packs into a
+/// fresh [`RunnerHost`] and build the [`RevisionDispatcher`].
+///
+/// `store_root` is the environments root (`~/.greentic/environments` in
+/// production; a temp dir under test) — the env dir is `<store_root>/<env_id>`.
+pub(crate) async fn activate_runtime_config(
+    store_root: &Path,
+    rc: &LoadedRuntimeConfig,
+) -> anyhow::Result<RuntimeConfigActivation> {
+    let env_id = EnvId::new(&rc.env_id)
+        .with_context(|| format!("invalid environment id `{}`", rc.env_id))?;
+    let env_dir = env_dir_in(store_root, &rc.env_id)?;
+
+    let store = LocalFsStore::new(store_root);
+    let env = store.load(&env_id).with_context(|| {
+        format!(
+            "loading environment `{}` for revision activation",
+            rc.env_id
+        )
+    })?;
+    let deployments = deployment_index(&env);
+
+    // Resolve every revision's deployment up front: it both fails fast on an
+    // inconsistent runtime-config and yields the distinct tenant set the host
+    // must be configured for before `build()`.
+    let mut tenants: HashSet<&str> = HashSet::new();
+    for block in &rc.revisions {
+        let meta = deployments.get(block.deployment_id.as_str()).ok_or_else(|| {
+            anyhow!(
+                "runtime-config references deployment `{}` that is not present in environment `{}`",
+                block.deployment_id,
+                rc.env_id
+            )
+        })?;
+        tenants.insert(meta.tenant.as_str());
+    }
+
+    // One minimal HostConfig per tenant. Flow-type bindings (routing) are not
+    // needed to load + key packs into ActivePacks — they get enriched when the
+    // ingress consumer lands (B3). Secrets fall back to HostBuilder's default
+    // manager here; B3 will pass the env's resolved manager.
+    let mut builder = HostBuilder::new();
+    for tenant in &tenants {
+        builder = builder.with_config(HostConfig::from_gtbind(TenantBindings {
+            tenant: (*tenant).to_string(),
+            packs: Vec::new(),
+            env_passthrough: Vec::new(),
+        }));
+    }
+    let host = builder
+        .build()
+        .context("building embedded runner host for revision activation")?;
+
+    let configs = host.tenant_configs();
+    for block in &rc.revisions {
+        let meta = &deployments[block.deployment_id.as_str()];
+        let deployment_id = DeploymentId(parse_ulid(&block.deployment_id, "deployment_id")?);
+        let revision_id = RevisionId(parse_ulid(&block.revision_id, "revision_id")?);
+        let bundle_id = BundleId::new(&block.bundle_id);
+        let config = configs
+            .get(&meta.tenant)
+            .cloned()
+            .ok_or_else(|| anyhow!("no host config registered for tenant `{}`", meta.tenant))?;
+
+        let pack_refs = read_revision_pack_refs(&env_dir, &revision_id, &block.pack_list_refs)
+            .with_context(|| {
+                format!("reading pinned packs for revision `{}`", block.revision_id)
+            })?;
+
+        let runtime = TenantRuntime::load_revision(
+            &pack_refs,
+            config,
+            None,
+            host.wasi_policy(),
+            host.session_host(),
+            host.session_store(),
+            host.state_store(),
+            host.state_host(),
+            host.secrets_manager(),
+            deployment_id,
+            bundle_id.clone(),
+            revision_id,
+            meta.customer_id.clone(),
+        )
+        .await
+        .with_context(|| format!("loading revision `{}`", block.revision_id))?;
+
+        host.active_packs()
+            .insert_revision(&meta.tenant, deployment_id, bundle_id, revision_id, runtime)
+            .with_context(|| {
+                format!(
+                    "inserting revision `{}` into active packs",
+                    block.revision_id
+                )
+            })?;
+    }
+
+    let signing_key = load_or_create_signing_key(&env_dir)?;
+    let dispatcher = RevisionDispatcher::from_runtime_config(
+        RevisionDispatcherConfig::new(&rc.env_id, signing_key),
+        rc,
+    )
+    .context("building revision dispatcher")?;
+
+    Ok(RuntimeConfigActivation {
+        host,
+        dispatcher,
+        revision_count: rc.revisions.len(),
+    })
+}
+
+/// Index a deployment's tenant + customer by `deployment_id` string. The
+/// runtime-config blocks carry the deployment id; the tenant binding lives on
+/// the `Environment`'s `BundleDeployment.route_binding`.
+fn deployment_index(env: &Environment) -> HashMap<String, DeploymentMeta> {
+    env.bundles
+        .iter()
+        .map(|dep| {
+            (
+                dep.deployment_id.to_string(),
+                DeploymentMeta {
+                    tenant: dep.route_binding.tenant_selector.tenant.clone(),
+                    customer_id: Some(dep.customer_id.as_str().to_string()),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Read a revision's `pack-list.lock` file(s) and turn the pinned packs into
+/// [`RevisionPackRef`]s. Each `LockedPack.path` is env-relative; it is
+/// re-contained under `env_dir` (defence in depth — the lock is ours but its
+/// `path` field is still data) and confirmed to be a regular file.
+///
+/// `lock_paths` are the already-resolved absolute lock paths from B0. The lock's
+/// own `revision_id` must match `expected` so a misplaced or cross-revision lock
+/// is rejected rather than silently activated.
+fn read_revision_pack_refs(
+    env_dir: &Path,
+    expected: &RevisionId,
+    lock_paths: &[PathBuf],
+) -> anyhow::Result<Vec<RevisionPackRef>> {
+    let mut refs = Vec::new();
+    for lock_path in lock_paths {
+        let bytes = std::fs::read(lock_path)
+            .with_context(|| format!("reading pack-list.lock `{}`", lock_path.display()))?;
+        let lock: PackListLock = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing pack-list.lock `{}`", lock_path.display()))?;
+        if &lock.revision_id != expected {
+            bail!(
+                "pack-list.lock `{}` pins revision `{}` but is referenced by revision `{}`",
+                lock_path.display(),
+                lock.revision_id,
+                expected
+            );
+        }
+        for pack in lock.packs {
+            let abs = normalize_under_root(env_dir, &pack.path).with_context(|| {
+                format!(
+                    "resolving pinned pack `{}` from `{}`",
+                    pack.path.display(),
+                    lock_path.display()
+                )
+            })?;
+            if !abs.is_file() {
+                bail!(
+                    "pinned pack `{}` (from `{}`) is not a file",
+                    abs.display(),
+                    lock_path.display()
+                );
+            }
+            refs.push(RevisionPackRef {
+                path: abs,
+                digest: pack.digest,
+            });
+        }
+    }
+    if refs.is_empty() {
+        bail!("revision `{expected}` resolved to no pinned packs");
+    }
+    Ok(refs)
+}
+
+fn parse_ulid(s: &str, label: &str) -> anyhow::Result<Ulid> {
+    Ulid::from_string(s).with_context(|| format!("invalid {label} `{s}` (expected ULID)"))
+}
+
+/// Load the per-env revision-dispatcher signing key, creating it on first use.
+///
+/// The key is a stable 32 random bytes persisted at `<env_dir>/{SIGNING_KEY_FILE}`
+/// so cookie + pin stickiness survives a restart. A concurrent first boot is
+/// race-safe: the create uses `create_new`, and a lost race re-reads the
+/// winner's key.
+fn load_or_create_signing_key(env_dir: &Path) -> anyhow::Result<[u8; 32]> {
+    let path = env_dir.join(SIGNING_KEY_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => key_from_bytes(&bytes, &path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_signing_key(&path),
+        Err(e) => Err(anyhow::Error::new(e)
+            .context(format!("reading revision signing key `{}`", path.display()))),
+    }
+}
+
+fn create_signing_key(path: &Path) -> anyhow::Result<[u8; 32]> {
+    use rand::Rng;
+    let mut key = [0u8; 32];
+    rand::rng().fill_bytes(&mut key);
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(path) {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(&key)
+                .with_context(|| format!("writing revision signing key `{}`", path.display()))?;
+            let _ = file.sync_all();
+            Ok(key)
+        }
+        // Another boot created it between our read and create — use its key so
+        // both processes sign with the same secret.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("reading revision signing key `{}`", path.display()))?;
+            key_from_bytes(&bytes, path)
+        }
+        Err(e) => Err(anyhow::Error::new(e).context(format!(
+            "creating revision signing key `{}`",
+            path.display()
+        ))),
+    }
+}
+
+fn key_from_bytes(bytes: &[u8], path: &Path) -> anyhow::Result<[u8; 32]> {
+    bytes.try_into().map_err(|_| {
+        anyhow!(
+            "revision signing key `{}` is {} bytes, expected 32 (corrupt — delete to regenerate)",
+            path.display(),
+            bytes.len()
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use greentic_deploy_spec::{
+        BundleDeployment, BundleDeploymentStatus, CustomerId, EnvironmentHostConfig, LockedPack,
+        PackId, RouteBinding, SchemaVersion, TenantSelector,
+    };
+    use tempfile::tempdir;
+
+    const ENV_ID: &str = "local";
+
+    fn env_id() -> EnvId {
+        EnvId::try_from(ENV_ID).unwrap()
+    }
+
+    fn make_deployment(
+        deployment_id: DeploymentId,
+        tenant: &str,
+        customer: &str,
+    ) -> BundleDeployment {
+        BundleDeployment {
+            schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
+            deployment_id,
+            env_id: env_id(),
+            bundle_id: BundleId::new("fast2flow"),
+            customer_id: CustomerId::new(customer),
+            status: BundleDeploymentStatus::Active,
+            current_revisions: Vec::new(),
+            route_binding: RouteBinding {
+                hosts: Vec::new(),
+                path_prefixes: Vec::new(),
+                tenant_selector: TenantSelector {
+                    tenant: tenant.to_string(),
+                    team: "default".to_string(),
+                },
+            },
+            revenue_share: Vec::new(),
+            revenue_policy_ref: PathBuf::from("revenue.json"),
+            usage: None,
+            created_at: chrono::Utc::now(),
+            authorization_ref: PathBuf::from("auth.json"),
+        }
+    }
+
+    fn make_env(bundles: Vec<BundleDeployment>) -> Environment {
+        Environment {
+            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
+            environment_id: env_id(),
+            name: ENV_ID.to_string(),
+            host_config: EnvironmentHostConfig {
+                env_id: env_id(),
+                region: None,
+                tenant_org_id: None,
+            },
+            packs: Vec::new(),
+            credentials_ref: None,
+            bundles,
+            revisions: Vec::new(),
+            traffic_splits: Vec::new(),
+            revocation: Default::default(),
+            retention: Default::default(),
+            health: Default::default(),
+        }
+    }
+
+    fn write_lock(env_dir: &Path, rel: &str, lock: &PackListLock) -> PathBuf {
+        let abs = env_dir.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, serde_json::to_vec(lock).unwrap()).unwrap();
+        abs
+    }
+
+    #[test]
+    fn deployment_index_maps_id_to_tenant_and_customer() {
+        let dep = make_deployment(DeploymentId::new(), "acme", "cust-1");
+        let key = dep.deployment_id.to_string();
+        let env = make_env(vec![dep]);
+
+        let index = deployment_index(&env);
+        let meta = index.get(&key).expect("deployment present");
+        assert_eq!(meta.tenant, "acme");
+        assert_eq!(meta.customer_id.as_deref(), Some("cust-1"));
+    }
+
+    #[test]
+    fn read_pack_refs_resolves_paths_and_binds_digests() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let rev = RevisionId::new();
+
+        // A real on-disk "pack" file the lock points at (content unchecked here;
+        // digest verification happens in TenantRuntime::load_revision).
+        let pack_rel = "revisions/r/bundle/packs/alpha/dist/alpha.gtpack";
+        let pack_abs = env_dir.join(pack_rel);
+        std::fs::create_dir_all(pack_abs.parent().unwrap()).unwrap();
+        std::fs::write(&pack_abs, b"PK\x03\x04").unwrap();
+
+        let lock = PackListLock {
+            schema: SchemaVersion::new(SchemaVersion::PACK_LIST_LOCK_V1),
+            revision_id: rev,
+            packs: vec![LockedPack {
+                pack_id: PackId::new("alpha"),
+                path: PathBuf::from(pack_rel),
+                digest: "sha256:deadbeef".to_string(),
+            }],
+        };
+        let lock_path = write_lock(env_dir, "revisions/r/pack-list.lock", &lock);
+
+        let refs = read_revision_pack_refs(env_dir, &rev, &[lock_path]).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].path, pack_abs);
+        assert_eq!(refs[0].digest, "sha256:deadbeef");
+    }
+
+    #[test]
+    fn read_pack_refs_rejects_revision_id_mismatch() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let lock_rev = RevisionId::new();
+
+        // The revision-id guard fires before any pack path is resolved, so the
+        // referenced pack file need not exist.
+        let lock = PackListLock {
+            schema: SchemaVersion::new(SchemaVersion::PACK_LIST_LOCK_V1),
+            revision_id: lock_rev,
+            packs: vec![LockedPack {
+                pack_id: PackId::new("alpha"),
+                path: PathBuf::from("packs/alpha.gtpack"),
+                digest: "sha256:00".to_string(),
+            }],
+        };
+        let lock_path = write_lock(env_dir, "pack-list.lock", &lock);
+
+        // Reference it under a DIFFERENT revision id.
+        let other = RevisionId::new();
+        let err = read_revision_pack_refs(env_dir, &other, &[lock_path]).unwrap_err();
+        assert!(
+            err.to_string().contains("pins revision"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_pack_refs_rejects_pack_path_that_is_not_a_regular_file() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let rev = RevisionId::new();
+
+        // A path that resolves (so it passes containment) but is a directory,
+        // not a `.gtpack` file — must be rejected by the is_file guard.
+        std::fs::create_dir_all(env_dir.join("packs/ghost.gtpack")).unwrap();
+
+        let lock = PackListLock {
+            schema: SchemaVersion::new(SchemaVersion::PACK_LIST_LOCK_V1),
+            revision_id: rev,
+            packs: vec![LockedPack {
+                pack_id: PackId::new("ghost"),
+                path: PathBuf::from("packs/ghost.gtpack"),
+                digest: "sha256:00".to_string(),
+            }],
+        };
+        let lock_path = write_lock(env_dir, "pack-list.lock", &lock);
+
+        let err = read_revision_pack_refs(env_dir, &rev, &[lock_path]).unwrap_err();
+        assert!(err.to_string().contains("is not a file"), "got: {err}");
+    }
+
+    #[test]
+    fn read_pack_refs_rejects_path_escaping_env_dir() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path().join("env");
+        std::fs::create_dir_all(&env_dir).unwrap();
+        // A sibling file outside the env dir the lock tries to reach via `..`.
+        std::fs::write(dir.path().join("outside.gtpack"), b"PK").unwrap();
+        let rev = RevisionId::new();
+
+        let lock = PackListLock {
+            schema: SchemaVersion::new(SchemaVersion::PACK_LIST_LOCK_V1),
+            revision_id: rev,
+            packs: vec![LockedPack {
+                pack_id: PackId::new("escape"),
+                path: PathBuf::from("../outside.gtpack"),
+                digest: "sha256:00".to_string(),
+            }],
+        };
+        let lock_path = write_lock(&env_dir, "pack-list.lock", &lock);
+
+        assert!(read_revision_pack_refs(&env_dir, &rev, &[lock_path]).is_err());
+    }
+
+    #[test]
+    fn signing_key_is_stable_across_loads() {
+        let dir = tempdir().unwrap();
+        let first = load_or_create_signing_key(dir.path()).unwrap();
+        let second = load_or_create_signing_key(dir.path()).unwrap();
+        assert_eq!(first, second, "key must be stable across boots");
+        assert!(first.iter().any(|&b| b != 0), "key must not be all zeroes");
+    }
+
+    #[test]
+    fn signing_key_rejects_wrong_length() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(SIGNING_KEY_FILE), b"too short").unwrap();
+        let err = load_or_create_signing_key(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("expected 32"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signing_key_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        load_or_create_signing_key(dir.path()).unwrap();
+        let mode = std::fs::metadata(dir.path().join(SIGNING_KEY_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Seed `<store_root>/local/` and return the env dir.
+    fn seed_env_dir(store_root: &Path) -> PathBuf {
+        let env_dir = store_root.join(ENV_ID);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        env_dir
+    }
+
+    fn write_environment(env_dir: &Path, env: &Environment) {
+        std::fs::write(
+            env_dir.join("environment.json"),
+            serde_json::to_vec(env).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A runtime-config with a single revision under `deployment_id`.
+    fn single_revision_rc(deployment_id: &DeploymentId) -> LoadedRuntimeConfig {
+        LoadedRuntimeConfig {
+            env_id: ENV_ID.to_string(),
+            revisions: vec![crate::runtime_config::ResolvedRevisionBlock {
+                deployment_id: deployment_id.to_string(),
+                revision_id: RevisionId::new().to_string(),
+                bundle_id: "fast2flow".to_string(),
+                pack_list_refs: Vec::new(),
+                pack_config_refs: Vec::new(),
+                weight_bps: 10_000,
+            }],
+        }
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    #[test]
+    fn activate_errors_when_environment_is_missing() {
+        // Isolated: explicit store_root, no global env / HOME mutation.
+        let dir = tempdir().unwrap();
+        seed_env_dir(dir.path());
+        let rc = single_revision_rc(&DeploymentId::new());
+
+        let err = match block_on(activate_runtime_config(dir.path(), &rc)) {
+            Ok(_) => panic!("expected activation to fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("loading environment"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn activate_errors_when_deployment_not_in_environment() {
+        let dir = tempdir().unwrap();
+        let env_dir = seed_env_dir(dir.path());
+        // Environment has no bundles, so the revision's deployment is unknown.
+        write_environment(&env_dir, &make_env(Vec::new()));
+        let rc = single_revision_rc(&DeploymentId::new());
+
+        let err = match block_on(activate_runtime_config(dir.path(), &rc)) {
+            Ok(_) => panic!("expected activation to fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("not present in environment"),
+            "got: {err:#}"
+        );
+    }
+}
