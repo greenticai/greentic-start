@@ -19,9 +19,17 @@
 //! custom `http.request` activity routed to the pack's entry flow). Provider
 //! webhook parsing (Slack/Telegram signature-verified `ingest_http`), WebChat /
 //! DirectLine, WebSocket upgrades, and static-asset serving under revisions are
-//! deliberately out of scope and stay on the legacy ingress for now. The
-//! revision-scoped HTTP route table travels in the routing bundle for when that
-//! provider-parse work lands; the generic slice routes at the deployment level.
+//! deliberately out of scope and stay on the legacy ingress for now.
+//!
+//! Because provider parsing is deferred, the slice is **fail-closed** rather than
+//! a catch-all: a request whose `(path, method)` matches the selected revision's
+//! declared provider route is refused (`501`) instead of being run generically —
+//! that would skip the provider's signature/token verification. Only `POST`
+//! requests to non-provider paths run the entry flow; everything else is `404`
+//! (no deployment bound) / `405` (wrong method) / `501` (provider path). Caller-
+//! asserted identity (`x-greentic-user`/`-session`, body `user`/`session`) is
+//! honoured only from loopback peers, so a remote caller cannot impersonate a
+//! user/session or pin a chosen revision (see `caller_identity`).
 
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -44,6 +52,7 @@ use tokio::sync::oneshot;
 use greentic_runner_host::{Activity, RunnerHost};
 
 use crate::deployment_routes::RevisionIngressRouting;
+use crate::http_routes::{HttpRouteTable, RevisionScope};
 use crate::operator_log;
 use crate::revision_dispatcher::{DispatchRequest, SetCookieDirective, cookie_name};
 
@@ -136,11 +145,18 @@ impl RevisionServer {
                         tokio::select! {
                             _ = &mut shutdown => break,
                             accept = listener.accept() => match accept {
-                                Ok((stream, _peer)) => {
+                                Ok((stream, peer)) => {
                                     let connection_state = state.clone();
+                                    // Caller-asserted identity (see `serve`) is only
+                                    // honoured from loopback peers; capture it here.
+                                    let peer_is_loopback = peer.ip().is_loopback();
                                     tokio::spawn(async move {
                                         let service = service_fn(move |req| {
-                                            handle_connection(req, connection_state.clone())
+                                            handle_connection(
+                                                req,
+                                                connection_state.clone(),
+                                                peer_is_loopback,
+                                            )
                                         });
                                         let io = TokioIo::new(stream);
                                         if let Err(err) =
@@ -199,8 +215,9 @@ impl RevisionServer {
 async fn handle_connection(
     req: Request<Incoming>,
     state: Arc<ServeState>,
+    peer_is_loopback: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    Ok(match serve(req, state).await {
+    Ok(match serve(req, state, peer_is_loopback).await {
         Ok(response) => response,
         Err(response) => response,
     })
@@ -211,7 +228,9 @@ async fn handle_connection(
 async fn serve(
     req: Request<Incoming>,
     state: Arc<ServeState>,
+    peer_is_loopback: bool,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let method = req.method().clone();
     let path = req.uri().path().to_string();
     if path == "/healthz" || path == "/health" {
         return Ok(text_response(StatusCode::OK, "ok"));
@@ -249,9 +268,11 @@ async fn serve(
             .map_err(|_| error_response(StatusCode::BAD_REQUEST, "request body must be JSON"))?
     };
 
-    // A `session` hint pins the revision (stickiness) and keys the session, so it
-    // feeds both the dispatcher and the activity. Header wins over body field.
-    let session_hint = session_header.or_else(|| str_field(&payload, "session"));
+    // Caller-asserted identity is only honoured from loopback peers (see
+    // `caller_identity`). The session hint both pins the revision (stickiness)
+    // and keys the flow session, so it feeds the dispatcher and the activity.
+    let (user, session_hint) =
+        caller_identity(peer_is_loopback, user_header, session_header, &payload);
     let cookie_value = cookie_header
         .as_deref()
         .and_then(|jar| read_cookie(jar, &cookie_name(deployment_id)));
@@ -286,7 +307,30 @@ async fn serve(
             )
         })?;
 
-    let user = user_header.or_else(|| str_field(&payload, "user"));
+    // Gate before executing: refuse provider webhook paths (deferred) and
+    // non-POST generic requests, rather than running the entry flow for them.
+    let scope = RevisionScope {
+        deployment_id,
+        bundle_id: outcome.bundle_id.clone(),
+        revision_id: outcome.revision_id,
+    };
+    match admit_request(&state.routing.http_routes, &scope, &path, &method) {
+        Admission::ProviderRoute => {
+            return Err(error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "this path is a provider ingress route; revision-aware provider serving is not \
+                 yet implemented (use the legacy --bundle ingress)",
+            ));
+        }
+        Admission::MethodNotAllowed => {
+            return Err(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "only POST is supported for the generic revision ingress",
+            ));
+        }
+        Admission::Serve => {}
+    }
+
     let activity = build_activity(&payload, &tenant, user.as_deref(), session_hint.as_deref());
 
     let replies = state
@@ -341,6 +385,67 @@ fn build_activity(
         activity = activity.with_session(session);
     }
     activity
+}
+
+/// Resolve the caller-asserted `(user, session)` identity, honouring it **only
+/// from loopback peers**. Header (`x-greentic-user`/`x-greentic-session`) wins
+/// over the body `user`/`session` field.
+///
+/// The legacy webchat/DirectLine ingress likewise derives identity from the
+/// unauthenticated client request, so on loopback this matches the existing
+/// posture. But this path has no authentication, so a non-loopback caller must
+/// not be able to assert another user's identity — which would let it resume
+/// that user's waiting flow or key its session — nor poison revision stickiness
+/// via a chosen session hint. Remote callers therefore run anonymously with no
+/// session hint (the HMAC-signed stickiness cookie, which they cannot forge,
+/// still works). A verified provider/DirectLine token is the Phase-D upgrade.
+fn caller_identity(
+    peer_is_loopback: bool,
+    user_header: Option<String>,
+    session_header: Option<String>,
+    payload: &Value,
+) -> (Option<String>, Option<String>) {
+    if !peer_is_loopback {
+        return (None, None);
+    }
+    let user = user_header.or_else(|| str_field(payload, "user"));
+    let session = session_header.or_else(|| str_field(payload, "session"));
+    (user, session)
+}
+
+/// Pre-execution admission decision for a dispatched revision request.
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    /// Run the generic entry-flow activity.
+    Serve,
+    /// The path matches a declared provider ingress route for this revision —
+    /// deferred (serving it generically would skip provider signature/token
+    /// verification), so it is refused.
+    ProviderRoute,
+    /// A non-POST request to a generic (non-provider) path.
+    MethodNotAllowed,
+}
+
+/// Decide whether a dispatched request may run the generic entry flow. Provider
+/// routes win first (they are refused regardless of method); otherwise only POST
+/// is admitted — a browser `GET /favicon.ico` under a broad `/` binding must not
+/// execute the flow.
+fn admit_request(
+    routes: &HttpRouteTable,
+    scope: &RevisionScope,
+    path: &str,
+    method: &hyper::Method,
+) -> Admission {
+    if routes
+        .match_request_for_revision(path, method.as_str(), scope)
+        .is_some()
+    {
+        return Admission::ProviderRoute;
+    }
+    if method != hyper::Method::POST {
+        return Admission::MethodNotAllowed;
+    }
+    Admission::Serve
 }
 
 /// Read the request body with a hard size cap. `Err(())` means the limit was
@@ -485,6 +590,91 @@ mod tests {
         let jar = "foo=1; _gt_rev_abc=xyz ; bar=2";
         assert_eq!(read_cookie(jar, "_gt_rev_abc"), Some("xyz".to_string()));
         assert_eq!(read_cookie(jar, "missing"), None);
+    }
+
+    #[test]
+    fn caller_identity_is_honoured_only_from_loopback() {
+        let payload = json!({ "user": "body-user", "session": "body-session" });
+
+        // Loopback: header wins over body, body fills the rest.
+        let (user, session) = caller_identity(true, Some("hdr-user".into()), None, &payload);
+        assert_eq!(user.as_deref(), Some("hdr-user"));
+        assert_eq!(session.as_deref(), Some("body-session"));
+
+        // Non-loopback: client-asserted identity is dropped entirely so a remote
+        // caller cannot impersonate a user/session or pin a chosen revision.
+        let (user, session) = caller_identity(
+            false,
+            Some("hdr-user".into()),
+            Some("hdr-session".into()),
+            &payload,
+        );
+        assert_eq!(user, None);
+        assert_eq!(session, None);
+    }
+
+    fn provider_route_table(scope: &RevisionScope) -> HttpRouteTable {
+        use crate::domains::Domain;
+        HttpRouteTable::from_descriptors(vec![crate::http_routes::descriptor_for_test(
+            "/slack/events",
+            &["POST"],
+            Domain::Messaging,
+            Some(scope.clone()),
+        )])
+    }
+
+    fn test_scope() -> RevisionScope {
+        RevisionScope {
+            deployment_id: greentic_deploy_spec::DeploymentId::new(),
+            bundle_id: greentic_deploy_spec::BundleId::new("fast2flow"),
+            revision_id: greentic_deploy_spec::RevisionId::new(),
+        }
+    }
+
+    #[test]
+    fn admit_refuses_declared_provider_route() {
+        let scope = test_scope();
+        let routes = provider_route_table(&scope);
+        // A POST to the declared provider webhook path is refused (deferred),
+        // never run as a generic activity that would skip signature verification.
+        assert_eq!(
+            admit_request(&routes, &scope, "/slack/events", &hyper::Method::POST),
+            Admission::ProviderRoute
+        );
+    }
+
+    #[test]
+    fn admit_rejects_non_post_on_generic_path() {
+        let scope = test_scope();
+        let routes = provider_route_table(&scope);
+        // A browser GET that doesn't hit a provider route must not run the flow.
+        assert_eq!(
+            admit_request(&routes, &scope, "/favicon.ico", &hyper::Method::GET),
+            Admission::MethodNotAllowed
+        );
+    }
+
+    #[test]
+    fn admit_serves_generic_post() {
+        let scope = test_scope();
+        let routes = provider_route_table(&scope);
+        assert_eq!(
+            admit_request(&routes, &scope, "/api/chat", &hyper::Method::POST),
+            Admission::Serve
+        );
+    }
+
+    #[test]
+    fn admit_does_not_match_provider_route_of_a_different_revision() {
+        let scope = test_scope();
+        let routes = provider_route_table(&scope);
+        // Same path, but a different revision's scope: not this revision's
+        // provider route, so a POST falls through to generic serving.
+        let other = test_scope();
+        assert_eq!(
+            admit_request(&routes, &other, "/slack/events", &hyper::Method::POST),
+            Admission::Serve
+        );
     }
 
     fn envelope_for(user: &str, conversation: &str) -> IngressEnvelope {
