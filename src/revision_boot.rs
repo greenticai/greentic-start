@@ -39,6 +39,9 @@ use greentic_deploy_spec::{
 use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
 use greentic_deployer::path_safety::normalize_under_root;
 use greentic_runner_host::runtime::{RevisionPackRef, TenantRuntime};
+use greentic_runner_host::storage::{
+    new_session_store, new_state_store, session_host_from, state_host_from,
+};
 use greentic_runner_host::{HostBuilder, HostConfig, RunnerHost, TenantBindings};
 use greentic_types::EnvId;
 
@@ -61,9 +64,8 @@ const SIGNING_KEY_FILE: &str = "revision-signing.key";
 /// ingress consumes to serve traffic across them.
 pub(crate) struct RuntimeConfigActivation {
     /// Embedded host holding the loaded revision runtimes. The execution bridge
-    /// that runs a request through a resolved revision's runtime is the next
-    /// step; until then the caller builds + reports the activation and drops it.
-    #[allow(dead_code)]
+    /// ([`crate::revision_serve`]) runs each request against the resolved
+    /// revision's runtime through `RunnerHost::handle_activity_for_revision`.
     pub(crate) host: RunnerHost,
     /// Dispatcher + revision-scoped HTTP routes + request→deployment map, ready
     /// to thread into [`crate::http_ingress`] via `HttpIngressConfig`.
@@ -199,15 +201,29 @@ pub(crate) async fn activate_runtime_config(
         let pack_paths: Vec<PathBuf> = pack_refs.iter().map(|r| r.path.clone()).collect();
         scoped_routes.extend(discover_revision_http_routes(&pack_paths, &scope));
 
+        // Session isolation: give each revision its OWN session and state store
+        // rather than sharing the host's. The session/resume/state backend keys
+        // on `(env, tenant, user)` plus pack/flow, NOT on the revision, so two
+        // live revisions of the same pack for one tenant sharing a backend would
+        // let a `wait`/resume snapshot created by revision A be fetched — or
+        // clobbered — by revision B during a traffic split. A fresh per-revision
+        // store namespaces snapshot + resume + working state in one move. This is
+        // the caller obligation documented on
+        // `RunnerHost::handle_activity_for_revision`.
+        let session_store = new_session_store();
+        let session_host = session_host_from(Arc::clone(&session_store));
+        let state_store = new_state_store();
+        let state_host = state_host_from(Arc::clone(&state_store));
+
         let runtime = TenantRuntime::load_revision(
             &pack_refs,
             config,
             None,
             host.wasi_policy(),
-            host.session_host(),
-            host.session_store(),
-            host.state_store(),
-            host.state_host(),
+            session_host,
+            session_store,
+            state_store,
+            state_host,
             host.secrets_manager(),
             deployment_id,
             bundle_id.clone(),
