@@ -25,6 +25,7 @@ use hyper::{
 use hyper_util::rt::tokio::TokioIo;
 use tokio::{net::TcpListener, runtime::Runtime, sync::oneshot};
 
+use crate::deployment_routes::RevisionIngressRouting;
 use crate::domains::Domain;
 use crate::http_routes::{HttpRouteTable, discover_http_routes_from_bundle};
 use crate::ingress_dispatch::{
@@ -39,7 +40,6 @@ use crate::runner_host::{DemoRunnerHost, OperatorContext};
 use crate::static_routes::{
     ActiveRouteTable, ReservedRouteSet, RouteScopeSegment, StaticRouteMatch, discover_from_bundle,
 };
-use greentic_deploy_spec::DeploymentId;
 use rand::Rng;
 
 use admin_relay::{
@@ -56,7 +56,6 @@ use static_handler::serve_static_route;
 
 const LEGACY_DIRECTLINE_COMPAT_ENV: &str = "GREENTIC_START_ENABLE_LEGACY_DIRECTLINE";
 
-#[derive(Clone)]
 pub struct HttpIngressConfig {
     pub bind_addr: SocketAddr,
     pub domains: Vec<Domain>,
@@ -68,6 +67,11 @@ pub struct HttpIngressConfig {
     /// Notifier backend to use for WebChat push events.
     /// Defaults to `NotifierConfig::Memory` when not specified.
     pub notifier_config: crate::notifier::NotifierConfig,
+    /// Revision-routing wiring when booting from a materialized runtime-config
+    /// (dispatcher + revision-scoped HTTP routes + request→deployment map).
+    /// `None` for the legacy single-bundle boot path, where the ingress never
+    /// consults revision routing.
+    pub revision_routing: Option<RevisionIngressRouting>,
 }
 
 pub struct HttpIngressServer {
@@ -217,8 +221,9 @@ impl HttpIngressServer {
             domains,
             active_route_table,
             http_route_table,
-            // No runtime-config producer yet (B4); single-bundle boot path.
-            revision_dispatcher: None,
+            // Carries the revision-routing wiring when booting from a
+            // materialized runtime-config; `None` on the single-bundle path.
+            revision_routing: config.revision_routing,
             admin_relay,
             notifier,
             session_manager: Arc::new(websocket::SessionManager::new(
@@ -369,10 +374,11 @@ struct HttpIngressState {
     domains: Vec<Domain>,
     active_route_table: ActiveRouteTable,
     http_route_table: HttpRouteTable,
-    /// Per-deployment traffic-split selector. `None` until B4's operator
-    /// materializes a runtime-config; while `None` the ingress takes the
-    /// single-bundle legacy path and never consults revision routing.
-    revision_dispatcher: Option<Arc<RevisionDispatcher>>,
+    /// Revision-routing wiring (dispatcher + revision-scoped HTTP routes +
+    /// request→deployment map) when booting from a materialized runtime-config.
+    /// `None` for the legacy single-bundle path, where the ingress never
+    /// consults revision routing.
+    revision_routing: Option<RevisionIngressRouting>,
     admin_relay: Option<Arc<AdminRelayConfig>>,
     // Used by WebSocket session handlers (Task 11+) to subscribe to activity events.
     pub notifier: std::sync::Arc<dyn crate::notifier::ActivityNotifier>,
@@ -482,6 +488,16 @@ where
     // - /v1/messaging/webchat/{tenant}/v3/directline/*
     // - /v1/web/webchat/{tenant}/token
     // - /v1/web/webchat/{tenant}/v3/directline/*
+    //
+    // NOTE (revision routing): these high-volume chat paths return here, BEFORE
+    // the `revision_routing` block below, so they always take the legacy
+    // single-bundle `state.runner_host` handlers and never consult the revision
+    // dispatcher — no traffic split, no drain awareness, no revision stickiness
+    // cookie. This is inert today (revision routing is dormant until a producer
+    // sets `revision_routing: Some`), but the execution-bridge PR that turns it
+    // on MUST resolve the deployment/revision before these shortcuts (or make
+    // these handlers consume the selected revision) — otherwise a rollout looks
+    // healthy on generic HTTP routes while WebChat ignores the split.
     if let Some((tenant, dl_path)) = parse_webchat_directline_route(&path) {
         let provider = state
             .active_route_table
@@ -667,23 +683,34 @@ where
     // Tries: (0) revision routing, (1) pack-declared HTTP routes, (2) static
     // routes, (3) standard ingress.
     let method = req.method().clone();
+    // Host header drives request→deployment resolution (the resolver strips the
+    // port and lowercases). Borrowed, not allocated — only the revision-routing
+    // block reads it, and that runs before the body is consumed below.
+    let host = req
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|value| value.to_str().ok());
     // Set-Cookie directive carried out of revision selection so the chosen
     // revision stays sticky for the session. Applied to the primary ingress
     // response below.
     let mut pending_set_cookie: Option<SetCookieDirective> = None;
     let parsed = 'resolve: {
-        // Revision routing (B3): once B4 materializes a runtime-config, resolve
-        // the deployment for this request, let the dispatcher pick a revision
-        // by traffic split / stickiness, and route to that revision's pack.
-        // Dormant while `revision_dispatcher` is `None` (no producer yet), so
-        // the legacy single-bundle path below is the only live one today.
-        if let Some(dispatcher) = state.revision_dispatcher.as_ref()
-            && let Some((deployment_id, tenant)) = resolve_deployment(&state, &path)
+        // Revision routing (B3): when booting from a materialized runtime-config,
+        // resolve the deployment for this request, let the dispatcher pick a
+        // revision by traffic split / stickiness, and route to that revision's
+        // scoped route. `revision_routing` is `None` on the legacy single-bundle
+        // boot path, so that path stays the only live one there.
+        //
+        // The WebChat / DirectLine / WS-upgrade shortcuts above return before
+        // reaching this block, so they are NOT revision-routed yet — see the
+        // note there; integrating them is part of the execution-bridge PR.
+        if let Some(routing) = state.revision_routing.as_ref()
+            && let Some((deployment_id, tenant)) = routing.deployment_routes.resolve(host, &path)
         {
             let cookie = extract_cookie(req.headers(), &cookie_name(deployment_id));
             let dispatch_req = DispatchRequest {
-                env_id: dispatcher.env_id(),
-                tenant: &tenant,
+                env_id: routing.dispatcher.env_id(),
+                tenant,
                 deployment_id,
                 session_hint: None,
                 // Public ingress traffic never trusts the revision header.
@@ -701,8 +728,8 @@ where
             // `revision_dispatcher` test fixture's RNG choice.
             let mut rng: rand::rngs::SmallRng = rand::make_rng();
             match dispatch_bound_deployment(
-                dispatcher,
-                &state.http_route_table,
+                routing.dispatcher.as_ref(),
+                &routing.http_routes,
                 &dispatch_req,
                 &path,
                 method.as_str(),
@@ -920,15 +947,6 @@ where
     build_http_response(&result.response)
         .map(|resp| apply_set_cookie(resp, pending_set_cookie.take()))
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err))
-}
-
-/// Resolve which deployment (and tenant) a public request belongs to. The
-/// mapping from `(host, path-prefix)` to a deployment lives in the
-/// `BundleDeployment` host table (B10), materialized by the operator (B4).
-/// Until that producer exists there is nothing to resolve, so this returns
-/// `None` and the ingress takes the legacy single-bundle path.
-fn resolve_deployment(_state: &HttpIngressState, _path: &str) -> Option<(DeploymentId, String)> {
-    None
 }
 
 /// A resolved revision route plus the optional stickiness cookie to emit.
@@ -2076,6 +2094,13 @@ mod tests {
     use tokio::runtime::Runtime;
 
     async fn test_state(domains: Vec<Domain>) -> Arc<HttpIngressState> {
+        build_test_state(domains, None).await
+    }
+
+    async fn build_test_state(
+        domains: Vec<Domain>,
+        revision_routing: Option<RevisionIngressRouting>,
+    ) -> Arc<HttpIngressState> {
         let dir = tempdir().unwrap();
         let discovery = crate::discovery::discover(dir.path()).unwrap();
         let secrets_handle =
@@ -2098,7 +2123,7 @@ mod tests {
             domains,
             active_route_table: ActiveRouteTable::default(),
             http_route_table: HttpRouteTable::default(),
-            revision_dispatcher: None,
+            revision_routing,
             admin_relay: None,
             notifier,
             session_manager: Arc::new(websocket::SessionManager::new(
@@ -2179,6 +2204,107 @@ mod tests {
             ))
             .unwrap_err();
         assert_eq!(invalid_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn revision_routing_resolves_then_fails_closed_when_no_scoped_route() {
+        // End-to-end through `handle_request_inner` with `revision_routing:
+        // Some`: a matching deployment binding resolves the request, the
+        // dispatcher selects the (only) revision, and — because no scoped HTTP
+        // route is declared for it — the request fails closed with 404 rather
+        // than falling through to the legacy single-bundle path. Proves the B3
+        // seam is reachable and authoritative once a producer wires it in.
+        use crate::deployment_routes::DeploymentRouteTable;
+        use crate::revision_dispatcher::{
+            RevisionDispatcher, RevisionDispatcherConfig, RevisionEntry,
+        };
+        use greentic_deploy_spec::{BundleId, DeploymentId, RevisionId};
+
+        let runtime = Runtime::new().unwrap();
+
+        let deployment_id = DeploymentId::new();
+        let bundle_id = BundleId::new("acme.bundle");
+        let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new("demo", [7u8; 32]));
+        dispatcher
+            .apply_traffic_split(
+                deployment_id,
+                vec![RevisionEntry {
+                    revision_id: RevisionId::new(),
+                    bundle_id: bundle_id.clone(),
+                    weight_bps: 10_000,
+                }],
+                bundle_id,
+                0,
+            )
+            .expect("apply traffic split");
+        // Empty-binding deployment route → matches any host/path.
+        let deployment_routes = DeploymentRouteTable::from_parts(vec![(
+            deployment_id,
+            "default".to_string(),
+            Vec::new(),
+            Vec::new(),
+        )]);
+        let routing = RevisionIngressRouting {
+            dispatcher: Arc::new(dispatcher),
+            // No revision-scoped routes declared → forces the fail-closed path.
+            http_routes: HttpRouteTable::default(),
+            deployment_routes,
+        };
+
+        let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
+        let response = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::GET, "/v1/events/ingress/p/demo"),
+                state,
+            ))
+            .expect_err("revision routing must fail closed");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = runtime.block_on(response_json(response));
+        assert_eq!(
+            body["message"], "no route for the selected revision in this deployment",
+            "404 must come from revision routing, not the legacy path"
+        );
+    }
+
+    #[test]
+    fn revision_routing_falls_back_to_legacy_when_deployment_unresolved() {
+        // `revision_routing: Some`, but the deployment binding requires a host
+        // the request does not carry → resolution returns `None`, so the revision
+        // block is skipped and the request takes the legacy path. The legacy
+        // events path then 404s for a *different* reason (no ingest handler),
+        // proving revision routing did not claim the request.
+        use crate::deployment_routes::DeploymentRouteTable;
+        use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
+        use greentic_deploy_spec::DeploymentId;
+
+        let runtime = Runtime::new().unwrap();
+        let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new("demo", [7u8; 32]));
+        let deployment_routes = DeploymentRouteTable::from_parts(vec![(
+            DeploymentId::new(),
+            "default".to_string(),
+            vec!["only.example.com".to_string()],
+            Vec::new(),
+        )]);
+        let routing = RevisionIngressRouting {
+            dispatcher: Arc::new(dispatcher),
+            http_routes: HttpRouteTable::default(),
+            deployment_routes,
+        };
+
+        let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
+        // No Host header → the host-bound deployment does not resolve.
+        let response = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::GET, "/v1/events/ingress/p/demo"),
+                state,
+            ))
+            .expect_err("legacy path 404s without an ingest handler");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = runtime.block_on(response_json(response));
+        assert_ne!(
+            body["message"], "no route for the selected revision in this deployment",
+            "unresolved deployment must not enter revision routing"
+        );
     }
 
     #[test]
@@ -2360,6 +2486,7 @@ mod tests {
             tenant: "demo".to_string(),
             public_base_url: None,
             notifier_config: crate::notifier::NotifierConfig::default(),
+            revision_routing: None,
         })
         .expect("start ingress server");
 
@@ -2413,6 +2540,7 @@ mod tests {
             tenant: "demo".to_string(),
             public_base_url: None,
             notifier_config: crate::notifier::NotifierConfig::default(),
+            revision_routing: None,
         }) {
             Ok(_) => panic!("occupied port range should fail ingress startup"),
             Err(err) => err,
@@ -2477,7 +2605,7 @@ mod tests {
                 blocking_failures: vec![],
             }),
             http_route_table: HttpRouteTable::default(),
-            revision_dispatcher: None,
+            revision_routing: None,
             admin_relay: None,
             notifier,
             session_manager: Arc::new(websocket::SessionManager::new(
@@ -2568,7 +2696,7 @@ mod tests {
                 blocking_failures: vec![],
             }),
             http_route_table: HttpRouteTable::default(),
-            revision_dispatcher: None,
+            revision_routing: None,
             admin_relay: None,
             notifier,
             session_manager: Arc::new(websocket::SessionManager::new(

@@ -16,15 +16,21 @@
 //!    each into the host's
 //!    [`ActivePacks`](greentic_runner_host::runtime::ActivePacks);
 //! 4. builds the [`RevisionDispatcher`] from the same config under a stable
-//!    per-env HMAC signing key.
+//!    per-env HMAC signing key;
+//! 5. discovers each loaded revision's pack-declared HTTP routes and stamps them
+//!    with the revision's [`RevisionScope`], and builds the request→deployment
+//!    [`DeploymentRouteTable`] from the environment's Active deployments.
 //!
-//! Serving traffic from the populated host + dispatcher (the ingress consumer,
-//! `resolve_deployment`) is the next step (B3); for now the caller activates and
-//! then fails loud that serving is not yet wired. The activation is therefore a
-//! self-contained, testable unit that B3 plugs into the ingress state.
+//! Steps 4 + 5 produce a [`RevisionIngressRouting`] the ingress consumes to
+//! resolve a request to a deployment, pick a revision by traffic split, and find
+//! that revision's route. Running the resolved request through the revision's
+//! runtime (the execution bridge from HTTP → `RunnerHost::handle_activity`) is
+//! the remaining step; until then the caller activates, reports, and drops the
+//! host. The activation is a self-contained, testable unit.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, anyhow, bail};
 use greentic_deploy_spec::{
@@ -36,6 +42,10 @@ use greentic_runner_host::runtime::{RevisionPackRef, TenantRuntime};
 use greentic_runner_host::{HostBuilder, HostConfig, RunnerHost, TenantBindings};
 use greentic_types::EnvId;
 
+use crate::deployment_routes::{DeploymentRouteTable, RevisionIngressRouting};
+use crate::http_routes::{
+    HttpRouteDescriptor, HttpRouteTable, RevisionScope, discover_revision_http_routes,
+};
 use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig, parse_ulid};
 use crate::runtime_config::{LoadedRuntimeConfig, env_dir_in};
 use crate::secrets_gate::DynSecretsManager;
@@ -46,15 +56,18 @@ use crate::secrets_gate::DynSecretsManager;
 const SIGNING_KEY_FILE: &str = "revision-signing.key";
 
 /// The outcome of activating a runtime-config: a host with every active
-/// revision loaded into its `ActivePacks`, plus the dispatcher that routes
-/// across them. B2 hands this back to the caller; B3 will thread it into the
-/// ingress state instead of dropping it.
+/// revision loaded into its `ActivePacks`, plus the ingress-routing artifacts
+/// (dispatcher + revision-scoped HTTP routes + request→deployment map) that the
+/// ingress consumes to serve traffic across them.
 pub(crate) struct RuntimeConfigActivation {
-    /// Embedded host holding the loaded revision runtimes. Consumed by the B3
-    /// ingress wiring; until then the caller activates and drops it.
+    /// Embedded host holding the loaded revision runtimes. The execution bridge
+    /// that runs a request through a resolved revision's runtime is the next
+    /// step; until then the caller builds + reports the activation and drops it.
     #[allow(dead_code)]
     pub(crate) host: RunnerHost,
-    pub(crate) dispatcher: RevisionDispatcher,
+    /// Dispatcher + revision-scoped HTTP routes + request→deployment map, ready
+    /// to thread into [`crate::http_ingress`] via `HttpIngressConfig`.
+    pub(crate) routing: RevisionIngressRouting,
 }
 
 /// What a deployment in the `Environment` says about itself, used both to key
@@ -150,6 +163,11 @@ pub(crate) async fn activate_runtime_config(
         .build()
         .context("building embedded runner host for revision activation")?;
 
+    // Revision-scoped HTTP routes accumulated across every loaded revision; the
+    // ingress matches against these via `match_request_for_revision` once the
+    // dispatcher picks a revision.
+    let mut scoped_routes: Vec<HttpRouteDescriptor> = Vec::new();
+
     let configs = host.tenant_configs();
     for block in &rc.revisions {
         // Both lookups are infallible: the validation loop above proved every
@@ -170,6 +188,16 @@ pub(crate) async fn activate_runtime_config(
             .with_context(|| {
                 format!("reading pinned packs for revision `{}`", block.revision_id)
             })?;
+
+        // Discover this revision's pack-declared HTTP routes and stamp them with
+        // its scope. Done before `load_revision` consumes `bundle_id`.
+        let scope = RevisionScope {
+            deployment_id,
+            bundle_id: bundle_id.clone(),
+            revision_id,
+        };
+        let pack_paths: Vec<PathBuf> = pack_refs.iter().map(|r| r.path.clone()).collect();
+        scoped_routes.extend(discover_revision_http_routes(&pack_paths, &scope));
 
         let runtime = TenantRuntime::load_revision(
             &pack_refs,
@@ -206,7 +234,13 @@ pub(crate) async fn activate_runtime_config(
     )
     .context("building revision dispatcher")?;
 
-    Ok(RuntimeConfigActivation { host, dispatcher })
+    let routing = RevisionIngressRouting {
+        dispatcher: Arc::new(dispatcher),
+        http_routes: HttpRouteTable::from_descriptors(scoped_routes),
+        deployment_routes: DeploymentRouteTable::from_environment(&env),
+    };
+
+    Ok(RuntimeConfigActivation { host, routing })
 }
 
 /// Index a deployment's tenant + customer by `deployment_id` string. The
