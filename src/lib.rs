@@ -288,12 +288,22 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             let store_root = greentic_deployer::environment::LocalFsStore::default_root().context(
                 "cannot determine the default environment store root (no home directory)",
             )?;
+            // Activate with the env's own DevStore secrets backend rather than
+            // HostBuilder's default env-var backend (which rejects non-local
+            // envs). B3 will refine this to the per-tenant/pack-declared backend
+            // once it resolves the serving context.
+            let env_dir = runtime_config::env_dir_in(&store_root, &env_id)?;
+            let secrets: crate::secrets_gate::DynSecretsManager =
+                std::sync::Arc::new(crate::secrets_client::SecretsClient::open(&env_dir)?);
             let activation_rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .context("building runtime for revision activation")?;
-            let activation =
-                activation_rt.block_on(revision_boot::activate_runtime_config(&store_root, &rc))?;
+            let activation = activation_rt.block_on(revision_boot::activate_runtime_config(
+                &store_root,
+                &rc,
+                secrets,
+            ))?;
             anyhow::bail!(
                 "activated {} revision(s) for env `{}` across {} deployment(s) into the runner \
                  host, but serving from a materialized runtime-config is not yet wired: the \
