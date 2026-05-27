@@ -320,7 +320,6 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             let server =
                 revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
                     bind_addr,
-                    env_id: rc.env_id.clone(),
                     host: std::sync::Arc::new(host),
                     routing,
                 })

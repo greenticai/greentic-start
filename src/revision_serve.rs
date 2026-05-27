@@ -65,14 +65,13 @@ const MAX_BODY_BYTES: usize = 1 << 20; // 1 MiB
 /// and routing the server serves over.
 pub(crate) struct RevisionServeConfig {
     pub bind_addr: SocketAddr,
-    pub env_id: String,
     pub host: Arc<RunnerHost>,
     pub routing: RevisionIngressRouting,
 }
 
 /// Per-connection shared state. Cheap to clone (everything behind an `Arc`).
+/// The env id is read from `routing.dispatcher.env_id()` — not stored twice.
 struct ServeState {
-    env_id: String,
     host: Arc<RunnerHost>,
     routing: RevisionIngressRouting,
 }
@@ -106,7 +105,6 @@ impl RevisionServer {
         let addr = SocketAddr::new(listen_ip, actual_port);
 
         let state = Arc::new(ServeState {
-            env_id: config.env_id,
             host: config.host,
             routing: config.routing,
         });
@@ -149,7 +147,10 @@ impl RevisionServer {
                                     let connection_state = state.clone();
                                     // Caller-asserted identity (see `serve`) is only
                                     // honoured from loopback peers; capture it here.
-                                    let peer_is_loopback = peer.ip().is_loopback();
+                                    // `to_canonical` so an IPv4-mapped IPv6 peer
+                                    // (`::ffff:127.0.0.1`, seen under an IPv6 bind)
+                                    // still reads as loopback.
+                                    let peer_is_loopback = peer.ip().to_canonical().is_loopback();
                                     tokio::spawn(async move {
                                         let service = service_fn(move |req| {
                                             handle_connection(
@@ -278,7 +279,7 @@ async fn serve(
         .and_then(|jar| read_cookie(jar, &cookie_name(deployment_id)));
 
     let dispatch_req = DispatchRequest {
-        env_id: &state.env_id,
+        env_id: state.routing.dispatcher.env_id(),
         tenant: &tenant,
         deployment_id,
         session_hint: session_hint.as_deref(),
@@ -487,12 +488,7 @@ fn read_cookie(jar: &str, name: &str) -> Option<String> {
 /// `Secure`, `HttpOnly`, `SameSite`) are an ingress concern, stamped here rather
 /// than by the dispatcher.
 fn apply_set_cookie(response: &mut Response<Full<Bytes>>, directive: &SetCookieDirective) {
-    let header_value = format!(
-        "{}={}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
-        directive.name,
-        directive.value,
-        directive.max_age.as_secs()
-    );
+    let header_value = directive.to_header_value();
     match header::HeaderValue::from_str(&header_value) {
         Ok(value) => {
             response.headers_mut().append(header::SET_COOKIE, value);

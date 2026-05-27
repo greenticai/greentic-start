@@ -112,14 +112,28 @@ pub enum SelectionReason {
     Weighted,
 }
 
-/// Set-Cookie directive the caller (B3) wraps into a full header — attributes
-/// (`Path`, `Secure`, `HttpOnly`, `SameSite=Lax`) are an ingress concern, not
-/// the dispatcher's.
+/// Set-Cookie directive the ingress turns into a full header via
+/// [`Self::to_header_value`]. The cookie security attributes (`Path`, `Secure`,
+/// `HttpOnly`, `SameSite=Lax`) live there so every ingress shares one policy.
 #[derive(Clone, Debug)]
 pub struct SetCookieDirective {
     pub name: String,
     pub value: String,
     pub max_age: Duration,
+}
+
+impl SetCookieDirective {
+    /// Render the `Set-Cookie` header value, including the shared security
+    /// attributes. Single source of the cookie policy so the ingresses that stamp
+    /// stickiness cookies cannot drift apart.
+    pub fn to_header_value(&self) -> String {
+        format!(
+            "{}={}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
+            self.name,
+            self.value,
+            self.max_age.as_secs()
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
