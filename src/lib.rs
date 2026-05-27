@@ -485,22 +485,21 @@ const NOISY_TRACE_TARGETS: &[&str] = &[
 fn build_trace_filter() -> tracing_subscriber::EnvFilter {
     use tracing_subscriber::EnvFilter;
     let base = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    NOISY_TRACE_TARGETS
-        .iter()
-        .fold(base, |filter, target| {
-            match format!("{target}=warn").parse() {
-                Ok(directive) => filter.add_directive(directive),
-                Err(_) => filter,
-            }
-        })
+    NOISY_TRACE_TARGETS.iter().fold(base, |filter, target| {
+        match format!("{target}=warn").parse() {
+            Ok(directive) => filter.add_directive(directive),
+            Err(_) => filter,
+        }
+    })
 }
 
 /// Install a `tracing` subscriber writing to `<log_dir>/trace.log`, filtered by
 /// `RUST_LOG` (defaults to `info`). Returns the appender guard, which must be
 /// kept alive for the process lifetime so the non-blocking writer flushes.
-fn init_trace_log(log_dir: &std::path::Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+fn init_trace_log(
+    log_dir: &std::path::Path,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use std::fs::OpenOptions;
-    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -532,7 +531,10 @@ fn init_trace_log(log_dir: &std::path::Path) -> Option<tracing_appender::non_blo
         Ok(()) => {
             operator_log::info(
                 module_path!(),
-                format!("tracing subscriber writing to {} (RUST_LOG={rust_log})", path.display()),
+                format!(
+                    "tracing subscriber writing to {} (RUST_LOG={rust_log})",
+                    path.display()
+                ),
             );
             tracing::info!(
                 target: "greentic_start",

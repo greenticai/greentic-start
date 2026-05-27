@@ -278,8 +278,10 @@ pub fn run_app_flow(
         .failures
         .iter()
         .find(|(node_id, _)| node_id.as_str() != "_runtime");
-    if !matches!(output.result.status, greentic_runner_desktop::RunStatus::Success)
-        && let Some((failed_node_id, failure)) = real_failure
+    if !matches!(
+        output.result.status,
+        greentic_runner_desktop::RunStatus::Success
+    ) && let Some((failed_node_id, failure)) = real_failure
     {
         let error_value = json!({
             "metadata": {
@@ -1016,7 +1018,9 @@ fn categorize_flow_error(error_kind: &str, error_message: &str) -> FlowErrorCate
         if (500..600).contains(&status) {
             return FlowErrorCategorization {
                 category: "service_unavailable",
-                user_message: "This service is temporarily unavailable. Please try again in a few minutes.".to_string(),
+                user_message:
+                    "This service is temporarily unavailable. Please try again in a few minutes."
+                        .to_string(),
                 fault: ErrorFault::UpstreamService,
             };
         }
@@ -1032,7 +1036,8 @@ fn categorize_flow_error(error_kind: &str, error_message: &str) -> FlowErrorCate
     if error_kind == "flow_execution_failed" {
         return FlowErrorCategorization {
             category: "flow_internal",
-            user_message: "Something went wrong while processing your request. Please try again.".to_string(),
+            user_message: "Something went wrong while processing your request. Please try again."
+                .to_string(),
             fault: ErrorFault::Greentic,
         };
     }
@@ -1678,7 +1683,10 @@ mod tests {
     #[test]
     fn categorize_flow_error_detects_auth_signals() {
         let cases = [
-            ("flow_node_failed", "component x failed: MCP_TOOL_ERROR: 401 API key required"),
+            (
+                "flow_node_failed",
+                "component x failed: MCP_TOOL_ERROR: 401 API key required",
+            ),
             ("flow_node_failed", "tool returned an error (status 403)"),
             ("flow_node_failed", "Authentication denied"),
             ("flow_node_failed", "apikey rejected"),
@@ -1777,8 +1785,8 @@ mod tests {
             reply.metadata.get("error_fault").map(String::as_str),
             Some("bundle_provider")
         );
-        assert!(reply.metadata.get("error_user_message").is_some());
-        assert!(reply.metadata.get("error_message").is_some());
+        assert!(reply.metadata.contains_key("error_user_message"));
+        assert!(reply.metadata.contains_key("error_message"));
         assert_eq!(
             reply.metadata.get("error_node_id").map(String::as_str),
             Some("call_weather")
@@ -1802,10 +1810,7 @@ mod tests {
         let replies = parse_envelopes(&output, &ingress).expect("renderedCard branch");
         assert_eq!(replies.len(), 1);
         assert!(
-            replies[0]
-                .metadata
-                .get("error_category")
-                .is_none(),
+            !replies[0].metadata.contains_key("error_category"),
             "error_category must not be set when a card branch already produced the reply"
         );
     }
