@@ -216,7 +216,7 @@ impl RevisionDispatcher {
     /// duplicate revision id, weights sum to 10,000). We do not re-validate
     /// here — the boundary between B0 and B1 is internal. `apply_traffic_split`
     /// is the public mutation entry point and *does* re-validate.
-    pub fn from_runtime_config(
+    pub(crate) fn from_runtime_config(
         cfg: RevisionDispatcherConfig,
         rc: &LoadedRuntimeConfig,
     ) -> anyhow::Result<Self> {

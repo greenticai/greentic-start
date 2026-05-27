@@ -1422,6 +1422,9 @@ fn start_http_ingress_server(
         tenant: config.tenant.clone(),
         public_base_url,
         notifier_config,
+        // Legacy single-bundle boot path: no materialized runtime-config, so
+        // revision routing is inert here.
+        revision_routing: None,
     })?;
     operator_log::info(
         module_path!(),

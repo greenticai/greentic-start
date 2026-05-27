@@ -59,7 +59,7 @@ enum RouteSegment {
 }
 
 /// Ordered table of pack-declared HTTP routes, sorted by specificity.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct HttpRouteTable {
     routes: Vec<HttpRouteDescriptor>,
 }
@@ -336,6 +336,43 @@ pub fn discover_http_routes_from_bundle(
         }
     }
     Ok(all_routes)
+}
+
+/// Discover HTTP routes from a revision's pinned pack files, stamping each with
+/// the revision's [`RevisionScope`].
+///
+/// A revision is a set of pinned `.gtpack` files (not a bundle directory), so
+/// this takes explicit pack paths and reuses the same per-pack manifest reader
+/// as [`discover_http_routes_from_bundle`]. The scope makes the resulting
+/// descriptors matchable via [`HttpRouteTable::match_request_for_revision`].
+/// A pack that declares no routes (or fails to read) is skipped with a warning
+/// — a malformed pack must not abort activation of the rest of the revision.
+pub fn discover_revision_http_routes(
+    pack_paths: &[PathBuf],
+    scope: &RevisionScope,
+) -> Vec<HttpRouteDescriptor> {
+    let mut routes = Vec::new();
+    for pack_path in pack_paths {
+        match read_pack_http_routes(pack_path) {
+            Ok(Some(mut pack_routes)) => {
+                for route in &mut pack_routes {
+                    route.scope = Some(scope.clone());
+                }
+                routes.extend(pack_routes);
+            }
+            Ok(None) => continue,
+            Err(err) => {
+                crate::operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "failed to read http-routes from {}: {err:#}",
+                        pack_path.display()
+                    ),
+                );
+            }
+        }
+    }
+    routes
 }
 
 fn read_pack_http_routes(pack_path: &Path) -> anyhow::Result<Option<Vec<HttpRouteDescriptor>>> {
@@ -699,5 +736,97 @@ mod tests {
         assert!(matches!(segs[2], RouteSegment::Literal(ref s) if s == "v3"));
         assert!(matches!(segs[3], RouteSegment::Literal(ref s) if s == "directline"));
         assert!(matches!(segs[4], RouteSegment::Wildcard));
+    }
+
+    /// Write a minimal `.gtpack` whose manifest declares a single
+    /// `greentic.http-routes.v1` route, mirroring the real on-disk shape. The
+    /// manifest is built via plain serde then re-encoded with the symbol-table
+    /// CBOR codec [`decode_pack_manifest`] expects.
+    fn write_http_routes_pack(path: &Path, pack_id: &str, pattern: &str) {
+        use std::io::Write as _;
+        use zip::write::FileOptions;
+
+        let manifest_json = serde_json::json!({
+            "schema_version": "1.0.0",
+            "pack_id": pack_id,
+            "version": "1.0.0",
+            "kind": "provider",
+            "publisher": "tests",
+            "extensions": {
+                EXT_HTTP_ROUTES_V1: {
+                    "kind": EXT_HTTP_ROUTES_V1,
+                    "version": "1.0.0",
+                    "inline": {
+                        "schema_version": 1,
+                        "routes": [{
+                            "pattern": pattern,
+                            "methods": ["GET"],
+                            "domain": "messaging"
+                        }]
+                    }
+                }
+            }
+        });
+        let manifest: greentic_types::PackManifest =
+            serde_json::from_value(manifest_json).expect("manifest deserializes");
+        let bytes = greentic_types::encode_pack_manifest(&manifest).expect("manifest encodes");
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .unwrap();
+        zip.write_all(&bytes).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn discover_revision_http_routes_stamps_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("alpha.gtpack");
+        let pattern = "/v1/messaging/webchat/{tenant}/token";
+        write_http_routes_pack(&pack, "alpha", pattern);
+
+        let scope = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let routes = discover_revision_http_routes(&[pack], &scope);
+        assert_eq!(routes.len(), 1, "one route discovered");
+        assert_eq!(routes[0].pattern, pattern);
+        let stamped = routes[0].scope.as_ref().expect("scope stamped");
+        assert_eq!(stamped.deployment_id, scope.deployment_id);
+        assert_eq!(stamped.bundle_id, scope.bundle_id);
+        assert_eq!(stamped.revision_id, scope.revision_id);
+
+        // The stamped route is matchable for its scope, invisible to the legacy
+        // matcher.
+        let table = HttpRouteTable::from_descriptors(routes);
+        assert!(
+            table
+                .match_request_for_revision("/v1/messaging/webchat/demo/token", "GET", &scope)
+                .is_some()
+        );
+        assert!(
+            table
+                .match_request("/v1/messaging/webchat/demo/token", "GET")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn discover_revision_http_routes_skips_unreadable_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not a zip — discovery must skip it (with a warning) and not abort.
+        let bad = dir.path().join("garbage.gtpack");
+        std::fs::write(&bad, b"not a zip archive").unwrap();
+        let missing = dir.path().join("does-not-exist.gtpack");
+
+        let scope = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let routes = discover_revision_http_routes(&[bad, missing], &scope);
+        assert!(routes.is_empty(), "unreadable packs yield no routes");
     }
 }

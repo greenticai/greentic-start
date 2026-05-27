@@ -18,6 +18,7 @@ mod component_qa_ops;
 pub mod config;
 mod demo_qa_bridge;
 mod dependency_resolver;
+mod deployment_routes;
 mod dev_store_path;
 mod discovery;
 mod doctor;
@@ -290,8 +291,8 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             )?;
             // Activate with the env's own DevStore secrets backend rather than
             // HostBuilder's default env-var backend (which rejects non-local
-            // envs). B3 will refine this to the per-tenant/pack-declared backend
-            // once it resolves the serving context.
+            // envs). A later step refines this to the per-tenant/pack-declared
+            // backend once the serving context is resolved.
             let env_dir = runtime_config::env_dir_in(&store_root, &env_id)?;
             let secrets: crate::secrets_gate::DynSecretsManager =
                 std::sync::Arc::new(crate::secrets_client::SecretsClient::open(&env_dir)?);
@@ -304,14 +305,21 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 &rc,
                 secrets,
             ))?;
+            // Activation now produces the full ingress-routing bundle (dispatcher
+            // + revision-scoped HTTP routes + request→deployment map). The
+            // remaining step is the execution bridge that runs a resolved request
+            // through the revision's runtime; until then we report and stop
+            // rather than pretend to serve.
             anyhow::bail!(
-                "activated {} revision(s) for env `{}` across {} deployment(s) into the runner \
-                 host, but serving from a materialized runtime-config is not yet wired: the \
-                 ingress consumer lands in B3. Pass `--bundle <path>` to boot a single bundle \
-                 directory for now.",
+                "activated {} revision(s) for env `{}` across {} deployment(s) ({} scoped HTTP \
+                 route(s), {} routable deployment(s)), but the request→revision execution bridge \
+                 is not yet wired. Pass `--bundle <path>` to boot a single bundle directory for \
+                 now.",
                 rc.revisions.len(),
                 rc.env_id,
-                activation.dispatcher.deployment_count(),
+                activation.routing.dispatcher.deployment_count(),
+                activation.routing.http_routes.routes().len(),
+                activation.routing.deployment_routes.len(),
             );
         }
     }
