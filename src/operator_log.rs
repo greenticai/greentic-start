@@ -4,6 +4,7 @@ use std::{
     fs::{File, OpenOptions},
     io,
     io::Write,
+    panic::Location,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -33,13 +34,19 @@ fn logger_slot() -> &'static Mutex<Option<Logger>> {
 }
 
 pub fn init(log_dir: PathBuf, min_level: Level) -> anyhow::Result<PathBuf> {
-    let fallback = std::env::current_dir()
+    let cwd_fallback = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("logs");
+    let home_fallback = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".greentic/logs"));
 
     let mut candidates = vec![log_dir.clone()];
-    if fallback != log_dir {
-        candidates.push(fallback.clone());
+    if cwd_fallback != log_dir {
+        candidates.push(cwd_fallback);
+    }
+    if let Some(home) = home_fallback
+        && !candidates.contains(&home)
+    {
+        candidates.push(home);
     }
 
     let mut last_error: Option<(PathBuf, io::Error)> = None;
@@ -85,14 +92,17 @@ pub fn init(log_dir: PathBuf, min_level: Level) -> anyhow::Result<PathBuf> {
 
 fn try_open_operator_log(log_dir: &Path) -> io::Result<File> {
     std::fs::create_dir_all(log_dir)?;
-    let operator_path = log_dir.join("operator.log");
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&operator_path)
+    // Unified host log: operator_log + tracing-subscriber both append here.
+    let path = log_dir.join("system.log");
+    OpenOptions::new().create(true).append(true).open(&path)
 }
 
+#[track_caller]
 pub fn log(level: Level, target: &str, message: String) {
+    log_at(Location::caller(), level, target, message);
+}
+
+fn log_at(location: &Location<'_>, level: Level, target: &str, message: String) {
     let slot = match logger_slot().lock() {
         Ok(slot) => slot,
         Err(_) => return,
@@ -109,15 +119,28 @@ pub fn log(level: Level, target: &str, message: String) {
         Err(_) => return,
     };
     let timestamp = Utc::now().to_rfc3339();
+    let file = shorten_log_path(location.file());
+    let line = location.line();
     let _ = writeln!(
         *writer,
-        "{timestamp} [{level:?}] {target} - {message}",
+        "{timestamp} [{level:?}] {target} {file}:{line} - {message}",
         level = level,
         target = target,
+        file = file,
+        line = line,
         message = message
     );
-    // Always flush to ensure logs are written immediately
     let _ = writer.flush();
+}
+
+/// Trim absolute paths emitted by `Location::caller()` down to a stable suffix
+/// (after `/src/`) so log entries stay portable across machines and CI runners.
+fn shorten_log_path(path: &str) -> &str {
+    if let Some(idx) = path.rfind("/src/") {
+        // Keep the `src/...` prefix so the path remains readable as a module reference.
+        return &path[idx + 1..];
+    }
+    path
 }
 
 #[cfg(test)]
@@ -144,22 +167,27 @@ pub fn reserve_service_log(log_dir: &Path, service: &str) -> anyhow::Result<Path
     Ok(path)
 }
 
+#[track_caller]
 pub fn trace(target: &str, message: impl AsRef<str>) {
     log(Level::Trace, target, message.as_ref().to_string());
 }
 
+#[track_caller]
 pub fn debug(target: &str, message: impl AsRef<str>) {
     log(Level::Debug, target, message.as_ref().to_string());
 }
 
+#[track_caller]
 pub fn info(target: &str, message: impl AsRef<str>) {
     log(Level::Info, target, message.as_ref().to_string());
 }
 
+#[track_caller]
 pub fn warn(target: &str, message: impl AsRef<str>) {
     log(Level::Warn, target, message.as_ref().to_string());
 }
 
+#[track_caller]
 pub fn error(target: &str, message: impl AsRef<str>) {
     log(Level::Error, target, message.as_ref().to_string());
 }
@@ -171,14 +199,28 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn writes_operator_log() -> anyhow::Result<()> {
+    fn writes_system_log_with_source_location() -> anyhow::Result<()> {
         reset_for_tests();
         let dir = tempdir()?;
         let _ = init(dir.path().to_path_buf(), Level::Info)?;
-        info("tests::writes_operator_log", "hello world");
-        let contents = fs::read_to_string(dir.path().join("operator.log"))?;
+        info("tests::writes_system_log", "hello world");
+        let contents = fs::read_to_string(dir.path().join("system.log"))?;
         assert!(contents.contains("hello world"));
+        assert!(
+            contents.contains("src/operator_log.rs:"),
+            "log entry must include file:line: {contents}"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn shorten_log_path_trims_to_src_suffix() {
+        assert_eq!(
+            shorten_log_path("/Users/whoever/project/crates/foo/src/bar/baz.rs"),
+            "src/bar/baz.rs"
+        );
+        assert_eq!(shorten_log_path("relative/path.rs"), "relative/path.rs");
+        assert_eq!(shorten_log_path("/no/src/marker.rs"), "src/marker.rs");
     }
 
     #[test]
