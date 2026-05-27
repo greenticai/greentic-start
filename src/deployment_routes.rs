@@ -99,6 +99,30 @@ impl DeploymentRouteTable {
         self.routes.len()
     }
 
+    /// Test-only: build a table directly from `(deployment_id, tenant, hosts,
+    /// path_prefixes)` tuples, applying the same host/prefix normalization as
+    /// [`Self::from_environment`]. Lets other modules' tests exercise routing
+    /// without constructing a full `Environment`.
+    #[cfg(test)]
+    pub(crate) fn from_parts(parts: Vec<(DeploymentId, String, Vec<String>, Vec<String>)>) -> Self {
+        let routes = parts
+            .into_iter()
+            .map(
+                |(deployment_id, tenant, hosts, path_prefixes)| DeploymentRoute {
+                    deployment_id,
+                    tenant,
+                    hosts: hosts
+                        .iter()
+                        .map(|h| h.trim().to_ascii_lowercase())
+                        .filter(|h| !h.is_empty())
+                        .collect(),
+                    path_prefixes: path_prefixes.iter().map(|p| normalize_prefix(p)).collect(),
+                },
+            )
+            .collect();
+        Self { routes }
+    }
+
     /// Resolve `(host, path)` to `(deployment_id, tenant)`.
     ///
     /// Host match is case-insensitive; an empty `hosts` binding matches any
