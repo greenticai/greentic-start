@@ -35,9 +35,8 @@ use greentic_deployer::path_safety::normalize_under_root;
 use greentic_runner_host::runtime::{RevisionPackRef, TenantRuntime};
 use greentic_runner_host::{HostBuilder, HostConfig, RunnerHost, TenantBindings};
 use greentic_types::EnvId;
-use ulid::Ulid;
 
-use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
+use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig, parse_ulid};
 use crate::runtime_config::{LoadedRuntimeConfig, env_dir_in};
 use crate::secrets_gate::DynSecretsManager;
 
@@ -56,8 +55,6 @@ pub(crate) struct RuntimeConfigActivation {
     #[allow(dead_code)]
     pub(crate) host: RunnerHost,
     pub(crate) dispatcher: RevisionDispatcher,
-    /// Number of revisions loaded into [`RunnerHost::active_packs`].
-    pub(crate) revision_count: usize,
 }
 
 /// What a deployment in the `Environment` says about itself, used both to key
@@ -66,7 +63,7 @@ pub(crate) struct RuntimeConfigActivation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DeploymentMeta {
     tenant: String,
-    customer_id: Option<String>,
+    customer_id: String,
     status: BundleDeploymentStatus,
     /// The bundle the deployment is (immutably) bound to.
     bundle_id: String,
@@ -155,14 +152,19 @@ pub(crate) async fn activate_runtime_config(
 
     let configs = host.tenant_configs();
     for block in &rc.revisions {
-        let meta = &deployments[block.deployment_id.as_str()];
+        // Both lookups are infallible: the validation loop above proved every
+        // block's deployment is present, and registered a host config for its
+        // tenant. `expect` documents that structural invariant.
+        let meta = deployments
+            .get(block.deployment_id.as_str())
+            .expect("deployment validated in the loop above");
         let deployment_id = DeploymentId(parse_ulid(&block.deployment_id, "deployment_id")?);
         let revision_id = RevisionId(parse_ulid(&block.revision_id, "revision_id")?);
         let bundle_id = BundleId::new(&block.bundle_id);
         let config = configs
             .get(&meta.tenant)
             .cloned()
-            .ok_or_else(|| anyhow!("no host config registered for tenant `{}`", meta.tenant))?;
+            .expect("host config registered for tenant in the loop above");
 
         let pack_refs = read_revision_pack_refs(&env_dir, &revision_id, &block.pack_list_refs)
             .with_context(|| {
@@ -182,7 +184,7 @@ pub(crate) async fn activate_runtime_config(
             deployment_id,
             bundle_id.clone(),
             revision_id,
-            meta.customer_id.clone(),
+            Some(meta.customer_id.clone()),
         )
         .await
         .with_context(|| format!("loading revision `{}`", block.revision_id))?;
@@ -204,11 +206,7 @@ pub(crate) async fn activate_runtime_config(
     )
     .context("building revision dispatcher")?;
 
-    Ok(RuntimeConfigActivation {
-        host,
-        dispatcher,
-        revision_count: rc.revisions.len(),
-    })
+    Ok(RuntimeConfigActivation { host, dispatcher })
 }
 
 /// Index a deployment's tenant + customer by `deployment_id` string. The
@@ -222,7 +220,7 @@ fn deployment_index(env: &Environment) -> HashMap<String, DeploymentMeta> {
                 dep.deployment_id.to_string(),
                 DeploymentMeta {
                     tenant: dep.route_binding.tenant_selector.tenant.clone(),
-                    customer_id: Some(dep.customer_id.as_str().to_string()),
+                    customer_id: dep.customer_id.as_str().to_string(),
                     status: dep.status,
                     bundle_id: dep.bundle_id.as_str().to_string(),
                 },
@@ -283,10 +281,6 @@ fn read_revision_pack_refs(
         bail!("revision `{expected}` resolved to no pinned packs");
     }
     Ok(refs)
-}
-
-fn parse_ulid(s: &str, label: &str) -> anyhow::Result<Ulid> {
-    Ulid::from_string(s).with_context(|| format!("invalid {label} `{s}` (expected ULID)"))
 }
 
 /// Load the per-env revision-dispatcher signing key, creating it on first use.
@@ -441,7 +435,7 @@ mod tests {
         let index = deployment_index(&env);
         let meta = index.get(&key).expect("deployment present");
         assert_eq!(meta.tenant, "acme");
-        assert_eq!(meta.customer_id.as_deref(), Some("cust-1"));
+        assert_eq!(meta.customer_id, "cust-1");
         assert_eq!(meta.bundle_id, "fast2flow");
         assert_eq!(meta.status, BundleDeploymentStatus::Active);
     }

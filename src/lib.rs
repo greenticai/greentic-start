@@ -309,7 +309,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                  host, but serving from a materialized runtime-config is not yet wired: the \
                  ingress consumer lands in B3. Pass `--bundle <path>` to boot a single bundle \
                  directory for now.",
-                activation.revision_count,
+                rc.revisions.len(),
                 rc.env_id,
                 activation.dispatcher.deployment_count(),
             );

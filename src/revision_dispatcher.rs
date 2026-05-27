@@ -743,7 +743,10 @@ fn weighted_pick_healthy<R: Rng + ?Sized>(
         .revision_id)
 }
 
-fn parse_ulid(s: &str, label: &str) -> anyhow::Result<Ulid> {
+/// Parse a Crockford-base32 ULID string into a typed [`Ulid`], with a labelled
+/// error. Shared with [`crate::revision_boot`] (the activation path parses the
+/// same runtime-config id strings).
+pub(crate) fn parse_ulid(s: &str, label: &str) -> anyhow::Result<Ulid> {
     Ulid::from_string(s).with_context(|| format!("invalid {label} `{s}` (expected ULID)"))
 }
 
