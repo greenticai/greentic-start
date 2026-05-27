@@ -23,6 +23,7 @@ use crate::secret_requirements::{answer_key_is_secret, secret_answer_keys_for_pa
 pub struct AppPackInfo {
     pub pack_id: String,
     pub flows: Vec<AppFlowInfo>,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -172,7 +173,12 @@ pub fn load_app_pack_info(pack_path: &Path) -> Result<AppPackInfo> {
     let pack_id = extract_text_or_symbol(&value, "pack_id", "pack_ids")
         .ok_or_else(|| anyhow::anyhow!("pack manifest missing pack id in {pack_path:?}"))?;
     let flows = extract_flows(&value);
-    Ok(AppPackInfo { pack_id, flows })
+    let capabilities = extract_capabilities(&value);
+    Ok(AppPackInfo {
+        pack_id,
+        flows,
+        capabilities,
+    })
 }
 
 pub fn select_app_flow(info: &AppPackInfo) -> Result<&AppFlowInfo> {
@@ -451,6 +457,21 @@ fn extract_flows(value: &CborValue) -> Vec<AppFlowInfo> {
         }
     }
     flows
+}
+
+fn extract_capabilities(value: &CborValue) -> Vec<String> {
+    let mut caps = Vec::new();
+    if let CborValue::Map(map) = value {
+        let caps_key = CborValue::Text("capabilities".to_string());
+        if let Some(CborValue::Array(entries)) = map.get(&caps_key) {
+            for entry in entries {
+                if let CborValue::Text(text) = entry {
+                    caps.push(text.clone());
+                }
+            }
+        }
+    }
+    caps
 }
 
 fn parse_flow_entry(value: &CborValue) -> Option<AppFlowInfo> {
@@ -1130,6 +1151,7 @@ mod tests {
                     kind: "workflow".to_string(),
                 },
             ],
+            capabilities: Vec::new(),
         };
         assert_eq!(select_app_flow(&info).expect("default flow").id, "default");
 
@@ -1145,6 +1167,7 @@ mod tests {
                     kind: "setup".to_string(),
                 },
             ],
+            capabilities: Vec::new(),
         };
         assert_eq!(
             select_app_flow(&single_messaging)
@@ -1168,6 +1191,7 @@ mod tests {
                     kind: "messaging".to_string(),
                 },
             ],
+            capabilities: Vec::new(),
         };
 
         let err = select_app_flow(&info).expect_err("ambiguous flow should fail");

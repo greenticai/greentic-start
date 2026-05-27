@@ -23,6 +23,7 @@ mod discovery;
 mod doctor;
 mod domains;
 mod event_router;
+mod fast2flow;
 pub(crate) mod flow_log;
 mod gmap;
 mod http_ingress;
