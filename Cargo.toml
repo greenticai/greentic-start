@@ -99,10 +99,11 @@ version = ">=1.1.0-dev, <1.2.0-0"
 [dependencies.greentic-runner-desktop]
 version = ">=1.1.0-dev, <1.2.0-0"
 
-# Floor bumped to the PR-1 publish that adds the revision pack-loading API
-# (`ActivePacks::{load,insert}_revision`, `RevisionPackRef`).
+# Floor bumped to the publish that adds `RunnerHost::handle_activity_for_revision`
+# (#369) — the revision-aware execute entry point the ingress dispatch bridge
+# calls. Supersedes the PR-1 `load_revision`/`insert_revision` floor.
 [dependencies.greentic-runner-host]
-version = ">=1.1.0-dev.26465681124, <1.2.0-0"
+version = ">=1.1.0-dev.26504544113, <1.2.0-0"
 
 [dependencies.greentic-secrets-lib]
 version = ">=1.1.0-dev, <1.2.0-0"

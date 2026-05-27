@@ -52,6 +52,7 @@ mod revision_dispatcher;
 mod revision_drain;
 pub mod revision_health_gate;
 mod revision_pin;
+mod revision_serve;
 mod rollout_telemetry;
 mod runner_exec;
 mod runner_host;
@@ -305,22 +306,46 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 &rc,
                 secrets,
             ))?;
-            // Activation now produces the full ingress-routing bundle (dispatcher
-            // + revision-scoped HTTP routes + request→deployment map). The
-            // remaining step is the execution bridge that runs a resolved request
-            // through the revision's runtime; until then we report and stop
-            // rather than pretend to serve.
-            anyhow::bail!(
-                "activated {} revision(s) for env `{}` across {} deployment(s) ({} scoped HTTP \
-                 route(s), {} routable deployment(s)), but the request→revision execution bridge \
-                 is not yet wired. Pass `--bundle <path>` to boot a single bundle directory for \
-                 now.",
-                rc.revisions.len(),
-                rc.env_id,
-                activation.routing.dispatcher.deployment_count(),
-                activation.routing.http_routes.routes().len(),
-                activation.routing.deployment_routes.len(),
+
+            // Execution bridge: serve the activated revisions over a slim HTTP
+            // loop. Each request resolves to a deployment, the dispatcher picks a
+            // revision, and the request runs against that revision's runtime via
+            // `RunnerHost::handle_activity_for_revision`. This is the generic-JSON
+            // vertical slice — provider webhook parsing, WebChat/WS, and static
+            // assets under revisions stay on the legacy `--bundle` ingress.
+            let revision_boot::RuntimeConfigActivation { host, routing } = activation;
+            let revision_count = rc.revisions.len();
+            let deployment_count = routing.dispatcher.deployment_count();
+            let bind_addr = revision_serve::default_bind_addr();
+            let server =
+                revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
+                    bind_addr,
+                    host: std::sync::Arc::new(host),
+                    routing,
+                })
+                .context("starting the revision ingress server")?;
+            let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "serving {revision_count} revision(s) for env `{}` across {deployment_count} \
+                     deployment(s) on http://{listen}",
+                    rc.env_id
+                ),
             );
+            println!(
+                "\nServing {revision_count} revision(s) for env `{}` on http://{listen}. \
+                 Press Ctrl+C to stop.",
+                rc.env_id
+            );
+            if let Err(err) = activation_rt.block_on(tokio::signal::ctrl_c()) {
+                operator_log::warn(
+                    module_path!(),
+                    format!("revision serving Ctrl+C listener error: {err}"),
+                );
+            }
+            server.stop()?;
+            return Ok(());
         }
     }
 

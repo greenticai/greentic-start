@@ -1033,12 +1033,7 @@ fn apply_set_cookie(
     directive: Option<SetCookieDirective>,
 ) -> Response<Full<Bytes>> {
     if let Some(directive) = directive {
-        let header = format!(
-            "{}={}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
-            directive.name,
-            directive.value,
-            directive.max_age.as_secs()
-        );
+        let header = directive.to_header_value();
         match hyper::header::HeaderValue::from_str(&header) {
             Ok(value) => {
                 response
