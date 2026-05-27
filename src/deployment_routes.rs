@@ -31,6 +31,28 @@ struct DeploymentRoute {
 }
 
 impl DeploymentRoute {
+    /// Build a route from raw binding data, applying host (trim + lowercase,
+    /// drop empties) and path-prefix normalization. Single normalization site
+    /// shared by [`DeploymentRouteTable::from_environment`] and the test
+    /// constructor, so they cannot drift.
+    fn new(
+        deployment_id: DeploymentId,
+        tenant: String,
+        hosts: &[String],
+        path_prefixes: &[String],
+    ) -> Self {
+        Self {
+            deployment_id,
+            tenant,
+            hosts: hosts
+                .iter()
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
+            path_prefixes: path_prefixes.iter().map(|p| normalize_prefix(p)).collect(),
+        }
+    }
+
     /// `true` when this route answers for `host`. An empty `hosts` list matches
     /// any host (including a request with no `Host` header); a non-empty list
     /// requires the request to carry a host that is in the list.
@@ -73,22 +95,13 @@ impl DeploymentRouteTable {
             .bundles
             .iter()
             .filter(|dep| dep.status == BundleDeploymentStatus::Active)
-            .map(|dep| DeploymentRoute {
-                deployment_id: dep.deployment_id,
-                tenant: dep.route_binding.tenant_selector.tenant.clone(),
-                hosts: dep
-                    .route_binding
-                    .hosts
-                    .iter()
-                    .map(|h| h.trim().to_ascii_lowercase())
-                    .filter(|h| !h.is_empty())
-                    .collect(),
-                path_prefixes: dep
-                    .route_binding
-                    .path_prefixes
-                    .iter()
-                    .map(|p| normalize_prefix(p))
-                    .collect(),
+            .map(|dep| {
+                DeploymentRoute::new(
+                    dep.deployment_id,
+                    dep.route_binding.tenant_selector.tenant.clone(),
+                    &dep.route_binding.hosts,
+                    &dep.route_binding.path_prefixes,
+                )
             })
             .collect();
         Self { routes }
@@ -107,18 +120,9 @@ impl DeploymentRouteTable {
     pub(crate) fn from_parts(parts: Vec<(DeploymentId, String, Vec<String>, Vec<String>)>) -> Self {
         let routes = parts
             .into_iter()
-            .map(
-                |(deployment_id, tenant, hosts, path_prefixes)| DeploymentRoute {
-                    deployment_id,
-                    tenant,
-                    hosts: hosts
-                        .iter()
-                        .map(|h| h.trim().to_ascii_lowercase())
-                        .filter(|h| !h.is_empty())
-                        .collect(),
-                    path_prefixes: path_prefixes.iter().map(|p| normalize_prefix(p)).collect(),
-                },
-            )
+            .map(|(deployment_id, tenant, hosts, path_prefixes)| {
+                DeploymentRoute::new(deployment_id, tenant, &hosts, &path_prefixes)
+            })
             .collect();
         Self { routes }
     }
@@ -131,7 +135,7 @@ impl DeploymentRouteTable {
     /// prefix wins. On a tie the first deployment in environment order wins —
     /// the operator rejects ambiguous bindings at deploy time, so a tie is not
     /// expected at runtime, but the resolution stays deterministic regardless.
-    pub fn resolve(&self, host: Option<&str>, path: &str) -> Option<(DeploymentId, String)> {
+    pub fn resolve(&self, host: Option<&str>, path: &str) -> Option<(DeploymentId, &str)> {
         let host = host.map(|h| host_without_port(h).to_ascii_lowercase());
         let mut best: Option<(&DeploymentRoute, usize)> = None;
         for route in &self.routes {
@@ -145,7 +149,7 @@ impl DeploymentRouteTable {
                 best = Some((route, len));
             }
         }
-        best.map(|(route, _)| (route.deployment_id, route.tenant.clone()))
+        best.map(|(route, _)| (route.deployment_id, route.tenant.as_str()))
     }
 }
 
@@ -154,7 +158,6 @@ impl DeploymentRouteTable {
 /// tables cannot serve, so the three travel together to enforce that invariant
 /// at the type level: the ingress is either fully revision-routed or fully
 /// legacy, never half-wired.
-#[derive(Clone)]
 pub struct RevisionIngressRouting {
     /// Per-deployment traffic-split selector built from the runtime-config.
     pub dispatcher: Arc<RevisionDispatcher>,
@@ -183,15 +186,13 @@ fn host_without_port(host: &str) -> &str {
     }
 }
 
-/// Normalize a configured path prefix: ensure a single leading `/`, drop any
-/// trailing `/` (except for the root prefix itself).
+/// Normalize a configured path prefix: collapse leading slashes to a single
+/// `/`, drop any trailing `/` (except for the root prefix itself). Collapsing
+/// the leading slash matters because a request path from hyper always has a
+/// single leading `/`, so a binding like `//api` would otherwise never match.
 fn normalize_prefix(prefix: &str) -> String {
-    let trimmed = prefix.trim();
-    let with_lead = if trimmed.starts_with('/') {
-        trimmed.to_string()
-    } else {
-        format!("/{trimmed}")
-    };
+    let core = prefix.trim().trim_start_matches('/');
+    let with_lead = format!("/{core}");
     let no_trail = with_lead.trim_end_matches('/');
     if no_trail.is_empty() {
         "/".to_string()
@@ -306,10 +307,7 @@ mod tests {
             ),
         ]));
         assert_eq!(table.len(), 1);
-        assert_eq!(
-            table.resolve(None, "/active/x"),
-            Some((active, "acme".to_string()))
-        );
+        assert_eq!(table.resolve(None, "/active/x"), Some((active, "acme")));
         assert!(table.resolve(None, "/paused/x").is_none());
     }
 
@@ -325,9 +323,9 @@ mod tests {
         )]));
         assert_eq!(
             table.resolve(Some("anything.example.com"), "/anywhere"),
-            Some((id, "acme".to_string()))
+            Some((id, "acme"))
         );
-        assert_eq!(table.resolve(None, "/"), Some((id, "acme".to_string())));
+        assert_eq!(table.resolve(None, "/"), Some((id, "acme")));
     }
 
     #[test]
@@ -363,15 +361,9 @@ mod tests {
             ),
         ]));
         // Most specific prefix wins.
-        assert_eq!(
-            table.resolve(None, "/api/v1/things"),
-            Some((api, "api".to_string()))
-        );
+        assert_eq!(table.resolve(None, "/api/v1/things"), Some((api, "api")));
         // Falls back to root for unrelated paths.
-        assert_eq!(
-            table.resolve(None, "/other"),
-            Some((root, "root".to_string()))
-        );
+        assert_eq!(table.resolve(None, "/other"), Some((root, "root")));
     }
 
     #[test]
@@ -416,5 +408,9 @@ mod tests {
         assert_eq!(normalize_prefix("/api/"), "/api");
         assert_eq!(normalize_prefix("/"), "/");
         assert_eq!(normalize_prefix(""), "/");
+        // Collapse repeated leading slashes — a request path always has exactly
+        // one, so "//api" must normalize to "/api" or it would never match.
+        assert_eq!(normalize_prefix("//api"), "/api");
+        assert_eq!(normalize_prefix("///"), "/");
     }
 }

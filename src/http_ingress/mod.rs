@@ -56,7 +56,6 @@ use static_handler::serve_static_route;
 
 const LEGACY_DIRECTLINE_COMPAT_ENV: &str = "GREENTIC_START_ENABLE_LEGACY_DIRECTLINE";
 
-#[derive(Clone)]
 pub struct HttpIngressConfig {
     pub bind_addr: SocketAddr,
     pub domains: Vec<Domain>,
@@ -684,13 +683,13 @@ where
     // Tries: (0) revision routing, (1) pack-declared HTTP routes, (2) static
     // routes, (3) standard ingress.
     let method = req.method().clone();
-    // Host header (port-stripped by the resolver) drives request→deployment
-    // resolution; captured before the body is consumed below.
+    // Host header drives request→deployment resolution (the resolver strips the
+    // port and lowercases). Borrowed, not allocated — only the revision-routing
+    // block reads it, and that runs before the body is consumed below.
     let host = req
         .headers()
         .get(hyper::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_string());
+        .and_then(|value| value.to_str().ok());
     // Set-Cookie directive carried out of revision selection so the chosen
     // revision stays sticky for the session. Applied to the primary ingress
     // response below.
@@ -706,13 +705,12 @@ where
         // reaching this block, so they are NOT revision-routed yet — see the
         // note there; integrating them is part of the execution-bridge PR.
         if let Some(routing) = state.revision_routing.as_ref()
-            && let Some((deployment_id, tenant)) =
-                routing.deployment_routes.resolve(host.as_deref(), &path)
+            && let Some((deployment_id, tenant)) = routing.deployment_routes.resolve(host, &path)
         {
             let cookie = extract_cookie(req.headers(), &cookie_name(deployment_id));
             let dispatch_req = DispatchRequest {
                 env_id: routing.dispatcher.env_id(),
-                tenant: &tenant,
+                tenant,
                 deployment_id,
                 session_hint: None,
                 // Public ingress traffic never trusts the revision header.

@@ -59,7 +59,7 @@ enum RouteSegment {
 }
 
 /// Ordered table of pack-declared HTTP routes, sorted by specificity.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct HttpRouteTable {
     routes: Vec<HttpRouteDescriptor>,
 }
@@ -319,23 +319,7 @@ pub fn discover_http_routes_from_bundle(
     bundle_root: &Path,
 ) -> anyhow::Result<Vec<HttpRouteDescriptor>> {
     let pack_paths = collect_runtime_pack_paths(bundle_root)?;
-    let mut all_routes = Vec::new();
-    for pack_path in pack_paths {
-        match read_pack_http_routes(&pack_path) {
-            Ok(Some(routes)) => all_routes.extend(routes),
-            Ok(None) => continue,
-            Err(err) => {
-                crate::operator_log::warn(
-                    module_path!(),
-                    format!(
-                        "failed to read http-routes from {}: {err:#}",
-                        pack_path.display()
-                    ),
-                );
-            }
-        }
-    }
-    Ok(all_routes)
+    Ok(discover_routes_from_packs(&pack_paths, None))
 }
 
 /// Discover HTTP routes from a revision's pinned pack files, stamping each with
@@ -345,18 +329,30 @@ pub fn discover_http_routes_from_bundle(
 /// this takes explicit pack paths and reuses the same per-pack manifest reader
 /// as [`discover_http_routes_from_bundle`]. The scope makes the resulting
 /// descriptors matchable via [`HttpRouteTable::match_request_for_revision`].
-/// A pack that declares no routes (or fails to read) is skipped with a warning
-/// — a malformed pack must not abort activation of the rest of the revision.
 pub fn discover_revision_http_routes(
     pack_paths: &[PathBuf],
     scope: &RevisionScope,
+) -> Vec<HttpRouteDescriptor> {
+    discover_routes_from_packs(pack_paths, Some(scope))
+}
+
+/// Read pack-declared HTTP routes from each pack path, optionally stamping every
+/// route with `scope` (`Some` = revision-scoped discovery, `None` = legacy
+/// single-bundle). A pack that declares no routes — or fails to read — is
+/// skipped with a warning so one malformed pack can't abort discovery of the
+/// rest.
+fn discover_routes_from_packs(
+    pack_paths: &[PathBuf],
+    scope: Option<&RevisionScope>,
 ) -> Vec<HttpRouteDescriptor> {
     let mut routes = Vec::new();
     for pack_path in pack_paths {
         match read_pack_http_routes(pack_path) {
             Ok(Some(mut pack_routes)) => {
-                for route in &mut pack_routes {
-                    route.scope = Some(scope.clone());
+                if let Some(scope) = scope {
+                    for route in &mut pack_routes {
+                        route.scope = Some(scope.clone());
+                    }
                 }
                 routes.extend(pack_routes);
             }
