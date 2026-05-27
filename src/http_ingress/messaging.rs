@@ -36,6 +36,16 @@ pub(super) fn route_messaging_envelopes(
     );
 
     for envelope in &envelopes {
+        // FIXME(act-on-directive): MVP logs the mapped directive inside
+        // try_for_request; follow-up wires non-Continue returns into the
+        // dispatcher to short-circuit the default-flow path.
+        let _ = crate::fast2flow::try_for_request(
+            crate::fast2flow::Fast2FlowConfig::global(),
+            ctx,
+            &pack_info,
+            envelope,
+            provider,
+        );
         let outputs = if let Some(route_to_card) = envelope.metadata.get("routeToCardId") {
             match read_card_from_pack(&app_pack_path, route_to_card) {
                 Some(mut card_json) => {
@@ -703,6 +713,7 @@ mod tests {
             &AppPackInfo {
                 pack_id: "app-pack".to_string(),
                 flows: vec![],
+                capabilities: Vec::new(),
             },
             &AppFlowInfo {
                 id: "default".to_string(),
