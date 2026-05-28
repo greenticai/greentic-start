@@ -398,14 +398,20 @@ fn extract_flows(value: &CborValue) -> Vec<AppFlowInfo> {
     flows
 }
 
+/// Reads the pack manifest's `capabilities: Vec<ComponentCapability>` and
+/// returns each entry's `name`. Cbor shape is `Array<Map>` per
+/// `greentic_types::ComponentCapability { name, description }`, not the
+/// flat `Array<Text>` an earlier draft assumed.
 fn extract_capabilities(value: &CborValue) -> Vec<String> {
     let mut caps = Vec::new();
     if let CborValue::Map(map) = value {
         let caps_key = CborValue::Text("capabilities".to_string());
         if let Some(CborValue::Array(entries)) = map.get(&caps_key) {
             for entry in entries {
-                if let CborValue::Text(text) = entry {
-                    caps.push(text.clone());
+                if let CborValue::Map(entry_map) = entry
+                    && let Some(name) = extract_text_from_map(entry_map, "name")
+                {
+                    caps.push(name);
                 }
             }
         }
@@ -1379,6 +1385,53 @@ mod tests {
                 .kind,
             "messaging"
         );
+    }
+
+    #[test]
+    fn extract_capabilities_reads_name_from_component_capability_entries() {
+        // Mirrors greentic_types::ComponentCapability { name, description } —
+        // the cbor for `capabilities` is Array<Map>, not Array<Text>.
+        let manifest = CborValue::Map(BTreeMap::from([(
+            CborValue::Text("capabilities".to_string()),
+            CborValue::Array(vec![
+                CborValue::Map(BTreeMap::from([
+                    cbor_text("name", "greentic.cap.fast2flow.v1"),
+                    cbor_text("description", "routable flows"),
+                ])),
+                CborValue::Map(BTreeMap::from([cbor_text("name", "greentic.cap.other.v1")])),
+            ]),
+        )]));
+        assert_eq!(
+            extract_capabilities(&manifest),
+            vec![
+                "greentic.cap.fast2flow.v1".to_string(),
+                "greentic.cap.other.v1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_capabilities_skips_entries_without_name_or_wrong_shape() {
+        // Bare strings and name-less maps must not surface as capabilities;
+        // returning silently keeps the gate fail-closed for malformed packs.
+        let manifest = CborValue::Map(BTreeMap::from([(
+            CborValue::Text("capabilities".to_string()),
+            CborValue::Array(vec![
+                CborValue::Map(BTreeMap::from([cbor_text("name", "greentic.cap.ok.v1")])),
+                CborValue::Map(BTreeMap::from([cbor_text("description", "no name")])),
+                CborValue::Text("legacy flat string".to_string()),
+            ]),
+        )]));
+        assert_eq!(
+            extract_capabilities(&manifest),
+            vec!["greentic.cap.ok.v1".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_capabilities_returns_empty_when_field_missing() {
+        let manifest = CborValue::Map(BTreeMap::from([cbor_text("pack_id", "demo-pack")]));
+        assert!(extract_capabilities(&manifest).is_empty());
     }
 
     #[test]
