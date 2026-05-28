@@ -52,6 +52,7 @@ mod revision_dispatcher;
 mod revision_drain;
 pub mod revision_health_gate;
 mod revision_pin;
+mod revision_reload;
 mod revision_serve;
 mod rollout_telemetry;
 mod runner_exec;
@@ -311,6 +312,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // backend once the serving context is resolved.
         let secrets: crate::secrets_gate::DynSecretsManager =
             std::sync::Arc::new(crate::secrets_client::SecretsClient::open(&env_dir)?);
+        // Clone for the runtime-config watcher's rebuild closure (N2.2):
+        // it needs the same secrets backend to rebuild activations after
+        // the deployer rewrites `runtime-config.json`. `DynSecretsManager`
+        // is `Arc<dyn ...>`, so this is a refcount bump.
+        let watcher_secrets = std::sync::Arc::clone(&secrets);
 
         // Load the Environment so the bind address can layer on top of the
         // persisted `host_config.listen_addr`. The same `Environment` is
@@ -367,12 +373,54 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         };
         operator_log::info(module_path!(), banner.clone());
         println!("\n{banner}. Press Ctrl+C to stop.");
+
+        // N2.2: spawn the runtime-config watcher. As the deployer rewrites
+        // `<env_dir>/runtime-config.json` (via `gtc op bundles add`,
+        // `revisions stage/warm`, `traffic set`), the watcher rebuilds the
+        // activation and hands it to `RevisionServer::reload` so the
+        // running server picks up new revisions / traffic splits without a
+        // process restart. Wrapped in `Arc` so the watcher can call
+        // `server.reload()` from its worker thread while the main thread
+        // still owns the original handle for the shutdown path.
+        let server = std::sync::Arc::new(server);
+        let watcher = revision_reload::spawn_runtime_config_watcher(
+            env_dir.clone(),
+            revision_reload::default_debounce(),
+            // Drain window matches the cold-start expectation: in-flight
+            // requests against the previous activation get ~30s to finish
+            // before the old `RunnerHost` drops. Tuned for local-dev;
+            // remote/cloud is Phase D scope.
+            std::time::Duration::from_secs(30),
+            std::sync::Arc::clone(&server),
+            revision_reload::default_rebuild(
+                store_root.clone(),
+                env_id.clone(),
+                watcher_secrets,
+                activation_rt.handle().clone(),
+            ),
+        )
+        .context("spawning runtime-config watcher")?;
+
         if let Err(err) = activation_rt.block_on(tokio::signal::ctrl_c()) {
             operator_log::warn(
                 module_path!(),
                 format!("revision serving Ctrl+C listener error: {err}"),
             );
         }
+        // Drop the watcher before stopping the server so the watcher's
+        // worker can't call `server.reload()` on a server that's already
+        // half-torn-down.
+        drop(watcher);
+        // Recover sole ownership for `stop()`. Any in-flight drain task
+        // spawned by N2.1's `reload()` already owns its own `Arc` to the
+        // previous activation (not to the server itself), so this should
+        // succeed unless a reload is mid-flight.
+        let server = std::sync::Arc::try_unwrap(server).map_err(|_| {
+            anyhow::anyhow!(
+                "RevisionServer Arc still has consumers at shutdown — \
+                 a reload may be mid-flight"
+            )
+        })?;
         server.stop()?;
         return Ok(());
     }
