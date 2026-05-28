@@ -32,7 +32,7 @@
 //! user/session or pin a chosen revision (see `caller_identity`).
 
 use std::convert::Infallible;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -50,6 +50,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
 use greentic_runner_host::{Activity, RunnerHost};
+
+use greentic_deploy_spec::{DEFAULT_LISTEN_ADDR, EnvironmentHostConfig};
 
 use crate::deployment_routes::RevisionIngressRouting;
 use crate::http_routes::{HttpRouteTable, RevisionScope};
@@ -74,6 +76,10 @@ pub(crate) struct RevisionServeConfig {
 struct ServeState {
     host: Arc<RunnerHost>,
     routing: RevisionIngressRouting,
+    /// Address the listener bound to (after the `find_available_port` bump).
+    /// Reported by `/status` so operators see the actual interface + port
+    /// rather than what the user requested.
+    bound_addr: SocketAddr,
 }
 
 /// A running revision ingress server on its own thread + Tokio runtime, mirroring
@@ -82,6 +88,9 @@ pub(crate) struct RevisionServer {
     shutdown: Option<oneshot::Sender<()>>,
     handle: Option<JoinHandle<Result<()>>>,
     actual_port: u16,
+    /// Dispatcher handle kept so external callers (the startup banner) can
+    /// snapshot the same counts `/status` reads.
+    dispatcher: Arc<crate::revision_dispatcher::RevisionDispatcher>,
 }
 
 impl RevisionServer {
@@ -104,9 +113,11 @@ impl RevisionServer {
         }
         let addr = SocketAddr::new(listen_ip, actual_port);
 
+        let dispatcher = Arc::clone(&config.routing.dispatcher);
         let state = Arc::new(ServeState {
             host: config.host,
             routing: config.routing,
+            bound_addr: addr,
         });
 
         let (tx, rx) = oneshot::channel();
@@ -188,6 +199,7 @@ impl RevisionServer {
             shutdown: Some(tx),
             handle: Some(handle),
             actual_port,
+            dispatcher,
         })
     }
 
@@ -195,6 +207,13 @@ impl RevisionServer {
     /// taken).
     pub(crate) fn actual_port(&self) -> u16 {
         self.actual_port
+    }
+
+    /// `(deployment_count, revision_count)` from a single dispatcher
+    /// snapshot — the same source `/status` reads. Used by the startup
+    /// banner so the banner and `/status` cannot disagree.
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        self.dispatcher.counts()
     }
 
     /// Signal shutdown and join the serving thread.
@@ -233,8 +252,9 @@ async fn serve(
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    if path == "/healthz" || path == "/health" {
-        return Ok(text_response(StatusCode::OK, "ok"));
+
+    if let Some(response) = try_probe_response(&path, &state) {
+        return Ok(response);
     }
 
     let host_header = header_str(req.headers(), header::HOST.as_str());
@@ -525,19 +545,88 @@ fn error_response(status: StatusCode, message: impl AsRef<str>) -> Response<Full
     text_response(status, message.as_ref())
 }
 
-/// Default bind address for the revision ingress: `127.0.0.1:8080`, with
-/// `GREENTIC_GATEWAY_LISTEN_ADDR` (IP) and `PORT` overrides matching the rest of
-/// the gateway configuration.
-pub(crate) fn default_bind_addr() -> SocketAddr {
-    let ip = std::env::var("GREENTIC_GATEWAY_LISTEN_ADDR")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<IpAddr>().ok())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-    let port = std::env::var("PORT")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u16>().ok())
-        .unwrap_or(8080);
-    SocketAddr::new(ip, port)
+/// `/livez`, `/readyz`, `/healthz`, `/health` return `200 ok`; `/status`
+/// returns the diagnostics JSON. Returns `None` for non-probe paths so the
+/// caller falls through to routing.
+fn try_probe_response(path: &str, state: &ServeState) -> Option<Response<Full<Bytes>>> {
+    if matches!(path, "/livez" | "/readyz" | "/healthz" | "/health") {
+        return Some(text_response(StatusCode::OK, "ok"));
+    }
+    if path == "/status" {
+        let (deployments_routed, revisions_active) = state.routing.dispatcher.counts();
+        let body = serde_json::json!({
+            "schema": "greentic.status.v1",
+            "env_id": state.routing.dispatcher.env_id(),
+            "listen_addr": state.bound_addr.to_string(),
+            "bundles_active": state.routing.deployment_routes.len(),
+            "deployments_routed": deployments_routed,
+            "revisions_active": revisions_active,
+        });
+        return Some(json_response(StatusCode::OK, body.to_string().into_bytes()));
+    }
+    None
+}
+
+/// Resolve the bind address for the revision ingress.
+///
+/// Precedence (lowest to highest, each layer wins over the previous):
+/// 1. The spec default ([`DEFAULT_LISTEN_ADDR`], `127.0.0.1:8080`).
+/// 2. The persisted `host_config.listen_addr` (set by `op env init` /
+///    `op config set listen_addr`).
+/// 3. `GREENTIC_GATEWAY_LISTEN_ADDR` — accepts a full `SocketAddr`
+///    (`0.0.0.0:9090`) or a bare `IpAddr` (`0.0.0.0`); for the bare-IP form
+///    the port is taken from layer (1) or (2).
+/// 4. `PORT` — port-only override matching the convention used by Heroku /
+///    Cloud Run / Fly and the rest of the gateway configuration.
+///
+/// Operators set `host_config.listen_addr` once at env init; the env-vars
+/// stay available for ad-hoc overrides (CI ports, local debugging) without
+/// rewriting the env file.
+pub(crate) fn resolve_bind_addr(host_config: Option<&EnvironmentHostConfig>) -> SocketAddr {
+    let mut addr = host_config
+        .map(EnvironmentHostConfig::resolved_listen_addr)
+        .unwrap_or(DEFAULT_LISTEN_ADDR);
+
+    if let Ok(raw) = std::env::var("GREENTIC_GATEWAY_LISTEN_ADDR") {
+        let trimmed = raw.trim();
+        // Empty / whitespace-only is treated as unset — many deployment
+        // systems expose env-vars as empty strings to mean "use default";
+        // a warning here would be noise.
+        if !trimmed.is_empty() {
+            if let Ok(sa) = trimmed.parse::<SocketAddr>() {
+                addr = sa;
+            } else if let Ok(ip) = trimmed.parse::<IpAddr>() {
+                addr = SocketAddr::new(ip, addr.port());
+            } else {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "GREENTIC_GATEWAY_LISTEN_ADDR={trimmed:?} is not a valid SocketAddr or IP; \
+                         falling back to {addr}"
+                    ),
+                );
+            }
+        }
+    }
+
+    if let Ok(raw) = std::env::var("PORT") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            if let Ok(port) = trimmed.parse::<u16>() {
+                addr.set_port(port);
+            } else {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "PORT={trimmed:?} is not a valid u16; keeping port {}",
+                        addr.port()
+                    ),
+                );
+            }
+        }
+    }
+
+    addr
 }
 
 #[cfg(test)]
@@ -777,5 +866,256 @@ mod tests {
         );
 
         store_a.clear(&envelope).expect("clear");
+    }
+
+    // --- N1.2: listen-address resolution ----------------------------------
+    //
+    // These tests mutate process env-vars; serialize via `test_env_lock` so
+    // they don't race the other listen-addr/env tests in the crate.
+
+    fn host_cfg_with(addr: Option<SocketAddr>) -> EnvironmentHostConfig {
+        EnvironmentHostConfig {
+            env_id: greentic_types::EnvId::new("local").unwrap(),
+            region: None,
+            tenant_org_id: None,
+            listen_addr: addr,
+        }
+    }
+
+    struct EnvVarGuard {
+        gateway_prev: Option<std::ffi::OsString>,
+        port_prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn clean() -> Self {
+            let gateway_prev = std::env::var_os("GREENTIC_GATEWAY_LISTEN_ADDR");
+            let port_prev = std::env::var_os("PORT");
+            // SAFETY: callers hold `test_env_lock` so env mutation is serialized.
+            unsafe {
+                std::env::remove_var("GREENTIC_GATEWAY_LISTEN_ADDR");
+                std::env::remove_var("PORT");
+            }
+            Self {
+                gateway_prev,
+                port_prev,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: callers hold `test_env_lock` so env mutation is serialized.
+            unsafe {
+                match &self.gateway_prev {
+                    Some(v) => std::env::set_var("GREENTIC_GATEWAY_LISTEN_ADDR", v),
+                    None => std::env::remove_var("GREENTIC_GATEWAY_LISTEN_ADDR"),
+                }
+                match &self.port_prev {
+                    Some(v) => std::env::set_var("PORT", v),
+                    None => std::env::remove_var("PORT"),
+                }
+            }
+        }
+    }
+
+    // --- N1.2: probe surface ---------------------------------------------
+
+    fn empty_state(env_id: &str, bound: SocketAddr) -> ServeState {
+        use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
+        let host = std::sync::Arc::new(
+            greentic_runner_host::HostBuilder::new()
+                .with_config(greentic_runner_host::HostConfig::from_gtbind(
+                    greentic_runner_host::TenantBindings {
+                        tenant: env_id.to_string(),
+                        packs: Vec::new(),
+                        env_passthrough: Vec::new(),
+                    },
+                ))
+                .build()
+                .expect("build placeholder host"),
+        );
+        let dispatcher = std::sync::Arc::new(RevisionDispatcher::new(
+            RevisionDispatcherConfig::new(env_id, [0u8; 32]),
+        ));
+        ServeState {
+            host,
+            routing: RevisionIngressRouting {
+                dispatcher,
+                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
+                deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+            },
+            bound_addr: bound,
+        }
+    }
+
+    fn body_string(resp: Response<Full<Bytes>>) -> String {
+        // `Full<Bytes>` carries its single chunk; `BodyExt::collect` is async,
+        // so a current-thread runtime drives the (immediate) future.
+        let body = resp.into_body();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime for test body collection");
+        let collected = runtime.block_on(body.collect()).expect("collect Full body");
+        let bytes = collected.to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn try_probe_response_returns_ok_for_each_probe_alias() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = empty_state("local", bound);
+        for path in ["/livez", "/readyz", "/healthz", "/health"] {
+            let resp = try_probe_response(path, &state)
+                .unwrap_or_else(|| panic!("expected probe response for {path}"));
+            assert_eq!(resp.status(), StatusCode::OK, "{path} status");
+            assert_eq!(body_string(resp), "ok", "{path} body");
+        }
+    }
+
+    #[test]
+    fn try_probe_response_status_reports_empty_runtime_diagnostics() {
+        // N1.2: with no bundles attached, `/status` returns the same JSON
+        // shape, with `bundles_active`/`deployments_routed`/`revisions_active`
+        // all zero. Operators read this to confirm the listener is up but no
+        // traffic is being served.
+        let bound: SocketAddr = "0.0.0.0:9090".parse().unwrap();
+        let state = empty_state("prod-eu", bound);
+        let resp = try_probe_response("/status", &state).expect("status response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_string(resp)).unwrap();
+        assert_eq!(body["schema"], "greentic.status.v1");
+        assert_eq!(body["env_id"], "prod-eu");
+        assert_eq!(body["listen_addr"], "0.0.0.0:9090");
+        assert_eq!(body["bundles_active"], 0);
+        assert_eq!(body["deployments_routed"], 0);
+        assert_eq!(body["revisions_active"], 0);
+    }
+
+    #[test]
+    fn try_probe_response_returns_none_for_non_probe_paths() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = empty_state("local", bound);
+        // Real traffic paths must fall through to the routing pipeline.
+        assert!(try_probe_response("/api/chat", &state).is_none());
+        assert!(try_probe_response("/livez/sub", &state).is_none());
+        assert!(try_probe_response("/", &state).is_none());
+    }
+
+    // --- N1.2: listen-address resolution ----------------------------------
+
+    #[test]
+    fn resolve_bind_addr_falls_back_to_spec_default_when_nothing_is_set() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _vars = EnvVarGuard::clean();
+        assert_eq!(resolve_bind_addr(None), DEFAULT_LISTEN_ADDR);
+    }
+
+    #[test]
+    fn resolve_bind_addr_uses_host_config_when_set() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _vars = EnvVarGuard::clean();
+        let configured: SocketAddr = "192.168.1.10:9000".parse().unwrap();
+        let host = host_cfg_with(Some(configured));
+        assert_eq!(resolve_bind_addr(Some(&host)), configured);
+    }
+
+    #[test]
+    fn resolve_bind_addr_gateway_env_full_socketaddr_overrides_host_config() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _vars = EnvVarGuard::clean();
+        let host = host_cfg_with(Some("192.168.1.10:9000".parse().unwrap()));
+        // SAFETY: tests holding `test_env_lock` serialize env mutations.
+        unsafe { std::env::set_var("GREENTIC_GATEWAY_LISTEN_ADDR", "0.0.0.0:7000") };
+        assert_eq!(
+            resolve_bind_addr(Some(&host)),
+            "0.0.0.0:7000".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_bind_addr_gateway_env_bare_ip_keeps_port_from_host_config() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _vars = EnvVarGuard::clean();
+        let host = host_cfg_with(Some("127.0.0.1:9090".parse().unwrap()));
+        // SAFETY: tests holding `test_env_lock` serialize env mutations.
+        unsafe { std::env::set_var("GREENTIC_GATEWAY_LISTEN_ADDR", "0.0.0.0") };
+        // Port carried over from host_config (9090), IP from env-var.
+        assert_eq!(
+            resolve_bind_addr(Some(&host)),
+            "0.0.0.0:9090".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_bind_addr_port_env_overrides_only_the_port() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _vars = EnvVarGuard::clean();
+        let host = host_cfg_with(Some("192.168.1.10:9000".parse().unwrap()));
+        // SAFETY: tests holding `test_env_lock` serialize env mutations.
+        unsafe { std::env::set_var("PORT", "5555") };
+        assert_eq!(
+            resolve_bind_addr(Some(&host)),
+            "192.168.1.10:5555".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_bind_addr_port_env_layers_on_top_of_gateway_env() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _vars = EnvVarGuard::clean();
+        // SAFETY: tests holding `test_env_lock` serialize env mutations.
+        unsafe {
+            std::env::set_var("GREENTIC_GATEWAY_LISTEN_ADDR", "10.0.0.5:8000");
+            std::env::set_var("PORT", "9999");
+        }
+        // PORT layers AFTER the GATEWAY env-var: same IP, PORT's port wins.
+        assert_eq!(
+            resolve_bind_addr(None),
+            "10.0.0.5:9999".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_bind_addr_invalid_gateway_env_falls_through() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _vars = EnvVarGuard::clean();
+        let host = host_cfg_with(Some("127.0.0.1:9090".parse().unwrap()));
+        // SAFETY: tests holding `test_env_lock` serialize env mutations.
+        unsafe { std::env::set_var("GREENTIC_GATEWAY_LISTEN_ADDR", "not-an-address") };
+        // Invalid env-var is ignored; persisted host_config wins.
+        assert_eq!(
+            resolve_bind_addr(Some(&host)),
+            "127.0.0.1:9090".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_bind_addr_invalid_port_env_falls_through() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _vars = EnvVarGuard::clean();
+        let host = host_cfg_with(Some("127.0.0.1:9090".parse().unwrap()));
+        // SAFETY: tests holding `test_env_lock` serialize env mutations.
+        unsafe { std::env::set_var("PORT", "not-a-number") };
+        assert_eq!(
+            resolve_bind_addr(Some(&host)),
+            "127.0.0.1:9090".parse::<SocketAddr>().unwrap()
+        );
     }
 }

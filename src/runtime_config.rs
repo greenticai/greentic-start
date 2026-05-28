@@ -76,12 +76,26 @@ fn env_dir(env_id: &str) -> anyhow::Result<PathBuf> {
 ///
 /// Returns `Ok(None)` when no runtime-config exists for the env (the common case
 /// today: nothing materializes the file until the operator handlers land). Returns
-/// `Err` when the file exists but is malformed, names the wrong schema or env,
-/// carries no revisions, or references pack files that escape the env directory
-/// or are missing.
+/// `Err` when the file exists but is malformed, names the wrong schema or env, or
+/// references pack files that escape the env directory or are missing. An empty
+/// `revisions` block is accepted (N1.2): a freshly-initialized env that has not
+/// had any bundles attached is a valid input — the boot path activates the empty
+/// runtime and the listener still comes up.
 pub(crate) fn load(env_id: &str) -> anyhow::Result<Option<LoadedRuntimeConfig>> {
     let dir = env_dir(env_id)?;
     load_in_dir(&dir, env_id)
+}
+
+/// Same as [`load`], but synthesizes an empty [`LoadedRuntimeConfig`] when the
+/// file does not exist. Used by the N1.2 bundle-less boot path so a missing
+/// `runtime-config.json` and an empty-revisions one funnel through the same
+/// activation surface — both produce a listener that serves probes only until
+/// the first bundle is attached (hot-attach in N2).
+pub(crate) fn load_or_empty(env_id: &str) -> anyhow::Result<LoadedRuntimeConfig> {
+    Ok(load(env_id)?.unwrap_or_else(|| LoadedRuntimeConfig {
+        env_id: env_id.to_string(),
+        revisions: Vec::new(),
+    }))
 }
 
 /// Same as [`load`], but resolves the env directory under `env_root` instead
@@ -126,9 +140,11 @@ fn validate_and_resolve(
             cfg.env_id.as_str()
         );
     }
-    if cfg.revisions.is_empty() {
-        bail!("runtime-config for env `{env_id}` declares no revisions");
-    }
+    // N1.2: an empty `revisions` block is no longer an error. A freshly-
+    // initialized env that hasn't had any bundles attached still has a
+    // valid runtime-config (the materializer may emit one alongside
+    // `environment.json`), and `gtc start` must boot the empty runtime so
+    // probe endpoints and the listener come up before bundles arrive.
 
     let mut revisions = Vec::with_capacity(cfg.revisions.len());
     for block in cfg.revisions {
@@ -333,12 +349,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_revisions() {
+    fn accepts_empty_revisions_for_bundle_less_boot() {
+        // N1.2: a runtime-config with no revisions is a valid input for an
+        // env that has not had any bundles attached. Validate succeeds and
+        // returns a LoadedRuntimeConfig with an empty revisions list; the
+        // boot path then activates an empty runtime and serves probes only.
         let tmp = TempDir::new().unwrap();
         let mut cfg = one_revision_cfg();
         cfg.revisions.clear();
-        let err = validate_and_resolve(cfg, "local", tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("no revisions"), "{err}");
+        let resolved = validate_and_resolve(cfg, "local", tmp.path()).expect("empty rc accepted");
+        assert!(resolved.revisions.is_empty());
+        assert_eq!(resolved.env_id, "local");
     }
 
     #[test]

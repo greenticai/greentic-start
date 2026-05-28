@@ -261,8 +261,29 @@ impl RevisionDispatcher {
         Ok(dispatcher)
     }
 
+    /// Number of distinct deployments routable by this dispatcher.
+    /// Callers that need this paired with [`Self::revision_count`] should
+    /// use [`Self::counts`] instead so both numbers come from the same
+    /// `arc_swap` snapshot.
     pub fn deployment_count(&self) -> usize {
         self.snapshot.load().deployments.len()
+    }
+
+    /// Total revisions across all deployments. See [`Self::counts`] when
+    /// reading this alongside [`Self::deployment_count`].
+    pub fn revision_count(&self) -> usize {
+        self.counts().1
+    }
+
+    /// Single-snapshot `(deployment_count, revision_count)`. One `arc_swap`
+    /// load, one map walk — callers that need both counts at the same
+    /// instant (`/status`, the startup banner) read from a single
+    /// consistent snapshot instead of two separate loads.
+    pub fn counts(&self) -> (usize, usize) {
+        let snap = self.snapshot.load();
+        let deployments = snap.deployments.len();
+        let revisions = snap.deployments.values().map(|d| d.revisions.len()).sum();
+        (deployments, revisions)
     }
 
     /// Env this dispatcher routes for. The ingress seam uses it to build the
@@ -849,6 +870,22 @@ mod tests {
         };
         let d = RevisionDispatcher::from_runtime_config(cfg("local"), &rc).unwrap();
         assert_eq!(d.deployment_count(), 2);
+        assert_eq!(d.revision_count(), 3);
+    }
+
+    #[test]
+    fn from_runtime_config_empty_rc_yields_zero_counts() {
+        // N1.2: bundle-less boot — empty runtime-config produces a dispatcher
+        // with zero deployments / zero revisions. `/status` reports those as
+        // `deployments_routed: 0` / `revisions_active: 0`, and the resolve
+        // step returns 404 for any inbound request, never invoking the host.
+        let rc = LoadedRuntimeConfig {
+            env_id: "local".into(),
+            revisions: Vec::new(),
+        };
+        let d = RevisionDispatcher::from_runtime_config(cfg("local"), &rc).unwrap();
+        assert_eq!(d.deployment_count(), 0);
+        assert_eq!(d.revision_count(), 0);
     }
 
     #[test]

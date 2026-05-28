@@ -276,77 +276,103 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
 
     bootstrap_local_environment()?;
 
-    // B0/B2: when launched without a `--bundle` root (and no explicit demo
-    // config), boot from the operator-materialized `runtime-config.v1` for the
-    // active env, if one exists. B0 loads + validates it; B2 (here) activates it
-    // — loading every revision's pinned packs into an embedded runner host and
-    // building the revision dispatcher. Serving traffic from the populated host
-    // (the ingress consumer) lands in B3, so for now we activate and fail loud
-    // rather than pretend to serve. No producer writes the file yet, so this
-    // path is dormant in practice.
+    // N1.2: bundle-less cold start. When launched without `--bundle` / `--config`,
+    // boot from the env's persisted state regardless of whether bundles are
+    // attached yet. The listener always comes up so `/livez`, `/readyz`, and
+    // `/status` are reachable; a missing or empty `runtime-config.v1` produces a
+    // zero-revision activation that serves probes + 404s for unrouted paths until
+    // bundles are attached (hot-attach lands in N2). When the runtime-config is
+    // populated, this is the same B0/B2/B3 path as before: load + validate, build
+    // an embedded runner host, run requests through the revision dispatcher.
     if request.bundle.is_none() && request.config.is_none() {
         let env_id = resolve_env(None);
-        if let Some(rc) = runtime_config::load(&env_id)? {
-            let store_root = greentic_deployer::environment::LocalFsStore::default_root().context(
-                "cannot determine the default environment store root (no home directory)",
-            )?;
-            // Activate with the env's own DevStore secrets backend rather than
-            // HostBuilder's default env-var backend (which rejects non-local
-            // envs). A later step refines this to the per-tenant/pack-declared
-            // backend once the serving context is resolved.
-            let env_dir = runtime_config::env_dir_in(&store_root, &env_id)?;
-            let secrets: crate::secrets_gate::DynSecretsManager =
-                std::sync::Arc::new(crate::secrets_client::SecretsClient::open(&env_dir)?);
-            let activation_rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .context("building runtime for revision activation")?;
-            let activation = activation_rt.block_on(revision_boot::activate_runtime_config(
-                &store_root,
-                &rc,
-                secrets,
-            ))?;
+        let rc = runtime_config::load_or_empty(&env_id)?;
+        let store_root = greentic_deployer::environment::LocalFsStore::default_root()
+            .context("cannot determine the default environment store root (no home directory)")?;
+        let env_dir = runtime_config::env_dir_in(&store_root, &env_id)?;
 
-            // Execution bridge: serve the activated revisions over a slim HTTP
-            // loop. Each request resolves to a deployment, the dispatcher picks a
-            // revision, and the request runs against that revision's runtime via
-            // `RunnerHost::handle_activity_for_revision`. This is the generic-JSON
-            // vertical slice — provider webhook parsing, WebChat/WS, and static
-            // assets under revisions stay on the legacy `--bundle` ingress.
-            let revision_boot::RuntimeConfigActivation { host, routing } = activation;
-            let revision_count = rc.revisions.len();
-            let deployment_count = routing.dispatcher.deployment_count();
-            let bind_addr = revision_serve::default_bind_addr();
-            let server =
-                revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
-                    bind_addr,
-                    host: std::sync::Arc::new(host),
-                    routing,
-                })
-                .context("starting the revision ingress server")?;
-            let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
-            operator_log::info(
-                module_path!(),
-                format!(
-                    "serving {revision_count} revision(s) for env `{}` across {deployment_count} \
-                     deployment(s) on http://{listen}",
-                    rc.env_id
-                ),
-            );
-            println!(
-                "\nServing {revision_count} revision(s) for env `{}` on http://{listen}. \
-                 Press Ctrl+C to stop.",
+        // Initialize operator.log under the env directory before any
+        // `operator_log::*` call on this path; otherwise every banner,
+        // listener log, and warning is silently dropped (the logger
+        // no-ops until `init`).
+        let log_level = if request.quiet {
+            operator_log::Level::Warn
+        } else if request.verbose {
+            operator_log::Level::Debug
+        } else {
+            operator_log::Level::Info
+        };
+        let log_dir = operator_log::init(env_dir.join("logs"), log_level)?;
+        let _trace_guard = init_trace_log(&log_dir);
+
+        // Activate with the env's own DevStore secrets backend rather than
+        // HostBuilder's default env-var backend (which rejects non-local
+        // envs). A later step refines this to the per-tenant/pack-declared
+        // backend once the serving context is resolved.
+        let secrets: crate::secrets_gate::DynSecretsManager =
+            std::sync::Arc::new(crate::secrets_client::SecretsClient::open(&env_dir)?);
+
+        // Load the Environment so the bind address can layer on top of the
+        // persisted `host_config.listen_addr`. The same `Environment` is
+        // threaded into `activate_runtime_config` so the activation path
+        // does not re-read the file (and cannot see a different snapshot).
+        let env_store = greentic_deployer::environment::LocalFsStore::new(store_root.clone());
+        let env_typed = greentic_types::EnvId::new(&env_id)
+            .with_context(|| format!("invalid environment id `{env_id}`"))?;
+        let environment =
+            greentic_deployer::environment::EnvironmentStore::load(&env_store, &env_typed)
+                .with_context(|| format!("loading environment `{env_id}` for bundle-less boot"))?;
+
+        let activation_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("building runtime for revision activation")?;
+        let activation = activation_rt.block_on(revision_boot::activate_runtime_config(
+            &store_root,
+            &rc,
+            secrets,
+            &environment,
+        ))?;
+
+        // Execution bridge: serve the activated revisions over a slim HTTP
+        // loop. Each request resolves to a deployment, the dispatcher picks a
+        // revision, and the request runs against that revision's runtime via
+        // `RunnerHost::handle_activity_for_revision`. This is the generic-JSON
+        // vertical slice — provider webhook parsing, WebChat/WS, and static
+        // assets under revisions stay on the legacy `--bundle` ingress.
+        let revision_boot::RuntimeConfigActivation { host, routing } = activation;
+        let bind_addr = revision_serve::resolve_bind_addr(Some(&environment.host_config));
+        let server = revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
+            bind_addr,
+            host: std::sync::Arc::new(host),
+            routing,
+        })
+        .context("starting the revision ingress server")?;
+        let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
+        let (deployment_count, revision_count) = server.counts();
+        let banner = if revision_count == 0 {
+            format!(
+                "no bundles attached to env `{}` — serving probes only on http://{listen} \
+                 (attach a bundle with `gtc op bundles add`)",
                 rc.env_id
+            )
+        } else {
+            format!(
+                "serving {revision_count} revision(s) for env `{}` across {deployment_count} \
+                 deployment(s) on http://{listen}",
+                rc.env_id
+            )
+        };
+        operator_log::info(module_path!(), banner.clone());
+        println!("\n{banner}. Press Ctrl+C to stop.");
+        if let Err(err) = activation_rt.block_on(tokio::signal::ctrl_c()) {
+            operator_log::warn(
+                module_path!(),
+                format!("revision serving Ctrl+C listener error: {err}"),
             );
-            if let Err(err) = activation_rt.block_on(tokio::signal::ctrl_c()) {
-                operator_log::warn(
-                    module_path!(),
-                    format!("revision serving Ctrl+C listener error: {err}"),
-                );
-            }
-            server.stop()?;
-            return Ok(());
         }
+        server.stop()?;
+        return Ok(());
     }
 
     // Temporary process-level API key fallback disabled while debugging the
