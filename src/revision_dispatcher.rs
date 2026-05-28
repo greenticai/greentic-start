@@ -309,6 +309,26 @@ impl RevisionDispatcher {
             .collect()
     }
 
+    /// `true` if `(deployment_id, revision_id)` is present in this
+    /// dispatcher's live routing table, regardless of weight. Used by the
+    /// reload drain path's liveness probe to detect a rollback / re-add: a
+    /// revision removed from one activation and re-introduced into a newer
+    /// one while the older activation's drain is still in its window. When
+    /// the newer (live) dispatcher reports the revision present, the drain
+    /// suppresses its stale `RevisionEvicted` telemetry.
+    pub(crate) fn contains_revision(
+        &self,
+        deployment_id: DeploymentId,
+        revision_id: RevisionId,
+    ) -> bool {
+        self.snapshot
+            .load()
+            .deployments
+            .get(&deployment_id)
+            .map(|entry| has_revision_any_weight(entry, revision_id))
+            .unwrap_or(false)
+    }
+
     /// Fold this dispatcher's per-deployment generations into a caller-owned
     /// `watermark` map, keeping the maximum for each id.
     ///

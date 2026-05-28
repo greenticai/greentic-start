@@ -62,7 +62,8 @@ use crate::http_routes::{HttpRouteTable, RevisionScope};
 use crate::operator_log;
 use crate::revision_dispatcher::{DispatchRequest, SetCookieDirective, cookie_name};
 use crate::revision_drain::{
-    DrainRequest, NoopRevisionTeardown, RevisionDrainCoordinator, RevisionTeardown,
+    DrainRequest, NoopRevisionTeardown, RevisionDrainCoordinator, RevisionLivenessProbe,
+    RevisionTeardown,
 };
 
 /// Largest request body the revision ingress accepts, in bytes. Even on the
@@ -135,14 +136,56 @@ fn removed_revisions(
         .collect()
 }
 
+/// Liveness probe handed to each drain coordinator so it can suppress a
+/// stale `RevisionEvicted` event when the revision it's draining is rolled
+/// back / re-added into a newer activation before the drain window elapses.
+///
+/// Checks the server's live activation slot, not the OLD activation being
+/// drained: if the revision reappears in whatever the server is currently
+/// serving (a strictly newer activation than `draining_dispatcher`), the
+/// eviction is stale and must not be reported.
+struct SlotLivenessProbe {
+    state: Arc<ServeState>,
+    /// The dispatcher this coordinator is draining. Identity guard: if the
+    /// live slot still points at it, the revision is NOT live "elsewhere" —
+    /// it's the same routing table, so the eviction event should fire
+    /// (matches a direct drain of the live dispatcher).
+    draining_dispatcher: Arc<crate::revision_dispatcher::RevisionDispatcher>,
+}
+
+impl RevisionLivenessProbe for SlotLivenessProbe {
+    fn is_live_elsewhere(
+        &self,
+        deployment_id: DeploymentId,
+        revision_id: greentic_deploy_spec::RevisionId,
+    ) -> bool {
+        let live = self.state.current();
+        // Same dispatcher instance ⇒ we're draining the live routing table,
+        // so the revision isn't live in a NEWER activation. Every reload
+        // swaps in a freshly-built dispatcher `Arc`, so pointer identity is
+        // a sound discriminator.
+        if Arc::ptr_eq(&live.routing.dispatcher, &self.draining_dispatcher) {
+            return false;
+        }
+        live.routing
+            .dispatcher
+            .contains_revision(deployment_id, revision_id)
+    }
+}
+
 /// Spawn one [`RevisionDrainCoordinator::run`] task per removed revision
 /// against `prev`'s dispatcher. Each task owns its own `Arc` to the OLD
 /// activation so the dispatcher and route table outlive the overlap-window
 /// drop spawned by [`RevisionServer::reload`]. WS close and teardown are
 /// both no-ops in N2.3 — see [`crate::revision_drain`] module docs for the
 /// Phase D follow-up.
+///
+/// Each task carries a [`SlotLivenessProbe`] over `state` so a revision
+/// rolled back into a newer activation within the drain window does not
+/// produce a stale `RevisionEvicted` event.
 fn spawn_revision_drains(
     runtime_handle: &Handle,
+    state: Arc<ServeState>,
     prev: Arc<Activation>,
     removed: Vec<(
         DeploymentId,
@@ -178,8 +221,13 @@ fn spawn_revision_drains(
         let dispatcher = Arc::clone(&prev.routing.dispatcher);
         let teardown = Arc::clone(&teardown);
         let bundle_id = bundle_id.clone();
+        let liveness: Arc<dyn RevisionLivenessProbe> = Arc::new(SlotLivenessProbe {
+            state: Arc::clone(&state),
+            draining_dispatcher: Arc::clone(&dispatcher),
+        });
         runtime_handle.spawn(async move {
-            let coord = RevisionDrainCoordinator::with_noop_ws(dispatcher, teardown);
+            let coord = RevisionDrainCoordinator::with_noop_ws(dispatcher, teardown)
+                .with_liveness_probe(liveness);
             let req = DrainRequest {
                 tenant: tenant.as_str(),
                 deployment_id,
@@ -492,6 +540,7 @@ impl RevisionServer {
         if !removed.is_empty() && !drain_window.is_zero() {
             spawn_revision_drains(
                 &self.runtime_handle,
+                Arc::clone(&self.state),
                 Arc::clone(&prev),
                 removed,
                 drain_window,
@@ -1970,6 +2019,96 @@ mod tests {
             old_dispatcher.draining_revisions(dep_id).is_empty(),
             "drain_window == 0 must bypass drain spawn (got {:?})",
             old_dispatcher.draining_revisions(dep_id)
+        );
+    }
+
+    // --- N2.3 Codex fix: stale-eviction suppression probe ------------------
+
+    /// Build a `ServeState` whose live slot holds `activation`. Helper for
+    /// the [`SlotLivenessProbe`] tests.
+    fn serve_state_with(activation: Activation) -> std::sync::Arc<ServeState> {
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        std::sync::Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(activation)),
+            bound_addr: bound,
+        })
+    }
+
+    #[test]
+    fn liveness_probe_reports_live_when_revision_present_in_newer_activation() {
+        // The live slot holds a NEWER activation (different dispatcher Arc)
+        // that serves the revision → the OLD activation's drain must treat
+        // the revision as live elsewhere and suppress its eviction event.
+        let env_id = "env-1";
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let rev_id = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("customer.support");
+
+        let draining = activation_with_ids(env_id, dep_id, rev_id, bundle_id.clone());
+        let draining_dispatcher = std::sync::Arc::clone(&draining.routing.dispatcher);
+        // A distinct, newer activation that also serves the revision.
+        let live = activation_with_ids(env_id, dep_id, rev_id, bundle_id);
+        let state = serve_state_with(live);
+
+        let probe = SlotLivenessProbe {
+            state,
+            draining_dispatcher,
+        };
+        assert!(
+            probe.is_live_elsewhere(dep_id, rev_id),
+            "revision present in a newer activation must read as live elsewhere"
+        );
+    }
+
+    #[test]
+    fn liveness_probe_reports_not_live_when_live_slot_is_the_draining_dispatcher() {
+        // Identity guard: if the live slot still points at the very
+        // dispatcher being drained, the revision is NOT live in a newer
+        // activation — the eviction event should fire (direct-drain
+        // semantics). Models the future `gtc op revisions drain` path.
+        let env_id = "env-1";
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let rev_id = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("customer.support");
+
+        let live = activation_with_ids(env_id, dep_id, rev_id, bundle_id);
+        let draining_dispatcher = std::sync::Arc::clone(&live.routing.dispatcher);
+        let state = serve_state_with(live);
+
+        let probe = SlotLivenessProbe {
+            state,
+            draining_dispatcher,
+        };
+        assert!(
+            !probe.is_live_elsewhere(dep_id, rev_id),
+            "draining the live dispatcher itself must NOT read as live elsewhere"
+        );
+    }
+
+    #[test]
+    fn liveness_probe_reports_not_live_when_revision_absent_from_live_slot() {
+        // Live slot is a newer activation that does NOT serve the revision
+        // (genuine removal, no rollback) → not live elsewhere → eviction
+        // event fires normally.
+        let env_id = "env-1";
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let rev_removed = greentic_deploy_spec::ids::RevisionId::new();
+        let rev_other = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("customer.support");
+
+        let draining = activation_with_ids(env_id, dep_id, rev_removed, bundle_id.clone());
+        let draining_dispatcher = std::sync::Arc::clone(&draining.routing.dispatcher);
+        // Newer activation serves a DIFFERENT revision under the same deployment.
+        let live = activation_with_ids(env_id, dep_id, rev_other, bundle_id);
+        let state = serve_state_with(live);
+
+        let probe = SlotLivenessProbe {
+            state,
+            draining_dispatcher,
+        };
+        assert!(
+            !probe.is_live_elsewhere(dep_id, rev_removed),
+            "a genuinely removed revision must NOT read as live elsewhere"
         );
     }
 }
