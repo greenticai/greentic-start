@@ -31,6 +31,7 @@
 //! honoured only from loopback peers, so a remote caller cannot impersonate a
 //! user/session or pin a chosen revision (see `caller_identity`).
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -40,6 +41,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
+use greentic_deploy_spec::ids::DeploymentId;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1::Builder as Http1Builder;
@@ -109,11 +111,6 @@ impl ServeState {
 
 /// What [`RevisionServer::reload`] returns so the producer can log / emit
 /// telemetry describing the transition without re-reading the dispatcher.
-///
-/// `#[allow(dead_code)]` because the consumer (the N2.2 file-watcher / HTTP
-/// reload signal producer) lands in a separate PR; tests exercise every
-/// field, so removing the allow once the producer arrives is mechanical.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReloadReport {
     pub prev_deployments: usize,
@@ -136,24 +133,36 @@ pub(crate) struct RevisionServer {
     /// schedules the overlap-window drop of the previous activation on it so
     /// any async resources held by the old [`RunnerHost`] tear down on the
     /// same runtime that built them.
-    ///
-    /// `#[allow(dead_code)]` because the producer that calls `reload` lands
-    /// in N2.2; tests already cover the wiring.
-    #[allow(dead_code)]
     runtime_handle: Handle,
     /// Serializes [`reload`](Self::reload) calls. Without it the
-    /// `load_full(prev) → carry_forward → swap(new)` sequence is not atomic
-    /// across concurrent producers: two reloads can both observe the same
-    /// prev, both bump generations from it, then both swap — the second
-    /// reload's generation bump is lost relative to the first's published
-    /// activation, so cookies minted in the brief window the first reload
-    /// was live still verify against the second's dispatcher.
+    /// `load_full(prev) → bump_generations → swap(new)` sequence is not
+    /// atomic across concurrent producers: two reloads can both observe
+    /// the same prev, both bump generations from it, then both swap — the
+    /// second reload's generation bump is lost relative to the first's
+    /// published activation, so cookies minted in the brief window the
+    /// first reload was live still verify against the second's dispatcher.
     ///
     /// N2.2's file-watcher is a single producer today, but an admin HTTP
     /// reload signal (or any future second producer) would violate that
     /// invariant; guarding the swap primitive here means the type system
     /// cannot be tricked.
     reload_lock: std::sync::Mutex<()>,
+    /// Per-deployment-id generation high-watermark, surviving across
+    /// activations including ones that drop a deployment entirely.
+    ///
+    /// Without this map, a bump driven only by the previous dispatcher
+    /// would miss deployments that disappeared from runtime-config: a
+    /// remove → re-add sequence within cookie/pin TTL would mint a fresh
+    /// dispatcher at the same generation the original served at, and
+    /// cookies signed before the removal would still verify after the
+    /// re-add. The watermark tombstones removed deployments so a re-added
+    /// one always bumps past its prior generation.
+    ///
+    /// Updated by [`reload`](Self::reload) by absorbing both the previous
+    /// and new activations on every swap. Initialized from the initial
+    /// activation at [`start`](Self::start) so cookie invalidation works
+    /// even on the very first reload after boot.
+    generation_watermark: std::sync::Mutex<HashMap<DeploymentId, u64>>,
 }
 
 impl RevisionServer {
@@ -265,6 +274,18 @@ impl RevisionServer {
             .recv()
             .context("failed to receive revision ingress startup result")??;
 
+        // Seed the watermark from the initial activation so the very first
+        // reload bumps generations off it — otherwise cookies signed against
+        // the cold-start activation could survive a remove → re-add that
+        // happens before any other reload has populated the watermark.
+        let mut initial_watermark: HashMap<DeploymentId, u64> = HashMap::new();
+        state
+            .slot
+            .load()
+            .routing
+            .dispatcher
+            .absorb_into_watermark(&mut initial_watermark);
+
         Ok(Self {
             shutdown: Some(tx),
             handle: Some(handle),
@@ -272,6 +293,7 @@ impl RevisionServer {
             state,
             runtime_handle,
             reload_lock: std::sync::Mutex::new(()),
+            generation_watermark: std::sync::Mutex::new(initial_watermark),
         })
     }
 
@@ -305,28 +327,28 @@ impl RevisionServer {
     /// request completes.
     ///
     /// This is the swap primitive the N2.2 file-watcher + reload signal
-    /// producer will call. A `drain_window` of zero drops the previous
+    /// producer calls. A `drain_window` of zero drops the previous
     /// activation immediately (only safe in tests, where the producer
     /// controls request scheduling).
     ///
-    /// Per-deployment dispatcher generations are carried forward from the
-    /// previous activation BEFORE the swap (see
-    /// [`crate::revision_dispatcher::RevisionDispatcher::carry_forward_generations_from`])
-    /// so any stickiness cookie or session pin minted against the previous
-    /// dispatcher is invalidated and the next request re-picks under the
-    /// new traffic split. Without that bump a reload that only changes
-    /// weights for an already-deployed `deployment_id` would leave
-    /// cookie-pinned clients on the pre-reload revision until cookie/pin
-    /// TTL, defeating canary cuts and partial rollbacks.
+    /// Per-deployment dispatcher generations are bumped against a
+    /// server-level high-watermark BEFORE the swap (see
+    /// [`crate::revision_dispatcher::RevisionDispatcher::bump_generations_from_watermark`]
+    /// and [`Self::generation_watermark`]) so any stickiness cookie or
+    /// session pin minted against an earlier activation is invalidated and
+    /// the next request re-picks under the new traffic split. The
+    /// watermark tracks every deployment id this server has ever seen,
+    /// including ones that have been removed and re-added — so a
+    /// remove → re-add rollback within cookie/pin TTL doesn't leak
+    /// stickiness from before the removal.
     ///
     /// Holds the [`reload_lock`](Self::reload_lock) for the whole sequence
     /// so concurrent producers (file-watcher + admin signal) cannot race
-    /// the `load_full(prev) → carry_forward → swap(new)` steps and lose a
-    /// generation bump.
-    #[allow(dead_code)] // consumed by N2.2; covered by unit tests
+    /// the `load_full(prev) → bump_generations → swap(new)` steps and
+    /// lose a generation bump.
     pub(crate) fn reload(&self, new: Activation, drain_window: Duration) -> ReloadReport {
-        // Serialize concurrent reloads so the load_full + carry_forward +
-        // swap sequence is atomic relative to other producers. See the
+        // Serialize concurrent reloads so the load_full + bump_generations
+        // + swap sequence is atomic relative to other producers. See the
         // field doc on `reload_lock`.
         let _reload_guard = self.reload_lock.lock().expect("reload lock poisoned");
         let new_arc = Arc::new(new);
@@ -337,10 +359,29 @@ impl RevisionServer {
         // whose generations are already correct for the very first
         // dispatch under the new activation.
         let prev = self.state.slot.load_full();
-        new_arc
-            .routing
-            .dispatcher
-            .carry_forward_generations_from(&prev.routing.dispatcher);
+        // Update the generation watermark and bump the new dispatcher off
+        // it. Absorbing prev → bump new → absorb new keeps the watermark
+        // strictly monotonic across every deployment id we've ever served
+        // (including ids that have been removed), so a re-introduced id
+        // always lands at a generation strictly greater than any cookie/pin
+        // could still be holding.
+        {
+            let mut watermark = self
+                .generation_watermark
+                .lock()
+                .expect("generation watermark lock poisoned");
+            prev.routing
+                .dispatcher
+                .absorb_into_watermark(&mut watermark);
+            new_arc
+                .routing
+                .dispatcher
+                .bump_generations_from_watermark(&watermark);
+            new_arc
+                .routing
+                .dispatcher
+                .absorb_into_watermark(&mut watermark);
+        }
         let (new_deployments, new_revisions) = new_arc.routing.dispatcher.counts();
         let prev = self.state.slot.swap(new_arc);
         let (prev_deployments, prev_revisions) = prev.routing.dispatcher.counts();
@@ -1323,6 +1364,16 @@ mod tests {
     /// slot + the current Tokio runtime handle. Lets reload tests run under
     /// `#[tokio::test]` without binding a real port.
     fn server_for_test(state: std::sync::Arc<ServeState>) -> RevisionServer {
+        // Mirror `start()`: seed the watermark from the initial activation
+        // so reload() tests behave the same way the production cold-start
+        // path does.
+        let mut watermark: HashMap<DeploymentId, u64> = HashMap::new();
+        state
+            .slot
+            .load()
+            .routing
+            .dispatcher
+            .absorb_into_watermark(&mut watermark);
         RevisionServer {
             shutdown: None,
             handle: None,
@@ -1330,6 +1381,7 @@ mod tests {
             state,
             runtime_handle: Handle::current(),
             reload_lock: std::sync::Mutex::new(()),
+            generation_watermark: std::sync::Mutex::new(watermark),
         }
     }
 
@@ -1438,13 +1490,12 @@ mod tests {
 
     #[tokio::test]
     async fn reload_invalidates_pre_reload_cookie_for_persisted_deployment() {
-        // Regression test for the Codex finding on PR-N2.1: without
-        // [`RevisionDispatcher::carry_forward_generations_from`], reload
-        // would publish a fresh dispatcher whose deployment generation
-        // matches the previous dispatcher's (both at the
-        // `apply_traffic_split`-from-zero default of 1) and a cookie minted
-        // pre-reload would still verify post-reload — defeating canary
-        // weight cuts and partial rollbacks for already-cookie'd clients.
+        // Regression test for the Codex finding on PR-N2.1: without the
+        // generation bump in reload(), a fresh dispatcher built from the
+        // same runtime-config would carry the same `apply_traffic_split`-
+        // from-zero default generation (1), and a cookie minted pre-reload
+        // would still verify post-reload — defeating canary weight cuts
+        // and partial rollbacks for already-cookie'd clients.
         let env_id = "env-1";
         let tenant = "tenant-a";
         let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
@@ -1496,7 +1547,7 @@ mod tests {
 
         let act2_snap = state.current();
         // The cookie's `g` is still 1, but the live dispatcher's expected
-        // generation is now 2 (1 + 1 from carry_forward) → mismatch → None.
+        // generation is now 2 (1 + 1 from the watermark bump) → mismatch → None.
         assert_eq!(
             act2_snap
                 .routing
@@ -1522,6 +1573,101 @@ mod tests {
                 .verify_cookie(&post_cookie, env_id, tenant, dep_id, 2, 0),
             Some(rev_id),
             "post-reload dispatcher must verify a cookie minted at the new generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_invalidates_cookie_after_remove_and_readd_within_ttl() {
+        // Codex regression: without the server-level generation watermark,
+        // a bump driven only by the previous dispatcher would miss
+        // deployments that had been removed from runtime-config. A
+        // deployment removed and later re-added before cookie/pin TTL
+        // elapsed got a fresh dispatcher at the same
+        // `from_runtime_config`-default generation, and the dispatcher
+        // would happily verify a cookie signed against the original
+        // activation. This test asserts the watermark tombstones removed
+        // deployments so the re-added one is strictly newer than anything
+        // a client could be holding.
+        let env_id = "env-1";
+        let tenant = "tenant-a";
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let rev_id = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("customer.support");
+
+        let act1 = activation_with_ids(env_id, dep_id, rev_id, bundle_id.clone());
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(act1)),
+            bound_addr: bound,
+        });
+        let server = server_for_test(std::sync::Arc::clone(&state));
+
+        // Sign a cookie against act1's generation (1, from
+        // `apply_traffic_split(.., 0)`).
+        let act1_snap = state.current();
+        let cookie = act1_snap.routing.dispatcher.seal_cookie(
+            env_id,
+            tenant,
+            dep_id,
+            rev_id,
+            /* generation */ 1,
+            /* expires_at */ 9_999_999_999,
+        );
+
+        // Reload to an activation that drops the deployment entirely
+        // (simulates the operator running `gtc op bundles remove` or
+        // setting traffic to 0 across all revisions). The watermark must
+        // record dep_id at generation 1 even though the live dispatcher
+        // no longer carries it.
+        let empty = empty_activation(env_id);
+        server.reload(empty, Duration::ZERO);
+
+        // Reload AGAIN to re-add the same deployment + revision (rollback
+        // / re-stage). The fresh dispatcher would otherwise pin dep_id at
+        // generation 1 again — the watermark must force it to 2.
+        let act3 = activation_with_ids(env_id, dep_id, rev_id, bundle_id);
+        server.reload(act3, Duration::ZERO);
+
+        let act3_snap = state.current();
+        assert_eq!(
+            act3_snap.routing.dispatcher.counts(),
+            (1, 1),
+            "re-added deployment must be present in the post-reload dispatcher"
+        );
+
+        // `dispatch()` passes the live dispatcher's current generation as
+        // `expected_generation` — the watermark must have bumped that past
+        // the cookie's signed generation. Mirror that here: a cookie
+        // signed at generation 1 must NOT verify under the live dispatcher's
+        // post-reload generation (which the watermark forced to 2).
+        assert_eq!(
+            act3_snap
+                .routing
+                .dispatcher
+                .verify_cookie(&cookie, env_id, tenant, dep_id, 2, 0),
+            None,
+            "cookie sealed before remove must NOT verify under the bumped generation"
+        );
+        // Specifically: the new generation is exactly 2 — one bump for
+        // the absorb(act1) that landed in the watermark before the empty
+        // reload, applied when act3's freshly-built generation 1 was
+        // bumped on top of it. A cookie sealed AT 2 verifies; sanity-check
+        // the watermark didn't over-bump.
+        let post_cookie = act3_snap.routing.dispatcher.seal_cookie(
+            env_id,
+            tenant,
+            dep_id,
+            rev_id,
+            2,
+            9_999_999_999,
+        );
+        assert_eq!(
+            act3_snap
+                .routing
+                .dispatcher
+                .verify_cookie(&post_cookie, env_id, tenant, dep_id, 2, 0),
+            Some(rev_id),
+            "cookie minted at the bumped generation (2) must verify"
         );
     }
 }

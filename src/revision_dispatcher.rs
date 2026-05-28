@@ -292,38 +292,64 @@ impl RevisionDispatcher {
         &self.env_id
     }
 
-    /// Carry forward per-deployment generations from a predecessor dispatcher,
-    /// bumping each by 1 so any stickiness cookie or session pin signed
-    /// against the predecessor is rejected by [`Self::verify_cookie`] / pin
-    /// `lookup` under the new dispatcher's `expected_generation`.
+    /// Fold this dispatcher's per-deployment generations into a caller-owned
+    /// `watermark` map, keeping the maximum for each id.
+    ///
+    /// Used by [`crate::revision_serve::RevisionServer::reload`] to maintain a
+    /// generation high-watermark across the lifetime of the server, including
+    /// deployments that have been removed from the active runtime-config.
+    /// Tracking removed deployment ids (rather than only the live ones in the
+    /// predecessor dispatcher) is what makes a remove → re-add sequence
+    /// invalidate cookies signed before the removal: the re-added dispatcher
+    /// is constructed fresh at generation 0, but the watermark still
+    /// remembers its previous generation and forces a strict bump on top of
+    /// it. See [`Self::bump_generations_from_watermark`].
+    pub(crate) fn absorb_into_watermark(
+        &self,
+        watermark: &mut std::collections::HashMap<DeploymentId, u64>,
+    ) {
+        let snap = self.snapshot.load();
+        for (dep_id, entry) in &snap.deployments {
+            let cur = watermark.entry(*dep_id).or_insert(0);
+            *cur = (*cur).max(entry.generation);
+        }
+    }
+
+    /// Bump each of this dispatcher's deployments whose id appears in the
+    /// `watermark` map: set its generation to `watermark[id] + 1` so that any
+    /// stickiness cookie or pin signed at the watermark's value (or below)
+    /// is rejected by [`Self::verify_cookie`] / pin `lookup` under the new
+    /// dispatcher's `expected_generation`.
     ///
     /// Called from the hot-reload path
     /// ([`crate::revision_serve::RevisionServer::reload`]) after a new
     /// dispatcher is built from a fresh runtime-config but BEFORE that
     /// dispatcher is published to the live ingress slot. Deployments that
-    /// exist only in `self` (newly introduced by the reload) keep the
-    /// generation they were constructed with — no client could be holding a
-    /// cookie/pin for them yet.
+    /// are NOT in the watermark (i.e. this server has never seen that id
+    /// before) keep the generation `from_runtime_config` assigned —
+    /// no client could be holding a cookie/pin for them yet.
     ///
-    /// Bumps **unconditionally** for the deployments both dispatchers share,
-    /// regardless of whether weights or revisions actually differ: a reload
-    /// is a deliberate operator action and existing cookies/pins must yield
-    /// to the new traffic split. Distinguishing "identical config" from
-    /// "changed config" is the N2.2 watcher's job (hash-skip before invoking
-    /// reload at all); correctness of the swap primitive does not depend on
-    /// it.
-    pub(crate) fn carry_forward_generations_from(&self, prev: &RevisionDispatcher) {
+    /// Bumps **unconditionally** for every deployment present in both this
+    /// dispatcher and the watermark, regardless of whether weights or
+    /// revisions actually differ: a reload is a deliberate operator action
+    /// and existing cookies/pins must yield to the new traffic split.
+    /// Distinguishing "identical config" from "changed config" is the
+    /// N2.2 watcher's job (hash-skip before invoking reload at all);
+    /// correctness of the swap primitive does not depend on it.
+    pub(crate) fn bump_generations_from_watermark(
+        &self,
+        watermark: &std::collections::HashMap<DeploymentId, u64>,
+    ) {
         // Defensive against a concurrent `apply_traffic_split`, even though
         // the canonical call site fires before `self` is published to the
         // live slot. Matches the mutation discipline of
         // [`Self::mutate_deployment`].
         let _w = self.write_lock.lock().expect("write lock poisoned");
-        let prev_snap = prev.snapshot.load();
         let cur = self.snapshot.load_full();
         let mut next = (*cur).clone();
         for (dep_id, entry) in next.deployments.iter_mut() {
-            if let Some(prev_entry) = prev_snap.deployments.get(dep_id) {
-                entry.generation = prev_entry.generation.saturating_add(1);
+            if let Some(&high) = watermark.get(dep_id) {
+                entry.generation = high.saturating_add(1);
             }
         }
         self.snapshot.store(std::sync::Arc::new(next));
@@ -1252,97 +1278,91 @@ mod tests {
     }
 
     #[test]
-    fn carry_forward_bumps_generation_for_shared_deployments() {
+    fn absorb_into_watermark_keeps_max_generation_per_deployment() {
         let dep1 = dep();
         let dep2 = dep();
         let r1 = rev();
         let r2 = rev();
-
-        // Predecessor dispatcher carries deployment `dep1` at generation 5
-        // and deployment `dep2` at generation 1.
-        let prev = RevisionDispatcher::new(cfg("local"));
-        prev.apply_traffic_split(dep1, vec![entry(r1, 10_000)], bundle(), 0)
+        let d = RevisionDispatcher::new(cfg("local"));
+        d.apply_traffic_split(dep1, vec![entry(r1, 10_000)], bundle(), 0)
             .unwrap();
         for expected in 1..5 {
-            prev.apply_traffic_split(dep1, vec![entry(r1, 10_000)], bundle(), expected)
+            d.apply_traffic_split(dep1, vec![entry(r1, 10_000)], bundle(), expected)
                 .unwrap();
         }
-        prev.apply_traffic_split(dep2, vec![entry(r2, 10_000)], bundle(), 0)
-            .unwrap();
-        let prev_gen_dep1 = prev
-            .snapshot
-            .load()
-            .deployments
-            .get(&dep1)
-            .map(|e| e.generation)
-            .unwrap();
-        let prev_gen_dep2 = prev
-            .snapshot
-            .load()
-            .deployments
-            .get(&dep2)
-            .map(|e| e.generation)
-            .unwrap();
-        assert_eq!(prev_gen_dep1, 5);
-        assert_eq!(prev_gen_dep2, 1);
-
-        // New dispatcher carries `dep1` (shared) and `dep3` (fresh). Both
-        // start at the generation `apply_traffic_split` writes (1).
-        let dep3 = dep();
-        let r3 = rev();
-        let new = RevisionDispatcher::new(cfg("local"));
-        new.apply_traffic_split(dep1, vec![entry(r1, 10_000)], bundle(), 0)
-            .unwrap();
-        new.apply_traffic_split(dep3, vec![entry(r3, 10_000)], bundle(), 0)
+        d.apply_traffic_split(dep2, vec![entry(r2, 10_000)], bundle(), 0)
             .unwrap();
 
-        new.carry_forward_generations_from(&prev);
+        // Pre-populate with an OLDER value for dep1 and a NEWER value for
+        // dep2 to prove the merge keeps the per-id maximum.
+        let mut watermark = std::collections::HashMap::new();
+        watermark.insert(dep1, 2);
+        watermark.insert(dep2, 7);
+        d.absorb_into_watermark(&mut watermark);
 
-        // Shared deployment bumped from prev's generation (5 + 1).
+        // dep1: max(2, 5) = 5; dep2: max(7, 1) = 7.
+        assert_eq!(watermark.get(&dep1).copied(), Some(5));
+        assert_eq!(watermark.get(&dep2).copied(), Some(7));
+    }
+
+    #[test]
+    fn bump_generations_from_watermark_only_touches_deployments_in_the_map() {
+        let dep1 = dep();
+        let dep2 = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = RevisionDispatcher::new(cfg("local"));
+        d.apply_traffic_split(dep1, vec![entry(r1, 10_000)], bundle(), 0)
+            .unwrap();
+        d.apply_traffic_split(dep2, vec![entry(r2, 10_000)], bundle(), 0)
+            .unwrap();
+
+        // Watermark knows only `dep1`. `dep2` is fresh and must be left
+        // alone so cookies on a never-before-seen deployment id stay at
+        // the constructed generation.
+        let mut watermark = std::collections::HashMap::new();
+        watermark.insert(dep1, 4);
+        d.bump_generations_from_watermark(&watermark);
+
+        // dep1: 4 + 1 = 5.
         assert_eq!(
-            new.snapshot
+            d.snapshot
                 .load()
                 .deployments
                 .get(&dep1)
                 .map(|e| e.generation),
-            Some(6)
+            Some(5)
         );
-        // Fresh deployment not in prev: leaves the new entry untouched (1).
+        // dep2: unchanged from `apply_traffic_split(.., 0)` -> 1.
         assert_eq!(
-            new.snapshot
+            d.snapshot
                 .load()
                 .deployments
-                .get(&dep3)
+                .get(&dep2)
                 .map(|e| e.generation),
             Some(1)
         );
-        // `dep2` only existed in prev — not reintroduced in new, so it stays
-        // absent from new's snapshot.
-        assert!(!new.snapshot.load().deployments.contains_key(&dep2));
     }
 
     #[test]
-    fn carry_forward_is_a_noop_when_no_deployments_are_shared() {
-        // Reloading from an empty activation (fresh `gtc start`) or to a
-        // disjoint deployment set must not touch the new dispatcher's
-        // generations — there are no pre-existing cookies for these
-        // deployments and gratuitously bumping would only widen the
-        // observable surface for downstream tests.
+    fn bump_generations_from_watermark_is_a_noop_for_disjoint_deployments() {
+        // The cold-start case: server's watermark is empty, so the new
+        // dispatcher's generations must be untouched.
         let dep1 = dep();
         let r1 = rev();
-        let prev = RevisionDispatcher::new(cfg("local"));
-        let new = RevisionDispatcher::new(cfg("local"));
-        new.apply_traffic_split(dep1, vec![entry(r1, 10_000)], bundle(), 0)
+        let d = RevisionDispatcher::new(cfg("local"));
+        d.apply_traffic_split(dep1, vec![entry(r1, 10_000)], bundle(), 0)
             .unwrap();
-        let gen_before = new
+        let watermark = std::collections::HashMap::new();
+        let gen_before = d
             .snapshot
             .load()
             .deployments
             .get(&dep1)
             .map(|e| e.generation)
             .unwrap();
-        new.carry_forward_generations_from(&prev);
-        let gen_after = new
+        d.bump_generations_from_watermark(&watermark);
+        let gen_after = d
             .snapshot
             .load()
             .deployments
