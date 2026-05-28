@@ -370,20 +370,58 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         operator_log::Level::Info
     };
 
-    let demo_paths =
-        bundle_config::resolve_demo_paths(request.config.clone(), request.bundle.as_deref())?;
+    // Initialize operator.log before any fallible setup so startup failures (bad
+    // bundle.yaml, missing config, unreadable paths) leave an on-disk trace.
+    let early_log_dir = request.log_dir.clone().unwrap_or_else(|| {
+        request
+            .bundle
+            .as_deref()
+            .map(|b| PathBuf::from(b).join("logs"))
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join("logs")
+            })
+    });
+    let log_dir = operator_log::init(early_log_dir, log_level)?;
+
+    // Install a tracing subscriber that writes RUST_LOG-filtered events to
+    // <log_dir>/trace.log. Without this, every `tracing::*` call in greentic
+    // crates (notably greentic-runner-host) is dropped because no subscriber
+    // is registered. We bind the appender guard to a long-lived `static` so
+    // background tasks can flush throughout the process lifetime.
+    let _trace_guard = init_trace_log(&log_dir);
+
+    let demo_paths = match bundle_config::resolve_demo_paths(
+        request.config.clone(),
+        request.bundle.as_deref(),
+    ) {
+        Ok(paths) => paths,
+        Err(err) => {
+            operator_log::error(
+                module_path!(),
+                format!("resolve_demo_paths failed: {err:#}"),
+            );
+            return Err(err);
+        }
+    };
     let config_path = demo_paths.config_path.clone();
     let config_dir = demo_paths.root_dir.clone();
     let state_dir = demo_paths.state_dir.clone();
 
     crate::warmup::adopt_bundle_cache_dir(&config_dir);
-    let log_dir = operator_log::init(
-        request
-            .log_dir
-            .clone()
-            .unwrap_or_else(|| config_dir.join("logs")),
-        log_level,
-    )?;
+
+    let resolved_log_dir = config_dir.join("logs");
+    if request.log_dir.is_none() && resolved_log_dir != log_dir {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "operator.log is at {} but resolved bundle log dir is {}; future logs stay at the former",
+                log_dir.display(),
+                resolved_log_dir.display()
+            ),
+        );
+    }
 
     // Initialize flow execution logger (writes to logs/flow.log)
     match flow_log::init(&log_dir) {
@@ -603,6 +641,106 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Crates whose log output is unconditionally clamped to `warn` regardless of
+/// the user's `RUST_LOG` setting. These are very chatty runtime/internals that
+/// drown trace.log under any debug-level base filter and rarely help debug
+/// greentic itself. Override by adjusting this list.
+const NOISY_TRACE_TARGETS: &[&str] = &[
+    "wasmtime",
+    "wasmtime_wasi",
+    "wasi_common",
+    "cranelift_codegen",
+    "cranelift_wasm",
+    "regalloc2",
+    "h2",
+    "hyper",
+    "hyper_util",
+    "rustls",
+    "tokio_util",
+    "tokio_tungstenite",
+    "tungstenite",
+    "want",
+    "mio",
+    "tower",
+];
+
+/// Build the trace.log `EnvFilter`. Starts from `RUST_LOG` (or `info` when
+/// unset) and then forcibly clamps known-noisy crates (wasmtime, h2, hyper,
+/// rustls, etc.) to `warn`. EnvFilter resolves last-write-wins per target, so
+/// appending after the user's directives is what makes the clamp stick.
+fn build_trace_filter() -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    let base = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    NOISY_TRACE_TARGETS.iter().fold(base, |filter, target| {
+        match format!("{target}=warn").parse() {
+            Ok(directive) => filter.add_directive(directive),
+            Err(_) => filter,
+        }
+    })
+}
+
+/// Install a `tracing` subscriber writing to `<log_dir>/trace.log`, filtered by
+/// `RUST_LOG` (defaults to `info`). Returns the appender guard, which must be
+/// kept alive for the process lifetime so the non-blocking writer flushes.
+fn init_trace_log(
+    log_dir: &std::path::Path,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use std::fs::OpenOptions;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    // Unified host log: operator_log writes here too; both formats co-exist
+    // line-by-line in append mode.
+    let path = log_dir.join("system.log");
+    let file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(f) => f,
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!("could not open system.log at {}: {err}", path.display()),
+            );
+            return None;
+        }
+    };
+    let (nb, guard) = tracing_appender::non_blocking(file);
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "<unset>".to_string());
+    let filter = build_trace_filter();
+    let layer = tracing_subscriber::fmt::layer()
+        .with_writer(nb)
+        .with_ansi(false)
+        .with_target(true);
+    match tracing_subscriber::registry()
+        .with(filter)
+        .with(layer)
+        .try_init()
+    {
+        Ok(()) => {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "tracing subscriber writing to {} (RUST_LOG={rust_log})",
+                    path.display()
+                ),
+            );
+            tracing::info!(
+                target: "greentic_start",
+                rust_log = %rust_log,
+                "tracing subscriber installed"
+            );
+        }
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "tracing subscriber try_init failed (another subscriber already installed?): {err}"
+                ),
+            );
+            return None;
+        }
+    }
+    Some(guard)
+}
+
 /// Idempotently auto-create the `local` Environment on first `gtc start`.
 ///
 /// Per A4 of `plans/next-gen-deployment.md`: every `gtc start`, `gtc up`, or
@@ -730,6 +868,38 @@ mod tests {
     use std::path::Path;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn build_trace_filter_clamps_noisy_targets_even_when_rust_log_unset() {
+        let _guard = test_env_lock().lock().unwrap();
+        // SAFETY: tests serialized via test_env_lock above.
+        unsafe { std::env::remove_var("RUST_LOG") };
+        let filter = build_trace_filter();
+        let printed = filter.to_string();
+        for target in NOISY_TRACE_TARGETS {
+            assert!(
+                printed.contains(&format!("{target}=warn")),
+                "expected `{target}=warn` in filter, got: {printed}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_trace_filter_clamps_noisy_targets_overriding_explicit_debug() {
+        let _guard = test_env_lock().lock().unwrap();
+        // SAFETY: tests serialized via test_env_lock above.
+        unsafe { std::env::set_var("RUST_LOG", "wasmtime=debug,info") };
+        let filter = build_trace_filter();
+        let printed = filter.to_string();
+        // The clamp directive appended after the user's directive should win
+        // because EnvFilter resolves last-write-wins per target.
+        assert!(
+            printed.contains("wasmtime=warn"),
+            "wasmtime clamp must override RUST_LOG override, got: {printed}"
+        );
+        // SAFETY: serialized.
+        unsafe { std::env::remove_var("RUST_LOG") };
+    }
 
     #[test]
     fn apply_nats_overrides_disables_nats_for_flag() {

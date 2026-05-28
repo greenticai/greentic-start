@@ -58,6 +58,8 @@ tokio-tungstenite = "0.29"
 tar = "0.4"
 thiserror = "2"
 tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 ulid = "1"
 unic-langid = "0.9"
 urlencoding = "2"
