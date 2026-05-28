@@ -36,14 +36,12 @@ use anyhow::{Context, anyhow, bail};
 use greentic_deploy_spec::{
     BundleDeploymentStatus, BundleId, DeploymentId, Environment, PackListLock, RevisionId,
 };
-use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
 use greentic_deployer::path_safety::normalize_under_root;
 use greentic_runner_host::runtime::{RevisionPackRef, TenantRuntime};
 use greentic_runner_host::storage::{
     new_session_store, new_state_store, session_host_from, state_host_from,
 };
 use greentic_runner_host::{HostBuilder, HostConfig, RunnerHost, TenantBindings};
-use greentic_types::EnvId;
 
 use crate::deployment_routes::{DeploymentRouteTable, RevisionIngressRouting};
 use crate::http_routes::{
@@ -89,23 +87,28 @@ struct DeploymentMeta {
 ///
 /// `store_root` is the environments root (`~/.greentic/environments` in
 /// production; a temp dir under test) — the env dir is `<store_root>/<env_id>`.
+/// `env` is the pre-loaded [`Environment`] for `rc.env_id`; passing it in (vs
+/// re-reading from disk) avoids a duplicate file read AND the TOCTOU window
+/// between the caller's bind-address resolution and the activation's
+/// deployment/tenant resolution.
 pub(crate) async fn activate_runtime_config(
     store_root: &Path,
     rc: &LoadedRuntimeConfig,
     secrets: DynSecretsManager,
+    env: &Environment,
 ) -> anyhow::Result<RuntimeConfigActivation> {
-    let env_id = EnvId::new(&rc.env_id)
-        .with_context(|| format!("invalid environment id `{}`", rc.env_id))?;
+    // `env_dir_in` validates `rc.env_id` as a safe directory segment via
+    // `EnvId::new`; no separate `EnvId::new` call is needed.
     let env_dir = env_dir_in(store_root, &rc.env_id)?;
 
-    let store = LocalFsStore::new(store_root);
-    let env = store.load(&env_id).with_context(|| {
-        format!(
-            "loading environment `{}` for revision activation",
+    if env.environment_id.as_str() != rc.env_id {
+        bail!(
+            "environment `{}` was loaded for activation of runtime-config naming env `{}`",
+            env.environment_id,
             rc.env_id
-        )
-    })?;
-    let deployments = deployment_index(&env);
+        );
+    }
+    let deployments = deployment_index(env);
 
     // Resolve + validate every revision's deployment up front: it fails fast on
     // a stale/inconsistent runtime-config and yields the distinct tenant set the
@@ -161,20 +164,17 @@ pub(crate) async fn activate_runtime_config(
     // invariant and keep the activation surface uniform across empty and
     // populated runtime-configs.
     let mut builder = HostBuilder::new().with_secrets_manager(secrets);
-    if tenants.is_empty() {
+    let effective_tenants: Vec<String> = if tenants.is_empty() {
+        vec![rc.env_id.clone()]
+    } else {
+        tenants.iter().map(|t| (*t).to_string()).collect()
+    };
+    for tenant in effective_tenants {
         builder = builder.with_config(HostConfig::from_gtbind(TenantBindings {
-            tenant: rc.env_id.clone(),
+            tenant,
             packs: Vec::new(),
             env_passthrough: Vec::new(),
         }));
-    } else {
-        for tenant in &tenants {
-            builder = builder.with_config(HostConfig::from_gtbind(TenantBindings {
-                tenant: (*tenant).to_string(),
-                packs: Vec::new(),
-                env_passthrough: Vec::new(),
-            }));
-        }
     }
     let host = builder
         .build()
@@ -268,7 +268,7 @@ pub(crate) async fn activate_runtime_config(
     let routing = RevisionIngressRouting {
         dispatcher: Arc::new(dispatcher),
         http_routes: HttpRouteTable::from_descriptors(scoped_routes),
-        deployment_routes: DeploymentRouteTable::from_environment(&env),
+        deployment_routes: DeploymentRouteTable::from_environment(env),
     };
 
     Ok(RuntimeConfigActivation { host, routing })
@@ -415,6 +415,7 @@ mod tests {
         BundleDeployment, BundleDeploymentStatus, CustomerId, EnvironmentHostConfig, LockedPack,
         PackId, PartyId, RevenueShareEntry, RouteBinding, SchemaVersion, TenantSelector,
     };
+    use greentic_types::EnvId;
     use tempfile::tempdir;
 
     const ENV_ID: &str = "local";
@@ -649,14 +650,6 @@ mod tests {
         env_dir
     }
 
-    fn write_environment(env_dir: &Path, env: &Environment) {
-        std::fs::write(
-            env_dir.join("environment.json"),
-            serde_json::to_vec(env).unwrap(),
-        )
-        .unwrap();
-    }
-
     /// A runtime-config with a single revision under `deployment_id`.
     fn single_revision_rc(deployment_id: &DeploymentId) -> LoadedRuntimeConfig {
         LoadedRuntimeConfig {
@@ -686,18 +679,27 @@ mod tests {
     }
 
     #[test]
-    fn activate_errors_when_environment_is_missing() {
-        // Isolated: explicit store_root, no global env / HOME mutation.
+    fn activate_errors_when_env_id_does_not_match_runtime_config() {
+        // The caller passes a pre-loaded Environment; activation must reject
+        // an env whose `environment_id` does not match the rc's `env_id` so a
+        // stale or wrong-env load cannot silently activate.
         let dir = tempdir().unwrap();
-        seed_env_dir(dir.path());
         let rc = single_revision_rc(&DeploymentId::new());
+        let mut mismatched = make_env(Vec::new());
+        mismatched.environment_id = EnvId::try_from("not-local").unwrap();
+        mismatched.host_config.env_id = EnvId::try_from("not-local").unwrap();
 
-        let err = match block_on(activate_runtime_config(dir.path(), &rc, dummy_secrets())) {
+        let err = match block_on(activate_runtime_config(
+            dir.path(),
+            &rc,
+            dummy_secrets(),
+            &mismatched,
+        )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
         };
         assert!(
-            err.to_string().contains("loading environment"),
+            err.to_string().contains("was loaded for activation"),
             "got: {err:#}"
         );
     }
@@ -705,12 +707,17 @@ mod tests {
     #[test]
     fn activate_errors_when_deployment_not_in_environment() {
         let dir = tempdir().unwrap();
-        let env_dir = seed_env_dir(dir.path());
+        seed_env_dir(dir.path());
         // Environment has no bundles, so the revision's deployment is unknown.
-        write_environment(&env_dir, &make_env(Vec::new()));
+        let env = make_env(Vec::new());
         let rc = single_revision_rc(&DeploymentId::new());
 
-        let err = match block_on(activate_runtime_config(dir.path(), &rc, dummy_secrets())) {
+        let err = match block_on(activate_runtime_config(
+            dir.path(),
+            &rc,
+            dummy_secrets(),
+            &env,
+        )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
         };
@@ -723,21 +730,23 @@ mod tests {
     #[test]
     fn activate_errors_when_deployment_is_not_active() {
         let dir = tempdir().unwrap();
-        let env_dir = seed_env_dir(dir.path());
+        seed_env_dir(dir.path());
         let dep_id = DeploymentId::new();
-        write_environment(
-            &env_dir,
-            &make_env(vec![make_deployment(
-                dep_id,
-                "acme",
-                "cust",
-                "fast2flow",
-                BundleDeploymentStatus::Paused,
-            )]),
-        );
+        let env = make_env(vec![make_deployment(
+            dep_id,
+            "acme",
+            "cust",
+            "fast2flow",
+            BundleDeploymentStatus::Paused,
+        )]);
         let rc = single_revision_rc(&dep_id);
 
-        let err = match block_on(activate_runtime_config(dir.path(), &rc, dummy_secrets())) {
+        let err = match block_on(activate_runtime_config(
+            dir.path(),
+            &rc,
+            dummy_secrets(),
+            &env,
+        )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
         };
@@ -747,22 +756,24 @@ mod tests {
     #[test]
     fn activate_errors_when_block_bundle_mismatches_deployment() {
         let dir = tempdir().unwrap();
-        let env_dir = seed_env_dir(dir.path());
+        seed_env_dir(dir.path());
         let dep_id = DeploymentId::new();
         // Deployment is bound to a different bundle than the runtime-config block.
-        write_environment(
-            &env_dir,
-            &make_env(vec![make_deployment(
-                dep_id,
-                "acme",
-                "cust",
-                "other-bundle",
-                BundleDeploymentStatus::Active,
-            )]),
-        );
+        let env = make_env(vec![make_deployment(
+            dep_id,
+            "acme",
+            "cust",
+            "other-bundle",
+            BundleDeploymentStatus::Active,
+        )]);
         let rc = single_revision_rc(&dep_id); // pins bundle "fast2flow"
 
-        let err = match block_on(activate_runtime_config(dir.path(), &rc, dummy_secrets())) {
+        let err = match block_on(activate_runtime_config(
+            dir.path(),
+            &rc,
+            dummy_secrets(),
+            &env,
+        )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
         };
@@ -776,21 +787,23 @@ mod tests {
         // fallback). With no pinned packs, activation then fails at pack
         // reading — proving the build + secrets-wiring step succeeded.
         let dir = tempdir().unwrap();
-        let env_dir = seed_env_dir(dir.path());
+        seed_env_dir(dir.path());
         let dep_id = DeploymentId::new();
-        write_environment(
-            &env_dir,
-            &make_env(vec![make_deployment(
-                dep_id,
-                "acme",
-                "cust",
-                "fast2flow",
-                BundleDeploymentStatus::Active,
-            )]),
-        );
+        let env = make_env(vec![make_deployment(
+            dep_id,
+            "acme",
+            "cust",
+            "fast2flow",
+            BundleDeploymentStatus::Active,
+        )]);
         let rc = single_revision_rc(&dep_id); // empty pack_list_refs
 
-        let err = match block_on(activate_runtime_config(dir.path(), &rc, dummy_secrets())) {
+        let err = match block_on(activate_runtime_config(
+            dir.path(),
+            &rc,
+            dummy_secrets(),
+            &env,
+        )) {
             Ok(_) => panic!("expected activation to fail at pack reading"),
             Err(e) => e,
         };
@@ -810,15 +823,20 @@ mod tests {
         // empty, and the placeholder host satisfies `HostBuilder::build()`'s
         // non-empty-configs invariant without being reachable at request time.
         let dir = tempdir().unwrap();
-        let env_dir = seed_env_dir(dir.path());
-        write_environment(&env_dir, &make_env(Vec::new()));
+        seed_env_dir(dir.path());
+        let env = make_env(Vec::new());
         let rc = LoadedRuntimeConfig {
             env_id: ENV_ID.to_string(),
             revisions: Vec::new(),
         };
 
-        let activation = block_on(activate_runtime_config(dir.path(), &rc, dummy_secrets()))
-            .expect("empty rc activates");
+        let activation = block_on(activate_runtime_config(
+            dir.path(),
+            &rc,
+            dummy_secrets(),
+            &env,
+        ))
+        .expect("empty rc activates");
         assert_eq!(activation.routing.dispatcher.deployment_count(), 0);
         assert_eq!(activation.routing.dispatcher.revision_count(), 0);
         assert_eq!(activation.routing.deployment_routes.len(), 0);

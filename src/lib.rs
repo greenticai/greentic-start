@@ -289,25 +289,39 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let rc = runtime_config::load_or_empty(&env_id)?;
         let store_root = greentic_deployer::environment::LocalFsStore::default_root()
             .context("cannot determine the default environment store root (no home directory)")?;
+        let env_dir = runtime_config::env_dir_in(&store_root, &env_id)?;
+
+        // Initialize operator.log under the env directory before any
+        // `operator_log::*` call on this path; otherwise every banner,
+        // listener log, and warning is silently dropped (the logger
+        // no-ops until `init`).
+        let log_level = if request.quiet {
+            operator_log::Level::Warn
+        } else if request.verbose {
+            operator_log::Level::Debug
+        } else {
+            operator_log::Level::Info
+        };
+        let log_dir = operator_log::init(env_dir.join("logs"), log_level)?;
+        let _trace_guard = init_trace_log(&log_dir);
+
         // Activate with the env's own DevStore secrets backend rather than
         // HostBuilder's default env-var backend (which rejects non-local
         // envs). A later step refines this to the per-tenant/pack-declared
         // backend once the serving context is resolved.
-        let env_dir = runtime_config::env_dir_in(&store_root, &env_id)?;
         let secrets: crate::secrets_gate::DynSecretsManager =
             std::sync::Arc::new(crate::secrets_client::SecretsClient::open(&env_dir)?);
 
         // Load the Environment so the bind address can layer on top of the
-        // persisted `host_config.listen_addr`. Bootstrap already ran above, so
-        // this is expected to succeed for `local` and any operator-initialized
-        // env; a load failure is a real config error, not a missing-env case.
+        // persisted `host_config.listen_addr`. The same `Environment` is
+        // threaded into `activate_runtime_config` so the activation path
+        // does not re-read the file (and cannot see a different snapshot).
         let env_store = greentic_deployer::environment::LocalFsStore::new(store_root.clone());
         let env_typed = greentic_types::EnvId::new(&env_id)
             .with_context(|| format!("invalid environment id `{env_id}`"))?;
         let environment =
             greentic_deployer::environment::EnvironmentStore::load(&env_store, &env_typed)
                 .with_context(|| format!("loading environment `{env_id}` for bundle-less boot"))?;
-        let host_config = environment.host_config.clone();
 
         let activation_rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -317,6 +331,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             &store_root,
             &rc,
             secrets,
+            &environment,
         ))?;
 
         // Execution bridge: serve the activated revisions over a slim HTTP
@@ -326,9 +341,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // vertical slice — provider webhook parsing, WebChat/WS, and static
         // assets under revisions stay on the legacy `--bundle` ingress.
         let revision_boot::RuntimeConfigActivation { host, routing } = activation;
-        let revision_count = rc.revisions.len();
-        let deployment_count = routing.dispatcher.deployment_count();
-        let bind_addr = revision_serve::resolve_bind_addr(Some(&host_config));
+        let bind_addr = revision_serve::resolve_bind_addr(Some(&environment.host_config));
         let server = revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
             bind_addr,
             host: std::sync::Arc::new(host),
@@ -336,6 +349,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         })
         .context("starting the revision ingress server")?;
         let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
+        let (deployment_count, revision_count) = server.counts();
         let banner = if revision_count == 0 {
             format!(
                 "no bundles attached to env `{}` — serving probes only on http://{listen} \

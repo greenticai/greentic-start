@@ -88,6 +88,9 @@ pub(crate) struct RevisionServer {
     shutdown: Option<oneshot::Sender<()>>,
     handle: Option<JoinHandle<Result<()>>>,
     actual_port: u16,
+    /// Dispatcher handle kept so external callers (the startup banner) can
+    /// snapshot the same counts `/status` reads.
+    dispatcher: Arc<crate::revision_dispatcher::RevisionDispatcher>,
 }
 
 impl RevisionServer {
@@ -110,6 +113,7 @@ impl RevisionServer {
         }
         let addr = SocketAddr::new(listen_ip, actual_port);
 
+        let dispatcher = Arc::clone(&config.routing.dispatcher);
         let state = Arc::new(ServeState {
             host: config.host,
             routing: config.routing,
@@ -195,6 +199,7 @@ impl RevisionServer {
             shutdown: Some(tx),
             handle: Some(handle),
             actual_port,
+            dispatcher,
         })
     }
 
@@ -202,6 +207,13 @@ impl RevisionServer {
     /// taken).
     pub(crate) fn actual_port(&self) -> u16 {
         self.actual_port
+    }
+
+    /// `(deployment_count, revision_count)` from a single dispatcher
+    /// snapshot — the same source `/status` reads. Used by the startup
+    /// banner so the banner and `/status` cannot disagree.
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        self.dispatcher.counts()
     }
 
     /// Signal shutdown and join the serving thread.
@@ -533,33 +545,24 @@ fn error_response(status: StatusCode, message: impl AsRef<str>) -> Response<Full
     text_response(status, message.as_ref())
 }
 
-/// k8s-style probe endpoints (N1.2). `/livez` and `/readyz` answer the two
-/// distinct lifecycle questions: liveness = "process is alive" (true while
-/// the listener accepts), readiness = "ready to accept traffic" (true the
-/// same moment the listener is up — a runtime with zero bundles still
-/// serves diagnostics + 404 for unrouted paths, so it IS ready). Returning
-/// 200 from both even on an empty runtime is intentional: bundle absence is
-/// visible through `/status` and route-resolution 404s, not by failing the
-/// probe. `/healthz` and `/health` stay alive as backward-compat aliases.
-///
-/// Returns `None` for any path that is not a probe; callers fall through to
-/// the regular routing path.
+/// `/livez`, `/readyz`, `/healthz`, `/health` return `200 ok`; `/status`
+/// returns the diagnostics JSON. Returns `None` for non-probe paths so the
+/// caller falls through to routing.
 fn try_probe_response(path: &str, state: &ServeState) -> Option<Response<Full<Bytes>>> {
     if matches!(path, "/livez" | "/readyz" | "/healthz" | "/health") {
         return Some(text_response(StatusCode::OK, "ok"));
     }
     if path == "/status" {
+        let (deployments_routed, revisions_active) = state.routing.dispatcher.counts();
         let body = serde_json::json!({
             "schema": "greentic.status.v1",
             "env_id": state.routing.dispatcher.env_id(),
             "listen_addr": state.bound_addr.to_string(),
             "bundles_active": state.routing.deployment_routes.len(),
-            "deployments_routed": state.routing.dispatcher.deployment_count(),
-            "revisions_active": state.routing.dispatcher.revision_count(),
+            "deployments_routed": deployments_routed,
+            "revisions_active": revisions_active,
         });
-        let bytes =
-            serde_json::to_vec(&body).expect("serializing fixed-shape status JSON is infallible");
-        return Some(json_response(StatusCode::OK, bytes));
+        return Some(json_response(StatusCode::OK, body.to_string().into_bytes()));
     }
     None
 }
@@ -586,32 +589,40 @@ pub(crate) fn resolve_bind_addr(host_config: Option<&EnvironmentHostConfig>) -> 
 
     if let Ok(raw) = std::env::var("GREENTIC_GATEWAY_LISTEN_ADDR") {
         let trimmed = raw.trim();
-        if let Ok(sa) = trimmed.parse::<SocketAddr>() {
-            addr = sa;
-        } else if let Ok(ip) = trimmed.parse::<IpAddr>() {
-            addr = SocketAddr::new(ip, addr.port());
-        } else {
-            operator_log::warn(
-                module_path!(),
-                format!(
-                    "GREENTIC_GATEWAY_LISTEN_ADDR={trimmed:?} is not a valid SocketAddr or IP; \
-                     falling back to {addr}"
-                ),
-            );
+        // Empty / whitespace-only is treated as unset — many deployment
+        // systems expose env-vars as empty strings to mean "use default";
+        // a warning here would be noise.
+        if !trimmed.is_empty() {
+            if let Ok(sa) = trimmed.parse::<SocketAddr>() {
+                addr = sa;
+            } else if let Ok(ip) = trimmed.parse::<IpAddr>() {
+                addr = SocketAddr::new(ip, addr.port());
+            } else {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "GREENTIC_GATEWAY_LISTEN_ADDR={trimmed:?} is not a valid SocketAddr or IP; \
+                         falling back to {addr}"
+                    ),
+                );
+            }
         }
     }
 
     if let Ok(raw) = std::env::var("PORT") {
         let trimmed = raw.trim();
-        match trimmed.parse::<u16>() {
-            Ok(port) => addr.set_port(port),
-            Err(_) => operator_log::warn(
-                module_path!(),
-                format!(
-                    "PORT={trimmed:?} is not a valid u16; keeping port {}",
-                    addr.port()
-                ),
-            ),
+        if !trimmed.is_empty() {
+            if let Ok(port) = trimmed.parse::<u16>() {
+                addr.set_port(port);
+            } else {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "PORT={trimmed:?} is not a valid u16; keeping port {}",
+                        addr.port()
+                    ),
+                );
+            }
         }
     }
 

@@ -261,21 +261,29 @@ impl RevisionDispatcher {
         Ok(dispatcher)
     }
 
+    /// Number of distinct deployments routable by this dispatcher.
+    /// Callers that need this paired with [`Self::revision_count`] should
+    /// use [`Self::counts`] instead so both numbers come from the same
+    /// `arc_swap` snapshot.
     pub fn deployment_count(&self) -> usize {
         self.snapshot.load().deployments.len()
     }
 
-    /// Total number of revisions across all deployments. Used by the bundle-
-    /// less probe surface (`/status`) so operators can confirm whether any
-    /// runtime traffic is being served vs. just the listener and probes
-    /// being up.
+    /// Total revisions across all deployments. See [`Self::counts`] when
+    /// reading this alongside [`Self::deployment_count`].
     pub fn revision_count(&self) -> usize {
-        self.snapshot
-            .load()
-            .deployments
-            .values()
-            .map(|d| d.revisions.len())
-            .sum()
+        self.counts().1
+    }
+
+    /// Single-snapshot `(deployment_count, revision_count)`. One `arc_swap`
+    /// load, one map walk — callers that need both counts at the same
+    /// instant (`/status`, the startup banner) read from a single
+    /// consistent snapshot instead of two separate loads.
+    pub fn counts(&self) -> (usize, usize) {
+        let snap = self.snapshot.load();
+        let deployments = snap.deployments.len();
+        let revisions = snap.deployments.values().map(|d| d.revisions.len()).sum();
+        (deployments, revisions)
     }
 
     /// Env this dispatcher routes for. The ingress seam uses it to build the
