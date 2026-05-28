@@ -294,9 +294,30 @@ impl RevisionServer {
     /// producer will call. A `drain_window` of zero drops the previous
     /// activation immediately (only safe in tests, where the producer
     /// controls request scheduling).
+    ///
+    /// Per-deployment dispatcher generations are carried forward from the
+    /// previous activation BEFORE the swap (see
+    /// [`crate::revision_dispatcher::RevisionDispatcher::carry_forward_generations_from`])
+    /// so any stickiness cookie or session pin minted against the previous
+    /// dispatcher is invalidated and the next request re-picks under the
+    /// new traffic split. Without that bump a reload that only changes
+    /// weights for an already-deployed `deployment_id` would leave
+    /// cookie-pinned clients on the pre-reload revision until cookie/pin
+    /// TTL, defeating canary cuts and partial rollbacks.
     #[allow(dead_code)] // consumed by N2.2; covered by unit tests
     pub(crate) fn reload(&self, new: Activation, drain_window: Duration) -> ReloadReport {
         let new_arc = Arc::new(new);
+        // Snapshot the previous activation BEFORE publishing the new one so
+        // the dispatcher generation bump runs against a stable reference.
+        // `swap` would also return the prev pointer atomically with the
+        // store, but doing the bump first means we publish a dispatcher
+        // whose generations are already correct for the very first
+        // dispatch under the new activation.
+        let prev = self.state.slot.load_full();
+        new_arc
+            .routing
+            .dispatcher
+            .carry_forward_generations_from(&prev.routing.dispatcher);
         let (new_deployments, new_revisions) = new_arc.routing.dispatcher.counts();
         let prev = self.state.slot.swap(new_arc);
         let (prev_deployments, prev_revisions) = prev.routing.dispatcher.counts();
@@ -1360,6 +1381,128 @@ mod tests {
         assert!(
             weak_old.upgrade().is_none(),
             "old activation must be freed once the drain window elapses"
+        );
+    }
+
+    /// Build an [`Activation`] with a single deployment + revision, both
+    /// taken as parameters so two activations can share IDs across a reload.
+    /// The dispatcher carries the deployment at generation 1 (whatever
+    /// `apply_traffic_split(.., expected_generation=0)` yields).
+    fn activation_with_ids(
+        env_id: &str,
+        deployment_id: greentic_deploy_spec::ids::DeploymentId,
+        revision_id: greentic_deploy_spec::ids::RevisionId,
+        bundle_id: greentic_deploy_spec::ids::BundleId,
+    ) -> Activation {
+        use crate::revision_dispatcher::{
+            RevisionDispatcher, RevisionDispatcherConfig, RevisionEntry,
+        };
+        let base = empty_activation(env_id);
+        let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new(env_id, [0u8; 32]));
+        let revisions = vec![RevisionEntry {
+            revision_id,
+            bundle_id: bundle_id.clone(),
+            weight_bps: 10_000,
+        }];
+        dispatcher
+            .apply_traffic_split(deployment_id, revisions, bundle_id, 0)
+            .expect("apply_traffic_split for shared-deployment activation");
+        Activation {
+            host: base.host,
+            routing: std::sync::Arc::new(RevisionIngressRouting {
+                dispatcher: std::sync::Arc::new(dispatcher),
+                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
+                deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_invalidates_pre_reload_cookie_for_persisted_deployment() {
+        // Regression test for the Codex finding on PR-N2.1: without
+        // [`RevisionDispatcher::carry_forward_generations_from`], reload
+        // would publish a fresh dispatcher whose deployment generation
+        // matches the previous dispatcher's (both at the
+        // `apply_traffic_split`-from-zero default of 1) and a cookie minted
+        // pre-reload would still verify post-reload — defeating canary
+        // weight cuts and partial rollbacks for already-cookie'd clients.
+        let env_id = "env-1";
+        let tenant = "tenant-a";
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let rev_id = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("customer.support");
+
+        let act1 = activation_with_ids(env_id, dep_id, rev_id, bundle_id.clone());
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(act1)),
+            bound_addr: bound,
+        });
+        let server = server_for_test(std::sync::Arc::clone(&state));
+
+        // Mint a cookie against the live (pre-reload) dispatcher. The test
+        // helper seals it under generation 1 — the value `apply_traffic_split`
+        // writes for a from-zero call.
+        let act1_snap = state.current();
+        assert_eq!(
+            act1_snap.routing.dispatcher.counts(),
+            (1, 1),
+            "pre-reload activation must hold the test deployment + revision"
+        );
+        let cookie = act1_snap.routing.dispatcher.seal_cookie(
+            env_id,
+            tenant,
+            dep_id,
+            rev_id,
+            /* generation */ 1,
+            /* expires_at */ 9_999_999_999,
+        );
+        // Sanity: the cookie verifies against the pre-reload dispatcher at
+        // generation 1, the value `apply_traffic_split(.., 0)` produces.
+        assert_eq!(
+            act1_snap
+                .routing
+                .dispatcher
+                .verify_cookie(&cookie, env_id, tenant, dep_id, 1, 0),
+            Some(rev_id),
+            "pre-reload dispatcher must verify its own cookie"
+        );
+
+        // Reload to a new activation that re-uses the SAME deployment + bundle
+        // + revision (only the dispatcher object is fresh). Carry-forward must
+        // bump the new dispatcher's generation so the cookie sealed under
+        // generation 1 no longer verifies.
+        let act2 = activation_with_ids(env_id, dep_id, rev_id, bundle_id);
+        server.reload(act2, Duration::ZERO);
+
+        let act2_snap = state.current();
+        // The cookie's `g` is still 1, but the live dispatcher's expected
+        // generation is now 2 (1 + 1 from carry_forward) → mismatch → None.
+        assert_eq!(
+            act2_snap
+                .routing
+                .dispatcher
+                .verify_cookie(&cookie, env_id, tenant, dep_id, 2, 0),
+            None,
+            "post-reload dispatcher must reject the pre-reload cookie"
+        );
+        // And the post-reload cookie minted against `act2`'s actual generation
+        // (2) does verify, proving the carry-forward landed at 2 specifically.
+        let post_cookie = act2_snap.routing.dispatcher.seal_cookie(
+            env_id,
+            tenant,
+            dep_id,
+            rev_id,
+            2,
+            9_999_999_999,
+        );
+        assert_eq!(
+            act2_snap
+                .routing
+                .dispatcher
+                .verify_cookie(&post_cookie, env_id, tenant, dep_id, 2, 0),
+            Some(rev_id),
+            "post-reload dispatcher must verify a cookie minted at the new generation"
         );
     }
 }
