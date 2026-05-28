@@ -9,6 +9,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use greentic_deploy_spec::{BundleId, DeploymentId, RevisionId};
 use greentic_types::{ExtensionInline, decode_pack_manifest};
 use serde::Deserialize;
 use zip::ZipArchive;
@@ -16,6 +17,17 @@ use zip::ZipArchive;
 use crate::domains::{self, Domain};
 
 pub const EXT_HTTP_ROUTES_V1: &str = "greentic.http-routes.v1";
+
+/// Deployment provenance of a route. Present only for routes discovered from a
+/// materialized runtime-config (multi-revision deployments, produced in B4).
+/// Routes discovered from a single bundle have no scope (`None` = legacy),
+/// matching the `Option = legacy` discipline used by `RuntimeKey`.
+#[derive(Clone, Debug)]
+pub struct RevisionScope {
+    pub deployment_id: DeploymentId,
+    pub bundle_id: BundleId,
+    pub revision_id: RevisionId,
+}
 
 /// A single HTTP route declared by a pack.
 #[derive(Clone, Debug)]
@@ -30,6 +42,9 @@ pub struct HttpRouteDescriptor {
     #[allow(dead_code)]
     pub provider_op: String,
     pub domain: Domain,
+    /// Deployment/bundle/revision this route belongs to, or `None` for a
+    /// legacy single-bundle route (every route discovered today).
+    pub scope: Option<RevisionScope>,
     /// Parsed segments from the pattern for matching.
     segments: Vec<RouteSegment>,
 }
@@ -53,6 +68,27 @@ pub struct HttpRouteMatch<'a> {
     pub descriptor: &'a HttpRouteDescriptor,
     pub tenant: String,
     pub team: String,
+}
+
+/// Test-only descriptor constructor; `segments` is private so callers in other
+/// modules (e.g. the ingress dispatch tests) cannot build one directly.
+#[cfg(test)]
+pub(crate) fn descriptor_for_test(
+    pattern: &str,
+    methods: &[&str],
+    domain: Domain,
+    scope: Option<RevisionScope>,
+) -> HttpRouteDescriptor {
+    HttpRouteDescriptor {
+        route_id: pattern.to_string(),
+        pack_id: "test-pack".to_string(),
+        pattern: pattern.to_string(),
+        methods: methods.iter().map(|m| m.to_string()).collect(),
+        provider_op: "ingest_http".to_string(),
+        domain,
+        scope,
+        segments: parse_route_pattern(pattern),
+    }
 }
 
 impl HttpRouteTable {
@@ -86,9 +122,48 @@ impl HttpRouteTable {
         &self.routes
     }
 
-    /// Match an incoming request path against declared routes.
+    /// Match an incoming request against legacy (unscoped) routes only.
     /// Returns the first matching route with extracted tenant/team values.
+    ///
+    /// Revision-scoped routes are skipped here so the single-bundle ingress
+    /// path never routes to a deployment revision; that path goes through
+    /// [`Self::match_request_for_revision`] after the dispatcher resolves a
+    /// revision. Today every discovered route is legacy, so this is the only
+    /// live matcher.
     pub fn match_request(&self, path: &str, method: &str) -> Option<HttpRouteMatch<'_>> {
+        self.match_first(path, method, |route| route.scope.is_none())
+    }
+
+    /// Match an incoming request against routes belonging to a specific
+    /// resolved scope. Used by the ingress dispatcher seam once a
+    /// [`crate::revision_dispatcher::RevisionDispatcher`] picks a revision.
+    ///
+    /// Matches on the **full** `(deployment_id, bundle_id, revision_id)`, not
+    /// just the revision: a shared route table can hold entries for several
+    /// deployments, and matching on revision alone could route a dispatch
+    /// outcome for one deployment to a route stamped for another under id
+    /// reuse or stale entries.
+    pub fn match_request_for_revision(
+        &self,
+        path: &str,
+        method: &str,
+        scope: &RevisionScope,
+    ) -> Option<HttpRouteMatch<'_>> {
+        self.match_first(path, method, |route| {
+            route.scope.as_ref().is_some_and(|s| {
+                s.deployment_id == scope.deployment_id
+                    && s.bundle_id == scope.bundle_id
+                    && s.revision_id == scope.revision_id
+            })
+        })
+    }
+
+    fn match_first(
+        &self,
+        path: &str,
+        method: &str,
+        accept: impl Fn(&HttpRouteDescriptor) -> bool,
+    ) -> Option<HttpRouteMatch<'_>> {
         let request_segments: Vec<&str> = path
             .trim_start_matches('/')
             .split('/')
@@ -96,6 +171,9 @@ impl HttpRouteTable {
             .collect();
 
         for route in &self.routes {
+            if !accept(route) {
+                continue;
+            }
             if !route.methods.is_empty()
                 && !route.methods.iter().any(|m| m.eq_ignore_ascii_case(method))
             {
@@ -241,10 +319,43 @@ pub fn discover_http_routes_from_bundle(
     bundle_root: &Path,
 ) -> anyhow::Result<Vec<HttpRouteDescriptor>> {
     let pack_paths = collect_runtime_pack_paths(bundle_root)?;
-    let mut all_routes = Vec::new();
+    Ok(discover_routes_from_packs(&pack_paths, None))
+}
+
+/// Discover HTTP routes from a revision's pinned pack files, stamping each with
+/// the revision's [`RevisionScope`].
+///
+/// A revision is a set of pinned `.gtpack` files (not a bundle directory), so
+/// this takes explicit pack paths and reuses the same per-pack manifest reader
+/// as [`discover_http_routes_from_bundle`]. The scope makes the resulting
+/// descriptors matchable via [`HttpRouteTable::match_request_for_revision`].
+pub fn discover_revision_http_routes(
+    pack_paths: &[PathBuf],
+    scope: &RevisionScope,
+) -> Vec<HttpRouteDescriptor> {
+    discover_routes_from_packs(pack_paths, Some(scope))
+}
+
+/// Read pack-declared HTTP routes from each pack path, optionally stamping every
+/// route with `scope` (`Some` = revision-scoped discovery, `None` = legacy
+/// single-bundle). A pack that declares no routes — or fails to read — is
+/// skipped with a warning so one malformed pack can't abort discovery of the
+/// rest.
+fn discover_routes_from_packs(
+    pack_paths: &[PathBuf],
+    scope: Option<&RevisionScope>,
+) -> Vec<HttpRouteDescriptor> {
+    let mut routes = Vec::new();
     for pack_path in pack_paths {
-        match read_pack_http_routes(&pack_path) {
-            Ok(Some(routes)) => all_routes.extend(routes),
+        match read_pack_http_routes(pack_path) {
+            Ok(Some(mut pack_routes)) => {
+                if let Some(scope) = scope {
+                    for route in &mut pack_routes {
+                        route.scope = Some(scope.clone());
+                    }
+                }
+                routes.extend(pack_routes);
+            }
             Ok(None) => continue,
             Err(err) => {
                 crate::operator_log::warn(
@@ -257,7 +368,7 @@ pub fn discover_http_routes_from_bundle(
             }
         }
     }
-    Ok(all_routes)
+    routes
 }
 
 fn read_pack_http_routes(pack_path: &Path) -> anyhow::Result<Option<Vec<HttpRouteDescriptor>>> {
@@ -324,6 +435,9 @@ fn parse_http_routes_v1(
             methods: record.methods,
             provider_op: record.provider_op,
             domain,
+            // Single-bundle discovery: no deployment provenance. B4's
+            // runtime-config-backed discovery stamps `Some(..)`.
+            scope: None,
             segments,
         });
     }
@@ -357,16 +471,16 @@ mod tests {
     use super::*;
 
     fn make_route(pattern: &str, methods: &[&str], domain: Domain) -> HttpRouteDescriptor {
-        let segments = parse_route_pattern(pattern);
-        HttpRouteDescriptor {
-            route_id: pattern.to_string(),
-            pack_id: "test-pack".to_string(),
-            pattern: pattern.to_string(),
-            methods: methods.iter().map(|m| m.to_string()).collect(),
-            provider_op: "ingest_http".to_string(),
-            domain,
-            segments,
-        }
+        make_scoped_route(pattern, methods, domain, None)
+    }
+
+    fn make_scoped_route(
+        pattern: &str,
+        methods: &[&str],
+        domain: Domain,
+        scope: Option<RevisionScope>,
+    ) -> HttpRouteDescriptor {
+        super::descriptor_for_test(pattern, methods, domain, scope)
     }
 
     #[test]
@@ -495,6 +609,121 @@ mod tests {
         assert_eq!(m.team, "support");
     }
 
+    fn scope_for(deployment_id: DeploymentId, revision_id: RevisionId) -> RevisionScope {
+        RevisionScope {
+            deployment_id,
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id,
+        }
+    }
+
+    #[test]
+    fn match_request_skips_revision_scoped_routes() {
+        let rev = RevisionId::new();
+        let table = HttpRouteTable::from_descriptors(vec![make_scoped_route(
+            "/v1/messaging/webchat/{tenant}/token",
+            &["GET"],
+            Domain::Messaging,
+            Some(scope_for(DeploymentId::new(), rev)),
+        )]);
+
+        // Legacy matcher ignores scoped routes.
+        assert!(
+            table
+                .match_request("/v1/messaging/webchat/demo/token", "GET")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn match_request_for_revision_only_matches_that_revision() {
+        let deployment = DeploymentId::new();
+        let scope_a = scope_for(deployment, RevisionId::new());
+        let scope_b = scope_for(deployment, RevisionId::new());
+        let table = HttpRouteTable::from_descriptors(vec![
+            make_scoped_route(
+                "/v1/messaging/webchat/{tenant}/token",
+                &["GET"],
+                Domain::Messaging,
+                Some(scope_a.clone()),
+            ),
+            make_scoped_route(
+                "/v1/messaging/webchat/{tenant}/token",
+                &["GET"],
+                Domain::Messaging,
+                Some(scope_b.clone()),
+            ),
+        ]);
+
+        let m = table
+            .match_request_for_revision("/v1/messaging/webchat/demo/token", "GET", &scope_a)
+            .expect("should match revision A's route");
+        assert_eq!(
+            m.descriptor.scope.as_ref().unwrap().revision_id,
+            scope_a.revision_id
+        );
+
+        // No legacy route exists, so the unscoped matcher finds nothing.
+        assert!(
+            table
+                .match_request("/v1/messaging/webchat/demo/token", "GET")
+                .is_none()
+        );
+
+        // A scope for a revision with no routes matches nothing.
+        let unknown = scope_for(deployment, RevisionId::new());
+        assert!(
+            table
+                .match_request_for_revision("/v1/messaging/webchat/demo/token", "GET", &unknown)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn match_request_for_revision_distinguishes_deployments() {
+        // Same revision id stamped under two different deployments. Matching on
+        // the full scope must not route one deployment's request to the other's
+        // route (regression for revision-only matching).
+        let revision = RevisionId::new();
+        let scope_a = scope_for(DeploymentId::new(), revision);
+        let scope_b = scope_for(DeploymentId::new(), revision);
+        let table = HttpRouteTable::from_descriptors(vec![make_scoped_route(
+            "/v1/messaging/webchat/{tenant}/token",
+            &["GET"],
+            Domain::Messaging,
+            Some(scope_a.clone()),
+        )]);
+
+        assert!(
+            table
+                .match_request_for_revision("/v1/messaging/webchat/demo/token", "GET", &scope_a)
+                .is_some(),
+            "deployment A's scope matches its own route"
+        );
+        assert!(
+            table
+                .match_request_for_revision("/v1/messaging/webchat/demo/token", "GET", &scope_b)
+                .is_none(),
+            "deployment B's scope must not match deployment A's route despite equal revision id"
+        );
+    }
+
+    #[test]
+    fn match_request_for_revision_skips_legacy_routes() {
+        let table = HttpRouteTable::from_descriptors(vec![make_route(
+            "/v1/messaging/webchat/{tenant}/token",
+            &["GET"],
+            Domain::Messaging,
+        )]);
+
+        let scope = scope_for(DeploymentId::new(), RevisionId::new());
+        assert!(
+            table
+                .match_request_for_revision("/v1/messaging/webchat/demo/token", "GET", &scope)
+                .is_none()
+        );
+    }
+
     #[test]
     fn parse_route_pattern_handles_variants() {
         let segs = parse_route_pattern("/v1/{tenant}/v3/directline/{path*}");
@@ -503,5 +732,97 @@ mod tests {
         assert!(matches!(segs[2], RouteSegment::Literal(ref s) if s == "v3"));
         assert!(matches!(segs[3], RouteSegment::Literal(ref s) if s == "directline"));
         assert!(matches!(segs[4], RouteSegment::Wildcard));
+    }
+
+    /// Write a minimal `.gtpack` whose manifest declares a single
+    /// `greentic.http-routes.v1` route, mirroring the real on-disk shape. The
+    /// manifest is built via plain serde then re-encoded with the symbol-table
+    /// CBOR codec [`decode_pack_manifest`] expects.
+    fn write_http_routes_pack(path: &Path, pack_id: &str, pattern: &str) {
+        use std::io::Write as _;
+        use zip::write::FileOptions;
+
+        let manifest_json = serde_json::json!({
+            "schema_version": "1.0.0",
+            "pack_id": pack_id,
+            "version": "1.0.0",
+            "kind": "provider",
+            "publisher": "tests",
+            "extensions": {
+                EXT_HTTP_ROUTES_V1: {
+                    "kind": EXT_HTTP_ROUTES_V1,
+                    "version": "1.0.0",
+                    "inline": {
+                        "schema_version": 1,
+                        "routes": [{
+                            "pattern": pattern,
+                            "methods": ["GET"],
+                            "domain": "messaging"
+                        }]
+                    }
+                }
+            }
+        });
+        let manifest: greentic_types::PackManifest =
+            serde_json::from_value(manifest_json).expect("manifest deserializes");
+        let bytes = greentic_types::encode_pack_manifest(&manifest).expect("manifest encodes");
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .unwrap();
+        zip.write_all(&bytes).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn discover_revision_http_routes_stamps_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("alpha.gtpack");
+        let pattern = "/v1/messaging/webchat/{tenant}/token";
+        write_http_routes_pack(&pack, "alpha", pattern);
+
+        let scope = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let routes = discover_revision_http_routes(&[pack], &scope);
+        assert_eq!(routes.len(), 1, "one route discovered");
+        assert_eq!(routes[0].pattern, pattern);
+        let stamped = routes[0].scope.as_ref().expect("scope stamped");
+        assert_eq!(stamped.deployment_id, scope.deployment_id);
+        assert_eq!(stamped.bundle_id, scope.bundle_id);
+        assert_eq!(stamped.revision_id, scope.revision_id);
+
+        // The stamped route is matchable for its scope, invisible to the legacy
+        // matcher.
+        let table = HttpRouteTable::from_descriptors(routes);
+        assert!(
+            table
+                .match_request_for_revision("/v1/messaging/webchat/demo/token", "GET", &scope)
+                .is_some()
+        );
+        assert!(
+            table
+                .match_request("/v1/messaging/webchat/demo/token", "GET")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn discover_revision_http_routes_skips_unreadable_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not a zip — discovery must skip it (with a warning) and not abort.
+        let bad = dir.path().join("garbage.gtpack");
+        std::fs::write(&bad, b"not a zip archive").unwrap();
+        let missing = dir.path().join("does-not-exist.gtpack");
+
+        let scope = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let routes = discover_revision_http_routes(&[bad, missing], &scope);
+        assert!(routes.is_empty(), "unreadable packs yield no routes");
     }
 }

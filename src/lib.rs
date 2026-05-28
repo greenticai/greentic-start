@@ -18,6 +18,7 @@ mod component_qa_ops;
 pub mod config;
 mod demo_qa_bridge;
 mod dependency_resolver;
+mod deployment_routes;
 mod dev_store_path;
 mod discovery;
 mod doctor;
@@ -46,10 +47,18 @@ mod post_ingress_hooks;
 mod project;
 pub mod provider_config_envelope;
 mod qa_persist;
+mod revision_boot;
+mod revision_dispatcher;
+mod revision_drain;
+pub mod revision_health_gate;
+mod revision_pin;
+mod revision_serve;
+mod rollout_telemetry;
 mod runner_exec;
 mod runner_host;
 mod runner_integration;
 pub mod runtime;
+mod runtime_config;
 pub mod runtime_state;
 mod secret_name;
 mod secret_requirements;
@@ -83,6 +92,105 @@ pub use cli_args::{
 
 const DEMO_DEFAULT_TENANT: &str = "demo";
 const DEMO_DEFAULT_TEAM: &str = "default";
+
+/// Default environment id when nothing is set. Flipped from `"dev"` to
+/// `"local"` as part of A4b — the `local` env is what `gtc setup` and
+/// `gtc start` auto-create per A4.
+pub const DEFAULT_ENV_ID: &str = "local";
+
+/// Legacy env id this crate accepts via the compat alias. Resolved values
+/// that match this string are remapped to [`DEFAULT_ENV_ID`] with a
+/// once-per-process warning, unless the operator disables the alias.
+pub const LEGACY_ENV_ID: &str = "dev";
+
+/// Env-var that disables the [`LEGACY_ENV_ID`] → [`DEFAULT_ENV_ID`] compat
+/// alias. Set to `1`, `true`, `yes`, or `on` (case-insensitive) to make
+/// any resolved value of `dev` hard-fail with a remediation hint.
+pub const DISABLE_ALIAS_ENV_VAR: &str = "GREENTIC_DISABLE_DEV_ALIAS";
+
+/// Resolve the effective environment string.
+///
+/// Priority: explicit override > `$GREENTIC_ENV` > [`DEFAULT_ENV_ID`]
+/// (`"local"`). After resolution, applies the [`LEGACY_ENV_ID`] →
+/// [`DEFAULT_ENV_ID`] compat alias: any value of `dev` is remapped to
+/// `local` with a once-per-process `tracing::warn!` unless
+/// [`DISABLE_ALIAS_ENV_VAR`] is set, in which case the resolution panics
+/// with a remediation hint.
+///
+/// This is the canonical helper for the `runner_host`, `secrets_setup`,
+/// and `qa_persist` paths. Mirrors `greentic_setup::resolve_env` (A4b
+/// PR2 in `greentic-setup`). If the duplication ever proves load-bearing,
+/// fold both into a shared helper in `greentic-deployer::cli::bootstrap`
+/// or similar.
+pub fn resolve_env(override_env: Option<&str>) -> String {
+    let raw = override_env
+        .map(|v| v.to_string())
+        .or_else(|| std::env::var("GREENTIC_ENV").ok())
+        .unwrap_or_else(|| DEFAULT_ENV_ID.to_string());
+    compat_alias::apply_dev_alias(&raw)
+}
+
+mod compat_alias {
+    //! `dev` → `local` compatibility alias (A4b).
+    //!
+    //! Mirrors `greentic_setup::compat_alias`. Centralizing into a shared
+    //! crate is deferred until the duplication starts mattering — the
+    //! logic is ~30 lines and the two crates have distinct test surfaces.
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{DEFAULT_ENV_ID, DISABLE_ALIAS_ENV_VAR, LEGACY_ENV_ID};
+
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    /// Apply the `dev` → `local` compat alias. Returns the remapped value
+    /// for any input equal to [`LEGACY_ENV_ID`]; returns the input
+    /// unchanged for any other value. Panics if the alias is disabled via
+    /// [`DISABLE_ALIAS_ENV_VAR`] and the input is the legacy id.
+    pub fn apply_dev_alias(env: &str) -> String {
+        if env != LEGACY_ENV_ID {
+            return env.to_string();
+        }
+        if alias_disabled() {
+            // Hard-fail expiry gate. The panic message is the remediation —
+            // tracing may not be wired in every binary that consumes
+            // `resolve_env`, and `process::exit()` bypasses test harnesses.
+            panic!(
+                "environment `{LEGACY_ENV_ID}` is no longer accepted (set via {DISABLE_ALIAS_ENV_VAR}=1). \
+                 Migrate to `{DEFAULT_ENV_ID}` via `gtc op env migrate-dev {DEFAULT_ENV_ID} --check` then `--apply`, \
+                 or pass `--env {DEFAULT_ENV_ID}` / unset $GREENTIC_ENV.",
+            );
+        }
+        if !WARNED.swap(true, Ordering::SeqCst) {
+            tracing::warn!(
+                target: "greentic_start::compat_alias",
+                legacy = LEGACY_ENV_ID,
+                target_env = DEFAULT_ENV_ID,
+                "env `{LEGACY_ENV_ID}` is deprecated; resolving as `{DEFAULT_ENV_ID}` for this process. \
+                 Plan the migration with `gtc op env migrate-dev {DEFAULT_ENV_ID} --check`; \
+                 set {DISABLE_ALIAS_ENV_VAR}=1 to hard-fail on `{LEGACY_ENV_ID}` in CI.",
+            );
+        }
+        DEFAULT_ENV_ID.to_string()
+    }
+
+    fn alias_disabled() -> bool {
+        std::env::var(DISABLE_ALIAS_ENV_VAR)
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    }
+
+    /// Reset the warning latch. Test-only so multiple `apply_dev_alias`
+    /// invocations can each verify the once-per-process behavior.
+    #[cfg(test)]
+    pub(super) fn reset_warning_latch_for_tests() {
+        WARNED.store(false, Ordering::SeqCst);
+    }
+}
 
 pub fn run_start_request(request: StartRequest) -> anyhow::Result<()> {
     run_start(request)
@@ -154,12 +262,90 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         std::env::set_var("GREENTIC_PROVIDER_CORE_ONLY", "0");
     }
 
-    // Set GREENTIC_ENV to "dev" if not already set. Secrets are persisted with env="dev"
-    // (see providers.rs, onboard/wizard.rs), so the runtime must match when reading.
+    // Set GREENTIC_ENV to the A4b default (`local`) if not already set.
+    // A4's `bootstrap_local_environment` (below) creates `~/.greentic/environments/local/`
+    // and downstream secret resolution keys off this env. If the user already exported
+    // `GREENTIC_ENV=dev`, the A4b compat alias inside `resolve_env` remaps it to
+    // `local` with a once-per-process warning until the alias is disabled.
     // SAFETY: This is called early in single-threaded startup before spawning workers.
     if std::env::var("GREENTIC_ENV").is_err() {
         unsafe {
-            std::env::set_var("GREENTIC_ENV", "dev");
+            std::env::set_var("GREENTIC_ENV", DEFAULT_ENV_ID);
+        }
+    }
+
+    bootstrap_local_environment()?;
+
+    // B0/B2: when launched without a `--bundle` root (and no explicit demo
+    // config), boot from the operator-materialized `runtime-config.v1` for the
+    // active env, if one exists. B0 loads + validates it; B2 (here) activates it
+    // — loading every revision's pinned packs into an embedded runner host and
+    // building the revision dispatcher. Serving traffic from the populated host
+    // (the ingress consumer) lands in B3, so for now we activate and fail loud
+    // rather than pretend to serve. No producer writes the file yet, so this
+    // path is dormant in practice.
+    if request.bundle.is_none() && request.config.is_none() {
+        let env_id = resolve_env(None);
+        if let Some(rc) = runtime_config::load(&env_id)? {
+            let store_root = greentic_deployer::environment::LocalFsStore::default_root().context(
+                "cannot determine the default environment store root (no home directory)",
+            )?;
+            // Activate with the env's own DevStore secrets backend rather than
+            // HostBuilder's default env-var backend (which rejects non-local
+            // envs). A later step refines this to the per-tenant/pack-declared
+            // backend once the serving context is resolved.
+            let env_dir = runtime_config::env_dir_in(&store_root, &env_id)?;
+            let secrets: crate::secrets_gate::DynSecretsManager =
+                std::sync::Arc::new(crate::secrets_client::SecretsClient::open(&env_dir)?);
+            let activation_rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building runtime for revision activation")?;
+            let activation = activation_rt.block_on(revision_boot::activate_runtime_config(
+                &store_root,
+                &rc,
+                secrets,
+            ))?;
+
+            // Execution bridge: serve the activated revisions over a slim HTTP
+            // loop. Each request resolves to a deployment, the dispatcher picks a
+            // revision, and the request runs against that revision's runtime via
+            // `RunnerHost::handle_activity_for_revision`. This is the generic-JSON
+            // vertical slice — provider webhook parsing, WebChat/WS, and static
+            // assets under revisions stay on the legacy `--bundle` ingress.
+            let revision_boot::RuntimeConfigActivation { host, routing } = activation;
+            let revision_count = rc.revisions.len();
+            let deployment_count = routing.dispatcher.deployment_count();
+            let bind_addr = revision_serve::default_bind_addr();
+            let server =
+                revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
+                    bind_addr,
+                    host: std::sync::Arc::new(host),
+                    routing,
+                })
+                .context("starting the revision ingress server")?;
+            let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "serving {revision_count} revision(s) for env `{}` across {deployment_count} \
+                     deployment(s) on http://{listen}",
+                    rc.env_id
+                ),
+            );
+            println!(
+                "\nServing {revision_count} revision(s) for env `{}` on http://{listen}. \
+                 Press Ctrl+C to stop.",
+                rc.env_id
+            );
+            if let Err(err) = activation_rt.block_on(tokio::signal::ctrl_c()) {
+                operator_log::warn(
+                    module_path!(),
+                    format!("revision serving Ctrl+C listener error: {err}"),
+                );
+            }
+            server.stop()?;
+            return Ok(());
         }
     }
 
@@ -555,6 +741,34 @@ fn init_trace_log(
     Some(guard)
 }
 
+/// Idempotently auto-create the `local` Environment on first `gtc start`.
+///
+/// Per A4 of `plans/next-gen-deployment.md`: every `gtc start`, `gtc up`, or
+/// `gtc restart` invocation guarantees a `local` Environment exists with the
+/// five default capability-slot bindings (deployer / secrets / telemetry /
+/// sessions / state) before any runner work runs. Subsequent calls find the
+/// env on disk and stay silent.
+fn bootstrap_local_environment() -> anyhow::Result<()> {
+    use greentic_deployer::cli::bootstrap::{LocalEnvOutcome, ensure_local_environment};
+    use greentic_deployer::environment::LocalFsStore;
+
+    let root = LocalFsStore::default_root()
+        .context("Cannot determine default environment store root (no home directory).")?;
+    let store = LocalFsStore::new(root.clone());
+    let (_env, outcome) = ensure_local_environment(&store)
+        .with_context(|| format!("Bootstrapping `local` environment at {}", root.display()))?;
+    if outcome == LocalEnvOutcome::Created {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "bootstrapped `local` environment with default capability bindings at {}",
+                root.display()
+            ),
+        );
+    }
+    Ok(())
+}
+
 fn apply_nats_overrides(config: &mut config::DemoConfig, args: &StartRequest) {
     let nats_mode = if args.no_nats {
         NatsModeArg::Off
@@ -797,6 +1011,37 @@ mod tests {
         .expect("write demo config");
     }
 
+    /// RAII guard that points `$HOME` at the given tempdir for the lifetime of
+    /// the returned value, restoring the previous value on drop. Used to keep
+    /// `bootstrap_local_environment` (and any other HOME-rooted state) from
+    /// writing into the host's real `~/.greentic` during tests.
+    struct HomeOverride {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl HomeOverride {
+        fn set(home: &Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            // SAFETY: tests holding `test_env_lock` serialize env mutations.
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for HomeOverride {
+        fn drop(&mut self) {
+            // SAFETY: tests holding `test_env_lock` serialize env mutations.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
     fn request_runtime_stop(bundle: &Path) -> thread::JoinHandle<()> {
         let runtime_paths =
             runtime_state::RuntimePaths::new(bundle.join("state"), "demo", "default");
@@ -820,6 +1065,7 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         crate::operator_log::reset_for_tests();
         let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::set(temp.path());
         let bundle = temp.path().join("bundle");
         write_demo_bundle(&bundle);
         let stop_thread = request_runtime_stop(&bundle);
@@ -844,6 +1090,7 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         crate::operator_log::reset_for_tests();
         let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::set(temp.path());
         let bundle = temp.path().join("bundle");
         write_demo_bundle(&bundle);
         let stop_thread = request_runtime_stop(&bundle);
@@ -869,6 +1116,7 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         crate::operator_log::reset_for_tests();
         let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::set(temp.path());
         let missing_bundle = temp.path().join("missing-bundle");
         let mut request = make_start_request(&missing_bundle);
         request.quiet = true;
@@ -882,6 +1130,15 @@ mod tests {
             "unexpected error: {message}"
         );
     }
+
+    // The no-bundle runtime-config boot path (B0 load → B2 activation → fail
+    // loud until B3 serving) is covered by the fully-isolated
+    // `revision_boot::tests::activate_*` unit tests, which exercise
+    // `activate_runtime_config` directly against an explicit store root. A
+    // `run_start`-level test is deliberately omitted here: it must override
+    // `HOME`/env while activation runs, which reliably trips a pre-existing
+    // isolation gap in the lock-free `messaging_app` secrets tests (they read
+    // env-derived paths without `test_env_lock`).
 
     #[test]
     fn auto_enables_cloudflared_when_no_deployer_packs() {
@@ -910,5 +1167,173 @@ mod tests {
             !candidates.is_empty(),
             "bundle with terraform.gtpack should detect deployer"
         );
+    }
+
+    #[test]
+    fn bootstrap_creates_local_env_under_default_root() {
+        let _env_guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::set(temp.path());
+        super::bootstrap_local_environment().expect("first bootstrap");
+        let env_file = temp
+            .path()
+            .join(".greentic")
+            .join("environments")
+            .join("local")
+            .join("environment.json");
+        assert!(env_file.exists(), "expected env file at {env_file:?}");
+    }
+
+    #[test]
+    fn bootstrap_is_idempotent_across_calls() {
+        let _env_guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = HomeOverride::set(temp.path());
+        super::bootstrap_local_environment().expect("first bootstrap");
+        super::bootstrap_local_environment().expect("second bootstrap");
+        let env_file = temp
+            .path()
+            .join(".greentic")
+            .join("environments")
+            .join("local")
+            .join("environment.json");
+        assert!(env_file.exists());
+    }
+
+    // ---- A4b compat-alias tests ------------------------------------------
+    //
+    // `GREENTIC_ENV` and `GREENTIC_DISABLE_DEV_ALIAS` are process-global;
+    // serialize via the shared `test_env_lock`. Each test snapshots and
+    // restores both vars + the warning latch so neighbors stay clean.
+
+    struct EnvVarsOverride {
+        prev_env: Option<std::ffi::OsString>,
+        prev_disable: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarsOverride {
+        fn clean() -> Self {
+            let prev_env = std::env::var_os("GREENTIC_ENV");
+            let prev_disable = std::env::var_os(DISABLE_ALIAS_ENV_VAR);
+            // SAFETY: tests holding `test_env_lock` serialize env mutations.
+            unsafe {
+                std::env::remove_var("GREENTIC_ENV");
+                std::env::remove_var(DISABLE_ALIAS_ENV_VAR);
+            }
+            super::compat_alias::reset_warning_latch_for_tests();
+            Self {
+                prev_env,
+                prev_disable,
+            }
+        }
+    }
+
+    impl Drop for EnvVarsOverride {
+        fn drop(&mut self) {
+            // SAFETY: tests holding `test_env_lock` serialize env mutations.
+            unsafe {
+                match self.prev_env.take() {
+                    Some(v) => std::env::set_var("GREENTIC_ENV", v),
+                    None => std::env::remove_var("GREENTIC_ENV"),
+                }
+                match self.prev_disable.take() {
+                    Some(v) => std::env::set_var(DISABLE_ALIAS_ENV_VAR, v),
+                    None => std::env::remove_var(DISABLE_ALIAS_ENV_VAR),
+                }
+            }
+        }
+    }
+
+    fn set_env_var(key: &str, value: &str) {
+        // SAFETY: tests holding `test_env_lock` serialize env mutations.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    #[test]
+    fn resolve_env_returns_local_by_default() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarsOverride::clean();
+        assert_eq!(resolve_env(None), "local");
+    }
+
+    #[test]
+    fn resolve_env_passes_through_non_legacy_override() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarsOverride::clean();
+        assert_eq!(resolve_env(Some("staging")), "staging");
+        assert_eq!(resolve_env(Some("prod")), "prod");
+        assert_eq!(resolve_env(Some("local")), "local");
+    }
+
+    #[test]
+    fn resolve_env_remaps_dev_override_to_local() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarsOverride::clean();
+        assert_eq!(resolve_env(Some("dev")), "local");
+    }
+
+    #[test]
+    fn resolve_env_remaps_dev_env_var_to_local() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarsOverride::clean();
+        set_env_var("GREENTIC_ENV", "dev");
+        assert_eq!(resolve_env(None), "local");
+    }
+
+    #[test]
+    fn alias_warning_latches_once_until_reset() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarsOverride::clean();
+        // First two calls remap; only the first fires warn. We can't count
+        // tracing events without wiring a subscriber, so we exercise the
+        // latch state by re-resetting and re-calling.
+        assert_eq!(compat_alias::apply_dev_alias("dev"), "local");
+        assert_eq!(compat_alias::apply_dev_alias("dev"), "local");
+        compat_alias::reset_warning_latch_for_tests();
+        assert_eq!(compat_alias::apply_dev_alias("dev"), "local");
+    }
+
+    #[test]
+    fn disable_alias_env_var_panics_on_dev() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarsOverride::clean();
+        set_env_var(DISABLE_ALIAS_ENV_VAR, "1");
+        let result = std::panic::catch_unwind(|| resolve_env(Some("dev")));
+        assert!(
+            result.is_err(),
+            "resolve_env should panic when alias is disabled and input is `dev`"
+        );
+    }
+
+    #[test]
+    fn disable_alias_accepts_truthy_strings() {
+        for value in ["1", "true", "TRUE", "yes", "YES", "on", " true "] {
+            let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+            let _env = EnvVarsOverride::clean();
+            set_env_var(DISABLE_ALIAS_ENV_VAR, value);
+            let result = std::panic::catch_unwind(|| resolve_env(Some("dev")));
+            assert!(
+                result.is_err(),
+                "DISABLE value `{value}` should hard-fail on dev resolution"
+            );
+        }
+    }
+
+    #[test]
+    fn disable_alias_does_not_panic_on_non_legacy_values() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVarsOverride::clean();
+        set_env_var(DISABLE_ALIAS_ENV_VAR, "1");
+        // Non-legacy values pass through unaffected even when the alias is
+        // disabled — the gate only fires on `dev`.
+        assert_eq!(resolve_env(Some("local")), "local");
+        assert_eq!(resolve_env(Some("staging")), "staging");
+        assert_eq!(resolve_env(None), "local");
     }
 }

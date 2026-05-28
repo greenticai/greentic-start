@@ -84,7 +84,13 @@ pub struct SecretsManagerResolver {
 #[async_trait::async_trait]
 impl SecretResolver for SecretsManagerResolver {
     async fn resolve(&self, raw: &str) -> Result<String> {
-        if !raw.starts_with("secret://") {
+        // Accept BOTH the legacy singular `secret://` scheme and the canonical
+        // plural `secrets://` scheme. B12a writes `secrets://` URI refs into
+        // the config envelope (e.g. state-redis `url`); a bare
+        // `starts_with("secret://")` check would NOT match `secrets://` (they
+        // differ at index 6) and would return the URI verbatim as a literal
+        // connection string.
+        if !raw.starts_with("secret://") && !raw.starts_with("secrets://") {
             return Ok(raw.to_string());
         }
         let bytes = self

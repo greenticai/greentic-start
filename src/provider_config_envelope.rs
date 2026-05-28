@@ -1,3 +1,12 @@
+//! Provider configuration envelope reader/writer for greentic-start.
+//!
+//! After B12a, `config.envelope.cbor` carries **non-secret** provider config
+//! only. Secret material is fetched from `SecretsBackend` keyed by the
+//! canonical `secrets://<env>/<tenant>/<team>/<provider>/<key>` URI; the
+//! envelope's `config` JSON no longer ships plaintext secret values.
+//! The envelope itself remains a transitional sink for non-secret runtime
+//! config until `pack-config.v1` ships.
+
 #![allow(dead_code)]
 
 use std::fs::File;

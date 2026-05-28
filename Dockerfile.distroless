@@ -21,22 +21,22 @@ ENV CARGO_TARGET_DIR=/tmp/target
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY i18n ./i18n
-
-RUN perl -0pi -e 's/\n\[\[bench\]\]\nname = "perf"\nharness = false\n//' Cargo.toml
+# Manifest declares a `perf` bench; cargo validates the path at parse time even
+# for a `--bin` build, so the file must exist (it is not compiled here).
+COPY benches ./benches
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/tmp/target \
-    cargo build --release --target x86_64-unknown-linux-musl --bin greentic-start \
+    cargo build --release --target x86_64-unknown-linux-musl \
+    --config 'profile.release.strip=true' --bin greentic-start \
     && mkdir -p /out \
     && cp /tmp/target/x86_64-unknown-linux-musl/release/greentic-start /out/greentic-start
 
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    squashfs-tools \
-    && rm -rf /var/lib/apt/lists/*
+# static-debian12:nonroot ships ca-certificates + a uid-65532 nonroot user and
+# no shell. The musl-static binary needs no runtime apt layer; squashfs-tools is
+# gone because bundle_ref.rs reads SquashFS in-process via `backhand` (P0.4).
+FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /out/greentic-start /usr/local/bin/greentic-start
 

@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::{env, fs};
 
 use anyhow::{Context, anyhow};
 use base64::{Engine as _, engine::general_purpose};
@@ -275,7 +275,7 @@ pub(super) fn secret_error_context(
     op_id: &str,
     pack: &ProviderPack,
 ) -> String {
-    let env = env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string());
+    let env = crate::resolve_env(None);
     let team = secrets_manager::canonical_team(ctx.team.as_deref()).into_owned();
     format!(
         "secret lookup context env={} tenant={} team={} provider={} flow={} pack_id={} pack_path={}",
@@ -363,6 +363,7 @@ pub(super) fn capability_route_error_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use tempfile::tempdir;
 
     #[test]

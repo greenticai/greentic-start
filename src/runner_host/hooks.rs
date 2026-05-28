@@ -117,7 +117,7 @@ impl DemoRunnerHost {
             return Ok(HookChainOutcome::Continue);
         };
         let scope = ResolveScope {
-            env: Some(std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string())),
+            env: Some(crate::resolve_env(None)),
             tenant: Some(ctx.tenant.clone()),
             team: ctx.team.clone(),
         };
