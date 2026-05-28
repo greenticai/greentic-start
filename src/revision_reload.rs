@@ -39,18 +39,12 @@ use crate::revision_serve::{Activation, RevisionServer};
 use crate::runtime_config::{self, LoadedRuntimeConfig};
 use crate::secrets_gate::DynSecretsManager;
 
-/// Basename of the materialized runtime-config under each env directory.
-/// Mirrors `runtime_config::RUNTIME_CONFIG_FILE`; duplicated here because
-/// that constant is module-private and we only need the basename for the
-/// event filter.
-const RUNTIME_CONFIG_BASENAME: &str = "runtime-config.json";
-
 /// Default debounce window for coalescing the deployer's commonly bundled
 /// `bundles add → revisions stage → traffic set` write sequence into a
 /// single rebuild. Tuned to be wider than the deployer's per-verb fsync
 /// latency on a warm cache (typical 5–30ms) and narrower than the
 /// operator's interactive expectation of "the change took effect".
-const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(250);
+pub(crate) const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Owned cleanup handle: dropping it shuts the debouncer (which closes the
 /// event channel) and joins the worker thread, so callers don't need to
@@ -67,8 +61,14 @@ pub(crate) struct WatcherHandle {
 
 impl Drop for WatcherHandle {
     fn drop(&mut self) {
-        // Close the event channel FIRST so the worker's `for result in rx`
-        // unblocks. Otherwise the join below deadlocks.
+        // Drop the debouncer FIRST so it signals its internal tick thread
+        // to stop. The event channel doesn't close synchronously here —
+        // `Debouncer::drop` only sets an atomic stop flag and detaches its
+        // tick thread; the channel closes when that thread wakes from its
+        // next tick (~timeout/4 = 62.5ms), sees the flag, and drops the
+        // `Sender` it owns. The worker join below blocks until that happens,
+        // so reversing this order (joining before dropping the debouncer)
+        // would deadlock — the channel would never close.
         drop(self.debouncer.take());
         if let Some(h) = self.worker.take() {
             // Worker exits when the event channel disconnects. Join logs a
@@ -105,7 +105,7 @@ pub(crate) fn spawn_runtime_config_watcher<R>(
 where
     R: FnMut() -> Result<Option<Activation>> + Send + 'static,
 {
-    let target_file = env_dir.join(RUNTIME_CONFIG_BASENAME);
+    let target_file = env_dir.join(runtime_config::RUNTIME_CONFIG_FILE);
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
 
     // notify watches the env DIR (not the file): the deployer rewrites
@@ -249,12 +249,6 @@ fn rebuild_once(
     }))
 }
 
-/// Default debounce window. Exposed so [`crate::lib::run_start`] doesn't
-/// have to know the constant.
-pub(crate) fn default_debounce() -> Duration {
-    DEFAULT_DEBOUNCE
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,11 +284,13 @@ mod tests {
     }
 
     fn write_runtime_config(env_dir: &Path, body: &str) {
-        std::fs::write(env_dir.join(RUNTIME_CONFIG_BASENAME), body).expect("write runtime-config");
+        std::fs::write(env_dir.join(runtime_config::RUNTIME_CONFIG_FILE), body)
+            .expect("write runtime-config");
     }
 
     fn delete_runtime_config(env_dir: &Path) {
-        std::fs::remove_file(env_dir.join(RUNTIME_CONFIG_BASENAME)).expect("delete runtime-config");
+        std::fs::remove_file(env_dir.join(runtime_config::RUNTIME_CONFIG_FILE))
+            .expect("delete runtime-config");
     }
 
     // The reload worker requires a `RevisionServer`. The test-only

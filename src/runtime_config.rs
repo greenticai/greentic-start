@@ -24,7 +24,7 @@ use greentic_deployer::environment::LocalFsStore;
 use greentic_types::EnvId;
 
 /// Filename of the materialized runtime-config inside an environment directory.
-const RUNTIME_CONFIG_FILE: &str = "runtime-config.json";
+pub(crate) const RUNTIME_CONFIG_FILE: &str = "runtime-config.json";
 
 /// Basis points are out of 10_000 (100%).
 const MAX_WEIGHT_BPS: u32 = 10_000;

@@ -385,7 +385,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let server = std::sync::Arc::new(server);
         let watcher = revision_reload::spawn_runtime_config_watcher(
             env_dir.clone(),
-            revision_reload::default_debounce(),
+            revision_reload::DEFAULT_DEBOUNCE,
             // Drain window matches the cold-start expectation: in-flight
             // requests against the previous activation get ~30s to finish
             // before the old `RunnerHost` drops. Tuned for local-dev;
@@ -412,16 +412,25 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // half-torn-down.
         drop(watcher);
         // Recover sole ownership for `stop()`. Any in-flight drain task
-        // spawned by N2.1's `reload()` already owns its own `Arc` to the
-        // previous activation (not to the server itself), so this should
-        // succeed unless a reload is mid-flight.
-        let server = std::sync::Arc::try_unwrap(server).map_err(|_| {
-            anyhow::anyhow!(
-                "RevisionServer Arc still has consumers at shutdown — \
-                 a reload may be mid-flight"
-            )
-        })?;
-        server.stop()?;
+        // spawned by N2.1's `reload()` owns an `Arc<Activation>`, NOT an
+        // `Arc<RevisionServer>`, so this should always succeed today. If a
+        // future contributor introduces a second `Arc<RevisionServer>`
+        // holder without updating the shutdown sequence, fall back to a
+        // warn-and-leak: skipping `stop()` leaves the listener thread
+        // running until process exit (which is moments away), which is
+        // strictly better than bailing out and skipping any other
+        // shutdown work the caller may have layered above us.
+        match std::sync::Arc::try_unwrap(server) {
+            Ok(server) => server.stop()?,
+            Err(_arc) => {
+                operator_log::warn(
+                    module_path!(),
+                    "RevisionServer Arc still has consumers at shutdown — \
+                     skipping graceful stop(); the listener thread will be \
+                     terminated on process exit.",
+                );
+            }
+        }
         return Ok(());
     }
 

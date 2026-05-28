@@ -111,11 +111,6 @@ impl ServeState {
 
 /// What [`RevisionServer::reload`] returns so the producer can log / emit
 /// telemetry describing the transition without re-reading the dispatcher.
-///
-/// `#[allow(dead_code)]` because the consumer (the N2.2 file-watcher / HTTP
-/// reload signal producer) lands in a separate PR; tests exercise every
-/// field, so removing the allow once the producer arrives is mechanical.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReloadReport {
     pub prev_deployments: usize,
@@ -138,10 +133,6 @@ pub(crate) struct RevisionServer {
     /// schedules the overlap-window drop of the previous activation on it so
     /// any async resources held by the old [`RunnerHost`] tear down on the
     /// same runtime that built them.
-    ///
-    /// `#[allow(dead_code)]` because the producer that calls `reload` lands
-    /// in N2.2; tests already cover the wiring.
-    #[allow(dead_code)]
     runtime_handle: Handle,
     /// Serializes [`reload`](Self::reload) calls. Without it the
     /// `load_full(prev) → bump_generations → swap(new)` sequence is not
@@ -159,14 +150,13 @@ pub(crate) struct RevisionServer {
     /// Per-deployment-id generation high-watermark, surviving across
     /// activations including ones that drop a deployment entirely.
     ///
-    /// Without this map, `carry_forward_generations_from(prev)` could only
-    /// bump deployments still present in the immediately previous
-    /// activation — a remove → re-add sequence within cookie/pin TTL
-    /// would mint a fresh dispatcher at the same generation the original
-    /// served at, and cookies signed before the removal would still
-    /// verify after the re-add. The watermark tombstones removed
-    /// deployments so a re-added one always bumps past its prior
-    /// generation.
+    /// Without this map, a bump driven only by the previous dispatcher
+    /// would miss deployments that disappeared from runtime-config: a
+    /// remove → re-add sequence within cookie/pin TTL would mint a fresh
+    /// dispatcher at the same generation the original served at, and
+    /// cookies signed before the removal would still verify after the
+    /// re-add. The watermark tombstones removed deployments so a re-added
+    /// one always bumps past its prior generation.
     ///
     /// Updated by [`reload`](Self::reload) by absorbing both the previous
     /// and new activations on every swap. Initialized from the initial
@@ -337,7 +327,7 @@ impl RevisionServer {
     /// request completes.
     ///
     /// This is the swap primitive the N2.2 file-watcher + reload signal
-    /// producer will call. A `drain_window` of zero drops the previous
+    /// producer calls. A `drain_window` of zero drops the previous
     /// activation immediately (only safe in tests, where the producer
     /// controls request scheduling).
     ///
@@ -356,7 +346,6 @@ impl RevisionServer {
     /// so concurrent producers (file-watcher + admin signal) cannot race
     /// the `load_full(prev) → bump_generations → swap(new)` steps and
     /// lose a generation bump.
-    #[allow(dead_code)] // consumed by N2.2; covered by unit tests
     pub(crate) fn reload(&self, new: Activation, drain_window: Duration) -> ReloadReport {
         // Serialize concurrent reloads so the load_full + bump_generations
         // + swap sequence is atomic relative to other producers. See the
@@ -1501,13 +1490,12 @@ mod tests {
 
     #[tokio::test]
     async fn reload_invalidates_pre_reload_cookie_for_persisted_deployment() {
-        // Regression test for the Codex finding on PR-N2.1: without
-        // [`RevisionDispatcher::carry_forward_generations_from`], reload
-        // would publish a fresh dispatcher whose deployment generation
-        // matches the previous dispatcher's (both at the
-        // `apply_traffic_split`-from-zero default of 1) and a cookie minted
-        // pre-reload would still verify post-reload — defeating canary
-        // weight cuts and partial rollbacks for already-cookie'd clients.
+        // Regression test for the Codex finding on PR-N2.1: without the
+        // generation bump in reload(), a fresh dispatcher built from the
+        // same runtime-config would carry the same `apply_traffic_split`-
+        // from-zero default generation (1), and a cookie minted pre-reload
+        // would still verify post-reload — defeating canary weight cuts
+        // and partial rollbacks for already-cookie'd clients.
         let env_id = "env-1";
         let tenant = "tenant-a";
         let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
@@ -1559,7 +1547,7 @@ mod tests {
 
         let act2_snap = state.current();
         // The cookie's `g` is still 1, but the live dispatcher's expected
-        // generation is now 2 (1 + 1 from carry_forward) → mismatch → None.
+        // generation is now 2 (1 + 1 from the watermark bump) → mismatch → None.
         assert_eq!(
             act2_snap
                 .routing
@@ -1591,14 +1579,15 @@ mod tests {
     #[tokio::test]
     async fn reload_invalidates_cookie_after_remove_and_readd_within_ttl() {
         // Codex regression: without the server-level generation watermark,
-        // `carry_forward_generations_from(prev)` only bumped deployments
-        // present in the immediately previous dispatcher. A deployment
-        // removed and later re-added before cookie/pin TTL elapsed got a
-        // fresh dispatcher at the same `from_runtime_config`-default
-        // generation, and the dispatcher would happily verify a cookie
-        // signed against the original activation. This test asserts the
-        // watermark tombstones removed deployments so the re-added one is
-        // strictly newer than anything a client could be holding.
+        // a bump driven only by the previous dispatcher would miss
+        // deployments that had been removed from runtime-config. A
+        // deployment removed and later re-added before cookie/pin TTL
+        // elapsed got a fresh dispatcher at the same
+        // `from_runtime_config`-default generation, and the dispatcher
+        // would happily verify a cookie signed against the original
+        // activation. This test asserts the watermark tombstones removed
+        // deployments so the re-added one is strictly newer than anything
+        // a client could be holding.
         let env_id = "env-1";
         let tenant = "tenant-a";
         let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
