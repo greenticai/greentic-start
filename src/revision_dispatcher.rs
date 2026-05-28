@@ -265,6 +265,19 @@ impl RevisionDispatcher {
         self.snapshot.load().deployments.len()
     }
 
+    /// Total number of revisions across all deployments. Used by the bundle-
+    /// less probe surface (`/status`) so operators can confirm whether any
+    /// runtime traffic is being served vs. just the listener and probes
+    /// being up.
+    pub fn revision_count(&self) -> usize {
+        self.snapshot
+            .load()
+            .deployments
+            .values()
+            .map(|d| d.revisions.len())
+            .sum()
+    }
+
     /// Env this dispatcher routes for. The ingress seam uses it to build the
     /// [`DispatchRequest`] so cookie validation binds to the right env.
     pub fn env_id(&self) -> &str {
@@ -849,6 +862,22 @@ mod tests {
         };
         let d = RevisionDispatcher::from_runtime_config(cfg("local"), &rc).unwrap();
         assert_eq!(d.deployment_count(), 2);
+        assert_eq!(d.revision_count(), 3);
+    }
+
+    #[test]
+    fn from_runtime_config_empty_rc_yields_zero_counts() {
+        // N1.2: bundle-less boot — empty runtime-config produces a dispatcher
+        // with zero deployments / zero revisions. `/status` reports those as
+        // `deployments_routed: 0` / `revisions_active: 0`, and the resolve
+        // step returns 404 for any inbound request, never invoking the host.
+        let rc = LoadedRuntimeConfig {
+            env_id: "local".into(),
+            revisions: Vec::new(),
+        };
+        let d = RevisionDispatcher::from_runtime_config(cfg("local"), &rc).unwrap();
+        assert_eq!(d.deployment_count(), 0);
+        assert_eq!(d.revision_count(), 0);
     }
 
     #[test]

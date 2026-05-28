@@ -153,13 +153,28 @@ pub(crate) async fn activate_runtime_config(
     // ingress consumer lands (B3). The secrets backend is supplied by the caller
     // (the env's resolved manager) so activation never silently falls back to
     // `HostBuilder`'s default env-var backend (which rejects non-local envs).
+    //
+    // `HostBuilder::build()` rejects an empty configs map, so the N1.2 bundle-
+    // less path (no revisions yet attached) seeds a placeholder tenant keyed by
+    // env_id. The dispatcher then has zero deployments, so the placeholder is
+    // never resolved at request time — it only exists to satisfy the builder
+    // invariant and keep the activation surface uniform across empty and
+    // populated runtime-configs.
     let mut builder = HostBuilder::new().with_secrets_manager(secrets);
-    for tenant in &tenants {
+    if tenants.is_empty() {
         builder = builder.with_config(HostConfig::from_gtbind(TenantBindings {
-            tenant: (*tenant).to_string(),
+            tenant: rc.env_id.clone(),
             packs: Vec::new(),
             env_passthrough: Vec::new(),
         }));
+    } else {
+        for tenant in &tenants {
+            builder = builder.with_config(HostConfig::from_gtbind(TenantBindings {
+                tenant: (*tenant).to_string(),
+                packs: Vec::new(),
+                env_passthrough: Vec::new(),
+            }));
+        }
     }
     let host = builder
         .build()
@@ -451,6 +466,7 @@ mod tests {
                 env_id: env_id(),
                 region: None,
                 tenant_org_id: None,
+                listen_addr: None,
             },
             packs: Vec::new(),
             credentials_ref: None,
@@ -785,5 +801,28 @@ mod tests {
             chain.contains("no pinned packs"),
             "expected to reach pack reading (host built with provided secrets), got: {chain}"
         );
+    }
+
+    #[test]
+    fn activate_empty_runtime_config_yields_zero_routing() {
+        // N1.2: an empty runtime-config (no bundles attached yet) activates
+        // cleanly. The dispatcher has zero deployments, the route tables are
+        // empty, and the placeholder host satisfies `HostBuilder::build()`'s
+        // non-empty-configs invariant without being reachable at request time.
+        let dir = tempdir().unwrap();
+        let env_dir = seed_env_dir(dir.path());
+        write_environment(&env_dir, &make_env(Vec::new()));
+        let rc = LoadedRuntimeConfig {
+            env_id: ENV_ID.to_string(),
+            revisions: Vec::new(),
+        };
+
+        let activation = block_on(activate_runtime_config(dir.path(), &rc, dummy_secrets()))
+            .expect("empty rc activates");
+        assert_eq!(activation.routing.dispatcher.deployment_count(), 0);
+        assert_eq!(activation.routing.dispatcher.revision_count(), 0);
+        assert_eq!(activation.routing.deployment_routes.len(), 0);
+        // Placeholder tenant config keyed by env_id so `build()` succeeds.
+        assert!(activation.host.tenant_configs().contains_key(ENV_ID));
     }
 }

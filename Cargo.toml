@@ -83,17 +83,19 @@ features = [
 ]
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
-# (per-env trust root + operator key, deployer #226). Floor bumped to the PR-2
-# publish that emits `pack_list_refs` in the materialized runtime-config.
+# (per-env trust root + operator key, deployer #226). Floor bumped to the N1.1
+# publish that adds `EnvironmentHostConfig.listen_addr` + threads it through
+# bootstrap, `op config set`, `op env create/update`, and `op env migrate`.
 [dependencies.greentic-deployer]
-version = ">=1.1.0-dev.26491802730, <1.2.0-0"
+version = ">=1.1.0-dev.26567667793, <1.2.0-0"
 default-features = false
 
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
 # / `Revision` cross the deployer boundary, so resolution must not pick an
-# older deploy-spec. Floor bumped to the PR-2 publish that adds `PackListLock`.
+# older deploy-spec. Floor bumped to the N1.1 publish that adds `listen_addr`
+# (and the `DEFAULT_LISTEN_ADDR` constant the bundle-less boot path consumes).
 [dependencies.greentic-deploy-spec]
-version = ">=0.1.26491802730, <0.2"
+version = ">=0.1.26567667793, <0.2"
 
 [dependencies.greentic-setup]
 version = ">=1.1.0-dev, <1.2.0-0"

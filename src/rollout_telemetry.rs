@@ -115,6 +115,7 @@ mod tests {
                 env_id: EnvId::try_from("prod-eu").unwrap(),
                 region: None,
                 tenant_org_id: owner.map(str::to_string),
+                listen_addr: None,
             },
             packs: Vec::new(),
             credentials_ref: None,
