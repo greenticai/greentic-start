@@ -1525,6 +1525,77 @@ mod tests {
         assert!(extract_capabilities(&manifest).is_empty());
     }
 
+    /// End-to-end round-trip: build a real `PackManifest` with our
+    /// capability, encode via `greentic_types::encode_pack_manifest` (the
+    /// canonical encoder that symbol-indexes the name), zip into a
+    /// `.gtpack`, then `load_app_pack_info` and assert detection.
+    #[test]
+    fn load_app_pack_info_detects_fast2flow_capability_via_canonical_encoding() {
+        use greentic_types::pack_manifest::{
+            ComponentCapability, PackFlowEntry, PackKind, PackManifest, PackSignatures,
+        };
+        use greentic_types::{Flow, FlowId, FlowKind, PackId, encode_pack_manifest};
+        use semver::Version;
+        use tempfile::tempdir;
+        use zip::write::FileOptions;
+
+        let flow = Flow {
+            schema_version: "flow-v1".to_string(),
+            id: FlowId::new("main").expect("flow id"),
+            kind: FlowKind::Messaging,
+            entrypoints: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                serde_json::Value::Null,
+            )]),
+            nodes: Default::default(),
+            metadata: Default::default(),
+        };
+        let manifest = PackManifest {
+            schema_version: "pack-v1".into(),
+            pack_id: PackId::new("greentic.test.fast2flow").expect("pack id"),
+            name: Some("fast2flow-test".into()),
+            version: Version::parse("0.1.0").expect("version"),
+            kind: PackKind::Application,
+            publisher: "test".into(),
+            components: Vec::new(),
+            flows: vec![PackFlowEntry {
+                id: FlowId::new("main").expect("flow id"),
+                kind: FlowKind::Messaging,
+                flow,
+                tags: vec!["default".to_string()],
+                entrypoints: vec!["default".to_string()],
+            }],
+            dependencies: Vec::new(),
+            capabilities: vec![ComponentCapability {
+                name: "greentic.cap.fast2flow.v1".to_string(),
+                description: Some("test fixture".to_string()),
+            }],
+            secret_requirements: Vec::new(),
+            signatures: PackSignatures::default(),
+            bootstrap: None,
+            extensions: None,
+        };
+        let cbor_bytes = encode_pack_manifest(&manifest).expect("encode manifest");
+
+        let dir = tempdir().expect("tempdir");
+        let pack_path = dir.path().join("test.gtpack");
+        let file = std::fs::File::create(&pack_path).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .expect("start file");
+        zip.write_all(&cbor_bytes).expect("write manifest");
+        zip.finish().expect("finish pack");
+
+        let info = load_app_pack_info(&pack_path).expect("load pack info");
+        assert_eq!(info.pack_id, "greentic.test.fast2flow");
+        assert!(
+            info.capabilities
+                .contains(&"greentic.cap.fast2flow.v1".to_string()),
+            "expected fast2flow capability via canonical encoding, got {:?}",
+            info.capabilities
+        );
+    }
+
     #[test]
     fn collect_transcript_outputs_prefers_targeted_node_then_last_output() {
         let dir = tempdir().expect("tempdir");
