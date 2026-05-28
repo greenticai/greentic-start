@@ -48,6 +48,12 @@ use crate::runtime_config::LoadedRuntimeConfig;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// A single revision's routing identity: `(deployment_id, bundle_id,
+/// revision_id)`. Returned by [`RevisionDispatcher::revision_keys`] and
+/// threaded through the reload drain path
+/// ([`crate::revision_serve::RevisionServer::reload`]).
+pub(crate) type RevisionKey = (DeploymentId, BundleId, RevisionId);
+
 /// Sum of basis points across a deployment's revisions. Mirrors deploy-spec §5.3.
 const TOTAL_WEIGHT_BPS: u32 = 10_000;
 
@@ -296,7 +302,7 @@ impl RevisionDispatcher {
     /// dispatcher currently routes for. One `arc_swap` load — used by
     /// [`crate::revision_serve::RevisionServer::reload`] to diff OLD vs NEW
     /// activations and fire a drain coordinator per removed revision.
-    pub(crate) fn revision_keys(&self) -> Vec<(DeploymentId, BundleId, RevisionId)> {
+    pub(crate) fn revision_keys(&self) -> Vec<RevisionKey> {
         let snap = self.snapshot.load();
         snap.deployments
             .iter()

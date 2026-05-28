@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use greentic_deploy_spec::ids::DeploymentId;
+use greentic_deploy_spec::ids::{DeploymentId, RevisionId};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1::Builder as Http1Builder;
@@ -60,7 +60,9 @@ use greentic_deploy_spec::{DEFAULT_LISTEN_ADDR, EnvironmentHostConfig};
 use crate::deployment_routes::RevisionIngressRouting;
 use crate::http_routes::{HttpRouteTable, RevisionScope};
 use crate::operator_log;
-use crate::revision_dispatcher::{DispatchRequest, SetCookieDirective, cookie_name};
+use crate::revision_dispatcher::{
+    DispatchRequest, RevisionDispatcher, RevisionKey, SetCookieDirective, cookie_name,
+};
 use crate::revision_drain::{
     DrainRequest, NoopRevisionTeardown, RevisionDrainCoordinator, RevisionLivenessProbe,
     RevisionTeardown,
@@ -113,26 +115,16 @@ impl ServeState {
     }
 }
 
-/// `(deployment_id, bundle_id, revision_id)` triples present in `prev` but
-/// absent from `next`. Used by [`RevisionServer::reload`] to identify revisions
-/// the operator just removed so the drain coordinator can fire one drain per
-/// removed revision against the OLD activation.
-fn removed_revisions(
-    prev: &crate::revision_dispatcher::RevisionDispatcher,
-    next: &crate::revision_dispatcher::RevisionDispatcher,
-) -> Vec<(
-    DeploymentId,
-    greentic_deploy_spec::BundleId,
-    greentic_deploy_spec::RevisionId,
-)> {
-    let next_keys: std::collections::HashSet<(DeploymentId, greentic_deploy_spec::RevisionId)> =
-        next.revision_keys()
-            .into_iter()
-            .map(|(d, _b, r)| (d, r))
-            .collect();
+/// [`RevisionKey`]s present in `prev` but absent from `next`. Used by
+/// [`RevisionServer::reload`] to identify revisions the operator just removed
+/// so the drain coordinator can fire one drain per removed revision against
+/// the OLD activation.
+fn removed_revisions(prev: &RevisionDispatcher, next: &RevisionDispatcher) -> Vec<RevisionKey> {
     prev.revision_keys()
         .into_iter()
-        .filter(|(d, _b, r)| !next_keys.contains(&(*d, *r)))
+        .filter(|(deployment_id, _bundle_id, revision_id)| {
+            !next.contains_revision(*deployment_id, *revision_id)
+        })
         .collect()
 }
 
@@ -150,15 +142,11 @@ struct SlotLivenessProbe {
     /// live slot still points at it, the revision is NOT live "elsewhere" —
     /// it's the same routing table, so the eviction event should fire
     /// (matches a direct drain of the live dispatcher).
-    draining_dispatcher: Arc<crate::revision_dispatcher::RevisionDispatcher>,
+    draining_dispatcher: Arc<RevisionDispatcher>,
 }
 
 impl RevisionLivenessProbe for SlotLivenessProbe {
-    fn is_live_elsewhere(
-        &self,
-        deployment_id: DeploymentId,
-        revision_id: greentic_deploy_spec::RevisionId,
-    ) -> bool {
+    fn is_live_elsewhere(&self, deployment_id: DeploymentId, revision_id: RevisionId) -> bool {
         let live = self.state.current();
         // Same dispatcher instance ⇒ we're draining the live routing table,
         // so the revision isn't live in a NEWER activation. Every reload
@@ -187,11 +175,7 @@ fn spawn_revision_drains(
     runtime_handle: &Handle,
     state: Arc<ServeState>,
     prev: Arc<Activation>,
-    removed: Vec<(
-        DeploymentId,
-        greentic_deploy_spec::BundleId,
-        greentic_deploy_spec::RevisionId,
-    )>,
+    removed: Vec<RevisionKey>,
     drain_window: Duration,
 ) {
     let drain_seconds: u32 = drain_window.as_secs().try_into().unwrap_or(u32::MAX);
@@ -220,7 +204,6 @@ fn spawn_revision_drains(
         };
         let dispatcher = Arc::clone(&prev.routing.dispatcher);
         let teardown = Arc::clone(&teardown);
-        let bundle_id = bundle_id.clone();
         let liveness: Arc<dyn RevisionLivenessProbe> = Arc::new(SlotLivenessProbe {
             state: Arc::clone(&state),
             draining_dispatcher: Arc::clone(&dispatcher),
@@ -498,6 +481,16 @@ impl RevisionServer {
         // whose generations are already correct for the very first
         // dispatch under the new activation.
         let prev = self.state.slot.load_full();
+        // `SlotLivenessProbe` (the drain path's stale-eviction guard) relies
+        // on every reload publishing a freshly-built dispatcher `Arc`, so it
+        // can use `Arc::ptr_eq` to tell the OLD dispatcher apart from the
+        // live one. Assert that invariant here: if a future optimization ever
+        // reuses a dispatcher `Arc` across reloads, this fails loudly in tests
+        // rather than silently breaking eviction telemetry.
+        debug_assert!(
+            !Arc::ptr_eq(&prev.routing.dispatcher, &new_arc.routing.dispatcher),
+            "reload must build a fresh dispatcher Arc (SlotLivenessProbe ptr_eq guard depends on it)"
+        );
         // Update the generation watermark and bump the new dispatcher off
         // it. Absorbing prev → bump new → absorb new keeps the watermark
         // strictly monotonic across every deployment id we've ever served
@@ -985,6 +978,9 @@ pub(crate) fn resolve_bind_addr(host_config: Option<&EnvironmentHostConfig>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `BundleId` is used only in tests (prod refers to it via the `RevisionKey`
+    // alias), so it lives here rather than in the library import set.
+    use greentic_deploy_spec::ids::BundleId;
     use greentic_runner_host::engine::runtime::{FlowResumeStore, IngressEnvelope};
     use greentic_runner_host::runner::engine::{ExecutionState, FlowSnapshot, FlowWait};
     use greentic_runner_host::storage::new_session_store;
@@ -1842,17 +1838,12 @@ mod tests {
     fn activation_with_two_revisions(
         env_id: &str,
         tenant: &str,
-        deployment_id: greentic_deploy_spec::ids::DeploymentId,
-        rev_a: greentic_deploy_spec::ids::RevisionId,
-        rev_b: greentic_deploy_spec::ids::RevisionId,
-        bundle_id: greentic_deploy_spec::ids::BundleId,
-    ) -> (
-        Activation,
-        std::sync::Arc<crate::revision_dispatcher::RevisionDispatcher>,
-    ) {
-        use crate::revision_dispatcher::{
-            RevisionDispatcher, RevisionDispatcherConfig, RevisionEntry,
-        };
+        deployment_id: DeploymentId,
+        rev_a: RevisionId,
+        rev_b: RevisionId,
+        bundle_id: BundleId,
+    ) -> (Activation, std::sync::Arc<RevisionDispatcher>) {
+        use crate::revision_dispatcher::{RevisionDispatcherConfig, RevisionEntry};
         let base = empty_activation(env_id);
         let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new(env_id, [0u8; 32]));
         let revisions = vec![
@@ -1894,10 +1885,10 @@ mod tests {
         // window. The kept revision must NOT be marked draining.
         let env_id = "env-1";
         let tenant = "tenant-a";
-        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
-        let rev_kept = greentic_deploy_spec::ids::RevisionId::new();
-        let rev_removed = greentic_deploy_spec::ids::RevisionId::new();
-        let bundle_id = greentic_deploy_spec::ids::BundleId::new("customer.support");
+        let dep_id = DeploymentId::new();
+        let rev_kept = RevisionId::new();
+        let rev_removed = RevisionId::new();
+        let bundle_id = BundleId::new("customer.support");
 
         let (act_old, old_dispatcher) = activation_with_two_revisions(
             env_id,
@@ -1907,11 +1898,7 @@ mod tests {
             rev_removed,
             bundle_id.clone(),
         );
-        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let state = std::sync::Arc::new(ServeState {
-            slot: ArcSwap::new(std::sync::Arc::new(act_old)),
-            bound_addr: bound,
-        });
+        let state = serve_state_with(act_old);
         let server = server_for_test(std::sync::Arc::clone(&state));
 
         // NEW activation keeps `rev_kept` only (single-revision, full weight).
@@ -1960,18 +1947,14 @@ mod tests {
         // reweighting the same revisions doesn't constitute a removal.
         let env_id = "env-1";
         let tenant = "tenant-a";
-        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
-        let rev_a = greentic_deploy_spec::ids::RevisionId::new();
-        let rev_b = greentic_deploy_spec::ids::RevisionId::new();
-        let bundle_id = greentic_deploy_spec::ids::BundleId::new("customer.support");
+        let dep_id = DeploymentId::new();
+        let rev_a = RevisionId::new();
+        let rev_b = RevisionId::new();
+        let bundle_id = BundleId::new("customer.support");
 
         let (act_old, old_dispatcher) =
             activation_with_two_revisions(env_id, tenant, dep_id, rev_a, rev_b, bundle_id.clone());
-        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let state = std::sync::Arc::new(ServeState {
-            slot: ArcSwap::new(std::sync::Arc::new(act_old)),
-            bound_addr: bound,
-        });
+        let state = serve_state_with(act_old);
         let server = server_for_test(std::sync::Arc::clone(&state));
 
         // NEW activation: same deployment, same two revisions (identical set).
@@ -1996,18 +1979,14 @@ mod tests {
         // have been the last strong handle outside the coordinator.
         let env_id = "env-1";
         let tenant = "tenant-a";
-        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
-        let rev_a = greentic_deploy_spec::ids::RevisionId::new();
-        let rev_b = greentic_deploy_spec::ids::RevisionId::new();
-        let bundle_id = greentic_deploy_spec::ids::BundleId::new("customer.support");
+        let dep_id = DeploymentId::new();
+        let rev_a = RevisionId::new();
+        let rev_b = RevisionId::new();
+        let bundle_id = BundleId::new("customer.support");
 
         let (act_old, old_dispatcher) =
             activation_with_two_revisions(env_id, tenant, dep_id, rev_a, rev_b, bundle_id.clone());
-        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let state = std::sync::Arc::new(ServeState {
-            slot: ArcSwap::new(std::sync::Arc::new(act_old)),
-            bound_addr: bound,
-        });
+        let state = serve_state_with(act_old);
         let server = server_for_test(std::sync::Arc::clone(&state));
 
         let act_new = activation_with_ids(env_id, dep_id, rev_a, bundle_id);
@@ -2040,9 +2019,9 @@ mod tests {
         // that serves the revision → the OLD activation's drain must treat
         // the revision as live elsewhere and suppress its eviction event.
         let env_id = "env-1";
-        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
-        let rev_id = greentic_deploy_spec::ids::RevisionId::new();
-        let bundle_id = greentic_deploy_spec::ids::BundleId::new("customer.support");
+        let dep_id = DeploymentId::new();
+        let rev_id = RevisionId::new();
+        let bundle_id = BundleId::new("customer.support");
 
         let draining = activation_with_ids(env_id, dep_id, rev_id, bundle_id.clone());
         let draining_dispatcher = std::sync::Arc::clone(&draining.routing.dispatcher);
@@ -2067,9 +2046,9 @@ mod tests {
         // activation — the eviction event should fire (direct-drain
         // semantics). Models the future `gtc op revisions drain` path.
         let env_id = "env-1";
-        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
-        let rev_id = greentic_deploy_spec::ids::RevisionId::new();
-        let bundle_id = greentic_deploy_spec::ids::BundleId::new("customer.support");
+        let dep_id = DeploymentId::new();
+        let rev_id = RevisionId::new();
+        let bundle_id = BundleId::new("customer.support");
 
         let live = activation_with_ids(env_id, dep_id, rev_id, bundle_id);
         let draining_dispatcher = std::sync::Arc::clone(&live.routing.dispatcher);
@@ -2091,10 +2070,10 @@ mod tests {
         // (genuine removal, no rollback) → not live elsewhere → eviction
         // event fires normally.
         let env_id = "env-1";
-        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
-        let rev_removed = greentic_deploy_spec::ids::RevisionId::new();
-        let rev_other = greentic_deploy_spec::ids::RevisionId::new();
-        let bundle_id = greentic_deploy_spec::ids::BundleId::new("customer.support");
+        let dep_id = DeploymentId::new();
+        let rev_removed = RevisionId::new();
+        let rev_other = RevisionId::new();
+        let bundle_id = BundleId::new("customer.support");
 
         let draining = activation_with_ids(env_id, dep_id, rev_removed, bundle_id.clone());
         let draining_dispatcher = std::sync::Arc::clone(&draining.routing.dispatcher);
