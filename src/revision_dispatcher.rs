@@ -292,6 +292,43 @@ impl RevisionDispatcher {
         &self.env_id
     }
 
+    /// Carry forward per-deployment generations from a predecessor dispatcher,
+    /// bumping each by 1 so any stickiness cookie or session pin signed
+    /// against the predecessor is rejected by [`Self::verify_cookie`] / pin
+    /// `lookup` under the new dispatcher's `expected_generation`.
+    ///
+    /// Called from the hot-reload path
+    /// ([`crate::revision_serve::RevisionServer::reload`]) after a new
+    /// dispatcher is built from a fresh runtime-config but BEFORE that
+    /// dispatcher is published to the live ingress slot. Deployments that
+    /// exist only in `self` (newly introduced by the reload) keep the
+    /// generation they were constructed with — no client could be holding a
+    /// cookie/pin for them yet.
+    ///
+    /// Bumps **unconditionally** for the deployments both dispatchers share,
+    /// regardless of whether weights or revisions actually differ: a reload
+    /// is a deliberate operator action and existing cookies/pins must yield
+    /// to the new traffic split. Distinguishing "identical config" from
+    /// "changed config" is the N2.2 watcher's job (hash-skip before invoking
+    /// reload at all); correctness of the swap primitive does not depend on
+    /// it.
+    pub(crate) fn carry_forward_generations_from(&self, prev: &RevisionDispatcher) {
+        // Defensive against a concurrent `apply_traffic_split`, even though
+        // the canonical call site fires before `self` is published to the
+        // live slot. Matches the mutation discipline of
+        // [`Self::mutate_deployment`].
+        let _w = self.write_lock.lock().expect("write lock poisoned");
+        let prev_snap = prev.snapshot.load();
+        let cur = self.snapshot.load_full();
+        let mut next = (*cur).clone();
+        for (dep_id, entry) in next.deployments.iter_mut() {
+            if let Some(prev_entry) = prev_snap.deployments.get(dep_id) {
+                entry.generation = prev_entry.generation.saturating_add(1);
+            }
+        }
+        self.snapshot.store(std::sync::Arc::new(next));
+    }
+
     /// Flag `revision_id` as draining under `deployment_id`. Weighted picks
     /// will skip it and `try_pin` writes against it are suppressed, but
     /// existing pin / valid cookie / trusted-header overrides still route to
@@ -1212,6 +1249,107 @@ mod tests {
             d.verify_cookie("not-a-cookie", "local", "tenant-a", dep_id, 3, 0)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn carry_forward_bumps_generation_for_shared_deployments() {
+        let dep1 = dep();
+        let dep2 = dep();
+        let r1 = rev();
+        let r2 = rev();
+
+        // Predecessor dispatcher carries deployment `dep1` at generation 5
+        // and deployment `dep2` at generation 1.
+        let prev = RevisionDispatcher::new(cfg("local"));
+        prev.apply_traffic_split(dep1, vec![entry(r1, 10_000)], bundle(), 0)
+            .unwrap();
+        for expected in 1..5 {
+            prev.apply_traffic_split(dep1, vec![entry(r1, 10_000)], bundle(), expected)
+                .unwrap();
+        }
+        prev.apply_traffic_split(dep2, vec![entry(r2, 10_000)], bundle(), 0)
+            .unwrap();
+        let prev_gen_dep1 = prev
+            .snapshot
+            .load()
+            .deployments
+            .get(&dep1)
+            .map(|e| e.generation)
+            .unwrap();
+        let prev_gen_dep2 = prev
+            .snapshot
+            .load()
+            .deployments
+            .get(&dep2)
+            .map(|e| e.generation)
+            .unwrap();
+        assert_eq!(prev_gen_dep1, 5);
+        assert_eq!(prev_gen_dep2, 1);
+
+        // New dispatcher carries `dep1` (shared) and `dep3` (fresh). Both
+        // start at the generation `apply_traffic_split` writes (1).
+        let dep3 = dep();
+        let r3 = rev();
+        let new = RevisionDispatcher::new(cfg("local"));
+        new.apply_traffic_split(dep1, vec![entry(r1, 10_000)], bundle(), 0)
+            .unwrap();
+        new.apply_traffic_split(dep3, vec![entry(r3, 10_000)], bundle(), 0)
+            .unwrap();
+
+        new.carry_forward_generations_from(&prev);
+
+        // Shared deployment bumped from prev's generation (5 + 1).
+        assert_eq!(
+            new.snapshot
+                .load()
+                .deployments
+                .get(&dep1)
+                .map(|e| e.generation),
+            Some(6)
+        );
+        // Fresh deployment not in prev: leaves the new entry untouched (1).
+        assert_eq!(
+            new.snapshot
+                .load()
+                .deployments
+                .get(&dep3)
+                .map(|e| e.generation),
+            Some(1)
+        );
+        // `dep2` only existed in prev — not reintroduced in new, so it stays
+        // absent from new's snapshot.
+        assert!(!new.snapshot.load().deployments.contains_key(&dep2));
+    }
+
+    #[test]
+    fn carry_forward_is_a_noop_when_no_deployments_are_shared() {
+        // Reloading from an empty activation (fresh `gtc start`) or to a
+        // disjoint deployment set must not touch the new dispatcher's
+        // generations — there are no pre-existing cookies for these
+        // deployments and gratuitously bumping would only widen the
+        // observable surface for downstream tests.
+        let dep1 = dep();
+        let r1 = rev();
+        let prev = RevisionDispatcher::new(cfg("local"));
+        let new = RevisionDispatcher::new(cfg("local"));
+        new.apply_traffic_split(dep1, vec![entry(r1, 10_000)], bundle(), 0)
+            .unwrap();
+        let gen_before = new
+            .snapshot
+            .load()
+            .deployments
+            .get(&dep1)
+            .map(|e| e.generation)
+            .unwrap();
+        new.carry_forward_generations_from(&prev);
+        let gen_after = new
+            .snapshot
+            .load()
+            .deployments
+            .get(&dep1)
+            .map(|e| e.generation)
+            .unwrap();
+        assert_eq!(gen_before, gen_after);
     }
 
     #[tokio::test]

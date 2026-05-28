@@ -36,8 +36,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1::Builder as Http1Builder;
@@ -46,7 +48,7 @@ use hyper::{Request, Response, StatusCode, header};
 use hyper_util::rt::tokio::TokioIo;
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::oneshot;
 
 use greentic_runner_host::{Activity, RunnerHost};
@@ -63,23 +65,61 @@ use crate::revision_dispatcher::{DispatchRequest, SetCookieDirective, cookie_nam
 /// exhaust memory before the JSON parse rejects it.
 const MAX_BODY_BYTES: usize = 1 << 20; // 1 MiB
 
-/// Inputs for [`RevisionServer::start`]: where to listen plus the activated host
-/// and routing the server serves over.
-pub(crate) struct RevisionServeConfig {
-    pub bind_addr: SocketAddr,
+/// Activated host + routing as a single coherent unit. Requests bind to one
+/// `Arc<Activation>` at the top of [`serve`] and use the same `host` and
+/// `routing` for the rest of their lifetime — so a [`RevisionServer::reload`]
+/// that swaps the slot mid-request cannot tear (dispatch via the new
+/// dispatcher, execute against the old host, or vice versa).
+pub(crate) struct Activation {
     pub host: Arc<RunnerHost>,
-    pub routing: RevisionIngressRouting,
+    pub routing: Arc<RevisionIngressRouting>,
 }
 
-/// Per-connection shared state. Cheap to clone (everything behind an `Arc`).
-/// The env id is read from `routing.dispatcher.env_id()` — not stored twice.
+/// Inputs for [`RevisionServer::start`]: where to listen plus the initial
+/// activation the server serves over. Reload swaps in a new [`Activation`] via
+/// [`RevisionServer::reload`].
+pub(crate) struct RevisionServeConfig {
+    pub bind_addr: SocketAddr,
+    pub activation: Arc<Activation>,
+}
+
+/// Per-connection shared state. Holds the live activation behind an
+/// [`ArcSwap`] so the producer (file-watcher / HTTP signal) can hot-attach new
+/// revisions without restarting the listener. Each request reads `slot` once
+/// at the top of [`serve`] and threads that snapshot through dispatch +
+/// execute. The env id is read from `activation.routing.dispatcher.env_id()`
+/// — not stored twice.
 struct ServeState {
-    host: Arc<RunnerHost>,
-    routing: RevisionIngressRouting,
+    slot: ArcSwap<Activation>,
     /// Address the listener bound to (after the `find_available_port` bump).
     /// Reported by `/status` so operators see the actual interface + port
     /// rather than what the user requested.
     bound_addr: SocketAddr,
+}
+
+impl ServeState {
+    /// Snapshot the live activation. Holding the returned `Arc` keeps the
+    /// activation alive across `.await` points, even if a concurrent reload
+    /// swaps the slot — the reload's drain window still ensures the old
+    /// activation outlives every in-flight request that pinned it.
+    fn current(&self) -> Arc<Activation> {
+        self.slot.load_full()
+    }
+}
+
+/// What [`RevisionServer::reload`] returns so the producer can log / emit
+/// telemetry describing the transition without re-reading the dispatcher.
+///
+/// `#[allow(dead_code)]` because the consumer (the N2.2 file-watcher / HTTP
+/// reload signal producer) lands in a separate PR; tests exercise every
+/// field, so removing the allow once the producer arrives is mechanical.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReloadReport {
+    pub prev_deployments: usize,
+    pub prev_revisions: usize,
+    pub new_deployments: usize,
+    pub new_revisions: usize,
 }
 
 /// A running revision ingress server on its own thread + Tokio runtime, mirroring
@@ -88,9 +128,32 @@ pub(crate) struct RevisionServer {
     shutdown: Option<oneshot::Sender<()>>,
     handle: Option<JoinHandle<Result<()>>>,
     actual_port: u16,
-    /// Dispatcher handle kept so external callers (the startup banner) can
-    /// snapshot the same counts `/status` reads.
-    dispatcher: Arc<crate::revision_dispatcher::RevisionDispatcher>,
+    /// Shared state holding the [`ArcSwap`] activation slot. Kept here so
+    /// [`reload`](Self::reload) can swap a new [`Activation`] in and
+    /// [`counts`](Self::counts) can read the live snapshot.
+    state: Arc<ServeState>,
+    /// Handle to the listener thread's Tokio runtime. [`reload`](Self::reload)
+    /// schedules the overlap-window drop of the previous activation on it so
+    /// any async resources held by the old [`RunnerHost`] tear down on the
+    /// same runtime that built them.
+    ///
+    /// `#[allow(dead_code)]` because the producer that calls `reload` lands
+    /// in N2.2; tests already cover the wiring.
+    #[allow(dead_code)]
+    runtime_handle: Handle,
+    /// Serializes [`reload`](Self::reload) calls. Without it the
+    /// `load_full(prev) → carry_forward → swap(new)` sequence is not atomic
+    /// across concurrent producers: two reloads can both observe the same
+    /// prev, both bump generations from it, then both swap — the second
+    /// reload's generation bump is lost relative to the first's published
+    /// activation, so cookies minted in the brief window the first reload
+    /// was live still verify against the second's dispatcher.
+    ///
+    /// N2.2's file-watcher is a single producer today, but an admin HTTP
+    /// reload signal (or any future second producer) would violate that
+    /// invariant; guarding the swap primitive here means the type system
+    /// cannot be tricked.
+    reload_lock: std::sync::Mutex<()>,
 }
 
 impl RevisionServer {
@@ -113,15 +176,21 @@ impl RevisionServer {
         }
         let addr = SocketAddr::new(listen_ip, actual_port);
 
-        let dispatcher = Arc::clone(&config.routing.dispatcher);
         let state = Arc::new(ServeState {
-            host: config.host,
-            routing: config.routing,
+            slot: ArcSwap::new(config.activation),
             bound_addr: addr,
         });
+        // Cloned into the listener thread; the original lives on as the
+        // [`RevisionServer::state`] handle so [`reload`] / [`counts`] read the
+        // same slot the running listener reads.
+        let listener_state = Arc::clone(&state);
 
         let (tx, rx) = oneshot::channel();
-        let (startup_tx, startup_rx) = mpsc::channel();
+        // The startup channel ships the Tokio runtime handle alongside the
+        // bind result so [`reload`] can schedule the overlap-window drop of
+        // the previous activation on the listener thread's runtime — the same
+        // runtime any held async resources were built on.
+        let (startup_tx, startup_rx) = mpsc::channel::<Result<Handle>>();
         let handle = thread::Builder::new()
             .name("revision-ingress".to_string())
             .spawn(move || -> Result<()> {
@@ -133,6 +202,7 @@ impl RevisionServer {
                             return Err(err);
                         }
                     };
+                let runtime_handle = runtime.handle().clone();
                 runtime.block_on(async move {
                     let listener = match TcpListener::bind(addr)
                         .await
@@ -144,7 +214,7 @@ impl RevisionServer {
                             return Err(err);
                         }
                     };
-                    let _ = startup_tx.send(Ok(()));
+                    let _ = startup_tx.send(Ok(runtime_handle));
                     operator_log::info(
                         module_path!(),
                         format!("revision ingress listening on http://{addr}"),
@@ -155,7 +225,7 @@ impl RevisionServer {
                             _ = &mut shutdown => break,
                             accept = listener.accept() => match accept {
                                 Ok((stream, peer)) => {
-                                    let connection_state = state.clone();
+                                    let connection_state = listener_state.clone();
                                     // Caller-asserted identity (see `serve`) is only
                                     // honoured from loopback peers; capture it here.
                                     // `to_canonical` so an IPv4-mapped IPv6 peer
@@ -191,7 +261,7 @@ impl RevisionServer {
                     Ok(())
                 })
             })?;
-        startup_rx
+        let runtime_handle = startup_rx
             .recv()
             .context("failed to receive revision ingress startup result")??;
 
@@ -199,7 +269,9 @@ impl RevisionServer {
             shutdown: Some(tx),
             handle: Some(handle),
             actual_port,
-            dispatcher,
+            state,
+            runtime_handle,
+            reload_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -209,11 +281,83 @@ impl RevisionServer {
         self.actual_port
     }
 
-    /// `(deployment_count, revision_count)` from a single dispatcher
-    /// snapshot — the same source `/status` reads. Used by the startup
-    /// banner so the banner and `/status` cannot disagree.
+    /// `(deployment_count, revision_count)` from a single snapshot of the
+    /// live activation's dispatcher — the same source `/status` reads. Used
+    /// by the startup banner and post-reload logging so banner and `/status`
+    /// cannot disagree.
     pub(crate) fn counts(&self) -> (usize, usize) {
-        self.dispatcher.counts()
+        self.state.slot.load().routing.dispatcher.counts()
+    }
+
+    /// Swap the live activation. Atomically replaces the slot so the next
+    /// request reaches the new host + routing; every request that already
+    /// snapshotted the previous activation (via [`ServeState::current`] at
+    /// the top of [`serve`]) keeps running against it for the rest of its
+    /// lifetime.
+    ///
+    /// The previous activation is held alive for `drain_window` on the
+    /// listener thread's runtime so async resources owned by the old
+    /// [`RunnerHost`] (timer-handle aborts, Redis connection manager drops,
+    /// telemetry exporters) tear down on the same runtime that built them,
+    /// not on a bare OS thread. After the window, the Arc is dropped — if no
+    /// in-flight request still pins it, the host and its [`TenantRuntime`]s
+    /// drop on the spot; otherwise the drop is deferred until the last
+    /// request completes.
+    ///
+    /// This is the swap primitive the N2.2 file-watcher + reload signal
+    /// producer will call. A `drain_window` of zero drops the previous
+    /// activation immediately (only safe in tests, where the producer
+    /// controls request scheduling).
+    ///
+    /// Per-deployment dispatcher generations are carried forward from the
+    /// previous activation BEFORE the swap (see
+    /// [`crate::revision_dispatcher::RevisionDispatcher::carry_forward_generations_from`])
+    /// so any stickiness cookie or session pin minted against the previous
+    /// dispatcher is invalidated and the next request re-picks under the
+    /// new traffic split. Without that bump a reload that only changes
+    /// weights for an already-deployed `deployment_id` would leave
+    /// cookie-pinned clients on the pre-reload revision until cookie/pin
+    /// TTL, defeating canary cuts and partial rollbacks.
+    ///
+    /// Holds the [`reload_lock`](Self::reload_lock) for the whole sequence
+    /// so concurrent producers (file-watcher + admin signal) cannot race
+    /// the `load_full(prev) → carry_forward → swap(new)` steps and lose a
+    /// generation bump.
+    #[allow(dead_code)] // consumed by N2.2; covered by unit tests
+    pub(crate) fn reload(&self, new: Activation, drain_window: Duration) -> ReloadReport {
+        // Serialize concurrent reloads so the load_full + carry_forward +
+        // swap sequence is atomic relative to other producers. See the
+        // field doc on `reload_lock`.
+        let _reload_guard = self.reload_lock.lock().expect("reload lock poisoned");
+        let new_arc = Arc::new(new);
+        // Snapshot the previous activation BEFORE publishing the new one so
+        // the dispatcher generation bump runs against a stable reference.
+        // `swap` would also return the prev pointer atomically with the
+        // store, but doing the bump first means we publish a dispatcher
+        // whose generations are already correct for the very first
+        // dispatch under the new activation.
+        let prev = self.state.slot.load_full();
+        new_arc
+            .routing
+            .dispatcher
+            .carry_forward_generations_from(&prev.routing.dispatcher);
+        let (new_deployments, new_revisions) = new_arc.routing.dispatcher.counts();
+        let prev = self.state.slot.swap(new_arc);
+        let (prev_deployments, prev_revisions) = prev.routing.dispatcher.counts();
+        if drain_window.is_zero() {
+            drop(prev);
+        } else {
+            self.runtime_handle.spawn(async move {
+                tokio::time::sleep(drain_window).await;
+                drop(prev);
+            });
+        }
+        ReloadReport {
+            prev_deployments,
+            prev_revisions,
+            new_deployments,
+            new_revisions,
+        }
     }
 
     /// Signal shutdown and join the serving thread.
@@ -257,6 +401,12 @@ async fn serve(
         return Ok(response);
     }
 
+    // Snapshot the activation ONCE per request so dispatch and execute see a
+    // coherent (host, routing) pair. A concurrent [`RevisionServer::reload`]
+    // swap is observed by the *next* request; this one keeps running against
+    // the activation it pinned here.
+    let activation = state.current();
+
     let host_header = header_str(req.headers(), header::HOST.as_str());
     let cookie_header = header_str(req.headers(), header::COOKIE.as_str());
     let user_header = header_str(req.headers(), "x-greentic-user");
@@ -264,7 +414,7 @@ async fn serve(
 
     // Resolve the bound deployment + tenant before touching the body, so an
     // unroutable request is rejected cheaply.
-    let (deployment_id, tenant) = state
+    let (deployment_id, tenant) = activation
         .routing
         .deployment_routes
         .resolve(host_header.as_deref(), &path)
@@ -299,7 +449,7 @@ async fn serve(
         .and_then(|jar| read_cookie(jar, &cookie_name(deployment_id)));
 
     let dispatch_req = DispatchRequest {
-        env_id: state.routing.dispatcher.env_id(),
+        env_id: activation.routing.dispatcher.env_id(),
         tenant: &tenant,
         deployment_id,
         session_hint: session_hint.as_deref(),
@@ -312,7 +462,7 @@ async fn serve(
     // `ThreadRng` is `!Send` and the dispatcher is async, so it cannot survive
     // the `.await` in the spawned connection task. Seed a `Send` `SmallRng`.
     let mut rng: rand::rngs::SmallRng = rand::make_rng();
-    let outcome = state
+    let outcome = activation
         .routing
         .dispatcher
         .dispatch(&dispatch_req, &mut rng)
@@ -335,7 +485,7 @@ async fn serve(
         bundle_id: outcome.bundle_id.clone(),
         revision_id: outcome.revision_id,
     };
-    match admit_request(&state.routing.http_routes, &scope, &path, &method) {
+    match admit_request(&activation.routing.http_routes, &scope, &path, &method) {
         Admission::ProviderRoute => {
             return Err(error_response(
                 StatusCode::NOT_IMPLEMENTED,
@@ -354,7 +504,7 @@ async fn serve(
 
     let activity = build_activity(&payload, &tenant, user.as_deref(), session_hint.as_deref());
 
-    let replies = state
+    let replies = activation
         .host
         .handle_activity_for_revision(
             &tenant,
@@ -553,12 +703,13 @@ fn try_probe_response(path: &str, state: &ServeState) -> Option<Response<Full<By
         return Some(text_response(StatusCode::OK, "ok"));
     }
     if path == "/status" {
-        let (deployments_routed, revisions_active) = state.routing.dispatcher.counts();
+        let activation = state.current();
+        let (deployments_routed, revisions_active) = activation.routing.dispatcher.counts();
         let body = serde_json::json!({
             "schema": "greentic.status.v1",
-            "env_id": state.routing.dispatcher.env_id(),
+            "env_id": activation.routing.dispatcher.env_id(),
             "listen_addr": state.bound_addr.to_string(),
-            "bundles_active": state.routing.deployment_routes.len(),
+            "bundles_active": activation.routing.deployment_routes.len(),
             "deployments_routed": deployments_routed,
             "revisions_active": revisions_active,
         });
@@ -921,7 +1072,25 @@ mod tests {
 
     // --- N1.2: probe surface ---------------------------------------------
 
-    fn empty_state(env_id: &str, bound: SocketAddr) -> ServeState {
+    /// Build an [`Activation`] from a host + dispatcher, threading the
+    /// other ingress-routing fields with their test-default empty values.
+    /// Single source of the assembly so test fixtures (`empty_activation`,
+    /// `populated_activation`, `activation_with_ids`) don't redeclare it.
+    fn activation_for_test(
+        host: std::sync::Arc<greentic_runner_host::RunnerHost>,
+        dispatcher: crate::revision_dispatcher::RevisionDispatcher,
+    ) -> Activation {
+        Activation {
+            host,
+            routing: std::sync::Arc::new(RevisionIngressRouting {
+                dispatcher: std::sync::Arc::new(dispatcher),
+                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
+                deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+            }),
+        }
+    }
+
+    fn empty_activation(env_id: &str) -> Activation {
         use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
         let host = std::sync::Arc::new(
             greentic_runner_host::HostBuilder::new()
@@ -935,16 +1104,13 @@ mod tests {
                 .build()
                 .expect("build placeholder host"),
         );
-        let dispatcher = std::sync::Arc::new(RevisionDispatcher::new(
-            RevisionDispatcherConfig::new(env_id, [0u8; 32]),
-        ));
+        let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new(env_id, [0u8; 32]));
+        activation_for_test(host, dispatcher)
+    }
+
+    fn empty_state(env_id: &str, bound: SocketAddr) -> ServeState {
         ServeState {
-            host,
-            routing: RevisionIngressRouting {
-                dispatcher,
-                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
-                deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
-            },
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation(env_id))),
             bound_addr: bound,
         }
     }
@@ -1116,6 +1282,246 @@ mod tests {
         assert_eq!(
             resolve_bind_addr(Some(&host)),
             "127.0.0.1:9090".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    // --- N2.1: reload + overlap-window drop --------------------------------
+
+    /// Build an [`Activation`] with `revision_count` revisions under a single
+    /// deployment, suitable for asserting reload counts change after swap.
+    fn populated_activation(env_id: &str, revision_count: u32) -> Activation {
+        use crate::revision_dispatcher::{
+            RevisionDispatcher, RevisionDispatcherConfig, RevisionEntry,
+        };
+        use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
+
+        let base = empty_activation(env_id);
+        let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new(env_id, [0u8; 32]));
+        let deployment_id = DeploymentId::new();
+        let bundle_id = BundleId::new("customer.support");
+        let total: u32 = 10_000;
+        let per_revision = total / revision_count;
+        let mut remainder = total - per_revision * revision_count;
+        let revisions: Vec<RevisionEntry> = (0..revision_count)
+            .map(|_| {
+                let weight_bps = per_revision + if remainder > 0 { 1 } else { 0 };
+                remainder = remainder.saturating_sub(1);
+                RevisionEntry {
+                    revision_id: RevisionId::new(),
+                    bundle_id: bundle_id.clone(),
+                    weight_bps,
+                }
+            })
+            .collect();
+        dispatcher
+            .apply_traffic_split(deployment_id, revisions, bundle_id, 0)
+            .expect("apply_traffic_split for test activation");
+        activation_for_test(base.host, dispatcher)
+    }
+
+    /// Construct a [`RevisionServer`] with no listener thread, just the state
+    /// slot + the current Tokio runtime handle. Lets reload tests run under
+    /// `#[tokio::test]` without binding a real port.
+    fn server_for_test(state: std::sync::Arc<ServeState>) -> RevisionServer {
+        RevisionServer {
+            shutdown: None,
+            handle: None,
+            actual_port: 0,
+            state,
+            runtime_handle: Handle::current(),
+            reload_lock: std::sync::Mutex::new(()),
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_swaps_activation_visible_to_next_counts() {
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(empty_state("env-1", bound));
+        let server = server_for_test(state);
+        assert_eq!(server.counts(), (0, 0));
+
+        let report = server.reload(populated_activation("env-1", 2), Duration::ZERO);
+        assert_eq!(report.prev_deployments, 0);
+        assert_eq!(report.prev_revisions, 0);
+        assert_eq!(report.new_deployments, 1);
+        assert_eq!(report.new_revisions, 2);
+
+        // The next reader sees the new activation; counts come from the same
+        // dispatcher `/status` reads.
+        assert_eq!(server.counts(), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn reload_inflight_arc_outlives_swap() {
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(empty_state("env-1", bound));
+        let server = server_for_test(std::sync::Arc::clone(&state));
+
+        // Snapshot the activation the way a request handler does at the top
+        // of `serve`. After the swap this Arc must still be live: a request
+        // mid-flight cannot tear (dispatch on new, execute on old).
+        let inflight = state.current();
+        let inflight_ptr = std::sync::Arc::as_ptr(&inflight) as usize;
+
+        server.reload(populated_activation("env-1", 1), Duration::from_secs(60));
+
+        // The swap is visible to the next reader, but the previously
+        // snapshotted Arc still points at the old activation.
+        let post_swap = state.current();
+        assert_ne!(
+            std::sync::Arc::as_ptr(&post_swap) as usize,
+            inflight_ptr,
+            "post-swap snapshot must point at the new activation"
+        );
+        // Old activation still serves zero revisions; new serves one.
+        let (old_deps, old_revs) = inflight.routing.dispatcher.counts();
+        assert_eq!((old_deps, old_revs), (0, 0));
+        let (new_deps, new_revs) = post_swap.routing.dispatcher.counts();
+        assert_eq!((new_deps, new_revs), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn reload_drops_old_activation_after_drain_window() {
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(empty_state("env-1", bound));
+        let server = server_for_test(std::sync::Arc::clone(&state));
+
+        // Track the pre-swap activation via a `Weak`. After the drain window
+        // elapses, every strong ref the spawned drop task held should be gone
+        // — `upgrade()` returns `None`.
+        let weak_old = std::sync::Arc::downgrade(&state.current());
+
+        let drain_window = Duration::from_millis(50);
+        server.reload(populated_activation("env-1", 1), drain_window);
+
+        // Inside the drain window: the spawned drop task is still sleeping,
+        // so the old activation is still alive.
+        assert!(
+            weak_old.upgrade().is_some(),
+            "old activation must outlive the drain window"
+        );
+
+        // Wait past the window. The drop task wakes, drops its Arc, and the
+        // last strong ref is gone.
+        tokio::time::sleep(drain_window + Duration::from_millis(200)).await;
+        assert!(
+            weak_old.upgrade().is_none(),
+            "old activation must be freed once the drain window elapses"
+        );
+    }
+
+    /// Build an [`Activation`] with a single deployment + revision, both
+    /// taken as parameters so two activations can share IDs across a reload.
+    /// The dispatcher carries the deployment at generation 1 (whatever
+    /// `apply_traffic_split(.., expected_generation=0)` yields).
+    fn activation_with_ids(
+        env_id: &str,
+        deployment_id: greentic_deploy_spec::ids::DeploymentId,
+        revision_id: greentic_deploy_spec::ids::RevisionId,
+        bundle_id: greentic_deploy_spec::ids::BundleId,
+    ) -> Activation {
+        use crate::revision_dispatcher::{
+            RevisionDispatcher, RevisionDispatcherConfig, RevisionEntry,
+        };
+        let base = empty_activation(env_id);
+        let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new(env_id, [0u8; 32]));
+        let revisions = vec![RevisionEntry {
+            revision_id,
+            bundle_id: bundle_id.clone(),
+            weight_bps: 10_000,
+        }];
+        dispatcher
+            .apply_traffic_split(deployment_id, revisions, bundle_id, 0)
+            .expect("apply_traffic_split for shared-deployment activation");
+        activation_for_test(base.host, dispatcher)
+    }
+
+    #[tokio::test]
+    async fn reload_invalidates_pre_reload_cookie_for_persisted_deployment() {
+        // Regression test for the Codex finding on PR-N2.1: without
+        // [`RevisionDispatcher::carry_forward_generations_from`], reload
+        // would publish a fresh dispatcher whose deployment generation
+        // matches the previous dispatcher's (both at the
+        // `apply_traffic_split`-from-zero default of 1) and a cookie minted
+        // pre-reload would still verify post-reload — defeating canary
+        // weight cuts and partial rollbacks for already-cookie'd clients.
+        let env_id = "env-1";
+        let tenant = "tenant-a";
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let rev_id = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("customer.support");
+
+        let act1 = activation_with_ids(env_id, dep_id, rev_id, bundle_id.clone());
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(act1)),
+            bound_addr: bound,
+        });
+        let server = server_for_test(std::sync::Arc::clone(&state));
+
+        // Mint a cookie against the live (pre-reload) dispatcher. The test
+        // helper seals it under generation 1 — the value `apply_traffic_split`
+        // writes for a from-zero call.
+        let act1_snap = state.current();
+        assert_eq!(
+            act1_snap.routing.dispatcher.counts(),
+            (1, 1),
+            "pre-reload activation must hold the test deployment + revision"
+        );
+        let cookie = act1_snap.routing.dispatcher.seal_cookie(
+            env_id,
+            tenant,
+            dep_id,
+            rev_id,
+            /* generation */ 1,
+            /* expires_at */ 9_999_999_999,
+        );
+        // Sanity: the cookie verifies against the pre-reload dispatcher at
+        // generation 1, the value `apply_traffic_split(.., 0)` produces.
+        assert_eq!(
+            act1_snap
+                .routing
+                .dispatcher
+                .verify_cookie(&cookie, env_id, tenant, dep_id, 1, 0),
+            Some(rev_id),
+            "pre-reload dispatcher must verify its own cookie"
+        );
+
+        // Reload to a new activation that re-uses the SAME deployment + bundle
+        // + revision (only the dispatcher object is fresh). Carry-forward must
+        // bump the new dispatcher's generation so the cookie sealed under
+        // generation 1 no longer verifies.
+        let act2 = activation_with_ids(env_id, dep_id, rev_id, bundle_id);
+        server.reload(act2, Duration::ZERO);
+
+        let act2_snap = state.current();
+        // The cookie's `g` is still 1, but the live dispatcher's expected
+        // generation is now 2 (1 + 1 from carry_forward) → mismatch → None.
+        assert_eq!(
+            act2_snap
+                .routing
+                .dispatcher
+                .verify_cookie(&cookie, env_id, tenant, dep_id, 2, 0),
+            None,
+            "post-reload dispatcher must reject the pre-reload cookie"
+        );
+        // And the post-reload cookie minted against `act2`'s actual generation
+        // (2) does verify, proving the carry-forward landed at 2 specifically.
+        let post_cookie = act2_snap.routing.dispatcher.seal_cookie(
+            env_id,
+            tenant,
+            dep_id,
+            rev_id,
+            2,
+            9_999_999_999,
+        );
+        assert_eq!(
+            act2_snap
+                .routing
+                .dispatcher
+                .verify_cookie(&post_cookie, env_id, tenant, dep_id, 2, 0),
+            Some(rev_id),
+            "post-reload dispatcher must verify a cookie minted at the new generation"
         );
     }
 }
