@@ -141,6 +141,19 @@ pub(crate) struct RevisionServer {
     /// in N2.2; tests already cover the wiring.
     #[allow(dead_code)]
     runtime_handle: Handle,
+    /// Serializes [`reload`](Self::reload) calls. Without it the
+    /// `load_full(prev) → carry_forward → swap(new)` sequence is not atomic
+    /// across concurrent producers: two reloads can both observe the same
+    /// prev, both bump generations from it, then both swap — the second
+    /// reload's generation bump is lost relative to the first's published
+    /// activation, so cookies minted in the brief window the first reload
+    /// was live still verify against the second's dispatcher.
+    ///
+    /// N2.2's file-watcher is a single producer today, but an admin HTTP
+    /// reload signal (or any future second producer) would violate that
+    /// invariant; guarding the swap primitive here means the type system
+    /// cannot be tricked.
+    reload_lock: std::sync::Mutex<()>,
 }
 
 impl RevisionServer {
@@ -258,6 +271,7 @@ impl RevisionServer {
             actual_port,
             state,
             runtime_handle,
+            reload_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -304,8 +318,17 @@ impl RevisionServer {
     /// weights for an already-deployed `deployment_id` would leave
     /// cookie-pinned clients on the pre-reload revision until cookie/pin
     /// TTL, defeating canary cuts and partial rollbacks.
+    ///
+    /// Holds the [`reload_lock`](Self::reload_lock) for the whole sequence
+    /// so concurrent producers (file-watcher + admin signal) cannot race
+    /// the `load_full(prev) → carry_forward → swap(new)` steps and lose a
+    /// generation bump.
     #[allow(dead_code)] // consumed by N2.2; covered by unit tests
     pub(crate) fn reload(&self, new: Activation, drain_window: Duration) -> ReloadReport {
+        // Serialize concurrent reloads so the load_full + carry_forward +
+        // swap sequence is atomic relative to other producers. See the
+        // field doc on `reload_lock`.
+        let _reload_guard = self.reload_lock.lock().expect("reload lock poisoned");
         let new_arc = Arc::new(new);
         // Snapshot the previous activation BEFORE publishing the new one so
         // the dispatcher generation bump runs against a stable reference.
@@ -1049,6 +1072,24 @@ mod tests {
 
     // --- N1.2: probe surface ---------------------------------------------
 
+    /// Build an [`Activation`] from a host + dispatcher, threading the
+    /// other ingress-routing fields with their test-default empty values.
+    /// Single source of the assembly so test fixtures (`empty_activation`,
+    /// `populated_activation`, `activation_with_ids`) don't redeclare it.
+    fn activation_for_test(
+        host: std::sync::Arc<greentic_runner_host::RunnerHost>,
+        dispatcher: crate::revision_dispatcher::RevisionDispatcher,
+    ) -> Activation {
+        Activation {
+            host,
+            routing: std::sync::Arc::new(RevisionIngressRouting {
+                dispatcher: std::sync::Arc::new(dispatcher),
+                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
+                deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+            }),
+        }
+    }
+
     fn empty_activation(env_id: &str) -> Activation {
         use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
         let host = std::sync::Arc::new(
@@ -1063,17 +1104,8 @@ mod tests {
                 .build()
                 .expect("build placeholder host"),
         );
-        let dispatcher = std::sync::Arc::new(RevisionDispatcher::new(
-            RevisionDispatcherConfig::new(env_id, [0u8; 32]),
-        ));
-        Activation {
-            host,
-            routing: std::sync::Arc::new(RevisionIngressRouting {
-                dispatcher,
-                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
-                deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
-            }),
-        }
+        let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new(env_id, [0u8; 32]));
+        activation_for_test(host, dispatcher)
     }
 
     fn empty_state(env_id: &str, bound: SocketAddr) -> ServeState {
@@ -1284,14 +1316,7 @@ mod tests {
         dispatcher
             .apply_traffic_split(deployment_id, revisions, bundle_id, 0)
             .expect("apply_traffic_split for test activation");
-        Activation {
-            host: base.host,
-            routing: std::sync::Arc::new(RevisionIngressRouting {
-                dispatcher: std::sync::Arc::new(dispatcher),
-                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
-                deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
-            }),
-        }
+        activation_for_test(base.host, dispatcher)
     }
 
     /// Construct a [`RevisionServer`] with no listener thread, just the state
@@ -1304,6 +1329,7 @@ mod tests {
             actual_port: 0,
             state,
             runtime_handle: Handle::current(),
+            reload_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -1407,14 +1433,7 @@ mod tests {
         dispatcher
             .apply_traffic_split(deployment_id, revisions, bundle_id, 0)
             .expect("apply_traffic_split for shared-deployment activation");
-        Activation {
-            host: base.host,
-            routing: std::sync::Arc::new(RevisionIngressRouting {
-                dispatcher: std::sync::Arc::new(dispatcher),
-                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
-                deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
-            }),
-        }
+        activation_for_test(base.host, dispatcher)
     }
 
     #[tokio::test]

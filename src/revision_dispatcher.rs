@@ -314,22 +314,19 @@ impl RevisionDispatcher {
     /// it.
     pub(crate) fn carry_forward_generations_from(&self, prev: &RevisionDispatcher) {
         // Defensive against a concurrent `apply_traffic_split`, even though
-        // the canonical call site fires `self` is not yet published to the
-        // live slot. Matches the mutation discipline of [`Self::mutate_deployment`].
+        // the canonical call site fires before `self` is published to the
+        // live slot. Matches the mutation discipline of
+        // [`Self::mutate_deployment`].
         let _w = self.write_lock.lock().expect("write lock poisoned");
         let prev_snap = prev.snapshot.load();
         let cur = self.snapshot.load_full();
         let mut next = (*cur).clone();
-        let mut bumped_any = false;
         for (dep_id, entry) in next.deployments.iter_mut() {
             if let Some(prev_entry) = prev_snap.deployments.get(dep_id) {
                 entry.generation = prev_entry.generation.saturating_add(1);
-                bumped_any = true;
             }
         }
-        if bumped_any {
-            self.snapshot.store(std::sync::Arc::new(next));
-        }
+        self.snapshot.store(std::sync::Arc::new(next));
     }
 
     /// Flag `revision_id` as draining under `deployment_id`. Weighted picks
