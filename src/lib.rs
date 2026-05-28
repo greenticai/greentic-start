@@ -344,8 +344,10 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let bind_addr = revision_serve::resolve_bind_addr(Some(&environment.host_config));
         let server = revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
             bind_addr,
-            host: std::sync::Arc::new(host),
-            routing,
+            activation: std::sync::Arc::new(revision_serve::Activation {
+                host: std::sync::Arc::new(host),
+                routing: std::sync::Arc::new(routing),
+            }),
         })
         .context("starting the revision ingress server")?;
         let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
