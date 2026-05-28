@@ -16,6 +16,7 @@ pub enum Domain {
     Events,
     Secrets,
     OAuth,
+    Observer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +105,12 @@ pub fn config(domain: Domain) -> DomainConfig {
             diagnostics_flow: "diagnostics",
             verify_flows: &[],
         },
+        Domain::Observer => DomainConfig {
+            providers_dir: "providers/observer",
+            setup_flow: "setup_default",
+            diagnostics_flow: "diagnostics",
+            verify_flows: &[],
+        },
     }
 }
 
@@ -113,6 +120,7 @@ pub fn validator_pack_path(root: &Path, domain: Domain) -> Option<PathBuf> {
         Domain::Events => "validators-events.gtpack",
         Domain::Secrets => "validators-secrets.gtpack",
         Domain::OAuth => "validators-oauth.gtpack",
+        Domain::Observer => "validators-observer.gtpack",
     };
     let path = root.join("validators").join(domain_name(domain)).join(name);
     if path.exists() { Some(path) } else { None }
@@ -329,6 +337,7 @@ pub(crate) fn provider_pack_matches_domain(
         Domain::Events => pack_id.starts_with("events-"),
         Domain::Secrets => pack_id.starts_with("secrets-"),
         Domain::OAuth => pack_id.starts_with("oauth-"),
+        Domain::Observer => pack_id.starts_with("observer-"),
     }
 }
 
@@ -1011,6 +1020,7 @@ pub(crate) fn domain_name(domain: Domain) -> &'static str {
         Domain::Events => "events",
         Domain::Secrets => "secrets",
         Domain::OAuth => "oauth",
+        Domain::Observer => "observer",
     }
 }
 

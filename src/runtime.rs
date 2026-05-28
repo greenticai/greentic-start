@@ -813,6 +813,7 @@ pub fn demo_up_services(
         .context("failed to resolve notifier config")?
     };
     let ingress_domains = detect_http_ingress_domains(&discovery, runner_host.as_ref());
+    log_observer_providers(&discovery);
     // Enable static routes if bundle declares them - no longer requires NATS mode
     let enable_static_routes = static_routes.bundle_has_static_routes();
     if enable_static_routes || ingress_domains.contains(&Domain::Messaging) {
@@ -1384,7 +1385,25 @@ fn parse_domain_name(value: &str) -> Option<Domain> {
         "events" => Some(Domain::Events),
         "oauth" => Some(Domain::OAuth),
         "secrets" => Some(Domain::Secrets),
+        "observer" => Some(Domain::Observer),
         _ => None,
+    }
+}
+
+/// Logs which observer-domain providers the bundle's discovery resolved.
+/// Observers are sinks (no HTTP ingress), so detect_http_ingress_domains
+/// doesn't reach them. This sibling log makes them visible at boot.
+fn log_observer_providers(discovery: &crate::discovery::DiscoveryResult) {
+    for provider in &discovery.providers {
+        if parse_domain_name(&provider.domain) == Some(Domain::Observer) {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[domain-detect] domain=Observer provider={} (sink, no http ingress)",
+                    provider.provider_id
+                ),
+            );
+        }
     }
 }
 

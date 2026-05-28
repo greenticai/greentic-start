@@ -255,6 +255,7 @@ pub(super) fn domain_name(domain: Domain) -> &'static str {
         Domain::Events => "events",
         Domain::Secrets => "secrets",
         Domain::OAuth => "oauth",
+        Domain::Observer => "observer",
     }
 }
 
