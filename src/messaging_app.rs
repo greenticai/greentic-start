@@ -399,24 +399,56 @@ fn extract_flows(value: &CborValue) -> Vec<AppFlowInfo> {
 }
 
 /// Reads the pack manifest's `capabilities: Vec<ComponentCapability>` and
-/// returns each entry's `name`. Cbor shape is `Array<Map>` per
-/// `greentic_types::ComponentCapability { name, description }`, not the
-/// flat `Array<Text>` an earlier draft assumed.
+/// returns each entry's `name`. The canonical encoder symbol-indexes the
+/// name as a `u32` into `symbols.capability_names`, so we resolve through
+/// that table when the inline value is an integer; an inline text name is
+/// also accepted for non-canonical encodings.
 fn extract_capabilities(value: &CborValue) -> Vec<String> {
     let mut caps = Vec::new();
-    if let CborValue::Map(map) = value {
-        let caps_key = CborValue::Text("capabilities".to_string());
-        if let Some(CborValue::Array(entries)) = map.get(&caps_key) {
-            for entry in entries {
-                if let CborValue::Map(entry_map) = entry
-                    && let Some(name) = extract_text_from_map(entry_map, "name")
-                {
-                    caps.push(name);
-                }
-            }
+    let CborValue::Map(map) = value else {
+        return caps;
+    };
+    let entries = match map.get(&CborValue::Text("capabilities".to_string())) {
+        Some(CborValue::Array(entries)) => entries,
+        _ => return caps,
+    };
+    let cap_names_table = symbol_table_array(map, "capability_names");
+    for entry in entries {
+        if let CborValue::Map(entry_map) = entry
+            && let Some(name) = resolve_capability_name(entry_map, cap_names_table)
+        {
+            caps.push(name);
         }
     }
     caps
+}
+
+fn resolve_capability_name(
+    entry_map: &BTreeMap<CborValue, CborValue>,
+    cap_names_table: Option<&Vec<CborValue>>,
+) -> Option<String> {
+    match entry_map.get(&CborValue::Text("name".to_string()))? {
+        CborValue::Text(text) => Some(text.clone()),
+        CborValue::Integer(idx) => match cap_names_table?.get(*idx as usize)? {
+            CborValue::Text(resolved) => Some(resolved.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn symbol_table_array<'a>(
+    manifest_map: &'a BTreeMap<CborValue, CborValue>,
+    table: &str,
+) -> Option<&'a Vec<CborValue>> {
+    let symbols = manifest_map.get(&CborValue::Text("symbols".to_string()))?;
+    let CborValue::Map(sym_map) = symbols else {
+        return None;
+    };
+    match sym_map.get(&CborValue::Text(table.to_string())) {
+        Some(CborValue::Array(arr)) => Some(arr),
+        _ => None,
+    }
 }
 
 fn parse_flow_entry(value: &CborValue) -> Option<AppFlowInfo> {
@@ -1431,6 +1463,65 @@ mod tests {
     #[test]
     fn extract_capabilities_returns_empty_when_field_missing() {
         let manifest = CborValue::Map(BTreeMap::from([cbor_text("pack_id", "demo-pack")]));
+        assert!(extract_capabilities(&manifest).is_empty());
+    }
+
+    #[test]
+    fn extract_capabilities_resolves_symbol_indexed_names() {
+        // Canonical EncodedCapability { name: u32, .. } references
+        // symbols.capability_names[idx] — what packc + greentic-types emit.
+        let manifest = CborValue::Map(BTreeMap::from([
+            (
+                CborValue::Text("symbols".to_string()),
+                CborValue::Map(BTreeMap::from([(
+                    CborValue::Text("capability_names".to_string()),
+                    CborValue::Array(vec![
+                        CborValue::Text("greentic.cap.fast2flow.v1".to_string()),
+                        CborValue::Text("greentic.cap.other.v1".to_string()),
+                    ]),
+                )])),
+            ),
+            (
+                CborValue::Text("capabilities".to_string()),
+                CborValue::Array(vec![
+                    CborValue::Map(BTreeMap::from([
+                        (CborValue::Text("name".to_string()), CborValue::Integer(0)),
+                        cbor_text("description", "fast2flow opt-in"),
+                    ])),
+                    CborValue::Map(BTreeMap::from([(
+                        CborValue::Text("name".to_string()),
+                        CborValue::Integer(1),
+                    )])),
+                ]),
+            ),
+        ]));
+        assert_eq!(
+            extract_capabilities(&manifest),
+            vec![
+                "greentic.cap.fast2flow.v1".to_string(),
+                "greentic.cap.other.v1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_capabilities_skips_out_of_range_symbol_indices() {
+        let manifest = CborValue::Map(BTreeMap::from([
+            (
+                CborValue::Text("symbols".to_string()),
+                CborValue::Map(BTreeMap::from([(
+                    CborValue::Text("capability_names".to_string()),
+                    CborValue::Array(vec![CborValue::Text("only-one".to_string())]),
+                )])),
+            ),
+            (
+                CborValue::Text("capabilities".to_string()),
+                CborValue::Array(vec![CborValue::Map(BTreeMap::from([(
+                    CborValue::Text("name".to_string()),
+                    CborValue::Integer(99),
+                )]))]),
+            ),
+        ]));
         assert!(extract_capabilities(&manifest).is_empty());
     }
 
