@@ -111,4 +111,182 @@ mod tests {
         };
         assert_eq!(scope_for(&ctx), "acme:legal");
     }
+
+    // End-to-end smoke covering the two-level gate, host invocation, and
+    // directive mapping. Cf. docs/fast2flow-prototype-bundle.md "Test plan".
+    #[cfg(unix)]
+    mod end_to_end {
+        use super::*;
+        use crate::fast2flow::gate::{BundleCapabilityGate, FAST2FLOW_CAPABILITY};
+        use crate::ingress::control_directive::ControlDirective;
+        use crate::messaging_app::{AppFlowInfo, AppPackInfo};
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use tempfile::{TempDir, tempdir};
+
+        fn pack_with_fast2flow_cap() -> AppPackInfo {
+            AppPackInfo {
+                pack_id: "sales-crm".to_string(),
+                flows: alloc_messaging_default(),
+                capabilities: vec![FAST2FLOW_CAPABILITY.to_string()],
+            }
+        }
+
+        fn alloc_messaging_default() -> Vec<AppFlowInfo> {
+            vec![AppFlowInfo {
+                id: "welcome".to_string(),
+                kind: "messaging".to_string(),
+            }]
+        }
+
+        fn ctx() -> OperatorContext {
+            OperatorContext {
+                tenant: "acme".to_string(),
+                team: None,
+                correlation_id: None,
+            }
+        }
+
+        fn envelope(text: &str) -> ChannelMessageEnvelope {
+            serde_json::from_value(json!({
+                "id": "msg-1",
+                "tenant": {
+                    "env": "dev",
+                    "tenant": "acme",
+                    "tenant_id": "acme",
+                    "team": "default",
+                    "attempt": 0
+                },
+                "channel": "conv-1",
+                "session_id": "conv-1",
+                "from": { "id": "user-1", "kind": "user" },
+                "text": text,
+                "metadata": {}
+            }))
+            .expect("envelope")
+        }
+
+        fn fake_host(body: &str) -> (TempDir, PathBuf) {
+            let dir = tempdir().expect("tempdir");
+            let path = dir.path().join("fake-host.sh");
+            let script = format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{body}'\n");
+            std::fs::write(&path, script).expect("write");
+            let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("perms");
+            (dir, path)
+        }
+
+        fn config_with(host_bin: PathBuf, indexes_path: Option<PathBuf>) -> Fast2FlowConfig {
+            Fast2FlowConfig {
+                host_bin,
+                registry_path: PathBuf::from("/tmp/registry"),
+                indexes_path,
+                time_budget_ms: 500,
+                gate: Arc::new(BundleCapabilityGate),
+            }
+        }
+
+        /// Materializes `<indexes_path>/<scope>/index.json` so the
+        /// file-existence gate clears.
+        fn place_index(indexes_path: &std::path::Path, scope: &str) {
+            let scope_dir = indexes_path.join(scope);
+            std::fs::create_dir_all(&scope_dir).expect("scope dir");
+            std::fs::write(scope_dir.join("index.json"), b"{}").expect("index");
+        }
+
+        #[test]
+        fn returns_dispatch_when_capability_index_and_host_all_align() {
+            let (_dir, host) = fake_host(
+                r#"{"directive":{"type":"dispatch","target":"sales-crm/pipeline_flow","confidence":0.92,"reason":"matched pipeline"}}"#,
+            );
+            let indexes = tempdir().expect("indexes dir");
+            place_index(indexes.path(), "acme:default");
+            let cfg = config_with(host, Some(indexes.path().to_path_buf()));
+
+            let result = try_for_request(
+                &cfg,
+                &ctx(),
+                &pack_with_fast2flow_cap(),
+                &envelope("show me my pipeline"),
+                "webchat",
+            );
+            match result {
+                Some(ControlDirective::Dispatch { target }) => {
+                    assert_eq!(target.tenant, "acme");
+                    assert_eq!(target.team, None);
+                    assert_eq!(target.pack, "sales-crm");
+                    assert_eq!(target.flow.as_deref(), Some("pipeline_flow"));
+                    assert!(target.node.is_none());
+                }
+                other => panic!("expected Dispatch, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn returns_none_when_pack_does_not_declare_capability() {
+            let (_dir, host) = fake_host(r#"{"directive":{"type":"continue"}}"#);
+            let indexes = tempdir().expect("indexes dir");
+            place_index(indexes.path(), "acme:default");
+            let cfg = config_with(host, Some(indexes.path().to_path_buf()));
+
+            let pack_without_cap = AppPackInfo {
+                pack_id: "no-fast2flow".to_string(),
+                flows: alloc_messaging_default(),
+                capabilities: Vec::new(),
+            };
+            let result = try_for_request(
+                &cfg,
+                &ctx(),
+                &pack_without_cap,
+                &envelope("show pipeline"),
+                "webchat",
+            );
+            assert!(result.is_none(), "gate must veto undeclared packs");
+        }
+
+        #[test]
+        fn returns_none_when_scope_index_file_missing() {
+            let (_dir, host) = fake_host(
+                r#"{"directive":{"type":"dispatch","target":"sales-crm/pipeline_flow","confidence":1.0,"reason":""}}"#,
+            );
+            // Indexes dir exists but no <scope>/index.json placed.
+            let indexes = tempdir().expect("indexes dir");
+            let cfg = config_with(host, Some(indexes.path().to_path_buf()));
+
+            let result = try_for_request(
+                &cfg,
+                &ctx(),
+                &pack_with_fast2flow_cap(),
+                &envelope("show pipeline"),
+                "webchat",
+            );
+            assert!(
+                result.is_none(),
+                "missing index file must short-circuit before host spawn"
+            );
+        }
+
+        #[test]
+        fn returns_none_when_host_returns_continue() {
+            let (_dir, host) = fake_host(r#"{"directive":{"type":"continue"}}"#);
+            let indexes = tempdir().expect("indexes dir");
+            place_index(indexes.path(), "acme:default");
+            let cfg = config_with(host, Some(indexes.path().to_path_buf()));
+
+            let result = try_for_request(
+                &cfg,
+                &ctx(),
+                &pack_with_fast2flow_cap(),
+                &envelope("hi"),
+                "webchat",
+            );
+            assert!(
+                result.is_none(),
+                "Continue directive maps to None so caller falls through"
+            );
+        }
+    }
 }
