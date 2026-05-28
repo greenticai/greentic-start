@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use greentic_deploy_spec::ids::DeploymentId;
+use greentic_deploy_spec::ids::{DeploymentId, RevisionId};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1::Builder as Http1Builder;
@@ -60,7 +60,13 @@ use greentic_deploy_spec::{DEFAULT_LISTEN_ADDR, EnvironmentHostConfig};
 use crate::deployment_routes::RevisionIngressRouting;
 use crate::http_routes::{HttpRouteTable, RevisionScope};
 use crate::operator_log;
-use crate::revision_dispatcher::{DispatchRequest, SetCookieDirective, cookie_name};
+use crate::revision_dispatcher::{
+    DispatchRequest, RevisionDispatcher, RevisionKey, SetCookieDirective, cookie_name,
+};
+use crate::revision_drain::{
+    DrainRequest, NoopRevisionTeardown, RevisionDrainCoordinator, RevisionLivenessProbe,
+    RevisionTeardown,
+};
 
 /// Largest request body the revision ingress accepts, in bytes. Even on the
 /// loopback / local posture a cap is required so one oversized POST cannot
@@ -106,6 +112,122 @@ impl ServeState {
     /// activation outlives every in-flight request that pinned it.
     fn current(&self) -> Arc<Activation> {
         self.slot.load_full()
+    }
+}
+
+/// [`RevisionKey`]s present in `prev` but absent from `next`. Used by
+/// [`RevisionServer::reload`] to identify revisions the operator just removed
+/// so the drain coordinator can fire one drain per removed revision against
+/// the OLD activation.
+fn removed_revisions(prev: &RevisionDispatcher, next: &RevisionDispatcher) -> Vec<RevisionKey> {
+    prev.revision_keys()
+        .into_iter()
+        .filter(|(deployment_id, _bundle_id, revision_id)| {
+            !next.contains_revision(*deployment_id, *revision_id)
+        })
+        .collect()
+}
+
+/// Liveness probe handed to each drain coordinator so it can suppress a
+/// stale `RevisionEvicted` event when the revision it's draining is rolled
+/// back / re-added into a newer activation before the drain window elapses.
+///
+/// Checks the server's live activation slot, not the OLD activation being
+/// drained: if the revision reappears in whatever the server is currently
+/// serving (a strictly newer activation than `draining_dispatcher`), the
+/// eviction is stale and must not be reported.
+struct SlotLivenessProbe {
+    state: Arc<ServeState>,
+    /// The dispatcher this coordinator is draining. Identity guard: if the
+    /// live slot still points at it, the revision is NOT live "elsewhere" —
+    /// it's the same routing table, so the eviction event should fire
+    /// (matches a direct drain of the live dispatcher).
+    draining_dispatcher: Arc<RevisionDispatcher>,
+}
+
+impl RevisionLivenessProbe for SlotLivenessProbe {
+    fn is_live_elsewhere(&self, deployment_id: DeploymentId, revision_id: RevisionId) -> bool {
+        let live = self.state.current();
+        // Same dispatcher instance ⇒ we're draining the live routing table,
+        // so the revision isn't live in a NEWER activation. Every reload
+        // swaps in a freshly-built dispatcher `Arc`, so pointer identity is
+        // a sound discriminator.
+        if Arc::ptr_eq(&live.routing.dispatcher, &self.draining_dispatcher) {
+            return false;
+        }
+        live.routing
+            .dispatcher
+            .contains_revision(deployment_id, revision_id)
+    }
+}
+
+/// Spawn one [`RevisionDrainCoordinator::run`] task per removed revision
+/// against `prev`'s dispatcher. Each task owns its own `Arc` to the OLD
+/// activation so the dispatcher and route table outlive the overlap-window
+/// drop spawned by [`RevisionServer::reload`]. WS close and teardown are
+/// both no-ops in N2.3 — see [`crate::revision_drain`] module docs for the
+/// Phase D follow-up.
+///
+/// Each task carries a [`SlotLivenessProbe`] over `state` so a revision
+/// rolled back into a newer activation within the drain window does not
+/// produce a stale `RevisionEvicted` event.
+fn spawn_revision_drains(
+    runtime_handle: &Handle,
+    state: Arc<ServeState>,
+    prev: Arc<Activation>,
+    removed: Vec<RevisionKey>,
+    drain_window: Duration,
+) {
+    let drain_seconds: u32 = drain_window.as_secs().try_into().unwrap_or(u32::MAX);
+    let teardown: Arc<dyn RevisionTeardown> = Arc::new(NoopRevisionTeardown);
+    for (deployment_id, bundle_id, revision_id) in removed {
+        let Some(tenant) = prev
+            .routing
+            .deployment_routes
+            .tenant_for(deployment_id)
+            .map(str::to_string)
+        else {
+            // The route table is built from the SAME runtime-config the
+            // dispatcher snapshotted, so a revision known to the dispatcher
+            // but missing from the route table is a structural inconsistency.
+            // Surface it loudly and skip — emitting telemetry on a tenantless
+            // drain would corrupt downstream rollouts of multi-tenant metrics.
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "skipping drain for revision {revision_id} of deployment \
+                     {deployment_id}: no tenant binding found in OLD activation \
+                     route table (deployment likely removed before reload diff)"
+                ),
+            );
+            continue;
+        };
+        let dispatcher = Arc::clone(&prev.routing.dispatcher);
+        let teardown = Arc::clone(&teardown);
+        let liveness: Arc<dyn RevisionLivenessProbe> = Arc::new(SlotLivenessProbe {
+            state: Arc::clone(&state),
+            draining_dispatcher: Arc::clone(&dispatcher),
+        });
+        runtime_handle.spawn(async move {
+            let coord = RevisionDrainCoordinator::with_noop_ws(dispatcher, teardown)
+                .with_liveness_probe(liveness);
+            let req = DrainRequest {
+                tenant: tenant.as_str(),
+                deployment_id,
+                bundle_id,
+                revision_id,
+                drain_seconds,
+            };
+            if let Err(err) = coord.run(req).await {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "drain coordinator for revision {revision_id} of \
+                         deployment {deployment_id} returned an error: {err}"
+                    ),
+                );
+            }
+        });
     }
 }
 
@@ -359,6 +481,16 @@ impl RevisionServer {
         // whose generations are already correct for the very first
         // dispatch under the new activation.
         let prev = self.state.slot.load_full();
+        // `SlotLivenessProbe` (the drain path's stale-eviction guard) relies
+        // on every reload publishing a freshly-built dispatcher `Arc`, so it
+        // can use `Arc::ptr_eq` to tell the OLD dispatcher apart from the
+        // live one. Assert that invariant here: if a future optimization ever
+        // reuses a dispatcher `Arc` across reloads, this fails loudly in tests
+        // rather than silently breaking eviction telemetry.
+        debug_assert!(
+            !Arc::ptr_eq(&prev.routing.dispatcher, &new_arc.routing.dispatcher),
+            "reload must build a fresh dispatcher Arc (SlotLivenessProbe ptr_eq guard depends on it)"
+        );
         // Update the generation watermark and bump the new dispatcher off
         // it. Absorbing prev → bump new → absorb new keeps the watermark
         // strictly monotonic across every deployment id we've ever served
@@ -382,9 +514,31 @@ impl RevisionServer {
                 .dispatcher
                 .absorb_into_watermark(&mut watermark);
         }
+        // Diff OLD vs NEW revision sets BEFORE the swap, so the drain
+        // coordinator (below) runs against a stable snapshot of "what was
+        // serving until now" — independent of the publish ordering.
+        let removed = removed_revisions(&prev.routing.dispatcher, &new_arc.routing.dispatcher);
         let (new_deployments, new_revisions) = new_arc.routing.dispatcher.counts();
         let prev = self.state.slot.swap(new_arc);
         let (prev_deployments, prev_revisions) = prev.routing.dispatcher.counts();
+        // Fire one drain coordinator per removed revision against the OLD
+        // activation. The coordinator marks the revision draining on OLD's
+        // dispatcher (cookie/pin holders re-dispatch immediately), waits
+        // `drain_window`, then evicts it from OLD's routing table — emitting
+        // `RolloutEvent::RevisionDraining` + `RevisionEvicted` along the way.
+        // The teardown is a no-op: the OLD activation drops wholesale at the
+        // bottom of this fn after `drain_window`, taking the `RunnerHost`'s
+        // `ActivePacks` with it. A real `ActivePacks::remove_revision` adapter
+        // is the Phase D follow-up (see `revision_drain` module docs).
+        if !removed.is_empty() && !drain_window.is_zero() {
+            spawn_revision_drains(
+                &self.runtime_handle,
+                Arc::clone(&self.state),
+                Arc::clone(&prev),
+                removed,
+                drain_window,
+            );
+        }
         if drain_window.is_zero() {
             drop(prev);
         } else {
@@ -824,6 +978,9 @@ pub(crate) fn resolve_bind_addr(host_config: Option<&EnvironmentHostConfig>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `BundleId` is used only in tests (prod refers to it via the `RevisionKey`
+    // alias), so it lives here rather than in the library import set.
+    use greentic_deploy_spec::ids::BundleId;
     use greentic_runner_host::engine::runtime::{FlowResumeStore, IngressEnvelope};
     use greentic_runner_host::runner::engine::{ExecutionState, FlowSnapshot, FlowWait};
     use greentic_runner_host::storage::new_session_store;
@@ -1668,6 +1825,269 @@ mod tests {
                 .verify_cookie(&post_cookie, env_id, tenant, dep_id, 2, 0),
             Some(rev_id),
             "cookie minted at the bumped generation (2) must verify"
+        );
+    }
+
+    // --- N2.3: revision drain on removal -----------------------------------
+
+    /// Activation with one deployment + two revisions, route table seeded
+    /// with `(deployment_id → tenant)` so `spawn_revision_drains` finds the
+    /// tenant binding. Returns `(activation, dispatcher_arc)` so callers can
+    /// keep a handle to OLD's dispatcher across the reload and observe drain
+    /// transitions on it after the producer task fires.
+    fn activation_with_two_revisions(
+        env_id: &str,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        rev_a: RevisionId,
+        rev_b: RevisionId,
+        bundle_id: BundleId,
+    ) -> (Activation, std::sync::Arc<RevisionDispatcher>) {
+        use crate::revision_dispatcher::{RevisionDispatcherConfig, RevisionEntry};
+        let base = empty_activation(env_id);
+        let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new(env_id, [0u8; 32]));
+        let revisions = vec![
+            RevisionEntry {
+                revision_id: rev_a,
+                bundle_id: bundle_id.clone(),
+                weight_bps: 5_000,
+            },
+            RevisionEntry {
+                revision_id: rev_b,
+                bundle_id: bundle_id.clone(),
+                weight_bps: 5_000,
+            },
+        ];
+        dispatcher
+            .apply_traffic_split(deployment_id, revisions, bundle_id, 0)
+            .expect("apply_traffic_split");
+        let dispatcher = std::sync::Arc::new(dispatcher);
+        let routing =
+            std::sync::Arc::new(RevisionIngressRouting {
+                dispatcher: std::sync::Arc::clone(&dispatcher),
+                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
+                deployment_routes: crate::deployment_routes::DeploymentRouteTable::from_parts(
+                    vec![(deployment_id, tenant.to_string(), Vec::new(), Vec::new())],
+                ),
+            });
+        let activation = Activation {
+            host: base.host,
+            routing,
+        };
+        (activation, dispatcher)
+    }
+
+    #[tokio::test]
+    async fn reload_drain_marks_then_evicts_removed_revision() {
+        // Reload removes one of two revisions under the same deployment.
+        // The drain coordinator should mark the removed revision draining
+        // on the OLD dispatcher immediately, and evict it after the drain
+        // window. The kept revision must NOT be marked draining.
+        let env_id = "env-1";
+        let tenant = "tenant-a";
+        let dep_id = DeploymentId::new();
+        let rev_kept = RevisionId::new();
+        let rev_removed = RevisionId::new();
+        let bundle_id = BundleId::new("customer.support");
+
+        let (act_old, old_dispatcher) = activation_with_two_revisions(
+            env_id,
+            tenant,
+            dep_id,
+            rev_kept,
+            rev_removed,
+            bundle_id.clone(),
+        );
+        let state = serve_state_with(act_old);
+        let server = server_for_test(std::sync::Arc::clone(&state));
+
+        // NEW activation keeps `rev_kept` only (single-revision, full weight).
+        let act_new = activation_with_ids(env_id, dep_id, rev_kept, bundle_id);
+
+        // Use a short drain window so the test finishes quickly. drain_seconds
+        // is derived from drain_window.as_secs(); 1s gives the coordinator
+        // enough room to mark, sleep, and evict before we assert.
+        server.reload(act_new, Duration::from_secs(1));
+
+        // After the swap returns, the drain task has been spawned but may
+        // not have run mark_draining yet. Yield to give it a chance.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            old_dispatcher.is_draining(dep_id, rev_removed),
+            "removed revision must be marked draining on OLD dispatcher"
+        );
+        assert!(
+            !old_dispatcher.is_draining(dep_id, rev_kept),
+            "kept revision must NOT be marked draining"
+        );
+
+        // Wait past the drain window. Coordinator evicts the removed
+        // revision from the OLD dispatcher.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let revision_ids: std::collections::HashSet<_> = old_dispatcher
+            .revision_keys()
+            .into_iter()
+            .filter(|(d, _, _)| *d == dep_id)
+            .map(|(_, _, r)| r)
+            .collect();
+        assert!(
+            !revision_ids.contains(&rev_removed),
+            "removed revision must be evicted from OLD dispatcher after drain"
+        );
+        assert!(
+            revision_ids.contains(&rev_kept),
+            "kept revision must remain on OLD dispatcher"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_does_not_drain_when_no_revisions_removed() {
+        // Reload that keeps the same revision set must not mark anything
+        // draining on the OLD dispatcher — adding a brand new deployment or
+        // reweighting the same revisions doesn't constitute a removal.
+        let env_id = "env-1";
+        let tenant = "tenant-a";
+        let dep_id = DeploymentId::new();
+        let rev_a = RevisionId::new();
+        let rev_b = RevisionId::new();
+        let bundle_id = BundleId::new("customer.support");
+
+        let (act_old, old_dispatcher) =
+            activation_with_two_revisions(env_id, tenant, dep_id, rev_a, rev_b, bundle_id.clone());
+        let state = serve_state_with(act_old);
+        let server = server_for_test(std::sync::Arc::clone(&state));
+
+        // NEW activation: same deployment, same two revisions (identical set).
+        let (act_new, _) =
+            activation_with_two_revisions(env_id, tenant, dep_id, rev_a, rev_b, bundle_id);
+        server.reload(act_new, Duration::from_millis(100));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            old_dispatcher.draining_revisions(dep_id).is_empty(),
+            "no revisions removed → nothing marked draining (got {:?})",
+            old_dispatcher.draining_revisions(dep_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_zero_drain_window_skips_drain_spawn() {
+        // `drain_window == 0` is a test-only mode that drops the OLD
+        // activation synchronously. The drain coordinator path MUST be
+        // bypassed too — otherwise drain tasks would race the synchronous
+        // drop against a dispatcher whose `Arc<RevisionDispatcher>` could
+        // have been the last strong handle outside the coordinator.
+        let env_id = "env-1";
+        let tenant = "tenant-a";
+        let dep_id = DeploymentId::new();
+        let rev_a = RevisionId::new();
+        let rev_b = RevisionId::new();
+        let bundle_id = BundleId::new("customer.support");
+
+        let (act_old, old_dispatcher) =
+            activation_with_two_revisions(env_id, tenant, dep_id, rev_a, rev_b, bundle_id.clone());
+        let state = serve_state_with(act_old);
+        let server = server_for_test(std::sync::Arc::clone(&state));
+
+        let act_new = activation_with_ids(env_id, dep_id, rev_a, bundle_id);
+        server.reload(act_new, Duration::ZERO);
+
+        // Give any erroneously-spawned drain task a chance to run.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            old_dispatcher.draining_revisions(dep_id).is_empty(),
+            "drain_window == 0 must bypass drain spawn (got {:?})",
+            old_dispatcher.draining_revisions(dep_id)
+        );
+    }
+
+    // --- N2.3 Codex fix: stale-eviction suppression probe ------------------
+
+    /// Build a `ServeState` whose live slot holds `activation`. Helper for
+    /// the [`SlotLivenessProbe`] tests.
+    fn serve_state_with(activation: Activation) -> std::sync::Arc<ServeState> {
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        std::sync::Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(activation)),
+            bound_addr: bound,
+        })
+    }
+
+    #[test]
+    fn liveness_probe_reports_live_when_revision_present_in_newer_activation() {
+        // The live slot holds a NEWER activation (different dispatcher Arc)
+        // that serves the revision → the OLD activation's drain must treat
+        // the revision as live elsewhere and suppress its eviction event.
+        let env_id = "env-1";
+        let dep_id = DeploymentId::new();
+        let rev_id = RevisionId::new();
+        let bundle_id = BundleId::new("customer.support");
+
+        let draining = activation_with_ids(env_id, dep_id, rev_id, bundle_id.clone());
+        let draining_dispatcher = std::sync::Arc::clone(&draining.routing.dispatcher);
+        // A distinct, newer activation that also serves the revision.
+        let live = activation_with_ids(env_id, dep_id, rev_id, bundle_id);
+        let state = serve_state_with(live);
+
+        let probe = SlotLivenessProbe {
+            state,
+            draining_dispatcher,
+        };
+        assert!(
+            probe.is_live_elsewhere(dep_id, rev_id),
+            "revision present in a newer activation must read as live elsewhere"
+        );
+    }
+
+    #[test]
+    fn liveness_probe_reports_not_live_when_live_slot_is_the_draining_dispatcher() {
+        // Identity guard: if the live slot still points at the very
+        // dispatcher being drained, the revision is NOT live in a newer
+        // activation — the eviction event should fire (direct-drain
+        // semantics). Models the future `gtc op revisions drain` path.
+        let env_id = "env-1";
+        let dep_id = DeploymentId::new();
+        let rev_id = RevisionId::new();
+        let bundle_id = BundleId::new("customer.support");
+
+        let live = activation_with_ids(env_id, dep_id, rev_id, bundle_id);
+        let draining_dispatcher = std::sync::Arc::clone(&live.routing.dispatcher);
+        let state = serve_state_with(live);
+
+        let probe = SlotLivenessProbe {
+            state,
+            draining_dispatcher,
+        };
+        assert!(
+            !probe.is_live_elsewhere(dep_id, rev_id),
+            "draining the live dispatcher itself must NOT read as live elsewhere"
+        );
+    }
+
+    #[test]
+    fn liveness_probe_reports_not_live_when_revision_absent_from_live_slot() {
+        // Live slot is a newer activation that does NOT serve the revision
+        // (genuine removal, no rollback) → not live elsewhere → eviction
+        // event fires normally.
+        let env_id = "env-1";
+        let dep_id = DeploymentId::new();
+        let rev_removed = RevisionId::new();
+        let rev_other = RevisionId::new();
+        let bundle_id = BundleId::new("customer.support");
+
+        let draining = activation_with_ids(env_id, dep_id, rev_removed, bundle_id.clone());
+        let draining_dispatcher = std::sync::Arc::clone(&draining.routing.dispatcher);
+        // Newer activation serves a DIFFERENT revision under the same deployment.
+        let live = activation_with_ids(env_id, dep_id, rev_other, bundle_id);
+        let state = serve_state_with(live);
+
+        let probe = SlotLivenessProbe {
+            state,
+            draining_dispatcher,
+        };
+        assert!(
+            !probe.is_live_elsewhere(dep_id, rev_removed),
+            "a genuinely removed revision must NOT read as live elsewhere"
         );
     }
 }

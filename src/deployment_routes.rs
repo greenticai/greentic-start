@@ -127,6 +127,18 @@ impl DeploymentRouteTable {
         Self { routes }
     }
 
+    /// Tenant bound to `deployment_id` in this table, or `None` if no Active
+    /// deployment with that id exists. Used by
+    /// [`crate::revision_serve::RevisionServer::reload`] to look up the
+    /// owning tenant of a revision that's about to be drained — the dispatcher
+    /// itself doesn't carry tenant, since each `DispatchRequest` brings its own.
+    pub(crate) fn tenant_for(&self, deployment_id: DeploymentId) -> Option<&str> {
+        self.routes
+            .iter()
+            .find(|r| r.deployment_id == deployment_id)
+            .map(|r| r.tenant.as_str())
+    }
+
     /// Resolve `(host, path)` to `(deployment_id, tenant)`.
     ///
     /// Host match is case-insensitive; an empty `hosts` binding matches any

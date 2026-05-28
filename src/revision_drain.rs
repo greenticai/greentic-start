@@ -34,8 +34,13 @@
 //!   A real registry threading `(deployment, revision)` through
 //!   `serve_session` is a Phase D undertaking; this PR provides the
 //!   seam so the coordinator's interface is stable when it lands.
-
-#![allow(dead_code)]
+//! - `RevisionTeardown` defaults to [`NoopRevisionTeardown`] in the N2.3
+//!   wiring: the OLD `Activation` (which owns the `RunnerHost` whose
+//!   `ActivePacks` carry the removed revision's `TenantRuntime`) is dropped
+//!   wholesale at the end of [`crate::revision_serve::RevisionServer::reload`]'s
+//!   overlap window anyway. A real `Arc<runner_host::ActivePacks>`-backed
+//!   teardown adapter — useful when removed revisions must be torn down
+//!   BEFORE the overlap window closes — is a Phase D follow-up.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,6 +98,62 @@ pub trait RevisionTeardown: Send + Sync {
     ) -> bool;
 }
 
+/// No-op [`RevisionTeardown`]. Used by N2.3 when the producer is
+/// [`crate::revision_serve::RevisionServer::reload`]: the OLD `Activation`
+/// (the one whose dispatcher we just drained against) is dropped wholesale
+/// at the end of the overlap window, which drops the `RunnerHost` it owns,
+/// which drops every `TenantRuntime` it holds — including the one for the
+/// drained revision. Calling `ActivePacks::remove_revision` first would just
+/// race the imminent wholesale drop without changing observable behavior.
+/// A real adapter that delegates to `ActivePacks::remove_revision` lands when
+/// (a) revisions need to be evicted from the live `RunnerHost` before the
+/// overlap window closes, or (b) the host instance outlives the activation.
+pub struct NoopRevisionTeardown;
+
+impl RevisionTeardown for NoopRevisionTeardown {
+    fn remove_revision(
+        &self,
+        _tenant: &str,
+        _deployment_id: DeploymentId,
+        _bundle_id: BundleId,
+        _revision_id: RevisionId,
+    ) -> bool {
+        // Intentionally empty: see module-level scope note. The drain
+        // coordinator's `removed_runtime` report bit will be `false` for
+        // every drain that runs against this teardown, by design.
+        false
+    }
+}
+
+/// Probe consulted before the coordinator emits its terminal
+/// [`RolloutEvent::RevisionEvicted`] telemetry. Returns `true` when the
+/// revision is live again in an activation OTHER than the one being drained
+/// — i.e. it was rolled back / re-added after the drain started but before
+/// the drain window elapsed. When `true`, the coordinator suppresses the
+/// eviction event so rollout/incident telemetry doesn't report a revision
+/// the server is actively serving again as evicted.
+///
+/// The default [`NoopRevisionLiveness`] returns `false`, which preserves the
+/// semantics of a drain against the *live* dispatcher (`gtc op revisions
+/// drain`): there the drained revision genuinely is going away, so its
+/// eviction event must fire.
+pub trait RevisionLivenessProbe: Send + Sync {
+    /// `true` if `(deployment_id, revision_id)` is live in a newer activation
+    /// than the one this coordinator is draining.
+    fn is_live_elsewhere(&self, deployment_id: DeploymentId, revision_id: RevisionId) -> bool;
+}
+
+/// No-op [`RevisionLivenessProbe`] — never suppresses the eviction event.
+/// Default for a direct drain of the live dispatcher, where the revision is
+/// genuinely being retired.
+pub struct NoopRevisionLiveness;
+
+impl RevisionLivenessProbe for NoopRevisionLiveness {
+    fn is_live_elsewhere(&self, _deployment_id: DeploymentId, _revision_id: RevisionId) -> bool {
+        false
+    }
+}
+
 /// One drain invocation. Pure inputs + behavior, no global state.
 pub struct DrainRequest<'a> {
     pub tenant: &'a str,
@@ -109,6 +170,7 @@ pub struct RevisionDrainCoordinator {
     dispatcher: Arc<RevisionDispatcher>,
     teardown: Arc<dyn RevisionTeardown>,
     ws_closer: Arc<dyn WsRevisionCloser>,
+    liveness: Arc<dyn RevisionLivenessProbe>,
 }
 
 impl RevisionDrainCoordinator {
@@ -121,7 +183,16 @@ impl RevisionDrainCoordinator {
             dispatcher,
             teardown,
             ws_closer,
+            liveness: Arc::new(NoopRevisionLiveness),
         }
+    }
+
+    /// Attach a [`RevisionLivenessProbe`] consulted before the terminal
+    /// `RevisionEvicted` emission. Without it, the coordinator never
+    /// suppresses the event (the [`NoopRevisionLiveness`] default).
+    pub fn with_liveness_probe(mut self, liveness: Arc<dyn RevisionLivenessProbe>) -> Self {
+        self.liveness = liveness;
+        self
     }
 
     /// Convenience constructor that wires the no-op WS closer.
@@ -194,7 +265,17 @@ impl RevisionDrainCoordinator {
         //    selection path (cookie, pin, weighted) skips it and the holder
         //    re-dispatches to a healthy revision with a fresh cookie.
         let evicted = self.dispatcher.evict_revision(deployment_id, revision_id);
-        if evicted {
+        // Suppress the terminal `RevisionEvicted` event if the revision is
+        // live again in a newer activation (rollback / re-add within the
+        // drain window). The `evict_revision` above still runs — it's
+        // harmless cleanup on the superseded dispatcher we drained — but
+        // emitting `RevisionEvicted` for a revision the server is actively
+        // serving again would corrupt rollout/incident telemetry. The
+        // earlier `RevisionDraining` stays emitted: at that instant (drain
+        // start) the revision genuinely had been removed.
+        let live_elsewhere = evicted && self.liveness.is_live_elsewhere(deployment_id, revision_id);
+        let eviction_event_emitted = evicted && !live_elsewhere;
+        if eviction_event_emitted {
             // C5.3: emit only when the call actually removed the revision —
             // an idempotent re-run on an already-evicted revision must not
             // double-count the transition.
@@ -205,6 +286,13 @@ impl RevisionDrainCoordinator {
                 deployment_id,
                 &bundle_id,
                 revision_id,
+            );
+        } else if live_elsewhere {
+            info!(
+                deployment_id = %deployment_id,
+                revision_id = %revision_id,
+                "revision re-added into a newer activation before the drain \
+                 window elapsed; suppressing stale RevisionEvicted telemetry",
             );
         }
 
@@ -237,6 +325,7 @@ impl RevisionDrainCoordinator {
         Ok(DrainReport {
             newly_marked,
             evicted_from_dispatch: evicted,
+            eviction_event_emitted,
             removed_runtime: removed,
         })
     }
@@ -255,6 +344,14 @@ pub struct DrainReport {
     /// was already absent. After this, cookie/pin holders re-dispatch to a
     /// healthy revision instead of the torn-down runtime.
     pub evicted_from_dispatch: bool,
+    /// `true` if the terminal [`RolloutEvent::RevisionEvicted`] telemetry was
+    /// emitted. Equals `evicted_from_dispatch` UNLESS the
+    /// [`RevisionLivenessProbe`] reported the revision live again in a newer
+    /// activation (rollback / re-add within the drain window), in which case
+    /// the dispatcher entry was still evicted (`evicted_from_dispatch == true`)
+    /// but the event was suppressed to avoid reporting a live revision as
+    /// evicted.
+    pub eviction_event_emitted: bool,
     /// `true` if `ActivePacks::remove_revision` popped an entry; `false`
     /// if no runtime was present (already torn down or never warmed).
     pub removed_runtime: bool,
@@ -369,6 +466,8 @@ mod tests {
 
         assert!(report.newly_marked);
         assert!(report.evicted_from_dispatch);
+        // No liveness probe (default no-op) ⇒ eviction event fires.
+        assert!(report.eviction_event_emitted);
         assert!(report.removed_runtime);
         // Eviction (step 3) cleared the draining flag and removed r2 from the
         // routing table, so it is no longer "draining" — it is gone.
@@ -381,6 +480,55 @@ mod tests {
         assert_eq!(calls[0].1, dep_id);
         assert_eq!(calls[0].2, bundle());
         assert_eq!(calls[0].3, r2);
+    }
+
+    /// Liveness probe that always reports the revision live elsewhere —
+    /// models a rollback / re-add into a newer activation during the drain
+    /// window.
+    struct AlwaysLiveElsewhere;
+
+    impl RevisionLivenessProbe for AlwaysLiveElsewhere {
+        fn is_live_elsewhere(&self, _: DeploymentId, _: RevisionId) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_suppresses_eviction_event_when_revision_live_elsewhere() {
+        // Codex PR-N2.3 finding: a revision removed then re-added within the
+        // drain window must not emit a stale `RevisionEvicted` for the live
+        // revision. The dispatcher entry is still evicted (harmless cleanup
+        // on the superseded dispatcher), but the terminal event is
+        // suppressed — `eviction_event_emitted == false`.
+        let dep_id = DeploymentId::new();
+        let r1 = RevisionId::new();
+        let dispatcher = dispatcher_with(dep_id, vec![entry(r1, 10_000)]);
+        let teardown = Arc::new(RecordingTeardown::new(false));
+        let coord = RevisionDrainCoordinator::with_noop_ws(Arc::clone(&dispatcher), teardown)
+            .with_liveness_probe(Arc::new(AlwaysLiveElsewhere));
+
+        let report = coord
+            .run(DrainRequest {
+                tenant: "acme",
+                deployment_id: dep_id,
+                bundle_id: bundle(),
+                revision_id: r1,
+                drain_seconds: 0,
+            })
+            .await
+            .expect("drain ran");
+
+        assert!(report.newly_marked, "draining flag was set at drain start");
+        assert!(
+            report.evicted_from_dispatch,
+            "dispatcher entry is still evicted (cleanup on the superseded table)"
+        );
+        assert!(
+            !report.eviction_event_emitted,
+            "RevisionEvicted telemetry must be suppressed for a re-added revision"
+        );
+        // The superseded dispatcher really did drop the entry.
+        assert!(!dispatcher.contains_revision(dep_id, r1));
     }
 
     #[tokio::test]

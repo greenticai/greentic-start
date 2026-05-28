@@ -48,6 +48,12 @@ use crate::runtime_config::LoadedRuntimeConfig;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// A single revision's routing identity: `(deployment_id, bundle_id,
+/// revision_id)`. Returned by [`RevisionDispatcher::revision_keys`] and
+/// threaded through the reload drain path
+/// ([`crate::revision_serve::RevisionServer::reload`]).
+pub(crate) type RevisionKey = (DeploymentId, BundleId, RevisionId);
+
 /// Sum of basis points across a deployment's revisions. Mirrors deploy-spec §5.3.
 const TOTAL_WEIGHT_BPS: u32 = 10_000;
 
@@ -290,6 +296,43 @@ impl RevisionDispatcher {
     /// [`DispatchRequest`] so cookie validation binds to the right env.
     pub fn env_id(&self) -> &str {
         &self.env_id
+    }
+
+    /// Snapshot every `(deployment_id, bundle_id, revision_id)` triple the
+    /// dispatcher currently routes for. One `arc_swap` load — used by
+    /// [`crate::revision_serve::RevisionServer::reload`] to diff OLD vs NEW
+    /// activations and fire a drain coordinator per removed revision.
+    pub(crate) fn revision_keys(&self) -> Vec<RevisionKey> {
+        let snap = self.snapshot.load();
+        snap.deployments
+            .iter()
+            .flat_map(|(dep_id, entry)| {
+                entry
+                    .revisions
+                    .iter()
+                    .map(move |r| (*dep_id, r.bundle_id.clone(), r.revision_id))
+            })
+            .collect()
+    }
+
+    /// `true` if `(deployment_id, revision_id)` is present in this
+    /// dispatcher's live routing table, regardless of weight. Used by the
+    /// reload drain path's liveness probe to detect a rollback / re-add: a
+    /// revision removed from one activation and re-introduced into a newer
+    /// one while the older activation's drain is still in its window. When
+    /// the newer (live) dispatcher reports the revision present, the drain
+    /// suppresses its stale `RevisionEvicted` telemetry.
+    pub(crate) fn contains_revision(
+        &self,
+        deployment_id: DeploymentId,
+        revision_id: RevisionId,
+    ) -> bool {
+        self.snapshot
+            .load()
+            .deployments
+            .get(&deployment_id)
+            .map(|entry| has_revision_any_weight(entry, revision_id))
+            .unwrap_or(false)
     }
 
     /// Fold this dispatcher's per-deployment generations into a caller-owned
