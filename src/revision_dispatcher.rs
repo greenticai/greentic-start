@@ -292,6 +292,23 @@ impl RevisionDispatcher {
         &self.env_id
     }
 
+    /// Snapshot every `(deployment_id, bundle_id, revision_id)` triple the
+    /// dispatcher currently routes for. One `arc_swap` load — used by
+    /// [`crate::revision_serve::RevisionServer::reload`] to diff OLD vs NEW
+    /// activations and fire a drain coordinator per removed revision.
+    pub(crate) fn revision_keys(&self) -> Vec<(DeploymentId, BundleId, RevisionId)> {
+        let snap = self.snapshot.load();
+        snap.deployments
+            .iter()
+            .flat_map(|(dep_id, entry)| {
+                entry
+                    .revisions
+                    .iter()
+                    .map(move |r| (*dep_id, r.bundle_id.clone(), r.revision_id))
+            })
+            .collect()
+    }
+
     /// Fold this dispatcher's per-deployment generations into a caller-owned
     /// `watermark` map, keeping the maximum for each id.
     ///

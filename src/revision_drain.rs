@@ -34,8 +34,13 @@
 //!   A real registry threading `(deployment, revision)` through
 //!   `serve_session` is a Phase D undertaking; this PR provides the
 //!   seam so the coordinator's interface is stable when it lands.
-
-#![allow(dead_code)]
+//! - `RevisionTeardown` defaults to [`NoopRevisionTeardown`] in the N2.3
+//!   wiring: the OLD `Activation` (which owns the `RunnerHost` whose
+//!   `ActivePacks` carry the removed revision's `TenantRuntime`) is dropped
+//!   wholesale at the end of [`crate::revision_serve::RevisionServer::reload`]'s
+//!   overlap window anyway. A real `Arc<runner_host::ActivePacks>`-backed
+//!   teardown adapter — useful when removed revisions must be torn down
+//!   BEFORE the overlap window closes — is a Phase D follow-up.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,6 +96,33 @@ pub trait RevisionTeardown: Send + Sync {
         bundle_id: BundleId,
         revision_id: RevisionId,
     ) -> bool;
+}
+
+/// No-op [`RevisionTeardown`]. Used by N2.3 when the producer is
+/// [`crate::revision_serve::RevisionServer::reload`]: the OLD `Activation`
+/// (the one whose dispatcher we just drained against) is dropped wholesale
+/// at the end of the overlap window, which drops the `RunnerHost` it owns,
+/// which drops every `TenantRuntime` it holds — including the one for the
+/// drained revision. Calling `ActivePacks::remove_revision` first would just
+/// race the imminent wholesale drop without changing observable behavior.
+/// A real adapter that delegates to `ActivePacks::remove_revision` lands when
+/// (a) revisions need to be evicted from the live `RunnerHost` before the
+/// overlap window closes, or (b) the host instance outlives the activation.
+pub struct NoopRevisionTeardown;
+
+impl RevisionTeardown for NoopRevisionTeardown {
+    fn remove_revision(
+        &self,
+        _tenant: &str,
+        _deployment_id: DeploymentId,
+        _bundle_id: BundleId,
+        _revision_id: RevisionId,
+    ) -> bool {
+        // Intentionally empty: see module-level scope note. The drain
+        // coordinator's `removed_runtime` report bit will be `false` for
+        // every drain that runs against this teardown, by design.
+        false
+    }
 }
 
 /// One drain invocation. Pure inputs + behavior, no global state.
