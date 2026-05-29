@@ -44,6 +44,7 @@ use greentic_runner_host::storage::{
 use greentic_runner_host::{HostBuilder, HostConfig, RunnerHost, TenantBindings};
 
 use crate::deployment_routes::{DeploymentRouteTable, RevisionIngressRouting};
+use crate::endpoint_admit::EndpointAdmit;
 use crate::http_routes::{
     HttpRouteDescriptor, HttpRouteTable, RevisionScope, discover_revision_http_routes,
 };
@@ -269,6 +270,7 @@ pub(crate) async fn activate_runtime_config(
         dispatcher: Arc::new(dispatcher),
         http_routes: HttpRouteTable::from_descriptors(scoped_routes),
         deployment_routes: DeploymentRouteTable::from_environment(env),
+        endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),
     };
 
     Ok(RuntimeConfigActivation { host, routing })
@@ -470,6 +472,7 @@ mod tests {
                 listen_addr: None,
             },
             packs: Vec::new(),
+            messaging_endpoints: Vec::new(),
             credentials_ref: None,
             bundles,
             revisions: Vec::new(),

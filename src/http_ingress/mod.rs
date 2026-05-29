@@ -2241,6 +2241,7 @@ mod tests {
         )]);
         let routing = RevisionIngressRouting {
             dispatcher: Arc::new(dispatcher),
+            endpoint_admit: Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             // No revision-scoped routes declared → forces the fail-closed path.
             http_routes: HttpRouteTable::default(),
             deployment_routes,
@@ -2282,6 +2283,7 @@ mod tests {
         )]);
         let routing = RevisionIngressRouting {
             dispatcher: Arc::new(dispatcher),
+            endpoint_admit: Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             http_routes: HttpRouteTable::default(),
             deployment_routes,
         };

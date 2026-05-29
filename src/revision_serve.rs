@@ -647,6 +647,17 @@ async fn serve(
         endpoint_header,
         &payload,
     );
+
+    // M1.4c-ii admit gate, step 1: if the caller asserts a messaging endpoint,
+    // it MUST be one this env declared. Resolved here (before dispatch) so an
+    // unknown endpoint refuses cheaply; the actual bundle-membership check is
+    // step 2, after dispatch picks a revision.
+    let admission = resolve_endpoint_admission(
+        endpoint_id.as_deref(),
+        activation.routing.endpoint_admit.as_ref(),
+    )
+    .map_err(|boxed| *boxed)?;
+
     let cookie_value = cookie_header
         .as_deref()
         .and_then(|jar| read_cookie(jar, &cookie_name(deployment_id)));
@@ -680,6 +691,13 @@ async fn serve(
                 "revision dispatch failed",
             )
         })?;
+
+    // M1.4c-ii admit gate, step 2: now that dispatch has chosen a revision, the
+    // resolved bundle MUST be in the asserted endpoint's `linked_bundles` ACL.
+    // Skipped when the caller asserts no endpoint (legacy single-instance
+    // back-compat) — non-loopback callers can't assert one anyway, as the
+    // header is dropped in `caller_identity`.
+    check_bundle_admission(&admission, outcome.bundle_id.as_str()).map_err(|boxed| *boxed)?;
 
     // Gate before executing: refuse provider webhook paths (deferred) and
     // non-POST generic requests, rather than running the entry flow for them.
@@ -832,6 +850,63 @@ fn validate_endpoint_id(raw: String) -> Option<String> {
         return None;
     }
     Some(raw)
+}
+
+/// Outcome of the M1.4c-ii pre-dispatch endpoint admit lookup.
+///
+/// `NotAsserted` is "no header on this request, gate is dormant"; `Resolved`
+/// carries the asserted endpoint's `linked_bundles` ACL so the post-dispatch
+/// step ([`check_bundle_admission`]) can deny when the dispatched bundle is
+/// outside it. Built by [`resolve_endpoint_admission`].
+#[derive(Debug)]
+enum EndpointAdmission<'a> {
+    NotAsserted,
+    Resolved(&'a std::collections::HashSet<String>),
+}
+
+/// M1.4c-ii admit gate, step 1: resolve the caller-asserted endpoint id
+/// against the env's declared endpoints. Pure, called from [`serve`] before
+/// dispatch so an unknown endpoint refuses cheaply (`UNAUTHORIZED`) rather
+/// than burning a dispatch + load on a request that will fail step 2 anyway.
+///
+/// The Err variant is boxed because `hyper::Response<Full<Bytes>>` is ~144
+/// bytes — matching [`dispatch_bound_deployment`] in `http_ingress` and the
+/// Phase-B "Box large HTTP Response in Result Err" precedent.
+fn resolve_endpoint_admission<'a>(
+    endpoint_id: Option<&str>,
+    admit: &'a crate::endpoint_admit::EndpointAdmit,
+) -> Result<EndpointAdmission<'a>, Box<Response<Full<Bytes>>>> {
+    let Some(eid) = endpoint_id else {
+        return Ok(EndpointAdmission::NotAsserted);
+    };
+    match admit.linked_bundles(eid) {
+        Some(acl) => Ok(EndpointAdmission::Resolved(acl)),
+        None => Err(Box::new(error_response(
+            StatusCode::UNAUTHORIZED,
+            "messaging endpoint not recognized in this environment",
+        ))),
+    }
+}
+
+/// M1.4c-ii admit gate, step 2: once dispatch picked a revision, refuse when
+/// the resolved bundle is not in the endpoint's `linked_bundles` ACL. Pure,
+/// called from [`serve`]. `NotAsserted` short-circuits to `Ok` (no header was
+/// asserted, no ACL applies).
+fn check_bundle_admission(
+    admission: &EndpointAdmission<'_>,
+    bundle_id: &str,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    let EndpointAdmission::Resolved(acl) = admission else {
+        return Ok(());
+    };
+    if acl.contains(bundle_id) {
+        Ok(())
+    } else {
+        Err(Box::new(error_response(
+            StatusCode::FORBIDDEN,
+            "this messaging endpoint is not authorized to route to the resolved bundle",
+        )))
+    }
 }
 
 /// Pre-execution admission decision for a dispatched revision request.
@@ -1235,6 +1310,119 @@ mod tests {
         assert_eq!(validate_endpoint_id(max_ok.clone()), Some(max_ok));
     }
 
+    // --- M1.4c-ii endpoint admit gate ---------------------------------------
+
+    #[test]
+    fn resolve_admission_returns_not_asserted_when_no_endpoint_header() {
+        let admit = crate::endpoint_admit::EndpointAdmit::default();
+        let outcome =
+            resolve_endpoint_admission(None, &admit).expect("no header is a clean pass-through");
+        assert!(matches!(outcome, EndpointAdmission::NotAsserted));
+    }
+
+    #[test]
+    fn resolve_admission_resolves_known_endpoint_to_its_acl() {
+        // Round-trip through `from_environment` so the keying matches prod.
+        use greentic_deploy_spec::{
+            BundleId, Environment, EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId,
+            SchemaVersion,
+        };
+        use greentic_types::EnvId;
+        let env_id = EnvId::try_from("local").unwrap();
+        let endpoint_id = MessagingEndpointId::new();
+        let wire_id = endpoint_id.to_string();
+        let now = chrono::Utc::now();
+        let endpoint = MessagingEndpoint {
+            schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
+            env_id: env_id.clone(),
+            endpoint_id,
+            provider_id: "teams-legal".to_string(),
+            provider_type: "teams".to_string(),
+            display_name: "Legal".to_string(),
+            secret_refs: Vec::new(),
+            linked_bundles: vec![BundleId::new("legal-bundle")],
+            welcome_flow: None,
+            generation: 1,
+            created_at: now,
+            updated_at: now,
+            updated_by: "test".to_string(),
+        };
+        let env = Environment {
+            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
+            environment_id: env_id.clone(),
+            name: "local".to_string(),
+            host_config: EnvironmentHostConfig {
+                env_id,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+            },
+            packs: Vec::new(),
+            messaging_endpoints: vec![endpoint],
+            credentials_ref: None,
+            bundles: Vec::new(),
+            revisions: Vec::new(),
+            traffic_splits: Vec::new(),
+            revocation: Default::default(),
+            retention: Default::default(),
+            health: Default::default(),
+        };
+        let admit = crate::endpoint_admit::EndpointAdmit::from_environment(&env);
+        let outcome = resolve_endpoint_admission(Some(&wire_id), &admit).expect("known endpoint");
+        match outcome {
+            EndpointAdmission::Resolved(acl) => assert!(acl.contains("legal-bundle")),
+            EndpointAdmission::NotAsserted => panic!("known endpoint must resolve to ACL"),
+        }
+    }
+
+    #[test]
+    fn resolve_admission_refuses_unknown_endpoint_with_401() {
+        let admit = crate::endpoint_admit::EndpointAdmit::default();
+        let err = resolve_endpoint_admission(Some("bogus"), &admit)
+            .expect_err("unknown endpoint must refuse");
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn check_bundle_admission_skips_when_endpoint_not_asserted() {
+        // The pre-dispatch step returned `NotAsserted` (no header) — the
+        // post-dispatch check must be a no-op so legacy single-instance
+        // traffic isn't accidentally gated.
+        check_bundle_admission(&EndpointAdmission::NotAsserted, "any-bundle")
+            .expect("no-header path must pass");
+    }
+
+    #[test]
+    fn check_bundle_admission_allows_bundle_in_acl() {
+        let mut acl = std::collections::HashSet::new();
+        acl.insert("legal-bundle".to_string());
+        acl.insert("shared-utils".to_string());
+        check_bundle_admission(&EndpointAdmission::Resolved(&acl), "legal-bundle")
+            .expect("bundle in ACL is admitted");
+    }
+
+    #[test]
+    fn check_bundle_admission_rejects_bundle_outside_acl_with_403() {
+        // This is the M1-the-accountant-cannot-reach-legal invariant: even
+        // if routing resolves a bundle, the endpoint's ACL trumps it.
+        let mut acl = std::collections::HashSet::new();
+        acl.insert("finance-bundle".to_string());
+        let err = check_bundle_admission(&EndpointAdmission::Resolved(&acl), "legal-bundle")
+            .expect_err("out-of-ACL bundle must refuse");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn check_bundle_admission_empty_acl_rejects_every_bundle() {
+        // A declared-but-unwired endpoint (empty `linked_bundles`) is
+        // semantically "this endpoint can route to nothing yet" — every
+        // bundle MUST fail closed, not pass through.
+        let acl = std::collections::HashSet::new();
+        let err = check_bundle_admission(&EndpointAdmission::Resolved(&acl), "any-bundle")
+            .expect_err("empty ACL must refuse every bundle");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
     fn provider_route_table(scope: &RevisionScope) -> HttpRouteTable {
         use crate::domains::Domain;
         HttpRouteTable::from_descriptors(vec![crate::http_routes::descriptor_for_test(
@@ -1473,6 +1661,7 @@ mod tests {
                 dispatcher: std::sync::Arc::new(dispatcher),
                 http_routes: HttpRouteTable::from_descriptors(Vec::new()),
                 deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+                endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             }),
         }
     }
@@ -2051,14 +2240,17 @@ mod tests {
             .apply_traffic_split(deployment_id, revisions, bundle_id, 0)
             .expect("apply_traffic_split");
         let dispatcher = std::sync::Arc::new(dispatcher);
-        let routing =
-            std::sync::Arc::new(RevisionIngressRouting {
-                dispatcher: std::sync::Arc::clone(&dispatcher),
-                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
-                deployment_routes: crate::deployment_routes::DeploymentRouteTable::from_parts(
-                    vec![(deployment_id, tenant.to_string(), Vec::new(), Vec::new())],
-                ),
-            });
+        let routing = std::sync::Arc::new(RevisionIngressRouting {
+            dispatcher: std::sync::Arc::clone(&dispatcher),
+            http_routes: HttpRouteTable::from_descriptors(Vec::new()),
+            deployment_routes: crate::deployment_routes::DeploymentRouteTable::from_parts(vec![(
+                deployment_id,
+                tenant.to_string(),
+                Vec::new(),
+                Vec::new(),
+            )]),
+            endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+        });
         let activation = Activation {
             host: base.host,
             routing,

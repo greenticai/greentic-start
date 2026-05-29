@@ -118,6 +118,7 @@ mod tests {
                 listen_addr: None,
             },
             packs: Vec::new(),
+            messaging_endpoints: Vec::new(),
             credentials_ref: None,
             bundles: Vec::new(),
             revisions: Vec::new(),

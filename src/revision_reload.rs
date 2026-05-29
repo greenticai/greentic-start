@@ -12,6 +12,18 @@
 //! the runtime-config activation (via [`crate::revision_boot::activate_runtime_config`])
 //! and hands the new activation to [`crate::revision_serve::RevisionServer::reload`].
 //!
+//! Some env-side mutations don't touch `runtime-config.json` — notably
+//! `op messaging endpoint {add,link-bundle,unlink-bundle,set-welcome-flow,remove}`,
+//! which writes `environment.json` plus the `messaging/` projection but
+//! leaves `runtime-config.json` alone. The admit table in
+//! [`crate::endpoint_admit`] is derived from `Environment.messaging_endpoints`,
+//! so the watcher must also fire on `environment.json` writes — otherwise an
+//! ACL revocation would not take effect on a running server until the next
+//! unrelated runtime-config write or a restart. The rebuild's dedup
+//! compares both the loaded `runtime-config` and the loaded `Environment`,
+//! so an unrelated `environment.json` rewrite that produces identical content
+//! still short-circuits, but a real ACL change always re-activates.
+//!
 //! The producer is intentionally tolerant: a malformed `runtime-config.json`,
 //! a missing `environment.json`, or any other failure inside the rebuild
 //! closure is logged and the previous activation keeps serving. The watcher
@@ -30,8 +42,12 @@ use notify_debouncer_full::{
     DebounceEventResult, Debouncer, RecommendedCache, new_debouncer, notify::RecommendedWatcher,
 };
 
+use greentic_deploy_spec::Environment;
 use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
 use greentic_types::EnvId;
+
+/// Keep in sync with `greentic-deployer/src/environment/store.rs::environment_path`.
+const ENVIRONMENT_FILE: &str = "environment.json";
 
 use crate::operator_log;
 use crate::revision_boot::{self, RuntimeConfigActivation};
@@ -105,7 +121,14 @@ pub(crate) fn spawn_runtime_config_watcher<R>(
 where
     R: FnMut() -> Result<Option<Activation>> + Send + 'static,
 {
-    let target_file = env_dir.join(runtime_config::RUNTIME_CONFIG_FILE);
+    // Trigger set: paths whose mutations must invalidate the activation.
+    // `runtime-config.json` is the original trigger; `environment.json` is
+    // the M1.4c-ii fix so messaging endpoint mutations (which only touch
+    // env.json + the messaging projection) re-activate the admit table.
+    let target_files = vec![
+        env_dir.join(runtime_config::RUNTIME_CONFIG_FILE),
+        env_dir.join(ENVIRONMENT_FILE),
+    ];
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
 
     // notify watches the env DIR (not the file): the deployer rewrites
@@ -126,7 +149,7 @@ where
     let worker = thread::Builder::new()
         .name("revision-reload".to_string())
         .spawn(move || {
-            reload_worker(rx, target_file, drain_window, server, rebuild);
+            reload_worker(rx, target_files, drain_window, server, rebuild);
         })
         .context("spawning runtime-config reload worker")?;
 
@@ -137,14 +160,14 @@ where
 }
 
 /// The worker loop. Reads debounced batches off `rx`, filters for events
-/// touching `target_file`, and on each matching batch calls `rebuild`
+/// touching any of `target_files`, and on each matching batch calls `rebuild`
 /// then `server.reload` with whatever activation the rebuild produced.
 ///
 /// Extracted from `spawn_runtime_config_watcher` so tests can drive the
 /// worker directly without going through `notify`.
 fn reload_worker<R>(
     rx: mpsc::Receiver<DebounceEventResult>,
-    target_file: PathBuf,
+    target_files: Vec<PathBuf>,
     drain_window: Duration,
     server: Arc<RevisionServer>,
     mut rebuild: R,
@@ -164,12 +187,17 @@ fn reload_worker<R>(
                 continue;
             }
         };
-        // Filter: only fire when an event actually touches our target.
+        // Filter: only fire when an event actually touches one of our targets.
         // `notify` reports every event under the watched directory; an
         // unrelated `revision-signing.key` write must NOT trigger reload.
-        let relevant = events
-            .iter()
-            .any(|ev| ev.event.paths.iter().any(|p| p == &target_file));
+        // Backup files (`environment.json.<ts>.bak`) don't match either —
+        // path equality, not prefix matching.
+        let relevant = events.iter().any(|ev| {
+            ev.event
+                .paths
+                .iter()
+                .any(|p| target_files.iter().any(|t| p == t))
+        });
         if !relevant {
             continue;
         }
@@ -201,9 +229,21 @@ fn reload_worker<R>(
     }
 }
 
+/// Snapshot of the inputs that produced the current activation, kept by
+/// [`default_rebuild`] for content-based dedup. Both `rc` and `env` are
+/// tracked because the activation derives state from both — `rc` drives
+/// the dispatcher; `env` drives the deployment route table AND the
+/// M1.4c-ii endpoint admit table — and either can change without the other
+/// (notably, `op messaging endpoint *` mutates env but not rc).
+#[derive(Debug, PartialEq, Eq)]
+struct LastReloadInputs {
+    rc: LoadedRuntimeConfig,
+    env: Environment,
+}
+
 /// Build the production rebuild closure: loads + dedupes + activates.
-/// The returned closure carries `last_rc` so identical-content writes
-/// (the deployer occasionally rewrites the same content on no-op
+/// The returned closure carries [`LastReloadInputs`] so identical-content
+/// writes (the deployer occasionally rewrites the same content on no-op
 /// operations) short-circuit before the expensive `activate_runtime_config`.
 ///
 /// `activation_rt` is the Tokio runtime [`crate::lib::run_start`] already
@@ -216,8 +256,8 @@ pub(crate) fn default_rebuild(
     secrets: DynSecretsManager,
     activation_rt: tokio::runtime::Handle,
 ) -> impl FnMut() -> Result<Option<Activation>> + Send + 'static {
-    let mut last_rc: Option<LoadedRuntimeConfig> = None;
-    move || rebuild_once(&store_root, &env_id, &secrets, &activation_rt, &mut last_rc)
+    let mut last: Option<LastReloadInputs> = None;
+    move || rebuild_once(&store_root, &env_id, &secrets, &activation_rt, &mut last)
 }
 
 fn rebuild_once(
@@ -225,24 +265,33 @@ fn rebuild_once(
     env_id: &str,
     secrets: &DynSecretsManager,
     activation_rt: &tokio::runtime::Handle,
-    last_rc: &mut Option<LoadedRuntimeConfig>,
+    last: &mut Option<LastReloadInputs>,
 ) -> Result<Option<Activation>> {
     let rc = runtime_config::load_in(store_root, env_id)?.unwrap_or_else(|| LoadedRuntimeConfig {
         env_id: env_id.to_string(),
         revisions: Vec::new(),
     });
-    if last_rc.as_ref() == Some(&rc) {
-        return Ok(None);
-    }
     let store = LocalFsStore::new(store_root.to_path_buf());
     let env_typed =
         EnvId::new(env_id).with_context(|| format!("invalid environment id `{env_id}`"))?;
     let environment = EnvironmentStore::load(&store, &env_typed)
         .with_context(|| format!("loading environment `{env_id}` for reload"))?;
+    // Dedup AFTER both reads — neither file alone is a sufficient key. An
+    // env.json rewrite with no real change short-circuits here even though
+    // the watcher fired, so cookies/pins aren't churned by no-op writes.
+    if let Some(prev) = last.as_ref()
+        && prev.rc == rc
+        && prev.env == environment
+    {
+        return Ok(None);
+    }
     let RuntimeConfigActivation { host, routing } = activation_rt.block_on(
         revision_boot::activate_runtime_config(store_root, &rc, Arc::clone(secrets), &environment),
     )?;
-    *last_rc = Some(rc);
+    *last = Some(LastReloadInputs {
+        rc,
+        env: environment,
+    });
     Ok(Some(Activation {
         host: Arc::new(host),
         routing: Arc::new(routing),
@@ -293,6 +342,10 @@ mod tests {
             .expect("delete runtime-config");
     }
 
+    fn write_environment_json(env_dir: &Path, body: &str) {
+        std::fs::write(env_dir.join(ENVIRONMENT_FILE), body).expect("write environment.json");
+    }
+
     // The reload worker requires a `RevisionServer`. The test-only
     // constructor in `revision_serve::tests` is module-private; we build a
     // production-style one over a free port. Tests that exercise the
@@ -307,6 +360,7 @@ mod tests {
         // RevisionServer::start with a placeholder activation built via
         // the same construction path the cold-start uses.
         use crate::deployment_routes::{DeploymentRouteTable, RevisionIngressRouting};
+        use crate::endpoint_admit::EndpointAdmit;
         use crate::http_routes::HttpRouteTable;
         use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
         use crate::revision_serve::{RevisionServeConfig, RevisionServer};
@@ -331,6 +385,7 @@ mod tests {
             dispatcher,
             http_routes: HttpRouteTable::from_descriptors(Vec::new()),
             deployment_routes: DeploymentRouteTable::default(),
+            endpoint_admit: Arc::new(EndpointAdmit::default()),
         });
         let activation = Arc::new(Activation { host, routing });
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -417,6 +472,59 @@ mod tests {
     }
 
     #[test]
+    fn watcher_fires_on_environment_json_create() {
+        // M1.4c-ii: `op messaging endpoint *` mutates `environment.json`
+        // (and the messaging projection under `messaging/`), NOT
+        // `runtime-config.json`. The watcher must fire on env.json so an
+        // ACL revocation re-activates the running server without a
+        // restart or an unrelated runtime-config write.
+        let env = fresh_env_dir();
+        let (tx, rx) = std_mpsc::channel();
+        let _handle = spawn_runtime_config_watcher(
+            env.path().to_path_buf(),
+            Duration::from_millis(50),
+            Duration::ZERO,
+            placeholder_server(),
+            channel_rebuild(tx),
+        )
+        .expect("spawn watcher");
+
+        write_environment_json(env.path(), r#"{"schema":"x"}"#);
+
+        rx.recv_timeout(Duration::from_secs(3))
+            .expect("watcher must fire after environment.json is created");
+    }
+
+    #[test]
+    fn watcher_ignores_environment_json_backup_files() {
+        // The deployer writes `environment.json.<ts>.bak` backups in the
+        // same directory. Path equality (not prefix matching) keeps those
+        // out of the trigger set.
+        let env = fresh_env_dir();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let _handle = spawn_runtime_config_watcher(
+            env.path().to_path_buf(),
+            Duration::from_millis(50),
+            Duration::ZERO,
+            placeholder_server(),
+            counting_rebuild(Arc::clone(&counter)),
+        )
+        .expect("spawn watcher");
+
+        std::fs::write(
+            env.path().join("environment.json.1234567890.bak"),
+            b"old-content",
+        )
+        .expect("write backup decoy");
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "watcher must ignore environment.json.<ts>.bak backups"
+        );
+    }
+
+    #[test]
     fn watcher_ignores_other_files_in_env_dir() {
         let env = fresh_env_dir();
         let counter = Arc::new(AtomicUsize::new(0));
@@ -441,6 +549,85 @@ mod tests {
             counter.load(Ordering::SeqCst),
             0,
             "watcher must ignore writes to files other than runtime-config.json"
+        );
+    }
+
+    fn empty_loaded_rc() -> LoadedRuntimeConfig {
+        LoadedRuntimeConfig {
+            env_id: "local".to_string(),
+            revisions: Vec::new(),
+        }
+    }
+
+    fn env_with_endpoints(endpoints: Vec<greentic_deploy_spec::MessagingEndpoint>) -> Environment {
+        use greentic_deploy_spec::{EnvironmentHostConfig, SchemaVersion};
+        use greentic_types::EnvId;
+        let env_id = EnvId::try_from("local").unwrap();
+        Environment {
+            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
+            environment_id: env_id.clone(),
+            name: "local".to_string(),
+            host_config: EnvironmentHostConfig {
+                env_id,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+            },
+            packs: Vec::new(),
+            messaging_endpoints: endpoints,
+            credentials_ref: None,
+            bundles: Vec::new(),
+            revisions: Vec::new(),
+            traffic_splits: Vec::new(),
+            revocation: Default::default(),
+            retention: Default::default(),
+            health: Default::default(),
+        }
+    }
+
+    fn make_endpoint(linked_bundles: &[&str]) -> greentic_deploy_spec::MessagingEndpoint {
+        use greentic_deploy_spec::{
+            BundleId, MessagingEndpoint, MessagingEndpointId, SchemaVersion,
+        };
+        use greentic_types::EnvId;
+        let now = chrono::Utc::now();
+        MessagingEndpoint {
+            schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
+            env_id: EnvId::try_from("local").unwrap(),
+            endpoint_id: MessagingEndpointId::new(),
+            provider_id: "teams-legal".to_string(),
+            provider_type: "teams".to_string(),
+            display_name: "Legal".to_string(),
+            secret_refs: Vec::new(),
+            linked_bundles: linked_bundles.iter().map(|b| BundleId::new(*b)).collect(),
+            welcome_flow: None,
+            generation: 1,
+            created_at: now,
+            updated_at: now,
+            updated_by: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn last_reload_inputs_inequality_on_messaging_endpoint_change() {
+        // M1.4c-ii correctness gate: an ACL revocation that updates env.json
+        // but leaves runtime-config.json untouched MUST not dedup. The
+        // `LastReloadInputs` key combines rc and env, so distinct env states
+        // (different `linked_bundles`) produce distinct keys and re-activate.
+        let rc = empty_loaded_rc();
+        let env_with = env_with_endpoints(vec![make_endpoint(&["legal-bundle"])]);
+        let env_without = env_with_endpoints(vec![make_endpoint(&[])]);
+        let a = LastReloadInputs {
+            rc: rc.clone(),
+            env: env_with,
+        };
+        let b = LastReloadInputs {
+            rc,
+            env: env_without,
+        };
+        assert_ne!(
+            a, b,
+            "messaging endpoint linked_bundles change must defeat dedup"
         );
     }
 
