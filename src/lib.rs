@@ -23,6 +23,7 @@ mod dev_store_path;
 mod discovery;
 mod doctor;
 mod domains;
+mod endpoint_admit;
 mod event_router;
 pub(crate) mod flow_log;
 mod gmap;

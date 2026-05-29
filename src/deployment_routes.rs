@@ -167,7 +167,7 @@ impl DeploymentRouteTable {
 
 /// The revision-routing artifacts threaded into the ingress when booting from a
 /// materialized runtime-config (B3 producer wiring). A dispatcher with no route
-/// tables cannot serve, so the three travel together to enforce that invariant
+/// tables cannot serve, so the four travel together to enforce that invariant
 /// at the type level: the ingress is either fully revision-routed or fully
 /// legacy, never half-wired.
 pub struct RevisionIngressRouting {
@@ -178,6 +178,10 @@ pub struct RevisionIngressRouting {
     pub http_routes: HttpRouteTable,
     /// `(host, path) → (deployment_id, tenant)` map for the resolve step.
     pub deployment_routes: DeploymentRouteTable,
+    /// M1.4c-ii admit table: per-endpoint `linked_bundles` ACL consulted when
+    /// a request carries `x-greentic-messaging-endpoint-id`. Travels with the
+    /// other routing artifacts so a reload swaps them as one coherent unit.
+    pub endpoint_admit: Arc<crate::endpoint_admit::EndpointAdmit>,
 }
 
 /// Strip a trailing `:port` from a host header value. IPv6 literals are bracketed
@@ -290,6 +294,7 @@ mod tests {
                 listen_addr: None,
             },
             packs: Vec::new(),
+            messaging_endpoints: Vec::new(),
             credentials_ref: None,
             bundles,
             revisions: Vec::new(),

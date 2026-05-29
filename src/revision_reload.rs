@@ -307,6 +307,7 @@ mod tests {
         // RevisionServer::start with a placeholder activation built via
         // the same construction path the cold-start uses.
         use crate::deployment_routes::{DeploymentRouteTable, RevisionIngressRouting};
+        use crate::endpoint_admit::EndpointAdmit;
         use crate::http_routes::HttpRouteTable;
         use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
         use crate::revision_serve::{RevisionServeConfig, RevisionServer};
@@ -331,6 +332,7 @@ mod tests {
             dispatcher,
             http_routes: HttpRouteTable::from_descriptors(Vec::new()),
             deployment_routes: DeploymentRouteTable::default(),
+            endpoint_admit: Arc::new(EndpointAdmit::default()),
         });
         let activation = Arc::new(Activation { host, routing });
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
