@@ -19,17 +19,12 @@ pub struct IngressReply {
     pub reason_code: Option<String>,
 }
 
-/// A single intent-extracted entity surfaced on a Dispatch, ready for
-/// consumers (card prefill, parameter binders) to read without
-/// re-running NLU. Mirrors the slim `RoutingEntity` shape on the wire.
+/// Intent-extracted entity surfaced on a Dispatch.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct PrefillEntity {
     pub kind: String,
     pub normalized: String,
     pub role: Option<String>,
-    /// Alternate serializations indexed by a stable format name
-    /// (e.g. `"iso"` → `"2026-05-30"` for date entities). Card
-    /// templates reference these via `${prefill_<kind>_<format>}`.
     pub formats: std::collections::BTreeMap<String, String>,
 }
 
@@ -38,8 +33,6 @@ pub enum ControlDirective {
     Continue,
     Dispatch {
         target: DispatchTarget,
-        /// Entities extracted by the intent prefill pass. Empty when
-        /// no prefill ran or no entities matched.
         entities: Vec<PrefillEntity>,
     },
     Respond {

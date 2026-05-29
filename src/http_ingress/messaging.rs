@@ -96,11 +96,12 @@ pub(super) fn route_messaging_envelopes(
                         .map(String::as_str)
                         .unwrap_or("en");
                     resolve_i18n_tokens(&mut card_json, &app_pack_path, locale);
-                    // Replace ${key} placeholders and carry form data forward
-                    // through Action.Submit buttons so subsequent cards can
-                    // also access the original form values.
-                    resolve_placeholders(&mut card_json, &envelope.metadata);
-                    carry_form_data_to_actions(&mut card_json, &envelope.metadata);
+                    // Empty-string defaults for unmatched `${prefill_*}`
+                    // — keeps the literal text out of the rendered card.
+                    let mut effective_metadata = envelope.metadata.clone();
+                    ensure_prefill_defaults(&card_json, &mut effective_metadata);
+                    resolve_placeholders(&mut card_json, &effective_metadata);
+                    carry_form_data_to_actions(&mut card_json, &effective_metadata);
                     let mut reply = envelope.clone();
                     reply.metadata.insert(
                         "adaptive_card".to_string(),
@@ -362,6 +363,55 @@ fn inject_prefill_metadata(
                 value.clone(),
             );
         }
+    }
+}
+
+/// Insert empty-string defaults for any unmatched `${prefill_*}`
+/// placeholder the card references. Non-prefill keys keep the existing
+/// "unresolved → keep literal" behaviour so two-pass flows aren't broken.
+fn ensure_prefill_defaults(
+    card: &serde_json::Value,
+    metadata: &mut std::collections::BTreeMap<String, String>,
+) {
+    let mut keys = std::collections::HashSet::<String>::new();
+    collect_placeholder_keys(card, &mut keys);
+    for key in keys {
+        if key.starts_with("prefill_") {
+            metadata.entry(key).or_insert_with(String::new);
+        }
+    }
+}
+
+fn collect_placeholder_keys(
+    value: &serde_json::Value,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match value {
+        serde_json::Value::String(s) => {
+            let mut rest = s.as_str();
+            while let Some(start) = rest.find("${") {
+                let after = &rest[start + 2..];
+                let Some(end) = after.find('}') else {
+                    break;
+                };
+                let key = after[..end].trim();
+                if !key.is_empty() {
+                    out.insert(key.to_string());
+                }
+                rest = &after[end + 1..];
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_placeholder_keys(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values() {
+                collect_placeholder_keys(v, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -700,6 +750,58 @@ mod tests {
     use crate::secrets_gate;
     use tempfile::tempdir;
     use zip::write::FileOptions;
+
+    #[test]
+    fn ensure_prefill_defaults_inserts_empty_for_unmatched_prefill_keys() {
+        let card = json!({"value": "${prefill_date_iso}"});
+        let mut metadata = std::collections::BTreeMap::<String, String>::new();
+        ensure_prefill_defaults(&card, &mut metadata);
+        assert_eq!(
+            metadata.get("prefill_date_iso").map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn ensure_prefill_defaults_preserves_existing_extracted_values() {
+        let card = json!({"value": "${prefill_date_iso}"});
+        let mut metadata = std::collections::BTreeMap::<String, String>::new();
+        metadata.insert("prefill_date_iso".into(), "2026-05-30".into());
+        ensure_prefill_defaults(&card, &mut metadata);
+        assert_eq!(
+            metadata.get("prefill_date_iso").map(String::as_str),
+            Some("2026-05-30")
+        );
+    }
+
+    #[test]
+    fn ensure_prefill_defaults_leaves_non_prefill_placeholders_alone() {
+        let card = json!({"value": "${other_token}", "subtitle": "${i18n:foo}"});
+        let mut metadata = std::collections::BTreeMap::<String, String>::new();
+        ensure_prefill_defaults(&card, &mut metadata);
+        assert!(metadata.get("other_token").is_none());
+        assert!(metadata.get("i18n:foo").is_none());
+    }
+
+    #[test]
+    fn end_to_end_unresolved_prefill_renders_empty_not_literal() {
+        let mut card = json!({"value": "${prefill_date_iso}"});
+        let mut metadata = std::collections::BTreeMap::<String, String>::new();
+        ensure_prefill_defaults(&card, &mut metadata);
+        resolve_placeholders(&mut card, &metadata);
+        assert_eq!(card["value"], json!(""));
+    }
+
+    #[test]
+    fn collect_placeholder_keys_handles_multiple_per_string() {
+        let v = json!("from ${a} to ${b}, on ${c}, missing}${d}");
+        let mut keys = std::collections::HashSet::<String>::new();
+        collect_placeholder_keys(&v, &mut keys);
+        assert!(keys.contains("a"));
+        assert!(keys.contains("b"));
+        assert!(keys.contains("c"));
+        assert!(keys.contains("d"));
+    }
 
     fn envelope() -> ChannelMessageEnvelope {
         serde_json::from_value(json!({

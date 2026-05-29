@@ -35,8 +35,7 @@ pub enum RoutingDirective {
         target: String,
         confidence: f32,
         reason: String,
-        /// Entities extracted by the routing host's intent prefill pass.
-        /// Empty when prefill was skipped or yielded nothing.
+        /// Entities extracted by the routing host's intent prefill.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         entities: Vec<RoutingEntity>,
     },
@@ -48,17 +47,14 @@ pub enum RoutingDirective {
     },
 }
 
-/// Slim entity surfaced on a Dispatch (kind + normalized + optional role
-/// + alternate format map). Mirrors `fast2flow_contracts::RoutingEntity`.
+/// Mirrors `fast2flow_contracts::RoutingEntity`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct RoutingEntity {
     pub kind: String,
     pub normalized: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    /// Alternate serializations (e.g. `"iso"` → `"2026-05-30"` for a
-    /// `YYYYMMDD` date entity). Producer-defined; consumers fan them
-    /// out generically without per-kind code.
+    /// Alternate serializations keyed by format name (e.g. `"iso"`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub formats: std::collections::BTreeMap<String, String>,
 }
