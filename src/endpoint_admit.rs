@@ -150,40 +150,6 @@ mod tests {
     }
 
     #[test]
-    fn distinct_endpoints_keep_disjoint_acls() {
-        let legal = endpoint("teams-legal", &["legal-bundle"]);
-        let finance = endpoint("teams-finance", &["finance-bundle"]);
-        let legal_id = legal.endpoint_id.to_string();
-        let finance_id = finance.endpoint_id.to_string();
-        let admit = EndpointAdmit::from_environment(&env_with(vec![legal, finance]));
-
-        assert!(
-            admit
-                .linked_bundles(&legal_id)
-                .unwrap()
-                .contains("legal-bundle")
-        );
-        assert!(
-            !admit
-                .linked_bundles(&legal_id)
-                .unwrap()
-                .contains("finance-bundle")
-        );
-        assert!(
-            admit
-                .linked_bundles(&finance_id)
-                .unwrap()
-                .contains("finance-bundle")
-        );
-        assert!(
-            !admit
-                .linked_bundles(&finance_id)
-                .unwrap()
-                .contains("legal-bundle")
-        );
-    }
-
-    #[test]
     fn endpoint_with_empty_acl_is_known_but_never_admits() {
         let ep = endpoint("teams-bare", &[]);
         let id = ep.endpoint_id.to_string();

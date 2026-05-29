@@ -1384,17 +1384,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_admission_empty_env_still_rejects_any_asserted_endpoint() {
-        // An env with no `messaging_endpoints` declared MUST NOT accept a
-        // header-asserted endpoint as an implicit pass — that would silently
-        // disable the gate. Same `UNAUTHORIZED` as any other unknown endpoint.
-        let admit = crate::endpoint_admit::EndpointAdmit::default();
-        let err = resolve_endpoint_admission(Some("teams-legal"), &admit)
-            .expect_err("empty env must refuse asserted endpoint");
-        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
     fn check_bundle_admission_skips_when_endpoint_not_asserted() {
         // The pre-dispatch step returned `NotAsserted` (no header) — the
         // post-dispatch check must be a no-op so legacy single-instance

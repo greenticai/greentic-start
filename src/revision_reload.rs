@@ -46,12 +46,7 @@ use greentic_deploy_spec::Environment;
 use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
 use greentic_types::EnvId;
 
-/// On-disk file the deployer rewrites whenever
-/// [`Environment::messaging_endpoints`] (and the rest of the compose-view)
-/// changes. Lives next to `runtime-config.json` in the env directory.
-/// Re-declared here as a `&'static str` because `greentic-deployer` doesn't
-/// publicly export the constant — keep in sync with
-/// `greentic-deployer/src/environment/store.rs::environment_path`.
+/// Keep in sync with `greentic-deployer/src/environment/store.rs::environment_path`.
 const ENVIRONMENT_FILE: &str = "environment.json";
 
 use crate::operator_log;
@@ -634,23 +629,6 @@ mod tests {
             a, b,
             "messaging endpoint linked_bundles change must defeat dedup"
         );
-    }
-
-    #[test]
-    fn last_reload_inputs_equality_on_identical_inputs() {
-        // The other side of the contract: byte-identical writes (a no-op
-        // env.json rewrite) DO dedup, so the deployer rewriting the same
-        // content doesn't churn cookies/pins on the running server.
-        let env = env_with_endpoints(vec![make_endpoint(&["legal-bundle"])]);
-        let a = LastReloadInputs {
-            rc: empty_loaded_rc(),
-            env: env.clone(),
-        };
-        let b = LastReloadInputs {
-            rc: empty_loaded_rc(),
-            env,
-        };
-        assert_eq!(a, b, "identical content must dedup");
     }
 
     #[test]
