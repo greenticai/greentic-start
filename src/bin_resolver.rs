@@ -1,5 +1,17 @@
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoInstallFormat {
+    DirectBinary,
+    Tgz,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutoInstallSource {
+    url: String,
+    format: AutoInstallFormat,
+}
+
 pub struct ResolveCtx {
     pub config_dir: PathBuf,
     pub explicit_path: Option<PathBuf>,
@@ -72,13 +84,15 @@ pub fn resolve_binary(name: &str, ctx: &ResolveCtx) -> anyhow::Result<PathBuf> {
 
 /// Return a download URL for known external binaries, or `None` if the binary
 /// is not in the auto-install list.
-fn auto_install_url(name: &str) -> Option<String> {
-    let (os, ext) = if cfg!(target_os = "linux") {
-        ("linux", "")
+fn auto_install_source(name: &str) -> Option<AutoInstallSource> {
+    let (os, ext, format) = if cfg!(target_os = "linux") {
+        ("linux", "", AutoInstallFormat::DirectBinary)
     } else if cfg!(target_os = "macos") {
-        ("darwin", "")
+        // Cloudflare publishes macOS release assets as tarballs, not as
+        // extensionless binaries. The old extensionless URL redirects to 404.
+        ("darwin", ".tgz", AutoInstallFormat::Tgz)
     } else if cfg!(target_os = "windows") {
-        ("windows", ".exe")
+        ("windows", ".exe", AutoInstallFormat::DirectBinary)
     } else {
         return None;
     };
@@ -92,17 +106,20 @@ fn auto_install_url(name: &str) -> Option<String> {
     };
 
     match name {
-        "cloudflared" => Some(format!(
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-{os}-{arch}{ext}"
-        )),
+        "cloudflared" => Some(AutoInstallSource {
+            url: format!(
+                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-{os}-{arch}{ext}"
+            ),
+            format,
+        }),
         _ => None,
     }
 }
 
 /// Try to download and install a known binary into `{config_dir}/bin/`.
 fn try_auto_install(name: &str, config_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
-    let url = match auto_install_url(name) {
-        Some(url) => url,
+    let source = match auto_install_source(name) {
+        Some(source) => source,
         None => return Ok(None),
     };
 
@@ -110,15 +127,22 @@ fn try_auto_install(name: &str, config_dir: &Path) -> anyhow::Result<Option<Path
     let dest = bin_dir.join(binary_name(name));
 
     eprintln!("Installing {name} → {}", dest.display());
-    eprintln!("  Downloading {url}");
+    eprintln!("  Downloading {}", source.url);
 
-    let response = ureq::get(&url)
+    let response = ureq::get(&source.url)
         .call()
-        .map_err(|err| anyhow::anyhow!("failed to download {name} from {url}: {err}"))?;
+        .map_err(|err| anyhow::anyhow!("failed to download {name} from {}: {err}", source.url))?;
 
     std::fs::create_dir_all(&bin_dir)?;
-    let mut file = std::fs::File::create(&dest)?;
-    std::io::copy(&mut response.into_body().into_reader(), &mut file)?;
+    match source.format {
+        AutoInstallFormat::DirectBinary => {
+            let mut file = std::fs::File::create(&dest)?;
+            std::io::copy(&mut response.into_body().into_reader(), &mut file)?;
+        }
+        AutoInstallFormat::Tgz => {
+            install_tgz_binary(response.into_body().into_reader(), name, &dest)?;
+        }
+    }
 
     #[cfg(unix)]
     {
@@ -128,6 +152,37 @@ fn try_auto_install(name: &str, config_dir: &Path) -> anyhow::Result<Option<Path
 
     eprintln!("  Installed {name} successfully");
     Ok(Some(dest))
+}
+
+fn install_tgz_binary(reader: impl std::io::Read, binary: &str, dest: &Path) -> anyhow::Result<()> {
+    let decoder = flate2::read::GzDecoder::new(reader);
+    let mut archive = tar::Archive::new(decoder);
+    let expected_name = binary_name(binary);
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+
+        let path = entry.path()?;
+        let is_binary = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == expected_name);
+        if !is_binary {
+            continue;
+        }
+
+        let mut file = std::fs::File::create(dest)?;
+        std::io::copy(&mut entry, &mut file)?;
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!(
+        "downloaded archive did not contain {}",
+        expected_name
+    ))
 }
 
 fn resolve_relative(base: &Path, path: &Path) -> PathBuf {
@@ -295,5 +350,40 @@ mod tests {
             normalize_env_key("operator-runner.v2"),
             "OPERATOR_RUNNER_V2"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn cloudflared_macos_auto_install_uses_tgz_asset() {
+        let source = auto_install_source("cloudflared").expect("source");
+
+        assert_eq!(source.format, AutoInstallFormat::Tgz);
+        assert!(source.url.ends_with(".tgz"));
+        assert!(source.url.contains("cloudflared-darwin-"));
+    }
+
+    #[test]
+    fn install_tgz_binary_extracts_matching_file() {
+        let dir = tempdir().expect("tempdir");
+        let archive_path = dir.path().join("cloudflared.tgz");
+        let archive_file = std::fs::File::create(&archive_path).expect("create archive");
+        let encoder = flate2::write::GzEncoder::new(archive_file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let payload = b"#!/bin/sh\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "cloudflared", &payload[..])
+            .expect("append");
+        let encoder = archive.into_inner().expect("finish tar");
+        encoder.finish().expect("finish gzip");
+
+        let dest = dir.path().join("cloudflared-out");
+        let reader = std::fs::File::open(&archive_path).expect("open archive");
+        install_tgz_binary(reader, "cloudflared", &dest).expect("extract");
+
+        assert_eq!(std::fs::read(&dest).expect("read dest"), payload);
     }
 }
