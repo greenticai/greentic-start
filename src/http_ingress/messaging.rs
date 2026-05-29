@@ -377,7 +377,7 @@ fn ensure_prefill_defaults(
     collect_placeholder_keys(card, &mut keys);
     for key in keys {
         if key.starts_with("prefill_") {
-            metadata.entry(key).or_insert_with(String::new);
+            metadata.entry(key).or_default();
         }
     }
 }
@@ -779,8 +779,8 @@ mod tests {
         let card = json!({"value": "${other_token}", "subtitle": "${i18n:foo}"});
         let mut metadata = std::collections::BTreeMap::<String, String>::new();
         ensure_prefill_defaults(&card, &mut metadata);
-        assert!(metadata.get("other_token").is_none());
-        assert!(metadata.get("i18n:foo").is_none());
+        assert!(!metadata.contains_key("other_token"));
+        assert!(!metadata.contains_key("i18n:foo"));
     }
 
     #[test]

@@ -67,7 +67,7 @@ pub fn try_for_request(
         None => {
             operator_log::info(
                 module_path!(),
-                "[fast2flow:gate] skip reason=no_indexes_path".to_string(),
+                "[fast2flow:gate] skip reason=no_indexes_path",
             );
             return None;
         }
