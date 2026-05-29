@@ -800,7 +800,38 @@ fn caller_identity(
     }
     let user = user_header.or_else(|| str_field(payload, "user"));
     let session = session_header.or_else(|| str_field(payload, "session"));
-    (user, session, endpoint_header)
+    let endpoint = endpoint_header.and_then(|raw| validate_endpoint_id(&raw));
+    (user, session, endpoint)
+}
+
+/// Validate a producer-asserted messaging endpoint id. Returns `Some(id)`
+/// only for ASCII identifiers matching `[A-Za-z0-9_.-]{1,128}` — the
+/// grammar that covers both the M1.2 ULID form and a hand-typeable slug
+/// (`teams-legal`). Anything else collapses to `None` so the runner runs
+/// unscoped rather than partitioning into a corrupt bucket. No
+/// whitespace-trimming — a producer that sends incidental whitespace has
+/// a bug we shouldn't mask; reject and let them fix it.
+///
+/// This defends the canonicalize-layer `ep=<eid>::<base>` session prefix:
+/// * an empty value (e.g. `X-Greentic-Messaging-Endpoint-Id:` with no
+///   body) would collapse all malformed-header traffic into one
+///   `ep=::<base>` namespace, losing endpoint isolation;
+/// * a value containing `:` (the prefix delimiter) would collide with
+///   other endpoint/base pairs — `eid="a"+base="b::c"` and
+///   `eid="a::b"+base="c"` both produce `ep=a::b::c`;
+/// * control characters / unbounded length would corrupt downstream
+///   session-store keys and telemetry attribute values.
+fn validate_endpoint_id(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw.len() > 128 {
+        return None;
+    }
+    if !raw
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(raw.to_string())
 }
 
 /// Pre-execution admission decision for a dispatched revision request.
@@ -1131,6 +1162,72 @@ mod tests {
         let (_, _, endpoint) =
             caller_identity(false, None, None, Some("teams-legal".into()), &payload);
         assert!(endpoint.is_none());
+    }
+
+    #[test]
+    fn caller_identity_silently_drops_malformed_endpoint_header() {
+        // A loopback caller asserting a malformed endpoint id (empty, contains
+        // the `:` prefix delimiter, control chars, over-length, etc.) gets the
+        // unscoped path — never the `ep=::<base>` collapse or a colliding
+        // `ep=a::b::c` bucket the runner cannot disambiguate.
+        let payload = json!({});
+        for raw in ["", "   ", "legal::accounting", "teams legal", "teams\n"] {
+            let (_, _, endpoint) = caller_identity(true, None, None, Some(raw.into()), &payload);
+            assert!(
+                endpoint.is_none(),
+                "header value {raw:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_endpoint_id_accepts_slug_and_ulid_forms() {
+        assert_eq!(
+            validate_endpoint_id("teams-legal"),
+            Some("teams-legal".into())
+        );
+        assert_eq!(
+            validate_endpoint_id("teams_legal.v2"),
+            Some("teams_legal.v2".into())
+        );
+        // ULID (Crockford base32, 26 chars) — the M1.2 on-disk form.
+        let ulid = "01HV3ZQXW8K0YBN8FXZ7P4M2R5";
+        assert_eq!(validate_endpoint_id(ulid), Some(ulid.into()));
+    }
+
+    #[test]
+    fn validate_endpoint_id_rejects_empty_and_surrounding_whitespace() {
+        // Empty header value fails the explicit empty check; surrounding
+        // whitespace fails the grammar check (no trim, see fn docs).
+        assert!(validate_endpoint_id("").is_none());
+        assert!(validate_endpoint_id("   ").is_none());
+        assert!(validate_endpoint_id("\t\n").is_none());
+        assert!(validate_endpoint_id("  teams-legal  ").is_none());
+    }
+
+    #[test]
+    fn validate_endpoint_id_rejects_prefix_delimiter() {
+        // `:` is the `ep=<eid>::<base>` delimiter; any colon in eid would
+        // make `ep=a::b::c` ambiguous (eid="a"+base="b::c" vs eid="a::b"+base="c").
+        assert!(validate_endpoint_id("legal::accounting").is_none());
+        assert!(validate_endpoint_id("foo:bar").is_none());
+    }
+
+    #[test]
+    fn validate_endpoint_id_rejects_control_chars_and_non_ascii() {
+        assert!(validate_endpoint_id("teams\nlegal").is_none());
+        assert!(validate_endpoint_id("teams\0legal").is_none());
+        assert!(validate_endpoint_id("teams legal").is_none()); // space
+        assert!(validate_endpoint_id("teams/legal").is_none());
+        assert!(validate_endpoint_id("команда").is_none()); // non-ASCII
+    }
+
+    #[test]
+    fn validate_endpoint_id_rejects_over_length() {
+        let too_long = "a".repeat(129);
+        assert!(validate_endpoint_id(&too_long).is_none());
+        let max_ok = "a".repeat(128);
+        assert_eq!(validate_endpoint_id(&max_ok), Some(max_ok));
     }
 
     fn provider_route_table(scope: &RevisionScope) -> HttpRouteTable {
