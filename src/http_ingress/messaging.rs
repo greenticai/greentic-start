@@ -35,17 +35,42 @@ pub(super) fn route_messaging_envelopes(
         ),
     );
 
-    for envelope in &envelopes {
-        // FIXME(act-on-directive): MVP logs the mapped directive inside
-        // try_for_request; follow-up wires non-Continue returns into the
-        // dispatcher to short-circuit the default-flow path.
-        let _ = crate::fast2flow::try_for_request(
+    for original in &envelopes {
+        // Per-envelope Fast2Flow probe. On Dispatch with a node target, we
+        // synthesize the same metadata an Adaptive Card button click would
+        // produce — `routeToCardId` — so the existing card path renders the
+        // chosen card. Continue / Respond / Deny still fall through to the
+        // default flow path; per-directive handling lands incrementally.
+        let mut owned;
+        let envelope: &ChannelMessageEnvelope = match crate::fast2flow::try_for_request(
             crate::fast2flow::Fast2FlowConfig::global(),
             ctx,
             &pack_info,
-            envelope,
+            original,
             provider,
-        );
+        ) {
+            Some(crate::ingress::control_directive::ControlDirective::Dispatch {
+                target,
+                entities,
+            }) if target.node.is_some() => {
+                let node = target.node.as_ref().expect("checked some").clone();
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "[fast2flow] dispatch -> routeToCardId={node} entities={} \
+                         (pack={} flow={:?})",
+                        entities.len(),
+                        target.pack,
+                        target.flow
+                    ),
+                );
+                owned = original.clone();
+                owned.metadata.insert("routeToCardId".to_string(), node);
+                inject_prefill_metadata(&mut owned, &entities);
+                &owned
+            }
+            _ => original,
+        };
         let outputs = if let Some(route_to_card) = envelope.metadata.get("routeToCardId") {
             match read_card_from_pack(&app_pack_path, route_to_card) {
                 Some(mut card_json) => {
@@ -95,6 +120,34 @@ pub(super) fn route_messaging_envelopes(
                     run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
                 }
             }
+        } else if pack_info
+            .capabilities
+            .iter()
+            .any(|c| c == crate::fast2flow::FAST2FLOW_CAPABILITY)
+            && envelope
+                .text
+                .as_deref()
+                .is_some_and(|t| !t.trim().is_empty())
+        {
+            // The pack opted into Fast2Flow routing, the user sent free text,
+            // and no dispatch resolved (Fast2Flow returned Continue and
+            // didn't set routeToCardId). Surface a short error so we don't
+            // re-echo the welcome menu and confuse the user.
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[fast2flow] no dispatch for free text — emitting error reply pack={} text_len={}",
+                    pack_info.pack_id,
+                    envelope.text.as_deref().map(str::len).unwrap_or(0)
+                ),
+            );
+            let mut reply = envelope.clone();
+            reply.metadata.remove("adaptive_card");
+            reply.text = Some(
+                "I'm not sure what you meant. Tap one of the menu options or rephrase your request."
+                    .to_string(),
+            );
+            vec![reply]
         } else {
             run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
         };
@@ -268,6 +321,48 @@ fn decode_injected_config_for_provider(config: serde_json::Value) -> serde_json:
         decoded.insert(key.clone(), value.clone());
     }
     serde_json::Value::Object(decoded)
+}
+
+/// Drop intent-extracted entities into `envelope.metadata` so the
+/// existing `${placeholder}` substitution step can wire them into card
+/// fields. The shape is intentionally generic — no per-kind code lives
+/// here. Each entity contributes:
+///
+///   * `prefill_<kind>`            — the canonical `normalized` value
+///   * `prefill_<kind>_<role>`     — when the entity carries a role
+///                                   tag (e.g. `prefill_location_from`,
+///                                   `prefill_location_to`)
+///   * `prefill_<kind>_<format>`   — for every entry in the entity's
+///                                   `formats` map (e.g. an `iso`
+///                                   variant of a `YYYYMMDD` date,
+///                                   set by the routing host so this
+///                                   layer stays kind-agnostic)
+///
+/// Card authors opt in per field via `value: "${prefill_<key>}"`. The
+/// runtime never assumes which fields exist or which entities will
+/// arrive — every entity surfaces under the same naming convention.
+fn inject_prefill_metadata(
+    envelope: &mut ChannelMessageEnvelope,
+    entities: &[crate::ingress::control_directive::PrefillEntity],
+) {
+    for entity in entities {
+        envelope.metadata.insert(
+            format!("prefill_{}", entity.kind),
+            entity.normalized.clone(),
+        );
+        if let Some(role) = entity.role.as_deref() {
+            envelope.metadata.insert(
+                format!("prefill_{}_{}", entity.kind, role),
+                entity.normalized.clone(),
+            );
+        }
+        for (format_name, value) in &entity.formats {
+            envelope.metadata.insert(
+                format!("prefill_{}_{}", entity.kind, format_name),
+                value.clone(),
+            );
+        }
+    }
 }
 
 fn read_card_from_pack(pack_path: &Path, card_key: &str) -> Option<serde_json::Value> {

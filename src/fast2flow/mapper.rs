@@ -2,7 +2,9 @@
 //! Tenant/team inherit from the request context. FIXME(observability):
 //! confidence + reason are dropped — emit a tracing span carrying both.
 
-use crate::ingress::control_directive::{ControlDirective, DispatchTarget, IngressReply};
+use crate::ingress::control_directive::{
+    ControlDirective, DispatchTarget, IngressReply, PrefillEntity,
+};
 use crate::runner_host::OperatorContext;
 
 use super::contracts::RoutingDirective;
@@ -13,8 +15,21 @@ pub fn map_directive_to_control(
 ) -> ControlDirective {
     match directive {
         RoutingDirective::Continue => ControlDirective::Continue,
-        RoutingDirective::Dispatch { target, .. } => match parse_target(&target, ctx) {
-            Some(dispatch) => ControlDirective::Dispatch { target: dispatch },
+        RoutingDirective::Dispatch {
+            target, entities, ..
+        } => match parse_target(&target, ctx) {
+            Some(dispatch) => ControlDirective::Dispatch {
+                target: dispatch,
+                entities: entities
+                    .into_iter()
+                    .map(|e| PrefillEntity {
+                        kind: e.kind,
+                        normalized: e.normalized,
+                        role: e.role,
+                        formats: e.formats,
+                    })
+                    .collect(),
+            },
             None => ControlDirective::Continue,
         },
         RoutingDirective::Respond { message } => ControlDirective::Respond {
@@ -118,11 +133,12 @@ mod tests {
                 target: "support".into(),
                 confidence: 0.8,
                 reason: "match".into(),
+                entities: Vec::new(),
             },
             &ctx(),
         );
         match mapped {
-            ControlDirective::Dispatch { target } => {
+            ControlDirective::Dispatch { target, .. } => {
                 assert_eq!(target.tenant, "acme");
                 assert_eq!(target.team.as_deref(), Some("legal"));
                 assert_eq!(target.pack, "support");
@@ -140,11 +156,12 @@ mod tests {
                 target: "support/refund_flow".into(),
                 confidence: 0.9,
                 reason: "refund keyword".into(),
+                entities: Vec::new(),
             },
             &ctx(),
         );
         match mapped {
-            ControlDirective::Dispatch { target } => {
+            ControlDirective::Dispatch { target, .. } => {
                 assert_eq!(target.pack, "support");
                 assert_eq!(target.flow.as_deref(), Some("refund_flow"));
                 assert!(target.node.is_none());
@@ -160,11 +177,12 @@ mod tests {
                 target: "support/refund_flow/confirm".into(),
                 confidence: 0.95,
                 reason: "deep link".into(),
+                entities: Vec::new(),
             },
             &ctx(),
         );
         match mapped {
-            ControlDirective::Dispatch { target } => {
+            ControlDirective::Dispatch { target, .. } => {
                 assert_eq!(target.pack, "support");
                 assert_eq!(target.flow.as_deref(), Some("refund_flow"));
                 assert_eq!(target.node.as_deref(), Some("confirm"));
@@ -180,6 +198,7 @@ mod tests {
                 target: "a/b/c/d".into(),
                 confidence: 1.0,
                 reason: "".into(),
+                entities: Vec::new(),
             },
             &ctx(),
         );
@@ -193,6 +212,7 @@ mod tests {
                 target: "  /  ".into(),
                 confidence: 1.0,
                 reason: "".into(),
+                entities: Vec::new(),
             },
             &ctx(),
         );

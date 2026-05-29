@@ -18,7 +18,7 @@ pub mod mapper;
 
 pub use config::Fast2FlowConfig;
 pub use contracts::{Fast2FlowHookInV1, MessageEnvelope};
-pub use gate::Fast2FlowGate;
+pub use gate::{FAST2FLOW_CAPABILITY, Fast2FlowGate};
 pub use host_process::invoke_routing_host;
 pub use mapper::map_directive_to_control;
 
@@ -38,12 +38,51 @@ pub fn try_for_request(
     envelope: &ChannelMessageEnvelope,
     provider: &str,
 ) -> Option<ControlDirective> {
-    if !cfg.has_deploy_intent() || !cfg.gate.is_enabled(ctx, pack) {
+    let deploy_intent = cfg.has_deploy_intent();
+    let gate_enabled = cfg.gate.is_enabled(ctx, pack);
+    operator_log::info(
+        module_path!(),
+        format!(
+            "[fast2flow:gate] enter tenant={} team={:?} pack={} caps={:?} deploy_intent={} gate_enabled={} text_len={}",
+            ctx.tenant,
+            ctx.team,
+            pack.pack_id,
+            pack.capabilities,
+            deploy_intent,
+            gate_enabled,
+            envelope.text.as_deref().map(str::len).unwrap_or(0)
+        ),
+    );
+    if !deploy_intent || !gate_enabled {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[fast2flow:gate] skip reason=gate deploy_intent={deploy_intent} gate_enabled={gate_enabled}"
+            ),
+        );
         return None;
     }
-    let indexes_path = cfg.indexes_path.as_ref()?;
+    let indexes_path = match cfg.indexes_path.as_ref() {
+        Some(p) => p,
+        None => {
+            operator_log::info(
+                module_path!(),
+                "[fast2flow:gate] skip reason=no_indexes_path".to_string(),
+            );
+            return None;
+        }
+    };
     let scope = scope_for(ctx);
-    if !indexes_path.join(&scope).join("index.json").is_file() {
+    let index_path = indexes_path.join(&scope).join("index.json");
+    let exists = index_path.is_file();
+    operator_log::info(
+        module_path!(),
+        format!(
+            "[fast2flow:gate] index_check path={} exists={exists}",
+            index_path.display()
+        ),
+    );
+    if !exists {
         return None;
     }
 
@@ -66,8 +105,12 @@ pub fn try_for_request(
             channel: None,
             provider: Some(provider.to_string()),
         },
-        // FIXME(session-active): thread runtime session state.
-        session_active: true,
+        // FIXME(session-active): thread the runtime's real session state.
+        // Defaulting to `false` so Fast2Flow's hook filter actually runs the
+        // matcher; `true` causes it to short-circuit to Continue (the
+        // "in-progress flow keeps priority" semantics) and silently masked
+        // every dispatch in early testing.
+        session_active: false,
         input_locale: locale,
         time_budget_ms: cfg.time_budget_ms,
         registry_path: cfg.registry_path.to_string_lossy().into_owned(),
@@ -214,7 +257,7 @@ mod tests {
                 "webchat",
             );
             match result {
-                Some(ControlDirective::Dispatch { target }) => {
+                Some(ControlDirective::Dispatch { target, .. }) => {
                     assert_eq!(target.tenant, "acme");
                     assert_eq!(target.team, None);
                     assert_eq!(target.pack, "sales-crm");

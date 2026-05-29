@@ -18,7 +18,11 @@ pub fn invoke_routing_host(
 ) -> Option<Fast2FlowHookOutV1> {
     let payload = serde_json::to_vec(input).ok()?;
 
+    // Explicitly forward our process env so FAST2FLOW_* tuning vars
+    // (MIN_CONFIDENCE, POLICY_PATH, LLM_PROVIDER, …) reach the host.
+    // Defensive against any parent-env stripping in the spawn chain.
     let mut child = Command::new(host_bin)
+        .envs(std::env::vars())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -33,6 +37,16 @@ pub fn invoke_routing_host(
     }
 
     let output = child.wait_with_output().ok()?;
+    // Surface anything the host wrote to stderr — policy-load failures,
+    // FAST2FLOW_TRACE_POLICY output, RUST_LOG diagnostics — so we don't
+    // silently drop the host's only feedback channel.
+    if !output.stderr.is_empty()
+        && let Ok(stderr_text) = std::str::from_utf8(&output.stderr)
+    {
+        for line in stderr_text.lines().filter(|l| !l.trim().is_empty()) {
+            crate::operator_log::info(module_path!(), format!("[fast2flow:host] {line}"));
+        }
+    }
     if !output.status.success() {
         return None;
     }
