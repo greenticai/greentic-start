@@ -606,6 +606,7 @@ async fn serve(
     let cookie_header = header_str(req.headers(), header::COOKIE.as_str());
     let user_header = header_str(req.headers(), "x-greentic-user");
     let session_header = header_str(req.headers(), "x-greentic-session");
+    let endpoint_header = header_str(req.headers(), "x-greentic-messaging-endpoint-id");
 
     // Resolve the bound deployment + tenant before touching the body, so an
     // unroutable request is rejected cheaply.
@@ -637,8 +638,15 @@ async fn serve(
     // Caller-asserted identity is only honoured from loopback peers (see
     // `caller_identity`). The session hint both pins the revision (stickiness)
     // and keys the flow session, so it feeds the dispatcher and the activity.
-    let (user, session_hint) =
-        caller_identity(peer_is_loopback, user_header, session_header, &payload);
+    // The messaging endpoint id (M1.4) partitions sessions/telemetry per
+    // provider instance — header-only, never from the body.
+    let (user, session_hint, endpoint_id) = caller_identity(
+        peer_is_loopback,
+        user_header,
+        session_header,
+        endpoint_header,
+        &payload,
+    );
     let cookie_value = cookie_header
         .as_deref()
         .and_then(|jar| read_cookie(jar, &cookie_name(deployment_id)));
@@ -697,7 +705,13 @@ async fn serve(
         Admission::Serve => {}
     }
 
-    let activity = build_activity(&payload, &tenant, user.as_deref(), session_hint.as_deref());
+    let activity = build_activity(
+        &payload,
+        &tenant,
+        user.as_deref(),
+        session_hint.as_deref(),
+        endpoint_id.as_deref(),
+    );
 
     let replies = activation
         .host
@@ -738,6 +752,7 @@ fn build_activity(
     tenant: &str,
     user: Option<&str>,
     session: Option<&str>,
+    endpoint: Option<&str>,
 ) -> Activity {
     let mut activity = match payload.get("text").and_then(Value::as_str) {
         Some(text) => Activity::text(text),
@@ -750,12 +765,14 @@ fn build_activity(
     if let Some(session) = session {
         activity = activity.with_session(session);
     }
+    if let Some(endpoint) = endpoint {
+        activity = activity.with_messaging_endpoint(endpoint);
+    }
     activity
 }
 
-/// Resolve the caller-asserted `(user, session)` identity, honouring it **only
-/// from loopback peers**. Header (`x-greentic-user`/`x-greentic-session`) wins
-/// over the body `user`/`session` field.
+/// Resolve the caller-asserted identity tuple, honouring it **only from
+/// loopback peers**. Header wins over body for `(user, session)`.
 ///
 /// The legacy webchat/DirectLine ingress likewise derives identity from the
 /// unauthenticated client request, so on loopback this matches the existing
@@ -765,18 +782,56 @@ fn build_activity(
 /// via a chosen session hint. Remote callers therefore run anonymously with no
 /// session hint (the HMAC-signed stickiness cookie, which they cannot forge,
 /// still works). A verified provider/DirectLine token is the Phase-D upgrade.
+///
+/// The messaging endpoint id (M1.4) is **header-only**, never read from the
+/// body even on loopback. It is an operational routing decision (which provider
+/// instance owns this request) that partitions sessions/telemetry per endpoint;
+/// reading it from the attacker-controlled payload would let a body-supplied
+/// endpoint id route a request to the wrong endpoint and pin the wrong session.
 fn caller_identity(
     peer_is_loopback: bool,
     user_header: Option<String>,
     session_header: Option<String>,
+    endpoint_header: Option<String>,
     payload: &Value,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, Option<String>, Option<String>) {
     if !peer_is_loopback {
-        return (None, None);
+        return (None, None, None);
     }
     let user = user_header.or_else(|| str_field(payload, "user"));
     let session = session_header.or_else(|| str_field(payload, "session"));
-    (user, session)
+    let endpoint = endpoint_header.and_then(validate_endpoint_id);
+    (user, session, endpoint)
+}
+
+/// Validate a producer-asserted messaging endpoint id. Returns `Some(id)`
+/// only for ASCII identifiers matching `[A-Za-z0-9_.-]{1,128}` — the
+/// grammar that covers both the M1.2 ULID form and a hand-typeable slug
+/// (`teams-legal`). Anything else collapses to `None` so the runner runs
+/// unscoped rather than partitioning into a corrupt bucket. No
+/// whitespace-trimming — a producer that sends incidental whitespace has
+/// a bug we shouldn't mask; reject and let them fix it.
+///
+/// This defends the canonicalize-layer `ep=<eid>::<base>` session prefix:
+/// * an empty value (e.g. `X-Greentic-Messaging-Endpoint-Id:` with no
+///   body) would collapse all malformed-header traffic into one
+///   `ep=::<base>` namespace, losing endpoint isolation;
+/// * a value containing `:` (the prefix delimiter) would collide with
+///   other endpoint/base pairs — `eid="a"+base="b::c"` and
+///   `eid="a::b"+base="c"` both produce `ep=a::b::c`;
+/// * control characters / unbounded length would corrupt downstream
+///   session-store keys and telemetry attribute values.
+fn validate_endpoint_id(raw: String) -> Option<String> {
+    if raw.is_empty() || raw.len() > 128 {
+        return None;
+    }
+    if !raw
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(raw)
 }
 
 /// Pre-execution admission decision for a dispatched revision request.
@@ -990,7 +1045,7 @@ mod tests {
     #[test]
     fn build_activity_text_field_becomes_messaging_activity() {
         let payload = json!({ "text": "hello there" });
-        let activity = build_activity(&payload, "acme", Some("u1"), Some("s1"));
+        let activity = build_activity(&payload, "acme", Some("u1"), Some("s1"), None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.user(), Some("u1"));
         assert_eq!(activity.session_id(), Some("s1"));
@@ -1004,7 +1059,7 @@ mod tests {
     #[test]
     fn build_activity_without_text_wraps_generic_payload() {
         let payload = json!({ "kind": "ping", "n": 7 });
-        let activity = build_activity(&payload, "acme", None, None);
+        let activity = build_activity(&payload, "acme", None, None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.user(), None);
         assert_eq!(activity.session_id(), None);
@@ -1014,9 +1069,29 @@ mod tests {
 
     #[test]
     fn build_activity_empty_body_is_a_null_custom_activity() {
-        let activity = build_activity(&Value::Null, "acme", None, None);
+        let activity = build_activity(&Value::Null, "acme", None, None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.payload(), &Value::Null);
+    }
+
+    #[test]
+    fn build_activity_plumbs_messaging_endpoint_id() {
+        let payload = json!({ "text": "hello" });
+        let activity = build_activity(
+            &payload,
+            "acme",
+            Some("u1"),
+            Some("s1"),
+            Some("teams-legal"),
+        );
+        // Serialize to wire form to prove the field rides on the Activity —
+        // there's no public accessor returning Option<&str> for the endpoint,
+        // and the runner reads it through the same serde shape.
+        let wire = serde_json::to_value(&activity).expect("serialize");
+        assert_eq!(
+            wire.get("messaging_endpoint_id").and_then(Value::as_str),
+            Some("teams-legal")
+        );
     }
 
     #[test]
@@ -1031,20 +1106,133 @@ mod tests {
         let payload = json!({ "user": "body-user", "session": "body-session" });
 
         // Loopback: header wins over body, body fills the rest.
-        let (user, session) = caller_identity(true, Some("hdr-user".into()), None, &payload);
+        let (user, session, endpoint) =
+            caller_identity(true, Some("hdr-user".into()), None, None, &payload);
         assert_eq!(user.as_deref(), Some("hdr-user"));
         assert_eq!(session.as_deref(), Some("body-session"));
+        assert!(endpoint.is_none());
 
         // Non-loopback: client-asserted identity is dropped entirely so a remote
         // caller cannot impersonate a user/session or pin a chosen revision.
-        let (user, session) = caller_identity(
+        let (user, session, endpoint) = caller_identity(
             false,
             Some("hdr-user".into()),
             Some("hdr-session".into()),
+            Some("teams-legal".into()),
             &payload,
         );
         assert_eq!(user, None);
         assert_eq!(session, None);
+        assert!(endpoint.is_none());
+    }
+
+    #[test]
+    fn caller_identity_returns_messaging_endpoint_from_loopback_header() {
+        let payload = json!({});
+        let (_, _, endpoint) =
+            caller_identity(true, None, None, Some("teams-legal".into()), &payload);
+        assert_eq!(endpoint.as_deref(), Some("teams-legal"));
+    }
+
+    #[test]
+    fn caller_identity_never_reads_messaging_endpoint_from_body() {
+        // Even on loopback, a body-supplied endpoint id must NOT be honoured.
+        // Endpoint id is an operational routing decision, not user-asserted
+        // identity; reading it from the payload would let an attacker pin a
+        // chosen endpoint and partition into the wrong session bucket.
+        let payload = json!({ "messaging_endpoint_id": "teams-attacker" });
+        let (_, _, endpoint) = caller_identity(true, None, None, None, &payload);
+        assert!(endpoint.is_none());
+    }
+
+    #[test]
+    fn caller_identity_drops_messaging_endpoint_on_non_loopback() {
+        // A remote caller cannot pin an endpoint id even via the header. The
+        // verified-token Phase-D upgrade is the only way for remote ingress to
+        // assert endpoint membership.
+        let payload = json!({});
+        let (_, _, endpoint) =
+            caller_identity(false, None, None, Some("teams-legal".into()), &payload);
+        assert!(endpoint.is_none());
+    }
+
+    #[test]
+    fn caller_identity_silently_drops_malformed_endpoint_header() {
+        // A loopback caller asserting a malformed endpoint id (empty, contains
+        // the `:` prefix delimiter, control chars, over-length, etc.) gets the
+        // unscoped path — never the `ep=::<base>` collapse or a colliding
+        // `ep=a::b::c` bucket the runner cannot disambiguate.
+        let payload = json!({});
+        for raw in ["", "   ", "legal::accounting", "teams legal", "teams\n"] {
+            let (_, _, endpoint) = caller_identity(true, None, None, Some(raw.into()), &payload);
+            assert!(
+                endpoint.is_none(),
+                "header value {raw:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_endpoint_id_accepts_slug_and_ulid_forms() {
+        assert_eq!(
+            validate_endpoint_id("teams-legal".into()),
+            Some("teams-legal".into())
+        );
+        assert_eq!(
+            validate_endpoint_id("teams_legal.v2".into()),
+            Some("teams_legal.v2".into())
+        );
+        // ULID (Crockford base32, 26 chars) — the M1.2 on-disk form.
+        let ulid = "01HV3ZQXW8K0YBN8FXZ7P4M2R5";
+        assert_eq!(validate_endpoint_id(ulid.into()), Some(ulid.into()));
+    }
+
+    #[test]
+    fn validate_endpoint_id_rejects_empty_and_surrounding_whitespace() {
+        // Empty header value fails the explicit empty check; surrounding
+        // whitespace fails the grammar check (no trim, see fn docs).
+        for raw in ["", "   ", "\t\n", "  teams-legal  "] {
+            assert!(
+                validate_endpoint_id(raw.into()).is_none(),
+                "{raw:?} should reject"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_endpoint_id_rejects_prefix_delimiter() {
+        // `:` is the `ep=<eid>::<base>` delimiter; any colon in eid would
+        // make `ep=a::b::c` ambiguous (eid="a"+base="b::c" vs eid="a::b"+base="c").
+        for raw in ["legal::accounting", "foo:bar"] {
+            assert!(
+                validate_endpoint_id(raw.into()).is_none(),
+                "{raw:?} should reject"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_endpoint_id_rejects_control_chars_and_non_ascii() {
+        for raw in [
+            "teams\nlegal",
+            "teams\0legal",
+            "teams legal", // space
+            "teams/legal",
+            "команда", // non-ASCII
+        ] {
+            assert!(
+                validate_endpoint_id(raw.into()).is_none(),
+                "{raw:?} should reject"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_endpoint_id_rejects_over_length() {
+        let too_long = "a".repeat(129);
+        assert!(validate_endpoint_id(too_long).is_none());
+        let max_ok = "a".repeat(128);
+        assert_eq!(validate_endpoint_id(max_ok.clone()), Some(max_ok));
     }
 
     fn provider_route_table(scope: &RevisionScope) -> HttpRouteTable {
@@ -1121,6 +1309,7 @@ mod tests {
             action: Some("messaging".into()),
             session_hint: Some(format!("acme:provider:{conversation}:{user}")),
             provider: Some("provider".into()),
+            messaging_endpoint_id: None,
             channel: Some(conversation.into()),
             conversation: Some(conversation.into()),
             user: Some(user.into()),
