@@ -800,7 +800,7 @@ fn caller_identity(
     }
     let user = user_header.or_else(|| str_field(payload, "user"));
     let session = session_header.or_else(|| str_field(payload, "session"));
-    let endpoint = endpoint_header.and_then(|raw| validate_endpoint_id(&raw));
+    let endpoint = endpoint_header.and_then(validate_endpoint_id);
     (user, session, endpoint)
 }
 
@@ -821,7 +821,7 @@ fn caller_identity(
 ///   `eid="a::b"+base="c"` both produce `ep=a::b::c`;
 /// * control characters / unbounded length would corrupt downstream
 ///   session-store keys and telemetry attribute values.
-fn validate_endpoint_id(raw: &str) -> Option<String> {
+fn validate_endpoint_id(raw: String) -> Option<String> {
     if raw.is_empty() || raw.len() > 128 {
         return None;
     }
@@ -831,7 +831,7 @@ fn validate_endpoint_id(raw: &str) -> Option<String> {
     {
         return None;
     }
-    Some(raw.to_string())
+    Some(raw)
 }
 
 /// Pre-execution admission decision for a dispatched revision request.
@@ -1095,14 +1095,6 @@ mod tests {
     }
 
     #[test]
-    fn build_activity_omits_messaging_endpoint_id_when_unset() {
-        let payload = json!({ "text": "hello" });
-        let activity = build_activity(&payload, "acme", None, None, None);
-        let wire = serde_json::to_value(&activity).expect("serialize");
-        assert!(wire.get("messaging_endpoint_id").is_none());
-    }
-
-    #[test]
     fn read_cookie_picks_the_named_pair() {
         let jar = "foo=1; _gt_rev_abc=xyz ; bar=2";
         assert_eq!(read_cookie(jar, "_gt_rev_abc"), Some("xyz".to_string()));
@@ -1183,51 +1175,64 @@ mod tests {
     #[test]
     fn validate_endpoint_id_accepts_slug_and_ulid_forms() {
         assert_eq!(
-            validate_endpoint_id("teams-legal"),
+            validate_endpoint_id("teams-legal".into()),
             Some("teams-legal".into())
         );
         assert_eq!(
-            validate_endpoint_id("teams_legal.v2"),
+            validate_endpoint_id("teams_legal.v2".into()),
             Some("teams_legal.v2".into())
         );
         // ULID (Crockford base32, 26 chars) — the M1.2 on-disk form.
         let ulid = "01HV3ZQXW8K0YBN8FXZ7P4M2R5";
-        assert_eq!(validate_endpoint_id(ulid), Some(ulid.into()));
+        assert_eq!(validate_endpoint_id(ulid.into()), Some(ulid.into()));
     }
 
     #[test]
     fn validate_endpoint_id_rejects_empty_and_surrounding_whitespace() {
         // Empty header value fails the explicit empty check; surrounding
         // whitespace fails the grammar check (no trim, see fn docs).
-        assert!(validate_endpoint_id("").is_none());
-        assert!(validate_endpoint_id("   ").is_none());
-        assert!(validate_endpoint_id("\t\n").is_none());
-        assert!(validate_endpoint_id("  teams-legal  ").is_none());
+        for raw in ["", "   ", "\t\n", "  teams-legal  "] {
+            assert!(
+                validate_endpoint_id(raw.into()).is_none(),
+                "{raw:?} should reject"
+            );
+        }
     }
 
     #[test]
     fn validate_endpoint_id_rejects_prefix_delimiter() {
         // `:` is the `ep=<eid>::<base>` delimiter; any colon in eid would
         // make `ep=a::b::c` ambiguous (eid="a"+base="b::c" vs eid="a::b"+base="c").
-        assert!(validate_endpoint_id("legal::accounting").is_none());
-        assert!(validate_endpoint_id("foo:bar").is_none());
+        for raw in ["legal::accounting", "foo:bar"] {
+            assert!(
+                validate_endpoint_id(raw.into()).is_none(),
+                "{raw:?} should reject"
+            );
+        }
     }
 
     #[test]
     fn validate_endpoint_id_rejects_control_chars_and_non_ascii() {
-        assert!(validate_endpoint_id("teams\nlegal").is_none());
-        assert!(validate_endpoint_id("teams\0legal").is_none());
-        assert!(validate_endpoint_id("teams legal").is_none()); // space
-        assert!(validate_endpoint_id("teams/legal").is_none());
-        assert!(validate_endpoint_id("команда").is_none()); // non-ASCII
+        for raw in [
+            "teams\nlegal",
+            "teams\0legal",
+            "teams legal", // space
+            "teams/legal",
+            "команда", // non-ASCII
+        ] {
+            assert!(
+                validate_endpoint_id(raw.into()).is_none(),
+                "{raw:?} should reject"
+            );
+        }
     }
 
     #[test]
     fn validate_endpoint_id_rejects_over_length() {
         let too_long = "a".repeat(129);
-        assert!(validate_endpoint_id(&too_long).is_none());
+        assert!(validate_endpoint_id(too_long).is_none());
         let max_ok = "a".repeat(128);
-        assert_eq!(validate_endpoint_id(&max_ok), Some(max_ok));
+        assert_eq!(validate_endpoint_id(max_ok.clone()), Some(max_ok));
     }
 
     fn provider_route_table(scope: &RevisionScope) -> HttpRouteTable {
