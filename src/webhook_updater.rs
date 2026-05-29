@@ -7,9 +7,9 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use greentic_secrets_lib::{DevStore, SecretFormat, SecretsStore};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::runtime::Builder as TokioBuilder;
 
 use crate::discovery::{DetectedProvider, DiscoveryResult};
@@ -409,8 +409,8 @@ fn update_provider_webhook(
 }
 
 /// Build provider config by reading secrets and merging with public_base_url.
-fn build_provider_config(
-    _config_dir: &Path,
+pub(crate) fn build_provider_config(
+    config_dir: &Path,
     secrets_handle: &SecretsManagerHandle,
     tenant: &str,
     team: &str,
@@ -418,7 +418,9 @@ fn build_provider_config(
     pack_path: &Path,
     new_url: &str,
 ) -> Result<Value> {
-    let mut config = serde_json::Map::new();
+    let mut config = Map::new();
+
+    merge_provider_setup_answers(config_dir, provider_id, &mut config)?;
 
     // Add new public_base_url and tenant/team so provider can build
     // the correct webhook URL (e.g. /v1/messaging/ingress/{provider}/{tenant}/{team})
@@ -472,6 +474,46 @@ fn build_provider_config(
     }
 
     Ok(Value::Object(config))
+}
+
+fn merge_provider_setup_answers(
+    config_dir: &Path,
+    provider_id: &str,
+    config: &mut Map<String, Value>,
+) -> Result<()> {
+    let setup_answers_path = config_dir
+        .join("state")
+        .join("config")
+        .join(provider_id)
+        .join("setup-answers.json");
+
+    if !setup_answers_path.exists() {
+        return Ok(());
+    }
+
+    let contents = std::fs::read_to_string(&setup_answers_path)
+        .with_context(|| format!("failed to read {}", setup_answers_path.display()))?;
+    let value: Value = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", setup_answers_path.display()))?;
+    let Some(answers) = value.as_object() else {
+        return Ok(());
+    };
+
+    for (key, value) in answers {
+        if provider_config_value_is_present(value) {
+            config.insert(key.clone(), value.clone());
+        }
+    }
+
+    Ok(())
+}
+
+fn provider_config_value_is_present(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(s) => !s.trim().is_empty(),
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -598,6 +640,68 @@ mod tests {
         assert_eq!(config["team"], "default");
         assert_eq!(config["provider_id"], "provider-a");
         assert_eq!(config.as_object().map(|m| m.len()), Some(4));
+    }
+
+    #[test]
+    fn build_provider_config_merges_setup_answers_and_runtime_fields_win() {
+        let tmp = TempDir::new().unwrap();
+        let provider_config_dir = tmp
+            .path()
+            .join("state")
+            .join("config")
+            .join("messaging-provider");
+        std::fs::create_dir_all(&provider_config_dir).expect("provider config dir");
+        std::fs::write(
+            provider_config_dir.join("setup-answers.json"),
+            serde_json::to_vec(&json!({
+                "public_base_url": "https://old.example",
+                "tenant_id": "tenant-from-setup",
+                "client_id": "client-from-setup",
+                "refresh_token": "refresh-from-setup",
+                "team_id": "team-from-setup",
+                "channel_id": "channel-from-setup",
+                "subscription_ops": [{"op": "sync_subscriptions"}],
+                "empty_value": "",
+                "null_value": null
+            }))
+            .unwrap(),
+        )
+        .expect("setup answers");
+
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(tmp.path(), "demo", Some("default"))
+                .expect("secrets");
+        let pack_path = tmp.path().join("provider.gtpack");
+        let file = std::fs::File::create(&pack_path).expect("pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", zip::write::FileOptions::<()>::default())
+            .expect("manifest");
+        zip.write_all(b"a0").expect("empty cbor map");
+        zip.finish().expect("finish pack");
+
+        let config = build_provider_config(
+            tmp.path(),
+            &secrets_handle,
+            "demo",
+            "default",
+            "messaging-provider",
+            &pack_path,
+            "https://new.example",
+        )
+        .expect("provider config");
+
+        assert_eq!(config["public_base_url"], "https://new.example");
+        assert_eq!(config["tenant"], "demo");
+        assert_eq!(config["team"], "default");
+        assert_eq!(config["provider_id"], "messaging-provider");
+        assert_eq!(config["tenant_id"], "tenant-from-setup");
+        assert_eq!(config["client_id"], "client-from-setup");
+        assert_eq!(config["refresh_token"], "refresh-from-setup");
+        assert_eq!(config["team_id"], "team-from-setup");
+        assert_eq!(config["channel_id"], "channel-from-setup");
+        assert_eq!(config["subscription_ops"][0]["op"], "sync_subscriptions");
+        assert!(config.get("empty_value").is_none());
+        assert!(config.get("null_value").is_none());
     }
 
     #[test]

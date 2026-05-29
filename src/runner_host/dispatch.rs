@@ -332,6 +332,20 @@ impl DemoRunnerHost {
         self.invoke_provider_component_op(domain, pack, provider_id, op_id, payload_bytes, ctx)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn invoke_pack_component_op_direct(
+        &self,
+        domain: Domain,
+        pack: &ProviderPack,
+        component_ref: &str,
+        op_id: &str,
+        config: &JsonValue,
+        input: &JsonValue,
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<FlowOutcome> {
+        self.invoke_pack_component_op(domain, pack, component_ref, op_id, config, input, ctx)
+    }
+
     pub(super) fn invoke_provider_component_op(
         &self,
         domain: Domain,
@@ -445,6 +459,95 @@ impl DemoRunnerHost {
                     mode: RunnerExecutionMode::Exec,
                 })
             }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn invoke_pack_component_op(
+        &self,
+        _domain: Domain,
+        pack: &ProviderPack,
+        component_ref: &str,
+        op_id: &str,
+        config: &JsonValue,
+        input: &JsonValue,
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<FlowOutcome> {
+        if let RunnerMode::Integration { .. } = &self.runner_mode {
+            return Ok(FlowOutcome {
+                success: false,
+                output: None,
+                raw: None,
+                error: Some(
+                    "direct component extension invocation is not supported by integration runner"
+                        .to_string(),
+                ),
+                mode: RunnerExecutionMode::Integration,
+            });
+        }
+
+        let config_json = serde_json::to_string(config)?;
+        let input_json = serde_json::to_string(input)?;
+        let result = make_runtime_or_thread_scope(|runtime| {
+            runtime.block_on(async {
+                let host_config = Arc::new(build_demo_host_config(&ctx.tenant));
+                let pack_runtime = PackRuntime::load(
+                    &pack.path,
+                    host_config.clone(),
+                    None,
+                    Some(&pack.path),
+                    None::<DynSessionStore>,
+                    Some(self.state_store.clone()),
+                    Arc::new(RunnerWasiPolicy::default()),
+                    self.secrets_handle.runtime_manager(Some(&pack.pack_id)),
+                    None,
+                    false,
+                    ComponentResolution::default(),
+                )
+                .await?;
+                let exec_ctx = ComponentExecCtx {
+                    tenant: ComponentTenantCtx {
+                        tenant: ctx.tenant.clone(),
+                        team: ctx.team.clone(),
+                        i18n_id: None,
+                        user: None,
+                        trace_id: None,
+                        correlation_id: ctx.correlation_id.clone(),
+                        deadline_unix_ms: None,
+                        attempt: 1,
+                        idempotency_key: None,
+                    },
+                    i18n_id: None,
+                    flow_id: op_id.to_string(),
+                    node_id: Some(op_id.to_string()),
+                };
+                pack_runtime
+                    .invoke_component(
+                        component_ref,
+                        exec_ctx,
+                        op_id,
+                        Some(config_json),
+                        input_json,
+                    )
+                    .await
+            })
+        });
+
+        match result {
+            Ok(value) => Ok(FlowOutcome {
+                success: true,
+                output: Some(value),
+                raw: None,
+                error: None,
+                mode: RunnerExecutionMode::Exec,
+            }),
+            Err(err) => Ok(FlowOutcome {
+                success: false,
+                output: None,
+                raw: None,
+                error: Some(err.to_string()),
+                mode: RunnerExecutionMode::Exec,
+            }),
         }
     }
 }
