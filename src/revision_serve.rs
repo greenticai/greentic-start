@@ -723,17 +723,11 @@ async fn serve(
         Admission::Serve => {}
     }
 
-    // M1.5 welcome-flow override (producer side) is deliberately NOT attached
-    // here yet. The runner-host contract refuses the override only on an
-    // active wait, which does NOT cover post-completion / no-wait / wait-TTL
-    // failure modes — attaching unconditionally would re-fire the welcome
-    // flow on every turn after the welcome's wait window expires (Codex
-    // adversarial review of PR #201). The fix is in greentic-runner: extend
-    // `apply_welcome_flow_override` to atomically check-and-mark a durable
-    // welcome-seen marker (the producer side can't make this atomic with the
-    // override application). Once that lands and floor-pins, this site flips
-    // to attach the hint built from
-    // `activation.routing.endpoint_admit.welcome_flow(eid)`.
+    // M1.5 welcome-flow override NOT attached: runner-host refuses overrides
+    // only on active wait, missing post-completion / no-wait / TTL-expiry
+    // turns. Fix is in greentic-runner: atomic check-and-mark in
+    // `apply_welcome_flow_override`. Re-enable here by replacing `None` with
+    // a hint built from `activation.routing.endpoint_admit.welcome_flow(eid)`.
 
     let activity = build_activity(
         &payload,

@@ -32,7 +32,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use greentic_deploy_spec::Environment;
+use greentic_deploy_spec::{Environment, WelcomeFlowRef};
 
 /// The per-endpoint state the revision ingress needs at request time:
 /// the `linked_bundles` ACL plus the M1.5 welcome-flow ref (if declared).
@@ -41,23 +41,14 @@ use greentic_deploy_spec::Environment;
 #[derive(Clone, Debug)]
 struct EndpointEntry {
     linked_bundles: HashSet<String>,
-    /// `(bundle_id, pack_id, flow_id)` from
-    /// [`MessagingEndpoint::welcome_flow`](greentic_deploy_spec::MessagingEndpoint::welcome_flow),
-    /// strung so the hot path doesn't rebuild typed ids. Read by the producer
-    /// at `revision_serve::serve` when the M1.5 first-contact attach flips on
+    /// [`MessagingEndpoint::welcome_flow`](greentic_deploy_spec::MessagingEndpoint::welcome_flow)
+    /// cloned in so the lookup is one map. Read by the producer at
+    /// `revision_serve::serve` when the M1.5 first-contact attach flips on
     /// (gated on the runner-host welcome-seen marker landing in a follow-up
     /// PR — Codex adversarial review of greentic-start#201). Until then the
     /// projection is dead at runtime; tests still exercise the lookup.
     #[allow(dead_code)]
-    welcome_flow: Option<WelcomeFlowEntry>,
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)] // Read in tests; producer wiring lands in the follow-up PR (see EndpointEntry).
-pub(crate) struct WelcomeFlowEntry {
-    pub(crate) bundle_id: String,
-    pub(crate) pack_id: String,
-    pub(crate) flow_id: String,
+    welcome_flow: Option<WelcomeFlowRef>,
 }
 
 /// Per-endpoint ACL projection of `Environment.messaging_endpoints` consulted
@@ -85,11 +76,7 @@ impl EndpointAdmit {
                         .iter()
                         .map(|b| b.as_str().to_string())
                         .collect(),
-                    welcome_flow: ep.welcome_flow.as_ref().map(|w| WelcomeFlowEntry {
-                        bundle_id: w.bundle_id.as_str().to_string(),
-                        pack_id: w.pack_id.as_str().to_string(),
-                        flow_id: w.flow_id.clone(),
-                    }),
+                    welcome_flow: ep.welcome_flow.clone(),
                 };
                 (ep.endpoint_id.to_string(), entry)
             })
@@ -117,7 +104,7 @@ impl EndpointAdmit {
     ///
     /// [`linked_bundles`]: EndpointAdmit::linked_bundles
     #[allow(dead_code)]
-    pub(crate) fn welcome_flow(&self, endpoint_id: &str) -> Option<&WelcomeFlowEntry> {
+    pub(crate) fn welcome_flow(&self, endpoint_id: &str) -> Option<&WelcomeFlowRef> {
         self.by_id
             .get(endpoint_id)
             .and_then(|e| e.welcome_flow.as_ref())
@@ -129,7 +116,7 @@ mod tests {
     use super::*;
     use greentic_deploy_spec::{
         BundleId, EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId, PackId,
-        SchemaVersion, WelcomeFlowRef,
+        SchemaVersion,
     };
     use greentic_types::EnvId;
 
@@ -231,8 +218,8 @@ mod tests {
         let admit = EndpointAdmit::from_environment(&env_with(vec![ep]));
 
         let ref_ = admit.welcome_flow(&id).expect("welcome ref present");
-        assert_eq!(ref_.bundle_id, "legal-bundle");
-        assert_eq!(ref_.pack_id, "legal-pack");
+        assert_eq!(ref_.bundle_id.as_str(), "legal-bundle");
+        assert_eq!(ref_.pack_id.as_str(), "legal-pack");
         assert_eq!(ref_.flow_id, "welcome");
     }
 
