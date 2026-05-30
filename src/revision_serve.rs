@@ -723,27 +723,17 @@ async fn serve(
         Admission::Serve => {}
     }
 
-    // M1.5 welcome-flow override (producer side): when this request asserts a
-    // messaging endpoint AND that endpoint declares a `welcome_flow` whose
-    // bundle matches the bundle dispatch resolved, attach the hint so the
-    // runner-host can swap the resolved `(pack_id, flow_id)` to the welcome
-    // flow on first contact. The cross-bundle case is dropped here because
-    // the runner-host re-keys to `(pack_id, flow_id)` within the dispatched
-    // revision and would fail to resolve a pack from a sibling bundle.
-    //
-    // First-contact decision is delegated to the runner-host
-    // (`FlowResumeStore::fetch`): it refuses the override when an active wait
-    // exists for this session. The documented limit — a welcome flow that
-    // never calls `session.wait` would re-fire on the next turn — is the
-    // producer-side "durable welcome-seen marker" follow-up to lift; see
-    // `WelcomeFlowHint` docs in `greentic-runner-host`.
-    let welcome_hint = endpoint_id.as_deref().and_then(|eid| {
-        let entry = activation.routing.endpoint_admit.welcome_flow(eid)?;
-        (entry.bundle_id == outcome.bundle_id.as_str()).then(|| WelcomeFlowHint {
-            pack_id: entry.pack_id.clone(),
-            flow_id: entry.flow_id.clone(),
-        })
-    });
+    // M1.5 welcome-flow override (producer side) is deliberately NOT attached
+    // here yet. The runner-host contract refuses the override only on an
+    // active wait, which does NOT cover post-completion / no-wait / wait-TTL
+    // failure modes — attaching unconditionally would re-fire the welcome
+    // flow on every turn after the welcome's wait window expires (Codex
+    // adversarial review of PR #201). The fix is in greentic-runner: extend
+    // `apply_welcome_flow_override` to atomically check-and-mark a durable
+    // welcome-seen marker (the producer side can't make this atomic with the
+    // override application). Once that lands and floor-pins, this site flips
+    // to attach the hint built from
+    // `activation.routing.endpoint_admit.welcome_flow(eid)`.
 
     let activity = build_activity(
         &payload,
@@ -751,7 +741,7 @@ async fn serve(
         user.as_deref(),
         session_hint.as_deref(),
         endpoint_id.as_deref(),
-        welcome_hint,
+        None,
     );
 
     let replies = activation

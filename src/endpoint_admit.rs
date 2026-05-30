@@ -43,15 +43,17 @@ struct EndpointEntry {
     linked_bundles: HashSet<String>,
     /// `(bundle_id, pack_id, flow_id)` from
     /// [`MessagingEndpoint::welcome_flow`](greentic_deploy_spec::MessagingEndpoint::welcome_flow),
-    /// strung so the hot path doesn't rebuild typed ids. The producer only
-    /// attaches the M1.5 hint when the dispatched bundle matches `bundle_id`,
-    /// because the runner-host's override re-keys to `(pack_id, flow_id)`
-    /// within the dispatched revision and a cross-bundle override would land
-    /// on a pack the active revision doesn't ship.
+    /// strung so the hot path doesn't rebuild typed ids. Read by the producer
+    /// at `revision_serve::serve` when the M1.5 first-contact attach flips on
+    /// (gated on the runner-host welcome-seen marker landing in a follow-up
+    /// PR — Codex adversarial review of greentic-start#201). Until then the
+    /// projection is dead at runtime; tests still exercise the lookup.
+    #[allow(dead_code)]
     welcome_flow: Option<WelcomeFlowEntry>,
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Read in tests; producer wiring lands in the follow-up PR (see EndpointEntry).
 pub(crate) struct WelcomeFlowEntry {
     pub(crate) bundle_id: String,
     pub(crate) pack_id: String,
@@ -109,7 +111,12 @@ impl EndpointAdmit {
     /// distinguish those at this site because [`linked_bundles`] has already
     /// classified unknowns as `UNAUTHORIZED` upstream.
     ///
+    /// Currently unused at runtime; tests exercise the lookup. Re-wired into
+    /// `revision_serve::serve` once the runner-host welcome-seen marker lands
+    /// (see the [`EndpointEntry::welcome_flow`] doc).
+    ///
     /// [`linked_bundles`]: EndpointAdmit::linked_bundles
+    #[allow(dead_code)]
     pub(crate) fn welcome_flow(&self, endpoint_id: &str) -> Option<&WelcomeFlowEntry> {
         self.by_id
             .get(endpoint_id)
