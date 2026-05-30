@@ -2131,6 +2131,7 @@ mod tests {
                 ..Default::default()
             },
             providers: None,
+            sql: None,
         };
         let static_routes = BundleStaticRoutesInspection::default();
         let restart = BTreeSet::new();
