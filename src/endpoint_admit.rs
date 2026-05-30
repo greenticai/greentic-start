@@ -34,16 +34,38 @@ use std::collections::{HashMap, HashSet};
 
 use greentic_deploy_spec::Environment;
 
+/// The per-endpoint state the revision ingress needs at request time:
+/// the `linked_bundles` ACL plus the M1.5 welcome-flow ref (if declared).
+/// Co-locating these prevents drift between two parallel maps keyed on the
+/// same endpoint id.
+#[derive(Clone, Debug)]
+struct EndpointEntry {
+    linked_bundles: HashSet<String>,
+    /// `(bundle_id, pack_id, flow_id)` from
+    /// [`MessagingEndpoint::welcome_flow`](greentic_deploy_spec::MessagingEndpoint::welcome_flow),
+    /// strung so the hot path doesn't rebuild typed ids. The producer only
+    /// attaches the M1.5 hint when the dispatched bundle matches `bundle_id`,
+    /// because the runner-host's override re-keys to `(pack_id, flow_id)`
+    /// within the dispatched revision and a cross-bundle override would land
+    /// on a pack the active revision doesn't ship.
+    welcome_flow: Option<WelcomeFlowEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WelcomeFlowEntry {
+    pub(crate) bundle_id: String,
+    pub(crate) pack_id: String,
+    pub(crate) flow_id: String,
+}
+
 /// Per-endpoint ACL projection of `Environment.messaging_endpoints` consulted
 /// by the revision ingress; see the module docs.
 #[derive(Clone, Debug, Default)]
 pub struct EndpointAdmit {
     /// Key: the on-wire `endpoint_id` form (the same string the caller asserts
     /// in `x-greentic-messaging-endpoint-id`, which matches
-    /// `MessagingEndpointId::to_string`). Value: the bundle ids the endpoint
-    /// is permitted to route to, as raw strings so the dispatch outcome can be
-    /// checked without rebuilding a typed id at the hot path.
-    by_id: HashMap<String, HashSet<String>>,
+    /// `MessagingEndpointId::to_string`).
+    by_id: HashMap<String, EndpointEntry>,
 }
 
 impl EndpointAdmit {
@@ -55,12 +77,19 @@ impl EndpointAdmit {
             .messaging_endpoints
             .iter()
             .map(|ep| {
-                let bundles = ep
-                    .linked_bundles
-                    .iter()
-                    .map(|b| b.as_str().to_string())
-                    .collect();
-                (ep.endpoint_id.to_string(), bundles)
+                let entry = EndpointEntry {
+                    linked_bundles: ep
+                        .linked_bundles
+                        .iter()
+                        .map(|b| b.as_str().to_string())
+                        .collect(),
+                    welcome_flow: ep.welcome_flow.as_ref().map(|w| WelcomeFlowEntry {
+                        bundle_id: w.bundle_id.as_str().to_string(),
+                        pack_id: w.pack_id.as_str().to_string(),
+                        flow_id: w.flow_id.clone(),
+                    }),
+                };
+                (ep.endpoint_id.to_string(), entry)
             })
             .collect();
         Self { by_id }
@@ -71,7 +100,20 @@ impl EndpointAdmit {
     /// through to the legacy path. The set itself may be empty (a declared but
     /// unwired endpoint), in which case any subsequent bundle check rejects.
     pub fn linked_bundles(&self, endpoint_id: &str) -> Option<&HashSet<String>> {
-        self.by_id.get(endpoint_id)
+        self.by_id.get(endpoint_id).map(|e| &e.linked_bundles)
+    }
+
+    /// Look up the M1.5 welcome-flow ref for `endpoint_id`, if the endpoint is
+    /// declared AND has `welcome_flow` set. Returns `None` for both unknown
+    /// endpoints and known-but-unset welcome flows — the producer cannot
+    /// distinguish those at this site because [`linked_bundles`] has already
+    /// classified unknowns as `UNAUTHORIZED` upstream.
+    ///
+    /// [`linked_bundles`]: EndpointAdmit::linked_bundles
+    pub(crate) fn welcome_flow(&self, endpoint_id: &str) -> Option<&WelcomeFlowEntry> {
+        self.by_id
+            .get(endpoint_id)
+            .and_then(|e| e.welcome_flow.as_ref())
     }
 }
 
@@ -79,7 +121,8 @@ impl EndpointAdmit {
 mod tests {
     use super::*;
     use greentic_deploy_spec::{
-        BundleId, EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId, SchemaVersion,
+        BundleId, EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId, PackId,
+        SchemaVersion, WelcomeFlowRef,
     };
     use greentic_types::EnvId;
 
@@ -167,5 +210,36 @@ mod tests {
             EndpointAdmit::from_environment(&env_with(vec![endpoint("teams-legal", &["legal"])]));
         assert!(admit.linked_bundles("bogus-endpoint-id").is_none());
         assert!(admit.linked_bundles("").is_none());
+    }
+
+    #[test]
+    fn welcome_flow_lookup_returns_ref_when_declared() {
+        let mut ep = endpoint("teams-legal", &["legal-bundle"]);
+        ep.welcome_flow = Some(WelcomeFlowRef {
+            bundle_id: BundleId::new("legal-bundle"),
+            pack_id: PackId::new("legal-pack"),
+            flow_id: "welcome".to_string(),
+        });
+        let id = ep.endpoint_id.to_string();
+        let admit = EndpointAdmit::from_environment(&env_with(vec![ep]));
+
+        let ref_ = admit.welcome_flow(&id).expect("welcome ref present");
+        assert_eq!(ref_.bundle_id, "legal-bundle");
+        assert_eq!(ref_.pack_id, "legal-pack");
+        assert_eq!(ref_.flow_id, "welcome");
+    }
+
+    #[test]
+    fn welcome_flow_lookup_returns_none_when_unset() {
+        // Both shapes that lack a welcome flow collapse to None at this site:
+        // an unknown endpoint AND a known endpoint whose `welcome_flow` is None.
+        // The unknown-vs-unset distinction belongs upstream at `linked_bundles`,
+        // which has already refused the unknown case with `UNAUTHORIZED`.
+        let ep = endpoint("teams-legal", &["legal-bundle"]); // welcome_flow: None
+        let id = ep.endpoint_id.to_string();
+        let admit = EndpointAdmit::from_environment(&env_with(vec![ep]));
+
+        assert!(admit.welcome_flow(&id).is_none());
+        assert!(admit.welcome_flow("bogus-endpoint-id").is_none());
     }
 }

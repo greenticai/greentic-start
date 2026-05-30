@@ -2482,9 +2482,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "1.1.0-dev.26643300318"
+version = "1.1.0-dev.26676081106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36fbbdb92d1603c0da0de6cc88474d98315c13982a750c8af02e0dc1048f77af"
+checksum = "bdf8e6bd00033fd6d837d0149db9f75f26dc63902a62a287712a2d1d5aaab99d"
 dependencies = [
  "anyhow",
  "arc-swap",

@@ -53,7 +53,7 @@ use tokio::net::TcpListener;
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::oneshot;
 
-use greentic_runner_host::{Activity, RunnerHost};
+use greentic_runner_host::{Activity, RunnerHost, WelcomeFlowHint};
 
 use greentic_deploy_spec::{DEFAULT_LISTEN_ADDR, EnvironmentHostConfig};
 
@@ -723,12 +723,35 @@ async fn serve(
         Admission::Serve => {}
     }
 
+    // M1.5 welcome-flow override (producer side): when this request asserts a
+    // messaging endpoint AND that endpoint declares a `welcome_flow` whose
+    // bundle matches the bundle dispatch resolved, attach the hint so the
+    // runner-host can swap the resolved `(pack_id, flow_id)` to the welcome
+    // flow on first contact. The cross-bundle case is dropped here because
+    // the runner-host re-keys to `(pack_id, flow_id)` within the dispatched
+    // revision and would fail to resolve a pack from a sibling bundle.
+    //
+    // First-contact decision is delegated to the runner-host
+    // (`FlowResumeStore::fetch`): it refuses the override when an active wait
+    // exists for this session. The documented limit — a welcome flow that
+    // never calls `session.wait` would re-fire on the next turn — is the
+    // producer-side "durable welcome-seen marker" follow-up to lift; see
+    // `WelcomeFlowHint` docs in `greentic-runner-host`.
+    let welcome_hint = endpoint_id.as_deref().and_then(|eid| {
+        let entry = activation.routing.endpoint_admit.welcome_flow(eid)?;
+        (entry.bundle_id == outcome.bundle_id.as_str()).then(|| WelcomeFlowHint {
+            pack_id: entry.pack_id.clone(),
+            flow_id: entry.flow_id.clone(),
+        })
+    });
+
     let activity = build_activity(
         &payload,
         &tenant,
         user.as_deref(),
         session_hint.as_deref(),
         endpoint_id.as_deref(),
+        welcome_hint,
     );
 
     let replies = activation
@@ -771,6 +794,7 @@ fn build_activity(
     user: Option<&str>,
     session: Option<&str>,
     endpoint: Option<&str>,
+    welcome_hint: Option<WelcomeFlowHint>,
 ) -> Activity {
     let mut activity = match payload.get("text").and_then(Value::as_str) {
         Some(text) => Activity::text(text),
@@ -785,6 +809,9 @@ fn build_activity(
     }
     if let Some(endpoint) = endpoint {
         activity = activity.with_messaging_endpoint(endpoint);
+    }
+    if let Some(hint) = welcome_hint {
+        activity = activity.with_welcome_flow_hint(hint);
     }
     activity
 }
@@ -1120,7 +1147,7 @@ mod tests {
     #[test]
     fn build_activity_text_field_becomes_messaging_activity() {
         let payload = json!({ "text": "hello there" });
-        let activity = build_activity(&payload, "acme", Some("u1"), Some("s1"), None);
+        let activity = build_activity(&payload, "acme", Some("u1"), Some("s1"), None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.user(), Some("u1"));
         assert_eq!(activity.session_id(), Some("s1"));
@@ -1134,7 +1161,7 @@ mod tests {
     #[test]
     fn build_activity_without_text_wraps_generic_payload() {
         let payload = json!({ "kind": "ping", "n": 7 });
-        let activity = build_activity(&payload, "acme", None, None, None);
+        let activity = build_activity(&payload, "acme", None, None, None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.user(), None);
         assert_eq!(activity.session_id(), None);
@@ -1144,7 +1171,7 @@ mod tests {
 
     #[test]
     fn build_activity_empty_body_is_a_null_custom_activity() {
-        let activity = build_activity(&Value::Null, "acme", None, None, None);
+        let activity = build_activity(&Value::Null, "acme", None, None, None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.payload(), &Value::Null);
     }
@@ -1158,6 +1185,7 @@ mod tests {
             Some("u1"),
             Some("s1"),
             Some("teams-legal"),
+            None,
         );
         // Serialize to wire form to prove the field rides on the Activity —
         // there's no public accessor returning Option<&str> for the endpoint,
@@ -1166,6 +1194,29 @@ mod tests {
         assert_eq!(
             wire.get("messaging_endpoint_id").and_then(Value::as_str),
             Some("teams-legal")
+        );
+    }
+
+    #[test]
+    fn build_activity_plumbs_welcome_flow_hint() {
+        let payload = json!({ "text": "hello" });
+        let activity = build_activity(
+            &payload,
+            "acme",
+            Some("u1"),
+            Some("s1"),
+            Some("teams-legal"),
+            Some(WelcomeFlowHint {
+                pack_id: "legal-pack".to_string(),
+                flow_id: "welcome".to_string(),
+            }),
+        );
+        assert_eq!(
+            activity.welcome_flow_hint(),
+            Some(&WelcomeFlowHint {
+                pack_id: "legal-pack".to_string(),
+                flow_id: "welcome".to_string(),
+            })
         );
     }
 
