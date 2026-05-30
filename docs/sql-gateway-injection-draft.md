@@ -1,94 +1,104 @@
 # SQL Gateway — greentic-start injection (ready-to-apply draft)
 
-**Status:** DRAFT — blocked on publishing `greentic-runner-host` with the `sql`
-module. Do not apply until that crate version is published and greentic-start's
-dependency is bumped. See spec/plan:
+**Status:** DRAFT — blocked on publishing `greentic-runner-host` (with the `sql`
+module + `sql::routes::router()` helper). Apply after that version is published
+and greentic-start's dependency is bumped. Spec/plan:
 `greentic-designer-extensions/docs/superpowers/{specs,plans}/2026-05-31-greentic-sql-gateway-runtime*`.
 
+## Serving topology — RESOLVED (was the open question)
+Traced live: **`greentic_runner_host::HostServer` is NOT used by `gtc start`** — it's
+only instantiated in the standalone `greentic-runner` binary (`greentic-runner-host/src/lib.rs`
+`run()`). `gtc start` (greentic-start) stands up two **hyper** (non-axum) servers —
+`HttpIngressServer` (`src/http_ingress/`, ~:8080) and `AdminServer` (mTLS, ~:9443) —
+and `DemoRunnerHost` (`src/runner_host/`) is a WASM executor with **no HTTP server**.
+So the `/sql` routes registered on `HostServer` (Task 6) are NOT reachable in a bundle.
+
+**Resolution: a dedicated localhost axum server in greentic-start** serving the SQL
+gateway via the reusable `greentic_runner_host::sql::routes::router(gateway)` helper
+(added on `research`, commit `5490ca7`). Bind it to **127.0.0.1** (internal only — the
+in-process design extension reaches it over localhost; no external exposure, which
+also sidesteps the network-allowlist worry). HostServer keeps its routes for the
+standalone runner binary; greentic-start gets its own tiny server.
+
 ## Current state (on `research`)
-- `greentic-runner-host` (branch merged to `research`, commit `a504139`) has the
-  full `src/sql/` gateway + `/sql/<conn>/{schema,query}` routes registered on
-  **`HostServer`** (`src/runner/mod.rs`) + `SqlGateway` in `ServerState` +
-  `HostServer::with_sql(...)` injection.
-- `greentic-start` (research) has a **re-declared** `SqlConfig`/`SqlConnectionConfig`/
-  `SqlEngine` in `src/config.rs` (mirrors `greentic_runner_host::sql::config`) and a
-  `DemoConfig.sql: Option<SqlConfig>` field. It depends on the **published**
-  `greentic-runner-host` crate (a `1.1.0-dev.<id>` version), NOT the local checkout.
+- `greentic-runner-host` (research, `a504139` + `5490ca7`): full `src/sql/` gateway,
+  `sql::routes::router(gateway) -> axum::Router`, `SqlGateway`, `HostServer::with_sql`.
+  25 sql tests pass.
+- `greentic-start` (research, `fe0bdb6`): re-declared `SqlConfig`/`SqlConnectionConfig`/
+  `SqlEngine` in `src/config.rs` + `DemoConfig.sql: Option<SqlConfig>`. Depends on the
+  **published** `greentic-runner-host` crate (not local).
 
-## ⚠️ OPEN QUESTION — resolve FIRST (blocks reachability)
-greentic-start does **not** construct `greentic_runner_host::HostServer`. It boots
-its own **`DemoRunnerHost`** (`src/runner_host/`) plus ingress/admin servers
-(`src/runtime.rs`, `src/admin_server.rs`). The `/sql/<conn>/...` routes were
-registered on `HostServer`, which may **not** be the HTTP server the bundle
-exposes / that the `greentic.sql` extension's host-`http` calls can reach.
+## Post-publish steps (apply in order)
 
-Before the gateway works end-to-end, confirm and reconcile ONE of:
-1. The bundle deployment actually serves `HostServer` somewhere (then injecting via
-   `HostServer::with_sql(...)` is enough — find that construction site), OR
-2. The `/sql` routes must be mounted on the server greentic-start really exposes
-   (DemoRunnerHost's router / the ingress axum app). In that case, expose a small
-   helper from `greentic-runner-host` to build an `axum::Router` for the SQL
-   gateway (e.g. `sql::routes::router(gateway) -> Router`) and `.merge()` it into
-   greentic-start's serving router, instead of relying on `HostServer`.
+### 1. Switch to the crate types + bump the dep
+- Bump the `greentic-runner-host` dependency in `greentic-start/Cargo.toml` to the
+  newly published version (the one containing the `sql` module + `router()`).
+- Delete the re-declared `SqlConfig`/`SqlConnectionConfig`/`SqlEngine` in `src/config.rs`;
+  change `DemoConfig.sql` to `Option<greentic_runner_host::sql::config::SqlConfig>`.
 
-Recommended: add `pub fn sql::routes::router(gateway: SqlGateway) -> axum::Router`
-to greentic-runner-host (a 5-line helper wrapping the two `.route(...)` calls
-with `.with_state(gateway)`), so BOTH `HostServer` and greentic-start's own server
-can mount it. Do this in the same runner-host change that gets published.
+### 2. Add a gateway port to the `sql:` config
+Add `port: Option<u16>` to `SqlConfig` (default e.g. 8765) so the bundle controls the
+local gateway port. (If editing the crate's `SqlConfig` is undesirable, keep the port
+in greentic-start's bundle/service config instead.)
 
-## Post-publish greentic-start wiring (apply after the above is resolved + published)
+### 3. Build the gateway from config + secrets
+Near the runner-host construction in `src/runtime.rs` (after
+`secrets_gate::resolve_secrets_manager(...)` ~line 785), build the gateway. Match the
+live secrets-handle API (find its `get`/`resolve` method):
+```rust
+let sql_gateway = if let Some(sql_cfg) = demo_config.sql.as_ref() {
+    let token = secrets_handle.resolve(&sql_cfg.auth_token_secret).await?;
+    if token.is_empty() && !sql_cfg.connections.is_empty() {
+        anyhow::bail!("sql.auth_token_secret resolved empty — refusing to start SQL gateway");
+    }
+    let mut conns = std::collections::HashMap::new();
+    for (name, c) in &sql_cfg.connections {
+        let dsn = secrets_handle.resolve(&c.dsn_secret).await?;
+        match greentic_runner_host::sql::pool::build(c.engine, &dsn, c.read_only).await {
+            Ok(pool) => { conns.insert(name.clone(),
+                greentic_runner_host::sql::SqlConnection { engine: c.engine, pool }); }
+            Err(e) => tracing::warn!("sql gateway: skip connection {name}: {e}"),
+        }
+    }
+    Some((greentic_runner_host::sql::SqlGateway::new(conns, token),
+          sql_cfg.port.unwrap_or(8765)))
+} else { None };
+```
 
-1. **Switch to the crate type** — delete the re-declared `SqlConfig`/`SqlConnectionConfig`/
-   `SqlEngine` in `src/config.rs` and change `DemoConfig.sql` to
-   `Option<greentic_runner_host::sql::config::SqlConfig>`. Bump the
-   `greentic-runner-host` dependency to the newly published version.
+### 4. Spawn the dedicated localhost axum server
+Alongside where `HttpIngressServer`/`AdminServer` are spawned (`src/runtime.rs` ~822):
+```rust
+if let Some((gateway, port)) = sql_gateway {
+    let app = greentic_runner_host::sql::routes::router(gateway);
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => {
+                tracing::info!("sql gateway listening on 127.0.0.1:{port}");
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::error!("sql gateway server error: {e}");
+                }
+            }
+            Err(e) => tracing::error!("sql gateway bind 127.0.0.1:{port}: {e}"),
+        }
+    });
+}
+```
+(Requires `axum` + `tokio` net in greentic-start — both are already deps; confirm.)
 
-2. **Build the gateway from config + secrets** — near where the runner host is
-   constructed (`src/runtime.rs`, after `secrets_gate::resolve_secrets_manager(...)`
-   at ~line 785), add (pseudocode against the live secrets API):
-   ```rust
-   let sql_gateway = if let Some(sql_cfg) = demo_config.sql.as_ref() {
-       let token = secrets_handle.resolve(&sql_cfg.auth_token_secret).await?;
-       let mut conns = std::collections::HashMap::new();
-       for (name, c) in &sql_cfg.connections {
-           let dsn = secrets_handle.resolve(&c.dsn_secret).await?;
-           match greentic_runner_host::sql::pool::build(c.engine, &dsn, c.read_only).await {
-               Ok(pool) => { conns.insert(name.clone(),
-                   greentic_runner_host::sql::SqlConnection { engine: c.engine, pool }); }
-               Err(e) => tracing::warn!("sql gateway: skip connection {name}: {e}"),
-           }
-       }
-       Some(greentic_runner_host::sql::SqlGateway::new(conns, token))
-   } else { None };
-   ```
-   (Match the live secrets-resolution method name — `resolve_secrets_manager` returns
-   a handle; find its `get`/`resolve` method.)
+### 5. Extension wiring (operator config)
+- `greentic.sql` extension's `secret://sql/connections` registry `base_url` per
+  connection → `http://127.0.0.1:<port>/sql/<conn>` (matching step 2's port).
+- Same token at `secret://sql/<name>/token` as `auth_token_secret`.
+- The extension's host-`http` already allows `127.0.0.1`/`localhost`
+  (net_allowlist in greentic-start's `runner_exec.rs`), so no extra allow-list needed
+  for the localhost gateway.
 
-3. **Inject** — pass `sql_gateway` into whichever server serves `/sql` (per the OPEN
-   QUESTION resolution): either `HostServer::with_sql(..., sql_gateway)` or
-   `.merge(sql::routes::router(gw))` into greentic-start's router.
+## Validation
+- `gtc start` a bundle with a `sql:` block + a temp SQLite DSN in secrets.
+- `curl -H "Authorization: Bearer <token>" http://127.0.0.1:<port>/sql/<conn>/schema`.
+- End-to-end via the `greentic.sql` extension's `sql_ask`.
 
-4. **Startup guard** (security follow-up from review) — refuse to start the gateway
-   if the resolved `auth_token` is empty while `connections` is non-empty:
-   ```rust
-   if let Some(gw_cfg) = demo_config.sql.as_ref() {
-       if token.is_empty() && !gw_cfg.connections.is_empty() {
-           anyhow::bail!("sql.auth_token_secret resolved empty — refusing to start SQL gateway");
-       }
-   }
-   ```
-
-5. **Extension wiring** — the operator sets the `greentic.sql` extension's
-   `secret://sql/connections` registry `base_url` to `http://<runner-host>:<port>/sql/<conn>`
-   and stores the same token at `secret://sql/<name>/token`. Ensure the extension's
-   `permissions.network` (or a runtime host-override) permits the runner's own host.
-
-## Validation after wiring
-- Build greentic-start; `gtc start` a bundle with a `sql:` block + a temp SQLite DSN.
-- `curl -H "Authorization: Bearer <token>" http://localhost:<port>/sql/<conn>/schema`.
-- Then end-to-end via the `greentic.sql` extension's `sql_ask`.
-
-## Known follow-ups (carried from the review)
-- PG/MySQL are compile-verified but untested (no live servers during build).
+## Known follow-ups (from review)
+- PG/MySQL compile-verified but untested (no live servers during build).
 - Empty-result → empty `columns` (v1 limitation).
-- Remove the `SqlConfig` duplication (step 1) once published.
+- Remove the `SqlConfig` duplication once on the published crate type (step 1).
