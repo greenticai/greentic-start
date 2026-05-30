@@ -5,6 +5,7 @@ use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::{Duration, SecondsFormat, Utc};
 use greentic_types::{ExtensionInline, decode_pack_manifest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -31,11 +32,44 @@ struct MessagingSubscriptionsExtension {
     #[serde(rename = "export")]
     export_name: String,
     #[serde(default)]
+    renewal_window_hours: Option<i64>,
+    #[serde(default)]
     state_template: Option<Value>,
     #[serde(default)]
     desired_state_template: Option<Value>,
     #[serde(default)]
     desired_subscriptions: Option<Value>,
+    #[serde(default)]
+    desired_state: Option<DesiredStateDeclaration>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+struct DesiredStateDeclaration {
+    #[serde(default)]
+    output_key: Option<String>,
+    #[serde(default)]
+    defaults: Map<String, Value>,
+    #[serde(default)]
+    notification_url: Option<NotificationUrlDeclaration>,
+    #[serde(default)]
+    expiration_policy: Option<ExpirationPolicyDeclaration>,
+    #[serde(default)]
+    templates: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct NotificationUrlDeclaration {
+    template: String,
+    #[serde(default)]
+    state_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct ExpirationPolicyDeclaration {
+    #[serde(default)]
+    state_key: Option<String>,
+    #[serde(default)]
+    host_supplied: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -70,9 +104,6 @@ pub fn sync_subscriptions_if_public_url_available(
         .filter(|provider| provider.domain == "messaging")
     {
         let Some(extension) = read_subscriptions_extension(&provider.pack_path)? else {
-            summary
-                .results
-                .push((provider.provider_id.clone(), "skipped".to_string()));
             continue;
         };
 
@@ -150,9 +181,10 @@ pub fn sync_subscriptions_if_public_url_available(
                 "output": outcome.output,
             });
             write_json(&state_path, &persisted)?;
-            summary
-                .results
-                .push((provider.provider_id.clone(), "synced".to_string()));
+            summary.results.push((
+                provider.provider_id.clone(),
+                subscription_result_description(&state, setup_answers.as_ref()),
+            ));
         } else {
             let error = outcome
                 .error
@@ -172,6 +204,89 @@ pub fn sync_subscriptions_if_public_url_available(
     }
 
     Ok(summary)
+}
+
+fn subscription_result_description(state: &Value, setup_answers: Option<&Value>) -> String {
+    let desired = state
+        .get("desired_subscriptions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if desired.is_empty() {
+        return "synced: no requested subscriptions".to_string();
+    }
+
+    let count = desired.len();
+    let mut parts = desired
+        .iter()
+        .take(3)
+        .map(subscription_target_label)
+        .collect::<Vec<_>>();
+    if desired.len() > parts.len() {
+        parts.push(format!("+{} more", desired.len() - parts.len()));
+    }
+
+    let setup_label = setup_answer_display_label(setup_answers)
+        .map(|label| format!(" for {label}"))
+        .unwrap_or_default();
+    let expires = first_expiration(&desired)
+        .map(|value| format!("; renews until {value}"))
+        .unwrap_or_default();
+    let noun = if count == 1 {
+        "subscription"
+    } else {
+        "subscriptions"
+    };
+    format!(
+        "synced {count} {noun}{setup_label}: {}{expires}",
+        parts.join(", ")
+    )
+}
+
+fn subscription_target_label(value: &Value) -> String {
+    for key in ["label", "display_name", "name", "resource"] {
+        if let Some(label) = value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+        {
+            return label.to_string();
+        }
+    }
+    "requested subscription".to_string()
+}
+
+fn setup_answer_display_label(setup_answers: Option<&Value>) -> Option<String> {
+    let answers = setup_answers.and_then(Value::as_object)?;
+    for suffix in [
+        "channel_name",
+        "calendar_name",
+        "mailbox_name",
+        "folder_name",
+        "chat_name",
+    ] {
+        if let Some(label) = answers
+            .get(suffix)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+        {
+            return Some(label.to_string());
+        }
+    }
+    None
+}
+
+fn first_expiration(desired: &[Value]) -> Option<String> {
+    desired.iter().find_map(|value| {
+        value
+            .get("expiration_datetime")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn read_subscriptions_extension(
@@ -266,6 +381,10 @@ fn build_subscription_state(
         return Some(expand_template_value(template, &context));
     }
 
+    if let Some(desired_state) = &extension.desired_state {
+        return build_declared_desired_state(extension, desired_state, &context, &notification_url);
+    }
+
     if let Some(desired) = setup_answers
         .and_then(|answers| answers.get("desired_subscriptions"))
         .or(extension.desired_subscriptions.as_ref())
@@ -278,6 +397,124 @@ fn build_subscription_state(
     }
 
     None
+}
+
+fn build_declared_desired_state(
+    extension: &MessagingSubscriptionsExtension,
+    desired_state: &DesiredStateDeclaration,
+    base_context: &BTreeMap<String, String>,
+    default_notification_url: &str,
+) -> Option<Value> {
+    let mut context = base_context.clone();
+    let notification_url = desired_state
+        .notification_url
+        .as_ref()
+        .map(|decl| expand_template_string(&decl.template, &context))
+        .unwrap_or_else(|| default_notification_url.to_string());
+    context.insert("notification_url".to_string(), notification_url.clone());
+    context.insert("webhook_url".to_string(), notification_url.clone());
+
+    if let Some(policy) = &desired_state.expiration_policy
+        && policy.host_supplied
+        && let Some(state_key) = policy.state_key.as_deref()
+    {
+        context
+            .entry(state_key.to_string())
+            .or_insert_with(|| generated_expiration_datetime(extension.renewal_window_hours));
+    }
+
+    let desired = desired_state
+        .templates
+        .iter()
+        .filter_map(|template| {
+            build_desired_subscription_from_template(template, desired_state, &context)
+        })
+        .collect::<Vec<_>>();
+    if desired.is_empty() {
+        return None;
+    }
+
+    let output_key = desired_state
+        .output_key
+        .as_deref()
+        .unwrap_or("desired_subscriptions");
+    let notification_state_key = desired_state
+        .notification_url
+        .as_ref()
+        .and_then(|decl| decl.state_key.as_deref())
+        .unwrap_or("notification_url");
+    let mut state = Map::new();
+    state.insert(
+        "webhook_url".to_string(),
+        Value::String(notification_url.clone()),
+    );
+    state.insert(
+        "notification_url".to_string(),
+        Value::String(notification_url.clone()),
+    );
+    state.insert(
+        notification_state_key.to_string(),
+        Value::String(notification_url),
+    );
+    if let Some(policy) = &desired_state.expiration_policy
+        && let Some(state_key) = policy.state_key.as_deref()
+        && let Some(value) = context.get(state_key)
+    {
+        state.insert(state_key.to_string(), Value::String(value.clone()));
+    }
+    state.insert(output_key.to_string(), Value::Array(desired));
+    Some(Value::Object(state))
+}
+
+fn build_desired_subscription_from_template(
+    template: &Value,
+    desired_state: &DesiredStateDeclaration,
+    context: &BTreeMap<String, String>,
+) -> Option<Value> {
+    let template = template.as_object()?;
+    if !template_conditions_match(template, context) {
+        return None;
+    }
+
+    let mut entry = desired_state.defaults.clone();
+    for (key, value) in template {
+        match key.as_str() {
+            "id" | "when_all" => {}
+            "resource_template" => {
+                entry.insert(
+                    "resource".to_string(),
+                    expand_template_value(value, context),
+                );
+            }
+            _ => {
+                entry.insert(key.clone(), expand_template_value(value, context));
+            }
+        }
+    }
+    Some(Value::Object(entry))
+}
+
+fn template_conditions_match(
+    template: &Map<String, Value>,
+    context: &BTreeMap<String, String>,
+) -> bool {
+    template
+        .get("when_all")
+        .and_then(Value::as_array)
+        .map(|keys| {
+            keys.iter().all(|key| {
+                key.as_str()
+                    .and_then(|name| context.get(name))
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(true)
+}
+
+fn generated_expiration_datetime(renewal_window_hours: Option<i64>) -> String {
+    let hours = renewal_window_hours.unwrap_or(24).max(1);
+    (Utc::now() + Duration::hours(hours)).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 fn template_context(
@@ -340,9 +577,11 @@ mod tests {
         MessagingSubscriptionsExtension {
             component_ref: "subscription-component".to_string(),
             export_name: "sync-subscriptions".to_string(),
+            renewal_window_hours: None,
             state_template: Some(template),
             desired_state_template: None,
             desired_subscriptions: None,
+            desired_state: None,
         }
     }
 
@@ -388,9 +627,11 @@ mod tests {
         let extension = MessagingSubscriptionsExtension {
             component_ref: "subscription-component".to_string(),
             export_name: "sync-subscriptions".to_string(),
+            renewal_window_hours: None,
             state_template: None,
             desired_state_template: None,
             desired_subscriptions: None,
+            desired_state: None,
         };
         let setup = json!({
             "desired_subscriptions": [{
@@ -426,9 +667,11 @@ mod tests {
         let extension = MessagingSubscriptionsExtension {
             component_ref: "subscription-component".to_string(),
             export_name: "sync-subscriptions".to_string(),
+            renewal_window_hours: None,
             state_template: None,
             desired_state_template: None,
             desired_subscriptions: None,
+            desired_state: None,
         };
 
         assert!(
@@ -441,6 +684,98 @@ mod tests {
                 "https://public.example",
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn builds_state_from_declared_desired_state_templates() {
+        let extension = MessagingSubscriptionsExtension {
+            component_ref: "subscription-component".to_string(),
+            export_name: "sync-subscriptions".to_string(),
+            renewal_window_hours: Some(6),
+            state_template: None,
+            desired_state_template: None,
+            desired_subscriptions: None,
+            desired_state: Some(DesiredStateDeclaration {
+                output_key: Some("desired_subscriptions".to_string()),
+                defaults: Map::from_iter([(
+                    "change_type".to_string(),
+                    Value::String("created".to_string()),
+                )]),
+                notification_url: Some(NotificationUrlDeclaration {
+                    template: "{public_base_url}/hooks/{provider_id}/{tenant}/{team}".to_string(),
+                    state_key: Some("notification_url".to_string()),
+                }),
+                expiration_policy: Some(ExpirationPolicyDeclaration {
+                    state_key: Some("expiration_datetime".to_string()),
+                    host_supplied: true,
+                }),
+                templates: vec![
+                    json!({
+                        "id": "account_stream_messages",
+                        "when_all": ["account_id", "stream_id"],
+                        "resource_template": "/accounts/{account_id}/streams/{stream_id}/messages",
+                        "expiration_datetime": "{expiration_datetime}",
+                        "notification_url": "{notification_url}"
+                    }),
+                    json!({
+                        "id": "direct_messages",
+                        "when_all": ["chat_id"],
+                        "resource_template": "/chats/{chat_id}/messages"
+                    }),
+                ],
+            }),
+        };
+        let setup = json!({
+            "account_id": "acct-1",
+            "stream_id": "stream-2"
+        });
+
+        let state = build_subscription_state(
+            &extension,
+            Some(&setup),
+            "messaging-generic",
+            "demo",
+            "default",
+            "https://public.example",
+        )
+        .expect("state");
+
+        assert_eq!(
+            state["webhook_url"],
+            "https://public.example/hooks/messaging-generic/demo/default"
+        );
+        assert_eq!(
+            state["desired_subscriptions"][0]["resource"],
+            "/accounts/acct-1/streams/stream-2/messages"
+        );
+        assert_eq!(
+            state["desired_subscriptions"][0]["notification_url"],
+            "https://public.example/hooks/messaging-generic/demo/default"
+        );
+        assert_eq!(state["desired_subscriptions"].as_array().unwrap().len(), 1);
+        let expiration = state["desired_subscriptions"][0]["expiration_datetime"]
+            .as_str()
+            .expect("expiration");
+        assert!(expiration.ends_with('Z'));
+        assert!(chrono::DateTime::parse_from_rfc3339(expiration).is_ok());
+    }
+
+    #[test]
+    fn subscription_result_description_names_requested_targets() {
+        let state = json!({
+            "desired_subscriptions": [{
+                "resource": "/accounts/acct-1/streams/stream-2/messages",
+                "expiration_datetime": "2026-01-01T00:00:00Z"
+            }]
+        });
+        let setup = json!({
+            "channel_name": "Support"
+        });
+
+        assert_eq!(
+            subscription_result_description(&state, Some(&setup)),
+            "synced 1 subscription for Support: /accounts/acct-1/streams/stream-2/messages; renews until 2026-01-01T00:00:00Z"
         );
     }
 }
