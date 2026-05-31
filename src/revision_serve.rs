@@ -807,31 +807,22 @@ fn build_activity(
     activity
 }
 
-/// Resolve the M1.5 welcome-flow hint for a request. Returns `Some` only when
-/// **all three** hold:
+/// Resolve the M1.5 welcome-flow hint for a request, projecting the
+/// admit-table's bundle-scoped lookup into the runner-host `WelcomeFlowHint`
+/// shape. Runner-host gates the override on a first-contact marker, so
+/// attaching on every matching turn is safe (greentic-runner#382).
 ///
-/// 1. the caller asserted an endpoint,
-/// 2. the env declared that endpoint with a `welcome_flow` ref, AND
-/// 3. the welcome ref's `bundle_id` matches the bundle dispatch picked.
+/// See [`EndpointAdmit::welcome_flow_for_bundle`] for the invariant the
+/// bundle-scoped lookup enforces.
 ///
-/// Step 3 matters because endpoints can `linked_bundles` more than one
-/// bundle (`linked_bundles: Vec<BundleId>`); the deploy-spec only invariant
-/// is `welcome_flow.bundle_id ∈ linked_bundles`, NOT that dispatch lands on
-/// the welcome bundle. Letting the hint cross bundles would target B's
-/// pack/flow on A's revision — wrong runtime entirely. When the bundles
-/// diverge, drop the hint silently and let the regular router handle the
-/// first contact on the dispatched bundle.
-///
-/// Runner-host gates the override on a first-contact marker, so attaching
-/// on every matching turn is safe (greentic-runner#382).
+/// [`EndpointAdmit::welcome_flow_for_bundle`]: crate::endpoint_admit::EndpointAdmit::welcome_flow_for_bundle
 fn resolve_welcome_flow_hint(
     endpoint_id: Option<&str>,
     dispatched_bundle: &BundleId,
     admit: &crate::endpoint_admit::EndpointAdmit,
 ) -> Option<WelcomeFlowHint> {
     endpoint_id
-        .and_then(|eid| admit.welcome_flow(eid))
-        .filter(|ref_| &ref_.bundle_id == dispatched_bundle)
+        .and_then(|eid| admit.welcome_flow_for_bundle(eid, dispatched_bundle))
         .map(|ref_| WelcomeFlowHint {
             pack_id: ref_.pack_id.as_str().to_string(),
             flow_id: ref_.flow_id.clone(),
@@ -1159,6 +1150,7 @@ mod tests {
     use super::*;
     // `BundleId` is used only in tests (prod refers to it via the `RevisionKey`
     // alias), so it lives here rather than in the library import set.
+    use greentic_deploy_spec::WelcomeFlowRef;
     use greentic_deploy_spec::ids::BundleId;
     use greentic_runner_host::engine::runtime::{FlowResumeStore, IngressEnvelope};
     use greentic_runner_host::runner::engine::{ExecutionState, FlowSnapshot, FlowWait};
@@ -1242,11 +1234,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_welcome_flow_hint_returns_hint_when_endpoint_declares_it() {
+    /// Build an `EndpointAdmit` populated with one endpoint and return both
+    /// the on-wire endpoint id (the same string `serve` would resolve from
+    /// the header) and the admit table.
+    fn admit_with_endpoint(
+        linked_bundles: Vec<BundleId>,
+        welcome_flow: Option<WelcomeFlowRef>,
+    ) -> (String, crate::endpoint_admit::EndpointAdmit) {
         use greentic_deploy_spec::{
-            BundleId, Environment, EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId,
-            PackId, SchemaVersion, WelcomeFlowRef,
+            Environment, EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId,
+            SchemaVersion,
         };
         use greentic_types::EnvId;
         let env_id = EnvId::try_from("local").unwrap();
@@ -1261,12 +1258,8 @@ mod tests {
             provider_type: "teams".to_string(),
             display_name: "Legal".to_string(),
             secret_refs: Vec::new(),
-            linked_bundles: vec![BundleId::new("legal-bundle")],
-            welcome_flow: Some(WelcomeFlowRef {
-                bundle_id: BundleId::new("legal-bundle"),
-                pack_id: PackId::new("legal-pack"),
-                flow_id: "welcome".to_string(),
-            }),
+            linked_bundles,
+            welcome_flow,
             generation: 1,
             created_at: now,
             updated_at: now,
@@ -1292,10 +1285,26 @@ mod tests {
             retention: Default::default(),
             health: Default::default(),
         };
-        let admit = crate::endpoint_admit::EndpointAdmit::from_environment(&env);
+        (
+            wire_id,
+            crate::endpoint_admit::EndpointAdmit::from_environment(&env),
+        )
+    }
+
+    #[test]
+    fn resolve_welcome_flow_hint_returns_hint_when_endpoint_declares_it() {
+        use greentic_deploy_spec::{PackId, WelcomeFlowRef};
+        let (wire_id, admit) = admit_with_endpoint(
+            vec![BundleId::new("legal-bundle")],
+            Some(WelcomeFlowRef {
+                bundle_id: BundleId::new("legal-bundle"),
+                pack_id: PackId::new("legal-pack"),
+                flow_id: "welcome".to_string(),
+            }),
+        );
 
         assert_eq!(
-            resolve_welcome_flow_hint(Some(&wire_id), &BundleId::new("legal-bundle"), &admit,),
+            resolve_welcome_flow_hint(Some(&wire_id), &BundleId::new("legal-bundle"), &admit),
             Some(WelcomeFlowHint {
                 pack_id: "legal-pack".to_string(),
                 flow_id: "welcome".to_string(),
@@ -1307,7 +1316,6 @@ mod tests {
     fn resolve_welcome_flow_hint_returns_none_without_endpoint() {
         // No endpoint asserted ⇒ no hint, even if some other endpoint in the
         // admit table has a welcome_flow declared.
-        use greentic_deploy_spec::ids::BundleId;
         let admit = crate::endpoint_admit::EndpointAdmit::default();
         assert_eq!(
             resolve_welcome_flow_hint(None, &BundleId::new("any-bundle"), &admit),
@@ -1320,10 +1328,9 @@ mod tests {
         // Endpoint declared but `welcome_flow` unset ⇒ no hint. Same shape as
         // an unknown endpoint (the unknown-vs-unset split belongs at the admit
         // gate, not here).
-        use greentic_deploy_spec::ids::BundleId;
         let admit = crate::endpoint_admit::EndpointAdmit::default();
         assert_eq!(
-            resolve_welcome_flow_hint(Some("teams-legal"), &BundleId::new("any-bundle"), &admit,),
+            resolve_welcome_flow_hint(Some("teams-legal"), &BundleId::new("any-bundle"), &admit),
             None
         );
     }
@@ -1335,55 +1342,15 @@ mod tests {
         // running B's pack/flow on A's revision would either misroute or 500.
         // The deploy-spec only invariant is `welcome_flow.bundle_id ∈
         // linked_bundles`, NOT that dispatch lands on the welcome bundle.
-        use greentic_deploy_spec::{
-            BundleId, Environment, EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId,
-            PackId, SchemaVersion, WelcomeFlowRef,
-        };
-        use greentic_types::EnvId;
-        let env_id = EnvId::try_from("local").unwrap();
-        let endpoint_id = MessagingEndpointId::new();
-        let wire_id = endpoint_id.to_string();
-        let now = chrono::Utc::now();
-        let endpoint = MessagingEndpoint {
-            schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
-            env_id: env_id.clone(),
-            endpoint_id,
-            provider_id: "teams-legal".to_string(),
-            provider_type: "teams".to_string(),
-            display_name: "Legal".to_string(),
-            secret_refs: Vec::new(),
-            linked_bundles: vec![BundleId::new("bundle-a"), BundleId::new("bundle-b")],
-            welcome_flow: Some(WelcomeFlowRef {
+        use greentic_deploy_spec::{PackId, WelcomeFlowRef};
+        let (wire_id, admit) = admit_with_endpoint(
+            vec![BundleId::new("bundle-a"), BundleId::new("bundle-b")],
+            Some(WelcomeFlowRef {
                 bundle_id: BundleId::new("bundle-b"),
                 pack_id: PackId::new("legal-pack"),
                 flow_id: "welcome".to_string(),
             }),
-            generation: 1,
-            created_at: now,
-            updated_at: now,
-            updated_by: "test".to_string(),
-        };
-        let env = Environment {
-            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
-            environment_id: env_id.clone(),
-            name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id,
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-            },
-            packs: Vec::new(),
-            messaging_endpoints: vec![endpoint],
-            credentials_ref: None,
-            bundles: Vec::new(),
-            revisions: Vec::new(),
-            traffic_splits: Vec::new(),
-            revocation: Default::default(),
-            retention: Default::default(),
-            health: Default::default(),
-        };
-        let admit = crate::endpoint_admit::EndpointAdmit::from_environment(&env);
+        );
 
         // Dispatch chose bundle A — welcome ref targets B ⇒ drop the hint.
         assert_eq!(

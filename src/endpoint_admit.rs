@@ -32,7 +32,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use greentic_deploy_spec::{Environment, WelcomeFlowRef};
+use greentic_deploy_spec::{BundleId, Environment, WelcomeFlowRef};
 
 /// The per-endpoint state the revision ingress needs at request time:
 /// the `linked_bundles` ACL plus the M1.5 welcome-flow ref (if declared).
@@ -88,21 +88,42 @@ impl EndpointAdmit {
         self.by_id.get(endpoint_id).map(|e| &e.linked_bundles)
     }
 
-    /// Look up the M1.5 welcome-flow ref for `endpoint_id`, if the endpoint is
-    /// declared AND has `welcome_flow` set. Returns `None` for both unknown
-    /// endpoints and known-but-unset welcome flows — the producer cannot
-    /// distinguish those at this site because [`linked_bundles`] has already
-    /// classified unknowns as `UNAUTHORIZED` upstream.
+    /// Look up the raw M1.5 welcome-flow ref for `endpoint_id`, if the
+    /// endpoint is declared AND has `welcome_flow` set. Returns `None` for
+    /// both unknown endpoints and known-but-unset welcome flows — the
+    /// producer cannot distinguish those at this site because
+    /// [`linked_bundles`] has already classified unknowns as `UNAUTHORIZED`
+    /// upstream.
     ///
-    /// Called from `revision_serve::serve` to build the per-request
-    /// `WelcomeFlowHint`; the runner-host gates it on a first-contact marker
-    /// so attaching the hint on every turn is safe.
+    /// Most callers want [`welcome_flow_for_bundle`]; this raw lookup is
+    /// kept for projection-level tests.
     ///
     /// [`linked_bundles`]: EndpointAdmit::linked_bundles
+    /// [`welcome_flow_for_bundle`]: EndpointAdmit::welcome_flow_for_bundle
     pub(crate) fn welcome_flow(&self, endpoint_id: &str) -> Option<&WelcomeFlowRef> {
         self.by_id
             .get(endpoint_id)
             .and_then(|e| e.welcome_flow.as_ref())
+    }
+
+    /// Look up the welcome-flow ref for `endpoint_id` **only when the
+    /// dispatched bundle matches the welcome ref's bundle**. Returns `None`
+    /// when the endpoint is unknown, has no welcome ref, OR dispatched into
+    /// a sibling bundle.
+    ///
+    /// The deploy-spec only invariant is `welcome_flow.bundle_id ∈
+    /// linked_bundles`, NOT that dispatch lands on the welcome bundle.
+    /// Endpoints can `linked_bundles` more than one bundle, and dispatch
+    /// picks one via traffic splits / pins. Crossing bundles would target
+    /// the welcome bundle's pack/flow on a sibling bundle's revision —
+    /// either misroute (pack-id collision) or 500 (pack absent).
+    pub(crate) fn welcome_flow_for_bundle(
+        &self,
+        endpoint_id: &str,
+        dispatched_bundle: &BundleId,
+    ) -> Option<&WelcomeFlowRef> {
+        self.welcome_flow(endpoint_id)
+            .filter(|ref_| &ref_.bundle_id == dispatched_bundle)
     }
 }
 
@@ -230,5 +251,38 @@ mod tests {
 
         assert!(admit.welcome_flow(&id).is_none());
         assert!(admit.welcome_flow("bogus-endpoint-id").is_none());
+    }
+
+    #[test]
+    fn welcome_flow_for_bundle_returns_ref_only_when_bundle_matches() {
+        let mut ep = endpoint("teams-legal", &["bundle-a", "bundle-b"]);
+        ep.welcome_flow = Some(WelcomeFlowRef {
+            bundle_id: BundleId::new("bundle-b"),
+            pack_id: PackId::new("legal-pack"),
+            flow_id: "welcome".to_string(),
+        });
+        let id = ep.endpoint_id.to_string();
+        let admit = EndpointAdmit::from_environment(&env_with(vec![ep]));
+
+        // Dispatch to the welcome bundle ⇒ ref returned.
+        let hit = admit
+            .welcome_flow_for_bundle(&id, &BundleId::new("bundle-b"))
+            .expect("ref present");
+        assert_eq!(hit.bundle_id.as_str(), "bundle-b");
+
+        // Dispatch to a sibling bundle ⇒ None (cross-bundle hint would
+        // target B's pack/flow on A's revision).
+        assert!(
+            admit
+                .welcome_flow_for_bundle(&id, &BundleId::new("bundle-a"))
+                .is_none()
+        );
+
+        // Unknown endpoint ⇒ None regardless of bundle.
+        assert!(
+            admit
+                .welcome_flow_for_bundle("bogus-endpoint-id", &BundleId::new("bundle-b"))
+                .is_none()
+        );
     }
 }
