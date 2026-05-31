@@ -261,6 +261,11 @@ pub(super) fn build_demo_host_config(tenant: &str) -> HostConfig {
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        // The `agents` field exists because greentic-start enables the
+        // `agentic-worker` feature on its runner deps. This demo host config
+        // declares no agents; Digital Worker agents reach the runtime via the
+        // bindings-YAML `agents:` section (HostConfig::load_from_path).
+        agents: HashMap::new(),
     }
 }
 
