@@ -1045,7 +1045,7 @@ pub fn demo_up_services(
     } else {
         crate::webhook_updater::WebhookUpdateSummary::default()
     };
-    let subscription_summary = if let Some(ref new_url) = public_base_url {
+    let subscription_summary =
         match crate::subscription_updater::sync_subscriptions_if_public_url_available(
             config_dir,
             &discovery,
@@ -1053,7 +1053,7 @@ pub fn demo_up_services(
             Some(runner_host.as_ref()),
             tenant,
             team,
-            new_url,
+            public_base_url.as_deref().unwrap_or(""),
         ) {
             Ok(summary) => summary,
             Err(err) => {
@@ -1066,10 +1066,7 @@ pub fn demo_up_services(
                 );
                 crate::subscription_updater::SubscriptionUpdateSummary::default()
             }
-        }
-    } else {
-        crate::subscription_updater::SubscriptionUpdateSummary::default()
-    };
+        };
 
     // http_listener_enabled: true if HTTP ingress server started (not tied to NATS)
     // asset_serving_enabled: true if bundle declares static routes we're enabling
@@ -1386,7 +1383,7 @@ fn detect_http_ingress_domains(
         let supported = discovery.providers.iter().any(|provider| {
             let domain_match = parse_domain_name(&provider.domain) == Some(domain);
             let op_support = runner_host.supports_op(domain, &provider.provider_id, "ingest_http");
-            operator_log::info(
+            operator_log::debug(
                 module_path!(),
                 format!(
                     "[domain-detect] domain={:?} provider={} domain_match={} op_support={}",
@@ -1396,7 +1393,7 @@ fn detect_http_ingress_domains(
             domain_match && op_support
         });
         let fallback_supported = matches!(domain, Domain::Events) && discovery.domains.events;
-        operator_log::info(
+        operator_log::debug(
             module_path!(),
             format!(
                 "[domain-detect] domain={:?} supported={} fallback={} => enabled={}",

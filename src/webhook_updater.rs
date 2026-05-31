@@ -6,16 +6,17 @@
 //! 2. Re-registers webhooks for providers that declare webhook ops
 
 use std::path::Path;
+use std::{future::Future, thread};
 
 use anyhow::{Context, Result};
 use greentic_secrets_lib::{DevStore, SecretFormat, SecretsStore};
 use serde_json::{Map, Value};
-use tokio::runtime::Builder as TokioBuilder;
 
 use crate::discovery::{DetectedProvider, DiscoveryResult};
 use crate::domains::Domain;
 use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
+use crate::secret_name;
 use crate::secret_requirements::load_secret_keys_from_pack;
 use crate::secrets_gate::{SecretsManagerHandle, canonical_secret_uri};
 use crate::secrets_setup::resolve_env;
@@ -112,6 +113,18 @@ pub fn update_webhooks_if_url_changed(
         .iter()
         .filter(|p| p.domain == "messaging")
         .collect();
+    operator_log::info(
+        module_path!(),
+        format!(
+            "[webhook-updater] messaging providers discovered count={} providers={}",
+            messaging_providers.len(),
+            messaging_providers
+                .iter()
+                .map(|provider| provider.provider_id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    );
 
     if messaging_providers.is_empty() {
         operator_log::debug(
@@ -125,6 +138,13 @@ pub fn update_webhooks_if_url_changed(
 
     for provider in &messaging_providers {
         let mut provider_webhook_count: u32 = 0;
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[webhook-updater] provider={} webhook check started",
+                provider.provider_id
+            ),
+        );
 
         // Step 1: Update public_base_url secret for this provider
         match update_provider_public_url_secret(
@@ -185,10 +205,10 @@ pub fn update_webhooks_if_url_changed(
                 );
             }
             Ok(false) => {
-                operator_log::debug(
+                operator_log::info(
                     module_path!(),
                     format!(
-                        "[webhook-updater] webhook not applicable for {}",
+                        "[webhook-updater] webhook skipped for {}",
                         provider.provider_id
                     ),
                 );
@@ -237,10 +257,8 @@ fn update_provider_public_url_secret(
     let env = resolve_env(None);
     let uri = canonical_secret_uri(&env, tenant, Some(team), provider_id, "public_base_url");
 
-    let rt = TokioBuilder::new_current_thread().enable_all().build()?;
-
     // Check if current value is different
-    let current_value = read_secret_bytes(&rt, secrets_handle, &uri).ok();
+    let current_value = read_secret_bytes(secrets_handle, &uri).ok();
     let current_url = current_value
         .as_ref()
         .and_then(|v| String::from_utf8(v.clone()).ok());
@@ -253,29 +271,53 @@ fn update_provider_public_url_secret(
     // `SecretsClient` is intentionally read-only, so use the writable dev store when present.
     if let Some(path) = secrets_handle.dev_store_path.as_ref() {
         let store = DevStore::with_path(path.clone())?;
-        rt.block_on(store.put(&uri, SecretFormat::Text, new_url.as_bytes()))
+        let uri = uri.clone();
+        let bytes = new_url.as_bytes().to_vec();
+        block_on_temp_runtime(async move { store.put(&uri, SecretFormat::Text, &bytes).await })
             .map_err(|e| anyhow::anyhow!("failed to write secret: {:?}", e))?;
     } else {
-        rt.block_on(secrets_handle.manager().write(&uri, new_url.as_bytes()))
+        let manager = secrets_handle.manager();
+        let uri = uri.clone();
+        let bytes = new_url.as_bytes().to_vec();
+        block_on_temp_runtime(async move { manager.write(&uri, &bytes).await })
             .map_err(|e| anyhow::anyhow!("failed to write secret: {:?}", e))?;
     }
 
     Ok(true)
 }
 
-fn read_secret_bytes(
-    rt: &tokio::runtime::Runtime,
-    secrets_handle: &SecretsManagerHandle,
-    uri: &str,
-) -> Result<Vec<u8>> {
+fn read_secret_bytes(secrets_handle: &SecretsManagerHandle, uri: &str) -> Result<Vec<u8>> {
     if let Some(path) = secrets_handle.dev_store_path.as_ref() {
         let store = DevStore::with_path(path.clone())?;
-        return rt
-            .block_on(store.get(uri))
+        let uri = uri.to_string();
+        return block_on_temp_runtime(async move { store.get(&uri).await })
             .map_err(|e| anyhow::anyhow!("failed to read secret: {:?}", e));
     }
-    rt.block_on(secrets_handle.manager().read(uri))
+    let manager = secrets_handle.manager();
+    let uri = uri.to_string();
+    block_on_temp_runtime(async move { manager.read(&uri).await })
         .map_err(|e| anyhow::anyhow!("failed to read secret: {:?}", e))
+}
+
+fn block_on_temp_runtime<F, T>(future: F) -> T
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let run = move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build temporary tokio runtime")
+            .block_on(future)
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        thread::spawn(run)
+            .join()
+            .expect("temporary tokio runtime thread panicked")
+    } else {
+        run()
+    }
 }
 
 /// Update webhook for a single provider.
@@ -330,9 +372,21 @@ fn update_provider_webhook(
 
     // Fallback: invoke provider WASM setup_webhook op directly
     let Some(host) = runner_host else {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[webhook-updater] provider={provider_id} webhook skipped reason=runner_host_unavailable"
+            ),
+        );
         return Ok(false);
     };
     if !host.supports_op(Domain::Messaging, provider_id, "setup_webhook") {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[webhook-updater] provider={provider_id} webhook skipped reason=no_setup_webhook_op"
+            ),
+        );
         return Ok(false);
     }
     let ctx = OperatorContext {
@@ -442,14 +496,15 @@ pub(crate) fn build_provider_config(
         return Ok(Value::Object(config));
     }
 
+    remove_declared_secret_values_from_setup_answers(&mut config, &secret_keys);
+
     // Read secrets and add to config
     let env = resolve_env(None);
-    let rt = TokioBuilder::new_current_thread().enable_all().build()?;
 
     for key in &secret_keys {
         let uri = canonical_secret_uri(&env, tenant, Some(team), provider_id, key);
 
-        match read_secret_bytes(&rt, secrets_handle, &uri) {
+        match read_secret_bytes(secrets_handle, &uri) {
             Ok(bytes) => {
                 // Try to decode as UTF-8 string first
                 if let Ok(value_str) = String::from_utf8(bytes.clone()) {
@@ -474,6 +529,19 @@ pub(crate) fn build_provider_config(
     }
 
     Ok(Value::Object(config))
+}
+
+fn remove_declared_secret_values_from_setup_answers(
+    config: &mut Map<String, Value>,
+    keys: &[String],
+) {
+    for key in keys {
+        let canonical = secret_name::canonical_secret_name(key);
+        config.remove(key);
+        config.remove(&canonical);
+        config.remove(&key.to_lowercase());
+        config.remove(&key.to_uppercase());
+    }
 }
 
 fn merge_provider_setup_answers(
@@ -809,5 +877,128 @@ mod tests {
         assert_eq!(config["public_base_url"], "https://demo.example");
         assert_eq!(config["bot_token"], "xoxb-123");
         assert_eq!(config["cert_b64"], "AJ+Slg==");
+    }
+
+    #[test]
+    fn build_provider_config_does_not_preserve_stale_setup_secret_values() {
+        let tmp = TempDir::new().unwrap();
+        let provider_config_dir = tmp
+            .path()
+            .join("state")
+            .join("config")
+            .join("messaging-slack");
+        std::fs::create_dir_all(&provider_config_dir).expect("provider config dir");
+        std::fs::write(
+            provider_config_dir.join("setup-answers.json"),
+            serde_json::to_vec(&json!({
+                "slack_configuration_access_token": "stale-access",
+                "SLACK_CONFIGURATION_REFRESH_TOKEN": "stale-refresh",
+                "default_channel": "C123"
+            }))
+            .unwrap(),
+        )
+        .expect("setup answers");
+
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(tmp.path(), "demo", Some("default")).unwrap();
+        let pack_path = tmp.path().join("provider.gtpack");
+        let file = std::fs::File::create(&pack_path).expect("pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "assets/secret-requirements.json",
+            zip::write::FileOptions::<()>::default(),
+        )
+        .expect("requirements");
+        zip.write_all(
+            serde_json::to_string(&json!([
+                {"key": "SLACK_CONFIGURATION_ACCESS_TOKEN"},
+                {"key": "SLACK_CONFIGURATION_REFRESH_TOKEN"}
+            ]))
+            .unwrap()
+            .as_bytes(),
+        )
+        .expect("write requirements");
+        zip.finish().expect("finish pack");
+
+        let config = build_provider_config(
+            tmp.path(),
+            &secrets_handle,
+            "demo",
+            "default",
+            "messaging-slack",
+            &pack_path,
+            "https://demo.example",
+        )
+        .unwrap();
+
+        assert_eq!(config["default_channel"], "C123");
+        assert!(config.get("slack_configuration_access_token").is_none());
+        assert!(config.get("SLACK_CONFIGURATION_REFRESH_TOKEN").is_none());
+    }
+
+    #[test]
+    fn build_provider_config_overlays_current_secret_after_scrubbing_setup_value() {
+        let tmp = TempDir::new().unwrap();
+        let provider_config_dir = tmp
+            .path()
+            .join("state")
+            .join("config")
+            .join("messaging-slack");
+        std::fs::create_dir_all(&provider_config_dir).expect("provider config dir");
+        std::fs::write(
+            provider_config_dir.join("setup-answers.json"),
+            serde_json::to_vec(&json!({
+                "slack_configuration_access_token": "stale-access"
+            }))
+            .unwrap(),
+        )
+        .expect("setup answers");
+
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(tmp.path(), "demo", Some("default")).unwrap();
+        let env = resolve_env(None);
+        let runtime = Runtime::new().unwrap();
+        let token_uri = secrets_gate::canonical_secret_uri(
+            &env,
+            "demo",
+            Some("default"),
+            "messaging-slack",
+            "SLACK_CONFIGURATION_ACCESS_TOKEN",
+        );
+        let store = DevStore::with_path(secrets_handle.dev_store_path.clone().unwrap()).unwrap();
+        runtime
+            .block_on(store.put(&token_uri, SecretFormat::Text, b"fresh-access"))
+            .unwrap();
+
+        let pack_path = tmp.path().join("provider.gtpack");
+        let file = std::fs::File::create(&pack_path).expect("pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "assets/secret-requirements.json",
+            zip::write::FileOptions::<()>::default(),
+        )
+        .expect("requirements");
+        zip.write_all(
+            serde_json::to_string(&json!([
+                {"key": "SLACK_CONFIGURATION_ACCESS_TOKEN"}
+            ]))
+            .unwrap()
+            .as_bytes(),
+        )
+        .expect("write requirements");
+        zip.finish().expect("finish pack");
+
+        let config = build_provider_config(
+            tmp.path(),
+            &secrets_handle,
+            "demo",
+            "default",
+            "messaging-slack",
+            &pack_path,
+            "https://demo.example",
+        )
+        .unwrap();
+
+        assert_eq!(config["slack_configuration_access_token"], "fresh-access");
     }
 }

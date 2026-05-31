@@ -756,13 +756,52 @@ where
         remote_addr: None,
     };
 
+    operator_log::debug(
+        module_path!(),
+        format!(
+            "[demo ingress] received method={} path={} domain={} provider={} tenant={} team={} payload_len={}",
+            method,
+            path,
+            domain_name(domain),
+            parsed.provider,
+            parsed.tenant,
+            parsed.team,
+            ingress_request.body.len()
+        ),
+    );
+
     let result = dispatch_http_ingress(
         state.runner_host.as_ref(),
         domain,
         &ingress_request,
         &context,
     )
-    .map_err(|err| error_response(StatusCode::BAD_GATEWAY, err.to_string()))?;
+    .map_err(|err| {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "[demo ingress] provider dispatch failed domain={} provider={} tenant={} team={} err={err}",
+                domain_name(domain),
+                parsed.provider,
+                parsed.tenant,
+                parsed.team
+            ),
+        );
+        error_response(StatusCode::BAD_GATEWAY, err.to_string())
+    })?;
+    operator_log::debug(
+        module_path!(),
+        format!(
+            "[demo ingress] provider parsed domain={} provider={} tenant={} team={} messages={} events={} status={}",
+            domain_name(domain),
+            parsed.provider,
+            parsed.tenant,
+            parsed.team,
+            result.messaging_envelopes.len(),
+            result.events.len(),
+            result.response.status
+        ),
+    );
     if !result.events.is_empty() {
         operator_log::info(
             module_path!(),
@@ -1811,24 +1850,33 @@ fn register_webchat_post_op_notifier(state: &Arc<HttpIngressState>) {
                 return;
             }
             if op_name != "directline_http" && op_name != "send_payload" {
-                eprintln!(
-                    "[ws post-op-notifier] op={} provider={} skipped (not directline_http or send_payload)",
-                    op_name, provider,
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "[ws post-op-notifier] op={} provider={} skipped (not directline_http or send_payload)",
+                        op_name, provider,
+                    ),
                 );
                 return;
             }
             let Some((tenant_id, conversation_id, new_watermark)) =
                 extract_greentic_metadata(output)
             else {
-                eprintln!(
-                    "[ws post-op-notifier] op={} provider={} skipped (no _greentic metadata)",
-                    op_name, provider,
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "[ws post-op-notifier] op={} provider={} skipped (no _greentic metadata)",
+                        op_name, provider,
+                    ),
                 );
                 return;
             };
-            eprintln!(
-                "[ws post-op-notifier] publishing event tenant={} conv={} watermark={}",
-                tenant_id, conversation_id, new_watermark,
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[ws post-op-notifier] publishing event tenant={} conv={} watermark={}",
+                    tenant_id, conversation_id, new_watermark,
+                ),
             );
             let notifier = notifier.clone();
             // The callback is invoked from a synchronous code path that

@@ -314,6 +314,18 @@ fn build_ingress_request(
 }
 
 fn parse_dispatch_result(value: &JsonValue) -> anyhow::Result<IngressDispatchResult> {
+    if let Some(body) = value.as_str() {
+        return Ok(IngressDispatchResult {
+            response: IngressHttpResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "text/plain".to_string())],
+                body: Some(body.as_bytes().to_vec()),
+            },
+            events: Vec::new(),
+            messaging_envelopes: Vec::new(),
+        });
+    }
+
     // Some provider WASM components return the WIT ABI envelope {"ok": {...}, "error": ...}
     // instead of the flat dispatch format. Unwrap "ok" when top-level looks like a WIT envelope.
     let value = if value.get("ok").is_some()
@@ -350,7 +362,7 @@ fn parse_dispatch_result(value: &JsonValue) -> anyhow::Result<IngressDispatchRes
     let events = parse_events(events_value)?;
     let messaging_envelopes = parse_messaging_envelopes(events_value);
 
-    operator_log::info(
+    operator_log::debug(
         module_path!(),
         format!(
             "[DEBUG] parsed events={}, messaging_envelopes={}",
@@ -630,6 +642,14 @@ mod tests {
 
     #[test]
     fn parse_dispatch_result_supports_wit_envelopes_and_debug_helpers() {
+        let validation = parse_dispatch_result(&json!("hello graph")).expect("string result");
+        assert_eq!(validation.response.status, 200);
+        assert_eq!(
+            validation.response.headers,
+            vec![("content-type".to_string(), "text/plain".to_string())]
+        );
+        assert_eq!(validation.response.body, Some(b"hello graph".to_vec()));
+
         let result = parse_dispatch_result(&json!({
             "ok": {
                 "response": {

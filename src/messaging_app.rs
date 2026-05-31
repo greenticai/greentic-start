@@ -785,8 +785,9 @@ fn parse_envelopes(
                 summarize_output_shape(value)
             ),
         );
-        let envelope: ChannelMessageEnvelope = serde_json::from_value(envelope.clone())
+        let mut envelope: ChannelMessageEnvelope = serde_json::from_value(envelope.clone())
             .context("app flow message payload is not a ChannelMessageEnvelope")?;
+        preserve_ingress_reply_route(&mut envelope, ingress_envelope);
         return Ok(vec![envelope]);
     }
     if let Some(rendered_card) = value.get("renderedCard")
@@ -1111,14 +1112,14 @@ fn parse_envelope_array(
     let mut seen = BTreeSet::new();
     for element in array {
         if let Ok(envelope) = serde_json::from_value::<ChannelMessageEnvelope>(element.clone()) {
-            push_unique_envelope(&mut envelopes, &mut seen, envelope)?;
+            push_unique_envelope(&mut envelopes, &mut seen, envelope, ingress_envelope)?;
             continue;
         }
 
         let nested = parse_envelopes(element, ingress_envelope)
             .context("app flow output array contains invalid channel envelope")?;
         for envelope in nested {
-            push_unique_envelope(&mut envelopes, &mut seen, envelope)?;
+            push_unique_envelope(&mut envelopes, &mut seen, envelope, ingress_envelope)?;
         }
     }
     Ok(envelopes)
@@ -1127,13 +1128,27 @@ fn parse_envelope_array(
 fn push_unique_envelope(
     envelopes: &mut Vec<ChannelMessageEnvelope>,
     seen: &mut BTreeSet<String>,
-    envelope: ChannelMessageEnvelope,
+    mut envelope: ChannelMessageEnvelope,
+    ingress_envelope: &ChannelMessageEnvelope,
 ) -> Result<()> {
+    preserve_ingress_reply_route(&mut envelope, ingress_envelope);
     let key = unique_envelope_key(&envelope)?;
     if seen.insert(key) {
         envelopes.push(envelope);
     }
     Ok(())
+}
+
+fn preserve_ingress_reply_route(
+    envelope: &mut ChannelMessageEnvelope,
+    ingress_envelope: &ChannelMessageEnvelope,
+) {
+    if envelope.to.is_empty() {
+        envelope.to = ingress_envelope.to.clone();
+    }
+    if envelope.session_id.trim().is_empty() {
+        envelope.session_id = ingress_envelope.session_id.clone();
+    }
 }
 
 fn unique_envelope_key(envelope: &ChannelMessageEnvelope) -> Result<String> {
@@ -1169,6 +1184,10 @@ mod tests {
                 "id": "user-1",
                 "kind": "user"
             },
+            "to": [{
+                "id": "Y2lzY29zcGFyazovL3VzL1JPT00vcm9vbS0x",
+                "kind": "room"
+            }],
             "text": "hello",
             "metadata": {}
         }))
@@ -1521,6 +1540,11 @@ mod tests {
         )
         .expect("message output");
         assert_eq!(message_output[0].text.as_deref(), Some("reply"));
+        assert_eq!(
+            message_output[0].to[0].id,
+            "Y2lzY29zcGFyazovL3VzL1JPT00vcm9vbS0x"
+        );
+        assert_eq!(message_output[0].to[0].kind.as_deref(), Some("room"));
 
         let events_output = parse_envelopes(
             &json!({
