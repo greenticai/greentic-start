@@ -5,44 +5,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-// --- SQL gateway config (mirrors greentic_runner_host::sql::config) ---
-// Duplicated here because greentic-runner-host's sql module is not yet published
-// to crates.io (only on feat/sql-gateway-runtime). Switch to the crate import
-// once the module ships in a published release.
-
-/// Database engine kind for a configured SQL gateway connection.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum SqlEngine {
-    Postgres,
-    Mysql,
-    Sqlite,
-}
-
-/// Per-connection configuration: engine + DSN secret URI.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct SqlConnectionConfig {
-    pub engine: SqlEngine,
-    /// Secret URI holding the DSN/connection string for this connection.
-    pub dsn_secret: String,
-    #[serde(default = "sql_default_read_only")]
-    pub read_only: bool,
-}
-
-/// Top-level `sql:` block in the bundle demo config.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Default)]
-pub struct SqlConfig {
-    /// Secret URI holding the shared bearer token the sql extension must present.
-    pub auth_token_secret: String,
-    #[serde(default)]
-    pub connections: std::collections::BTreeMap<String, SqlConnectionConfig>,
-}
-
-fn sql_default_read_only() -> bool {
-    true
-}
-
-// --- end SQL gateway config ---
+// SQL gateway config is now provided by the published crate type.
+// See greentic_runner_host::sql::config::SqlConfig.
 
 #[derive(Clone, Debug, Deserialize, Default)]
 pub struct OperatorConfig {
@@ -136,13 +100,10 @@ pub struct DemoConfig {
     pub services: DemoServicesConfig,
     #[serde(default)]
     pub providers: Option<std::collections::BTreeMap<String, DemoProviderConfig>>,
-    // TODO(sql-gateway follow-up): replace SqlConfig with
-    // `greentic_runner_host::sql::config::SqlConfig` once the sql module
-    // ships in a published greentic-runner-host release (currently only on
-    // the feat/sql-gateway-runtime branch). The two structs must stay in sync
-    // until then.
+    /// SQL gateway configuration. When present, `gtc start` spawns a dedicated
+    /// localhost axum server serving `/sql/<conn>/schema` and `/sql/<conn>/query`.
     #[serde(default)]
-    pub sql: Option<SqlConfig>,
+    pub sql: Option<greentic_runner_host::sql::config::SqlConfig>,
 }
 
 impl Default for DemoConfig {

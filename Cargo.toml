@@ -78,11 +78,16 @@ features = [
 [dependencies.greentic-setup]
 version = ">=1.1.0-dev, <1.2.0-0"
 
+[dependencies.axum]
+version = "0.8"
+
 [dependencies.greentic-runner-desktop]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = "=1.2.0-research"
+default-features = false
 
 [dependencies.greentic-runner-host]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = "=1.2.0-research"
+default-features = false
 
 [dependencies.greentic-secrets-lib]
 version = ">=1.1.0-dev, <1.2.0-0"

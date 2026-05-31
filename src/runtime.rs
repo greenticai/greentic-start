@@ -828,6 +828,123 @@ pub fn demo_up_services(
         notifier_config,
     )
     .with_context(|| "failed to start local HTTP ingress server")?;
+
+    // ── SQL gateway (optional) ─────────────────────────────────────────────
+    // When `demo_config.sql` is set, resolve secrets and spawn a dedicated
+    // localhost axum server serving `/sql/<conn>/schema` + `/sql/<conn>/query`.
+    // The default port is 8765 (not yet in SqlConfig v1 — hardcoded here).
+    const SQL_GATEWAY_DEFAULT_PORT: u16 = 8765;
+    if let Some(sql_cfg) = config.sql.as_ref() {
+        let sql_secrets_manager = secrets_handle.manager();
+        let sql_cfg_owned = sql_cfg.clone();
+        let sql_future = async move {
+            // Resolve the bearer token secret.
+            let token_bytes = sql_secrets_manager
+                .read(&sql_cfg_owned.auth_token_secret)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "sql.auth_token_secret ({}): {e}",
+                        sql_cfg_owned.auth_token_secret
+                    )
+                })?;
+            let token = String::from_utf8(token_bytes).map_err(|e| {
+                anyhow::anyhow!("sql.auth_token_secret value is not valid UTF-8: {e}")
+            })?;
+            if token.is_empty() && !sql_cfg_owned.connections.is_empty() {
+                anyhow::bail!(
+                    "sql.auth_token_secret resolved to an empty string — \
+                     refusing to start SQL gateway (set the secret or remove the sql: block)"
+                );
+            }
+
+            // Build a pool for each configured connection.
+            let mut connections: std::collections::HashMap<
+                String,
+                greentic_runner_host::sql::SqlConnection,
+            > = std::collections::HashMap::new();
+            for (connection_name, connection_cfg) in &sql_cfg_owned.connections {
+                let dsn_bytes = sql_secrets_manager
+                    .read(&connection_cfg.dsn_secret)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "sql connection {connection_name} dsn_secret ({}): {e}",
+                            connection_cfg.dsn_secret
+                        )
+                    })?;
+                let dsn = String::from_utf8(dsn_bytes).map_err(|e| {
+                    anyhow::anyhow!(
+                        "sql connection {connection_name} dsn value is not valid UTF-8: {e}"
+                    )
+                })?;
+                match greentic_runner_host::sql::pool::build(
+                    connection_cfg.engine,
+                    &dsn,
+                    connection_cfg.read_only,
+                )
+                .await
+                {
+                    Ok(pool) => {
+                        connections.insert(
+                            connection_name.clone(),
+                            greentic_runner_host::sql::SqlConnection {
+                                engine: connection_cfg.engine,
+                                pool,
+                            },
+                        );
+                    }
+                    Err(pool_error) => {
+                        tracing::warn!(
+                            "sql gateway: skipping connection {connection_name}: {pool_error}"
+                        );
+                    }
+                }
+            }
+
+            Ok::<_, anyhow::Error>((
+                greentic_runner_host::sql::SqlGateway::new(connections, token),
+                SQL_GATEWAY_DEFAULT_PORT,
+            ))
+        };
+
+        let sql_gateway_result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(sql_future)),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to build temporary tokio runtime for sql gateway")?
+                .block_on(sql_future),
+        };
+
+        match sql_gateway_result {
+            Ok((gateway, port)) => {
+                let gateway_app = greentic_runner_host::sql::routes::router(gateway);
+                tokio::spawn(async move {
+                    match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                        Ok(listener) => {
+                            tracing::info!("sql gateway listening on 127.0.0.1:{port}");
+                            if let Err(serve_error) = axum::serve(listener, gateway_app).await {
+                                tracing::error!("sql gateway server error: {serve_error}");
+                            }
+                        }
+                        Err(bind_error) => {
+                            tracing::error!("sql gateway bind 127.0.0.1:{port}: {bind_error}");
+                        }
+                    }
+                });
+                operator_log::info(
+                    module_path!(),
+                    format!("sql gateway started on 127.0.0.1:{SQL_GATEWAY_DEFAULT_PORT}"),
+                );
+            }
+            Err(gateway_error) => {
+                anyhow::bail!("sql gateway startup failed: {gateway_error:#}");
+            }
+        }
+    }
+    // ── end SQL gateway ────────────────────────────────────────────────────
+
     let run_gsm_services = config.services.nats.enabled;
     operator_log::info(
         module_path!(),
