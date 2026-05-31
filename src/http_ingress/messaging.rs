@@ -24,7 +24,7 @@ pub(super) fn route_messaging_envelopes(
     let pack_info = app::load_app_pack_info(&app_pack_path).context("load app pack manifest")?;
     let flow = app::select_app_flow(&pack_info).context("select app default flow")?;
 
-    operator_log::info(
+    operator_log::debug(
         module_path!(),
         format!(
             "[demo messaging] routing {} envelope(s) through app flow={} pack={}",
@@ -115,7 +115,7 @@ pub(super) fn route_messaging_envelopes(
                 .and_then(|v| v.as_str())
                 .map(|s| !s.is_empty())
                 .unwrap_or(false);
-            operator_log::info(
+            operator_log::debug(
                 module_path!(),
                 format!(
                     "[demo messaging] pre-encode adaptive_card={} text_present={} session_id={} route={} tenant={} metadata_keys={}",
@@ -202,7 +202,7 @@ pub(super) fn route_messaging_envelopes(
                 .unwrap_or(false);
 
             if outcome.success && provider_ok {
-                operator_log::info(
+                operator_log::debug(
                     module_path!(),
                     format!(
                         "[demo messaging] send succeeded provider={} envelope_id={}",

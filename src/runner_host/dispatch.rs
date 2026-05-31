@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,9 +12,18 @@ use greentic_runner_host::RunnerWasiPolicy;
 use greentic_runner_host::component_api::node::{
     ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx,
 };
-use greentic_runner_host::pack::{ComponentResolution, PackRuntime};
+use greentic_runner_host::pack::{
+    ComponentResolution, ComponentState, HostState, PackRuntime, register_all,
+};
+use greentic_runner_host::runtime_wasmtime::{Component, Engine, Linker, Store};
 use greentic_runner_host::storage::DynSessionStore;
+use greentic_types::{
+    ArtifactLocationV1, EXT_COMPONENT_SOURCES_V1, ExtensionInline, decode_pack_manifest,
+};
+use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
+use wasmtime::component::TypedFunc;
+use zip::ZipArchive;
 
 use crate::domains::{Domain, ProviderPack};
 use crate::operator_log;
@@ -421,7 +432,13 @@ impl DemoRunnerHost {
         match result {
             Ok(value) => {
                 let value_str = serde_json::to_string(&value).unwrap_or_default();
-                operator_log::info(
+                let level = if is_startup_diagnostic_op(op_id) {
+                    operator_log::Level::Info
+                } else {
+                    operator_log::Level::Debug
+                };
+                operator_log::log(
+                    level,
                     module_path!(),
                     format!(
                         "[wasm-output] op={} provider={} value_preview={}",
@@ -541,6 +558,20 @@ impl DemoRunnerHost {
                 error: None,
                 mode: RunnerExecutionMode::Exec,
             }),
+            Err(err)
+                if operation_is_provider_common_subscription(op_id)
+                    && err.to_string().contains(
+                        "component exports neither node@0.5/0.4 nor component-runtime@0.6",
+                    ) =>
+            {
+                self.invoke_provider_common_subscription_component(
+                    pack,
+                    component_ref,
+                    config,
+                    input,
+                    ctx,
+                )
+            }
             Err(err) => Ok(FlowOutcome {
                 success: false,
                 output: None,
@@ -550,6 +581,252 @@ impl DemoRunnerHost {
             }),
         }
     }
+
+    fn invoke_provider_common_subscription_component(
+        &self,
+        pack: &ProviderPack,
+        component_ref: &str,
+        config: &JsonValue,
+        input: &JsonValue,
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<FlowOutcome> {
+        let component_bytes = read_pack_component_wasm(&pack.path, component_ref)?;
+        let config_json = serde_json::to_string(config)?;
+        let input_json = serde_json::to_string(input)?;
+        let exec_ctx = ComponentExecCtx {
+            tenant: ComponentTenantCtx {
+                tenant: ctx.tenant.clone(),
+                team: ctx.team.clone(),
+                i18n_id: None,
+                user: None,
+                trace_id: None,
+                correlation_id: ctx.correlation_id.clone(),
+                deadline_unix_ms: None,
+                attempt: 1,
+                idempotency_key: None,
+            },
+            i18n_id: None,
+            flow_id: "sync-subscriptions".to_string(),
+            node_id: Some("sync-subscriptions".to_string()),
+        };
+        let http_client = Arc::new(reqwest::blocking::Client::new());
+        let result = (|| {
+            let host_config = Arc::new(build_demo_host_config(&ctx.tenant));
+            let engine = Engine::default();
+            let component = Component::from_binary(&engine, &component_bytes)?;
+            let mut linker = Linker::new(&engine);
+            register_all(&mut linker, true)?;
+            let host_state = HostState::new(
+                pack.pack_id.clone(),
+                host_config,
+                http_client,
+                None,
+                None::<DynSessionStore>,
+                Some(self.state_store.clone()),
+                self.secrets_handle.runtime_manager(Some(&pack.pack_id)),
+                None,
+                Some(exec_ctx),
+                Some(component_ref.to_string()),
+                true,
+            )?;
+            let store_state =
+                ComponentState::new(host_state, Arc::new(RunnerWasiPolicy::default()))?;
+            let mut store = Store::new(&engine, store_state);
+            let instance = linker.instantiate(&mut store, &component)?;
+            let subs_index = instance
+                .get_export_index(&mut store, None, "provider:common/subscriptions@0.0.2")
+                .context("get provider-common subscriptions export")?;
+            let sync_index = instance
+                .get_export_index(&mut store, Some(&subs_index), "sync-subscriptions")
+                .context("get sync-subscriptions export")?;
+            let sync: TypedFunc<(String, String), (Result<String, String>,)> = instance
+                .get_typed_func(&mut store, sync_index)
+                .map_err(|err| anyhow!("get typed sync-subscriptions function: {err}"))?;
+            let (result,) = sync
+                .call(&mut store, (config_json, input_json))
+                .map_err(|err| anyhow!("call provider-common sync-subscriptions: {err}"))?;
+            let output = result.map_err(anyhow::Error::msg)?;
+            let value = serde_json::from_str(&output).unwrap_or(JsonValue::String(output));
+            anyhow::Ok(value)
+        })();
+
+        match result {
+            Ok(value) => Ok(FlowOutcome {
+                success: true,
+                output: Some(value),
+                raw: None,
+                error: None,
+                mode: RunnerExecutionMode::Exec,
+            }),
+            Err(err) => Ok(FlowOutcome {
+                success: false,
+                output: None,
+                raw: None,
+                error: Some(err.to_string()),
+                mode: RunnerExecutionMode::Exec,
+            }),
+        }
+    }
+}
+
+fn operation_is_provider_common_subscription(op_id: &str) -> bool {
+    op_id == "sync-subscriptions"
+}
+
+fn is_startup_diagnostic_op(op_id: &str) -> bool {
+    matches!(
+        op_id,
+        "setup_webhook"
+            | "verify_webhooks"
+            | "sync-subscriptions"
+            | "sync_subscriptions"
+            | "subscription_ensure"
+            | "subscription_renew"
+            | "subscription_delete"
+    )
+}
+
+fn read_pack_component_wasm(pack_path: &Path, component_ref: &str) -> anyhow::Result<Vec<u8>> {
+    let wasm = find_component_wasm_path(pack_path, component_ref)?
+        .ok_or_else(|| anyhow::anyhow!("component '{component_ref}' not found in pack manifest"))?;
+    if pack_path.is_dir() {
+        let wasm_path = pack_path.join(wasm);
+        return std::fs::read(&wasm_path)
+            .with_context(|| format!("read component wasm {}", wasm_path.display()));
+    }
+    let file =
+        File::open(pack_path).with_context(|| format!("open pack {}", pack_path.display()))?;
+    let mut archive = ZipArchive::new(file)
+        .with_context(|| format!("read pack archive {}", pack_path.display()))?;
+    let mut entry = archive
+        .by_name(&wasm)
+        .with_context(|| format!("read component wasm {wasm} from {}", pack_path.display()))?;
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn find_component_wasm_path(
+    pack_path: &Path,
+    component_ref: &str,
+) -> anyhow::Result<Option<String>> {
+    if let Some(manifest) = read_pack_manifest_json(pack_path)?
+        && let Some(wasm) = manifest
+            .components
+            .iter()
+            .find(|component| component.id == component_ref)
+            .and_then(|component| component.wasm.clone())
+    {
+        return Ok(Some(wasm));
+    }
+
+    if let Some(bytes) = read_pack_manifest_cbor_bytes(pack_path)? {
+        let manifest = decode_pack_manifest(&bytes)
+            .with_context(|| format!("parse manifest.cbor from {}", pack_path.display()))?;
+        if manifest
+            .components
+            .iter()
+            .any(|component| component.id.as_str() == component_ref)
+        {
+            if let Some(wasm) = manifest
+                .extensions
+                .as_ref()
+                .and_then(|extensions| extensions.get(EXT_COMPONENT_SOURCES_V1))
+                .and_then(|extension| extension.inline.as_ref())
+                .and_then(|inline| component_source_wasm_path(inline, component_ref))
+            {
+                return Ok(Some(wasm));
+            }
+            return Ok(Some(format!("components/{component_ref}.wasm")));
+        }
+    }
+
+    Ok(None)
+}
+
+fn component_source_wasm_path(inline: &ExtensionInline, component_ref: &str) -> Option<String> {
+    let ExtensionInline::Other(value) = inline else {
+        return None;
+    };
+    let sources =
+        serde_json::from_value::<greentic_types::ComponentSourcesV1>(value.clone()).ok()?;
+    sources
+        .components
+        .into_iter()
+        .find(|entry| {
+            entry.name == component_ref
+                || entry
+                    .component_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == component_ref)
+        })
+        .and_then(|entry| match entry.artifact {
+            ArtifactLocationV1::Inline { wasm_path, .. } => Some(wasm_path),
+            ArtifactLocationV1::Remote => None,
+        })
+}
+
+fn read_pack_manifest_cbor_bytes(pack_path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    if pack_path.is_dir() {
+        let path = pack_path.join("manifest.cbor");
+        if !path.exists() {
+            return Ok(None);
+        }
+        return std::fs::read(&path)
+            .map(Some)
+            .with_context(|| format!("read {}", path.display()));
+    }
+    let file =
+        File::open(pack_path).with_context(|| format!("open pack {}", pack_path.display()))?;
+    let mut archive = ZipArchive::new(file)
+        .with_context(|| format!("read pack archive {}", pack_path.display()))?;
+    let mut entry = match archive.by_name("manifest.cbor") {
+        Ok(file) => file,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+fn read_pack_manifest_json(pack_path: &Path) -> anyhow::Result<Option<PackManifestJson>> {
+    let bytes = if pack_path.is_dir() {
+        let path = pack_path.join("pack.manifest.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        std::fs::read(&path).with_context(|| format!("read {}", path.display()))?
+    } else {
+        let file =
+            File::open(pack_path).with_context(|| format!("open pack {}", pack_path.display()))?;
+        let mut archive = ZipArchive::new(file)
+            .with_context(|| format!("read pack archive {}", pack_path.display()))?;
+        let mut entry = match archive.by_name("pack.manifest.json") {
+            Ok(file) => file,
+            Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        bytes
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .with_context(|| format!("parse pack.manifest.json from {}", pack_path.display()))
+}
+
+#[derive(Debug, Deserialize)]
+struct PackManifestJson {
+    #[serde(default)]
+    components: Vec<PackComponentJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackComponentJson {
+    id: String,
+    #[serde(default)]
+    wasm: Option<String>,
 }
 
 #[cfg(test)]
