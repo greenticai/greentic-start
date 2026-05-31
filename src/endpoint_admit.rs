@@ -43,11 +43,7 @@ struct EndpointEntry {
     linked_bundles: HashSet<String>,
     /// [`MessagingEndpoint::welcome_flow`](greentic_deploy_spec::MessagingEndpoint::welcome_flow)
     /// cloned in so the lookup is one map. Read by the producer at
-    /// `revision_serve::serve` when the M1.5 first-contact attach flips on
-    /// (gated on the runner-host welcome-seen marker landing in a follow-up
-    /// PR — Codex adversarial review of greentic-start#201). Until then the
-    /// projection is dead at runtime; tests still exercise the lookup.
-    #[allow(dead_code)]
+    /// `revision_serve::serve` to build the per-request `WelcomeFlowHint`.
     welcome_flow: Option<WelcomeFlowRef>,
 }
 
@@ -98,12 +94,11 @@ impl EndpointAdmit {
     /// distinguish those at this site because [`linked_bundles`] has already
     /// classified unknowns as `UNAUTHORIZED` upstream.
     ///
-    /// Currently unused at runtime; tests exercise the lookup. Re-wired into
-    /// `revision_serve::serve` once the runner-host welcome-seen marker lands
-    /// (see the [`EndpointEntry::welcome_flow`] doc).
+    /// Called from `revision_serve::serve` to build the per-request
+    /// `WelcomeFlowHint`; the runner-host gates it on a first-contact marker
+    /// so attaching the hint on every turn is safe.
     ///
     /// [`linked_bundles`]: EndpointAdmit::linked_bundles
-    #[allow(dead_code)]
     pub(crate) fn welcome_flow(&self, endpoint_id: &str) -> Option<&WelcomeFlowRef> {
         self.by_id
             .get(endpoint_id)

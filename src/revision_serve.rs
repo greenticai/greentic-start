@@ -723,11 +723,12 @@ async fn serve(
         Admission::Serve => {}
     }
 
-    // M1.5 welcome-flow override NOT attached: runner-host refuses overrides
-    // only on active wait, missing post-completion / no-wait / TTL-expiry
-    // turns. Fix is in greentic-runner: atomic check-and-mark in
-    // `apply_welcome_flow_override`. Re-enable here by replacing `None` with
-    // a hint built from `activation.routing.endpoint_admit.welcome_flow(eid)`.
+    // M1.5 welcome-flow override (attach side). The runner-host gates the
+    // override on a durable first-contact marker (greentic-runner#382), so
+    // attaching the hint on every turn is safe: post-completion / no-wait /
+    // TTL-expiry turns no longer re-fire.
+    let welcome_hint =
+        resolve_welcome_flow_hint(endpoint_id.as_deref(), &activation.routing.endpoint_admit);
 
     let activity = build_activity(
         &payload,
@@ -735,7 +736,7 @@ async fn serve(
         user.as_deref(),
         session_hint.as_deref(),
         endpoint_id.as_deref(),
-        None,
+        welcome_hint,
     );
 
     let replies = activation
@@ -798,6 +799,22 @@ fn build_activity(
         activity = activity.with_welcome_flow_hint(hint);
     }
     activity
+}
+
+/// Resolve the M1.5 welcome-flow hint for a request. Returns `Some` only when
+/// the caller asserted an endpoint AND the env declared that endpoint with a
+/// `welcome_flow` ref. Runner-host gates the override on a first-contact
+/// marker, so attaching on every turn is safe (greentic-runner#382).
+fn resolve_welcome_flow_hint(
+    endpoint_id: Option<&str>,
+    admit: &crate::endpoint_admit::EndpointAdmit,
+) -> Option<WelcomeFlowHint> {
+    endpoint_id
+        .and_then(|eid| admit.welcome_flow(eid))
+        .map(|ref_| WelcomeFlowHint {
+            pack_id: ref_.pack_id.as_str().to_string(),
+            flow_id: ref_.flow_id.clone(),
+        })
 }
 
 /// Resolve the caller-asserted identity tuple, honouring it **only from
@@ -1202,6 +1219,84 @@ mod tests {
                 flow_id: "welcome".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn resolve_welcome_flow_hint_returns_hint_when_endpoint_declares_it() {
+        use greentic_deploy_spec::{
+            BundleId, Environment, EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId,
+            PackId, SchemaVersion, WelcomeFlowRef,
+        };
+        use greentic_types::EnvId;
+        let env_id = EnvId::try_from("local").unwrap();
+        let endpoint_id = MessagingEndpointId::new();
+        let wire_id = endpoint_id.to_string();
+        let now = chrono::Utc::now();
+        let endpoint = MessagingEndpoint {
+            schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
+            env_id: env_id.clone(),
+            endpoint_id,
+            provider_id: "teams-legal".to_string(),
+            provider_type: "teams".to_string(),
+            display_name: "Legal".to_string(),
+            secret_refs: Vec::new(),
+            linked_bundles: vec![BundleId::new("legal-bundle")],
+            welcome_flow: Some(WelcomeFlowRef {
+                bundle_id: BundleId::new("legal-bundle"),
+                pack_id: PackId::new("legal-pack"),
+                flow_id: "welcome".to_string(),
+            }),
+            generation: 1,
+            created_at: now,
+            updated_at: now,
+            updated_by: "test".to_string(),
+        };
+        let env = Environment {
+            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
+            environment_id: env_id.clone(),
+            name: "local".to_string(),
+            host_config: EnvironmentHostConfig {
+                env_id,
+                region: None,
+                tenant_org_id: None,
+                listen_addr: None,
+            },
+            packs: Vec::new(),
+            messaging_endpoints: vec![endpoint],
+            credentials_ref: None,
+            bundles: Vec::new(),
+            revisions: Vec::new(),
+            traffic_splits: Vec::new(),
+            revocation: Default::default(),
+            retention: Default::default(),
+            health: Default::default(),
+        };
+        let admit = crate::endpoint_admit::EndpointAdmit::from_environment(&env);
+
+        assert_eq!(
+            resolve_welcome_flow_hint(Some(&wire_id), &admit),
+            Some(WelcomeFlowHint {
+                pack_id: "legal-pack".to_string(),
+                flow_id: "welcome".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_welcome_flow_hint_returns_none_without_endpoint() {
+        // No endpoint asserted ⇒ no hint, even if some other endpoint in the
+        // admit table has a welcome_flow declared.
+        let admit = crate::endpoint_admit::EndpointAdmit::default();
+        assert_eq!(resolve_welcome_flow_hint(None, &admit), None);
+    }
+
+    #[test]
+    fn resolve_welcome_flow_hint_returns_none_when_endpoint_has_no_welcome() {
+        // Endpoint declared but `welcome_flow` unset ⇒ no hint. Same shape as
+        // an unknown endpoint (the unknown-vs-unset split belongs at the admit
+        // gate, not here).
+        let admit = crate::endpoint_admit::EndpointAdmit::default();
+        assert_eq!(resolve_welcome_flow_hint(Some("teams-legal"), &admit), None);
     }
 
     #[test]
