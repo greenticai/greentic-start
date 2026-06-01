@@ -12,6 +12,8 @@ use greentic_types::cbor::canonical;
 use greentic_types::decode_pack_manifest;
 use greentic_types::schemas::component::v0_6_0::ComponentQaSpec;
 
+pub const APPLY_SECRETS_PATCH_KEY: &str = "__greentic_apply_secrets_patch";
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum QaMode {
     Default,
@@ -310,11 +312,19 @@ fn validate_i18n_contract(
 }
 
 fn extract_config_from_apply_output(apply_json: JsonValue) -> JsonValue {
-    if let Some(value) = apply_json.get("config") {
+    let mut config = if let Some(value) = apply_json.get("config") {
         value.clone()
     } else {
-        apply_json
+        apply_json.clone()
+    };
+
+    if let Some(patch) = apply_json.get("secrets_patch")
+        && let Some(map) = config.as_object_mut()
+    {
+        map.insert(APPLY_SECRETS_PATCH_KEY.to_string(), patch.clone());
     }
+
+    config
 }
 
 fn supports_component_qa_contract(pack_path: &Path) -> anyhow::Result<bool> {
@@ -595,6 +605,25 @@ mod tests {
     fn extract_apply_output_falls_back_to_payload() {
         let config = extract_config_from_apply_output(json!({"token":"x"}));
         assert_eq!(config, json!({"token":"x"}));
+    }
+
+    #[test]
+    fn extract_apply_output_carries_secrets_patch_with_config() {
+        let config = extract_config_from_apply_output(json!({
+            "config": {"public_base_url": "https://example.com"},
+            "secrets_patch": {
+                "set": {
+                    "WEBEX_WEBHOOK_SECRET": "generated"
+                },
+                "delete": []
+            }
+        }));
+
+        assert_eq!(config["public_base_url"], "https://example.com");
+        assert_eq!(
+            config[APPLY_SECRETS_PATCH_KEY]["set"]["WEBEX_WEBHOOK_SECRET"],
+            "generated"
+        );
     }
 
     #[test]

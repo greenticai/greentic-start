@@ -281,6 +281,8 @@ fn apply_envelope_tenant_overrides(
     envelope_config: &JsonValue,
 ) {
     template["tenant_id"] = JsonValue::String(tenant_id.to_string());
+    template["webchat"]["directline"]["token_url"] =
+        JsonValue::String(format!("/v1/messaging/webchat/{tenant_id}/token"));
 
     if let Some(skin) = envelope_config.get("skin").and_then(|v| v.as_str())
         && !skin.is_empty()
@@ -687,6 +689,10 @@ mod tests {
         let parsed: JsonValue = serde_json::from_slice(&body).expect("parse json");
 
         assert_eq!(parsed["tenant_id"], json!("demo"));
+        assert_eq!(
+            parsed["webchat"]["directline"]["token_url"],
+            json!("/v1/messaging/webchat/demo/token")
+        );
         assert_eq!(parsed["skin"], json!("3aigent"));
         assert_eq!(parsed["legacy_skin"], json!("_template"));
         assert_eq!(parsed["nav_links"][0]["num"], json!("M1"));
@@ -770,6 +776,10 @@ mod tests {
         });
         let parsed: JsonValue = serde_json::from_slice(&body).expect("parse json");
         assert_eq!(parsed["tenant_id"], json!("demo"));
+        assert_eq!(
+            parsed["webchat"]["directline"]["token_url"],
+            json!("/v1/messaging/webchat/demo/token")
+        );
         assert_eq!(parsed["skin"], json!("3aigent"));
         assert_eq!(
             parsed["nav_links"],

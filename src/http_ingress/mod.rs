@@ -1532,17 +1532,34 @@ where
             .insert(key, result.response.clone());
     }
 
-    if request.path == "/token" && (200..300).contains(&result.response.status) {
+    if request.path == "/token" {
         let body = result.response.body.as_deref().unwrap_or_default();
-        let token_ok = serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("token")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
-            .is_some_and(|token| !token.trim().is_empty());
+        if !(200..300).contains(&result.response.status) {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "[webchat directline] token request failed provider={} tenant={} team={} status={} body={}",
+                    request.provider,
+                    request.tenant,
+                    request.team,
+                    result.response.status,
+                    String::from_utf8_lossy(body)
+                        .chars()
+                        .take(500)
+                        .collect::<String>()
+                ),
+            );
+        }
+        let token_ok = (200..300).contains(&result.response.status)
+            && serde_json::from_slice::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("token")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .is_some_and(|token| !token.trim().is_empty());
         if !token_ok {
             return Err(error_response(
                 StatusCode::BAD_GATEWAY,
