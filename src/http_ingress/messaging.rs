@@ -5,6 +5,7 @@ use greentic_types::ChannelMessageEnvelope;
 use serde_json::json;
 
 use crate::domains::Domain;
+use crate::ingress_dispatch::build_injected_config;
 use crate::messaging_app as app;
 use crate::messaging_dto::ProviderPayloadV1;
 use crate::messaging_egress as egress;
@@ -183,8 +184,15 @@ pub(super) fn route_messaging_envelopes(
             };
 
             let provider_type = runner_host.canonical_provider_type(Domain::Messaging, provider);
-            let send_input =
-                egress::build_send_payload(payload, &provider_type, &ctx.tenant, ctx.team.clone());
+            let config = build_injected_config(runner_host, Domain::Messaging, provider, ctx)
+                .map(decode_injected_config_for_provider);
+            let send_input = egress::build_send_payload(
+                payload,
+                &provider_type,
+                &ctx.tenant,
+                ctx.team.clone(),
+                config,
+            );
             let send_bytes = serde_json::to_vec(&send_input)?;
             let outcome = runner_host.invoke_provider_op(
                 Domain::Messaging,
@@ -231,6 +239,25 @@ pub(super) fn route_messaging_envelopes(
         }
     }
     Ok(())
+}
+
+fn decode_injected_config_for_provider(config: serde_json::Value) -> serde_json::Value {
+    let Some(obj) = config.as_object() else {
+        return config;
+    };
+    let mut decoded = serde_json::Map::new();
+    for (key, value) in obj {
+        if let Some(raw_key) = key.strip_suffix("_b64")
+            && let Some(text) = value.as_str()
+            && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(text)
+            && let Ok(decoded_text) = String::from_utf8(bytes)
+        {
+            decoded.insert(raw_key.to_string(), serde_json::Value::String(decoded_text));
+            continue;
+        }
+        decoded.insert(key.clone(), value.clone());
+    }
+    serde_json::Value::Object(decoded)
 }
 
 fn read_card_from_pack(pack_path: &Path, card_key: &str) -> Option<serde_json::Value> {

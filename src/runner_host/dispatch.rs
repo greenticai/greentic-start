@@ -593,40 +593,47 @@ impl DemoRunnerHost {
         let component_bytes = read_pack_component_wasm(&pack.path, component_ref)?;
         let config_json = serde_json::to_string(config)?;
         let input_json = serde_json::to_string(input)?;
-        let exec_ctx = ComponentExecCtx {
-            tenant: ComponentTenantCtx {
-                tenant: ctx.tenant.clone(),
-                team: ctx.team.clone(),
+        let tenant = ctx.tenant.clone();
+        let team = ctx.team.clone();
+        let correlation_id = ctx.correlation_id.clone();
+        let secrets_manager = self.secrets_handle.runtime_manager(Some(&pack.pack_id));
+        let state_store = self.state_store.clone();
+        let pack_id = pack.pack_id.clone();
+        let component_ref = component_ref.to_string();
+        let result = make_runtime_or_thread_scope(|_| {
+            let exec_ctx = ComponentExecCtx {
+                tenant: ComponentTenantCtx {
+                    tenant: tenant.clone(),
+                    team: team.clone(),
+                    i18n_id: None,
+                    user: None,
+                    trace_id: None,
+                    correlation_id: correlation_id.clone(),
+                    deadline_unix_ms: None,
+                    attempt: 1,
+                    idempotency_key: None,
+                },
                 i18n_id: None,
-                user: None,
-                trace_id: None,
-                correlation_id: ctx.correlation_id.clone(),
-                deadline_unix_ms: None,
-                attempt: 1,
-                idempotency_key: None,
-            },
-            i18n_id: None,
-            flow_id: "sync-subscriptions".to_string(),
-            node_id: Some("sync-subscriptions".to_string()),
-        };
-        let http_client = Arc::new(reqwest::blocking::Client::new());
-        let result = (|| {
-            let host_config = Arc::new(build_demo_host_config(&ctx.tenant));
+                flow_id: "sync-subscriptions".to_string(),
+                node_id: Some("sync-subscriptions".to_string()),
+            };
+            let http_client = Arc::new(reqwest::blocking::Client::new());
+            let host_config = Arc::new(build_demo_host_config(&tenant));
             let engine = Engine::default();
             let component = Component::from_binary(&engine, &component_bytes)?;
             let mut linker = Linker::new(&engine);
             register_all(&mut linker, true)?;
             let host_state = HostState::new(
-                pack.pack_id.clone(),
+                pack_id,
                 host_config,
                 http_client,
                 None,
                 None::<DynSessionStore>,
-                Some(self.state_store.clone()),
-                self.secrets_handle.runtime_manager(Some(&pack.pack_id)),
+                Some(state_store),
+                secrets_manager,
                 None,
                 Some(exec_ctx),
-                Some(component_ref.to_string()),
+                Some(component_ref),
                 true,
             )?;
             let store_state =
@@ -648,7 +655,7 @@ impl DemoRunnerHost {
             let output = result.map_err(anyhow::Error::msg)?;
             let value = serde_json::from_str(&output).unwrap_or(JsonValue::String(output));
             anyhow::Ok(value)
-        })();
+        });
 
         match result {
             Ok(value) => Ok(FlowOutcome {
@@ -666,6 +673,103 @@ impl DemoRunnerHost {
                 mode: RunnerExecutionMode::Exec,
             }),
         }
+    }
+
+    pub(crate) fn invoke_provider_ingress_extension(
+        &self,
+        domain: Domain,
+        provider_id: &str,
+        headers_json: String,
+        body_json: String,
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<Option<FlowOutcome>> {
+        let Some(pack) = self.catalog.get(&(domain, provider_id.to_string())) else {
+            return Ok(None);
+        };
+        let Some(extension) = read_provider_ingress_extension(&pack.path)? else {
+            return Ok(None);
+        };
+        let component_bytes = read_pack_component_wasm(&pack.path, &extension.component_ref)?;
+        let tenant = ctx.tenant.clone();
+        let team = ctx.team.clone();
+        let correlation_id = ctx.correlation_id.clone();
+        let secrets_manager = self.secrets_handle.runtime_manager(Some(&pack.pack_id));
+        let state_store = self.state_store.clone();
+        let pack_id = pack.pack_id.clone();
+        let result = make_runtime_or_thread_scope(|_| {
+            let exec_ctx = ComponentExecCtx {
+                tenant: ComponentTenantCtx {
+                    tenant: tenant.clone(),
+                    team: team.clone(),
+                    i18n_id: None,
+                    user: None,
+                    trace_id: None,
+                    correlation_id: correlation_id.clone(),
+                    deadline_unix_ms: None,
+                    attempt: 1,
+                    idempotency_key: None,
+                },
+                i18n_id: None,
+                flow_id: extension.export_name.clone(),
+                node_id: Some(extension.export_name.clone()),
+            };
+            let http_client = Arc::new(reqwest::blocking::Client::new());
+            let host_config = Arc::new(build_demo_host_config(&tenant));
+            let engine = Engine::default();
+            let component = Component::from_binary(&engine, &component_bytes)?;
+            let mut linker = Linker::new(&engine);
+            register_all(&mut linker, true)?;
+            let host_state = HostState::new(
+                pack_id,
+                host_config,
+                http_client,
+                None,
+                None::<DynSessionStore>,
+                Some(state_store),
+                secrets_manager,
+                None,
+                Some(exec_ctx),
+                Some(extension.component_ref.clone()),
+                true,
+            )?;
+            let store_state =
+                ComponentState::new(host_state, Arc::new(RunnerWasiPolicy::default()))?;
+            let mut store = Store::new(&engine, store_state);
+            let instance = linker.instantiate(&mut store, &component)?;
+            let ingress_index = instance
+                .get_export_index(&mut store, None, "provider:common/ingress@0.0.2")
+                .context("get provider-common ingress export")?;
+            let handle_index = instance
+                .get_export_index(&mut store, Some(&ingress_index), &extension.export_name)
+                .with_context(|| format!("get {} export", extension.export_name))?;
+            let handle: TypedFunc<(String, String), (Result<String, String>,)> = instance
+                .get_typed_func(&mut store, handle_index)
+                .map_err(|err| anyhow!("get typed handle-webhook function: {err}"))?;
+            let (result,) = handle
+                .call(&mut store, (headers_json, body_json))
+                .map_err(|err| anyhow!("call provider-common handle-webhook: {err}"))?;
+            let output = result.map_err(anyhow::Error::msg)?;
+            let value = serde_json::from_str(&output).unwrap_or(JsonValue::String(output));
+            anyhow::Ok(value)
+        });
+
+        let outcome = match result {
+            Ok(value) => FlowOutcome {
+                success: true,
+                output: Some(value),
+                raw: None,
+                error: None,
+                mode: RunnerExecutionMode::Exec,
+            },
+            Err(err) => FlowOutcome {
+                success: false,
+                output: None,
+                raw: None,
+                error: Some(err.to_string()),
+                mode: RunnerExecutionMode::Exec,
+            },
+        };
+        Ok(Some(outcome))
     }
 }
 
@@ -766,6 +870,56 @@ fn component_source_wasm_path(inline: &ExtensionInline, component_ref: &str) -> 
         })
 }
 
+fn read_provider_ingress_extension(
+    pack_path: &Path,
+) -> anyhow::Result<Option<ProviderIngressExtension>> {
+    if let Some(bytes) = read_pack_manifest_cbor_bytes(pack_path)? {
+        let manifest = decode_pack_manifest(&bytes)
+            .with_context(|| format!("parse manifest.cbor from {}", pack_path.display()))?;
+        if let Some(inline) = manifest
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get("messaging.provider_ingress.v1"))
+            .and_then(|extension| extension.inline.as_ref())
+            && let ExtensionInline::Other(value) = inline
+        {
+            return serde_json::from_value::<ProviderIngressExtension>(value.clone())
+                .map(Some)
+                .with_context(|| {
+                    format!(
+                        "parse messaging.provider_ingress.v1 from {}",
+                        pack_path.display()
+                    )
+                });
+        }
+    }
+
+    if let Some(manifest) = read_pack_manifest_json(pack_path)?
+        && let Some(value) = manifest
+            .extensions
+            .get("messaging.provider_ingress.v1")
+            .and_then(|extension| extension.get("inline"))
+    {
+        return serde_json::from_value::<ProviderIngressExtension>(value.clone())
+            .map(Some)
+            .with_context(|| {
+                format!(
+                    "parse messaging.provider_ingress.v1 from {}",
+                    pack_path.display()
+                )
+            });
+    }
+
+    Ok(None)
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ProviderIngressExtension {
+    component_ref: String,
+    #[serde(rename = "export")]
+    export_name: String,
+}
+
 fn read_pack_manifest_cbor_bytes(pack_path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     if pack_path.is_dir() {
         let path = pack_path.join("manifest.cbor");
@@ -820,6 +974,8 @@ fn read_pack_manifest_json(pack_path: &Path) -> anyhow::Result<Option<PackManife
 struct PackManifestJson {
     #[serde(default)]
     components: Vec<PackComponentJson>,
+    #[serde(default)]
+    extensions: serde_json::Map<String, JsonValue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -985,5 +1141,32 @@ mod tests {
         assert_eq!(outcome.mode, RunnerExecutionMode::Integration);
         assert_eq!(outcome.output, None);
         assert_eq!(outcome.raw.as_deref(), Some("plain stdout"));
+    }
+
+    #[test]
+    fn provider_ingress_extension_can_be_read_from_json_manifest() {
+        let dir = tempdir().unwrap();
+        let manifest = serde_json::json!({
+            "components": [],
+            "extensions": {
+                "messaging.provider_ingress.v1": {
+                    "inline": {
+                        "component_ref": "messaging-ingress-teams",
+                        "export": "handle-webhook"
+                    }
+                }
+            }
+        });
+        std::fs::write(
+            dir.path().join("pack.manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let extension = read_provider_ingress_extension(dir.path())
+            .unwrap()
+            .expect("provider ingress extension");
+        assert_eq!(extension.component_ref, "messaging-ingress-teams");
+        assert_eq!(extension.export_name, "handle-webhook");
     }
 }

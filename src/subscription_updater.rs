@@ -147,6 +147,7 @@ pub fn sync_subscriptions_if_public_url_available(
         let extension = match read_subscriptions_extension(&provider.pack_path) {
             Ok(Some(extension)) => extension,
             Ok(None) => {
+                let message = "skipped: no subscription extension".to_string();
                 operator_log::info(
                     module_path!(),
                     format!(
@@ -154,6 +155,9 @@ pub fn sync_subscriptions_if_public_url_available(
                         provider.provider_id
                     ),
                 );
+                summary
+                    .results
+                    .push((provider.provider_id.clone(), message));
                 continue;
             }
             Err(err) => {
@@ -226,6 +230,15 @@ pub fn sync_subscriptions_if_public_url_available(
             config,
         )?;
         let config_keys = object_keys_label(&config);
+        let diagnostic = subscription_state_diagnostic(&state);
+        let attempt_path = write_subscription_attempt_audit(
+            config_dir,
+            &provider.provider_id,
+            &extension,
+            &state,
+            &config_keys,
+            None,
+        )?;
         operator_log::info(
             module_path!(),
             format!(
@@ -234,9 +247,16 @@ pub fn sync_subscriptions_if_public_url_available(
                 extension.component_ref,
                 extension.export_name,
                 config_keys,
-                subscription_state_diagnostic(&state)
+                diagnostic
             ),
         );
+        summary.results.push((
+            provider.provider_id.clone(),
+            format!(
+                "loaded: {diagnostic}; config_keys={config_keys}; audit={}",
+                attempt_path.display()
+            ),
+        ));
         let pack = ProviderPack {
             pack_id: provider.provider_id.clone(),
             display_name: None,
@@ -325,10 +345,17 @@ pub fn sync_subscriptions_if_public_url_available(
                 .error
                 .or(outcome.raw)
                 .unwrap_or_else(|| "unknown subscription sync failure".to_string());
+            let attempt_path = write_subscription_attempt_audit(
+                config_dir,
+                &provider.provider_id,
+                &extension,
+                &state,
+                &config_keys,
+                Some(&error),
+            )?;
             let detail = format!(
-                "{error}; {}; config_keys={}",
-                subscription_state_diagnostic(&state),
-                config_keys
+                "{error}; {diagnostic}; config_keys={config_keys}; audit={}",
+                attempt_path.display()
             );
             operator_log::warn(
                 module_path!(),
@@ -381,6 +408,31 @@ fn subscription_result_description(state: &Value, setup_answers: Option<&Value>)
         "synced {count} {noun}{setup_label}: {}{expires}",
         parts.join(", ")
     )
+}
+
+fn write_subscription_attempt_audit(
+    config_dir: &Path,
+    provider_id: &str,
+    extension: &MessagingSubscriptionsExtension,
+    state: &Value,
+    config_keys: &str,
+    error: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    let path = config_dir
+        .join("state")
+        .join("subscriptions")
+        .join(format!("{provider_id}.attempt.json"));
+    let audit = json!({
+        "provider_id": provider_id,
+        "component_ref": extension.component_ref,
+        "export": extension.export_name,
+        "config_keys": config_keys,
+        "diagnostic": subscription_state_diagnostic(state),
+        "state": state,
+        "error": error,
+    });
+    write_json(&path, &audit)?;
+    Ok(path)
 }
 
 fn subscription_target_label(value: &Value) -> String {
