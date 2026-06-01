@@ -916,8 +916,9 @@ async fn handle_worker_invoke(
         .user_id
         .as_ref()
         .map(|u| u.as_str().to_string());
+    let flow_payload = normalize_worker_payload(&worker_req.payload);
     let activity = build_activity(
-        &worker_req.payload,
+        &flow_payload,
         &tenant,
         user.as_deref(),
         session_hint.as_deref(),
@@ -970,8 +971,19 @@ async fn handle_worker_invoke(
 /// Card becomes an `adaptive-card` message carrying the card JSON; a reply with
 /// a `text` field becomes a `text` message; anything else passes the activity
 /// payload through under a generic `activity` kind.
+///
+/// A node that pauses for user input (`session.wait`, e.g. a card menu whose
+/// buttons drive conditional routing) returns its rendered output wrapped in a
+/// `{"status":"pending","response":{...}}` envelope. The card the user must see
+/// lives in `response`, so unwrap a pending envelope first — otherwise the
+/// menu (and every intermediate waiting card) would surface as an opaque
+/// `activity` and never render.
 fn activity_to_worker_message(activity: &Activity) -> WorkerInvokeMessage {
-    let payload = activity.payload();
+    let raw = activity.payload();
+    let payload = match raw.get("status").and_then(Value::as_str) {
+        Some("pending") => raw.get("response").unwrap_or(raw),
+        _ => raw,
+    };
     if let Some(card) = payload.get("renderedCard") {
         WorkerInvokeMessage {
             kind: "adaptive-card".to_string(),
@@ -987,6 +999,26 @@ fn activity_to_worker_message(activity: &Activity) -> WorkerInvokeMessage {
             kind: "activity".to_string(),
             payload: payload.clone(),
         }
+    }
+}
+
+/// Shape a worker-invoke payload for the flow engine's routing context.
+///
+/// The engine synthesises the `response.*` object that conditional routes test
+/// (e.g. `response.action == "about_card"`) from the activity's
+/// `entry.metadata.*`. A typed chat message arrives as `{"text": "..."}` and
+/// already drives `response.text`, so it passes through untouched. An Adaptive
+/// Card `Action.Submit` instead posts its `data` verbatim (e.g.
+/// `{"action": "about_card"}`) with no `text` — lift such a payload under
+/// `metadata` so a card button navigates the flow, mirroring how the legacy
+/// messaging adapters surface submit data. Non-object, empty, or `text`
+/// payloads are returned unchanged.
+fn normalize_worker_payload(payload: &Value) -> Value {
+    match payload {
+        Value::Object(map) if !map.is_empty() && !map.get("text").is_some_and(Value::is_string) => {
+            serde_json::json!({ "metadata": payload.clone() })
+        }
+        _ => payload.clone(),
     }
 }
 
@@ -1406,6 +1438,38 @@ mod tests {
     }
 
     #[test]
+    fn normalize_worker_payload_lifts_card_submit_into_metadata() {
+        // An Adaptive Card Action.Submit posts its data verbatim with no `text`.
+        let submit = json!({ "action": "about_card" });
+        let shaped = normalize_worker_payload(&submit);
+        assert_eq!(shaped, json!({ "metadata": { "action": "about_card" } }));
+
+        // Through build_activity the action lands where the engine's routing
+        // context reads it (`response.action` <- entry.metadata.action).
+        let activity = build_activity(&shaped, "acme", None, Some("s1"), None, None);
+        assert_eq!(
+            activity
+                .payload()
+                .pointer("/metadata/action")
+                .and_then(Value::as_str),
+            Some("about_card")
+        );
+    }
+
+    #[test]
+    fn normalize_worker_payload_passes_text_through() {
+        let typed = json!({ "text": "capabilities" });
+        assert_eq!(normalize_worker_payload(&typed), typed);
+    }
+
+    #[test]
+    fn normalize_worker_payload_passes_empty_and_non_object_through() {
+        assert_eq!(normalize_worker_payload(&json!({})), json!({}));
+        assert_eq!(normalize_worker_payload(&Value::Null), Value::Null);
+        assert_eq!(normalize_worker_payload(&json!("hi")), json!("hi"));
+    }
+
+    #[test]
     fn activity_to_worker_message_maps_card_text_and_generic() {
         // A rendered Adaptive Card becomes an `adaptive-card` message carrying
         // the card JSON (not the wrapping payload).
@@ -1429,6 +1493,24 @@ mod tests {
         let msg = activity_to_worker_message(&other);
         assert_eq!(msg.kind, "activity");
         assert_eq!(msg.payload, json!({ "n": 7 }));
+    }
+
+    #[test]
+    fn activity_to_worker_message_unwraps_pending_card() {
+        // A paused (session.wait) menu node wraps its rendered card in a
+        // pending envelope; the card must still surface as `adaptive-card`.
+        let card = json!({ "type": "AdaptiveCard", "version": "1.6" });
+        let pending = Activity::custom(
+            "response",
+            json!({
+                "status": "pending",
+                "reason": "awaiting user submit",
+                "response": { "renderedCard": card.clone() }
+            }),
+        );
+        let msg = activity_to_worker_message(&pending);
+        assert_eq!(msg.kind, "adaptive-card");
+        assert_eq!(msg.payload, card);
     }
 
     #[test]
