@@ -243,7 +243,7 @@ pub(super) fn read_transcript_outputs(run_dir: &Path) -> anyhow::Result<Option<J
 }
 
 pub(super) fn build_demo_host_config(tenant: &str) -> HostConfig {
-    HostConfig {
+    let mut config = HostConfig {
         tenant: tenant.to_string(),
         bindings_path: PathBuf::from("<demo-provider>"),
         flow_type_bindings: HashMap::new(),
@@ -261,11 +261,43 @@ pub(super) fn build_demo_host_config(tenant: &str) -> HostConfig {
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
-        // The `agents` field exists because greentic-start enables the
-        // `agentic-worker` feature on its runner deps. This demo host config
-        // declares no agents; Digital Worker agents reach the runtime via the
-        // bindings-YAML `agents:` section (HostConfig::load_from_path).
+        // Populated below from GREENTIC_AW_AGENTS_FILE when set. greentic-start
+        // builds a synthetic HostConfig (there is no bindings-YAML path here),
+        // so Digital Worker agents for the agentic worker are sourced from that
+        // env-pointed file rather than a bindings `agents:` section.
         agents: HashMap::new(),
+    };
+    apply_demo_agents(&mut config);
+    config
+}
+
+/// Source Digital Worker agent definitions from `GREENTIC_AW_AGENTS_FILE` (a
+/// YAML map of `<agent_id>: AgentConfig`) into the host config. Absent, empty,
+/// unreadable, or unparseable → no agents (fail-soft, logged), so a bad file
+/// never blocks `gtc start`; the agentic-worker node simply stays disabled.
+fn apply_demo_agents(config: &mut HostConfig) {
+    let Ok(path) = env::var("GREENTIC_AW_AGENTS_FILE") else {
+        return;
+    };
+    if path.trim().is_empty() {
+        return;
+    }
+    match fs::read_to_string(&path) {
+        Ok(contents) => parse_demo_agents_into(config, &contents, &path),
+        Err(error) => {
+            tracing::warn!(path = %path, error = %error, "GREENTIC_AW_AGENTS_FILE unreadable; no demo agents");
+        }
+    }
+}
+
+/// Parse a YAML `<agent_id>: AgentConfig` map into `config.agents`. Split from
+/// [`apply_demo_agents`] so it is unit-testable without mutating process env.
+fn parse_demo_agents_into(config: &mut HostConfig, contents: &str, src: &str) {
+    match serde_yaml_bw::from_str(contents) {
+        Ok(agents) => config.agents = agents,
+        Err(error) => {
+            tracing::warn!(src = %src, error = %error, "GREENTIC_AW_AGENTS_FILE parse failed; no demo agents");
+        }
     }
 }
 
@@ -369,6 +401,45 @@ pub(super) fn capability_route_error_outcome(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn parse_demo_agents_into_populates_agents_from_yaml() {
+        let mut config = build_demo_host_config("acme");
+        assert!(
+            config.agents.is_empty(),
+            "demo config starts with no agents"
+        );
+
+        let yaml = r#"
+research-bot:
+  agent_id: research-bot
+  system_prompt: "be helpful"
+  llm:
+    provider: openai
+    model: gpt-4o-mini
+  tools:
+    - extension_id: greentic.tavily
+      tool_name: web_search
+"#;
+        parse_demo_agents_into(&mut config, yaml, "test");
+
+        assert_eq!(config.agents.len(), 1);
+        let agent = config.agents.get("research-bot").expect("agent present");
+        assert_eq!(agent.system_prompt, "be helpful");
+        assert_eq!(agent.llm.model, "gpt-4o-mini");
+        assert_eq!(agent.tools.len(), 1);
+        assert_eq!(agent.tools[0].tool_name, "web_search");
+    }
+
+    #[test]
+    fn parse_demo_agents_into_is_fail_soft_on_garbage() {
+        let mut config = build_demo_host_config("acme");
+        parse_demo_agents_into(&mut config, "{not valid agents yaml", "test");
+        assert!(
+            config.agents.is_empty(),
+            "a malformed agents file must leave agents empty, not panic"
+        );
+    }
 
     #[test]
     fn helper_functions_cover_domains_aliases_and_secret_detection() {

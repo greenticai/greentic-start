@@ -25,6 +25,7 @@ pins the runner via git **tag `aw-overlay-v1`** with `features =
 | Env var | Purpose | Default |
 |---------|---------|---------|
 | `GREENTIC_AW_REDIS_URL` | AW session-state store (REQUIRED; unset → agent disabled) | — |
+| `GREENTIC_AW_AGENTS_FILE` | YAML map of `<agent_id>: AgentConfig` (the agents) | — |
 | `GREENTIC_EXTENSIONS_DIR` | extension discovery dir | `~/.greentic/extensions` |
 | `GREENTIC_AGENT_MANIFESTS_DIR` | DW manifest overlay dir | `~/.greentic/agents` |
 | `OPENAI_API_KEY` / LLM bridge vars | LLM backend | — |
@@ -34,11 +35,27 @@ and the agent path is skipped — that is graceful degradation, not a failure.
 
 ## Per-agent config
 
-- Operator YAML `agents.<id>` (bindings YAML, parsed by
-  `HostConfig::load_from_path`): `system_prompt`, `llm`, optional `limits`,
-  optional `tools`.
-- Optional `<id>.json` manifest in the manifests dir overlays the tool set —
-  see greentic-runner `docs/agentic-worker-tools.md`.
+greentic-start builds a synthetic `HostConfig` (no bindings-YAML path), so agents
+are sourced from the file pointed to by **`GREENTIC_AW_AGENTS_FILE`** — a YAML map
+of `<agent_id>: AgentConfig`:
+
+```yaml
+research-bot:
+  agent_id: research-bot
+  system_prompt: "You are a research assistant. Use tools when helpful."
+  llm:
+    provider: openai
+    model: gpt-4o-mini
+  tools:                       # optional; replaced by a manifest overlay if present
+    - extension_id: greentic.tavily
+      tool_name: web_search
+  # limits: { ... }            # optional; sensible defaults apply when omitted
+```
+
+A missing, empty, unreadable, or unparseable file is logged and ignored (no
+agents) rather than failing `gtc start`. An optional `<agent_id>.json` manifest in
+the manifests dir overlays the tool set onto each agent — see greentic-runner
+`docs/agentic-worker-tools.md`.
 
 ## Smoke test (manual)
 
@@ -47,15 +64,12 @@ extension:
 
 ```bash
 export GREENTIC_AW_REDIS_URL=redis://127.0.0.1:6379
+export GREENTIC_AW_AGENTS_FILE=$HOME/.greentic/agents.yaml    # the agents map
 export GREENTIC_EXTENSIONS_DIR=$HOME/.greentic/extensions
-export GREENTIC_AGENT_MANIFESTS_DIR=$HOME/.greentic/agents   # optional (overlay)
+export GREENTIC_AGENT_MANIFESTS_DIR=$HOME/.greentic/agents    # optional (overlay)
 cargo run -p greentic-start -- start ./my-bundle --cloudflared off
 ```
 
 Expected: a log line `AW runtime constructed` with `agent_count > 0`. Drive a
 `DwAgent` flow node and confirm a tool is invoked (the step trail contains a
 `tool_call` entry).
-
-> Follow-up: `build_demo_host_config` (the non-bindings demo path) currently
-> declares no agents, so DwAgent nodes only activate via the bindings-YAML
-> `agents:` path. Sourcing agents into the demo host config is a separate task.
