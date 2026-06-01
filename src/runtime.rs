@@ -56,6 +56,7 @@ struct StartupInfo {
     channels: Vec<String>,
     mode: String,
     webhook_results: Vec<(String, String)>,
+    subscription_results: Vec<(String, String)>,
 }
 
 impl StartupInfo {
@@ -80,6 +81,13 @@ impl StartupInfo {
             println!();
             println!("Webhooks:");
             for (provider, desc) in &self.webhook_results {
+                println!("  [{provider}] {desc}");
+            }
+        }
+        if !self.subscription_results.is_empty() {
+            println!();
+            println!("Subscriptions:");
+            for (provider, desc) in &self.subscription_results {
                 println!("  [{provider}] {desc}");
             }
         }
@@ -731,6 +739,7 @@ pub fn demo_up(
         channels: Vec::new(),
         mode,
         webhook_results: Vec::new(),
+        subscription_results: Vec::new(),
     };
     info.print();
 
@@ -1036,6 +1045,28 @@ pub fn demo_up_services(
     } else {
         crate::webhook_updater::WebhookUpdateSummary::default()
     };
+    let subscription_summary =
+        match crate::subscription_updater::sync_subscriptions_if_public_url_available(
+            config_dir,
+            &discovery,
+            &secrets_handle,
+            Some(runner_host.as_ref()),
+            tenant,
+            team,
+            public_base_url.as_deref().unwrap_or(""),
+        ) {
+            Ok(summary) => summary,
+            Err(err) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "[subscription-updater] failed to sync subscriptions: {}",
+                        err
+                    ),
+                );
+                crate::subscription_updater::SubscriptionUpdateSummary::default()
+            }
+        };
 
     // http_listener_enabled: true if HTTP ingress server started (not tied to NATS)
     // asset_serving_enabled: true if bundle declares static routes we're enabling
@@ -1260,6 +1291,7 @@ pub fn demo_up_services(
         channels,
         mode,
         webhook_results: webhook_summary.results,
+        subscription_results: subscription_summary.results,
     };
     info.print();
 
@@ -1351,7 +1383,7 @@ fn detect_http_ingress_domains(
         let supported = discovery.providers.iter().any(|provider| {
             let domain_match = parse_domain_name(&provider.domain) == Some(domain);
             let op_support = runner_host.supports_op(domain, &provider.provider_id, "ingest_http");
-            operator_log::info(
+            operator_log::debug(
                 module_path!(),
                 format!(
                     "[domain-detect] domain={:?} provider={} domain_match={} op_support={}",
@@ -1361,7 +1393,7 @@ fn detect_http_ingress_domains(
             domain_match && op_support
         });
         let fallback_supported = matches!(domain, Domain::Events) && discovery.domains.events;
-        operator_log::info(
+        operator_log::debug(
             module_path!(),
             format!(
                 "[domain-detect] domain={:?} supported={} fallback={} => enabled={}",
@@ -1860,6 +1892,7 @@ mod tests {
             channels: vec!["webchat".to_string()],
             mode: "embedded runner".to_string(),
             webhook_results: vec![("slack".to_string(), "ok".to_string())],
+            subscription_results: vec![("teams".to_string(), "synced".to_string())],
         };
         info.print();
 

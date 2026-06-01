@@ -2,10 +2,12 @@ use crate::dev_store_path;
 use anyhow::{Result as AnyhowResult, anyhow};
 use async_trait::async_trait;
 use greentic_secrets_lib::{
-    Result as SecretResult, SecretError, SecretsManager, SecretsStore,
+    Result as SecretResult, SecretError, SecretFormat, SecretsManager, SecretsStore,
     core::{Error as CoreError, seed::DevStore},
 };
 use std::path::{Path, PathBuf};
+
+use crate::secret_name;
 
 pub struct SecretsClient {
     store_path: PathBuf,
@@ -41,7 +43,8 @@ impl SecretsManager for SecretsClient {
         // become visible without restarting the operator process.
         let store = DevStore::with_path(self.store_path.clone())
             .map_err(|err| SecretError::Backend(err.to_string().into()))?;
-        let result = store.get(path).await;
+        let canonical_path = canonicalize_dev_store_secret_uri(path);
+        let result = store.get(canonical_path.as_deref().unwrap_or(path)).await;
         match result {
             Ok(value) => Ok(value),
             Err(CoreError::NotFound { entity }) => Err(SecretError::NotFound(entity)),
@@ -49,10 +52,18 @@ impl SecretsManager for SecretsClient {
         }
     }
 
-    async fn write(&self, _: &str, _: &[u8]) -> SecretResult<()> {
-        Err(SecretError::Permission(
-            "dev secrets store is read-only".into(),
-        ))
+    async fn write(&self, path: &str, bytes: &[u8]) -> SecretResult<()> {
+        let store = DevStore::with_path(self.store_path.clone())
+            .map_err(|err| SecretError::Backend(err.to_string().into()))?;
+        let canonical_path = canonicalize_dev_store_secret_uri(path);
+        store
+            .put(
+                canonical_path.as_deref().unwrap_or(path),
+                SecretFormat::Bytes,
+                bytes,
+            )
+            .await
+            .map_err(|err| SecretError::Backend(err.to_string().into()))
     }
 
     async fn delete(&self, _: &str) -> SecretResult<()> {
@@ -60,6 +71,20 @@ impl SecretsManager for SecretsClient {
             "dev secrets store is read-only".into(),
         ))
     }
+}
+
+fn canonicalize_dev_store_secret_uri(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("secrets://")?;
+    let mut segments = trimmed.split('/').collect::<Vec<_>>();
+    if segments.len() != 5 {
+        return None;
+    }
+    let canonical_key = secret_name::canonical_secret_key_path(segments[4]);
+    if canonical_key == segments[4] {
+        return None;
+    }
+    segments[4] = &canonical_key;
+    Some(format!("secrets://{}", segments.join("/")))
 }
 
 #[cfg(test)]
@@ -126,6 +151,26 @@ mod tests {
                 .await
         })?;
         assert_eq!(value, b"after-startup".to_vec());
+        Ok(())
+    }
+
+    #[test]
+    fn writes_secret_to_dev_store() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let store_path = dir.path().join("secrets.env");
+        let client = SecretsClient::open_with_path(store_path.clone())?;
+        let runtime = Runtime::new()?;
+        let uri = "secrets://dev/demo/default/messaging-slack/SLACK_CONFIGURATION_ACCESS_TOKEN";
+
+        runtime.block_on(async { client.write(uri, b"xoxe-access").await })?;
+
+        let store = DevStore::with_path(store_path)?;
+        let canonical_uri =
+            "secrets://dev/demo/default/messaging-slack/slack_configuration_access_token";
+        let value = runtime.block_on(async { store.get(canonical_uri).await })?;
+        assert_eq!(value, b"xoxe-access".to_vec());
+        let value = runtime.block_on(async { client.read(uri).await })?;
+        assert_eq!(value, b"xoxe-access".to_vec());
         Ok(())
     }
 }

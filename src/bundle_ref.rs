@@ -181,10 +181,14 @@ fn extract_bundle_archive(
     let out_dir = bundle_cache_dir(&fetched.digest);
     let marker = bundle_cache_marker_path(&fetched.digest);
     if marker.exists() {
-        return Ok(ResolvedBundle {
-            source_ref: fetched.source_ref.clone(),
-            bundle_dir: resolve_extracted_bundle_root(&out_dir),
-        });
+        let bundle_dir = resolve_extracted_bundle_root(&out_dir);
+        if extracted_bundle_cache_ready(&bundle_dir) {
+            return Ok(ResolvedBundle {
+                source_ref: fetched.source_ref.clone(),
+                bundle_dir,
+            });
+        }
+        let _ = fs::remove_file(&marker);
     }
 
     if out_dir.exists() {
@@ -249,6 +253,13 @@ fn resolve_extracted_bundle_root(out_dir: &Path) -> PathBuf {
         return nested;
     }
     out_dir.to_path_buf()
+}
+
+fn extracted_bundle_cache_ready(bundle_dir: &Path) -> bool {
+    match fs::read_dir(bundle_dir) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(_) => false,
+    }
 }
 
 fn extracted_bundle_root_has_config(root: &Path) -> bool {
@@ -1155,6 +1166,14 @@ mod tests {
             "hello gz"
         );
 
+        let digest = local_file_digest(&tar_gz_path).expect("digest");
+        let cache_dir = bundle_cache_dir(&digest);
+        let marker = bundle_cache_marker_path(&digest);
+        let _ = fs::remove_file(&marker);
+        let _ = fs::remove_dir_all(&cache_dir);
+        fs::create_dir_all(&cache_dir).expect("empty cache dir");
+        fs::write(&marker, "stale marker\n").expect("stale marker");
+
         let resolved = resolve_bundle_ref(tar_gz_path.to_string_lossy().as_ref()).expect("resolve");
         assert!(
             resolved
@@ -1163,6 +1182,8 @@ mod tests {
                 .join("index.txt")
                 .exists()
         );
+        let _ = fs::remove_file(marker);
+        let _ = fs::remove_dir_all(cache_dir);
     }
 
     // Phase 0 P0.4 — extraction-path hardening regression tests.

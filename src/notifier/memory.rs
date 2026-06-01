@@ -1,4 +1,5 @@
 use crate::notifier::{ActivityNotifier, EventStream, NotifierError, NotifyEvent};
+use crate::operator_log;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures_util::StreamExt;
@@ -27,18 +28,24 @@ impl ActivityNotifier for InMemoryNotifier {
             let receiver_count = sender.receiver_count();
             // send returns Err(SendError) if no receivers — drop silently.
             let send_result = sender.send(event.clone());
-            eprintln!(
-                "[ws notifier:memory] publish tenant={} conv={} watermark={} subscribers={} send_ok={}",
-                event.tenant_id,
-                event.conversation_id,
-                event.new_watermark,
-                receiver_count,
-                send_result.is_ok(),
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[ws notifier:memory] publish tenant={} conv={} watermark={} subscribers={} send_ok={}",
+                    event.tenant_id,
+                    event.conversation_id,
+                    event.new_watermark,
+                    receiver_count,
+                    send_result.is_ok(),
+                ),
             );
         } else {
-            eprintln!(
-                "[ws notifier:memory] publish tenant={} conv={} watermark={} no_channel_for_key",
-                event.tenant_id, event.conversation_id, event.new_watermark,
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[ws notifier:memory] publish tenant={} conv={} watermark={} no_channel_for_key",
+                    event.tenant_id, event.conversation_id, event.new_watermark,
+                ),
             );
         }
     }
