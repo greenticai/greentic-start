@@ -46,6 +46,7 @@ pub(super) fn route_messaging_envelopes(
             crate::fast2flow::Fast2FlowConfig::global(),
             ctx,
             &pack_info,
+            &app_pack_path,
             original,
             provider,
         ) {

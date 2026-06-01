@@ -35,6 +35,7 @@ pub fn try_for_request(
     cfg: &Fast2FlowConfig,
     ctx: &OperatorContext,
     pack: &AppPackInfo,
+    pack_path: &std::path::Path,
     envelope: &ChannelMessageEnvelope,
     provider: &str,
 ) -> Option<ControlDirective> {
@@ -74,7 +75,23 @@ pub fn try_for_request(
     };
     let scope = scope_for(ctx);
     let index_path = indexes_path.join(&scope).join("index.json");
-    let exists = index_path.is_file();
+    let mut exists = index_path.is_file();
+    if !exists {
+        // Fallback: materialize from the pack's own assets/intent-index.json.
+        // Lets packs ship their routing index self-contained without the
+        // operator having to populate `<indexes_path>/<scope>/index.json`
+        // out-of-band. Materialised once; subsequent requests reuse the file.
+        if materialize_index_from_pack(pack_path, &index_path) {
+            exists = true;
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[fast2flow:gate] materialized index from pack -> {}",
+                    index_path.display()
+                ),
+            );
+        }
+    }
     operator_log::info(
         module_path!(),
         format!(
@@ -129,6 +146,40 @@ pub fn try_for_request(
         ControlDirective::Continue => None,
         actionable => Some(actionable),
     }
+}
+
+/// Copy `assets/intent-index.json` out of the pack zip into `target_index`.
+fn materialize_index_from_pack(
+    pack_path: &std::path::Path,
+    target_index: &std::path::Path,
+) -> bool {
+    let Ok(file) = std::fs::File::open(pack_path) else {
+        return false;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return false;
+    };
+    let mut buf = Vec::new();
+    {
+        let Ok(mut entry) = archive.by_name("assets/intent-index.json") else {
+            return false;
+        };
+        if std::io::Read::read_to_end(&mut entry, &mut buf).is_err() {
+            return false;
+        }
+    }
+    if let Some(parent) = target_index.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return false;
+    }
+    if std::fs::write(target_index, &buf).is_err() {
+        return false;
+    }
+    if let Some(parent) = target_index.parent() {
+        let _ = std::fs::write(parent.join("latest"), "index.json\n");
+    }
+    true
 }
 
 #[cfg(test)]
@@ -253,6 +304,7 @@ mod tests {
                 &cfg,
                 &ctx(),
                 &pack_with_fast2flow_cap(),
+                std::path::Path::new("/nonexistent.gtpack"),
                 &envelope("show me my pipeline"),
                 "webchat",
             );
@@ -284,6 +336,7 @@ mod tests {
                 &cfg,
                 &ctx(),
                 &pack_without_cap,
+                std::path::Path::new("/nonexistent.gtpack"),
                 &envelope("show pipeline"),
                 "webchat",
             );
@@ -303,6 +356,7 @@ mod tests {
                 &cfg,
                 &ctx(),
                 &pack_with_fast2flow_cap(),
+                std::path::Path::new("/nonexistent.gtpack"),
                 &envelope("show pipeline"),
                 "webchat",
             );
@@ -323,6 +377,7 @@ mod tests {
                 &cfg,
                 &ctx(),
                 &pack_with_fast2flow_cap(),
+                std::path::Path::new("/nonexistent.gtpack"),
                 &envelope("hi"),
                 "webchat",
             );
