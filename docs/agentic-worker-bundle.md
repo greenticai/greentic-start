@@ -73,3 +73,20 @@ cargo run -p greentic-start -- start ./my-bundle --cloudflared off
 Expected: a log line `AW runtime constructed` with `agent_count > 0`. Drive a
 `DwAgent` flow node and confirm a tool is invoked (the step trail contains a
 `tool_call` entry).
+
+## Smoke test (cross-host registry path)
+
+`scripts/smoke-agent-deploy.sh` automates the deterministic half of the
+designer→runtime pipeline: it boots the `greentic-designer-admin` agent registry
+(dev/ephemeral), mints a tenant `gtc_live` key, publishes a sample `AgentConfig`
+(the designer "Deploy" / `PUT /api/v1/designer/agents/{id}`), and verifies the
+runtime-facing pull (`GET`, the exact call `HttpConfigProvider` makes) plus the
+401/404 paths. It then prints the precise `GREENTIC_AW_ADMIN_ENDPOINT` /
+`GREENTIC_AW_ADMIN_TOKEN` env + `gtc start` command and the agent-loop
+verification checklist (which needs your Redis + LLM key + an installed
+extension, so it stays manual).
+
+```bash
+# build the admin binary first: (cd ../greentic-designer-admin && cargo build)
+scripts/smoke-agent-deploy.sh
+```
