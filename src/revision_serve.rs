@@ -596,6 +596,21 @@ async fn serve(
         return Ok(response);
     }
 
+    // Worker-invoke gateway contract: a HostWorker gateway (e.g. greentic-gui's
+    // `HttpWorkerBackend`) POSTs a `HostWorkerRequest` here and expects a
+    // `HostWorkerResponse`. Handled before deployment-route resolution because a
+    // broad `/`-prefix route binding would otherwise match `/workers/invoke` and
+    // run it as a generic entry-flow activity.
+    if path == "/workers/invoke" {
+        if method != hyper::Method::POST {
+            return Err(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "worker invoke requires POST",
+            ));
+        }
+        return handle_worker_invoke(req, Arc::clone(&state), peer_is_loopback).await;
+    }
+
     // Snapshot the activation ONCE per request so dispatch and execute see a
     // coherent (host, routing) pair. A concurrent [`RevisionServer::reload`]
     // swap is observed by the *next* request; this one keeps running against
@@ -773,6 +788,206 @@ async fn serve(
         apply_set_cookie(&mut response, &directive);
     }
     Ok(response)
+}
+
+/// `POST /workers/invoke` payload, mirroring
+/// `greentic_interfaces_host::worker::HostWorkerRequest` (the envelope a
+/// HostWorker gateway such as greentic-gui's `HttpWorkerBackend` posts). Defined
+/// locally so the runtime need not depend on the interfaces-host crate just to
+/// (de)serialize a JSON contract; the field names and [`greentic_types::TenantCtx`]
+/// are shared, so the wire form matches. Unknown fields (e.g. `timestamp_utc`,
+/// `version`) are ignored.
+#[derive(serde::Deserialize)]
+struct WorkerInvokeRequest {
+    #[serde(default)]
+    version: String,
+    tenant: greentic_types::TenantCtx,
+    #[serde(default)]
+    worker_id: String,
+    #[serde(default)]
+    payload: Value,
+    #[serde(default)]
+    correlation_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
+}
+
+/// One reply message, mirroring `HostWorkerMessage`.
+#[derive(serde::Serialize)]
+struct WorkerInvokeMessage {
+    kind: String,
+    payload: Value,
+}
+
+/// `POST /workers/invoke` response, mirroring `HostWorkerResponse` so the
+/// gateway's `resp.json::<HostWorkerResponse>()` round-trips.
+#[derive(serde::Serialize)]
+struct WorkerInvokeResponse {
+    version: String,
+    tenant: greentic_types::TenantCtx,
+    worker_id: String,
+    timestamp_utc: String,
+    messages: Vec<WorkerInvokeMessage>,
+    correlation_id: Option<String>,
+    session_id: Option<String>,
+    thread_id: Option<String>,
+}
+
+/// Handle `POST /workers/invoke`: resolve the deployment for the asserted tenant,
+/// dispatch a revision, run the payload as an [`Activity`], and return the reply
+/// activities mapped into a `HostWorkerResponse`-shaped body.
+///
+/// Loopback-only: the contract trusts the caller-asserted tenant/user/session,
+/// so it accepts only co-located gateways (e.g. greentic-gui on the same host).
+/// A remote, authenticated gateway is the Phase-D upgrade — mirrors the
+/// loopback identity posture of the generic ingress (`caller_identity`).
+async fn handle_worker_invoke(
+    req: Request<Incoming>,
+    state: Arc<ServeState>,
+    peer_is_loopback: bool,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    if !peer_is_loopback {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "worker invoke is restricted to loopback callers",
+        ));
+    }
+
+    let activation = state.current();
+
+    let body_bytes = read_body_limited(req).await.map_err(|_| {
+        error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds the size limit",
+        )
+    })?;
+    let worker_req: WorkerInvokeRequest = serde_json::from_slice(&body_bytes).map_err(|err| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            format!("invalid HostWorkerRequest body: {err}"),
+        )
+    })?;
+
+    // Resolve the deployment by the asserted tenant (lone-deployment fallback for
+    // the common local case), then execute under the deployment's OWN tenant.
+    let (deployment_id, tenant) = activation
+        .routing
+        .deployment_routes
+        .resolve_worker(worker_req.tenant.tenant_id.as_str())
+        .map(|(id, tenant)| (id, tenant.to_string()))
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "no active deployment resolves for the requested tenant",
+            )
+        })?;
+
+    let session_hint = worker_req.session_id.clone();
+    let dispatch_req = DispatchRequest {
+        env_id: activation.routing.dispatcher.env_id(),
+        tenant: &tenant,
+        deployment_id,
+        session_hint: session_hint.as_deref(),
+        trusted: false,
+        header_revision: None,
+        cookie: None,
+    };
+    let mut rng: rand::rngs::SmallRng = rand::make_rng();
+    let outcome = activation
+        .routing
+        .dispatcher
+        .dispatch(&dispatch_req, &mut rng)
+        .await
+        .map_err(|err| {
+            operator_log::warn(
+                module_path!(),
+                format!("worker-invoke dispatch for deployment {deployment_id} failed: {err:#}"),
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "revision dispatch failed",
+            )
+        })?;
+
+    let user = worker_req
+        .tenant
+        .user_id
+        .as_ref()
+        .map(|u| u.as_str().to_string());
+    let activity = build_activity(
+        &worker_req.payload,
+        &tenant,
+        user.as_deref(),
+        session_hint.as_deref(),
+        None,
+        None,
+    );
+
+    let replies = activation
+        .host
+        .handle_activity_for_revision(
+            &tenant,
+            deployment_id,
+            outcome.bundle_id.clone(),
+            outcome.revision_id,
+            activity,
+        )
+        .await
+        .map_err(|err| {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "worker-invoke execution failed for deployment {deployment_id} revision {}: {err:#}",
+                    outcome.revision_id
+                ),
+            );
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "flow execution failed")
+        })?;
+
+    let messages = replies.iter().map(activity_to_worker_message).collect();
+    let response = WorkerInvokeResponse {
+        version: if worker_req.version.is_empty() {
+            "1.0.0".to_string()
+        } else {
+            worker_req.version
+        },
+        tenant: worker_req.tenant,
+        worker_id: worker_req.worker_id,
+        timestamp_utc: chrono::Utc::now().to_rfc3339(),
+        messages,
+        correlation_id: worker_req.correlation_id,
+        session_id: worker_req.session_id,
+        thread_id: worker_req.thread_id,
+    };
+    let body = serde_json::to_vec(&response)
+        .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(json_response(StatusCode::OK, body))
+}
+
+/// Map a runner reply [`Activity`] into a worker message. A rendered Adaptive
+/// Card becomes an `adaptive-card` message carrying the card JSON; a reply with
+/// a `text` field becomes a `text` message; anything else passes the activity
+/// payload through under a generic `activity` kind.
+fn activity_to_worker_message(activity: &Activity) -> WorkerInvokeMessage {
+    let payload = activity.payload();
+    if let Some(card) = payload.get("renderedCard") {
+        WorkerInvokeMessage {
+            kind: "adaptive-card".to_string(),
+            payload: card.clone(),
+        }
+    } else if payload.get("text").is_some() {
+        WorkerInvokeMessage {
+            kind: "text".to_string(),
+            payload: payload.clone(),
+        }
+    } else {
+        WorkerInvokeMessage {
+            kind: "activity".to_string(),
+            payload: payload.clone(),
+        }
+    }
 }
 
 /// Map a generic JSON request body to a canonical [`Activity`]. A `text` field
@@ -1188,6 +1403,32 @@ mod tests {
         let activity = build_activity(&Value::Null, "acme", None, None, None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.payload(), &Value::Null);
+    }
+
+    #[test]
+    fn activity_to_worker_message_maps_card_text_and_generic() {
+        // A rendered Adaptive Card becomes an `adaptive-card` message carrying
+        // the card JSON (not the wrapping payload).
+        let card = json!({ "type": "AdaptiveCard", "version": "1.6" });
+        let card_activity = Activity::custom("response", json!({ "renderedCard": card.clone() }));
+        let msg = activity_to_worker_message(&card_activity);
+        assert_eq!(msg.kind, "adaptive-card");
+        assert_eq!(msg.payload, card);
+
+        // A text reply becomes a `text` message preserving the `{text: …}` body.
+        let text_activity = Activity::text("hello there");
+        let msg = activity_to_worker_message(&text_activity);
+        assert_eq!(msg.kind, "text");
+        assert_eq!(
+            msg.payload.get("text").and_then(Value::as_str),
+            Some("hello there")
+        );
+
+        // Anything else passes the payload through under the generic kind.
+        let other = Activity::custom("response", json!({ "n": 7 }));
+        let msg = activity_to_worker_message(&other);
+        assert_eq!(msg.kind, "activity");
+        assert_eq!(msg.payload, json!({ "n": 7 }));
     }
 
     #[test]
