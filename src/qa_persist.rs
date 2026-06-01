@@ -163,8 +163,8 @@ pub async fn persist_qa_results(
         persist_qa_secrets(&store, &env, tenant, team, provider_id, config, form_spec).await?;
 
     // Seed aliases from secret-requirements.json so WASM components can find
-    // secrets by their canonical requirement key (e.g. SLACK_BOT_TOKEN →
-    // slack_bot_token) even when the answers file uses a shorter key (bot_token).
+    // secrets by their canonical requirement key when provider metadata declares
+    // a longer runtime key than the setup answer key.
     if let Some(config_map) = config.as_object() {
         let alias_count = seed_secret_requirement_aliases(
             &store,
@@ -226,8 +226,7 @@ pub fn oauth_authorize_stub(provider_id: &str, auth_url: Option<&str>) -> Option
 /// canonicalization.
 ///
 /// This allows WASM components to find secrets by their canonical requirement
-/// key (e.g. `SLACK_BOT_TOKEN` → `slack_bot_token`) even when the answers file
-/// uses a shorter key (e.g. `bot_token`).
+/// key even when the answers file uses a shorter key.
 pub async fn seed_secret_requirement_aliases(
     store: &DevStore,
     config_map: &JsonMap<String, Value>,
@@ -258,7 +257,7 @@ pub async fn seed_secret_requirement_aliases(
         }
 
         // Find a config value where the canonical requirement key ends with the
-        // canonical config key. E.g., "slack_bot_token" ends with "bot_token".
+        // canonical config key.
         let matched_value = config_map.iter().find_map(|(cfg_key, cfg_val)| {
             let norm_cfg = canonical_secret_name(cfg_key);
             if canonical_req_key.ends_with(&norm_cfg) {

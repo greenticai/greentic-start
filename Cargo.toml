@@ -1,6 +1,6 @@
 [package]
 name = "greentic-start"
-version = "0.5.33"
+version = "0.5.34"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -44,6 +44,7 @@ qa-spec = { version = ">=0.5.0, <0.6.0" }
 rand = "0.10"
 rpassword = "7"
 redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 semver = "1"

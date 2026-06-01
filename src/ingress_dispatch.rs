@@ -35,6 +35,28 @@ pub fn dispatch_http_ingress_with_op(
     ctx: &OperatorContext,
     op_name: &str,
 ) -> anyhow::Result<IngressDispatchResult> {
+    if op_name == "ingest_http"
+        && let Some(outcome) = runner_host.invoke_provider_ingress_extension(
+            domain,
+            &request.provider,
+            provider_ingress_headers_json(request)?,
+            provider_ingress_body_json(request)?,
+            ctx,
+        )?
+    {
+        if !outcome.success {
+            let message = outcome
+                .error
+                .or(outcome.raw)
+                .unwrap_or_else(|| "provider ingress failed".to_string());
+            anyhow::bail!("{message}");
+        }
+        let value = outcome.output.unwrap_or_else(|| json!({}));
+        let decoded =
+            parse_dispatch_result(&value).with_context(|| "decode provider ingress output")?;
+        return Ok(decoded);
+    }
+
     // Inject secrets into config for providers running in provider_core_only mode.
     // Fall back to a minimal config for events providers that require a non-null
     // config object even when no secrets or setup have been configured yet.
@@ -110,6 +132,57 @@ pub fn dispatch_http_ingress_with_op(
         ctx,
     )?;
     Ok(decoded)
+}
+
+fn provider_ingress_headers_json(request: &IngressRequestV1) -> anyhow::Result<String> {
+    let mut headers = JsonMap::new();
+    for (key, value) in &request.headers {
+        headers.insert(key.clone(), JsonValue::String(value.clone()));
+    }
+    headers.insert(
+        "method".to_string(),
+        JsonValue::String(request.method.clone()),
+    );
+    headers.insert("path".to_string(), JsonValue::String(request.path.clone()));
+    let query = request
+        .query
+        .iter()
+        .map(|(key, value)| {
+            let key = decode_query_component(key);
+            let value = decode_query_component(value);
+            format!(
+                "{}={}",
+                urlencoding::encode(&key),
+                urlencoding::encode(&value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    headers.insert("query".to_string(), JsonValue::String(query));
+    for (key, value) in &request.query {
+        let key = decode_query_component(key);
+        if key == "validationToken" || key == "validation_token" {
+            headers.insert(key, JsonValue::String(decode_query_component(value)));
+        }
+    }
+    serde_json::to_string(&JsonValue::Object(headers)).context("serialize provider ingress headers")
+}
+
+fn decode_query_component(value: &str) -> String {
+    // HTTP query parameters use application/x-www-form-urlencoded space
+    // semantics in practice for Graph validation tokens. The urlencoding
+    // crate decodes percent escapes but intentionally leaves '+' untouched.
+    let value = value.replace('+', " ");
+    urlencoding::decode(&value)
+        .map(|value| value.into_owned())
+        .unwrap_or(value)
+}
+
+fn provider_ingress_body_json(request: &IngressRequestV1) -> anyhow::Result<String> {
+    if request.body.is_empty() {
+        return Ok("{}".to_string());
+    }
+    String::from_utf8(request.body.clone()).context("provider ingress body is not utf-8")
 }
 
 /// Build injected config with pre-fetched secrets for providers running in provider_core_only mode.
@@ -314,6 +387,18 @@ fn build_ingress_request(
 }
 
 fn parse_dispatch_result(value: &JsonValue) -> anyhow::Result<IngressDispatchResult> {
+    if let Some(body) = value.as_str() {
+        return Ok(IngressDispatchResult {
+            response: IngressHttpResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "text/plain".to_string())],
+                body: Some(body.as_bytes().to_vec()),
+            },
+            events: Vec::new(),
+            messaging_envelopes: Vec::new(),
+        });
+    }
+
     // Some provider WASM components return the WIT ABI envelope {"ok": {...}, "error": ...}
     // instead of the flat dispatch format. Unwrap "ok" when top-level looks like a WIT envelope.
     let value = if value.get("ok").is_some()
@@ -350,7 +435,7 @@ fn parse_dispatch_result(value: &JsonValue) -> anyhow::Result<IngressDispatchRes
     let events = parse_events(events_value)?;
     let messaging_envelopes = parse_messaging_envelopes(events_value);
 
-    operator_log::info(
+    operator_log::debug(
         module_path!(),
         format!(
             "[DEBUG] parsed events={}, messaging_envelopes={}",
@@ -600,6 +685,36 @@ mod tests {
                 ("x-b".to_string(), "2".to_string())
             ]
         );
+
+        let provider_headers = provider_ingress_headers_json(&IngressRequestV1 {
+            v: 1,
+            domain: "messaging".to_string(),
+            provider: "messaging-teams".to_string(),
+            handler: None,
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            method: "GET".to_string(),
+            path: "/v1/messaging/ingress/messaging-teams/demo/default".to_string(),
+            query: vec![(
+                "validationToken".to_string(),
+                "Validation%3A+Testing+client+application+reachability%26more".to_string(),
+            )],
+            headers: Vec::new(),
+            body: Vec::new(),
+            correlation_id: None,
+            remote_addr: None,
+        })
+        .expect("provider ingress headers");
+        let provider_headers: JsonValue =
+            serde_json::from_str(&provider_headers).expect("headers json");
+        assert_eq!(
+            provider_headers["validationToken"],
+            "Validation: Testing client application reachability&more"
+        );
+        assert_eq!(
+            provider_headers["query"],
+            "validationToken=Validation%3A%20Testing%20client%20application%20reachability%26more"
+        );
     }
 
     #[test]
@@ -630,6 +745,14 @@ mod tests {
 
     #[test]
     fn parse_dispatch_result_supports_wit_envelopes_and_debug_helpers() {
+        let validation = parse_dispatch_result(&json!("hello graph")).expect("string result");
+        assert_eq!(validation.response.status, 200);
+        assert_eq!(
+            validation.response.headers,
+            vec![("content-type".to_string(), "text/plain".to_string())]
+        );
+        assert_eq!(validation.response.body, Some(b"hello graph".to_vec()));
+
         let result = parse_dispatch_result(&json!({
             "ok": {
                 "response": {

@@ -55,6 +55,9 @@ pub struct SendPayloadInV1 {
     pub tenant: TenantHint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_scope: Option<serde_json::Value>,
+    /// Host-injected provider configuration for providers that support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
