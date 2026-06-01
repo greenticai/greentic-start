@@ -163,6 +163,31 @@ impl DeploymentRouteTable {
         }
         best.map(|(route, _)| (route.deployment_id, route.tenant.as_str()))
     }
+
+    /// Resolve a deployment for a worker-invoke call, which carries a tenant but
+    /// no `(host, path)` to match on.
+    ///
+    /// Prefers an exact tenant match against an Active deployment's
+    /// `tenant_selector`. When none matches but exactly one deployment is bound,
+    /// fall back to that lone deployment regardless of the caller's tenant label
+    /// — the common single-app local case, where a GUI gateway's default tenant
+    /// (e.g. `tenant-default`) need not be hand-aligned with the deployment's
+    /// tenant for the worker contract to work out of the box. With two or more
+    /// deployments and no tenant match the result is `None` (ambiguous).
+    ///
+    /// Returns the deployment id paired with the deployment's OWN tenant, so the
+    /// caller executes under the tenant the revision was loaded with, not the
+    /// (possibly mismatched) tenant the request asserted.
+    pub(crate) fn resolve_worker(&self, tenant: &str) -> Option<(DeploymentId, &str)> {
+        if let Some(route) = self.routes.iter().find(|r| r.tenant == tenant) {
+            return Some((route.deployment_id, route.tenant.as_str()));
+        }
+        if self.routes.len() == 1 {
+            let route = &self.routes[0];
+            return Some((route.deployment_id, route.tenant.as_str()));
+        }
+        None
+    }
 }
 
 /// The revision-routing artifacts threaded into the ingress when booting from a
@@ -410,6 +435,48 @@ mod tests {
             BundleDeploymentStatus::Active,
         )]));
         assert!(table.resolve(None, "/different").is_none());
+    }
+
+    #[test]
+    fn resolve_worker_prefers_exact_tenant_then_falls_back_to_lone_deployment() {
+        let only = DeploymentId::new();
+        let single = DeploymentRouteTable::from_environment(&env(vec![deployment(
+            only,
+            "default",
+            &[],
+            &[],
+            BundleDeploymentStatus::Active,
+        )]));
+        // Exact tenant match.
+        assert_eq!(single.resolve_worker("default"), Some((only, "default")));
+        // No tenant match, but a lone deployment ⇒ fall back to it, returning
+        // the deployment's OWN tenant ("default"), not the asserted one.
+        assert_eq!(
+            single.resolve_worker("tenant-default"),
+            Some((only, "default"))
+        );
+
+        // Two deployments: exact match resolves, an unknown tenant is ambiguous.
+        let acme = DeploymentId::new();
+        let beta = DeploymentId::new();
+        let multi = DeploymentRouteTable::from_environment(&env(vec![
+            deployment(
+                acme,
+                "acme",
+                &[],
+                &["/acme"],
+                BundleDeploymentStatus::Active,
+            ),
+            deployment(
+                beta,
+                "beta",
+                &[],
+                &["/beta"],
+                BundleDeploymentStatus::Active,
+            ),
+        ]));
+        assert_eq!(multi.resolve_worker("beta"), Some((beta, "beta")));
+        assert!(multi.resolve_worker("nobody").is_none());
     }
 
     #[test]
