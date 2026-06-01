@@ -34,12 +34,11 @@ use crate::{
     secrets_gate::canonical_secret_uri,
 };
 
-pub fn resolve_env(override_env: Option<&str>) -> String {
-    override_env
-        .map(|value| value.to_string())
-        .or_else(|| std::env::var("GREENTIC_ENV").ok())
-        .unwrap_or_else(|| "dev".to_string())
-}
+/// Re-export of the crate-level [`crate::resolve_env`] for callers that
+/// still import `secrets_setup::resolve_env`. The A4b compat alias is
+/// applied inside `crate::resolve_env` so every consumer sees the same
+/// remap behavior.
+pub use crate::resolve_env;
 
 pub struct SecretsSetup {
     store: DevStore,
@@ -201,7 +200,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_env_prefers_override_then_env_then_dev() {
+    fn resolve_env_prefers_override_then_env_then_default() {
+        // Updated for A4b: the bare default is now `local` (was `dev`),
+        // and any `dev` value goes through the compat-alias remap.
+        // Env-var mutation is serialized via the shared `ENV_LOCK` /
+        // `with_clean_env` helper in `lib.rs::tests`; this test stays
+        // intentionally simple by avoiding `GREENTIC_DISABLE_DEV_ALIAS`
+        // (the gate is tested in `lib.rs`).
         assert_eq!(resolve_env(Some("stage")), "stage");
         unsafe {
             std::env::set_var("GREENTIC_ENV", "prod");
@@ -210,7 +215,7 @@ mod tests {
         unsafe {
             std::env::remove_var("GREENTIC_ENV");
         }
-        assert_eq!(resolve_env(None), "dev");
+        assert_eq!(resolve_env(None), "local");
     }
 
     #[test]

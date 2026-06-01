@@ -82,11 +82,27 @@ pub(super) fn route_messaging_envelopes(
                             route_to_card
                         ),
                     );
-                    run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
+                    run_app_flow_safe(
+                        runner_host,
+                        bundle,
+                        ctx,
+                        &app_pack_path,
+                        &pack_info,
+                        flow,
+                        envelope,
+                    )
                 }
             }
         } else {
-            run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
+            run_app_flow_safe(
+                runner_host,
+                bundle,
+                ctx,
+                &app_pack_path,
+                &pack_info,
+                flow,
+                envelope,
+            )
         };
 
         for mut out_envelope in outputs {
@@ -271,6 +287,7 @@ fn read_card_from_pack(pack_path: &Path, card_key: &str) -> Option<serde_json::V
 }
 
 fn run_app_flow_safe(
+    runner_host: &DemoRunnerHost,
     bundle: &Path,
     ctx: &OperatorContext,
     app_pack_path: &Path,
@@ -279,6 +296,7 @@ fn run_app_flow_safe(
     envelope: &ChannelMessageEnvelope,
 ) -> Vec<ChannelMessageEnvelope> {
     match app::run_app_flow(
+        runner_host,
         bundle,
         ctx,
         app_pack_path,
@@ -691,8 +709,21 @@ mod tests {
     #[test]
     fn run_app_flow_safe_falls_back_to_original_envelope_on_errors() {
         let dir = tempdir().expect("tempdir");
+        let discovery = crate::discovery::discover(dir.path()).expect("discovery");
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
+                .expect("secrets handle");
+        let runner_host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )
+        .expect("runner host");
         let original = envelope();
         let outputs = run_app_flow_safe(
+            &runner_host,
             dir.path(),
             &OperatorContext {
                 tenant: "demo".to_string(),
