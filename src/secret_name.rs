@@ -13,7 +13,9 @@ fn trace_if_needed(raw: &str, canonical: &str) {
     }
     if raw != canonical {
         eprintln!(
-            "GREENTIC_SECRETS_TRACE: canonicalizing secret name raw={raw} canonical={canonical}"
+            "GREENTIC_SECRETS_TRACE: canonicalized secret name raw_len={} canonical_len={}",
+            raw.len(),
+            canonical.len()
         );
         eprintln!("backtrace:\n{:?}", Backtrace::capture());
     }
