@@ -24,6 +24,7 @@ mod discovery;
 mod doctor;
 mod domains;
 mod endpoint_admit;
+mod endpoint_resolver;
 mod event_router;
 pub(crate) mod flow_log;
 mod gmap;
@@ -79,6 +80,8 @@ mod static_routes;
 mod subscription_updater;
 mod subscriptions_universal;
 pub mod supervisor;
+#[cfg(test)]
+mod test_fixtures;
 mod timer_scheduler;
 mod tunnel_prompt;
 mod warmup;
