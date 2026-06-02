@@ -209,11 +209,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     // TELEMETRY_EXPORT/OTLP_ENDPOINT env vars) requests OTLP, an additional
     // OpenTelemetry tracer + meter + logger layer is composed into the same
     // subscriber. Absent → file-only, today's behaviour.
-    let _trace_guard = init_trace_log(
-        &log_dir,
-        peeked_telemetry.as_ref(),
-        &peeked_service_name,
-    );
+    let _trace_guard = init_trace_log(&log_dir, peeked_telemetry.as_ref(), &peeked_service_name);
 
     let demo_paths = match bundle_config::resolve_demo_paths(
         request.config.clone(),
@@ -562,19 +558,21 @@ fn init_trace_log(
         .with_target(true);
 
     let resolved = otlp_telemetry::resolve(telemetry, fallback_service_name);
-    let otlp_layer = resolved.as_ref().and_then(|r| match otlp_telemetry::install_layer(r) {
-        Ok(layer) => Some(layer),
-        Err(err) => {
-            operator_log::warn(
-                module_path!(),
-                format!(
-                    "OTLP exporter init failed (endpoint={}); file logging only: {err:#}",
-                    r.endpoint
-                ),
-            );
-            None
-        }
-    });
+    let otlp_layer = resolved
+        .as_ref()
+        .and_then(|r| match otlp_telemetry::install_layer(r) {
+            Ok(layer) => Some(layer),
+            Err(err) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "OTLP exporter init failed (endpoint={}); file logging only: {err:#}",
+                        r.endpoint
+                    ),
+                );
+                None
+            }
+        });
     let otlp_summary = resolved
         .as_ref()
         .map(|r| format!("{:?} endpoint={}", r.exporter, r.endpoint))

@@ -127,6 +127,9 @@ mod tests {
     #[test]
     fn keeps_static_segments() {
         assert_eq!(normalise_route("/healthz"), "/healthz");
-        assert_eq!(normalise_route("/admin/packs/status"), "/admin/packs/status");
+        assert_eq!(
+            normalise_route("/admin/packs/status"),
+            "/admin/packs/status"
+        );
     }
 }
