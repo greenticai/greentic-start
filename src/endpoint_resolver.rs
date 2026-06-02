@@ -165,9 +165,14 @@ fn should_probe(
 /// for the admit gate keeps the resolver's argument list short and binds
 /// the dispatched revision to the resolver call by construction.
 ///
-/// `payload` is the raw request body bytes passed through to every probed
-/// component. The body is JSON at this layer but the host accepts opaque
-/// bytes (the WIT contract is `body: list<u8>`), so we don't reserialize.
+/// `payload` is the M1 IID.4d wrapper bytes produced by
+/// [`crate::identify_payload::build_identify_payload`]:
+/// `{headers: [{name,value}], body: <parsed-or-null>}`. The WIT contract
+/// is opaque `list<u8>`, so we pass it through unmodified — providers
+/// whose discriminator lives in the body (Teams, Slack, Webex, etc.)
+/// read `body.<field>`; providers whose discriminator lives in HTTP
+/// headers (Telegram via `x-telegram-bot-api-secret-token`) read
+/// `headers[name=…].value`.
 ///
 /// Returns the [`ResolverOutcome`] for the serve site to act on. Component
 /// traps / infrastructure errors bubble as `Err`; the caller distinguishes
