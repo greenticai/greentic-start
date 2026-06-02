@@ -165,33 +165,43 @@ fn should_probe(
 /// for the admit gate keeps the resolver's argument list short and binds
 /// the dispatched revision to the resolver call by construction.
 ///
-/// `payload` is the M1 IID.4d wrapper bytes produced by
-/// [`crate::identify_payload::build_identify_payload`]:
-/// `{headers: [{name,value}], body: <parsed-or-null>}`. The WIT contract
-/// is opaque `list<u8>`, so we pass it through unmodified — providers
-/// whose discriminator lives in the body (Teams, Slack, Webex, etc.)
-/// read `body.<field>`; providers whose discriminator lives in HTTP
-/// headers (Telegram via `x-telegram-bot-api-secret-token`) read
+/// `build_payload` produces the M1 IID.4d wrapper bytes
+/// (`{headers: [{name,value}], body: <parsed-or-null>}` — see
+/// [`crate::identify_payload::build_identify_payload`]). It is invoked
+/// LAZILY — only after [`should_probe`] confirms the resolver will
+/// actually run a WASM probe. Public traffic, header-pinned eid, and
+/// no-endpoint envs all short-circuit before the body Value is cloned
+/// or re-serialized.
+///
+/// The WIT contract is opaque `list<u8>`, so the resolver passes
+/// `build_payload`'s output through unmodified — providers whose
+/// discriminator lives in the body (Teams, Slack, Webex, etc.) read
+/// `body.<field>`; providers whose discriminator lives in HTTP headers
+/// (Telegram via `x-telegram-bot-api-secret-token`) read
 /// `headers[name=…].value`.
 ///
 /// Returns the [`ResolverOutcome`] for the serve site to act on. Component
 /// traps / infrastructure errors bubble as `Err`; the caller distinguishes
 /// "no identification" (a clean variant) from "the host couldn't even run
 /// the probe" (an error).
-pub(crate) async fn resolve(
+pub(crate) async fn resolve<F>(
     host: &Arc<RunnerHost>,
     tenant: &str,
     scope: &RevisionScope,
     admit: &EndpointAdmit,
     header_eid: Option<&str>,
     peer_is_loopback: bool,
-    payload: &[u8],
-) -> anyhow::Result<ResolverOutcome> {
+    build_payload: F,
+) -> anyhow::Result<ResolverOutcome>
+where
+    F: FnOnce() -> Vec<u8>,
+{
     let provider_types: Vec<&str> = admit.provider_types().collect();
     if let Some(outcome) = should_probe(peer_is_loopback, header_eid, provider_types.len()) {
         return Ok(outcome);
     }
 
+    let payload = build_payload();
     let outcomes = host
         .identify_messaging_endpoints_for_revision(
             tenant,
@@ -199,7 +209,7 @@ pub(crate) async fn resolve(
             scope.bundle_id.clone(),
             scope.revision_id,
             &provider_types,
-            payload,
+            &payload,
         )
         .await?;
 

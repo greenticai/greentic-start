@@ -750,8 +750,9 @@ async fn serve(
     // M1 IID.4d wrapper: pass `{headers, body}` instead of raw body bytes so
     // providers whose discriminator lives in HTTP headers (Telegram) can
     // identify the instance the same way body-based providers do (Teams,
-    // Slack, etc.). `payload` is already the body parsed to a Value here.
-    let identify_bytes = identify_payload::build_identify_payload(&identify_headers, &payload);
+    // Slack, etc.). Build LAZILY — the resolver short-circuits without
+    // touching the payload on public traffic, header-pinned eids, and
+    // no-endpoint envs, so most requests skip the body clone + re-serialize.
     let resolution = endpoint_resolver::resolve(
         &activation.host,
         &tenant,
@@ -759,7 +760,7 @@ async fn serve(
         activation.routing.endpoint_admit.as_ref(),
         header_endpoint_id.as_deref(),
         peer_is_loopback,
-        &identify_bytes,
+        || identify_payload::build_identify_payload(&identify_headers, &payload),
     )
     .await
     .map_err(|err| {

@@ -20,30 +20,10 @@
 //! See `greentic:provider-instance-identity@0.1.0/identify-instance` for
 //! the contract docstring.
 //!
-//! Header allowlist is **explicit per-header**, not a prefix match. Only
-//! known routing discriminators ride the wrapper:
-//!
-//! - `x-telegram-bot-api-secret-token` — Telegram's per-bot shared
-//!   secret, set by the operator at `setWebhook` time.
-//!
-//! Future providers with header-based discriminators (e.g. a future
-//! `x-slack-signature` use case) must add their header name to
-//! [`IDENTIFY_HEADER_ALLOWLIST`] explicitly. The narrow allowlist limits
-//! the cross-provider blast radius: every declared `provider_type`'s
-//! probe receives the SAME wrapper (the runner-host fan-out is
-//! single-payload), so any header we forward is visible to EVERY
-//! probed component. Per-provider scoping (different wrappers per
-//! probe) is tracked as Phase D hardening; until it lands, the
-//! allowlist stays minimal.
-//!
-//! Headers we never forward, regardless of name:
-//!
-//! - `Authorization` / `Cookie` / `Set-Cookie` / `Proxy-*-Authorization`
-//!   variants — bearer tokens and session cookies have no place in a
-//!   non-authoritative routing probe.
-//! - `x-greentic-*` operator-internal trust signals — they are consumed
-//!   by greentic-start itself (caller identity, session hints, header-
-//!   pinned eid) and must never reach untrusted WASM probes.
+//! Headers ride the wrapper via an **explicit per-header allowlist**
+//! ([`IDENTIFY_HEADER_ALLOWLIST`]) — not a prefix match. See that
+//! constant's doc-comment for the contents, the rationale, and the
+//! threat model around extending it.
 
 use hyper::HeaderMap;
 use serde_json::{Value, json};
@@ -53,10 +33,26 @@ use serde_json::{Value, json};
 /// canonical-cased keys, but [`collect_identify_headers`] lowercases
 /// before matching).
 ///
+/// Current entries:
+///
+/// - `x-telegram-bot-api-secret-token` — Telegram's per-bot shared
+///   secret, set by the operator at `setWebhook` time. Telegram is the
+///   only provider whose discriminator does not live in the body.
+///
 /// Adding an entry expands the cross-provider blast radius — every
 /// probed `provider_type` receives the SAME wrapper, so any allowlisted
 /// header is visible to EVERY probed component. Keep this list minimal
 /// and stop adding to it once per-provider scoping ships in Phase D.
+///
+/// Categories that MUST never be added here, regardless of any future
+/// provider need:
+///
+/// - `Authorization` / `Cookie` / `Set-Cookie` / `Proxy-*-Authorization`
+///   variants — bearer tokens and session cookies have no place in a
+///   non-authoritative routing probe.
+/// - `x-greentic-*` operator-internal trust signals — they are consumed
+///   by greentic-start itself (caller identity, session hints, header-
+///   pinned eid) and must never reach untrusted WASM probes.
 const IDENTIFY_HEADER_ALLOWLIST: &[&str] = &["x-telegram-bot-api-secret-token"];
 
 /// Collect the routing-relevant request headers in `(name_lowercase, value)`
