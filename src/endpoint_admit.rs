@@ -55,27 +55,23 @@ pub struct EndpointAdmit {
     /// in `x-greentic-messaging-endpoint-id`, which matches
     /// `MessagingEndpointId::to_string`).
     by_id: HashMap<String, EndpointEntry>,
-    /// Key: `(provider_type, provider_id)` from each endpoint.
-    /// Value: the same `endpoint_id` string used by [`by_id`].
-    ///
-    /// Populated for the M1 IID.4 resolver: when a request arrives without
+    /// Two-level index: `provider_type → provider_id → endpoint_id`. Drives
+    /// the M1 IID.4 resolver: when a request arrives without
     /// `x-greentic-messaging-endpoint-id`, the host invokes each enabled
     /// provider component's `identify-instance` export; the returned
     /// `provider_id` is paired with the resolver's known `provider_type` and
     /// looked up here to recover the matching `endpoint_id`.
     ///
+    /// Nested over a flat `(String, String)` key map because:
+    /// * Two-step lookup borrows on `&str` directly, no per-call allocation.
+    /// * `provider_types()` is the outer map's keys.
+    /// * `endpoint_count_for_provider_type(t)` is the inner map's `.len()` —
+    ///   the separate count field this replaced is redundant.
+    ///
     /// (`provider_type`, `provider_id`) uniqueness is an
     /// [`Environment::validate`](greentic_deploy_spec::Environment::validate)
     /// invariant, so duplicates can't reach this table.
-    ///
-    /// [`by_id`]: Self::by_id
-    by_provider: HashMap<(String, String), String>,
-    /// Number of endpoints declared per `provider_type`. Drives the M1 IID.4
-    /// ambiguity policy: when the request has no header AND the resolver
-    /// returns no match, an env with ≥2 endpoints of the same `provider_type`
-    /// must 422 instead of falling through (silently picking "the" endpoint
-    /// is wrong when the env declares more than one of that type).
-    counts_by_provider_type: HashMap<String, usize>,
+    by_provider_type: HashMap<String, HashMap<String, String>>,
 }
 
 impl EndpointAdmit {
@@ -84,8 +80,7 @@ impl EndpointAdmit {
     /// checks at request time are O(1) regardless of ACL size.
     pub fn from_environment(env: &Environment) -> Self {
         let mut by_id = HashMap::with_capacity(env.messaging_endpoints.len());
-        let mut by_provider = HashMap::with_capacity(env.messaging_endpoints.len());
-        let mut counts_by_provider_type: HashMap<String, usize> = HashMap::new();
+        let mut by_provider_type: HashMap<String, HashMap<String, String>> = HashMap::new();
         for ep in &env.messaging_endpoints {
             let endpoint_id = ep.endpoint_id.to_string();
             by_id.insert(
@@ -99,18 +94,14 @@ impl EndpointAdmit {
                     welcome_flow: ep.welcome_flow.clone(),
                 },
             );
-            by_provider.insert(
-                (ep.provider_type.clone(), ep.provider_id.clone()),
-                endpoint_id,
-            );
-            *counts_by_provider_type
+            by_provider_type
                 .entry(ep.provider_type.clone())
-                .or_insert(0) += 1;
+                .or_default()
+                .insert(ep.provider_id.clone(), endpoint_id);
         }
         Self {
             by_id,
-            by_provider,
-            counts_by_provider_type,
+            by_provider_type,
         }
     }
 
@@ -122,8 +113,9 @@ impl EndpointAdmit {
         provider_type: &str,
         provider_id: &str,
     ) -> Option<&str> {
-        self.by_provider
-            .get(&(provider_type.to_string(), provider_id.to_string()))
+        self.by_provider_type
+            .get(provider_type)
+            .and_then(|m| m.get(provider_id))
             .map(String::as_str)
     }
 
@@ -131,15 +123,15 @@ impl EndpointAdmit {
     /// The resolver uses this to pick which provider components to probe per
     /// request (one probe per type, not per endpoint).
     pub(crate) fn provider_types(&self) -> impl Iterator<Item = &str> {
-        self.counts_by_provider_type.keys().map(String::as_str)
+        self.by_provider_type.keys().map(String::as_str)
     }
 
     /// Number of endpoints declared for `provider_type`. ≥2 means a missing
     /// header MUST fail closed when the resolver cannot disambiguate.
     pub(crate) fn endpoint_count_for_provider_type(&self, provider_type: &str) -> usize {
-        self.counts_by_provider_type
+        self.by_provider_type
             .get(provider_type)
-            .copied()
+            .map(HashMap::len)
             .unwrap_or(0)
     }
 
@@ -193,65 +185,8 @@ impl EndpointAdmit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use greentic_deploy_spec::{
-        BundleId, EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId, PackId,
-        SchemaVersion,
-    };
-    use greentic_types::EnvId;
-
-    fn env_id() -> EnvId {
-        EnvId::try_from("local").unwrap()
-    }
-
-    fn endpoint(provider_id: &str, bundles: &[&str]) -> MessagingEndpoint {
-        endpoint_typed("teams", provider_id, bundles)
-    }
-
-    fn endpoint_typed(
-        provider_type: &str,
-        provider_id: &str,
-        bundles: &[&str],
-    ) -> MessagingEndpoint {
-        let now = chrono::Utc::now();
-        MessagingEndpoint {
-            schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
-            env_id: env_id(),
-            endpoint_id: MessagingEndpointId::new(),
-            provider_id: provider_id.to_string(),
-            provider_type: provider_type.to_string(),
-            display_name: provider_id.to_string(),
-            secret_refs: Vec::new(),
-            linked_bundles: bundles.iter().map(|b| BundleId::new(*b)).collect(),
-            welcome_flow: None,
-            generation: 1,
-            created_at: now,
-            updated_at: now,
-            updated_by: "test".to_string(),
-        }
-    }
-
-    fn env_with(endpoints: Vec<MessagingEndpoint>) -> Environment {
-        Environment {
-            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
-            environment_id: env_id(),
-            name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id: env_id(),
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-            },
-            packs: Vec::new(),
-            messaging_endpoints: endpoints,
-            credentials_ref: None,
-            bundles: Vec::new(),
-            revisions: Vec::new(),
-            traffic_splits: Vec::new(),
-            revocation: Default::default(),
-            retention: Default::default(),
-            health: Default::default(),
-        }
-    }
+    use crate::test_fixtures::{endpoint, endpoint_typed, env_with};
+    use greentic_deploy_spec::{BundleId, PackId};
 
     #[test]
     fn empty_env_yields_empty_table() {

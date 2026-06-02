@@ -715,6 +715,16 @@ async fn serve(
             )
         })?;
 
+    // Bind the dispatched revision tuple once. Both the resolver (below)
+    // and `admit_request` (further down) consume it; sharing one binding
+    // makes the "every downstream step operates on the same revision"
+    // invariant visible at the call site.
+    let scope = RevisionScope {
+        deployment_id,
+        bundle_id: outcome.bundle_id.clone(),
+        revision_id: outcome.revision_id,
+    };
+
     // M1 IID.4 resolver: dispatch has picked a revision; ask each enabled
     // provider component (one probe per declared `provider_type`) to
     // identify this payload, and fold the per-type results against the
@@ -734,9 +744,7 @@ async fn serve(
     let resolution = endpoint_resolver::resolve(
         &activation.host,
         &tenant,
-        deployment_id,
-        &outcome.bundle_id,
-        outcome.revision_id,
+        &scope,
         activation.routing.endpoint_admit.as_ref(),
         header_endpoint_id.as_deref(),
         peer_is_loopback,
@@ -804,11 +812,6 @@ async fn serve(
 
     // Gate before executing: refuse provider webhook paths (deferred) and
     // non-POST generic requests, rather than running the entry flow for them.
-    let scope = RevisionScope {
-        deployment_id,
-        bundle_id: outcome.bundle_id.clone(),
-        revision_id: outcome.revision_id,
-    };
     match admit_request(&activation.routing.http_routes, &scope, &path, &method) {
         Admission::ProviderRoute => {
             return Err(error_response(

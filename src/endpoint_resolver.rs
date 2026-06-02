@@ -40,11 +40,11 @@
 
 use std::sync::Arc;
 
-use greentic_deploy_spec::{BundleId, DeploymentId, RevisionId};
 use greentic_runner_host::RunnerHost;
 use greentic_runner_host::pack::IdentifyOutcome;
 
 use crate::endpoint_admit::EndpointAdmit;
+use crate::http_routes::RevisionScope;
 
 /// The decision the resolver hands back to the serve pipeline.
 ///
@@ -159,8 +159,11 @@ fn should_probe(
 /// without invoking any provider component (a remote caller posting a forged
 /// payload must not be able to claim an endpoint it doesn't own).
 ///
-/// `(deployment_id, bundle_id, revision_id)` MUST be the post-dispatch tuple
-/// — the host method loads the revision's pack runtime by exactly that key.
+/// `scope` MUST be the post-dispatch revision tuple — the host method loads
+/// the revision's pack runtime by exactly `(deployment_id, bundle_id,
+/// revision_id)`. Reusing the `RevisionScope` the call site already built
+/// for the admit gate keeps the resolver's argument list short and binds
+/// the dispatched revision to the resolver call by construction.
 ///
 /// `payload` is the raw request body bytes passed through to every probed
 /// component. The body is JSON at this layer but the host accepts opaque
@@ -170,18 +173,10 @@ fn should_probe(
 /// traps / infrastructure errors bubble as `Err`; the caller distinguishes
 /// "no identification" (a clean variant) from "the host couldn't even run
 /// the probe" (an error).
-// The argument list mirrors `RunnerHost::identify_messaging_endpoints_for_revision`
-// + the admit table + the (separate-by-nature) header eid + the trust gate.
-// Bundling them into a struct would just move the same 9 fields and force the
-// call site (one caller, `revision_serve::serve`) to build a builder. The
-// argument count is the right cost.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve(
     host: &Arc<RunnerHost>,
     tenant: &str,
-    deployment_id: DeploymentId,
-    bundle_id: &BundleId,
-    revision_id: RevisionId,
+    scope: &RevisionScope,
     admit: &EndpointAdmit,
     header_eid: Option<&str>,
     peer_is_loopback: bool,
@@ -195,9 +190,9 @@ pub(crate) async fn resolve(
     let outcomes = host
         .identify_messaging_endpoints_for_revision(
             tenant,
-            deployment_id,
-            bundle_id.clone(),
-            revision_id,
+            scope.deployment_id,
+            scope.bundle_id.clone(),
+            scope.revision_id,
             &provider_types,
             payload,
         )
@@ -210,36 +205,49 @@ pub(crate) async fn resolve(
 /// outcomes and decides between Hit / Miss / Ambiguous / NoImpl per the rules
 /// described on [`ResolverOutcome`]. Pulled out of [`resolve`] so it can be
 /// unit-tested without a running [`RunnerHost`].
+///
+/// Tracks three signals:
+/// * `hit` — `Some(eid)` after the first known-identified outcome; setting it
+///   twice (two different types both identified to known eids) poisons to
+///   `Ambiguous`. (Endpoint ids are env-unique, so two hits are always two
+///   distinct eids — no dedup needed.)
+/// * `poison` — any signal that requires `Ambiguous` regardless of other
+///   outcomes: a second hit, an `Identified(unknown_provider_id)`, or a
+///   `NoMatch` for a `provider_type` with ≥2 declared endpoints.
+/// * `any_non_unsupported` — at least one type returned `NoMatch` or
+///   `Identified`, distinguishing `Miss` from `NoImpl`.
 fn fold_outcomes(
     admit: &EndpointAdmit,
     outcomes: &std::collections::HashMap<String, IdentifyOutcome>,
 ) -> ResolverOutcome {
-    let mut hits: Vec<String> = Vec::new();
-    // `Unsupported` is the lattice floor; any `NoMatch` or `Identified` from
-    // any pack outranks it. If every type stays at `Unsupported`, the
-    // components never exported the world.
-    let mut any_no_match_amb = false;
+    let mut hit: Option<String> = None;
+    let mut poison = false;
     let mut any_non_unsupported = false;
-    let mut any_unknown_identified = false;
 
     for (provider_type, outcome) in outcomes {
         match outcome {
             IdentifyOutcome::Identified(provider_id) => {
                 any_non_unsupported = true;
-                if let Some(eid) = admit.endpoint_id_for_provider(provider_type, provider_id) {
-                    hits.push(eid.to_string());
-                } else {
-                    // The component explicitly identified a concrete
-                    // `provider_id` that the env never declared as an
-                    // endpoint. Because the resolver only probes
-                    // `provider_type`s where the admit table declares ≥1
-                    // endpoint, this always means either operational drift (a
-                    // bot the env doesn't know about) or a forged payload.
-                    // Both must fail closed — silently dropping to Miss would
-                    // let the request run as legacy unscoped traffic, which
-                    // is asymmetric with the header path (unknown header eid
-                    // is 401).
-                    any_unknown_identified = true;
+                match admit.endpoint_id_for_provider(provider_type, provider_id) {
+                    Some(eid) => {
+                        if hit.is_some() {
+                            poison = true;
+                        }
+                        hit = Some(eid.to_string());
+                    }
+                    None => {
+                        // The component explicitly identified a concrete
+                        // `provider_id` that the env never declared as an
+                        // endpoint. Because the resolver only probes
+                        // `provider_type`s where the admit table declares ≥1
+                        // endpoint, this always means either operational
+                        // drift (a bot the env doesn't know about) or a
+                        // forged payload. Both fail closed — silently
+                        // dropping to Miss would let the request run as
+                        // legacy unscoped traffic, asymmetric with the
+                        // header path's 401 on unknown eid.
+                        poison = true;
+                    }
                 }
             }
             IdentifyOutcome::NoMatch => {
@@ -247,34 +255,22 @@ fn fold_outcomes(
                 // ≥2 endpoints of this type AND the component said "none of
                 // them" — we cannot disambiguate by other means, fail closed.
                 if admit.endpoint_count_for_provider_type(provider_type) >= 2 {
-                    any_no_match_amb = true;
+                    poison = true;
                 }
             }
             IdentifyOutcome::Unsupported => {
-                // Stay at floor; do nothing.
+                // `Unsupported` is the lattice floor; any other outcome
+                // outranks it. If every type stays here, the components
+                // never exported the world.
             }
         }
     }
 
-    // Multiple distinct hits → ambiguous. Dedup first: one component might
-    // (incorrectly) point at one endpoint while another component happens to
-    // map to the same eid via shared provider_id — that's still one hit.
-    hits.sort_unstable();
-    hits.dedup();
-
-    if hits.len() > 1 || any_unknown_identified {
-        // Multiple distinct hits → ambiguous. Unknown-identified also poisons
-        // the result: even if another type returned a clean hit, the env's
-        // understanding of "which bots are mine" disagrees with what the
-        // component sees. Fail closed rather than silently routing on the
-        // clean hit while ignoring the drift signal.
+    if poison {
         return ResolverOutcome::Ambiguous;
     }
-    if let Some(eid) = hits.into_iter().next() {
+    if let Some(eid) = hit {
         return ResolverOutcome::Hit(eid);
-    }
-    if any_no_match_amb {
-        return ResolverOutcome::Ambiguous;
     }
     if any_non_unsupported {
         return ResolverOutcome::Miss;
@@ -285,60 +281,12 @@ fn fold_outcomes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use greentic_deploy_spec::{
-        Environment, EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId, SchemaVersion,
-    };
-    use greentic_types::EnvId;
+    use crate::test_fixtures::{endpoint_typed, env_with};
+    use greentic_deploy_spec::MessagingEndpoint;
     use std::collections::HashMap;
 
-    fn env_id() -> EnvId {
-        EnvId::try_from("local").unwrap()
-    }
-
-    fn endpoint_typed(
-        provider_type: &str,
-        provider_id: &str,
-        bundles: &[&str],
-    ) -> MessagingEndpoint {
-        let now = chrono::Utc::now();
-        MessagingEndpoint {
-            schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
-            env_id: env_id(),
-            endpoint_id: MessagingEndpointId::new(),
-            provider_id: provider_id.to_string(),
-            provider_type: provider_type.to_string(),
-            display_name: provider_id.to_string(),
-            secret_refs: Vec::new(),
-            linked_bundles: bundles.iter().map(|b| BundleId::new(*b)).collect(),
-            welcome_flow: None,
-            generation: 1,
-            created_at: now,
-            updated_at: now,
-            updated_by: "test".to_string(),
-        }
-    }
-
     fn admit_from(endpoints: Vec<MessagingEndpoint>) -> EndpointAdmit {
-        EndpointAdmit::from_environment(&Environment {
-            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
-            environment_id: env_id(),
-            name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id: env_id(),
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-            },
-            packs: Vec::new(),
-            messaging_endpoints: endpoints,
-            credentials_ref: None,
-            bundles: Vec::new(),
-            revisions: Vec::new(),
-            traffic_splits: Vec::new(),
-            revocation: Default::default(),
-            retention: Default::default(),
-            health: Default::default(),
-        })
+        EndpointAdmit::from_environment(&env_with(endpoints))
     }
 
     #[test]

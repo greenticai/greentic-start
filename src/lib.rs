@@ -80,6 +80,8 @@ mod static_routes;
 mod subscription_updater;
 mod subscriptions_universal;
 pub mod supervisor;
+#[cfg(test)]
+mod test_fixtures;
 mod timer_scheduler;
 mod tunnel_prompt;
 mod warmup;
