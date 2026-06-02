@@ -77,6 +77,14 @@ pub(crate) enum ResolverOutcome {
     NoImpl,
     /// The env declares no messaging endpoints, so no probe was issued.
     Skipped,
+    /// The request arrived from a non-loopback peer without a trusted header.
+    /// Running the resolver on untrusted traffic would let a forged webhook
+    /// payload drive endpoint derivation (a remote caller posting a
+    /// discriminator that the provider component identifies as "Teams Bot X"
+    /// would get sessions/welcome-flows for that endpoint). Kept distinct
+    /// from `Skipped` so operators can distinguish "env declares no
+    /// endpoints" from "we refused to run the resolver on untrusted traffic".
+    PublicSkipped,
 }
 
 impl ResolverOutcome {
@@ -91,6 +99,7 @@ impl ResolverOutcome {
             ResolverOutcome::Ambiguous => "ambiguous",
             ResolverOutcome::NoImpl => "no-impl",
             ResolverOutcome::Skipped => "skipped",
+            ResolverOutcome::PublicSkipped => "public-skipped",
         }
     }
 
@@ -107,6 +116,34 @@ impl ResolverOutcome {
     }
 }
 
+/// Determine whether the resolver should probe provider components or
+/// short-circuit. Extracted as a pure helper for testability (no
+/// [`RunnerHost`] needed).
+///
+/// Returns `Some(outcome)` when we can decide without running the host,
+/// `None` when a probe is needed.
+fn should_probe(
+    peer_is_loopback: bool,
+    header_eid: Option<&str>,
+    provider_types_count: usize,
+) -> Option<ResolverOutcome> {
+    if let Some(eid) = header_eid {
+        return Some(ResolverOutcome::HeaderWins(eid.to_string()));
+    }
+    // Trust boundary: the resolver is a parallel trust-derivation mechanism
+    // to `caller_identity`'s header path. A remote caller must not be able
+    // to drive endpoint derivation via a forged webhook payload — only
+    // loopback peers (greentic-messaging or the operator CLI) are trusted
+    // originators.
+    if !peer_is_loopback {
+        return Some(ResolverOutcome::PublicSkipped);
+    }
+    if provider_types_count == 0 {
+        return Some(ResolverOutcome::Skipped);
+    }
+    None
+}
+
 /// Resolve the messaging endpoint for a dispatched request.
 ///
 /// `header_eid` is the validated eid the caller asserted via
@@ -114,6 +151,13 @@ impl ResolverOutcome {
 /// `revision_serve::caller_identity`). When `Some`, this short-circuits to
 /// [`ResolverOutcome::HeaderWins`] — the header is the operator's manual
 /// override and beats the resolver.
+///
+/// `peer_is_loopback` carries the same trust-boundary signal that
+/// `revision_serve::caller_identity` uses: only loopback peers are allowed to
+/// drive endpoint derivation. When the header is absent and the peer is NOT
+/// loopback, the resolver short-circuits to [`ResolverOutcome::PublicSkipped`]
+/// without invoking any provider component (a remote caller posting a forged
+/// payload must not be able to claim an endpoint it doesn't own).
 ///
 /// `(deployment_id, bundle_id, revision_id)` MUST be the post-dispatch tuple
 /// — the host method loads the revision's pack runtime by exactly that key.
@@ -127,10 +171,10 @@ impl ResolverOutcome {
 /// "no identification" (a clean variant) from "the host couldn't even run
 /// the probe" (an error).
 // The argument list mirrors `RunnerHost::identify_messaging_endpoints_for_revision`
-// + the admit table + the (separate-by-nature) header eid. Bundling them into
-// a struct would just move the same 8 fields and force the call site (one
-// caller, `revision_serve::serve`) to build a builder. The argument count is
-// the right cost.
+// + the admit table + the (separate-by-nature) header eid + the trust gate.
+// Bundling them into a struct would just move the same 9 fields and force the
+// call site (one caller, `revision_serve::serve`) to build a builder. The
+// argument count is the right cost.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve(
     host: &Arc<RunnerHost>,
@@ -140,15 +184,12 @@ pub(crate) async fn resolve(
     revision_id: RevisionId,
     admit: &EndpointAdmit,
     header_eid: Option<&str>,
+    peer_is_loopback: bool,
     payload: &[u8],
 ) -> anyhow::Result<ResolverOutcome> {
-    if let Some(eid) = header_eid {
-        return Ok(ResolverOutcome::HeaderWins(eid.to_string()));
-    }
-
     let provider_types: Vec<&str> = admit.provider_types().collect();
-    if provider_types.is_empty() {
-        return Ok(ResolverOutcome::Skipped);
+    if let Some(outcome) = should_probe(peer_is_loopback, header_eid, provider_types.len()) {
+        return Ok(outcome);
     }
 
     let outcomes = host
@@ -179,6 +220,7 @@ fn fold_outcomes(
     // components never exported the world.
     let mut any_no_match_amb = false;
     let mut any_non_unsupported = false;
+    let mut any_unknown_identified = false;
 
     for (provider_type, outcome) in outcomes {
         match outcome {
@@ -186,12 +228,19 @@ fn fold_outcomes(
                 any_non_unsupported = true;
                 if let Some(eid) = admit.endpoint_id_for_provider(provider_type, provider_id) {
                     hits.push(eid.to_string());
+                } else {
+                    // The component explicitly identified a concrete
+                    // `provider_id` that the env never declared as an
+                    // endpoint. Because the resolver only probes
+                    // `provider_type`s where the admit table declares ≥1
+                    // endpoint, this always means either operational drift (a
+                    // bot the env doesn't know about) or a forged payload.
+                    // Both must fail closed — silently dropping to Miss would
+                    // let the request run as legacy unscoped traffic, which
+                    // is asymmetric with the header path (unknown header eid
+                    // is 401).
+                    any_unknown_identified = true;
                 }
-                // An `Identified` whose provider_id is NOT in the admit table
-                // is an operational drift: the component thinks "this is bot
-                // X" but the env never declared bot X as an endpoint. Treat
-                // it as Miss for THIS provider_type — the env clearly didn't
-                // intend to route it, and falling through doesn't help.
             }
             IdentifyOutcome::NoMatch => {
                 any_non_unsupported = true;
@@ -213,7 +262,12 @@ fn fold_outcomes(
     hits.sort_unstable();
     hits.dedup();
 
-    if hits.len() > 1 {
+    if hits.len() > 1 || any_unknown_identified {
+        // Multiple distinct hits → ambiguous. Unknown-identified also poisons
+        // the result: even if another type returned a clean hit, the env's
+        // understanding of "which bots are mine" disagrees with what the
+        // component sees. Fail closed rather than silently routing on the
+        // clean hit while ignoring the drift signal.
         return ResolverOutcome::Ambiguous;
     }
     if let Some(eid) = hits.into_iter().next() {
@@ -300,6 +354,7 @@ mod tests {
         assert_eq!(ResolverOutcome::Ambiguous.origin(), "ambiguous");
         assert_eq!(ResolverOutcome::NoImpl.origin(), "no-impl");
         assert_eq!(ResolverOutcome::Skipped.origin(), "skipped");
+        assert_eq!(ResolverOutcome::PublicSkipped.origin(), "public-skipped");
     }
 
     #[test]
@@ -319,6 +374,7 @@ mod tests {
         assert!(ResolverOutcome::Ambiguous.endpoint_id().is_none());
         assert!(ResolverOutcome::NoImpl.endpoint_id().is_none());
         assert!(ResolverOutcome::Skipped.endpoint_id().is_none());
+        assert!(ResolverOutcome::PublicSkipped.endpoint_id().is_none());
     }
 
     #[test]
@@ -334,16 +390,19 @@ mod tests {
     }
 
     #[test]
-    fn fold_identified_unknown_provider_id_falls_through_as_miss() {
-        // The component said "this is bot X" but the env doesn't know bot X
-        // — that's drift, not ambiguity. Falling through is right: the env
-        // didn't intend to route it.
+    fn fold_identified_unknown_provider_id_is_ambiguous() {
+        // The component explicitly identified a concrete provider_id that the
+        // env never declared. Because the resolver only probes provider_types
+        // with >=1 declared endpoint, this always means operational drift (a
+        // bot the env doesn't know about) or a forged payload. Failing closed
+        // keeps the trust boundary symmetric with the header path (unknown
+        // header eid -> 401).
         let admit = admit_from(vec![endpoint_typed("teams", "28:known", &["b"])]);
         let outcomes = HashMap::from([(
             "teams".to_string(),
             IdentifyOutcome::Identified("28:unknown-drift".to_string()),
         )]);
-        assert_eq!(fold_outcomes(&admit, &outcomes), ResolverOutcome::Miss);
+        assert_eq!(fold_outcomes(&admit, &outcomes), ResolverOutcome::Ambiguous);
     }
 
     #[test]
@@ -424,5 +483,73 @@ mod tests {
             ("slack".to_string(), IdentifyOutcome::Unsupported),
         ]);
         assert_eq!(fold_outcomes(&admit, &outcomes), ResolverOutcome::Miss);
+    }
+
+    #[test]
+    fn fold_known_hit_plus_unknown_identified_is_ambiguous() {
+        // One type returns Identified(known) -> hit, another returns
+        // Identified(unknown) -> the unknown one poisons the result. Even
+        // though we have a clean hit from teams, the slack component
+        // identifying an undeclared bot is a strong signal that the env's
+        // endpoint declarations are stale or the payload is forged. Fail
+        // closed.
+        let teams = endpoint_typed("teams", "28:legal", &["b1"]);
+        let slack = endpoint_typed("slack", "T0LEGAL", &["b1"]);
+        let admit = admit_from(vec![teams, slack]);
+        let outcomes = HashMap::from([
+            (
+                "teams".to_string(),
+                IdentifyOutcome::Identified("28:legal".to_string()),
+            ),
+            (
+                "slack".to_string(),
+                IdentifyOutcome::Identified("UNDECLARED-BOT".to_string()),
+            ),
+        ]);
+        assert_eq!(fold_outcomes(&admit, &outcomes), ResolverOutcome::Ambiguous);
+    }
+
+    #[test]
+    fn should_probe_header_wins_short_circuits() {
+        let outcome = should_probe(true, Some("teams-legal"), 3);
+        assert_eq!(
+            outcome,
+            Some(ResolverOutcome::HeaderWins("teams-legal".into()))
+        );
+    }
+
+    #[test]
+    fn should_probe_public_peer_without_header_short_circuits() {
+        // Non-loopback peer with no header must not drive the resolver —
+        // a forged webhook payload must not derive an endpoint.
+        let outcome = should_probe(false, None, 3);
+        assert_eq!(outcome, Some(ResolverOutcome::PublicSkipped));
+    }
+
+    #[test]
+    fn should_probe_loopback_with_endpoints_proceeds() {
+        // Loopback peer, no header, declared endpoints -> probe needed.
+        let outcome = should_probe(true, None, 2);
+        assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn should_probe_loopback_no_endpoints_skips() {
+        // Loopback peer but env declares no endpoints -> Skipped.
+        let outcome = should_probe(true, None, 0);
+        assert_eq!(outcome, Some(ResolverOutcome::Skipped));
+    }
+
+    #[test]
+    fn should_probe_public_peer_with_header_still_wins() {
+        // Even on public traffic, an asserted header wins (the header path
+        // is independently gated by caller_identity — only loopback peers
+        // get header_eid=Some). This test documents that should_probe
+        // doesn't double-gate the header path.
+        let outcome = should_probe(false, Some("teams-legal"), 3);
+        assert_eq!(
+            outcome,
+            Some(ResolverOutcome::HeaderWins("teams-legal".into()))
+        );
     }
 }

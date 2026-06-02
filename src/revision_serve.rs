@@ -724,6 +724,13 @@ async fn serve(
     // loads the picked revision's pack runtime to find the component
     // bindings), BEFORE the post-dispatch admit step (so a resolver Hit
     // re-resolves admission against the chosen eid).
+    //
+    // Trust boundary: `peer_is_loopback` gates the resolver the same way
+    // `caller_identity` gates the header path. Without this gate, a remote
+    // caller posting a forged webhook payload with a discriminator the
+    // provider component identifies (e.g. a Teams serviceUrl for bot X)
+    // would derive an endpoint and cross-contaminate sessions/welcome-flows.
+    // The resolver short-circuits to `PublicSkipped` for non-loopback peers.
     let resolution = endpoint_resolver::resolve(
         &activation.host,
         &tenant,
@@ -732,6 +739,7 @@ async fn serve(
         outcome.revision_id,
         activation.routing.endpoint_admit.as_ref(),
         header_endpoint_id.as_deref(),
+        peer_is_loopback,
         &body_bytes,
     )
     .await
