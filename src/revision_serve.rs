@@ -58,6 +58,7 @@ use greentic_runner_host::{Activity, RunnerHost, WelcomeFlowHint};
 use greentic_deploy_spec::{DEFAULT_LISTEN_ADDR, EnvironmentHostConfig};
 
 use crate::deployment_routes::RevisionIngressRouting;
+use crate::endpoint_resolver;
 use crate::http_routes::{HttpRouteTable, RevisionScope};
 use crate::operator_log;
 use crate::revision_dispatcher::{
@@ -655,7 +656,13 @@ async fn serve(
     // and keys the flow session, so it feeds the dispatcher and the activity.
     // The messaging endpoint id (M1.4) partitions sessions/telemetry per
     // provider instance — header-only, never from the body.
-    let (user, session_hint, endpoint_id) = caller_identity(
+    //
+    // `header_endpoint_id` is the eid the caller pinned via header (loopback
+    // only). The eid that flows into the activity is decided AFTER dispatch,
+    // by the M1 IID.4 resolver: header wins when present, otherwise the
+    // resolver asks each enabled provider component to identify itself from
+    // the payload. See [`endpoint_resolver::resolve`].
+    let (user, session_hint, header_endpoint_id) = caller_identity(
         peer_is_loopback,
         user_header,
         session_header,
@@ -665,10 +672,11 @@ async fn serve(
 
     // M1.4c-ii admit gate, step 1: if the caller asserts a messaging endpoint,
     // it MUST be one this env declared. Resolved here (before dispatch) so an
-    // unknown endpoint refuses cheaply; the actual bundle-membership check is
-    // step 2, after dispatch picks a revision.
-    let admission = resolve_endpoint_admission(
-        endpoint_id.as_deref(),
+    // unknown asserted endpoint refuses cheaply; the actual bundle-membership
+    // check is step 2, after dispatch picks a revision. Resolver-derived eids
+    // (no header asserted) re-resolve admission post-dispatch — see below.
+    let header_admission = resolve_endpoint_admission(
+        header_endpoint_id.as_deref(),
         activation.routing.endpoint_admit.as_ref(),
     )
     .map_err(|boxed| *boxed)?;
@@ -707,11 +715,83 @@ async fn serve(
             )
         })?;
 
-    // M1.4c-ii admit gate, step 2: now that dispatch has chosen a revision, the
-    // resolved bundle MUST be in the asserted endpoint's `linked_bundles` ACL.
-    // Skipped when the caller asserts no endpoint (legacy single-instance
-    // back-compat) — non-loopback callers can't assert one anyway, as the
-    // header is dropped in `caller_identity`.
+    // M1 IID.4 resolver: dispatch has picked a revision; ask each enabled
+    // provider component (one probe per declared `provider_type`) to
+    // identify this payload, and fold the per-type results against the
+    // env's `(provider_type, provider_id) → endpoint_id` table.
+    //
+    // Placement: AFTER dispatch (the host method is revision-scoped — it
+    // loads the picked revision's pack runtime to find the component
+    // bindings), BEFORE the post-dispatch admit step (so a resolver Hit
+    // re-resolves admission against the chosen eid).
+    let resolution = endpoint_resolver::resolve(
+        &activation.host,
+        &tenant,
+        deployment_id,
+        &outcome.bundle_id,
+        outcome.revision_id,
+        activation.routing.endpoint_admit.as_ref(),
+        header_endpoint_id.as_deref(),
+        &body_bytes,
+    )
+    .await
+    .map_err(|err| {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "messaging-endpoint resolver failed for deployment {deployment_id} \
+                 revision {}: {err:#}",
+                outcome.revision_id
+            ),
+        );
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "messaging-endpoint resolution failed",
+        )
+    })?;
+
+    // `gt.endpoint_resolution` telemetry — emitted as a structured event
+    // with snake_case field names (tracing's macro grammar can't take
+    // dotted field names directly). Operators converting these to
+    // `gt.*` attribute form do it at the subscriber layer (the
+    // `tracing-opentelemetry` bridge namespaces by event target). The
+    // downstream flow span carries `gt.messaging_endpoint_id` via the
+    // activity (M1.4 runner-host); this pair lets operators see "did the
+    // eid come from a trusted header, the resolver, or fall through".
+    tracing::info!(
+        target: "greentic_start::endpoint_resolver",
+        endpoint_resolution = resolution.origin(),
+        messaging_endpoint_id = resolution.endpoint_id().unwrap_or(""),
+        "messaging-endpoint resolution outcome",
+    );
+
+    // Ambiguous is the only resolver outcome that refuses the request
+    // outright: env declares ≥2 endpoints of a `provider_type` and the
+    // component returned NoMatch (or multiple distinct hits) — silently
+    // routing to "the" endpoint would mis-attribute traffic.
+    if matches!(resolution, endpoint_resolver::ResolverOutcome::Ambiguous) {
+        return Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "messaging endpoint resolution is ambiguous; assert the endpoint via \
+             x-greentic-messaging-endpoint-id",
+        ));
+    }
+
+    let endpoint_id: Option<String> = resolution.endpoint_id().map(str::to_string);
+
+    // M1.4c-ii admit gate, step 2: now that dispatch + resolver have
+    // converged on an eid (header- or resolver-derived) and a revision, the
+    // resolved bundle MUST be in that endpoint's `linked_bundles` ACL.
+    // `header_admission` covers the header-asserted path; resolver hits
+    // re-resolve here against the freshly-resolved eid. Skipped when
+    // neither path yielded an eid (legacy single-instance back-compat).
+    let admission = match endpoint_id.as_deref() {
+        Some(eid) if header_endpoint_id.is_none() => {
+            resolve_endpoint_admission(Some(eid), activation.routing.endpoint_admit.as_ref())
+                .map_err(|boxed| *boxed)?
+        }
+        _ => header_admission,
+    };
     check_bundle_admission(&admission, outcome.bundle_id.as_str()).map_err(|boxed| *boxed)?;
 
     // Gate before executing: refuse provider webhook paths (deferred) and

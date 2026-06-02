@@ -24,6 +24,7 @@ mod discovery;
 mod doctor;
 mod domains;
 mod endpoint_admit;
+mod endpoint_resolver;
 mod event_router;
 pub(crate) mod flow_log;
 mod gmap;

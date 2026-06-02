@@ -107,15 +107,13 @@ version = ">=1.1.0-dev, <1.2.0-0"
 [dependencies.greentic-runner-desktop]
 version = ">=1.1.0-dev, <1.2.0-0"
 
-# Floor bumped to the M1.5 welcome-seen marker publish
-# (greentic-runner#382) which makes `apply_welcome_flow_override` durable —
-# it now refuses overrides on the active-wait safety net AND on a per-
-# `(tenant, env, eid, user)` first-contact marker. Earlier publishes
-# re-fire the override after flow completion / no-wait turns / TTL expiry,
-# so attaching the hint on every turn (the producer-flip in
-# `revision_serve.rs`) is unsafe below this floor.
+# Floor bumped to the M1 IID.4a publish (greentic-runner#390) which exposes
+# `RunnerHost::identify_messaging_endpoints_for_revision` + the public
+# `pack::IdentifyOutcome` enum that drives the eid resolver wired into
+# `revision_serve` (this PR). Earlier publishes still satisfy the M1.5
+# welcome-seen marker floor (#382) but lack the resolver surface.
 [dependencies.greentic-runner-host]
-version = ">=1.1.0-dev.26680254699, <1.2.0-0"
+version = ">=1.1.0-dev.26812293063, <1.2.0-0"
 
 [dependencies.greentic-secrets-lib]
 version = ">=1.1.0-dev, <1.2.0-0"

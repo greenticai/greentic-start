@@ -2299,9 +2299,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-flow"
-version = "1.1.0-dev.26494845245"
+version = "1.1.0-dev.26802580431"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76915fc2251213eb52ce739d96baffc5b5eca0d6a928c4b9e0e757945255057f"
+checksum = "23e42f9020a703fdccbe9529e025edcea87645ce0a1cea8537fd378e0b79003c"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2482,9 +2482,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "1.1.0-dev.26680254699"
+version = "1.1.0-dev.26812293063"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af117814b378cbd2ab06001018afba51953fdad615207db351adb40289fd0791"
+checksum = "25ae81d6af34cb935b59086f5fb67d12b7bb7c9484967940bc3c05bc3c96966d"
 dependencies = [
  "anyhow",
  "arc-swap",

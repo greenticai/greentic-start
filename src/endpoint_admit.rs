@@ -55,6 +55,27 @@ pub struct EndpointAdmit {
     /// in `x-greentic-messaging-endpoint-id`, which matches
     /// `MessagingEndpointId::to_string`).
     by_id: HashMap<String, EndpointEntry>,
+    /// Key: `(provider_type, provider_id)` from each endpoint.
+    /// Value: the same `endpoint_id` string used by [`by_id`].
+    ///
+    /// Populated for the M1 IID.4 resolver: when a request arrives without
+    /// `x-greentic-messaging-endpoint-id`, the host invokes each enabled
+    /// provider component's `identify-instance` export; the returned
+    /// `provider_id` is paired with the resolver's known `provider_type` and
+    /// looked up here to recover the matching `endpoint_id`.
+    ///
+    /// (`provider_type`, `provider_id`) uniqueness is an
+    /// [`Environment::validate`](greentic_deploy_spec::Environment::validate)
+    /// invariant, so duplicates can't reach this table.
+    ///
+    /// [`by_id`]: Self::by_id
+    by_provider: HashMap<(String, String), String>,
+    /// Number of endpoints declared per `provider_type`. Drives the M1 IID.4
+    /// ambiguity policy: when the request has no header AND the resolver
+    /// returns no match, an env with ≥2 endpoints of the same `provider_type`
+    /// must 422 instead of falling through (silently picking "the" endpoint
+    /// is wrong when the env declares more than one of that type).
+    counts_by_provider_type: HashMap<String, usize>,
 }
 
 impl EndpointAdmit {
@@ -62,22 +83,64 @@ impl EndpointAdmit {
     /// `linked_bundles` is materialized as a `HashSet<String>` so membership
     /// checks at request time are O(1) regardless of ACL size.
     pub fn from_environment(env: &Environment) -> Self {
-        let by_id = env
-            .messaging_endpoints
-            .iter()
-            .map(|ep| {
-                let entry = EndpointEntry {
+        let mut by_id = HashMap::with_capacity(env.messaging_endpoints.len());
+        let mut by_provider = HashMap::with_capacity(env.messaging_endpoints.len());
+        let mut counts_by_provider_type: HashMap<String, usize> = HashMap::new();
+        for ep in &env.messaging_endpoints {
+            let endpoint_id = ep.endpoint_id.to_string();
+            by_id.insert(
+                endpoint_id.clone(),
+                EndpointEntry {
                     linked_bundles: ep
                         .linked_bundles
                         .iter()
                         .map(|b| b.as_str().to_string())
                         .collect(),
                     welcome_flow: ep.welcome_flow.clone(),
-                };
-                (ep.endpoint_id.to_string(), entry)
-            })
-            .collect();
-        Self { by_id }
+                },
+            );
+            by_provider.insert(
+                (ep.provider_type.clone(), ep.provider_id.clone()),
+                endpoint_id,
+            );
+            *counts_by_provider_type
+                .entry(ep.provider_type.clone())
+                .or_insert(0) += 1;
+        }
+        Self {
+            by_id,
+            by_provider,
+            counts_by_provider_type,
+        }
+    }
+
+    /// Look up the on-wire `endpoint_id` for a `(provider_type, provider_id)`
+    /// pair. Used by the M1 IID.4 resolver to recover an `endpoint_id` from a
+    /// `provider_id` returned by a component's `identify-instance` probe.
+    pub(crate) fn endpoint_id_for_provider(
+        &self,
+        provider_type: &str,
+        provider_id: &str,
+    ) -> Option<&str> {
+        self.by_provider
+            .get(&(provider_type.to_string(), provider_id.to_string()))
+            .map(String::as_str)
+    }
+
+    /// Iterate over the distinct `provider_type` values declared in this env.
+    /// The resolver uses this to pick which provider components to probe per
+    /// request (one probe per type, not per endpoint).
+    pub(crate) fn provider_types(&self) -> impl Iterator<Item = &str> {
+        self.counts_by_provider_type.keys().map(String::as_str)
+    }
+
+    /// Number of endpoints declared for `provider_type`. ≥2 means a missing
+    /// header MUST fail closed when the resolver cannot disambiguate.
+    pub(crate) fn endpoint_count_for_provider_type(&self, provider_type: &str) -> usize {
+        self.counts_by_provider_type
+            .get(provider_type)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Look up the ACL set for `endpoint_id`. `None` means *this env has never
@@ -141,13 +204,21 @@ mod tests {
     }
 
     fn endpoint(provider_id: &str, bundles: &[&str]) -> MessagingEndpoint {
+        endpoint_typed("teams", provider_id, bundles)
+    }
+
+    fn endpoint_typed(
+        provider_type: &str,
+        provider_id: &str,
+        bundles: &[&str],
+    ) -> MessagingEndpoint {
         let now = chrono::Utc::now();
         MessagingEndpoint {
             schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
             env_id: env_id(),
             endpoint_id: MessagingEndpointId::new(),
             provider_id: provider_id.to_string(),
-            provider_type: "teams".to_string(),
+            provider_type: provider_type.to_string(),
             display_name: provider_id.to_string(),
             secret_refs: Vec::new(),
             linked_bundles: bundles.iter().map(|b| BundleId::new(*b)).collect(),
@@ -251,6 +322,74 @@ mod tests {
 
         assert!(admit.welcome_flow(&id).is_none());
         assert!(admit.welcome_flow("bogus-endpoint-id").is_none());
+    }
+
+    #[test]
+    fn endpoint_id_for_provider_returns_matching_endpoint() {
+        let teams_legal = endpoint_typed("teams", "28:legal-bot", &["legal-bundle"]);
+        let teams_accounting = endpoint_typed("teams", "28:acct-bot", &["acct-bundle"]);
+        let slack = endpoint_typed("slack", "T0LEGAL", &["legal-bundle"]);
+        let (legal_id, acct_id, slack_id) = (
+            teams_legal.endpoint_id.to_string(),
+            teams_accounting.endpoint_id.to_string(),
+            slack.endpoint_id.to_string(),
+        );
+        let admit =
+            EndpointAdmit::from_environment(&env_with(vec![teams_legal, teams_accounting, slack]));
+
+        assert_eq!(
+            admit.endpoint_id_for_provider("teams", "28:legal-bot"),
+            Some(legal_id.as_str())
+        );
+        assert_eq!(
+            admit.endpoint_id_for_provider("teams", "28:acct-bot"),
+            Some(acct_id.as_str())
+        );
+        assert_eq!(
+            admit.endpoint_id_for_provider("slack", "T0LEGAL"),
+            Some(slack_id.as_str())
+        );
+    }
+
+    #[test]
+    fn endpoint_id_for_provider_returns_none_on_cross_type_or_unknown_id() {
+        let admit = EndpointAdmit::from_environment(&env_with(vec![endpoint_typed(
+            "teams",
+            "28:legal-bot",
+            &["legal-bundle"],
+        )]));
+
+        // Wrong type (Slack key against Teams entry).
+        assert!(
+            admit
+                .endpoint_id_for_provider("slack", "28:legal-bot")
+                .is_none()
+        );
+        // Right type, unknown provider_id.
+        assert!(
+            admit
+                .endpoint_id_for_provider("teams", "28:unknown")
+                .is_none()
+        );
+        // Empty inputs.
+        assert!(admit.endpoint_id_for_provider("", "").is_none());
+    }
+
+    #[test]
+    fn endpoint_counts_by_provider_type_reflect_declared_endpoints() {
+        let admit = EndpointAdmit::from_environment(&env_with(vec![
+            endpoint_typed("teams", "28:a", &["b1"]),
+            endpoint_typed("teams", "28:b", &["b2"]),
+            endpoint_typed("slack", "T0", &["b1"]),
+        ]));
+
+        assert_eq!(admit.endpoint_count_for_provider_type("teams"), 2);
+        assert_eq!(admit.endpoint_count_for_provider_type("slack"), 1);
+        assert_eq!(admit.endpoint_count_for_provider_type("telegram"), 0);
+
+        let mut types: Vec<&str> = admit.provider_types().collect();
+        types.sort_unstable();
+        assert_eq!(types, vec!["slack", "teams"]);
     }
 
     #[test]
