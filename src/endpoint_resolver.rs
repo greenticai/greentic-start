@@ -49,10 +49,10 @@ use crate::endpoint_admit::EndpointAdmit;
 /// The decision the resolver hands back to the serve pipeline.
 ///
 /// `Hit`/`Miss`/`Ambiguous`/`NoImpl` are mutually exclusive results of a
-/// real probe; `HeaderWins`/`Skipped` are the two short-circuit paths that
-/// never invoked the host. The call site decides HTTP status / telemetry
-/// attribution; this enum carries the *raw* decision, not its policy
-/// translation.
+/// real probe; `HeaderWins`/`Skipped`/`PublicSkipped` are the three
+/// short-circuit paths that never invoked the host. The call site decides
+/// HTTP status / telemetry attribution; this enum carries the *raw*
+/// decision, not its policy translation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolverOutcome {
     /// The caller's trusted header pinned the eid; the resolver did not run.
@@ -105,9 +105,9 @@ impl ResolverOutcome {
 
     /// Convenience for the serve site: the resolved eid (if any) that should
     /// be threaded into the activity. `HeaderWins`/`Hit` return `Some`;
-    /// `Miss`/`Ambiguous`/`NoImpl`/`Skipped` return `None`. `Ambiguous` is
-    /// `None` here because the call site is expected to refuse the request
-    /// before reaching the activity.
+    /// `Miss`/`Ambiguous`/`NoImpl`/`Skipped`/`PublicSkipped` return `None`.
+    /// `Ambiguous` is `None` here because the call site is expected to refuse
+    /// the request before reaching the activity.
     pub(crate) fn endpoint_id(&self) -> Option<&str> {
         match self {
             ResolverOutcome::HeaderWins(eid) | ResolverOutcome::Hit(eid) => Some(eid.as_str()),
