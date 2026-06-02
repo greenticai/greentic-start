@@ -60,6 +60,7 @@ use greentic_deploy_spec::{DEFAULT_LISTEN_ADDR, EnvironmentHostConfig};
 use crate::deployment_routes::RevisionIngressRouting;
 use crate::endpoint_resolver;
 use crate::http_routes::{HttpRouteTable, RevisionScope};
+use crate::identify_payload;
 use crate::operator_log;
 use crate::revision_dispatcher::{
     DispatchRequest, RevisionDispatcher, RevisionKey, SetCookieDirective, cookie_name,
@@ -623,6 +624,11 @@ async fn serve(
     let user_header = header_str(req.headers(), "x-greentic-user");
     let session_header = header_str(req.headers(), "x-greentic-session");
     let endpoint_header = header_str(req.headers(), "x-greentic-messaging-endpoint-id");
+    // M1 IID.4d wrapper: collect routing-relevant request headers BEFORE
+    // `read_body_limited` consumes `req`. The resolver uses these to give
+    // header-discriminated providers (Telegram via secret-token) the same
+    // identify-instance call shape that body-discriminated providers use.
+    let identify_headers = identify_payload::collect_identify_headers(req.headers());
 
     // Resolve the bound deployment + tenant before touching the body, so an
     // unroutable request is rejected cheaply.
@@ -741,6 +747,12 @@ async fn serve(
     // provider component identifies (e.g. a Teams serviceUrl for bot X)
     // would derive an endpoint and cross-contaminate sessions/welcome-flows.
     // The resolver short-circuits to `PublicSkipped` for non-loopback peers.
+    // M1 IID.4d wrapper: pass `{headers, body}` instead of raw body bytes so
+    // providers whose discriminator lives in HTTP headers (Telegram) can
+    // identify the instance the same way body-based providers do (Teams,
+    // Slack, etc.). Build LAZILY — the resolver short-circuits without
+    // touching the payload on public traffic, header-pinned eids, and
+    // no-endpoint envs, so most requests skip the body clone + re-serialize.
     let resolution = endpoint_resolver::resolve(
         &activation.host,
         &tenant,
@@ -748,7 +760,7 @@ async fn serve(
         activation.routing.endpoint_admit.as_ref(),
         header_endpoint_id.as_deref(),
         peer_is_loopback,
-        &body_bytes,
+        || identify_payload::build_identify_payload(&identify_headers, &payload),
     )
     .await
     .map_err(|err| {
