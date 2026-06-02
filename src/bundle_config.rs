@@ -118,6 +118,43 @@ fn normalized_bundle_has_runtime_payload(root_dir: &Path) -> bool {
     root_dir.join("bundle-manifest.json").exists() || root_dir.join("resolved").is_dir()
 }
 
+/// Optional `telemetry:` block carried inside a normalized `bundle.yaml`.
+///
+/// Backwards compatible: when the block is absent the deserializer skips it and
+/// callers see `None`, which preserves the legacy "file appender only" behavior.
+#[derive(Clone, Debug, Default, Deserialize, serde::Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct BundleTelemetryConfig {
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    #[serde(default = "default_exporter")]
+    pub exporter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    #[serde(default = "default_sampling", skip_serializing_if = "is_one")]
+    pub sampling: f64,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn is_true(v: &bool) -> bool {
+    *v
+}
+fn default_exporter() -> String {
+    "none".to_string()
+}
+fn default_sampling() -> f64 {
+    1.0
+}
+fn is_one(v: &f64) -> bool {
+    (*v - 1.0).abs() < f64::EPSILON
+}
+
 /// Extended bundle.yaml structure with optional demo config fields
 #[derive(Debug, Deserialize)]
 struct ExtendedBundleYaml {
@@ -127,6 +164,8 @@ struct ExtendedBundleYaml {
     team: Option<String>,
     #[serde(default)]
     providers: Option<std::collections::BTreeMap<String, config::DemoProviderConfig>>,
+    #[serde(default)]
+    telemetry: Option<BundleTelemetryConfig>,
 }
 
 /// Result of loading extended bundle.yaml
@@ -134,6 +173,62 @@ struct ExtendedBundleResult {
     tenant: Option<String>,
     team: Option<String>,
     providers: Option<std::collections::BTreeMap<String, config::DemoProviderConfig>>,
+    #[allow(dead_code)]
+    telemetry: Option<BundleTelemetryConfig>,
+}
+
+/// Read just the `telemetry:` block from a normalized bundle.yaml.
+pub(crate) fn peek_bundle_telemetry(bundle_path: &Path) -> Option<BundleTelemetryConfig> {
+    let raw = std::fs::read_to_string(bundle_path).ok()?;
+    let parsed: ExtendedBundleYaml = serde_yaml_bw::from_str(&raw).ok()?;
+    parsed.telemetry
+}
+
+/// Read the optional sidecar telemetry artifact persisted by `gtc setup` at
+/// `<bundle_root>/state/config/platform/telemetry.json`.
+pub(crate) fn peek_sidecar_telemetry(bundle_root: &Path) -> Option<BundleTelemetryConfig> {
+    let path = bundle_root
+        .join("state")
+        .join("config")
+        .join("platform")
+        .join("telemetry.json");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let obj = value.as_object()?;
+    let exporter = obj
+        .get("exporter")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none")
+        .to_string();
+    let enabled = obj
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(exporter != "none");
+    let endpoint = obj
+        .get("endpoint")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let service_name = obj
+        .get("service_name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let headers = obj
+        .get("headers")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(BundleTelemetryConfig {
+        enabled,
+        exporter,
+        endpoint,
+        service_name,
+        sampling: 1.0,
+        headers,
+    })
 }
 
 /// Load extended config from bundle.yaml if present (tenant, team, providers)
@@ -170,6 +265,7 @@ fn load_extended_bundle_config(
         tenant: parsed.tenant,
         team: parsed.team,
         providers,
+        telemetry: parsed.telemetry,
     }))
 }
 

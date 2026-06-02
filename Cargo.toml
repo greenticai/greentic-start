@@ -1,6 +1,6 @@
 [package]
 name = "greentic-start"
-version = "0.5.35"
+version = "0.5.36"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -64,6 +64,11 @@ thiserror = "2"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-opentelemetry = "0.32"
+opentelemetry = { version = "0.31", features = ["logs"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "logs"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic"] }
+opentelemetry-appender-tracing = "0.31"
 unic-langid = "0.9"
 ureq = { version = "3", features = ["json"] }
 urlencoding = "2"

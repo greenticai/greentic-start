@@ -414,10 +414,15 @@ where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
 {
+    let started = std::time::Instant::now();
+    let method = req.method().as_str().to_string();
+    let route = crate::metrics::normalise_route(req.uri().path());
     let response = match handle_request_inner(req, state).await {
         Ok(response) => with_cors(response),
         Err(response) => with_cors(response),
     };
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    crate::metrics::record_http_request(&method, &route, response.status().as_u16(), elapsed_ms);
     Ok(response)
 }
 

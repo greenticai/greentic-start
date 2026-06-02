@@ -33,12 +33,14 @@ mod ingress_types;
 mod messaging_app;
 mod messaging_dto;
 mod messaging_egress;
+mod metrics;
 mod ngrok;
 pub mod notifier;
 mod offers;
 mod onboard;
 mod operator_i18n;
 mod operator_log;
+mod otlp_telemetry;
 #[doc(hidden)]
 pub mod perf_harness;
 mod port_utils;
@@ -200,12 +202,18 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     });
     let log_dir = operator_log::init(early_log_dir, log_level)?;
 
+    let (peeked_telemetry, peeked_service_name) = peek_startup_telemetry(&request);
+
     // Install a tracing subscriber that writes RUST_LOG-filtered events to
-    // <log_dir>/trace.log. Without this, every `tracing::*` call in greentic
-    // crates (notably greentic-runner-host) is dropped because no subscriber
-    // is registered. We bind the appender guard to a long-lived `static` so
-    // background tasks can flush throughout the process lifetime.
-    let _trace_guard = init_trace_log(&log_dir);
+    // <log_dir>/system.log. When a bundle's `telemetry:` block (or the
+    // TELEMETRY_EXPORT/OTLP_ENDPOINT env vars) requests OTLP, an additional
+    // OpenTelemetry tracer + meter + logger layer is composed into the same
+    // subscriber. Absent → file-only, today's behaviour.
+    let _trace_guard = init_trace_log(
+        &log_dir,
+        peeked_telemetry.as_ref(),
+        &peeked_service_name,
+    );
 
     let demo_paths = match bundle_config::resolve_demo_paths(
         request.config.clone(),
@@ -479,6 +487,34 @@ const NOISY_TRACE_TARGETS: &[&str] = &[
     "tower",
 ];
 
+/// Best-effort peek of the bundle's `telemetry:` block (or its sidecar
+/// artifact) before the tracing subscriber is installed.
+fn peek_startup_telemetry(
+    request: &StartRequest,
+) -> (Option<bundle_config::BundleTelemetryConfig>, String) {
+    let Ok(demo_paths) =
+        bundle_config::resolve_demo_paths(request.config.clone(), request.bundle.as_deref())
+    else {
+        return (None, "greentic".to_string());
+    };
+    let bundle_yaml = demo_paths.root_dir.join("bundle.yaml");
+    let telemetry = bundle_config::peek_bundle_telemetry(&bundle_yaml)
+        .or_else(|| bundle_config::peek_bundle_telemetry(&demo_paths.config_path))
+        .or_else(|| bundle_config::peek_sidecar_telemetry(&demo_paths.root_dir));
+    let service_name = telemetry
+        .as_ref()
+        .and_then(|t| t.service_name.clone())
+        .or_else(|| {
+            demo_paths
+                .root_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "greentic".to_string());
+    (telemetry, service_name)
+}
+
 /// Build the trace.log `EnvFilter`. Starts from `RUST_LOG` (or `info` when
 /// unset) and then forcibly clamps known-noisy crates (wasmtime, h2, hyper,
 /// rustls, etc.) to `warn`. EnvFilter resolves last-write-wins per target, so
@@ -494,18 +530,18 @@ fn build_trace_filter() -> tracing_subscriber::EnvFilter {
     })
 }
 
-/// Install a `tracing` subscriber writing to `<log_dir>/trace.log`, filtered by
-/// `RUST_LOG` (defaults to `info`). Returns the appender guard, which must be
-/// kept alive for the process lifetime so the non-blocking writer flushes.
+/// Install a `tracing` subscriber writing to `<log_dir>/system.log`. When
+/// `telemetry` resolves to OTLP, an additional OpenTelemetry tracer + meter
+/// + logger layer is composed alongside the file appender.
 fn init_trace_log(
     log_dir: &std::path::Path,
+    telemetry: Option<&bundle_config::BundleTelemetryConfig>,
+    fallback_service_name: &str,
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use std::fs::OpenOptions;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    // Unified host log: operator_log writes here too; both formats co-exist
-    // line-by-line in append mode.
     let path = log_dir.join("system.log");
     let file = match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(f) => f,
@@ -520,26 +556,54 @@ fn init_trace_log(
     let (nb, guard) = tracing_appender::non_blocking(file);
     let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "<unset>".to_string());
     let filter = build_trace_filter();
-    let layer = tracing_subscriber::fmt::layer()
+    let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(nb)
         .with_ansi(false)
         .with_target(true);
-    match tracing_subscriber::registry()
-        .with(filter)
-        .with(layer)
-        .try_init()
-    {
+
+    let resolved = otlp_telemetry::resolve(telemetry, fallback_service_name);
+    let otlp_layer = resolved.as_ref().and_then(|r| match otlp_telemetry::install_layer(r) {
+        Ok(layer) => Some(layer),
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "OTLP exporter init failed (endpoint={}); file logging only: {err:#}",
+                    r.endpoint
+                ),
+            );
+            None
+        }
+    });
+    let otlp_summary = resolved
+        .as_ref()
+        .map(|r| format!("{:?} endpoint={}", r.exporter, r.endpoint))
+        .unwrap_or_else(|| "none".to_string());
+
+    let init_result = match otlp_layer {
+        Some(layer) => tracing_subscriber::registry()
+            .with(filter)
+            .with(file_layer)
+            .with(layer)
+            .try_init(),
+        None => tracing_subscriber::registry()
+            .with(filter)
+            .with(file_layer)
+            .try_init(),
+    };
+    match init_result {
         Ok(()) => {
             operator_log::info(
                 module_path!(),
                 format!(
-                    "tracing subscriber writing to {} (RUST_LOG={rust_log})",
+                    "tracing subscriber writing to {} (RUST_LOG={rust_log} otlp={otlp_summary})",
                     path.display()
                 ),
             );
             tracing::info!(
                 target: "greentic_start",
                 rust_log = %rust_log,
+                otlp = %otlp_summary,
                 "tracing subscriber installed"
             );
         }

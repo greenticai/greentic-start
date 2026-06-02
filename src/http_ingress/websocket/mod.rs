@@ -187,6 +187,19 @@ impl pump::ActivitySource for RunnerHostActivitySource {
     }
 }
 
+/// Decrements `greentic.conversations.active` when dropped. Created after a
+/// successful WS handshake so the gauge mirrors live connections regardless
+/// of how the session ends.
+struct SessionMetricGuard {
+    tenant: String,
+}
+
+impl Drop for SessionMetricGuard {
+    fn drop(&mut self) {
+        crate::metrics::record_session_end(&self.tenant, "webchat");
+    }
+}
+
 /// Serve a single WebSocket session: complete the upgrade, then bridge the
 /// `Pump` output frames into the WS sink and watch the WS stream for client
 /// disconnects.
@@ -211,6 +224,10 @@ pub async fn serve_session(
             tenant_id, conversation_id, initial_watermark,
         ),
     );
+    crate::metrics::record_session_start(&tenant_id, "webchat");
+    let _session_metric = SessionMetricGuard {
+        tenant: tenant_id.clone(),
+    };
     let mut ws = match websocket.await {
         Ok(stream) => {
             operator_log::debug(
