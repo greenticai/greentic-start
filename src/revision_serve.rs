@@ -666,15 +666,16 @@ async fn serve(
 
     // Phase D.3: the body is read as raw bytes; the strict JSON parse is
     // deferred until we know this is the generic-JSON branch (provider
-    // webhooks send form-urlencoded / signature payloads / etc. that the
-    // provider component decodes itself). For caller_identity we still want
-    // to peek for body-supplied `user`/`session` on loopback callers, so
-    // attempt a tolerant parse here — any failure collapses to `Null` and
-    // identity falls back to headers (the only trusted source on remote).
-    let identity_payload: Value = if body_bytes.is_empty() {
-        Value::Null
-    } else {
+    // webhooks send form-urlencoded / signature payloads that the provider
+    // component decodes itself). `caller_identity` only consumes a JSON
+    // body on loopback peers — non-loopback callers go straight to
+    // `(None, None, None)` regardless of body content — so we skip the
+    // tolerant parse entirely off-loopback to save the cost on every
+    // public provider webhook.
+    let identity_payload: Value = if peer_is_loopback && !body_bytes.is_empty() {
         serde_json::from_slice(&body_bytes).unwrap_or(Value::Null)
+    } else {
+        Value::Null
     };
 
     // Caller-asserted identity is only honoured from loopback peers (see
@@ -763,9 +764,6 @@ async fn serve(
             return dispatch_provider_route(
                 Arc::clone(&activation),
                 &tenant,
-                deployment_id,
-                outcome.bundle_id.clone(),
-                outcome.revision_id,
                 &scope,
                 &path,
                 method.as_str(),
@@ -1556,9 +1554,6 @@ pub(crate) fn resolve_bind_addr(host_config: Option<&EnvironmentHostConfig>) -> 
 async fn dispatch_provider_route(
     activation: Arc<Activation>,
     tenant: &str,
-    deployment_id: DeploymentId,
-    bundle_id: BundleId,
-    revision_id: RevisionId,
     scope: &RevisionScope,
     path: &str,
     method: &str,
@@ -1589,6 +1584,9 @@ async fn dispatch_provider_route(
         ));
     };
     let provider_op = route_match.descriptor.provider_op.clone();
+    let deployment_id = scope.deployment_id;
+    let bundle_id = scope.bundle_id.clone();
+    let revision_id = scope.revision_id;
 
     let http_in = build_provider_http_in(
         &provider_type,
@@ -1645,23 +1643,79 @@ async fn dispatch_provider_route(
         )
     })?;
 
-    // Per-ingress pipeline: forward the envelope into the flow runtime,
-    // collect the reply Activities, and ship each reply back out through
-    // the provider's egress ops (`render_plan` → `encode` → `send_payload`).
-    // Without the egress chain the upstream would receive a 2xx ack while
-    // the bot's reply is silently dropped — matches the legacy ingress
-    // pipeline in `route_messaging_envelopes`.
-    //
-    // Errors are logged but do NOT fail the HTTP response: returning a
-    // non-2xx to a webhook source (Telegram, Slack, …) triggers a retry,
-    // which would then double-process the inbound envelope. The internal
-    // failure mode (broken egress) wouldn't recover on retry anyway.
-    for ingress in &result.messaging_envelopes {
-        let activity = envelope_to_activity(ingress, tenant);
+    // `result.events` are EventEnvelopeV1 (event-fabric) emissions. The
+    // legacy `dispatch_http_ingress` routes these only for `Domain::Events`
+    // through `event_router::route_events_to_default_flow`; the revision-
+    // aware event path is Phase D.4 work. Log non-empty counts so operators
+    // see the gap until the routing seam lands.
+    if !result.events.is_empty() {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "provider {provider_type} emitted {} event(s) on op {provider_op} \
+                 (deployment {deployment_id} revision {revision_id}); revision-aware \
+                 event routing is Phase D.4 work — events dropped for now",
+                result.events.len()
+            ),
+        );
+    }
+
+    // Detach the per-ingress pipeline so the HTTP response isn't blocked
+    // by the 3-call egress chain (`render_plan` → `encode` → `send_payload`).
+    // Slack enforces a 3-second webhook timeout; with N replies per ingress
+    // and M envelopes per webhook the inline cost = `M * N * 3 * WASM_invoke`
+    // would routinely blow past it. Matches the legacy posture in
+    // `dispatch_http_ingress`, which `std::thread::spawn`s
+    // `route_messaging_envelopes`. Errors are logged inside the spawned
+    // task — the upstream already received its 2xx ack by the time the
+    // egress runs.
+    if !result.messaging_envelopes.is_empty() {
+        let ingress_envelopes = result.messaging_envelopes.clone();
+        let pipeline_activation = Arc::clone(&activation);
+        let pipeline_tenant = tenant.to_string();
+        let pipeline_provider = provider_type.clone();
+        let pipeline_bundle = bundle_id.clone();
+        tokio::spawn(async move {
+            run_provider_inbound_pipeline(
+                pipeline_activation,
+                pipeline_tenant,
+                deployment_id,
+                pipeline_bundle,
+                revision_id,
+                pipeline_provider,
+                ingress_envelopes,
+            )
+            .await;
+        });
+    }
+
+    Ok(synthesize_provider_response(&result.response))
+}
+
+/// Per-ingress pipeline: for each inbound envelope, drive the flow runtime
+/// and ship each reply Activity back out through the provider's egress
+/// chain. Runs in a detached `tokio::spawn` so the HTTP ack is sent before
+/// the egress completes (the webhook upstream doesn't need to wait for our
+/// bot reply to be delivered).
+///
+/// Errors are logged but never bubble out — the upstream already saw its
+/// 2xx, so returning a non-2xx now is impossible, and propagating an Err
+/// would just hang in the abandoned task.
+async fn run_provider_inbound_pipeline(
+    activation: Arc<Activation>,
+    tenant: String,
+    deployment_id: DeploymentId,
+    bundle_id: BundleId,
+    revision_id: RevisionId,
+    provider_type: String,
+    envelopes: Vec<ChannelMessageEnvelope>,
+) {
+    for ingress in &envelopes {
+        let activity = envelope_to_activity(ingress, &tenant);
         let replies = match activation
             .host
             .handle_activity_for_revision(
-                tenant,
+                &tenant,
                 deployment_id,
                 bundle_id.clone(),
                 revision_id,
@@ -1686,7 +1740,7 @@ async fn dispatch_provider_route(
             let reply_envelope = build_reply_envelope(ingress, &reply);
             if let Err(err) = run_reply_egress(
                 &activation,
-                tenant,
+                &tenant,
                 deployment_id,
                 bundle_id.clone(),
                 revision_id,
@@ -1706,25 +1760,6 @@ async fn dispatch_provider_route(
             }
         }
     }
-
-    // `result.events` are EventEnvelopeV1 (event-fabric) emissions. The
-    // legacy `dispatch_http_ingress` routes these only for `Domain::Events`
-    // through `event_router::route_events_to_default_flow`; the revision-
-    // aware event path is Phase D.4 work. Log non-empty counts so operators
-    // see the gap until the routing seam lands.
-    if !result.events.is_empty() {
-        operator_log::warn(
-            module_path!(),
-            format!(
-                "provider {provider_type} emitted {} event(s) on op {provider_op} \
-                 (deployment {deployment_id} revision {revision_id}); revision-aware \
-                 event routing is Phase D.4 work — events dropped for now",
-                result.events.len()
-            ),
-        );
-    }
-
-    Ok(synthesize_provider_response(&result.response))
 }
 
 /// Run the provider's egress chain for a single reply envelope: invoke
@@ -1748,29 +1783,41 @@ async fn run_reply_egress(
     provider_type: &str,
     envelope: &ChannelMessageEnvelope,
 ) -> Result<()> {
+    use crate::messaging_dto::{EncodeInV1, ProviderPayloadV1, RenderPlanInV1};
+
     let message_value = serde_json::to_value(envelope).context("serialize reply envelope")?;
 
+    // Shared closure: each step calls `invoke_provider_for_revision` with
+    // the same 7 routing args, varying only by op + serialized input.
+    let invoke = async |op: &'static str, input: Value| -> Result<Value> {
+        let input_bytes =
+            serde_json::to_vec(&input).with_context(|| format!("encode {op} input"))?;
+        activation
+            .host
+            .invoke_provider_for_revision(
+                tenant,
+                deployment_id,
+                bundle_id.clone(),
+                revision_id,
+                provider_type,
+                op,
+                input_bytes,
+                None,
+                None,
+            )
+            .await
+            .with_context(|| format!("{op} invocation"))
+    };
+
     // render_plan(message) → plan
-    let render_input = serde_json::to_vec(&serde_json::json!({
-        "v": 1,
-        "message": message_value,
-    }))
-    .context("encode render_plan input")?;
-    let plan_value = activation
-        .host
-        .invoke_provider_for_revision(
-            tenant,
-            deployment_id,
-            bundle_id.clone(),
-            revision_id,
-            provider_type,
-            "render_plan",
-            render_input,
-            None,
-            None,
-        )
-        .await
-        .context("render_plan invocation")?;
+    let render_input = serde_json::to_value(RenderPlanInV1 {
+        v: 1,
+        message: message_value.clone(),
+    })
+    .context("encode RenderPlanInV1")?;
+    let plan_value = invoke("render_plan", render_input).await?;
+    // Providers may return the plan as a typed `RenderPlanOutV1` (`plan_json`)
+    // string, a `{ "plan": ... }` wrapper, or the plan object directly.
     let plan = plan_value
         .get("plan_json")
         .and_then(|v| v.as_str())
@@ -1779,52 +1826,36 @@ async fn run_reply_egress(
         .unwrap_or(plan_value);
 
     // encode(message, plan) → ProviderPayloadV1
-    let encode_input = serde_json::to_vec(&serde_json::json!({
-        "v": 1,
-        "message": &message_value,
-        "plan": &plan,
-    }))
-    .context("encode `encode` input")?;
-    let encode_value = activation
-        .host
-        .invoke_provider_for_revision(
-            tenant,
-            deployment_id,
-            bundle_id.clone(),
-            revision_id,
-            provider_type,
-            "encode",
-            encode_input,
-            None,
-            None,
-        )
-        .await
-        .context("encode invocation")?;
+    let encode_input = serde_json::to_value(EncodeInV1 {
+        v: 1,
+        message: message_value,
+        plan,
+    })
+    .context("encode EncodeInV1")?;
+    let encode_value = invoke("encode", encode_input).await?;
     let payload_value = encode_value.get("payload").cloned().unwrap_or(encode_value);
+    let payload: ProviderPayloadV1 =
+        serde_json::from_value(payload_value).context("decode ProviderPayloadV1")?;
 
-    // send_payload(provider_type, payload, tenant) → outcome
-    let send_input = serde_json::to_vec(&serde_json::json!({
-        "v": 1,
-        "provider_type": provider_type,
-        "payload": payload_value,
-        "tenant": { "tenant": tenant },
-    }))
-    .context("encode send_payload input")?;
-    let send_outcome = activation
-        .host
-        .invoke_provider_for_revision(
-            tenant,
-            deployment_id,
-            bundle_id,
-            revision_id,
-            provider_type,
-            "send_payload",
-            send_input,
-            None,
-            None,
-        )
-        .await
-        .context("send_payload invocation")?;
+    // send_payload(provider_type, payload, tenant) → outcome.
+    // `messaging_egress::build_send_payload` is the legacy constructor —
+    // mirrored inline here because it also injects bundle-rooted config,
+    // which the revision-aware path doesn't have yet (Phase D follow-up).
+    let send_input = serde_json::to_value(crate::messaging_dto::SendPayloadInV1 {
+        v: 1,
+        provider_type: provider_type.to_string(),
+        payload,
+        tenant: crate::messaging_dto::TenantHint {
+            tenant: tenant.to_string(),
+            team: None,
+            user: None,
+            correlation_id: None,
+        },
+        reply_scope: None,
+        config: None,
+    })
+    .context("encode SendPayloadInV1")?;
+    let send_outcome = invoke("send_payload", send_input).await?;
 
     if send_outcome
         .get("ok")
@@ -1855,6 +1886,19 @@ fn build_reply_envelope(
     ingress: &ChannelMessageEnvelope,
     reply: &Activity,
 ) -> ChannelMessageEnvelope {
+    // Keys carried forward from the ingress envelope's metadata when the
+    // reply doesn't supply its own. Kept in sync with the legacy
+    // `messaging_app::base_reply_envelope` reset list.
+    const REPLY_METADATA_KEYS: &[&str] = &[
+        "env",
+        "tenant",
+        "team",
+        "route",
+        "locale",
+        "universal",
+        "autoStart",
+    ];
+
     if let Ok(mut envelope) =
         serde_json::from_value::<ChannelMessageEnvelope>(reply.payload().clone())
     {
@@ -1881,12 +1925,10 @@ fn build_reply_envelope(
     envelope.text = None;
     envelope.attachments.clear();
 
-    // Strip ingress-only metadata; only carry forward the keys that route
-    // egress (kept in sync with legacy `base_reply_envelope`).
     let mut clean = std::collections::BTreeMap::new();
-    for key in ["env", "tenant", "team", "route", "locale", "universal"] {
-        if let Some(value) = envelope.metadata.remove(key) {
-            clean.insert(key.to_string(), value);
+    for key in REPLY_METADATA_KEYS {
+        if let Some(value) = envelope.metadata.remove(*key) {
+            clean.insert((*key).to_string(), value);
         }
     }
     envelope.metadata = clean;
@@ -1903,11 +1945,10 @@ fn build_reply_envelope(
     envelope
 }
 
-/// Collect every request header into a `(name_lowercase, value_utf8)` list
-/// suitable for embedding into [`HttpInV1::headers`]. Multi-value headers
-/// produce one entry per occurrence. Headers whose value is not valid UTF-8
-/// are dropped (the wire shape is JSON; surfacing a hard 500 here would let
-/// a single malformed header take down an otherwise-valid webhook).
+/// Collect every request header into `(name_lowercase, value_utf8)` pairs
+/// for [`HttpInV1::headers`]. Non-UTF-8 values are silently dropped — the
+/// wire is JSON, so a single malformed header would otherwise 500 the
+/// whole webhook.
 fn collect_forwarded_request_headers(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
@@ -1952,17 +1993,11 @@ fn build_provider_http_in(
 }
 
 /// Split a raw query string (sans leading `?`) into `(key, value)` pairs.
-/// Empty values are preserved as `""`; entries with no `=` keep an empty
-/// value. No percent-decoding here — the provider components decode their
-/// own keys (matching the legacy ingress contract).
+/// Entries with no `=` keep an empty value. No percent-decoding — the
+/// provider component decodes its own keys (legacy ingress contract).
 fn parse_query_pairs(query: Option<&str>) -> Vec<(String, String)> {
-    let Some(query) = query else {
-        return Vec::new();
-    };
-    if query.is_empty() {
-        return Vec::new();
-    }
     query
+        .unwrap_or_default()
         .split('&')
         .filter(|s| !s.is_empty())
         .map(|pair| match pair.split_once('=') {
