@@ -330,15 +330,12 @@ fn decode_injected_config_for_provider(config: serde_json::Value) -> serde_json:
 /// fields. The shape is intentionally generic — no per-kind code lives
 /// here. Each entity contributes:
 ///
-///   * `prefill_<kind>`            — the canonical `normalized` value
-///   * `prefill_<kind>_<role>`     — when the entity carries a role
-///                                   tag (e.g. `prefill_location_from`,
-///                                   `prefill_location_to`)
-///   * `prefill_<kind>_<format>`   — for every entry in the entity's
-///                                   `formats` map (e.g. an `iso`
-///                                   variant of a `YYYYMMDD` date,
-///                                   set by the routing host so this
-///                                   layer stays kind-agnostic)
+/// * `prefill_<kind>` — the canonical `normalized` value.
+/// * `prefill_<kind>_<role>` — when the entity carries a role tag
+///   (e.g. `prefill_location_from`, `prefill_location_to`).
+/// * `prefill_<kind>_<format>` — for every entry in the entity's
+///   `formats` map (e.g. an `iso` variant of a `YYYYMMDD` date, set
+///   by the routing host so this layer stays kind-agnostic).
 ///
 /// Card authors opt in per field via `value: "${prefill_<key>}"`. The
 /// runtime never assumes which fields exist or which entities will
