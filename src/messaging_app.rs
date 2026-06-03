@@ -22,6 +22,7 @@ use crate::runner_host::OperatorContext;
 pub struct AppPackInfo {
     pub pack_id: String,
     pub flows: Vec<AppFlowInfo>,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -171,7 +172,12 @@ pub fn load_app_pack_info(pack_path: &Path) -> Result<AppPackInfo> {
     let pack_id = extract_text_or_symbol(&value, "pack_id", "pack_ids")
         .ok_or_else(|| anyhow::anyhow!("pack manifest missing pack id in {pack_path:?}"))?;
     let flows = extract_flows(&value);
-    Ok(AppPackInfo { pack_id, flows })
+    let capabilities = extract_capabilities(&value);
+    Ok(AppPackInfo {
+        pack_id,
+        flows,
+        capabilities,
+    })
 }
 
 pub fn select_app_flow(info: &AppPackInfo) -> Result<&AppFlowInfo> {
@@ -390,6 +396,59 @@ fn extract_flows(value: &CborValue) -> Vec<AppFlowInfo> {
         }
     }
     flows
+}
+
+/// Reads the pack manifest's `capabilities: Vec<ComponentCapability>` and
+/// returns each entry's `name`. The canonical encoder symbol-indexes the
+/// name as a `u32` into `symbols.capability_names`, so we resolve through
+/// that table when the inline value is an integer; an inline text name is
+/// also accepted for non-canonical encodings.
+fn extract_capabilities(value: &CborValue) -> Vec<String> {
+    let mut caps = Vec::new();
+    let CborValue::Map(map) = value else {
+        return caps;
+    };
+    let entries = match map.get(&CborValue::Text("capabilities".to_string())) {
+        Some(CborValue::Array(entries)) => entries,
+        _ => return caps,
+    };
+    let cap_names_table = symbol_table_array(map, "capability_names");
+    for entry in entries {
+        if let CborValue::Map(entry_map) = entry
+            && let Some(name) = resolve_capability_name(entry_map, cap_names_table)
+        {
+            caps.push(name);
+        }
+    }
+    caps
+}
+
+fn resolve_capability_name(
+    entry_map: &BTreeMap<CborValue, CborValue>,
+    cap_names_table: Option<&Vec<CborValue>>,
+) -> Option<String> {
+    match entry_map.get(&CborValue::Text("name".to_string()))? {
+        CborValue::Text(text) => Some(text.clone()),
+        CborValue::Integer(idx) => match cap_names_table?.get(*idx as usize)? {
+            CborValue::Text(resolved) => Some(resolved.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn symbol_table_array<'a>(
+    manifest_map: &'a BTreeMap<CborValue, CborValue>,
+    table: &str,
+) -> Option<&'a Vec<CborValue>> {
+    let symbols = manifest_map.get(&CborValue::Text("symbols".to_string()))?;
+    let CborValue::Map(sym_map) = symbols else {
+        return None;
+    };
+    match sym_map.get(&CborValue::Text(table.to_string())) {
+        Some(CborValue::Array(arr)) => Some(arr),
+        _ => None,
+    }
 }
 
 fn parse_flow_entry(value: &CborValue) -> Option<AppFlowInfo> {
@@ -1266,6 +1325,7 @@ mod tests {
                     kind: "workflow".to_string(),
                 },
             ],
+            capabilities: Vec::new(),
         };
         assert_eq!(select_app_flow(&info).expect("default flow").id, "default");
 
@@ -1281,6 +1341,7 @@ mod tests {
                     kind: "setup".to_string(),
                 },
             ],
+            capabilities: Vec::new(),
         };
         assert_eq!(
             select_app_flow(&single_messaging)
@@ -1304,6 +1365,7 @@ mod tests {
                     kind: "messaging".to_string(),
                 },
             ],
+            capabilities: Vec::new(),
         };
 
         let err = select_app_flow(&info).expect_err("ambiguous flow should fail");
@@ -1354,6 +1416,183 @@ mod tests {
                 .expect("default kind flow")
                 .kind,
             "messaging"
+        );
+    }
+
+    #[test]
+    fn extract_capabilities_reads_name_from_component_capability_entries() {
+        // Mirrors greentic_types::ComponentCapability { name, description } —
+        // the cbor for `capabilities` is Array<Map>, not Array<Text>.
+        let manifest = CborValue::Map(BTreeMap::from([(
+            CborValue::Text("capabilities".to_string()),
+            CborValue::Array(vec![
+                CborValue::Map(BTreeMap::from([
+                    cbor_text("name", "greentic.cap.fast2flow.v1"),
+                    cbor_text("description", "routable flows"),
+                ])),
+                CborValue::Map(BTreeMap::from([cbor_text("name", "greentic.cap.other.v1")])),
+            ]),
+        )]));
+        assert_eq!(
+            extract_capabilities(&manifest),
+            vec![
+                "greentic.cap.fast2flow.v1".to_string(),
+                "greentic.cap.other.v1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_capabilities_skips_entries_without_name_or_wrong_shape() {
+        // Bare strings and name-less maps must not surface as capabilities;
+        // returning silently keeps the gate fail-closed for malformed packs.
+        let manifest = CborValue::Map(BTreeMap::from([(
+            CborValue::Text("capabilities".to_string()),
+            CborValue::Array(vec![
+                CborValue::Map(BTreeMap::from([cbor_text("name", "greentic.cap.ok.v1")])),
+                CborValue::Map(BTreeMap::from([cbor_text("description", "no name")])),
+                CborValue::Text("legacy flat string".to_string()),
+            ]),
+        )]));
+        assert_eq!(
+            extract_capabilities(&manifest),
+            vec!["greentic.cap.ok.v1".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_capabilities_returns_empty_when_field_missing() {
+        let manifest = CborValue::Map(BTreeMap::from([cbor_text("pack_id", "demo-pack")]));
+        assert!(extract_capabilities(&manifest).is_empty());
+    }
+
+    #[test]
+    fn extract_capabilities_resolves_symbol_indexed_names() {
+        // Canonical EncodedCapability { name: u32, .. } references
+        // symbols.capability_names[idx] — what packc + greentic-types emit.
+        let manifest = CborValue::Map(BTreeMap::from([
+            (
+                CborValue::Text("symbols".to_string()),
+                CborValue::Map(BTreeMap::from([(
+                    CborValue::Text("capability_names".to_string()),
+                    CborValue::Array(vec![
+                        CborValue::Text("greentic.cap.fast2flow.v1".to_string()),
+                        CborValue::Text("greentic.cap.other.v1".to_string()),
+                    ]),
+                )])),
+            ),
+            (
+                CborValue::Text("capabilities".to_string()),
+                CborValue::Array(vec![
+                    CborValue::Map(BTreeMap::from([
+                        (CborValue::Text("name".to_string()), CborValue::Integer(0)),
+                        cbor_text("description", "fast2flow opt-in"),
+                    ])),
+                    CborValue::Map(BTreeMap::from([(
+                        CborValue::Text("name".to_string()),
+                        CborValue::Integer(1),
+                    )])),
+                ]),
+            ),
+        ]));
+        assert_eq!(
+            extract_capabilities(&manifest),
+            vec![
+                "greentic.cap.fast2flow.v1".to_string(),
+                "greentic.cap.other.v1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_capabilities_skips_out_of_range_symbol_indices() {
+        let manifest = CborValue::Map(BTreeMap::from([
+            (
+                CborValue::Text("symbols".to_string()),
+                CborValue::Map(BTreeMap::from([(
+                    CborValue::Text("capability_names".to_string()),
+                    CborValue::Array(vec![CborValue::Text("only-one".to_string())]),
+                )])),
+            ),
+            (
+                CborValue::Text("capabilities".to_string()),
+                CborValue::Array(vec![CborValue::Map(BTreeMap::from([(
+                    CborValue::Text("name".to_string()),
+                    CborValue::Integer(99),
+                )]))]),
+            ),
+        ]));
+        assert!(extract_capabilities(&manifest).is_empty());
+    }
+
+    /// End-to-end round-trip: build a real `PackManifest` with our
+    /// capability, encode via `greentic_types::encode_pack_manifest` (the
+    /// canonical encoder that symbol-indexes the name), zip into a
+    /// `.gtpack`, then `load_app_pack_info` and assert detection.
+    #[test]
+    fn load_app_pack_info_detects_fast2flow_capability_via_canonical_encoding() {
+        use greentic_types::pack_manifest::{
+            ComponentCapability, PackFlowEntry, PackKind, PackManifest, PackSignatures,
+        };
+        use greentic_types::{Flow, FlowId, FlowKind, PackId, encode_pack_manifest};
+        use semver::Version;
+        use tempfile::tempdir;
+        use zip::write::FileOptions;
+
+        let flow = Flow {
+            schema_version: "flow-v1".to_string(),
+            id: FlowId::new("main").expect("flow id"),
+            kind: FlowKind::Messaging,
+            entrypoints: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                serde_json::Value::Null,
+            )]),
+            nodes: Default::default(),
+            metadata: Default::default(),
+        };
+        let manifest = PackManifest {
+            schema_version: "pack-v1".into(),
+            pack_id: PackId::new("greentic.test.fast2flow").expect("pack id"),
+            name: Some("fast2flow-test".into()),
+            version: Version::parse("0.1.0").expect("version"),
+            kind: PackKind::Application,
+            publisher: "test".into(),
+            components: Vec::new(),
+            flows: vec![PackFlowEntry {
+                id: FlowId::new("main").expect("flow id"),
+                kind: FlowKind::Messaging,
+                flow,
+                tags: vec!["default".to_string()],
+                entrypoints: vec!["default".to_string()],
+            }],
+            dependencies: Vec::new(),
+            capabilities: vec![ComponentCapability {
+                name: "greentic.cap.fast2flow.v1".to_string(),
+                description: Some("test fixture".to_string()),
+            }],
+            secret_requirements: Vec::new(),
+            signatures: PackSignatures::default(),
+            bootstrap: None,
+            extensions: None,
+        };
+        let cbor_bytes = encode_pack_manifest(&manifest).expect("encode manifest");
+
+        let dir = tempdir().expect("tempdir");
+        let pack_path = dir.path().join("test.gtpack");
+        let file = std::fs::File::create(&pack_path).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .expect("start file");
+        zip.write_all(&cbor_bytes).expect("write manifest");
+        zip.finish().expect("finish pack");
+
+        let info = load_app_pack_info(&pack_path).expect("load pack info");
+        assert_eq!(info.pack_id, "greentic.test.fast2flow");
+        assert!(
+            info.capabilities
+                .contains(&"greentic.cap.fast2flow.v1".to_string()),
+            "expected fast2flow capability via canonical encoding, got {:?}",
+            info.capabilities
         );
     }
 
