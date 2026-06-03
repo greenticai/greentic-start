@@ -2111,6 +2111,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn admit_classifies_synthesized_webhook_for_root_bound_deployment() {
+        // Regression guard: a root-bound deployment (empty `path_prefixes`)
+        // owning an `ingest_http` provider must still classify
+        // `POST /webhook/<provider>` as `ProviderRoute`. An earlier draft of
+        // synthesis short-circuited on empty prefixes, which silently dropped
+        // the gate and let public webhook POSTs fall through to generic flow
+        // serving.
+        let scope = test_scope();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack_path = dir.path().join("telegram.gtpack");
+        crate::http_routes::tests::write_provider_pack(
+            &pack_path,
+            "telegram-pack",
+            "messaging.telegram.bot",
+            &["ingest_http"],
+        );
+
+        let descriptors = crate::http_routes::synthesize_provider_ingest_routes(
+            &[pack_path],
+            &scope,
+            &[], // root-bound deployment
+        );
+        assert_eq!(descriptors.len(), 1, "root-bound synthesis emits one route");
+        let table = HttpRouteTable::from_descriptors(descriptors);
+
+        assert_eq!(
+            admit_request(&table, &scope, "/webhook/telegram", &hyper::Method::POST),
+            Admission::ProviderRoute,
+        );
+    }
+
     fn envelope_for(user: &str, conversation: &str) -> IngressEnvelope {
         IngressEnvelope {
             tenant: "acme".into(),

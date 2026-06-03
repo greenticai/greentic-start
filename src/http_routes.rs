@@ -10,13 +10,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use greentic_deploy_spec::{BundleId, DeploymentId, RevisionId};
-use greentic_types::{ExtensionInline, decode_pack_manifest};
+use greentic_types::{ExtensionInline, PackManifest, decode_pack_manifest};
 use serde::Deserialize;
 use zip::ZipArchive;
 
 use crate::domains::{self, Domain};
 
 pub const EXT_HTTP_ROUTES_V1: &str = "greentic.http-routes.v1";
+
+/// Op name a provider component must export to be eligible for synthesized
+/// webhook ingress routes (see [`synthesize_provider_ingest_routes`]).
+pub const INGEST_HTTP_OP: &str = "ingest_http";
 
 /// Deployment provenance of a route. Present only for routes discovered from a
 /// materialized runtime-config (multi-revision deployments, produced in B4).
@@ -41,6 +45,13 @@ pub struct HttpRouteDescriptor {
     /// dispatch layer needs to call a non-default operation on the provider.
     #[allow(dead_code)]
     pub provider_op: String,
+    /// The provider's `provider_type` (e.g. `messaging.telegram.bot`) when the
+    /// route was synthesized from `greentic.provider-extension.v1`. The
+    /// dispatch layer uses it to resolve the provider binding by type within
+    /// the revision's runtime. `None` for routes discovered via the legacy
+    /// `greentic.http-routes.v1` extension, which name no provider.
+    #[allow(dead_code)]
+    pub provider_type: Option<String>,
     pub domain: Domain,
     /// Deployment/bundle/revision this route belongs to, or `None` for a
     /// legacy single-bundle route (every route discovered today).
@@ -84,7 +95,8 @@ pub(crate) fn descriptor_for_test(
         pack_id: "test-pack".to_string(),
         pattern: pattern.to_string(),
         methods: methods.iter().map(|m| m.to_string()).collect(),
-        provider_op: "ingest_http".to_string(),
+        provider_op: INGEST_HTTP_OP.to_string(),
+        provider_type: None,
         domain,
         scope,
         segments: parse_route_pattern(pattern),
@@ -322,14 +334,15 @@ pub fn discover_http_routes_from_bundle(
     Ok(discover_routes_from_packs(&pack_paths, None))
 }
 
-/// Discover HTTP routes from a revision's pinned pack files, stamping each with
-/// the revision's [`RevisionScope`].
+/// Discover declared-only HTTP routes from a revision's pinned pack files,
+/// stamping each with the revision's [`RevisionScope`].
 ///
-/// A revision is a set of pinned `.gtpack` files (not a bundle directory), so
-/// this takes explicit pack paths and reuses the same per-pack manifest reader
-/// as [`discover_http_routes_from_bundle`]. The scope makes the resulting
-/// descriptors matchable via [`HttpRouteTable::match_request_for_revision`].
-pub fn discover_revision_http_routes(
+/// Test-only since production discovery goes through [`discover_revision_routes`]
+/// which fans out into both declared and synthesized routes in a single per-pack
+/// manifest read. Kept here so the declared-route extractor remains directly
+/// testable.
+#[cfg(test)]
+pub(crate) fn discover_revision_http_routes(
     pack_paths: &[PathBuf],
     scope: &RevisionScope,
 ) -> Vec<HttpRouteDescriptor> {
@@ -371,7 +384,10 @@ fn discover_routes_from_packs(
     routes
 }
 
-fn read_pack_http_routes(pack_path: &Path) -> anyhow::Result<Option<Vec<HttpRouteDescriptor>>> {
+/// Open one `.gtpack`, read `manifest.cbor`, and decode it. The single
+/// IO+decode site every per-pack reader funnels through, so a pack is opened
+/// at most once per discovery pass.
+fn read_pack_manifest(pack_path: &Path) -> anyhow::Result<PackManifest> {
     let file = std::fs::File::open(pack_path)?;
     let mut archive = ZipArchive::new(file)?;
     let mut manifest_entry = archive.by_name("manifest.cbor").map_err(|err| {
@@ -382,17 +398,26 @@ fn read_pack_http_routes(pack_path: &Path) -> anyhow::Result<Option<Vec<HttpRout
     })?;
     let mut bytes = Vec::new();
     manifest_entry.read_to_end(&mut bytes)?;
-    let manifest = decode_pack_manifest(&bytes)
-        .with_context(|| format!("failed to decode pack manifest in {}", pack_path.display()))?;
-    let extensions = match manifest.extensions.as_ref() {
-        Some(ext) => ext,
-        None => return Ok(None),
-    };
+    decode_pack_manifest(&bytes)
+        .with_context(|| format!("failed to decode pack manifest in {}", pack_path.display()))
+}
 
-    if let Some(extension) = extensions.get(EXT_HTTP_ROUTES_V1) {
-        return parse_http_routes_v1(extension, manifest.pack_id.as_str(), pack_path);
-    }
-    Ok(None)
+fn read_pack_http_routes(pack_path: &Path) -> anyhow::Result<Option<Vec<HttpRouteDescriptor>>> {
+    let manifest = read_pack_manifest(pack_path)?;
+    http_routes_from_manifest(&manifest, pack_path)
+}
+
+fn http_routes_from_manifest(
+    manifest: &PackManifest,
+    pack_path: &Path,
+) -> anyhow::Result<Option<Vec<HttpRouteDescriptor>>> {
+    let Some(extensions) = manifest.extensions.as_ref() else {
+        return Ok(None);
+    };
+    let Some(extension) = extensions.get(EXT_HTTP_ROUTES_V1) else {
+        return Ok(None);
+    };
+    parse_http_routes_v1(extension, manifest.pack_id.as_str(), pack_path)
 }
 
 fn parse_http_routes_v1(
@@ -434,6 +459,7 @@ fn parse_http_routes_v1(
             pattern: record.pattern,
             methods: record.methods,
             provider_op: record.provider_op,
+            provider_type: None,
             domain,
             // Single-bundle discovery: no deployment provenance. B4's
             // runtime-config-backed discovery stamps `Some(..)`.
@@ -464,10 +490,214 @@ fn collect_runtime_pack_paths(bundle_root: &Path) -> anyhow::Result<Vec<PathBuf>
     Ok(seen.into_values().collect())
 }
 
+// ── Provider-ingress synthesis ──────────────────────────────────────────────
+//
+// Packs declaring `greentic.provider-extension.v1` providers whose `ops`
+// include `ingest_http` get a webhook route synthesized for them — one per
+// `(provider, deployment-prefix)` pair. The URL convention is
+// `<prefix>/webhook/<provider-name>` (POST), where `<provider-name>` is
+// derived from `provider_type` by stripping a leading `messaging.` and any
+// trailing kind suffix (`.bot`, `.graph`, `.client`, …) → `telegram`, `teams`,
+// `slack`, etc.
+//
+// This is intentionally separate from the `greentic.http-routes.v1` reader:
+// the two extensions coexist, the http-routes reader skips packs that only
+// declare a provider, and vice versa.
+
+/// Synthesize webhook ingress routes for any provider in the given packs whose
+/// `greentic.provider-extension.v1` declaration includes the `ingest_http` op.
+///
+/// One descriptor is emitted per (`ingest_http` provider, `path_prefix`) pair.
+/// Each descriptor is stamped with `scope` so it matches only inside the
+/// owning deployment via [`HttpRouteTable::match_request_for_revision`].
+///
+/// Packs that don't declare a provider extension, or whose providers don't
+/// expose `ingest_http`, are skipped silently. Unreadable packs emit a
+/// warning and are skipped (same posture as
+/// [`discover_revision_http_routes`]).
+///
+/// An empty `path_prefixes` slice is treated as a single root binding ("") —
+/// the same contract `DeploymentRouteTable` uses (an empty list matches any
+/// path at the lowest specificity). Without this, a root-bound deployment's
+/// `POST /webhook/<provider>` would skip the `ProviderRoute` admission gate
+/// and fall through to generic-flow serving, defeating the purpose of the
+/// gate.
+/// Synthesize provider-ingest routes only. Test-only — production goes through
+/// [`discover_revision_routes`] which fans out into both declared and
+/// synthesized routes in a single per-pack manifest read.
+#[cfg(test)]
+pub(crate) fn synthesize_provider_ingest_routes(
+    pack_paths: &[PathBuf],
+    scope: &RevisionScope,
+    path_prefixes: &[String],
+) -> Vec<HttpRouteDescriptor> {
+    let root_fallback = [String::new()];
+    let prefixes: &[String] = if path_prefixes.is_empty() {
+        &root_fallback
+    } else {
+        path_prefixes
+    };
+    let mut routes = Vec::new();
+    for pack_path in pack_paths {
+        let manifest = match read_pack_manifest(pack_path) {
+            Ok(m) => m,
+            Err(err) => {
+                crate::operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "failed to read manifest from {}: {err:#}",
+                        pack_path.display()
+                    ),
+                );
+                continue;
+            }
+        };
+        routes.extend(synthesize_provider_routes_from_manifest(
+            &manifest, pack_path, scope, prefixes,
+        ));
+    }
+    routes
+}
+
+fn synthesize_provider_routes_from_manifest(
+    manifest: &PackManifest,
+    pack_path: &Path,
+    scope: &RevisionScope,
+    prefixes: &[String],
+) -> Vec<HttpRouteDescriptor> {
+    let Some(inline) = manifest.provider_extension_inline() else {
+        return Vec::new();
+    };
+    let pack_id = manifest.pack_id.as_str();
+    let mut routes = Vec::new();
+    for provider in &inline.providers {
+        if !provider.ops.iter().any(|op| op == INGEST_HTTP_OP) {
+            continue;
+        }
+        let Some(name) = derive_provider_name(&provider.provider_type) else {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "skipping ingest_http route synthesis for {}: cannot derive a \
+                     provider-name from provider_type `{}`",
+                    pack_path.display(),
+                    provider.provider_type,
+                ),
+            );
+            continue;
+        };
+        for prefix in prefixes {
+            let pattern = build_webhook_pattern(prefix, &name);
+            let segments = parse_route_pattern(&pattern);
+            routes.push(HttpRouteDescriptor {
+                route_id: format!("{pack_id}:provider-webhook:{name}@{prefix}"),
+                pack_id: pack_id.to_string(),
+                pattern,
+                methods: vec!["POST".to_string()],
+                provider_op: INGEST_HTTP_OP.to_string(),
+                provider_type: Some(provider.provider_type.clone()),
+                domain: Domain::Messaging,
+                scope: Some(scope.clone()),
+                segments,
+            });
+        }
+    }
+    routes
+}
+
+/// Single-pass discovery used at revision activation: opens each pack ONCE,
+/// reads its manifest ONCE, and produces both declared (`greentic.http-routes.v1`)
+/// and synthesized (`greentic.provider-extension.v1` + `ingest_http`) routes.
+/// Replaces back-to-back calls to [`discover_revision_http_routes`] +
+/// [`synthesize_provider_ingest_routes`] (which would each open every pack
+/// independently).
+pub fn discover_revision_routes(
+    pack_paths: &[PathBuf],
+    scope: &RevisionScope,
+    path_prefixes: &[String],
+) -> Vec<HttpRouteDescriptor> {
+    let root_fallback = [String::new()];
+    let prefixes: &[String] = if path_prefixes.is_empty() {
+        &root_fallback
+    } else {
+        path_prefixes
+    };
+    let mut routes = Vec::new();
+    for pack_path in pack_paths {
+        let manifest = match read_pack_manifest(pack_path) {
+            Ok(m) => m,
+            Err(err) => {
+                crate::operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "failed to read manifest from {}: {err:#}",
+                        pack_path.display()
+                    ),
+                );
+                continue;
+            }
+        };
+        match http_routes_from_manifest(&manifest, pack_path) {
+            Ok(Some(mut declared)) => {
+                for route in &mut declared {
+                    route.scope = Some(scope.clone());
+                }
+                routes.extend(declared);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                crate::operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "failed to read http-routes from {}: {err:#}",
+                        pack_path.display()
+                    ),
+                );
+            }
+        }
+        routes.extend(synthesize_provider_routes_from_manifest(
+            &manifest, pack_path, scope, prefixes,
+        ));
+    }
+    routes
+}
+
+/// Derive a URL-safe provider-name from a `provider_type` like
+/// `messaging.telegram.bot` → `telegram`. The leading `messaging.` is stripped
+/// when present, then the trailing kind suffix (`bot`, `graph`, `client`,
+/// `gui`, `webhook`) is dropped if there is more than one segment remaining.
+/// Returns `None` for unrecognizable shapes (empty, no dots after stripping).
+fn derive_provider_name(provider_type: &str) -> Option<String> {
+    let trimmed = provider_type
+        .strip_prefix("messaging.")
+        .unwrap_or(provider_type);
+    let mut parts: Vec<&str> = trimmed.split('.').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    if parts.len() > 1 {
+        let last = *parts.last().unwrap();
+        if matches!(last, "bot" | "graph" | "client" | "gui" | "webhook") {
+            parts.pop();
+        }
+    }
+    let name = parts.join("-").to_ascii_lowercase();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+fn build_webhook_pattern(prefix: &str, name: &str) -> String {
+    let trimmed = prefix.trim_matches('/');
+    if trimmed.is_empty() {
+        format!("/webhook/{name}")
+    } else {
+        format!("/{trimmed}/webhook/{name}")
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn make_route(pattern: &str, methods: &[&str], domain: Domain) -> HttpRouteDescriptor {
@@ -824,5 +1054,292 @@ mod tests {
         };
         let routes = discover_revision_http_routes(&[bad, missing], &scope);
         assert!(routes.is_empty(), "unreadable packs yield no routes");
+    }
+
+    // ── Provider-ingress synthesis tests ───────────────────────────────────
+
+    #[test]
+    fn derive_provider_name_strips_messaging_prefix_and_kind_suffix() {
+        assert_eq!(
+            derive_provider_name("messaging.telegram.bot").as_deref(),
+            Some("telegram")
+        );
+        assert_eq!(
+            derive_provider_name("messaging.teams.graph").as_deref(),
+            Some("teams")
+        );
+        assert_eq!(
+            derive_provider_name("messaging.slack.client").as_deref(),
+            Some("slack")
+        );
+        assert_eq!(
+            derive_provider_name("messaging.webchat.gui").as_deref(),
+            Some("webchat")
+        );
+    }
+
+    #[test]
+    fn derive_provider_name_preserves_unknown_shapes() {
+        // No `messaging.` prefix, no kind suffix → use the whole thing.
+        assert_eq!(
+            derive_provider_name("events.timer").as_deref(),
+            Some("events-timer")
+        );
+        // Only one segment after stripping → keep it, even if it's a kind name.
+        assert_eq!(
+            derive_provider_name("messaging.bot").as_deref(),
+            Some("bot")
+        );
+        // Empty + degenerate inputs.
+        assert!(derive_provider_name("").is_none());
+        assert!(derive_provider_name(".").is_none());
+        assert!(derive_provider_name("messaging.").is_none());
+    }
+
+    #[test]
+    fn build_webhook_pattern_handles_prefix_variants() {
+        assert_eq!(
+            build_webhook_pattern("/bot", "telegram"),
+            "/bot/webhook/telegram"
+        );
+        assert_eq!(
+            build_webhook_pattern("bot", "telegram"),
+            "/bot/webhook/telegram"
+        );
+        assert_eq!(
+            build_webhook_pattern("/bot/", "telegram"),
+            "/bot/webhook/telegram"
+        );
+        assert_eq!(build_webhook_pattern("/", "telegram"), "/webhook/telegram");
+        assert_eq!(build_webhook_pattern("", "telegram"), "/webhook/telegram");
+        assert_eq!(
+            build_webhook_pattern("/api/v1", "teams"),
+            "/api/v1/webhook/teams"
+        );
+    }
+
+    /// Write a minimal `.gtpack` whose manifest declares a single provider via
+    /// `greentic.provider-extension.v1`. `ops` controls whether the provider
+    /// exposes `ingest_http` (and is therefore eligible for webhook
+    /// synthesis). `pub(crate)` so the revision_serve tests share this fixture
+    /// instead of duplicating the manifest shape.
+    pub(crate) fn write_provider_pack(
+        path: &Path,
+        pack_id: &str,
+        provider_type: &str,
+        ops: &[&str],
+    ) {
+        use std::io::Write as _;
+        use zip::write::FileOptions;
+
+        let manifest_json = serde_json::json!({
+            "schema_version": "1.0.0",
+            "pack_id": pack_id,
+            "version": "1.0.0",
+            "kind": "provider",
+            "publisher": "tests",
+            "extensions": {
+                greentic_types::PROVIDER_EXTENSION_ID: {
+                    "kind": greentic_types::PROVIDER_EXTENSION_ID,
+                    "version": "1.0.0",
+                    "inline": {
+                        "providers": [{
+                            "provider_type": provider_type,
+                            "capabilities": [],
+                            "ops": ops,
+                            "config_schema_ref": "config.schema.json",
+                            "runtime": {
+                                "component_ref": format!("{pack_id}-component"),
+                                "export": "schema-core-api",
+                                "world": "greentic:provider/schema-core@1.0.0"
+                            }
+                        }]
+                    }
+                }
+            }
+        });
+        let manifest: greentic_types::PackManifest =
+            serde_json::from_value(manifest_json).expect("manifest deserializes");
+        let bytes = greentic_types::encode_pack_manifest(&manifest).expect("manifest encodes");
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .unwrap();
+        zip.write_all(&bytes).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn synthesize_provider_routes_for_ingest_http_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("telegram.gtpack");
+        write_provider_pack(
+            &pack,
+            "telegram-pack",
+            "messaging.telegram.bot",
+            &["ingest_http"],
+        );
+
+        let scope = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let routes = synthesize_provider_ingest_routes(&[pack], &scope, &["/bot".to_string()]);
+        assert_eq!(
+            routes.len(),
+            1,
+            "one prefix × one ingest_http provider = one route"
+        );
+        let route = &routes[0];
+        assert_eq!(route.pattern, "/bot/webhook/telegram");
+        assert_eq!(route.methods, vec!["POST".to_string()]);
+        assert_eq!(route.provider_op, INGEST_HTTP_OP);
+        assert_eq!(
+            route.provider_type.as_deref(),
+            Some("messaging.telegram.bot")
+        );
+        let stamped = route.scope.as_ref().expect("scope stamped");
+        assert_eq!(stamped.deployment_id, scope.deployment_id);
+        assert_eq!(stamped.revision_id, scope.revision_id);
+    }
+
+    #[test]
+    fn synthesize_provider_routes_skips_providers_without_ingest_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("egress-only.gtpack");
+        write_provider_pack(&pack, "egress-only", "messaging.email.smtp", &["send"]);
+
+        let scope = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let routes = synthesize_provider_ingest_routes(&[pack], &scope, &["/bot".to_string()]);
+        assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn synthesize_provider_routes_emits_one_per_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("telegram.gtpack");
+        write_provider_pack(
+            &pack,
+            "telegram-pack",
+            "messaging.telegram.bot",
+            &["ingest_http"],
+        );
+
+        let scope = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let routes = synthesize_provider_ingest_routes(
+            &[pack],
+            &scope,
+            &["/bot".to_string(), "/api/bot".to_string()],
+        );
+        let patterns: Vec<&str> = routes.iter().map(|r| r.pattern.as_str()).collect();
+        assert_eq!(
+            patterns,
+            vec!["/bot/webhook/telegram", "/api/bot/webhook/telegram"]
+        );
+    }
+
+    #[test]
+    fn synthesize_provider_routes_empty_prefixes_mounts_at_root() {
+        // Mirrors `DeploymentRouteTable`'s "empty = match any path" contract.
+        // Without root-prefix synthesis a `POST /webhook/<provider>` to a
+        // root-bound deployment would skip the `ProviderRoute` admission gate
+        // and fall through to generic flow serving — defeating the gate.
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("telegram.gtpack");
+        write_provider_pack(
+            &pack,
+            "telegram-pack",
+            "messaging.telegram.bot",
+            &["ingest_http"],
+        );
+
+        let scope = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let routes = synthesize_provider_ingest_routes(&[pack], &scope, &[]);
+        assert_eq!(
+            routes.len(),
+            1,
+            "empty prefixes treated as a single root binding"
+        );
+        assert_eq!(routes[0].pattern, "/webhook/telegram");
+        assert_eq!(routes[0].methods, vec!["POST".to_string()]);
+
+        let table = HttpRouteTable::from_descriptors(routes);
+        assert!(
+            table
+                .match_request_for_revision("/webhook/telegram", "POST", &scope)
+                .is_some(),
+            "root-bound synthesized route must match /webhook/<name>"
+        );
+    }
+
+    #[test]
+    fn synthesize_provider_routes_skips_unreadable_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("garbage.gtpack");
+        std::fs::write(&bad, b"not a zip").unwrap();
+        let missing = dir.path().join("absent.gtpack");
+
+        let scope = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let routes =
+            synthesize_provider_ingest_routes(&[bad, missing], &scope, &["/bot".to_string()]);
+        assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn synthesized_route_matches_only_inside_its_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("telegram.gtpack");
+        write_provider_pack(
+            &pack,
+            "telegram-pack",
+            "messaging.telegram.bot",
+            &["ingest_http"],
+        );
+
+        let scope_a = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("a"),
+            revision_id: RevisionId::new(),
+        };
+        let scope_b = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("b"),
+            revision_id: RevisionId::new(),
+        };
+        let routes = synthesize_provider_ingest_routes(&[pack], &scope_a, &["/bot".to_string()]);
+        let table = HttpRouteTable::from_descriptors(routes);
+        assert!(
+            table
+                .match_request_for_revision("/bot/webhook/telegram", "POST", &scope_a)
+                .is_some()
+        );
+        assert!(
+            table
+                .match_request_for_revision("/bot/webhook/telegram", "POST", &scope_b)
+                .is_none()
+        );
+        // Legacy (unscoped) matcher must never see a synthesized route.
+        assert!(
+            table
+                .match_request("/bot/webhook/telegram", "POST")
+                .is_none()
+        );
     }
 }
