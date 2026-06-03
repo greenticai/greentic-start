@@ -46,8 +46,7 @@ use greentic_runner_host::{HostBuilder, HostConfig, RunnerHost, TenantBindings};
 use crate::deployment_routes::{DeploymentRouteTable, RevisionIngressRouting};
 use crate::endpoint_admit::EndpointAdmit;
 use crate::http_routes::{
-    HttpRouteDescriptor, HttpRouteTable, RevisionScope, discover_revision_http_routes,
-    synthesize_provider_ingest_routes,
+    HttpRouteDescriptor, HttpRouteTable, RevisionScope, discover_revision_routes,
 };
 use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig, parse_ulid};
 use crate::runtime_config::{LoadedRuntimeConfig, env_dir_in};
@@ -212,20 +211,19 @@ pub(crate) async fn activate_runtime_config(
                 format!("reading pinned packs for revision `{}`", block.revision_id)
             })?;
 
-        // Discover this revision's pack-declared HTTP routes and stamp them with
-        // its scope. Done before `load_revision` consumes `bundle_id`.
+        // Discover this revision's HTTP routes in a single per-pack manifest
+        // read: declared (`greentic.http-routes.v1`) AND synthesized provider
+        // webhooks (`greentic.provider-extension.v1` with `ingest_http`,
+        // mounted under each of the deployment's path prefixes as
+        // `<prefix>/webhook/<provider-name>`). Done before `load_revision`
+        // consumes `bundle_id`.
         let scope = RevisionScope {
             deployment_id,
             bundle_id: bundle_id.clone(),
             revision_id,
         };
         let pack_paths: Vec<PathBuf> = pack_refs.iter().map(|r| r.path.clone()).collect();
-        scoped_routes.extend(discover_revision_http_routes(&pack_paths, &scope));
-        // Phase D.1 — synthesize a webhook ingress route for every provider that
-        // exports `ingest_http`, mounted under each of the deployment's bound
-        // path prefixes (`<prefix>/webhook/<provider-name>`). Same scope stamp
-        // as the declared routes above, so they share `match_request_for_revision`.
-        scoped_routes.extend(synthesize_provider_ingest_routes(
+        scoped_routes.extend(discover_revision_routes(
             &pack_paths,
             &scope,
             &meta.path_prefixes,

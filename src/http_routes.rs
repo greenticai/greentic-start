@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use greentic_deploy_spec::{BundleId, DeploymentId, RevisionId};
-use greentic_types::{
-    ExtensionInline, PROVIDER_EXTENSION_ID, ProviderExtensionInline, decode_pack_manifest,
-};
+use greentic_types::{ExtensionInline, PackManifest, decode_pack_manifest};
 use serde::Deserialize;
 use zip::ZipArchive;
 
@@ -336,14 +334,15 @@ pub fn discover_http_routes_from_bundle(
     Ok(discover_routes_from_packs(&pack_paths, None))
 }
 
-/// Discover HTTP routes from a revision's pinned pack files, stamping each with
-/// the revision's [`RevisionScope`].
+/// Discover declared-only HTTP routes from a revision's pinned pack files,
+/// stamping each with the revision's [`RevisionScope`].
 ///
-/// A revision is a set of pinned `.gtpack` files (not a bundle directory), so
-/// this takes explicit pack paths and reuses the same per-pack manifest reader
-/// as [`discover_http_routes_from_bundle`]. The scope makes the resulting
-/// descriptors matchable via [`HttpRouteTable::match_request_for_revision`].
-pub fn discover_revision_http_routes(
+/// Test-only since production discovery goes through [`discover_revision_routes`]
+/// which fans out into both declared and synthesized routes in a single per-pack
+/// manifest read. Kept here so the declared-route extractor remains directly
+/// testable.
+#[cfg(test)]
+pub(crate) fn discover_revision_http_routes(
     pack_paths: &[PathBuf],
     scope: &RevisionScope,
 ) -> Vec<HttpRouteDescriptor> {
@@ -385,7 +384,10 @@ fn discover_routes_from_packs(
     routes
 }
 
-fn read_pack_http_routes(pack_path: &Path) -> anyhow::Result<Option<Vec<HttpRouteDescriptor>>> {
+/// Open one `.gtpack`, read `manifest.cbor`, and decode it. The single
+/// IO+decode site every per-pack reader funnels through, so a pack is opened
+/// at most once per discovery pass.
+fn read_pack_manifest(pack_path: &Path) -> anyhow::Result<PackManifest> {
     let file = std::fs::File::open(pack_path)?;
     let mut archive = ZipArchive::new(file)?;
     let mut manifest_entry = archive.by_name("manifest.cbor").map_err(|err| {
@@ -396,17 +398,26 @@ fn read_pack_http_routes(pack_path: &Path) -> anyhow::Result<Option<Vec<HttpRout
     })?;
     let mut bytes = Vec::new();
     manifest_entry.read_to_end(&mut bytes)?;
-    let manifest = decode_pack_manifest(&bytes)
-        .with_context(|| format!("failed to decode pack manifest in {}", pack_path.display()))?;
-    let extensions = match manifest.extensions.as_ref() {
-        Some(ext) => ext,
-        None => return Ok(None),
-    };
+    decode_pack_manifest(&bytes)
+        .with_context(|| format!("failed to decode pack manifest in {}", pack_path.display()))
+}
 
-    if let Some(extension) = extensions.get(EXT_HTTP_ROUTES_V1) {
-        return parse_http_routes_v1(extension, manifest.pack_id.as_str(), pack_path);
-    }
-    Ok(None)
+fn read_pack_http_routes(pack_path: &Path) -> anyhow::Result<Option<Vec<HttpRouteDescriptor>>> {
+    let manifest = read_pack_manifest(pack_path)?;
+    http_routes_from_manifest(&manifest, pack_path)
+}
+
+fn http_routes_from_manifest(
+    manifest: &PackManifest,
+    pack_path: &Path,
+) -> anyhow::Result<Option<Vec<HttpRouteDescriptor>>> {
+    let Some(extensions) = manifest.extensions.as_ref() else {
+        return Ok(None);
+    };
+    let Some(extension) = extensions.get(EXT_HTTP_ROUTES_V1) else {
+        return Ok(None);
+    };
+    parse_http_routes_v1(extension, manifest.pack_id.as_str(), pack_path)
 }
 
 fn parse_http_routes_v1(
@@ -511,12 +522,16 @@ fn collect_runtime_pack_paths(bundle_root: &Path) -> anyhow::Result<Vec<PathBuf>
 /// `POST /webhook/<provider>` would skip the `ProviderRoute` admission gate
 /// and fall through to generic-flow serving, defeating the purpose of the
 /// gate.
-pub fn synthesize_provider_ingest_routes(
+/// Synthesize provider-ingest routes only. Test-only — production goes through
+/// [`discover_revision_routes`] which fans out into both declared and
+/// synthesized routes in a single per-pack manifest read.
+#[cfg(test)]
+pub(crate) fn synthesize_provider_ingest_routes(
     pack_paths: &[PathBuf],
     scope: &RevisionScope,
     path_prefixes: &[String],
 ) -> Vec<HttpRouteDescriptor> {
-    let root_fallback: [String; 1] = [String::new()];
+    let root_fallback = [String::new()];
     let prefixes: &[String] = if path_prefixes.is_empty() {
         &root_fallback
     } else {
@@ -524,89 +539,127 @@ pub fn synthesize_provider_ingest_routes(
     };
     let mut routes = Vec::new();
     for pack_path in pack_paths {
-        let (pack_id, inline) = match read_pack_provider_extension(pack_path) {
-            Ok(Some(pair)) => pair,
-            Ok(None) => continue,
+        let manifest = match read_pack_manifest(pack_path) {
+            Ok(m) => m,
             Err(err) => {
                 crate::operator_log::warn(
                     module_path!(),
                     format!(
-                        "failed to read provider extension from {}: {err:#}",
+                        "failed to read manifest from {}: {err:#}",
                         pack_path.display()
                     ),
                 );
                 continue;
             }
         };
+        routes.extend(synthesize_provider_routes_from_manifest(
+            &manifest, pack_path, scope, prefixes,
+        ));
+    }
+    routes
+}
 
-        for provider in &inline.providers {
-            if !provider.ops.iter().any(|op| op == INGEST_HTTP_OP) {
-                continue;
-            }
-            let Some(name) = derive_provider_name(&provider.provider_type) else {
-                crate::operator_log::warn(
-                    module_path!(),
-                    format!(
-                        "skipping ingest_http route synthesis for {}: cannot derive a \
-                         provider-name from provider_type `{}`",
-                        pack_path.display(),
-                        provider.provider_type,
-                    ),
-                );
-                continue;
-            };
-            for prefix in prefixes {
-                let pattern = build_webhook_pattern(prefix, &name);
-                let segments = parse_route_pattern(&pattern);
-                routes.push(HttpRouteDescriptor {
-                    route_id: format!("{pack_id}:provider-webhook:{name}@{prefix}"),
-                    pack_id: pack_id.clone(),
-                    pattern,
-                    methods: vec!["POST".to_string()],
-                    provider_op: INGEST_HTTP_OP.to_string(),
-                    provider_type: Some(provider.provider_type.clone()),
-                    domain: Domain::Messaging,
-                    scope: Some(scope.clone()),
-                    segments,
-                });
-            }
+fn synthesize_provider_routes_from_manifest(
+    manifest: &PackManifest,
+    pack_path: &Path,
+    scope: &RevisionScope,
+    prefixes: &[String],
+) -> Vec<HttpRouteDescriptor> {
+    let Some(inline) = manifest.provider_extension_inline() else {
+        return Vec::new();
+    };
+    let pack_id = manifest.pack_id.as_str();
+    let mut routes = Vec::new();
+    for provider in &inline.providers {
+        if !provider.ops.iter().any(|op| op == INGEST_HTTP_OP) {
+            continue;
+        }
+        let Some(name) = derive_provider_name(&provider.provider_type) else {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "skipping ingest_http route synthesis for {}: cannot derive a \
+                     provider-name from provider_type `{}`",
+                    pack_path.display(),
+                    provider.provider_type,
+                ),
+            );
+            continue;
+        };
+        for prefix in prefixes {
+            let pattern = build_webhook_pattern(prefix, &name);
+            let segments = parse_route_pattern(&pattern);
+            routes.push(HttpRouteDescriptor {
+                route_id: format!("{pack_id}:provider-webhook:{name}@{prefix}"),
+                pack_id: pack_id.to_string(),
+                pattern,
+                methods: vec!["POST".to_string()],
+                provider_op: INGEST_HTTP_OP.to_string(),
+                provider_type: Some(provider.provider_type.clone()),
+                domain: Domain::Messaging,
+                scope: Some(scope.clone()),
+                segments,
+            });
         }
     }
     routes
 }
 
-fn read_pack_provider_extension(
-    pack_path: &Path,
-) -> anyhow::Result<Option<(String, ProviderExtensionInline)>> {
-    let file = std::fs::File::open(pack_path)?;
-    let mut archive = ZipArchive::new(file)?;
-    let mut manifest_entry = archive.by_name("manifest.cbor").map_err(|err| {
-        anyhow::anyhow!(
-            "failed to open manifest.cbor in {}: {err}",
-            pack_path.display()
-        )
-    })?;
-    let mut bytes = Vec::new();
-    manifest_entry.read_to_end(&mut bytes)?;
-    let manifest = decode_pack_manifest(&bytes)
-        .with_context(|| format!("failed to decode pack manifest in {}", pack_path.display()))?;
-    let extensions = match manifest.extensions.as_ref() {
-        Some(ext) => ext,
-        None => return Ok(None),
+/// Single-pass discovery used at revision activation: opens each pack ONCE,
+/// reads its manifest ONCE, and produces both declared (`greentic.http-routes.v1`)
+/// and synthesized (`greentic.provider-extension.v1` + `ingest_http`) routes.
+/// Replaces back-to-back calls to [`discover_revision_http_routes`] +
+/// [`synthesize_provider_ingest_routes`] (which would each open every pack
+/// independently).
+pub fn discover_revision_routes(
+    pack_paths: &[PathBuf],
+    scope: &RevisionScope,
+    path_prefixes: &[String],
+) -> Vec<HttpRouteDescriptor> {
+    let root_fallback = [String::new()];
+    let prefixes: &[String] = if path_prefixes.is_empty() {
+        &root_fallback
+    } else {
+        path_prefixes
     };
-    let Some(extension) = extensions.get(PROVIDER_EXTENSION_ID) else {
-        return Ok(None);
-    };
-    let Some(inline) = extension.inline.as_ref() else {
-        return Ok(None);
-    };
-    let ExtensionInline::Provider(provider_inline) = inline else {
-        return Ok(None);
-    };
-    Ok(Some((
-        manifest.pack_id.as_str().to_string(),
-        provider_inline.clone(),
-    )))
+    let mut routes = Vec::new();
+    for pack_path in pack_paths {
+        let manifest = match read_pack_manifest(pack_path) {
+            Ok(m) => m,
+            Err(err) => {
+                crate::operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "failed to read manifest from {}: {err:#}",
+                        pack_path.display()
+                    ),
+                );
+                continue;
+            }
+        };
+        match http_routes_from_manifest(&manifest, pack_path) {
+            Ok(Some(mut declared)) => {
+                for route in &mut declared {
+                    route.scope = Some(scope.clone());
+                }
+                routes.extend(declared);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                crate::operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "failed to read http-routes from {}: {err:#}",
+                        pack_path.display()
+                    ),
+                );
+            }
+        }
+        routes.extend(synthesize_provider_routes_from_manifest(
+            &manifest, pack_path, scope, prefixes,
+        ));
+    }
+    routes
 }
 
 /// Derive a URL-safe provider-name from a `provider_type` like
@@ -644,7 +697,7 @@ fn build_webhook_pattern(prefix: &str, name: &str) -> String {
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn make_route(pattern: &str, methods: &[&str], domain: Domain) -> HttpRouteDescriptor {
@@ -1068,8 +1121,14 @@ mod tests {
     /// Write a minimal `.gtpack` whose manifest declares a single provider via
     /// `greentic.provider-extension.v1`. `ops` controls whether the provider
     /// exposes `ingest_http` (and is therefore eligible for webhook
-    /// synthesis).
-    fn write_provider_pack(path: &Path, pack_id: &str, provider_type: &str, ops: &[&str]) {
+    /// synthesis). `pub(crate)` so the revision_serve tests share this fixture
+    /// instead of duplicating the manifest shape.
+    pub(crate) fn write_provider_pack(
+        path: &Path,
+        pack_id: &str,
+        provider_type: &str,
+        ops: &[&str],
+    ) {
         use std::io::Write as _;
         use zip::write::FileOptions;
 
@@ -1080,8 +1139,8 @@ mod tests {
             "kind": "provider",
             "publisher": "tests",
             "extensions": {
-                PROVIDER_EXTENSION_ID: {
-                    "kind": PROVIDER_EXTENSION_ID,
+                greentic_types::PROVIDER_EXTENSION_ID: {
+                    "kind": greentic_types::PROVIDER_EXTENSION_ID,
                     "version": "1.0.0",
                     "inline": {
                         "providers": [{
