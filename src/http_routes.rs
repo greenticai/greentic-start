@@ -505,20 +505,23 @@ fn collect_runtime_pack_paths(bundle_root: &Path) -> anyhow::Result<Vec<PathBuf>
 /// warning and are skipped (same posture as
 /// [`discover_revision_http_routes`]).
 ///
-/// An empty `path_prefixes` slice yields no routes for this revision: the
-/// deployment hasn't claimed any URL space yet, so there is nowhere safe to
-/// mount a webhook. (`DeploymentRouteTable` treats empty as "match any path",
-/// but synthesizing a root-prefix `/webhook/<name>` for a deployment that
-/// declared no prefixes would steal that URL from any other deployment that
-/// later binds at `/`.)
+/// An empty `path_prefixes` slice is treated as a single root binding ("") —
+/// the same contract `DeploymentRouteTable` uses (an empty list matches any
+/// path at the lowest specificity). Without this, a root-bound deployment's
+/// `POST /webhook/<provider>` would skip the `ProviderRoute` admission gate
+/// and fall through to generic-flow serving, defeating the purpose of the
+/// gate.
 pub fn synthesize_provider_ingest_routes(
     pack_paths: &[PathBuf],
     scope: &RevisionScope,
     path_prefixes: &[String],
 ) -> Vec<HttpRouteDescriptor> {
-    if path_prefixes.is_empty() {
-        return Vec::new();
-    }
+    let root_fallback: [String; 1] = [String::new()];
+    let prefixes: &[String] = if path_prefixes.is_empty() {
+        &root_fallback
+    } else {
+        path_prefixes
+    };
     let mut routes = Vec::new();
     for pack_path in pack_paths {
         let (pack_id, inline) = match read_pack_provider_extension(pack_path) {
@@ -552,7 +555,7 @@ pub fn synthesize_provider_ingest_routes(
                 );
                 continue;
             };
-            for prefix in path_prefixes {
+            for prefix in prefixes {
                 let pattern = build_webhook_pattern(prefix, &name);
                 let segments = parse_route_pattern(&pattern);
                 routes.push(HttpRouteDescriptor {
@@ -1186,7 +1189,11 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_provider_routes_no_prefixes_yields_none() {
+    fn synthesize_provider_routes_empty_prefixes_mounts_at_root() {
+        // Mirrors `DeploymentRouteTable`'s "empty = match any path" contract.
+        // Without root-prefix synthesis a `POST /webhook/<provider>` to a
+        // root-bound deployment would skip the `ProviderRoute` admission gate
+        // and fall through to generic flow serving — defeating the gate.
         let dir = tempfile::tempdir().unwrap();
         let pack = dir.path().join("telegram.gtpack");
         write_provider_pack(
@@ -1202,9 +1209,20 @@ mod tests {
             revision_id: RevisionId::new(),
         };
         let routes = synthesize_provider_ingest_routes(&[pack], &scope, &[]);
+        assert_eq!(
+            routes.len(),
+            1,
+            "empty prefixes treated as a single root binding"
+        );
+        assert_eq!(routes[0].pattern, "/webhook/telegram");
+        assert_eq!(routes[0].methods, vec!["POST".to_string()]);
+
+        let table = HttpRouteTable::from_descriptors(routes);
         assert!(
-            routes.is_empty(),
-            "deployment with no prefixes mounts no webhook (would steal `/` from other deployments)"
+            table
+                .match_request_for_revision("/webhook/telegram", "POST", &scope)
+                .is_some(),
+            "root-bound synthesized route must match /webhook/<name>"
         );
     }
 

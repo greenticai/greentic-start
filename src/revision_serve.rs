@@ -2111,6 +2111,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn admit_classifies_synthesized_webhook_for_root_bound_deployment() {
+        // Regression guard: a root-bound deployment (empty `path_prefixes`)
+        // owning an `ingest_http` provider must still classify
+        // `POST /webhook/<provider>` as `ProviderRoute`. An earlier draft of
+        // `synthesize_provider_ingest_routes` short-circuited on empty
+        // prefixes, which silently dropped the gate and let public webhook
+        // POSTs fall through to generic flow serving.
+        let scope = test_scope();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack_path = dir.path().join("telegram.gtpack");
+        write_provider_pack_for_test(
+            &pack_path,
+            "telegram-pack",
+            "messaging.telegram.bot",
+            &["ingest_http"],
+        );
+
+        let descriptors = crate::http_routes::synthesize_provider_ingest_routes(
+            &[pack_path],
+            &scope,
+            &[], // root-bound deployment
+        );
+        assert_eq!(descriptors.len(), 1, "root-bound synthesis emits one route");
+        let table = HttpRouteTable::from_descriptors(descriptors);
+
+        assert_eq!(
+            admit_request(&table, &scope, "/webhook/telegram", &hyper::Method::POST),
+            Admission::ProviderRoute,
+        );
+    }
+
+    /// Mirror of `http_routes::tests::write_provider_pack`, kept private to
+    /// the admit-tests in this module so they can build a real .gtpack
+    /// manifest carrying a `greentic.provider-extension.v1` provider with the
+    /// given ops without exporting the helper.
+    fn write_provider_pack_for_test(
+        path: &std::path::Path,
+        pack_id: &str,
+        provider_type: &str,
+        ops: &[&str],
+    ) {
+        use std::io::Write as _;
+        use zip::write::FileOptions;
+
+        let manifest_json = serde_json::json!({
+            "schema_version": "1.0.0",
+            "pack_id": pack_id,
+            "version": "1.0.0",
+            "kind": "provider",
+            "publisher": "tests",
+            "extensions": {
+                greentic_types::PROVIDER_EXTENSION_ID: {
+                    "kind": greentic_types::PROVIDER_EXTENSION_ID,
+                    "version": "1.0.0",
+                    "inline": {
+                        "providers": [{
+                            "provider_type": provider_type,
+                            "capabilities": [],
+                            "ops": ops,
+                            "config_schema_ref": "config.schema.json",
+                            "runtime": {
+                                "component_ref": format!("{pack_id}-component"),
+                                "export": "schema-core-api",
+                                "world": "greentic:provider/schema-core@1.0.0"
+                            }
+                        }]
+                    }
+                }
+            }
+        });
+        let manifest: greentic_types::PackManifest =
+            serde_json::from_value(manifest_json).expect("manifest deserializes");
+        let bytes = greentic_types::encode_pack_manifest(&manifest).expect("manifest encodes");
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .unwrap();
+        zip.write_all(&bytes).unwrap();
+        zip.finish().unwrap();
+    }
+
     fn envelope_for(user: &str, conversation: &str) -> IngressEnvelope {
         IngressEnvelope {
             tenant: "acme".into(),
