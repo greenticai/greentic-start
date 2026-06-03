@@ -41,12 +41,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
+use greentic_types::ChannelMessageEnvelope;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1::Builder as Http1Builder;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, header};
+use hyper::{HeaderMap, Request, Response, StatusCode, header};
 use hyper_util::rt::tokio::TokioIo;
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -61,6 +64,9 @@ use crate::deployment_routes::RevisionIngressRouting;
 use crate::endpoint_resolver;
 use crate::http_routes::{HttpRouteTable, RevisionScope};
 use crate::identify_payload;
+use crate::ingress_dispatch::parse_dispatch_result;
+use crate::ingress_types::IngressHttpResponse;
+use crate::messaging_dto::HttpInV1;
 use crate::operator_log;
 use crate::revision_dispatcher::{
     DispatchRequest, RevisionDispatcher, RevisionKey, SetCookieDirective, cookie_name,
@@ -629,6 +635,13 @@ async fn serve(
     // header-discriminated providers (Telegram via secret-token) the same
     // identify-instance call shape that body-discriminated providers use.
     let identify_headers = identify_payload::collect_identify_headers(req.headers());
+    // Phase D.3: collect every request header + the raw query string here
+    // too, BEFORE the body read consumes `req`. The `ProviderRoute` arm
+    // forwards them verbatim to the provider component (via `HttpInV1`) so
+    // that signature-verifying providers (Slack, GitHub, etc.) see the
+    // exact request the upstream sent.
+    let request_headers = collect_forwarded_request_headers(req.headers());
+    let query_string = req.uri().query().map(str::to_string);
 
     // Resolve the bound deployment + tenant before touching the body, so an
     // unroutable request is rejected cheaply.
@@ -650,11 +663,19 @@ async fn serve(
             "request body exceeds the size limit",
         )
     })?;
-    let payload: Value = if body_bytes.is_empty() {
-        Value::Null
+
+    // Phase D.3: the body is read as raw bytes; the strict JSON parse is
+    // deferred until we know this is the generic-JSON branch (provider
+    // webhooks send form-urlencoded / signature payloads that the provider
+    // component decodes itself). `caller_identity` only consumes a JSON
+    // body on loopback peers — non-loopback callers go straight to
+    // `(None, None, None)` regardless of body content — so we skip the
+    // tolerant parse entirely off-loopback to save the cost on every
+    // public provider webhook.
+    let identity_payload: Value = if peer_is_loopback && !body_bytes.is_empty() {
+        serde_json::from_slice(&body_bytes).unwrap_or(Value::Null)
     } else {
-        serde_json::from_slice(&body_bytes)
-            .map_err(|_| error_response(StatusCode::BAD_REQUEST, "request body must be JSON"))?
+        Value::Null
     };
 
     // Caller-asserted identity is only honoured from loopback peers (see
@@ -673,7 +694,7 @@ async fn serve(
         user_header,
         session_header,
         endpoint_header,
-        &payload,
+        &identity_payload,
     );
 
     // M1.4c-ii admit gate, step 1: if the caller asserts a messaging endpoint,
@@ -729,6 +750,45 @@ async fn serve(
         deployment_id,
         bundle_id: outcome.bundle_id.clone(),
         revision_id: outcome.revision_id,
+    };
+
+    // Phase D.3: branch out to the provider-route handler BEFORE the
+    // generic-JSON path runs the endpoint resolver / strict JSON parse /
+    // entry-flow build_activity. Provider webhooks send raw bodies
+    // (form-urlencoded, signature blobs, custom encodings) that the
+    // provider component decodes itself; forcing JSON parse here would
+    // turn every non-JSON webhook into a 400 even though the provider
+    // would have handled it correctly.
+    match admit_request(&activation.routing.http_routes, &scope, &path, &method) {
+        Admission::ProviderRoute => {
+            return dispatch_provider_route(
+                Arc::clone(&activation),
+                &tenant,
+                &scope,
+                &path,
+                method.as_str(),
+                query_string.as_deref(),
+                &request_headers,
+                &body_bytes,
+            )
+            .await;
+        }
+        Admission::MethodNotAllowed => {
+            return Err(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "only POST is supported for the generic revision ingress",
+            ));
+        }
+        Admission::Serve => {}
+    }
+
+    // Generic-JSON branch: NOW require the body to be valid JSON. Provider
+    // routes already short-circuited above with the raw bytes.
+    let payload: Value = if body_bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body_bytes)
+            .map_err(|_| error_response(StatusCode::BAD_REQUEST, "request body must be JSON"))?
     };
 
     // M1 IID.4 resolver: dispatch has picked a revision; ask each enabled
@@ -821,25 +881,6 @@ async fn serve(
         _ => header_admission,
     };
     check_bundle_admission(&admission, outcome.bundle_id.as_str()).map_err(|boxed| *boxed)?;
-
-    // Gate before executing: refuse provider webhook paths (deferred) and
-    // non-POST generic requests, rather than running the entry flow for them.
-    match admit_request(&activation.routing.http_routes, &scope, &path, &method) {
-        Admission::ProviderRoute => {
-            return Err(error_response(
-                StatusCode::NOT_IMPLEMENTED,
-                "this path is a provider ingress route; revision-aware provider serving is not \
-                 yet implemented (use the legacy --bundle ingress)",
-            ));
-        }
-        Admission::MethodNotAllowed => {
-            return Err(error_response(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "only POST is supported for the generic revision ingress",
-            ));
-        }
-        Admission::Serve => {}
-    }
 
     // M1.5 welcome-flow override (attach side). The runner-host gates the
     // override on a durable first-contact marker (greentic-runner#382), so
@@ -1495,6 +1536,529 @@ pub(crate) fn resolve_bind_addr(host_config: Option<&EnvironmentHostConfig>) -> 
     addr
 }
 
+/// Phase D.3 provider-route handler. Invokes the per-revision provider
+/// component selected by the synthesized webhook route, parses its HTTP/event
+/// envelope, forwards each emitted messaging envelope through the flow
+/// runtime, and returns the provider's HTTP response verbatim to the upstream
+/// caller (so signature-verifying providers see the round-trip they expect).
+///
+/// Legacy `greentic.http-routes.v1` routes (no synthesized `provider_type`)
+/// are kept on the 501 path: D.3 only wires routes that came from
+/// `greentic.provider-extension.v1` synthesis. A future revision can extend
+/// to legacy routes once their dispatch contract is settled.
+///
+/// On provider-invocation error the request returns `502` so the upstream
+/// retries; on parse/decode error we return `502` rather than `500` because
+/// the failure originated in the downstream component's reply.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_provider_route(
+    activation: Arc<Activation>,
+    tenant: &str,
+    scope: &RevisionScope,
+    path: &str,
+    method: &str,
+    query: Option<&str>,
+    request_headers: &[(String, String)],
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let Some(route_match) = activation
+        .routing
+        .http_routes
+        .match_request_for_revision(path, method, scope)
+    else {
+        // `admit_request` just confirmed a match, so this only fires if the
+        // table swapped under us between admit and dispatch (or a test
+        // misuses this helper). Return 500 so the upstream surfaces the
+        // anomaly instead of silently re-running as a generic activity.
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provider route disappeared between admit and dispatch",
+        ));
+    };
+
+    let Some(provider_type) = route_match.descriptor.provider_type.clone() else {
+        return Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "this path is a legacy http-routes.v1 route; Phase D.3 only \
+             handles greentic.provider-extension.v1 synthesized routes",
+        ));
+    };
+    let provider_op = route_match.descriptor.provider_op.clone();
+    let deployment_id = scope.deployment_id;
+    let bundle_id = scope.bundle_id.clone();
+    let revision_id = scope.revision_id;
+
+    let http_in = build_provider_http_in(
+        &provider_type,
+        tenant,
+        method,
+        path,
+        query,
+        request_headers,
+        body,
+    );
+    let input_json = serde_json::to_vec(&http_in).map_err(|err| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("encode HttpInV1 for provider {provider_type}: {err}"),
+        )
+    })?;
+
+    let output = activation
+        .host
+        .invoke_provider_for_revision(
+            tenant,
+            deployment_id,
+            bundle_id.clone(),
+            revision_id,
+            &provider_type,
+            &provider_op,
+            input_json,
+            None,
+            None,
+        )
+        .await
+        .map_err(|err| {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "provider {provider_type} op {provider_op} failed for \
+                     deployment {deployment_id} revision {revision_id}: {err:#}"
+                ),
+            );
+            error_response(StatusCode::BAD_GATEWAY, "provider invocation failed")
+        })?;
+
+    let result = parse_dispatch_result(&output).map_err(|err| {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "provider {provider_type} op {provider_op} returned an undecodable \
+                 envelope (deployment {deployment_id} revision {revision_id}): {err:#}"
+            ),
+        );
+        error_response(
+            StatusCode::BAD_GATEWAY,
+            "could not decode provider response envelope",
+        )
+    })?;
+
+    // `result.events` are EventEnvelopeV1 (event-fabric) emissions. The
+    // legacy `dispatch_http_ingress` routes these only for `Domain::Events`
+    // through `event_router::route_events_to_default_flow`; the revision-
+    // aware event path is Phase D.4 work. Log non-empty counts so operators
+    // see the gap until the routing seam lands.
+    if !result.events.is_empty() {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "provider {provider_type} emitted {} event(s) on op {provider_op} \
+                 (deployment {deployment_id} revision {revision_id}); revision-aware \
+                 event routing is Phase D.4 work — events dropped for now",
+                result.events.len()
+            ),
+        );
+    }
+
+    // Detach the per-ingress pipeline so the HTTP response isn't blocked
+    // by the 3-call egress chain (`render_plan` → `encode` → `send_payload`).
+    // Slack enforces a 3-second webhook timeout; with N replies per ingress
+    // and M envelopes per webhook the inline cost = `M * N * 3 * WASM_invoke`
+    // would routinely blow past it. Matches the legacy posture in
+    // `dispatch_http_ingress`, which `std::thread::spawn`s
+    // `route_messaging_envelopes`. Errors are logged inside the spawned
+    // task — the upstream already received its 2xx ack by the time the
+    // egress runs.
+    if !result.messaging_envelopes.is_empty() {
+        let ingress_envelopes = result.messaging_envelopes.clone();
+        let pipeline_activation = Arc::clone(&activation);
+        let pipeline_tenant = tenant.to_string();
+        let pipeline_provider = provider_type.clone();
+        let pipeline_bundle = bundle_id.clone();
+        tokio::spawn(async move {
+            run_provider_inbound_pipeline(
+                pipeline_activation,
+                pipeline_tenant,
+                deployment_id,
+                pipeline_bundle,
+                revision_id,
+                pipeline_provider,
+                ingress_envelopes,
+            )
+            .await;
+        });
+    }
+
+    Ok(synthesize_provider_response(&result.response))
+}
+
+/// Per-ingress pipeline: for each inbound envelope, drive the flow runtime
+/// and ship each reply Activity back out through the provider's egress
+/// chain. Runs in a detached `tokio::spawn` so the HTTP ack is sent before
+/// the egress completes (the webhook upstream doesn't need to wait for our
+/// bot reply to be delivered).
+///
+/// Errors are logged but never bubble out — the upstream already saw its
+/// 2xx, so returning a non-2xx now is impossible, and propagating an Err
+/// would just hang in the abandoned task.
+async fn run_provider_inbound_pipeline(
+    activation: Arc<Activation>,
+    tenant: String,
+    deployment_id: DeploymentId,
+    bundle_id: BundleId,
+    revision_id: RevisionId,
+    provider_type: String,
+    envelopes: Vec<ChannelMessageEnvelope>,
+) {
+    for ingress in &envelopes {
+        let activity = envelope_to_activity(ingress, &tenant);
+        let replies = match activation
+            .host
+            .handle_activity_for_revision(
+                &tenant,
+                deployment_id,
+                bundle_id.clone(),
+                revision_id,
+                activity,
+            )
+            .await
+        {
+            Ok(replies) => replies,
+            Err(err) => {
+                operator_log::error(
+                    module_path!(),
+                    format!(
+                        "forwarding provider event to flow runtime failed for \
+                         deployment {deployment_id} revision {revision_id}: {err:#}"
+                    ),
+                );
+                continue;
+            }
+        };
+
+        for reply in replies {
+            let reply_envelope = build_reply_envelope(ingress, &reply);
+            if let Err(err) = run_reply_egress(
+                &activation,
+                &tenant,
+                deployment_id,
+                bundle_id.clone(),
+                revision_id,
+                &provider_type,
+                &reply_envelope,
+            )
+            .await
+            {
+                operator_log::error(
+                    module_path!(),
+                    format!(
+                        "provider {provider_type} egress failed for deployment \
+                         {deployment_id} revision {revision_id} (reply id={}): {err:#}",
+                        reply_envelope.id
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// Run the provider's egress chain for a single reply envelope: invoke
+/// `render_plan`, feed the plan into `encode`, then ship the encoded
+/// payload via `send_payload`. Each step calls
+/// [`RunnerHost::invoke_provider_for_revision`] so the same revision that
+/// handled the inbound webhook also produces the outbound reply.
+///
+/// Provider components declare `render_plan`/`encode`/`send_payload` in
+/// their `greentic.provider-extension.v1` ops allowlist; if a provider
+/// omits one, the helper fails closed with the host's allowlist error.
+/// That mirrors the legacy `messaging_egress` pipeline (`render_plan` →
+/// `encode_payload` → `send_payload`).
+#[allow(clippy::too_many_arguments)]
+async fn run_reply_egress(
+    activation: &Activation,
+    tenant: &str,
+    deployment_id: DeploymentId,
+    bundle_id: BundleId,
+    revision_id: RevisionId,
+    provider_type: &str,
+    envelope: &ChannelMessageEnvelope,
+) -> Result<()> {
+    use crate::messaging_dto::{EncodeInV1, ProviderPayloadV1, RenderPlanInV1};
+
+    let message_value = serde_json::to_value(envelope).context("serialize reply envelope")?;
+
+    // Shared closure: each step calls `invoke_provider_for_revision` with
+    // the same 7 routing args, varying only by op + serialized input.
+    let invoke = async |op: &'static str, input: Value| -> Result<Value> {
+        let input_bytes =
+            serde_json::to_vec(&input).with_context(|| format!("encode {op} input"))?;
+        activation
+            .host
+            .invoke_provider_for_revision(
+                tenant,
+                deployment_id,
+                bundle_id.clone(),
+                revision_id,
+                provider_type,
+                op,
+                input_bytes,
+                None,
+                None,
+            )
+            .await
+            .with_context(|| format!("{op} invocation"))
+    };
+
+    // render_plan(message) → plan
+    let render_input = serde_json::to_value(RenderPlanInV1 {
+        v: 1,
+        message: message_value.clone(),
+    })
+    .context("encode RenderPlanInV1")?;
+    let plan_value = invoke("render_plan", render_input).await?;
+    // Providers may return the plan as a typed `RenderPlanOutV1` (`plan_json`)
+    // string, a `{ "plan": ... }` wrapper, or the plan object directly.
+    let plan = plan_value
+        .get("plan_json")
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .or_else(|| plan_value.get("plan").cloned())
+        .unwrap_or(plan_value);
+
+    // encode(message, plan) → ProviderPayloadV1
+    let encode_input = serde_json::to_value(EncodeInV1 {
+        v: 1,
+        message: message_value,
+        plan,
+    })
+    .context("encode EncodeInV1")?;
+    let encode_value = invoke("encode", encode_input).await?;
+    let payload_value = encode_value.get("payload").cloned().unwrap_or(encode_value);
+    let payload: ProviderPayloadV1 =
+        serde_json::from_value(payload_value).context("decode ProviderPayloadV1")?;
+
+    // send_payload(provider_type, payload, tenant) → outcome.
+    // `messaging_egress::build_send_payload` is the legacy constructor —
+    // mirrored inline here because it also injects bundle-rooted config,
+    // which the revision-aware path doesn't have yet (Phase D follow-up).
+    let send_input = serde_json::to_value(crate::messaging_dto::SendPayloadInV1 {
+        v: 1,
+        provider_type: provider_type.to_string(),
+        payload,
+        tenant: crate::messaging_dto::TenantHint {
+            tenant: tenant.to_string(),
+            team: None,
+            user: None,
+            correlation_id: None,
+        },
+        reply_scope: None,
+        config: None,
+    })
+    .context("encode SendPayloadInV1")?;
+    let send_outcome = invoke("send_payload", send_input).await?;
+
+    if send_outcome
+        .get("ok")
+        .and_then(|v| v.as_bool())
+        .is_some_and(|ok| !ok)
+    {
+        let error_msg = send_outcome
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("send_payload reported ok=false");
+        anyhow::bail!("{error_msg}");
+    }
+    Ok(())
+}
+
+/// Build a reply [`ChannelMessageEnvelope`] from an inbound `ingress`
+/// envelope (used as the routing base — channel, session_id, recipients,
+/// tenant) and a reply [`Activity`] produced by the flow runtime. Mirrors
+/// `messaging_app::base_reply_envelope` and layers the activity's payload
+/// on top.
+///
+/// If the activity's payload itself deserializes as a full envelope (some
+/// flows emit one directly), use that and only repair the route fields
+/// (channel/session/to) from the ingress. Otherwise treat the payload as
+/// the reply text or wholesale `metadata` carrier and start from a
+/// clone of the ingress envelope.
+fn build_reply_envelope(
+    ingress: &ChannelMessageEnvelope,
+    reply: &Activity,
+) -> ChannelMessageEnvelope {
+    // Keys carried forward from the ingress envelope's metadata when the
+    // reply doesn't supply its own. Kept in sync with the legacy
+    // `messaging_app::base_reply_envelope` reset list.
+    const REPLY_METADATA_KEYS: &[&str] = &[
+        "env",
+        "tenant",
+        "team",
+        "route",
+        "locale",
+        "universal",
+        "autoStart",
+    ];
+
+    if let Ok(mut envelope) =
+        serde_json::from_value::<ChannelMessageEnvelope>(reply.payload().clone())
+    {
+        if envelope.session_id.trim().is_empty() {
+            envelope.session_id = ingress.session_id.clone();
+        }
+        if envelope.channel.is_empty() {
+            envelope.channel = ingress.channel.clone();
+        }
+        if envelope.to.is_empty() {
+            envelope.to = ingress.to.clone();
+        }
+        if envelope.id.is_empty() {
+            envelope.id = uuid::Uuid::new_v4().to_string();
+        }
+        return envelope;
+    }
+
+    let mut envelope = ingress.clone();
+    envelope.id = uuid::Uuid::new_v4().to_string();
+    envelope.from = None;
+    envelope.correlation_id = None;
+    envelope.reply_scope = None;
+    envelope.text = None;
+    envelope.attachments.clear();
+
+    let mut clean = std::collections::BTreeMap::new();
+    for key in REPLY_METADATA_KEYS {
+        if let Some(value) = envelope.metadata.remove(*key) {
+            clean.insert((*key).to_string(), value);
+        }
+    }
+    envelope.metadata = clean;
+
+    if let Some(text) = reply
+        .payload()
+        .get("text")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        envelope.text = Some(text.to_string());
+    }
+
+    envelope
+}
+
+/// Collect every request header into `(name_lowercase, value_utf8)` pairs
+/// for [`HttpInV1::headers`]. Non-UTF-8 values are silently dropped — the
+/// wire is JSON, so a single malformed header would otherwise 500 the
+/// whole webhook.
+fn collect_forwarded_request_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            Some((
+                name.as_str().to_ascii_lowercase(),
+                value.to_str().ok()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// Build the [`HttpInV1`] wire envelope a `greentic.provider-extension.v1`
+/// component expects on `ingest_http`. Mirrors the shape the legacy ingress
+/// builds in [`crate::ingress_dispatch::build_ingress_request`], minus the
+/// pack-level config injection (Phase D revision-aware config injection is
+/// follow-up work — components that need secrets read them from the host
+/// directly today).
+fn build_provider_http_in(
+    provider: &str,
+    tenant: &str,
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> HttpInV1 {
+    HttpInV1 {
+        v: 1,
+        provider: provider.to_string(),
+        route: None,
+        binding_id: None,
+        tenant_hint: Some(tenant.to_string()),
+        team_hint: None,
+        method: method.to_string(),
+        path: path.to_string(),
+        query: parse_query_pairs(query),
+        headers: headers.to_vec(),
+        body_b64: BASE64.encode(body),
+        config: None,
+    }
+}
+
+/// Split a raw query string (sans leading `?`) into `(key, value)` pairs.
+/// Entries with no `=` keep an empty value. No percent-decoding — the
+/// provider component decodes its own keys (legacy ingress contract).
+fn parse_query_pairs(query: Option<&str>) -> Vec<(String, String)> {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((k, v)) => (k.to_string(), v.to_string()),
+            None => (pair.to_string(), String::new()),
+        })
+        .collect()
+}
+
+/// Project a [`ChannelMessageEnvelope`] emitted by a provider component into
+/// the runtime's [`Activity`] shape. Mirrors [`build_activity`]: a non-empty
+/// `text` becomes a messaging activity, otherwise the whole envelope rides
+/// as a `provider.event` custom activity so the flow can still inspect it.
+fn envelope_to_activity(envelope: &ChannelMessageEnvelope, fallback_tenant: &str) -> Activity {
+    let mut activity = match envelope.text.as_deref() {
+        Some(text) if !text.is_empty() => Activity::text(text),
+        _ => {
+            let payload = serde_json::to_value(envelope).unwrap_or(Value::Null);
+            Activity::custom("provider.event", payload)
+        }
+    };
+    let envelope_tenant = envelope.tenant.tenant_id.as_str();
+    let tenant = if envelope_tenant.is_empty() {
+        fallback_tenant
+    } else {
+        envelope_tenant
+    };
+    activity = activity.with_tenant(tenant);
+    if !envelope.session_id.is_empty() {
+        activity = activity.with_session(&envelope.session_id);
+    }
+    if let Some(from) = envelope.from.as_ref()
+        && !from.id.is_empty()
+    {
+        activity = activity.from_user(&from.id);
+    }
+    activity
+}
+
+/// Turn the provider's [`IngressHttpResponse`] back into a hyper response.
+/// Status defaults to `200` when the provider omits it (a common convention
+/// for "ack" webhooks). Headers that fail to parse as ASCII are dropped
+/// rather than failing the whole response.
+fn synthesize_provider_response(response: &IngressHttpResponse) -> Response<Full<Bytes>> {
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::OK);
+    let body = response.body.clone().map(Bytes::from).unwrap_or_default();
+    let mut builder = Response::builder().status(status);
+    for (name, value) in &response.headers {
+        // Skip headers that don't parse — surfacing them as a 500 would let
+        // a single malformed reply header void an otherwise-correct webhook.
+        if let Ok(header_name) = hyper::header::HeaderName::try_from(name.as_str())
+            && let Ok(header_value) = hyper::header::HeaderValue::try_from(value.as_str())
+        {
+            builder = builder.header(header_name, header_value);
+        }
+    }
+    builder
+        .body(Full::new(body))
+        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "invalid provider response"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2108,6 +2672,261 @@ mod tests {
         assert_eq!(
             admit_request(&routes, &other, "/slack/events", &hyper::Method::POST),
             Admission::Serve
+        );
+    }
+
+    #[test]
+    fn parse_query_pairs_splits_amp_separated_pairs() {
+        let pairs = parse_query_pairs(Some("a=1&b=&c"));
+        assert_eq!(
+            pairs,
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), String::new()),
+                ("c".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_pairs_handles_none_and_empty() {
+        assert!(parse_query_pairs(None).is_empty());
+        assert!(parse_query_pairs(Some("")).is_empty());
+        // A leading separator is harmless — the empty segment is skipped.
+        assert_eq!(
+            parse_query_pairs(Some("&a=1")),
+            vec![("a".to_string(), "1".to_string())]
+        );
+    }
+
+    #[test]
+    fn collect_forwarded_request_headers_lowercases_keys_and_keeps_multi_value() {
+        use hyper::http::header::{HeaderName, HeaderValue};
+        let mut map = HeaderMap::new();
+        map.insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+        map.append(
+            HeaderName::from_static("x-trace"),
+            HeaderValue::from_static("a"),
+        );
+        map.append(
+            HeaderName::from_static("x-trace"),
+            HeaderValue::from_static("b"),
+        );
+        // Non-UTF8 values are silently dropped — see helper doc.
+        map.insert(
+            HeaderName::from_static("x-bad"),
+            HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        let mut headers = collect_forwarded_request_headers(&map);
+        headers.sort();
+        assert_eq!(
+            headers,
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("x-trace".to_string(), "a".to_string()),
+                ("x-trace".to_string(), "b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_provider_http_in_wires_fields_and_b64_body() {
+        let headers = vec![("content-type".to_string(), "application/json".to_string())];
+        let http_in = build_provider_http_in(
+            "messaging.telegram.bot",
+            "acme",
+            "POST",
+            "/webhook/telegram",
+            Some("token=abc&n=1"),
+            &headers,
+            br#"{"update_id":42}"#,
+        );
+        assert_eq!(http_in.provider, "messaging.telegram.bot");
+        assert_eq!(http_in.tenant_hint.as_deref(), Some("acme"));
+        assert_eq!(http_in.method, "POST");
+        assert_eq!(http_in.path, "/webhook/telegram");
+        assert_eq!(http_in.headers, headers);
+        assert_eq!(http_in.query.len(), 2);
+        assert_eq!(http_in.body_b64, BASE64.encode(br#"{"update_id":42}"#));
+    }
+
+    #[test]
+    fn envelope_to_activity_maps_text_and_identity() {
+        let envelope: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-1",
+            "tenant": {
+                "env": "dev",
+                "tenant": "acme",
+                "tenant_id": "acme",
+                "attempt": 0,
+            },
+            "channel": "telegram",
+            "session_id": "sess-1",
+            "from": { "id": "u1", "kind": "user" },
+            "text": "hello",
+            "metadata": {},
+        }))
+        .expect("envelope");
+        let activity = envelope_to_activity(&envelope, "fallback");
+        assert_eq!(activity.tenant(), Some("acme"));
+        assert_eq!(activity.session_id(), Some("sess-1"));
+        assert_eq!(activity.user(), Some("u1"));
+        assert_eq!(activity.flow_type(), Some("messaging"));
+        assert_eq!(
+            activity.payload().get("text").and_then(Value::as_str),
+            Some("hello"),
+        );
+    }
+
+    #[test]
+    fn envelope_to_activity_skips_empty_session_pin() {
+        // Empty `session_id` keeps the activity unpinned — otherwise the
+        // runtime buckets parallel callers under a single empty session key.
+        let envelope: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-1",
+            "tenant": {
+                "env": "dev",
+                "tenant": "acme",
+                "tenant_id": "acme",
+                "attempt": 0,
+            },
+            "channel": "telegram",
+            "session_id": "",
+            "metadata": {},
+        }))
+        .expect("envelope");
+        let activity = envelope_to_activity(&envelope, "fallback");
+        assert_eq!(activity.tenant(), Some("acme"));
+        assert_eq!(activity.session_id(), None);
+    }
+
+    #[test]
+    fn build_reply_envelope_text_activity_clones_ingress_route() {
+        // A simple "text" reply Activity carries its text in `payload.text`;
+        // route fields (channel, session, to) must come from the ingress
+        // envelope so the provider knows where to deliver the bot reply.
+        let ingress: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-in-1",
+            "tenant": {
+                "env": "dev",
+                "tenant": "acme",
+                "tenant_id": "acme",
+                "attempt": 0,
+            },
+            "channel": "telegram",
+            "session_id": "chat-42",
+            "to": [{ "id": "room-1", "kind": "room" }],
+            "from": { "id": "user-1", "kind": "user" },
+            "text": "hi",
+            "metadata": { "route": "/webhook/telegram", "leftover": "stripped" },
+        }))
+        .expect("ingress envelope");
+
+        let reply = Activity::text("hello back");
+        let envelope = build_reply_envelope(&ingress, &reply);
+
+        // Route fields preserved.
+        assert_eq!(envelope.session_id, "chat-42");
+        assert_eq!(envelope.channel, "telegram");
+        assert_eq!(envelope.to.len(), 1);
+        // Reply text picked up from activity payload.
+        assert_eq!(envelope.text.as_deref(), Some("hello back"));
+        // From / correlation reset on a reply (the bot does NOT impersonate
+        // the inbound user).
+        assert!(envelope.from.is_none());
+        assert!(envelope.correlation_id.is_none());
+        // New `id` — not the inbound `id` (deduper would otherwise drop the
+        // reply as a duplicate of the inbound).
+        assert_ne!(envelope.id, "msg-in-1");
+        // Ingress metadata pruned to the routing-relevant subset.
+        assert!(envelope.metadata.contains_key("route"));
+        assert!(!envelope.metadata.contains_key("leftover"));
+    }
+
+    #[test]
+    fn build_reply_envelope_full_payload_envelope_uses_it_verbatim() {
+        // An Activity whose payload IS a ChannelMessageEnvelope (e.g. an
+        // emit_message node serializing one) should be used verbatim —
+        // only route holes (empty session/channel/to/id) get backfilled
+        // from the ingress so the egress can deliver it.
+        let ingress: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-in-2",
+            "tenant": {
+                "env": "dev",
+                "tenant": "acme",
+                "tenant_id": "acme",
+                "attempt": 0,
+            },
+            "channel": "telegram",
+            "session_id": "chat-7",
+            "to": [{ "id": "room-7", "kind": "room" }],
+            "metadata": {},
+        }))
+        .expect("ingress envelope");
+
+        // Reply envelope only carries text + (empty) session_id; the
+        // builder must fall back to the ingress session/channel/to so the
+        // provider knows where to deliver.
+        let reply_payload = json!({
+            "id": "",
+            "tenant": {
+                "env": "dev",
+                "tenant": "acme",
+                "tenant_id": "acme",
+                "attempt": 0,
+            },
+            "channel": "",
+            "session_id": "",
+            "text": "scripted-reply",
+            "metadata": {},
+        });
+        let reply = Activity::custom("messaging", reply_payload);
+
+        let envelope = build_reply_envelope(&ingress, &reply);
+        assert_eq!(envelope.session_id, "chat-7");
+        assert_eq!(envelope.channel, "telegram");
+        assert_eq!(envelope.to.len(), 1);
+        assert_eq!(envelope.text.as_deref(), Some("scripted-reply"));
+        assert!(!envelope.id.is_empty(), "id backfilled from uuid");
+    }
+
+    #[test]
+    fn synthesize_provider_response_defaults_to_200_and_preserves_body() {
+        let response = IngressHttpResponse {
+            status: 0, // Not a real HTTP status — synth must fall back to 200.
+            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+            body: Some(b"ok".to_vec()),
+        };
+        let out = synthesize_provider_response(&response);
+        assert_eq!(out.status(), StatusCode::OK);
+        assert_eq!(
+            out.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain"),
+        );
+    }
+
+    #[test]
+    fn synthesize_provider_response_drops_malformed_headers() {
+        let response = IngressHttpResponse {
+            status: 202,
+            // `"\n bad"` is not a valid header name — must be dropped, not 500.
+            headers: vec![
+                ("\n bad".to_string(), "x".to_string()),
+                ("x-good".to_string(), "ok".to_string()),
+            ],
+            body: None,
+        };
+        let out = synthesize_provider_response(&response);
+        assert_eq!(out.status(), StatusCode::ACCEPTED);
+        assert!(out.headers().get("\n bad").is_none());
+        assert_eq!(
+            out.headers().get("x-good").and_then(|v| v.to_str().ok()),
+            Some("ok"),
         );
     }
 

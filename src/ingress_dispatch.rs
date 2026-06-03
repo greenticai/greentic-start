@@ -393,7 +393,7 @@ fn build_ingress_request(
     }
 }
 
-fn parse_dispatch_result(value: &JsonValue) -> anyhow::Result<IngressDispatchResult> {
+pub(crate) fn parse_dispatch_result(value: &JsonValue) -> anyhow::Result<IngressDispatchResult> {
     if let Some(body) = value.as_str() {
         return Ok(IngressDispatchResult {
             response: IngressHttpResponse {
