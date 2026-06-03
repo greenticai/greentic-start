@@ -47,6 +47,7 @@ use crate::deployment_routes::{DeploymentRouteTable, RevisionIngressRouting};
 use crate::endpoint_admit::EndpointAdmit;
 use crate::http_routes::{
     HttpRouteDescriptor, HttpRouteTable, RevisionScope, discover_revision_http_routes,
+    synthesize_provider_ingest_routes,
 };
 use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig, parse_ulid};
 use crate::runtime_config::{LoadedRuntimeConfig, env_dir_in};
@@ -81,6 +82,10 @@ struct DeploymentMeta {
     status: BundleDeploymentStatus,
     /// The bundle the deployment is (immutably) bound to.
     bundle_id: String,
+    /// Path prefixes the deployment binds. Used by provider-webhook route
+    /// synthesis to mount routes under the deployment's own URL space rather
+    /// than at the root.
+    path_prefixes: Vec<String>,
 }
 
 /// Activate `rc` under `store_root`: load every active revision's packs into a
@@ -216,6 +221,15 @@ pub(crate) async fn activate_runtime_config(
         };
         let pack_paths: Vec<PathBuf> = pack_refs.iter().map(|r| r.path.clone()).collect();
         scoped_routes.extend(discover_revision_http_routes(&pack_paths, &scope));
+        // Phase D.1 — synthesize a webhook ingress route for every provider that
+        // exports `ingest_http`, mounted under each of the deployment's bound
+        // path prefixes (`<prefix>/webhook/<provider-name>`). Same scope stamp
+        // as the declared routes above, so they share `match_request_for_revision`.
+        scoped_routes.extend(synthesize_provider_ingest_routes(
+            &pack_paths,
+            &scope,
+            &meta.path_prefixes,
+        ));
 
         // Session isolation: give each revision its OWN session and state store
         // rather than sharing the host's. The session/resume/state backend keys
@@ -290,6 +304,7 @@ fn deployment_index(env: &Environment) -> HashMap<String, DeploymentMeta> {
                     customer_id: dep.customer_id.as_str().to_string(),
                     status: dep.status,
                     bundle_id: dep.bundle_id.as_str().to_string(),
+                    path_prefixes: dep.route_binding.path_prefixes.clone(),
                 },
             )
         })
