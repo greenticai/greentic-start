@@ -49,7 +49,17 @@ impl Fast2FlowConfig {
         let registry_path = std::env::var(ENV_REGISTRY_PATH)
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_REGISTRY_PATH));
-        let indexes_path = std::env::var(ENV_INDEXES_PATH).ok().map(PathBuf::from);
+        // When the env var is unset, fall back to a per-process temp dir.
+        // The pack-fallback materializer writes `<scope>/index.json` here
+        // from `assets/intent-index.json` inside the pack, so a pack that
+        // ships its routing index inline runs without operator setup.
+        // External deployers (k8s, cloud bundle controllers) can still
+        // pin a durable path via `GREENTIC_FAST2FLOW_INDEXES_PATH`.
+        let indexes_path = Some(
+            std::env::var(ENV_INDEXES_PATH)
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| std::env::temp_dir().join("greentic-fast2flow-indexes")),
+        );
         let time_budget_ms = std::env::var(ENV_TIME_BUDGET)
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -78,7 +88,10 @@ impl Fast2FlowConfig {
         CONFIG.get_or_init(Self::from_env)
     }
 
-    /// Cheapest pre-check: `indexes_path` must be set to ever invoke.
+    /// Cheapest pre-check. `indexes_path` is now always populated
+    /// (env-provided or temp-dir default), so this only short-circuits
+    /// when an operator explicitly suppresses fast2flow via a follow-up
+    /// hook. Kept as a public surface for forward-compat.
     pub fn has_deploy_intent(&self) -> bool {
         self.indexes_path.is_some()
     }
@@ -153,5 +166,34 @@ mod tests {
     fn force_enable_overrides_undeclared_packs() {
         let cfg = config_with(Some("/tmp/idx"), true, 500);
         assert!(cfg.gate.is_enabled(&ctx(), &pack(&[])));
+    }
+}
+
+#[cfg(test)]
+mod default_env_tests {
+    use super::*;
+
+    #[test]
+    fn from_env_without_indexes_var_falls_back_to_temp_dir() {
+        // SAFETY: tests are single-threaded for env mutation by default in cargo test.
+        // We restore the previous state at end.
+        let prev = std::env::var(ENV_INDEXES_PATH).ok();
+        // SAFETY: removing env var in single-threaded test context.
+        unsafe { std::env::remove_var(ENV_INDEXES_PATH) };
+
+        let cfg = Fast2FlowConfig::from_env();
+        let path = cfg.indexes_path.as_ref().expect("default should populate");
+        assert!(
+            path.starts_with(std::env::temp_dir()),
+            "default indexes_path should live under temp_dir, got {:?}",
+            path
+        );
+        assert!(cfg.has_deploy_intent());
+
+        // restore
+        if let Some(val) = prev {
+            // SAFETY: restoring previous env var in single-threaded test context.
+            unsafe { std::env::set_var(ENV_INDEXES_PATH, val) };
+        }
     }
 }

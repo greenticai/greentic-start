@@ -1,8 +1,21 @@
-# Fast2Flow Prototype Bundle — `sales-crm-fast2flow-demo`
+# Fast2Flow Prototype Bundle — historical design note
 
-Status: **design draft**, not yet built. Tracks the bundle-side surface the
-Fast2Flow integration ([feat/fast2flow-routing-host](../README.md)) needs to
-fire end-to-end.
+Status: **shipped**. The opt-in surface described below now lives on `main`:
+
+- Packs opt in by declaring `greentic.cap.fast2flow.v1` in their
+  `pack.yaml` — `greentic-pack` honours the top-level `capabilities:`
+  block and unions it into the compiled `manifest.capabilities`.
+- `GREENTIC_FAST2FLOW_INDEXES_PATH` is now optional. The runtime falls
+  back to `<temp_dir>/greentic-fast2flow-indexes` and the
+  pack-fallback materializer reads `assets/intent-index.json` straight
+  from the `.gtpack` (still allowed for k8s/cloud deployers to pin via
+  the env var).
+- Worked example:
+  [greentic-demo / apps/pet-daycare-app](https://github.com/greenticai/greentic-demo/tree/main/apps/pet-daycare-app).
+
+This file is kept as the historical design note that informed those
+landings; the user-facing doc is now
+[greentic-docs / components / fast2flow.mdx](https://github.com/greenticai/greentic-docs/blob/main/src/content/docs/components/fast2flow.mdx).
 
 ## Goal
 
