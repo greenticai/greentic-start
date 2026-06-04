@@ -2012,13 +2012,19 @@ fn parse_query_pairs(query: Option<&str>) -> Vec<(String, String)> {
 /// `text` becomes a messaging activity, otherwise the whole envelope rides
 /// as a `provider.event` custom activity so the flow can still inspect it.
 fn envelope_to_activity(envelope: &ChannelMessageEnvelope, fallback_tenant: &str) -> Activity {
-    let mut activity = match envelope.text.as_deref() {
-        Some(text) if !text.is_empty() => Activity::text(text),
-        _ => {
-            let payload = serde_json::to_value(envelope).unwrap_or(Value::Null);
-            Activity::custom("provider.event", payload)
-        }
-    };
+    // Serialize the whole envelope as the activity payload so the flow engine
+    // sees BOTH `entry.text` and `entry.metadata.*`. `build_routing_context`
+    // synthesises the `response.*` object that conditional routes test (e.g.
+    // `response.action == "about_card"`) from `entry.metadata.*` plus
+    // `entry.text`. A card button's submit data is flattened into the provider
+    // envelope's metadata by the provider ingest (slack/teams/webex/telegram),
+    // so it must reach the flow — otherwise every button press loses its action
+    // and the entry (welcome) card re-renders. Mirrors the legacy
+    // `messaging_app::run_app_flow`, which passes the full envelope as
+    // `entry.input`; `messaging` flow type matches the prior `Activity::text`
+    // resolution for typed messages.
+    let payload = serde_json::to_value(envelope).unwrap_or(Value::Null);
+    let mut activity = Activity::custom("provider.event", payload).with_flow_type("messaging");
     let envelope_tenant = envelope.tenant.tenant_id.as_str();
     let tenant = if envelope_tenant.is_empty() {
         fallback_tenant
@@ -2801,6 +2807,46 @@ mod tests {
         let activity = envelope_to_activity(&envelope, "fallback");
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.session_id(), None);
+    }
+
+    #[test]
+    fn envelope_to_activity_carries_metadata_for_button_routing() {
+        // A card-button press arrives as an ingress envelope whose submit data
+        // is flattened into `metadata` (e.g. `action`). The flow engine builds
+        // `response.action` from `entry.metadata.action`, so the activity
+        // payload must expose the envelope metadata — otherwise the button
+        // press loses its action and the entry (welcome) card re-renders.
+        let envelope: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "cb-1",
+            "tenant": {
+                "env": "dev",
+                "tenant": "acme",
+                "tenant_id": "acme",
+                "attempt": 0,
+            },
+            "channel": "telegram",
+            "session_id": "sess-1",
+            "from": { "id": "u1", "kind": "user" },
+            "text": "[callback:{\"action\":\"about_card\"}]",
+            "metadata": {
+                "action": "about_card",
+                "callback_data": "{\"action\":\"about_card\"}",
+            },
+        }))
+        .expect("envelope");
+        let activity = envelope_to_activity(&envelope, "fallback");
+        let entry = activity.payload();
+        // `response.action` resolves from `entry.metadata.action`.
+        assert_eq!(
+            entry.pointer("/metadata/action").and_then(Value::as_str),
+            Some("about_card"),
+        );
+        // `response.text` still resolves from `entry.text`.
+        assert_eq!(
+            entry.pointer("/text").and_then(Value::as_str),
+            Some("[callback:{\"action\":\"about_card\"}]"),
+        );
+        assert_eq!(activity.flow_type(), Some("messaging"));
     }
 
     #[test]
