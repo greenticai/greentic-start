@@ -575,6 +575,7 @@ mod tests {
             },
             packs: Vec::new(),
             messaging_endpoints: endpoints,
+            extensions: Vec::new(),
             credentials_ref: None,
             bundles: Vec::new(),
             revisions: Vec::new(),

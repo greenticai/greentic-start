@@ -1388,6 +1388,29 @@ where
         directline_session::Preflight::Respond(response) => return Err(response),
         directline_session::Preflight::Forward(plan) => plan,
     };
+    // Fail-closed on an unresolvable `ext://` config reference (see
+    // `ingress_dispatch::build_injected_config`) rather than forwarding a
+    // provider call with dropped config.
+    let injected_config = build_injected_config(
+        &state.runner_host,
+        Domain::Messaging,
+        request.provider,
+        &ctx,
+    )
+    .map_err(|err| {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "config resolution failed for provider `{}`: {err:#}",
+                request.provider
+            ),
+        );
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provider config resolution failed",
+        )
+    })?
+    .unwrap_or(serde_json::Value::Null);
     let payload = serde_json::json!({
         "v": 1,
         "provider": request.provider,
@@ -1400,12 +1423,7 @@ where
         "query": provider_query_string,
         "headers": headers,
         "body_b64": base64::engine::general_purpose::STANDARD.encode(&body),
-        "config": build_injected_config(
-            &state.runner_host,
-            Domain::Messaging,
-            request.provider,
-            &ctx,
-        ).unwrap_or(serde_json::Value::Null),
+        "config": injected_config,
     });
     let payload_bytes = serde_json::to_vec(&payload).map_err(|err| {
         error_response(

@@ -66,6 +66,7 @@ pub(crate) fn env_with(endpoints: Vec<MessagingEndpoint>) -> Environment {
         },
         packs: Vec::new(),
         messaging_endpoints: endpoints,
+        extensions: Vec::new(),
         credentials_ref: None,
         bundles: Vec::new(),
         revisions: Vec::new(),

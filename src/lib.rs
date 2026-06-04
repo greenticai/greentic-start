@@ -26,6 +26,7 @@ mod domains;
 mod endpoint_admit;
 mod endpoint_resolver;
 mod event_router;
+mod extension_resolver;
 pub(crate) mod flow_log;
 mod gmap;
 mod http_ingress;

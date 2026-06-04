@@ -2204,9 +2204,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deploy-spec"
-version = "0.1.26628825486"
+version = "0.1.26948183687"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6e7f27d60deb46ff7816c2fc75cad782e0c03628e4e56f2292d55b78d2c9419"
+checksum = "9b7f1a92d45b2f0b2504e4fd31a348f9ef78172c02fd9ec58c70f1d16e92771e"
 dependencies = [
  "chrono",
  "greentic-config-types",
@@ -2223,9 +2223,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.1.0-dev.26628825486"
+version = "1.1.0-dev.26948183687"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf4b355c02bdac7c280673a102ac9ac6d56b5bba1048dfae244d9835086e257e"
+checksum = "260f7c33b924f56be7bdb790705b032bfc65ee0cd0b5c02d2c7b7a82467ae2c5"
 dependencies = [
  "anyhow",
  "async-trait",
