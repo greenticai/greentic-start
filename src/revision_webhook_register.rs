@@ -12,11 +12,16 @@
 //! so a configured public address is the only thing we can hand to a provider.
 //! With none, registration is skipped (register manually, e.g. via `curl`).
 //!
-//! Runs at boot and after every config reload (hot-attach) — see
-//! [`rebuild_with_registration`].
+//! Runs at boot (after the revision server is listening) and after every
+//! config reload (hot-attach) — see [`post_reload_registration`], which fires
+//! only AFTER `server.reload` swapped the new activation in, so the registered
+//! URL is live before the provider can validate or deliver to it. Both runs
+//! are detached tasks with a per-invocation timeout: a slow or stuck provider
+//! API call must never delay the activation swap, the reload watcher, or boot.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use greentic_deploy_spec::{DeploymentId, Environment, MessagingEndpoint};
@@ -28,6 +33,11 @@ use crate::revision_serve::Activation;
 
 /// Provider op that performs the external webhook registration.
 const SETUP_WEBHOOK_OP: &str = "setup_webhook";
+
+/// Upper bound per `setup_webhook` invocation. Bounds async waits inside the
+/// host; a provider stuck in a blocking in-component HTTP call is additionally
+/// bounded by the host HTTP client's own timeouts.
+const SETUP_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One planned `setup_webhook` invocation, fully resolved from the served
 /// routes + the environment. Kept separate from the invocation loop so the
@@ -47,6 +57,14 @@ struct WebhookRegistration {
     /// The IID `secret_token` (endpoint `provider_id`), when an endpoint links
     /// this bundle. `None` ⇒ register URL-only (single-bundle fallback).
     secret_token: Option<String>,
+    /// Stable, non-secret instance discriminator for providers that reconcile
+    /// registrations by name. Webex prefixes its webhook names with a
+    /// tenant+instance string and DELETES stale entries under that prefix —
+    /// without a distinct instance every auto-registration collapses to the
+    /// provider's `default-default` and deployments sharing one bot delete
+    /// each other's webhooks. The matched `endpoint_id` when an endpoint
+    /// links the bundle, else the `deployment_id` — both ULIDs.
+    instance_id: String,
     /// Count of *additional* same-provider endpoints linked to this bundle
     /// beyond the one we registered. A bot has a single webhook, so we register
     /// the first and warn (never the value — `provider_id` is the secret-token).
@@ -55,7 +73,11 @@ struct WebhookRegistration {
 
 impl WebhookRegistration {
     fn payload(&self) -> Vec<u8> {
-        let mut body = json!({ "webhook_url": self.webhook_url });
+        let mut body = json!({
+            "webhook_url": self.webhook_url,
+            "tenant": self.tenant,
+            "provider_instance_id": self.instance_id,
+        });
         if let Some(token) = &self.secret_token {
             body["secret_token"] = json!(token);
         }
@@ -117,22 +139,31 @@ pub(crate) async fn register_new_model_webhooks(
                 ),
             );
         }
-        match activation
-            .host
-            .invoke_provider_for_revision(
-                &plan.tenant,
-                plan.deployment_id,
-                plan.bundle_id.clone(),
-                plan.revision_id,
-                &plan.provider_type,
-                SETUP_WEBHOOK_OP,
-                plan.payload(),
-                None,
-                None,
-            )
-            .await
-        {
-            Ok(output) => {
+        let invoke = activation.host.invoke_provider_for_revision(
+            &plan.tenant,
+            plan.deployment_id,
+            plan.bundle_id.clone(),
+            plan.revision_id,
+            &plan.provider_type,
+            SETUP_WEBHOOK_OP,
+            plan.payload(),
+            None,
+            None,
+        );
+        match tokio::time::timeout(SETUP_WEBHOOK_TIMEOUT, invoke).await {
+            Err(_elapsed) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "webhook registration timed out after {}s: provider={} url={} \
+                         (the provider may or may not have stored the webhook)",
+                        SETUP_WEBHOOK_TIMEOUT.as_secs(),
+                        plan.provider_name,
+                        plan.webhook_url,
+                    ),
+                );
+            }
+            Ok(Ok(output)) => {
                 // `setup_webhook` may run yet report a logical failure as
                 // `{"ok": false}` (bad token, provider API error, ...).
                 let ok = output.get("ok").and_then(Value::as_bool).unwrap_or(true);
@@ -161,7 +192,7 @@ pub(crate) async fn register_new_model_webhooks(
                     );
                 }
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 // No `setup_webhook` op, missing creds, etc. — not fatal.
                 operator_log::debug(
                     module_path!(),
@@ -230,6 +261,10 @@ fn plan_webhook_registrations(
             })
             .collect();
         let secret_token = matching.first().map(|e| e.provider_id.clone());
+        let instance_id = matching
+            .first()
+            .map(|e| e.endpoint_id.to_string())
+            .unwrap_or_else(|| scope.deployment_id.to_string());
         let extra_endpoints = matching.len().saturating_sub(1);
 
         plans.push(WebhookRegistration {
@@ -241,6 +276,7 @@ fn plan_webhook_registrations(
             provider_name: name,
             webhook_url: format!("{base}{}", route.pattern),
             secret_token,
+            instance_id,
             extra_endpoints,
         });
     }
@@ -248,42 +284,40 @@ fn plan_webhook_registrations(
     plans
 }
 
-/// Wrap a rebuild closure so a successful reload (`Ok(Some(activation))`, i.e.
-/// the config actually changed) re-registers webhooks against the new
-/// activation. Idempotent for unchanged paths; covers hot-attached deployments.
-pub(crate) fn rebuild_with_registration<R>(
-    mut base_rebuild: R,
+/// Build the runtime-config watcher's post-reload hook: after a reload that
+/// actually changed config (`Ok(Some(..))` rebuild) swapped a new activation
+/// into the server, re-register webhooks against it. Running AFTER the swap
+/// matters: a provider that validates the URL during `setup_webhook` (or
+/// delivers immediately) must hit the newly-served routes, not the superseded
+/// activation. The registration itself runs as a detached task so the watcher
+/// thread stays free to process the next reload event. Idempotent for
+/// unchanged paths; covers hot-attached deployments; failures are best-effort
+/// logged — the next config reload re-registers.
+pub(crate) fn post_reload_registration(
     store_root: PathBuf,
     env_id: String,
     public_base_url: Option<String>,
     rt: tokio::runtime::Handle,
-) -> impl FnMut() -> Result<Option<Activation>> + Send + 'static
-where
-    R: FnMut() -> Result<Option<Activation>> + Send + 'static,
-{
-    move || {
-        let result = base_rebuild()?;
-        if let Some(activation) = result.as_ref() {
-            match load_environment(&store_root, &env_id) {
-                Ok(env) => {
-                    rt.block_on(register_new_model_webhooks(
-                        activation,
-                        &env,
-                        public_base_url.as_deref(),
-                    ));
-                }
-                Err(err) => {
-                    operator_log::warn(
-                        module_path!(),
-                        format!(
-                            "skipping webhook re-registration after reload: \
-                             cannot load environment `{env_id}`: {err:#}"
-                        ),
-                    );
-                }
+) -> impl FnMut(&Activation) + Send + 'static {
+    move |activation: &Activation| {
+        let env = match load_environment(&store_root, &env_id) {
+            Ok(env) => env,
+            Err(err) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "skipping webhook re-registration after reload: \
+                         cannot load environment `{env_id}`: {err:#}"
+                    ),
+                );
+                return;
             }
-        }
-        Ok(result)
+        };
+        let activation = activation.clone();
+        let public_base_url = public_base_url.clone();
+        rt.spawn(async move {
+            register_new_model_webhooks(&activation, &env, public_base_url.as_deref()).await;
+        });
     }
 }
 
@@ -342,6 +376,7 @@ mod tests {
             scope(dep, "realbot-pack", rev),
         )];
         let endpoints = vec![endpoint("telegram", "tg-secret-token", &["realbot-pack"])];
+        let eid = endpoints[0].endpoint_id.to_string();
         let tenants = HashMap::from([(dep, "default".to_string())]);
 
         let plans = plan_webhook_registrations(&routes, &endpoints, &tenants, "https://host/");
@@ -351,10 +386,15 @@ mod tests {
         assert_eq!(p.secret_token.as_deref(), Some("tg-secret-token"));
         assert_eq!(p.tenant, "default");
         assert_eq!(p.provider_type, "messaging.telegram");
-        // payload carries both fields
         let body: Value = serde_json::from_slice(&p.payload()).unwrap();
         assert_eq!(body["webhook_url"], "https://host/bot/webhook/telegram");
         assert_eq!(body["secret_token"], "tg-secret-token");
+        // Identity fields: webex derives its reconciliation instance from
+        // tenant + provider_instance_id; without them every registration
+        // collapses to `default-default` and deployments sharing one bot
+        // delete each other's webhooks.
+        assert_eq!(body["tenant"], "default");
+        assert_eq!(body["provider_instance_id"], eid.as_str());
     }
 
     #[test]
@@ -375,6 +415,8 @@ mod tests {
         assert!(plans[0].secret_token.is_none());
         let body: Value = serde_json::from_slice(&plans[0].payload()).unwrap();
         assert!(body.get("secret_token").is_none());
+        // No endpoint → the deployment id is the stable instance discriminator.
+        assert_eq!(body["provider_instance_id"], dep.to_string().as_str());
     }
 
     #[test]

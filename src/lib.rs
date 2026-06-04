@@ -386,13 +386,22 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // Gated on a configured PUBLIC_BASE_URL — the bundle-less boot runs no
         // tunnel, so a configured public address is the only one we can hand to
         // a provider. With none, registration is skipped (register manually).
+        // Detached: the server is already listening, and a slow or stuck
+        // provider API call must not delay the watcher spawn or Ctrl+C
+        // handling; each invocation is bounded by `SETUP_WEBHOOK_TIMEOUT`.
         let public_base_url = startup_contract::configured_public_base_url_from_env()?;
         if revision_count > 0 {
-            activation_rt.block_on(revision_webhook_register::register_new_model_webhooks(
-                &activation,
-                &environment,
-                public_base_url.as_deref(),
-            ));
+            let boot_activation = std::sync::Arc::clone(&activation);
+            let boot_url = public_base_url.clone();
+            let boot_env = environment;
+            activation_rt.spawn(async move {
+                revision_webhook_register::register_new_model_webhooks(
+                    &boot_activation,
+                    &boot_env,
+                    boot_url.as_deref(),
+                )
+                .await;
+            });
         }
         // The server holds its own `Arc<Activation>`; release ours so a later
         // reload can free the superseded activation after its drain window.
@@ -407,22 +416,6 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // `server.reload()` from its worker thread while the main thread
         // still owns the original handle for the shutdown path.
         let server = std::sync::Arc::new(server);
-        // Wrap the rebuild so each reload that actually changes config (a
-        // hot-attached deployment, a new endpoint) re-registers webhooks
-        // against the freshly-activated revisions. Idempotent for unchanged
-        // routes (same URL + secret_token).
-        let rebuild = revision_webhook_register::rebuild_with_registration(
-            revision_reload::default_rebuild(
-                store_root.clone(),
-                env_id.clone(),
-                watcher_secrets,
-                activation_rt.handle().clone(),
-            ),
-            store_root.clone(),
-            env_id.clone(),
-            public_base_url,
-            activation_rt.handle().clone(),
-        );
         let watcher = revision_reload::spawn_runtime_config_watcher(
             env_dir.clone(),
             revision_reload::DEFAULT_DEBOUNCE,
@@ -432,7 +425,23 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             // remote/cloud is Phase D scope.
             std::time::Duration::from_secs(30),
             std::sync::Arc::clone(&server),
-            rebuild,
+            revision_reload::default_rebuild(
+                store_root.clone(),
+                env_id.clone(),
+                watcher_secrets,
+                activation_rt.handle().clone(),
+            ),
+            // Each reload that actually changed config (hot-attached
+            // deployment, new endpoint) re-registers webhooks against the
+            // freshly-served activation — AFTER the swap, so the registered
+            // URL is live before the provider validates or delivers to it.
+            // Idempotent for unchanged routes (same URL + secret_token).
+            revision_webhook_register::post_reload_registration(
+                store_root.clone(),
+                env_id.clone(),
+                public_base_url,
+                activation_rt.handle().clone(),
+            ),
         )
         .context("spawning runtime-config watcher")?;
 

@@ -87,6 +87,11 @@ const MAX_BODY_BYTES: usize = 1 << 20; // 1 MiB
 /// `routing` for the rest of their lifetime — so a [`RevisionServer::reload`]
 /// that swaps the slot mid-request cannot tear (dispatch via the new
 /// dispatcher, execute against the old host, or vice versa).
+///
+/// `Clone` is two `Arc` bumps — the reload worker clones the activation it
+/// swaps in so the post-reload hook observes the same (host, routing) pair
+/// the server now serves.
+#[derive(Clone)]
 pub(crate) struct Activation {
     pub host: Arc<RunnerHost>,
     pub routing: Arc<RevisionIngressRouting>,
@@ -771,6 +776,9 @@ async fn serve(
                 query_string.as_deref(),
                 &request_headers,
                 &body_bytes,
+                peer_is_loopback,
+                &identify_headers,
+                header_endpoint_id.as_deref(),
             )
             .await;
         }
@@ -1561,6 +1569,9 @@ async fn dispatch_provider_route(
     query: Option<&str>,
     request_headers: &[(String, String)],
     body: &[u8],
+    peer_is_loopback: bool,
+    identify_headers: &[(String, String)],
+    header_endpoint_id: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
     let Some(route_match) = activation
         .routing
@@ -1588,6 +1599,82 @@ async fn dispatch_provider_route(
     let deployment_id = scope.deployment_id;
     let bundle_id = scope.bundle_id.clone();
     let revision_id = scope.revision_id;
+
+    // M1 IID.4 resolver, provider-route arm — mirrors the generic-JSON branch:
+    // identify the endpoint instance from `{headers, body}`, folded against
+    // the env's `(provider_type, provider_id) → endpoint_id` admit table, with
+    // the same trust boundary (loopback header wins; non-loopback peers
+    // short-circuit to `PublicSkipped`; ≥2-endpoint ambiguity fails closed).
+    // Without this, provider webhooks ran flows with no endpoint attribution:
+    // the auto-registered IID `secret_token` (see `revision_webhook_register`)
+    // was never matched, and per-endpoint session isolation, welcome-flow
+    // selection, and the linked-bundle ACL never applied on this path.
+    let resolution = endpoint_resolver::resolve(
+        &activation.host,
+        tenant,
+        scope,
+        activation.routing.endpoint_admit.as_ref(),
+        header_endpoint_id,
+        peer_is_loopback,
+        || {
+            // Provider bodies are not necessarily JSON (form-urlencoded,
+            // signature blobs) — identify is best-effort on the body; the
+            // header set (e.g. Telegram's secret-token) is always carried.
+            let body_value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            identify_payload::build_identify_payload(identify_headers, &body_value)
+        },
+    )
+    .await
+    .map_err(|err| {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "messaging-endpoint resolver failed for provider {provider_type} \
+                 (deployment {deployment_id} revision {revision_id}): {err:#}"
+            ),
+        );
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "messaging-endpoint resolution failed",
+        )
+    })?;
+
+    tracing::info!(
+        target: "greentic_start::endpoint_resolver",
+        endpoint_resolution = resolution.origin(),
+        messaging_endpoint_id = resolution.endpoint_id().unwrap_or(""),
+        "messaging-endpoint resolution outcome (provider route)",
+    );
+
+    if matches!(resolution, endpoint_resolver::ResolverOutcome::Ambiguous) {
+        return Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "messaging endpoint resolution is ambiguous; assert the endpoint via \
+             x-greentic-messaging-endpoint-id",
+        ));
+    }
+    let endpoint_id: Option<String> = resolution.endpoint_id().map(str::to_string);
+
+    // M1.4c-ii admit gate: the resolved endpoint's `linked_bundles` ACL must
+    // include the scoped bundle, refused BEFORE `ingest_http` runs so traffic
+    // outside the ACL never reaches the provider component. A `None` eid
+    // short-circuits to Ok (legacy single-instance back-compat), matching the
+    // generic branch.
+    let admission = resolve_endpoint_admission(
+        endpoint_id.as_deref(),
+        activation.routing.endpoint_admit.as_ref(),
+    )
+    .map_err(|boxed| *boxed)?;
+    check_bundle_admission(&admission, scope.bundle_id.as_str()).map_err(|boxed| *boxed)?;
+
+    // M1.5 welcome-flow hint, bundle-scoped like the generic branch. Safe to
+    // attach per-turn — runner-host gates the override on a durable
+    // first-contact marker (greentic-runner#382).
+    let welcome_hint = resolve_welcome_flow_hint(
+        endpoint_id.as_deref(),
+        &scope.bundle_id,
+        &activation.routing.endpoint_admit,
+    );
 
     let http_in = build_provider_http_in(
         &provider_type,
@@ -1685,6 +1772,8 @@ async fn dispatch_provider_route(
                 revision_id,
                 pipeline_provider,
                 ingress_envelopes,
+                endpoint_id,
+                welcome_hint,
             )
             .await;
         });
@@ -1702,6 +1791,7 @@ async fn dispatch_provider_route(
 /// Errors are logged but never bubble out — the upstream already saw its
 /// 2xx, so returning a non-2xx now is impossible, and propagating an Err
 /// would just hang in the abandoned task.
+#[allow(clippy::too_many_arguments)]
 async fn run_provider_inbound_pipeline(
     activation: Arc<Activation>,
     tenant: String,
@@ -1710,9 +1800,16 @@ async fn run_provider_inbound_pipeline(
     revision_id: RevisionId,
     provider_type: String,
     envelopes: Vec<ChannelMessageEnvelope>,
+    endpoint_id: Option<String>,
+    welcome_hint: Option<WelcomeFlowHint>,
 ) {
     for ingress in &envelopes {
-        let activity = envelope_to_activity(ingress, &tenant);
+        let activity = envelope_to_activity(
+            ingress,
+            &tenant,
+            endpoint_id.as_deref(),
+            welcome_hint.clone(),
+        );
         let replies = match activation
             .host
             .handle_activity_for_revision(
@@ -2036,7 +2133,12 @@ fn parse_query_pairs(query: Option<&str>) -> Vec<(String, String)> {
 /// the runtime's [`Activity`] shape. Mirrors [`build_activity`]: a non-empty
 /// `text` becomes a messaging activity, otherwise the whole envelope rides
 /// as a `provider.event` custom activity so the flow can still inspect it.
-fn envelope_to_activity(envelope: &ChannelMessageEnvelope, fallback_tenant: &str) -> Activity {
+fn envelope_to_activity(
+    envelope: &ChannelMessageEnvelope,
+    fallback_tenant: &str,
+    endpoint_id: Option<&str>,
+    welcome_hint: Option<WelcomeFlowHint>,
+) -> Activity {
     // Serialize the whole envelope as the activity payload so the flow engine
     // sees BOTH `entry.text` and `entry.metadata.*`. `build_routing_context`
     // synthesises the `response.*` object that conditional routes test (e.g.
@@ -2064,6 +2166,15 @@ fn envelope_to_activity(envelope: &ChannelMessageEnvelope, fallback_tenant: &str
         && !from.id.is_empty()
     {
         activity = activity.from_user(&from.id);
+    }
+    // M1.4 endpoint attribution + M1.5 welcome hint, resolved once per request
+    // in `dispatch_provider_route` and attached to every envelope's activity —
+    // the same pair `build_activity` threads on the generic-JSON branch.
+    if let Some(eid) = endpoint_id {
+        activity = activity.with_messaging_endpoint(eid);
+    }
+    if let Some(hint) = welcome_hint {
+        activity = activity.with_welcome_flow_hint(hint);
     }
     activity
 }
@@ -2801,7 +2912,7 @@ mod tests {
             "metadata": {},
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback");
+        let activity = envelope_to_activity(&envelope, "fallback", None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.session_id(), Some("sess-1"));
         assert_eq!(activity.user(), Some("u1"));
@@ -2829,7 +2940,7 @@ mod tests {
             "metadata": {},
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback");
+        let activity = envelope_to_activity(&envelope, "fallback", None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.session_id(), None);
     }
@@ -2859,7 +2970,7 @@ mod tests {
             },
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback");
+        let activity = envelope_to_activity(&envelope, "fallback", None, None);
         let entry = activity.payload();
         // `response.action` resolves from `entry.metadata.action`.
         assert_eq!(
@@ -2872,6 +2983,38 @@ mod tests {
             Some("[callback:{\"action\":\"about_card\"}]"),
         );
         assert_eq!(activity.flow_type(), Some("messaging"));
+    }
+
+    #[test]
+    fn envelope_to_activity_attaches_endpoint_and_welcome_hint() {
+        // M1.4/M1.5 on the provider-route path: the eid + welcome hint
+        // resolved in `dispatch_provider_route` must reach the activity so
+        // per-endpoint session isolation and welcome-flow selection apply to
+        // provider webhooks the same way the generic-JSON branch's
+        // `build_activity` applies them.
+        let envelope: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-1",
+            "tenant": {
+                "env": "dev",
+                "tenant": "acme",
+                "tenant_id": "acme",
+                "attempt": 0,
+            },
+            "channel": "telegram",
+            "session_id": "sess-1",
+            "from": { "id": "u1", "kind": "user" },
+            "text": "hello",
+            "metadata": {},
+        }))
+        .expect("envelope");
+        let hint = WelcomeFlowHint {
+            pack_id: "welcome-pack".to_string(),
+            flow_id: "welcome-flow".to_string(),
+        };
+        let activity =
+            envelope_to_activity(&envelope, "fallback", Some("ep-legal"), Some(hint.clone()));
+        assert_eq!(activity.messaging_endpoint_id(), Some("ep-legal"));
+        assert_eq!(activity.welcome_flow_hint(), Some(&hint));
     }
 
     #[test]

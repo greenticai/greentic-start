@@ -111,15 +111,24 @@ impl Drop for WatcherHandle {
 /// The watcher takes ownership of `rebuild` and `server` for the worker's
 /// lifetime; both are dropped when the returned [`WatcherHandle`] is
 /// dropped.
-pub(crate) fn spawn_runtime_config_watcher<R>(
+///
+/// `post_reload` runs AFTER `server.reload` swapped the new activation in.
+/// Side effects that need the new routes to be live (e.g. provider webhook
+/// re-registration, which an external provider may validate or deliver to
+/// immediately) belong there, never inside `rebuild` — the server still
+/// serves the OLD activation while `rebuild` runs, so a slow side effect
+/// inside `rebuild` would also delay the swap itself.
+pub(crate) fn spawn_runtime_config_watcher<R, P>(
     env_dir: PathBuf,
     debounce: Duration,
     drain_window: Duration,
     server: Arc<RevisionServer>,
     rebuild: R,
+    post_reload: P,
 ) -> Result<WatcherHandle>
 where
     R: FnMut() -> Result<Option<Activation>> + Send + 'static,
+    P: FnMut(&Activation) + Send + 'static,
 {
     // Trigger set: paths whose mutations must invalidate the activation.
     // `runtime-config.json` is the original trigger; `environment.json` is
@@ -149,7 +158,7 @@ where
     let worker = thread::Builder::new()
         .name("revision-reload".to_string())
         .spawn(move || {
-            reload_worker(rx, target_files, drain_window, server, rebuild);
+            reload_worker(rx, target_files, drain_window, server, rebuild, post_reload);
         })
         .context("spawning runtime-config reload worker")?;
 
@@ -165,14 +174,16 @@ where
 ///
 /// Extracted from `spawn_runtime_config_watcher` so tests can drive the
 /// worker directly without going through `notify`.
-fn reload_worker<R>(
+fn reload_worker<R, P>(
     rx: mpsc::Receiver<DebounceEventResult>,
     target_files: Vec<PathBuf>,
     drain_window: Duration,
     server: Arc<RevisionServer>,
     mut rebuild: R,
+    mut post_reload: P,
 ) where
     R: FnMut() -> Result<Option<Activation>> + Send + 'static,
+    P: FnMut(&Activation) + Send + 'static,
 {
     for result in rx {
         let events = match result {
@@ -203,6 +214,10 @@ fn reload_worker<R>(
         }
         match rebuild() {
             Ok(Some(activation)) => {
+                // Clone (two Arc bumps) so the post-reload hook observes the
+                // SAME (host, routing) pair the server now serves; the hook
+                // fires only after the swap below.
+                let live = activation.clone();
                 let report = server.reload(activation, drain_window);
                 operator_log::info(
                     module_path!(),
@@ -214,6 +229,7 @@ fn reload_worker<R>(
                         report.new_revisions,
                     ),
                 );
+                post_reload(&live);
             }
             Ok(None) => {
                 // Identical-config write or otherwise no-op rebuild;
@@ -408,6 +424,7 @@ mod tests {
             Duration::ZERO,
             placeholder_server(),
             channel_rebuild(tx),
+            |_: &Activation| {},
         )
         .expect("spawn watcher");
 
@@ -432,6 +449,7 @@ mod tests {
             Duration::ZERO,
             placeholder_server(),
             channel_rebuild(tx),
+            |_: &Activation| {},
         )
         .expect("spawn watcher");
 
@@ -454,6 +472,7 @@ mod tests {
             Duration::ZERO,
             placeholder_server(),
             counting_rebuild(Arc::clone(&counter)),
+            |_: &Activation| {},
         )
         .expect("spawn watcher");
 
@@ -486,6 +505,7 @@ mod tests {
             Duration::ZERO,
             placeholder_server(),
             channel_rebuild(tx),
+            |_: &Activation| {},
         )
         .expect("spawn watcher");
 
@@ -508,6 +528,7 @@ mod tests {
             Duration::ZERO,
             placeholder_server(),
             counting_rebuild(Arc::clone(&counter)),
+            |_: &Activation| {},
         )
         .expect("spawn watcher");
 
@@ -534,6 +555,7 @@ mod tests {
             Duration::ZERO,
             placeholder_server(),
             counting_rebuild(Arc::clone(&counter)),
+            |_: &Activation| {},
         )
         .expect("spawn watcher");
 
@@ -650,6 +672,7 @@ mod tests {
                     Ok(None)
                 }
             },
+            |_: &Activation| {},
         )
         .expect("spawn watcher");
 
