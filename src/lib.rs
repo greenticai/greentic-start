@@ -57,6 +57,7 @@ pub mod revision_health_gate;
 mod revision_pin;
 mod revision_reload;
 mod revision_serve;
+mod revision_webhook_register;
 mod rollout_telemetry;
 mod runner_exec;
 mod runner_host;
@@ -354,12 +355,13 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // assets under revisions stay on the legacy `--bundle` ingress.
         let revision_boot::RuntimeConfigActivation { host, routing } = activation;
         let bind_addr = revision_serve::resolve_bind_addr(Some(&environment.host_config));
+        let activation = std::sync::Arc::new(revision_serve::Activation {
+            host: std::sync::Arc::new(host),
+            routing: std::sync::Arc::new(routing),
+        });
         let server = revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
             bind_addr,
-            activation: std::sync::Arc::new(revision_serve::Activation {
-                host: std::sync::Arc::new(host),
-                routing: std::sync::Arc::new(routing),
-            }),
+            activation: std::sync::Arc::clone(&activation),
         })
         .context("starting the revision ingress server")?;
         let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
@@ -380,6 +382,22 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         operator_log::info(module_path!(), banner.clone());
         println!("\n{banner}. Press Ctrl+C to stop.");
 
+        // Phase D: auto-register provider webhooks for the served revisions.
+        // Gated on a configured PUBLIC_BASE_URL — the bundle-less boot runs no
+        // tunnel, so a configured public address is the only one we can hand to
+        // a provider. With none, registration is skipped (register manually).
+        let public_base_url = startup_contract::configured_public_base_url_from_env()?;
+        if revision_count > 0 {
+            activation_rt.block_on(revision_webhook_register::register_new_model_webhooks(
+                &activation,
+                &environment,
+                public_base_url.as_deref(),
+            ));
+        }
+        // The server holds its own `Arc<Activation>`; release ours so a later
+        // reload can free the superseded activation after its drain window.
+        drop(activation);
+
         // N2.2: spawn the runtime-config watcher. As the deployer rewrites
         // `<env_dir>/runtime-config.json` (via `gtc op bundles add`,
         // `revisions stage/warm`, `traffic set`), the watcher rebuilds the
@@ -389,6 +407,22 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // `server.reload()` from its worker thread while the main thread
         // still owns the original handle for the shutdown path.
         let server = std::sync::Arc::new(server);
+        // Wrap the rebuild so each reload that actually changes config (a
+        // hot-attached deployment, a new endpoint) re-registers webhooks
+        // against the freshly-activated revisions. Idempotent for unchanged
+        // routes (same URL + secret_token).
+        let rebuild = revision_webhook_register::rebuild_with_registration(
+            revision_reload::default_rebuild(
+                store_root.clone(),
+                env_id.clone(),
+                watcher_secrets,
+                activation_rt.handle().clone(),
+            ),
+            store_root.clone(),
+            env_id.clone(),
+            public_base_url,
+            activation_rt.handle().clone(),
+        );
         let watcher = revision_reload::spawn_runtime_config_watcher(
             env_dir.clone(),
             revision_reload::DEFAULT_DEBOUNCE,
@@ -398,12 +432,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             // remote/cloud is Phase D scope.
             std::time::Duration::from_secs(30),
             std::sync::Arc::clone(&server),
-            revision_reload::default_rebuild(
-                store_root.clone(),
-                env_id.clone(),
-                watcher_secrets,
-                activation_rt.handle().clone(),
-            ),
+            rebuild,
         )
         .context("spawning runtime-config watcher")?;
 
