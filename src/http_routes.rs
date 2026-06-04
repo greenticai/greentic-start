@@ -103,6 +103,28 @@ pub(crate) fn descriptor_for_test(
     }
 }
 
+/// Test-only synthesized provider-ingest descriptor with a `provider_type` and
+/// `scope` set (unlike [`descriptor_for_test`], which names no provider). Used
+/// by `revision_webhook_register` tests to exercise the route↔endpoint join.
+#[cfg(test)]
+pub(crate) fn provider_descriptor_for_test(
+    pattern: &str,
+    provider_type: &str,
+    scope: RevisionScope,
+) -> HttpRouteDescriptor {
+    HttpRouteDescriptor {
+        route_id: pattern.to_string(),
+        pack_id: "test-pack".to_string(),
+        pattern: pattern.to_string(),
+        methods: vec!["POST".to_string()],
+        provider_op: INGEST_HTTP_OP.to_string(),
+        provider_type: Some(provider_type.to_string()),
+        domain: Domain::Messaging,
+        scope: Some(scope),
+        segments: parse_route_pattern(pattern),
+    }
+}
+
 impl HttpRouteTable {
     pub fn from_descriptors(mut routes: Vec<HttpRouteDescriptor>) -> Self {
         // Sort by segment count descending (most specific first).
@@ -667,7 +689,7 @@ pub fn discover_revision_routes(
 /// when present, then the trailing kind suffix (`bot`, `graph`, `client`,
 /// `gui`, `webhook`) is dropped if there is more than one segment remaining.
 /// Returns `None` for unrecognizable shapes (empty, no dots after stripping).
-fn derive_provider_name(provider_type: &str) -> Option<String> {
+pub(crate) fn derive_provider_name(provider_type: &str) -> Option<String> {
     let trimmed = provider_type
         .strip_prefix("messaging.")
         .unwrap_or(provider_type);

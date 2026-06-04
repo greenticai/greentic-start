@@ -57,6 +57,7 @@ pub mod revision_health_gate;
 mod revision_pin;
 mod revision_reload;
 mod revision_serve;
+mod revision_webhook_register;
 mod rollout_telemetry;
 mod runner_exec;
 mod runner_host;
@@ -354,12 +355,13 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // assets under revisions stay on the legacy `--bundle` ingress.
         let revision_boot::RuntimeConfigActivation { host, routing } = activation;
         let bind_addr = revision_serve::resolve_bind_addr(Some(&environment.host_config));
+        let activation = std::sync::Arc::new(revision_serve::Activation {
+            host: std::sync::Arc::new(host),
+            routing: std::sync::Arc::new(routing),
+        });
         let server = revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
             bind_addr,
-            activation: std::sync::Arc::new(revision_serve::Activation {
-                host: std::sync::Arc::new(host),
-                routing: std::sync::Arc::new(routing),
-            }),
+            activation: std::sync::Arc::clone(&activation),
         })
         .context("starting the revision ingress server")?;
         let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
@@ -379,6 +381,31 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         };
         operator_log::info(module_path!(), banner.clone());
         println!("\n{banner}. Press Ctrl+C to stop.");
+
+        // Phase D: auto-register provider webhooks for the served revisions.
+        // Gated on a configured PUBLIC_BASE_URL — the bundle-less boot runs no
+        // tunnel, so a configured public address is the only one we can hand to
+        // a provider. With none, registration is skipped (register manually).
+        // Detached: the server is already listening, and a slow or stuck
+        // provider API call must not delay the watcher spawn or Ctrl+C
+        // handling; each invocation is bounded by `SETUP_WEBHOOK_TIMEOUT`.
+        let public_base_url = startup_contract::configured_public_base_url_from_env()?;
+        if revision_count > 0 {
+            let boot_activation = std::sync::Arc::clone(&activation);
+            let boot_url = public_base_url.clone();
+            let boot_env = environment;
+            activation_rt.spawn(async move {
+                revision_webhook_register::register_new_model_webhooks(
+                    &boot_activation,
+                    &boot_env,
+                    boot_url.as_deref(),
+                )
+                .await;
+            });
+        }
+        // The server holds its own `Arc<Activation>`; release ours so a later
+        // reload can free the superseded activation after its drain window.
+        drop(activation);
 
         // N2.2: spawn the runtime-config watcher. As the deployer rewrites
         // `<env_dir>/runtime-config.json` (via `gtc op bundles add`,
@@ -402,6 +429,17 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 store_root.clone(),
                 env_id.clone(),
                 watcher_secrets,
+                activation_rt.handle().clone(),
+            ),
+            // Each reload that actually changed config (hot-attached
+            // deployment, new endpoint) re-registers webhooks against the
+            // freshly-served activation — AFTER the swap, so the registered
+            // URL is live before the provider validates or delivers to it.
+            // Idempotent for unchanged routes (same URL + secret_token).
+            revision_webhook_register::post_reload_registration(
+                store_root.clone(),
+                env_id.clone(),
+                public_base_url,
                 activation_rt.handle().clone(),
             ),
         )
