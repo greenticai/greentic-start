@@ -85,21 +85,22 @@ features = [
 ]
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
-# (per-env trust root + operator key, deployer #226). Floor bumped to the M1.2
-# publish (deployer #6e4427a + follow-ups) — the deployer cross-uses
-# `Environment.messaging_endpoints` in its CLI; an older deployer paired with
-# the M1.2 deploy-spec fails to initialize that field.
+# (per-env trust root + operator key, deployer #226). Floor bumped to the
+# Extension-slot publish (deployer #239 / #240) — the deployer's
+# `EnvironmentStore` round-trips `Environment.extensions`; an older deployer
+# paired with the Path-3 deploy-spec would drop that field on load.
 [dependencies.greentic-deployer]
-version = ">=1.1.0-dev.26628825486, <1.2.0-0"
+version = ">=1.1.0-dev.26948183687, <1.2.0-0"
 default-features = false
 
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
 # / `Revision` cross the deployer boundary, so resolution must not pick an
-# older deploy-spec. Floor bumped to the M1.2 publish that adds
-# `MessagingEndpoint` + `Environment.messaging_endpoints` — the M1.4c-ii
-# admit gate reads those, earlier publishes don't expose them.
+# older deploy-spec. Floor bumped to the Extension-slot publish that adds
+# `Environment.extensions` + `ExtensionRef` + `Environment::extension_for_ref`
+# — the `ext://` runtime resolver reads those, earlier publishes don't expose
+# them.
 [dependencies.greentic-deploy-spec]
-version = ">=0.1.26628825486, <0.2"
+version = ">=0.1.26948183687, <0.2"
 
 [dependencies.greentic-setup]
 version = ">=1.1.0-dev, <1.2.0-0"

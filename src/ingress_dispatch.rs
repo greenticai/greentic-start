@@ -3,7 +3,8 @@
 use anyhow::Context;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use greentic_types::ChannelMessageEnvelope;
+use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
+use greentic_types::{ChannelMessageEnvelope, EnvId};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::fs;
 use std::path::Path;
@@ -61,16 +62,17 @@ pub fn dispatch_http_ingress_with_op(
     // Inject secrets into config for providers running in provider_core_only mode.
     // Fall back to a minimal config for events providers that require a non-null
     // config object even when no secrets or setup have been configured yet.
-    let config = build_injected_config(runner_host, domain, &request.provider, ctx).or_else(|| {
-        if matches!(domain, Domain::Events) {
-            Some(json!({
-                "target_url": "http://0.0.0.0:0/events/noop",
-                "timeout_ms": 1
-            }))
-        } else {
-            None
-        }
-    });
+    let config =
+        build_injected_config(runner_host, domain, &request.provider, ctx)?.or_else(|| {
+            if matches!(domain, Domain::Events) {
+                Some(json!({
+                    "target_url": "http://0.0.0.0:0/events/noop",
+                    "timeout_ms": 1
+                }))
+            } else {
+                None
+            }
+        });
 
     let http_in = build_ingress_request(
         &request.provider,
@@ -196,9 +198,11 @@ pub(crate) fn build_injected_config(
     domain: Domain,
     provider: &str,
     ctx: &OperatorContext,
-) -> Option<JsonValue> {
+) -> anyhow::Result<Option<JsonValue>> {
     // Get the pack path for this provider
-    let pack_path = runner_host.get_provider_pack_path(domain, provider)?;
+    let Some(pack_path) = runner_host.get_provider_pack_path(domain, provider) else {
+        return Ok(None);
+    };
 
     let mut config_map = serde_json::Map::new();
 
@@ -214,13 +218,22 @@ pub(crate) fn build_injected_config(
 
     // Prefer already-materialized runtime config over live secret-store reads.
     // This keeps hot ingress paths off the dev-store for cloud targets like AWS.
-    if let Some(envelope_config) =
-        load_provider_config_from_envelope(runner_host.bundle_root(), provider)
-    {
-        inject_config_values(&mut config_map, &envelope_config, &secret_keys);
+    let mut envelope_config =
+        load_provider_config_from_envelope(runner_host.bundle_root(), provider);
+    let mut setup_answers = load_provider_setup_answers(runner_host.bundle_root(), provider);
+
+    // Path 3: substitute any `ext://<path>[/<instance>]` config value with the
+    // bound extension's resolved config/answers blob before it is encoded for
+    // the component — the open-namespace analogue of the `secrets://`
+    // resolution below. Fail-closed: a value naming an unbound extension errors
+    // the ingress rather than handing the component an opaque `ext://` string.
+    resolve_ext_refs_in_sources(&mut envelope_config, &mut setup_answers)?;
+
+    if let Some(envelope_config) = &envelope_config {
+        inject_config_values(&mut config_map, envelope_config, &secret_keys);
     }
-    if let Some(setup_answers) = load_provider_setup_answers(runner_host.bundle_root(), provider) {
-        inject_config_values(&mut config_map, &setup_answers, &secret_keys);
+    if let Some(setup_answers) = &setup_answers {
+        inject_config_values(&mut config_map, setup_answers, &secret_keys);
     }
     inject_runtime_env_config(&mut config_map, provider);
 
@@ -254,10 +267,54 @@ pub(crate) fn build_injected_config(
     }
 
     if !config_map.is_empty() {
-        Some(JsonValue::Object(config_map))
+        Ok(Some(JsonValue::Object(config_map)))
     } else {
-        None
+        Ok(None)
     }
+}
+
+/// Resolve `ext://` references that may appear in a provider's config sources,
+/// loading the active environment **only** when a reference is actually present
+/// (the env-store read stays off the common ingress path, which carries none).
+/// Fail-closed — a stale or invalid reference is an error, never a
+/// pass-through. See [`crate::extension_resolver`].
+fn resolve_ext_refs_in_sources(
+    envelope_config: &mut Option<JsonValue>,
+    setup_answers: &mut Option<JsonValue>,
+) -> anyhow::Result<()> {
+    let any_ext_ref = [envelope_config.as_ref(), setup_answers.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_object)
+        .any(crate::extension_resolver::map_has_ext_ref);
+    if !any_ext_ref {
+        return Ok(());
+    }
+
+    let env_id = crate::resolve_env(None);
+    let store_root = LocalFsStore::default_root()
+        .context("resolving environment store root for ext:// resolution")?;
+    let env_dir = crate::runtime_config::env_dir_in(&store_root, &env_id)?;
+    let env_typed =
+        EnvId::new(&env_id).with_context(|| format!("invalid environment id `{env_id}`"))?;
+    let store = LocalFsStore::new(store_root);
+    let environment = EnvironmentStore::load(&store, &env_typed)
+        .with_context(|| format!("loading environment `{env_id}` for ext:// resolution"))?;
+
+    // One memo across both sources: the same `ext://` ref under several keys
+    // (or in both envelope and setup-answers) reads its blob once per ingress.
+    let mut resolved = std::collections::HashMap::new();
+    for source in [envelope_config, setup_answers] {
+        if let Some(map) = source.as_mut().and_then(JsonValue::as_object_mut) {
+            crate::extension_resolver::rewrite_ext_refs(
+                map,
+                &environment,
+                &env_dir,
+                &mut resolved,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn inject_runtime_env_config(config_map: &mut JsonMap<String, JsonValue>, provider: &str) {

@@ -200,7 +200,7 @@ pub(super) fn route_messaging_envelopes(
             };
 
             let provider_type = runner_host.canonical_provider_type(Domain::Messaging, provider);
-            let config = build_injected_config(runner_host, Domain::Messaging, provider, ctx)
+            let config = build_injected_config(runner_host, Domain::Messaging, provider, ctx)?
                 .map(decode_injected_config_for_provider);
             let send_input = egress::build_send_payload(
                 payload,

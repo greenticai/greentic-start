@@ -119,6 +119,7 @@ mod tests {
             },
             packs: Vec::new(),
             messaging_endpoints: Vec::new(),
+            extensions: Vec::new(),
             credentials_ref: None,
             bundles: Vec::new(),
             revisions: Vec::new(),
