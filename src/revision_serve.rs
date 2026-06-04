@@ -45,6 +45,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
 use greentic_types::ChannelMessageEnvelope;
+use greentic_types::messaging::extensions::ext_keys;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1::Builder as Http1Builder;
@@ -1933,13 +1934,37 @@ fn build_reply_envelope(
     }
     envelope.metadata = clean;
 
-    if let Some(text) = reply
-        .payload()
-        .get("text")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        envelope.text = Some(text.to_string());
+    // Lift the flow reply's content via the same extractor the worker/chat
+    // path uses (`activity_to_worker_message`), so it handles the `session.wait`
+    // "pending" wrapper and `renderedCard` shape uniformly. An adaptive card
+    // goes into `metadata["adaptive_card"]` — where every provider's
+    // `resolve_adaptive_card` reads it — plus `extensions[ADAPTIVE_CARD]` for
+    // the typed pipeline; otherwise carry the reply text. Without the card lift,
+    // TierD providers (Telegram/Slack/WhatsApp/...) fall back to their
+    // "universal <provider> payload" placeholder instead of the card.
+    let message = activity_to_worker_message(reply);
+    match message.kind.as_str() {
+        "adaptive-card" => {
+            if let Ok(ac_json) = serde_json::to_string(&message.payload) {
+                envelope
+                    .metadata
+                    .insert("adaptive_card".to_string(), ac_json);
+            }
+            envelope
+                .extensions
+                .insert(ext_keys::ADAPTIVE_CARD.to_string(), message.payload);
+        }
+        "text" => {
+            if let Some(text) = message
+                .payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                envelope.text = Some(text.to_string());
+            }
+        }
+        _ => {}
     }
 
     envelope
@@ -2844,6 +2869,62 @@ mod tests {
         // Ingress metadata pruned to the routing-relevant subset.
         assert!(envelope.metadata.contains_key("route"));
         assert!(!envelope.metadata.contains_key("leftover"));
+    }
+
+    #[test]
+    fn build_reply_envelope_lifts_rendered_card_into_metadata() {
+        // A flow that renders an Adaptive Card (e.g. welcome_card) returns it as
+        // a custom `response` Activity carrying `renderedCard`. The provider
+        // egress reads the card from `metadata["adaptive_card"]`; if it isn't
+        // lifted, TierD providers (Telegram/Slack/...) send their
+        // "universal <provider> payload" placeholder instead of the card.
+        let ingress: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-in-card",
+            "tenant": { "env": "dev", "tenant": "acme", "tenant_id": "acme", "attempt": 0 },
+            "channel": "telegram",
+            "session_id": "chat-7",
+            "to": [{ "id": "room-1", "kind": "room" }],
+            "text": "hi",
+        }))
+        .expect("ingress envelope");
+
+        let card = json!({ "type": "AdaptiveCard", "version": "1.6" });
+
+        // Direct `renderedCard` shape.
+        let reply = Activity::custom("response", json!({ "renderedCard": card.clone() }));
+        let envelope = build_reply_envelope(&ingress, &reply);
+        let stored: Value = serde_json::from_str(
+            envelope
+                .metadata
+                .get("adaptive_card")
+                .expect("adaptive_card in metadata"),
+        )
+        .expect("card json");
+        assert_eq!(stored, card);
+        assert_eq!(
+            envelope.extensions.get(ext_keys::ADAPTIVE_CARD),
+            Some(&card)
+        );
+        // Card present → no redundant text bubble, route cloned from ingress.
+        assert!(envelope.text.is_none());
+        assert_eq!(envelope.channel, "telegram");
+        assert_eq!(envelope.session_id, "chat-7");
+
+        // `session.wait` "pending" wrapper: the welcome_card node pauses, so the
+        // card arrives wrapped — the same extractor must still find it.
+        let pending = Activity::custom(
+            "response",
+            json!({ "status": "pending", "response": { "renderedCard": card.clone() } }),
+        );
+        let envelope = build_reply_envelope(&ingress, &pending);
+        let stored: Value = serde_json::from_str(
+            envelope
+                .metadata
+                .get("adaptive_card")
+                .expect("adaptive_card from pending wrapper"),
+        )
+        .expect("card json");
+        assert_eq!(stored, card);
     }
 
     #[test]
