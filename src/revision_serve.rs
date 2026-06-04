@@ -704,11 +704,11 @@ async fn serve(
     );
 
     // M1.4c-ii admit gate, step 1: if the caller asserts a messaging endpoint,
-    // it MUST be one this env declared. Resolved here (before dispatch) so an
-    // unknown asserted endpoint refuses cheaply; the actual bundle-membership
-    // check is step 2, after dispatch picks a revision. Resolver-derived eids
-    // (no header asserted) re-resolve admission post-dispatch — see below.
-    let header_admission = resolve_endpoint_admission(
+    // it MUST be one this env declared. Checked here (before dispatch) so an
+    // unknown asserted endpoint refuses cheaply; the bundle-membership check
+    // is step 2, inside [`resolve_endpoint_for_scope`] after dispatch picks a
+    // revision.
+    resolve_endpoint_admission(
         header_endpoint_id.as_deref(),
         activation.routing.endpoint_admit.as_ref(),
     )
@@ -800,109 +800,18 @@ async fn serve(
             .map_err(|_| error_response(StatusCode::BAD_REQUEST, "request body must be JSON"))?
     };
 
-    // M1 IID.4 resolver: dispatch has picked a revision; ask each enabled
-    // provider component (one probe per declared `provider_type`) to
-    // identify this payload, and fold the per-type results against the
-    // env's `(provider_type, provider_id) → endpoint_id` table.
-    //
-    // Placement: AFTER dispatch (the host method is revision-scoped — it
-    // loads the picked revision's pack runtime to find the component
-    // bindings), BEFORE the post-dispatch admit step (so a resolver Hit
-    // re-resolves admission against the chosen eid).
-    //
-    // Trust boundary: `peer_is_loopback` gates the resolver the same way
-    // `caller_identity` gates the header path. Without this gate, a remote
-    // caller posting a forged webhook payload with a discriminator the
-    // provider component identifies (e.g. a Teams serviceUrl for bot X)
-    // would derive an endpoint and cross-contaminate sessions/welcome-flows.
-    // The resolver short-circuits to `PublicSkipped` for non-loopback peers.
-    // M1 IID.4d wrapper: pass `{headers, body}` instead of raw body bytes so
-    // providers whose discriminator lives in HTTP headers (Telegram) can
-    // identify the instance the same way body-based providers do (Teams,
-    // Slack, etc.). Build LAZILY — the resolver short-circuits without
-    // touching the payload on public traffic, header-pinned eids, and
-    // no-endpoint envs, so most requests skip the body clone + re-serialize.
-    let resolution = endpoint_resolver::resolve(
-        &activation.host,
+    // M1 IID.4 resolver + M1.4c-ii admit + M1.5 welcome hint — shared with the
+    // provider-route arm; see [`resolve_endpoint_for_scope`]. The identify
+    // payload is built lazily from the already-parsed JSON body.
+    let (endpoint_id, welcome_hint) = resolve_endpoint_for_scope(
+        &activation,
         &tenant,
         &scope,
-        activation.routing.endpoint_admit.as_ref(),
         header_endpoint_id.as_deref(),
         peer_is_loopback,
         || identify_payload::build_identify_payload(&identify_headers, &payload),
     )
-    .await
-    .map_err(|err| {
-        operator_log::warn(
-            module_path!(),
-            format!(
-                "messaging-endpoint resolver failed for deployment {deployment_id} \
-                 revision {}: {err:#}",
-                outcome.revision_id
-            ),
-        );
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "messaging-endpoint resolution failed",
-        )
-    })?;
-
-    // `gt.endpoint_resolution` telemetry — emitted as a structured event
-    // with snake_case field names (tracing's macro grammar can't take
-    // dotted field names directly). Operators converting these to
-    // `gt.*` attribute form do it at the subscriber layer (the
-    // `tracing-opentelemetry` bridge namespaces by event target). The
-    // downstream flow span carries `gt.messaging_endpoint_id` via the
-    // activity (M1.4 runner-host); this pair lets operators see "did the
-    // eid come from a trusted header, the resolver, or fall through".
-    tracing::info!(
-        target: "greentic_start::endpoint_resolver",
-        endpoint_resolution = resolution.origin(),
-        messaging_endpoint_id = resolution.endpoint_id().unwrap_or(""),
-        "messaging-endpoint resolution outcome",
-    );
-
-    // Ambiguous is the only resolver outcome that refuses the request
-    // outright: env declares ≥2 endpoints of a `provider_type` and the
-    // component returned NoMatch (or multiple distinct hits) — silently
-    // routing to "the" endpoint would mis-attribute traffic.
-    if matches!(resolution, endpoint_resolver::ResolverOutcome::Ambiguous) {
-        return Err(error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "messaging endpoint resolution is ambiguous; assert the endpoint via \
-             x-greentic-messaging-endpoint-id",
-        ));
-    }
-
-    let endpoint_id: Option<String> = resolution.endpoint_id().map(str::to_string);
-
-    // M1.4c-ii admit gate, step 2: now that dispatch + resolver have
-    // converged on an eid (header- or resolver-derived) and a revision, the
-    // resolved bundle MUST be in that endpoint's `linked_bundles` ACL.
-    // `header_admission` covers the header-asserted path; resolver hits
-    // re-resolve here against the freshly-resolved eid. Skipped when
-    // neither path yielded an eid (legacy single-instance back-compat).
-    let admission = match endpoint_id.as_deref() {
-        Some(eid) if header_endpoint_id.is_none() => {
-            resolve_endpoint_admission(Some(eid), activation.routing.endpoint_admit.as_ref())
-                .map_err(|boxed| *boxed)?
-        }
-        _ => header_admission,
-    };
-    check_bundle_admission(&admission, outcome.bundle_id.as_str()).map_err(|boxed| *boxed)?;
-
-    // M1.5 welcome-flow override (attach side). The runner-host gates the
-    // override on a durable first-contact marker (greentic-runner#382), so
-    // attaching the hint on every turn is safe: post-completion / no-wait /
-    // TTL-expiry turns no longer re-fire. The hint is also bundle-scoped
-    // because dispatch may have picked a different bundle than the welcome
-    // ref points at (endpoints can `linked_bundles` more than one bundle);
-    // running B's flow on A's revision would either misroute or 500.
-    let welcome_hint = resolve_welcome_flow_hint(
-        endpoint_id.as_deref(),
-        &outcome.bundle_id,
-        &activation.routing.endpoint_admit,
-    );
+    .await?;
 
     let activity = build_activity(
         &payload,
@@ -1559,6 +1468,99 @@ pub(crate) fn resolve_bind_addr(host_config: Option<&EnvironmentHostConfig>) -> 
 /// On provider-invocation error the request returns `502` so the upstream
 /// retries; on parse/decode error we return `502` rather than `500` because
 /// the failure originated in the downstream component's reply.
+/// Post-dispatch messaging-endpoint pipeline, shared by the generic-JSON and
+/// provider-route arms of [`serve`]: resolve the endpoint (M1 IID.4), emit the
+/// resolution telemetry, fail closed on ambiguity, enforce the linked-bundle
+/// ACL (M1.4c-ii step 2), and look up the bundle-scoped welcome hint (M1.5).
+/// One implementation so the two arms cannot drift on admission semantics.
+///
+/// Trust boundary: `peer_is_loopback` gates the resolver the same way
+/// `caller_identity` gates the header path — a remote caller posting a forged
+/// payload with a discriminator a component identifies (e.g. a Teams
+/// serviceUrl) must not derive an endpoint; the resolver short-circuits to
+/// `PublicSkipped` off-loopback. `build_payload` produces the M1 IID.4d
+/// `{headers, body}` wrapper LAZILY — public traffic, header-pinned eids, and
+/// no-endpoint envs never pay for it.
+///
+/// The `gt.endpoint_resolution` telemetry is a structured event (tracing's
+/// macro grammar can't take dotted field names); the downstream flow span
+/// carries `gt.messaging_endpoint_id` via the activity, so operators can see
+/// "did the eid come from a trusted header, the resolver, or fall through".
+///
+/// `Ambiguous` (≥2 endpoints of a probed type and no decisive match) is the
+/// only resolver outcome refused outright — silently routing to "the"
+/// endpoint would mis-attribute traffic. A `None` eid passes (legacy
+/// single-instance back-compat). The welcome hint is bundle-scoped because
+/// dispatch may have picked a different bundle than the welcome ref points
+/// at; attaching it per-turn is safe — runner-host gates the override on a
+/// durable first-contact marker (greentic-runner#382).
+async fn resolve_endpoint_for_scope<F>(
+    activation: &Activation,
+    tenant: &str,
+    scope: &RevisionScope,
+    header_endpoint_id: Option<&str>,
+    peer_is_loopback: bool,
+    build_payload: F,
+) -> Result<(Option<String>, Option<WelcomeFlowHint>), Response<Full<Bytes>>>
+where
+    F: FnOnce() -> Vec<u8>,
+{
+    let resolution = endpoint_resolver::resolve(
+        &activation.host,
+        tenant,
+        scope,
+        activation.routing.endpoint_admit.as_ref(),
+        header_endpoint_id,
+        peer_is_loopback,
+        build_payload,
+    )
+    .await
+    .map_err(|err| {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "messaging-endpoint resolver failed for deployment {} revision {}: {err:#}",
+                scope.deployment_id, scope.revision_id,
+            ),
+        );
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "messaging-endpoint resolution failed",
+        )
+    })?;
+
+    tracing::info!(
+        target: "greentic_start::endpoint_resolver",
+        endpoint_resolution = resolution.origin(),
+        messaging_endpoint_id = resolution.endpoint_id().unwrap_or(""),
+        "messaging-endpoint resolution outcome",
+    );
+
+    if matches!(resolution, endpoint_resolver::ResolverOutcome::Ambiguous) {
+        return Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "messaging endpoint resolution is ambiguous; assert the endpoint via \
+             x-greentic-messaging-endpoint-id",
+        ));
+    }
+    let endpoint_id: Option<String> = resolution.endpoint_id().map(str::to_string);
+
+    let admission = resolve_endpoint_admission(
+        endpoint_id.as_deref(),
+        activation.routing.endpoint_admit.as_ref(),
+    )
+    .map_err(|boxed| *boxed)?;
+    check_bundle_admission(&admission, scope.bundle_id.as_str()).map_err(|boxed| *boxed)?;
+
+    let welcome_hint = resolve_welcome_flow_hint(
+        endpoint_id.as_deref(),
+        &scope.bundle_id,
+        &activation.routing.endpoint_admit,
+    );
+
+    Ok((endpoint_id, welcome_hint))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_provider_route(
     activation: Arc<Activation>,
@@ -1600,81 +1602,25 @@ async fn dispatch_provider_route(
     let bundle_id = scope.bundle_id.clone();
     let revision_id = scope.revision_id;
 
-    // M1 IID.4 resolver, provider-route arm — mirrors the generic-JSON branch:
-    // identify the endpoint instance from `{headers, body}`, folded against
-    // the env's `(provider_type, provider_id) → endpoint_id` admit table, with
-    // the same trust boundary (loopback header wins; non-loopback peers
-    // short-circuit to `PublicSkipped`; ≥2-endpoint ambiguity fails closed).
-    // Without this, provider webhooks ran flows with no endpoint attribution:
-    // the auto-registered IID `secret_token` (see `revision_webhook_register`)
-    // was never matched, and per-endpoint session isolation, welcome-flow
-    // selection, and the linked-bundle ACL never applied on this path.
-    let resolution = endpoint_resolver::resolve(
-        &activation.host,
+    // M1 IID.4 resolver + admit + welcome hint — shared with the generic-JSON
+    // branch; see [`resolve_endpoint_for_scope`]. This is what makes the
+    // auto-registered IID `secret_token` (see `revision_webhook_register`)
+    // actually identify the endpoint on provider webhooks. Provider bodies are
+    // not necessarily JSON (form-urlencoded, signature blobs) — identify is
+    // best-effort on the body; the header set (e.g. Telegram's secret-token)
+    // is always carried.
+    let (endpoint_id, welcome_hint) = resolve_endpoint_for_scope(
+        &activation,
         tenant,
         scope,
-        activation.routing.endpoint_admit.as_ref(),
         header_endpoint_id,
         peer_is_loopback,
         || {
-            // Provider bodies are not necessarily JSON (form-urlencoded,
-            // signature blobs) — identify is best-effort on the body; the
-            // header set (e.g. Telegram's secret-token) is always carried.
             let body_value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
             identify_payload::build_identify_payload(identify_headers, &body_value)
         },
     )
-    .await
-    .map_err(|err| {
-        operator_log::warn(
-            module_path!(),
-            format!(
-                "messaging-endpoint resolver failed for provider {provider_type} \
-                 (deployment {deployment_id} revision {revision_id}): {err:#}"
-            ),
-        );
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "messaging-endpoint resolution failed",
-        )
-    })?;
-
-    tracing::info!(
-        target: "greentic_start::endpoint_resolver",
-        endpoint_resolution = resolution.origin(),
-        messaging_endpoint_id = resolution.endpoint_id().unwrap_or(""),
-        "messaging-endpoint resolution outcome (provider route)",
-    );
-
-    if matches!(resolution, endpoint_resolver::ResolverOutcome::Ambiguous) {
-        return Err(error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "messaging endpoint resolution is ambiguous; assert the endpoint via \
-             x-greentic-messaging-endpoint-id",
-        ));
-    }
-    let endpoint_id: Option<String> = resolution.endpoint_id().map(str::to_string);
-
-    // M1.4c-ii admit gate: the resolved endpoint's `linked_bundles` ACL must
-    // include the scoped bundle, refused BEFORE `ingest_http` runs so traffic
-    // outside the ACL never reaches the provider component. A `None` eid
-    // short-circuits to Ok (legacy single-instance back-compat), matching the
-    // generic branch.
-    let admission = resolve_endpoint_admission(
-        endpoint_id.as_deref(),
-        activation.routing.endpoint_admit.as_ref(),
-    )
-    .map_err(|boxed| *boxed)?;
-    check_bundle_admission(&admission, scope.bundle_id.as_str()).map_err(|boxed| *boxed)?;
-
-    // M1.5 welcome-flow hint, bundle-scoped like the generic branch. Safe to
-    // attach per-turn — runner-host gates the override on a durable
-    // first-contact marker (greentic-runner#382).
-    let welcome_hint = resolve_welcome_flow_hint(
-        endpoint_id.as_deref(),
-        &scope.bundle_id,
-        &activation.routing.endpoint_admit,
-    );
+    .await?;
 
     let http_in = build_provider_http_in(
         &provider_type,

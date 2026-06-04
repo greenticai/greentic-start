@@ -334,35 +334,14 @@ fn load_environment(store_root: &Path, env_id: &str) -> Result<Environment> {
 mod tests {
     use super::*;
     use crate::http_routes::{RevisionScope, provider_descriptor_for_test};
-    use greentic_deploy_spec::{
-        BundleId, DeploymentId, MessagingEndpoint, MessagingEndpointId, RevisionId, SchemaVersion,
-    };
-    use greentic_types::EnvId;
+    use crate::test_fixtures::endpoint_typed as endpoint;
+    use greentic_deploy_spec::{BundleId, DeploymentId, RevisionId};
 
     fn scope(deployment: DeploymentId, bundle: &str, revision: RevisionId) -> RevisionScope {
         RevisionScope {
             deployment_id: deployment,
             bundle_id: BundleId::new(bundle),
             revision_id: revision,
-        }
-    }
-
-    fn endpoint(provider_type: &str, provider_id: &str, linked: &[&str]) -> MessagingEndpoint {
-        let now = chrono::Utc::now();
-        MessagingEndpoint {
-            schema: SchemaVersion::new(SchemaVersion::MESSAGING_ENDPOINT_V1),
-            env_id: EnvId::try_from("local").unwrap(),
-            endpoint_id: MessagingEndpointId::new(),
-            provider_id: provider_id.to_string(),
-            provider_type: provider_type.to_string(),
-            display_name: "test".to_string(),
-            secret_refs: Vec::new(),
-            linked_bundles: linked.iter().map(|b| BundleId::new(*b)).collect(),
-            welcome_flow: None,
-            generation: 1,
-            created_at: now,
-            updated_at: now,
-            updated_by: "test".to_string(),
         }
     }
 
