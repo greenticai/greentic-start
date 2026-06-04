@@ -301,9 +301,17 @@ fn resolve_ext_refs_in_sources(
     let environment = EnvironmentStore::load(&store, &env_typed)
         .with_context(|| format!("loading environment `{env_id}` for ext:// resolution"))?;
 
+    // One memo across both sources: the same `ext://` ref under several keys
+    // (or in both envelope and setup-answers) reads its blob once per ingress.
+    let mut resolved = std::collections::HashMap::new();
     for source in [envelope_config, setup_answers] {
         if let Some(map) = source.as_mut().and_then(JsonValue::as_object_mut) {
-            crate::extension_resolver::rewrite_ext_refs(map, &environment, &env_dir)?;
+            crate::extension_resolver::rewrite_ext_refs(
+                map,
+                &environment,
+                &env_dir,
+                &mut resolved,
+            )?;
         }
     }
     Ok(())

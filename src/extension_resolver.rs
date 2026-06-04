@@ -14,6 +14,7 @@
 //! pass-through. A stale `ext://` string must not reach the component as opaque
 //! config it cannot interpret.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
@@ -67,16 +68,29 @@ pub(crate) fn resolve_extension_ref(
 /// Replace every top-level `ext://` string value in `map` with its resolved
 /// extension config. Errors propagate (fail-closed) so a stale reference fails
 /// the ingress rather than reaching the component unresolved.
+///
+/// `resolved` memoizes by raw reference string so a ref that appears under
+/// several keys — or in both config sources of one ingress (envelope AND
+/// setup-answers commonly carry the same value) — reads its answers blob from
+/// disk once. The caller shares one memo across all sources of a request.
 pub(crate) fn rewrite_ext_refs(
     map: &mut JsonMap<String, JsonValue>,
     env: &Environment,
     env_root: &Path,
+    resolved: &mut HashMap<String, JsonValue>,
 ) -> Result<()> {
     for value in map.values_mut() {
         let Some(raw) = as_ext_ref(value).map(str::to_string) else {
             continue;
         };
-        *value = resolve_extension_ref(env, env_root, &raw)?;
+        *value = match resolved.get(&raw) {
+            Some(cached) => cached.clone(),
+            None => {
+                let fresh = resolve_extension_ref(env, env_root, &raw)?;
+                resolved.insert(raw, fresh.clone());
+                fresh
+            }
+        };
     }
     Ok(())
 }
@@ -84,10 +98,7 @@ pub(crate) fn rewrite_ext_refs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use greentic_deploy_spec::{
-        EnvironmentHostConfig, ExtensionBinding, PackDescriptor, PackId, SchemaVersion,
-    };
-    use greentic_types::EnvId;
+    use greentic_deploy_spec::{ExtensionBinding, PackDescriptor, PackId};
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -106,29 +117,13 @@ mod tests {
         }
     }
 
+    /// Shared minimal env from `test_fixtures`, parameterized on the one field
+    /// these tests consult — keeps this module off the per-field fixture drift
+    /// the shared module exists to prevent.
     fn env_with(extensions: Vec<ExtensionBinding>) -> Environment {
-        let env_id = EnvId::try_from("local").unwrap();
-        Environment {
-            schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
-            environment_id: env_id.clone(),
-            name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id,
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-            },
-            packs: Vec::new(),
-            credentials_ref: None,
-            bundles: Vec::new(),
-            revisions: Vec::new(),
-            traffic_splits: Vec::new(),
-            messaging_endpoints: Vec::new(),
-            extensions,
-            revocation: Default::default(),
-            retention: Default::default(),
-            health: Default::default(),
-        }
+        let mut env = crate::test_fixtures::env_with(Vec::new());
+        env.extensions = extensions;
+        env
     }
 
     #[test]
@@ -265,10 +260,45 @@ mod tests {
         .clone();
 
         assert!(map_has_ext_ref(&map));
-        rewrite_ext_refs(&mut map, &env, dir.path()).unwrap();
+        rewrite_ext_refs(&mut map, &env, dir.path(), &mut HashMap::new()).unwrap();
         assert_eq!(map.get("endpoint").unwrap(), &json!({"k":"v"}));
         assert_eq!(map.get("plain").unwrap(), &json!("literal"));
         assert_eq!(map.get("number").unwrap(), &json!(7));
         assert!(!map_has_ext_ref(&map));
+    }
+
+    #[test]
+    fn duplicate_refs_resolve_once_via_shared_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let answers_dir = dir.path().join("extensions/acme.crm");
+        std::fs::create_dir_all(&answers_dir).unwrap();
+        std::fs::write(answers_dir.join("answers.json"), br#"{"k":"v"}"#).unwrap();
+        let env = env_with(vec![binding(
+            "acme.crm@1.0.0",
+            None,
+            Some("extensions/acme.crm/answers.json"),
+        )]);
+
+        // Same ref under two keys in one map, and again in a second map fed
+        // the SAME memo (the cross-source shape `build_injected_config` uses).
+        let mut first = json!({ "a": "ext://acme.crm", "b": "ext://acme.crm" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let mut second = json!({ "c": "ext://acme.crm" })
+            .as_object()
+            .unwrap()
+            .clone();
+
+        let mut resolved = HashMap::new();
+        rewrite_ext_refs(&mut first, &env, dir.path(), &mut resolved).unwrap();
+        // Delete the blob: a memo hit must NOT touch the filesystem again.
+        std::fs::remove_file(dir.path().join("extensions/acme.crm/answers.json")).unwrap();
+        rewrite_ext_refs(&mut second, &env, dir.path(), &mut resolved).unwrap();
+
+        for (map, key) in [(&first, "a"), (&first, "b"), (&second, "c")] {
+            assert_eq!(map.get(key).unwrap(), &json!({"k":"v"}));
+        }
+        assert_eq!(resolved.len(), 1, "one memo entry per unique ref");
     }
 }
