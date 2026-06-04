@@ -47,6 +47,10 @@ struct WebhookRegistration {
     /// The IID `secret_token` (endpoint `provider_id`), when an endpoint links
     /// this bundle. `None` ⇒ register URL-only (single-bundle fallback).
     secret_token: Option<String>,
+    /// Count of *additional* same-provider endpoints linked to this bundle
+    /// beyond the one we registered. A bot has a single webhook, so we register
+    /// the first and warn (never the value — `provider_id` is the secret-token).
+    extra_endpoints: usize,
 }
 
 impl WebhookRegistration {
@@ -103,6 +107,16 @@ pub(crate) async fn register_new_model_webhooks(
     }
 
     for plan in plans {
+        if plan.extra_endpoints > 0 {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "provider={} bundle has {} additional endpoint(s) linked beyond the one \
+                     auto-registered; a bot has a single webhook — register the others manually",
+                    plan.provider_name, plan.extra_endpoints,
+                ),
+            );
+        }
         match activation
             .host
             .invoke_provider_for_revision(
@@ -202,17 +216,21 @@ fn plan_webhook_registrations(
             continue;
         };
 
-        // The endpoint that links this bundle for this provider supplies the
-        // IID secret_token. Matched on the canonical provider name so the
-        // route's descriptor type (`messaging.telegram`) and the endpoint's
-        // class (`telegram`) reconcile.
-        let secret_token = endpoints
+        // Endpoints that link this bundle for this provider supply the IID
+        // secret_token. Matched on the canonical provider name so the route's
+        // descriptor type (`messaging.telegram`) and the endpoint's class
+        // (`telegram`) reconcile. A bot has ONE webhook, so we register the
+        // first matching endpoint and surface a count of any extras (their
+        // `provider_id`s are secret-tokens — never logged).
+        let matching: Vec<&MessagingEndpoint> = endpoints
             .iter()
-            .find(|e| {
+            .filter(|e| {
                 e.linked_bundles.iter().any(|b| b == &scope.bundle_id)
                     && derive_provider_name(&e.provider_type).as_deref() == Some(name.as_str())
             })
-            .map(|e| e.provider_id.clone());
+            .collect();
+        let secret_token = matching.first().map(|e| e.provider_id.clone());
+        let extra_endpoints = matching.len().saturating_sub(1);
 
         plans.push(WebhookRegistration {
             tenant: tenant.clone(),
@@ -223,6 +241,7 @@ fn plan_webhook_registrations(
             provider_name: name,
             webhook_url: format!("{base}{}", route.pattern),
             secret_token,
+            extra_endpoints,
         });
     }
 
@@ -356,6 +375,33 @@ mod tests {
         assert!(plans[0].secret_token.is_none());
         let body: Value = serde_json::from_slice(&plans[0].payload()).unwrap();
         assert!(body.get("secret_token").is_none());
+    }
+
+    #[test]
+    fn multiple_same_provider_endpoints_register_first_and_count_extras() {
+        let dep = DeploymentId::new();
+        let rev = RevisionId::new();
+        let routes = vec![provider_descriptor_for_test(
+            "/bot/webhook/telegram",
+            "messaging.telegram.bot",
+            scope(dep, "realbot-pack", rev),
+        )];
+        let endpoints = vec![
+            endpoint("telegram", "tok-a", &["realbot-pack"]),
+            endpoint("telegram", "tok-b", &["realbot-pack"]),
+        ];
+        let tenants = HashMap::from([(dep, "default".to_string())]);
+        let plans = plan_webhook_registrations(&routes, &endpoints, &tenants, "https://host");
+        assert_eq!(plans.len(), 1, "one webhook per provider route");
+        assert_eq!(
+            plans[0].secret_token.as_deref(),
+            Some("tok-a"),
+            "first wins"
+        );
+        assert_eq!(
+            plans[0].extra_endpoints, 1,
+            "second endpoint counted as extra"
+        );
     }
 
     #[test]
