@@ -4,11 +4,13 @@
 //! `endpoint_id`.
 //!
 //! The resolver is a thin coordinator over
-//! [`RunnerHost::identify_messaging_endpoints_for_revision`]: it picks the
-//! [`EndpointAdmit::provider_types`] set to probe, hands the host the request
-//! body, and folds the per-`provider_type` outcomes against the admit table to
-//! yield a [`ResolverOutcome`]. The resolver does **not** decide HTTP status
-//! codes or telemetry envelopes — that policy lives at the
+//! [`RunnerHost::identify_messaging_endpoints_for_revision_scoped`]: it picks
+//! the [`EndpointAdmit::provider_types`] set to probe, preflights hint
+//! coverage so unhinted siblings don't see allowlisted headers, hands the
+//! host the structured `(headers, body)` pair, and folds the per-
+//! `provider_type` outcomes against the admit table to yield a
+//! [`ResolverOutcome`]. The resolver does **not** decide HTTP status codes
+//! or telemetry envelopes — that policy lives at the
 //! `revision_serve::serve` call site.
 //!
 //! Distinct conditions are surfaced as distinct outcomes (rather than
@@ -147,27 +149,23 @@ fn should_probe(
     None
 }
 
-/// Preflight header scoping: if ALL probed `provider_type`s are hinted
-/// (the `describe_identify_instances_for_revision` map returns `Some(hint)`
-/// for every key), the caller's `headers` pass through unchanged — the
-/// runner-host's per-provider scoping narrows them further at wrapper-build
-/// time. If ANY type is unhinted (`None`), headers are stripped to an empty
-/// list. This prevents the runner-host's back-compat pass-through
-/// (`None => headers.iter().collect()` in `build_scoped_identify_payload`)
-/// from leaking allowlisted headers (e.g. the Telegram secret token) to
-/// sibling providers that have no use for them.
+/// Preflight header scoping: pass `headers` through when ALL probed
+/// `provider_type`s are hinted; strip to empty when ANY is unhinted. Closes
+/// the runner-host's back-compat pass-through
+/// (`None => headers.iter().collect()` in `build_scoped_identify_payload`),
+/// which would otherwise leak allowlisted headers (e.g. the Telegram secret
+/// token) to sibling providers that don't declare them.
 ///
-/// Returns the (possibly empty) header list, plus the set of unhinted
-/// `provider_type` names (empty when all hinted). The caller uses the
-/// unhinted set for the one-per-probe warning log.
-fn scope_headers_to_hinted(
+/// Returns the (possibly empty) header list and the unhinted `provider_type`
+/// names (borrowed from `hints`, empty when all hinted) — the caller logs
+/// them in the one-per-probe warning when stripping kicks in.
+fn scope_headers_to_hinted<'a>(
     headers: Vec<(String, String)>,
-    hints: &HashMap<String, Option<IdentifyInstanceHint>>,
-) -> (Vec<(String, String)>, Vec<String>) {
-    let unhinted: Vec<String> = hints
+    hints: &'a HashMap<String, Option<IdentifyInstanceHint>>,
+) -> (Vec<(String, String)>, Vec<&'a str>) {
+    let unhinted: Vec<&'a str> = hints
         .iter()
-        .filter(|(_, hint)| hint.is_none())
-        .map(|(provider_type, _)| provider_type.clone())
+        .filter_map(|(provider_type, hint)| hint.is_none().then_some(provider_type.as_str()))
         .collect();
     if unhinted.is_empty() {
         (headers, unhinted)
@@ -199,22 +197,12 @@ fn scope_headers_to_hinted(
 ///
 /// `build_headers_body` produces the structured `(headers, body)` pair the
 /// per-provider wrapper is built from inside the runner host. It is invoked
-/// LAZILY — only after [`should_probe`] confirms the resolver will actually
-/// run a WASM probe. Public traffic, header-pinned eid, and no-endpoint envs
-/// all short-circuit before the body Value is cloned.
-///
-/// The runner-host `_scoped` variant builds the wrapper PER PROVIDER from
-/// each component's cached `describe-identify-instance` hint: hinted
-/// components receive ONLY the headers their hint declares; unhinted
-/// components receive every header passed in (back-compat). To close that
-/// back-compat leak at the greentic-start altitude, the resolver preflights
-/// hint coverage via
-/// [`RunnerHost::describe_identify_instances_for_revision`]: when ANY probed
-/// provider is unhinted, headers are stripped to empty BEFORE calling the
-/// scoped variant. All-hinted revisions keep their headers. This ensures
-/// header-discriminated providers (Telegram via
-/// `x-telegram-bot-api-secret-token`) MUST ship hints to receive headers,
-/// and unhinted siblings never see them.
+/// LAZILY — only after [`should_probe`] confirms a probe is needed. Public
+/// traffic, header-pinned eid, and no-endpoint envs all short-circuit before
+/// the body Value is cloned. The runner-host's `_scoped` variant filters
+/// headers per-provider from each component's `describe-identify-instance`
+/// hint; greentic-start additionally strips headers when any probed
+/// provider is unhinted — see [`scope_headers_to_hinted`].
 ///
 /// Returns the [`ResolverOutcome`] for the serve site to act on. Component
 /// traps / infrastructure errors bubble as `Err`; the caller distinguishes
@@ -237,11 +225,8 @@ where
         return Ok(outcome);
     }
 
-    // Preflight: discover which probed provider_types have a
-    // describe-identify-instance hint. Unhinted providers would receive ALL
-    // passed headers via the runner-host's back-compat path — strip headers
-    // to empty when any provider is unhinted so secrets don't leak across
-    // sibling providers.
+    // Hint preflight feeds [`scope_headers_to_hinted`] — see that helper
+    // for the strip policy.
     let hints = host
         .describe_identify_instances_for_revision(
             tenant,
@@ -625,7 +610,7 @@ mod tests {
             ("slack".to_string(), None), // unhinted
         ]);
         let (out, unhinted) = scope_headers_to_hinted(headers, &hints);
-        assert_eq!(unhinted, vec!["slack".to_string()]);
+        assert_eq!(unhinted, vec!["slack"]);
         assert!(out.is_empty(), "any unhinted type should strip all headers");
     }
 
