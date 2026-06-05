@@ -1597,6 +1597,7 @@ async fn dispatch_provider_route(
              handles greentic.provider-extension.v1 synthesized routes",
         ));
     };
+    let descriptor_pack_id = route_match.descriptor.pack_id.clone();
     let provider_op = route_match.descriptor.provider_op.clone();
     let deployment_id = scope.deployment_id;
     let bundle_id = scope.bundle_id.clone();
@@ -1716,6 +1717,7 @@ async fn dispatch_provider_route(
                 deployment_id,
                 pipeline_bundle,
                 revision_id,
+                descriptor_pack_id,
                 pipeline_provider,
                 ingress_envelopes,
                 endpoint_id,
@@ -1744,6 +1746,7 @@ async fn run_provider_inbound_pipeline(
     deployment_id: DeploymentId,
     bundle_id: BundleId,
     revision_id: RevisionId,
+    pack_id: String,
     provider_type: String,
     envelopes: Vec<ChannelMessageEnvelope>,
     endpoint_id: Option<String>,
@@ -1788,6 +1791,7 @@ async fn run_provider_inbound_pipeline(
                 deployment_id,
                 bundle_id.clone(),
                 revision_id,
+                &pack_id,
                 &provider_type,
                 &reply_envelope,
             )
@@ -1824,6 +1828,7 @@ async fn run_reply_egress(
     deployment_id: DeploymentId,
     bundle_id: BundleId,
     revision_id: RevisionId,
+    pack_id: &str,
     provider_type: &str,
     envelope: &ChannelMessageEnvelope,
 ) -> Result<()> {
@@ -1881,24 +1886,25 @@ async fn run_reply_egress(
     let payload: ProviderPayloadV1 =
         serde_json::from_value(payload_value).context("decode ProviderPayloadV1")?;
 
-    // send_payload(provider_type, payload, tenant) → outcome.
-    // `messaging_egress::build_send_payload` is the legacy constructor —
-    // mirrored inline here because it also injects bundle-rooted config,
-    // which the revision-aware path doesn't have yet (Phase D follow-up).
-    let send_input = serde_json::to_value(crate::messaging_dto::SendPayloadInV1 {
-        v: 1,
-        provider_type: provider_type.to_string(),
+    // send_payload(provider_type, payload, tenant, config) → outcome.
+    // Per-pack overrides — projected from this Active deployment's
+    // `BundleDeployment.config_overrides` (D.4) — flow through
+    // `messaging_egress::build_send_payload`, which injects them into
+    // the Greentic envelope body so the provider's `load_config` sees
+    // the same shape the legacy path produces.
+    let pack_overrides = crate::messaging_egress::pack_config_overrides_as_json(
+        &activation.routing.deployment_config_overrides,
+        deployment_id,
+        pack_id,
+    );
+    let send = crate::messaging_egress::build_send_payload(
         payload,
-        tenant: crate::messaging_dto::TenantHint {
-            tenant: tenant.to_string(),
-            team: None,
-            user: None,
-            correlation_id: None,
-        },
-        reply_scope: None,
-        config: None,
-    })
-    .context("encode SendPayloadInV1")?;
+        provider_type.to_string(),
+        tenant.to_string(),
+        None,
+        pack_overrides,
+    );
+    let send_input = serde_json::to_value(&send).context("encode SendPayloadInV1")?;
     let send_outcome = invoke("send_payload", send_input).await?;
 
     if send_outcome
@@ -3355,6 +3361,7 @@ mod tests {
                 http_routes: HttpRouteTable::from_descriptors(Vec::new()),
                 deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+                deployment_config_overrides: std::sync::Arc::default(),
             }),
         }
     }
@@ -3943,6 +3950,7 @@ mod tests {
                 Vec::new(),
             )]),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+            deployment_config_overrides: std::sync::Arc::default(),
         });
         let activation = Activation {
             host: base.host,

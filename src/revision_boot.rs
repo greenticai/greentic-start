@@ -43,7 +43,9 @@ use greentic_runner_host::storage::{
 };
 use greentic_runner_host::{HostBuilder, HostConfig, RunnerHost, TenantBindings};
 
-use crate::deployment_routes::{DeploymentRouteTable, RevisionIngressRouting};
+use crate::deployment_routes::{
+    DeploymentRouteTable, RevisionIngressRouting, deployment_config_overrides_from_environment,
+};
 use crate::endpoint_admit::EndpointAdmit;
 use crate::http_routes::{
     HttpRouteDescriptor, HttpRouteTable, RevisionScope, discover_revision_routes,
@@ -283,6 +285,7 @@ pub(crate) async fn activate_runtime_config(
         http_routes: HttpRouteTable::from_descriptors(scoped_routes),
         deployment_routes: DeploymentRouteTable::from_environment(env),
         endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),
+        deployment_config_overrides: Arc::new(deployment_config_overrides_from_environment(env)),
     };
 
     Ok(RuntimeConfigActivation { host, routing })
@@ -470,6 +473,7 @@ mod tests {
             usage: None,
             created_at: chrono::Utc::now(),
             authorization_ref: PathBuf::from("auth.json"),
+            config_overrides: std::collections::BTreeMap::new(),
         }
     }
 
