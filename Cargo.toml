@@ -86,21 +86,21 @@ features = [
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
 # (per-env trust root + operator key, deployer #226). Floor bumped to the
-# Extension-slot publish (deployer #239 / #240) — the deployer's
-# `EnvironmentStore` round-trips `Environment.extensions`; an older deployer
-# paired with the Path-3 deploy-spec would drop that field on load.
+# D.4 train-2 publish (deployer #243) — `BundleDeployment.config_overrides`
+# is read here at egress time, so the deployer + deploy-spec must both
+# expose the field.
 [dependencies.greentic-deployer]
-version = ">=1.1.0-dev.26948183687, <1.2.0-0"
+version = ">=1.1.0-dev.27009344392, <1.2.0-0"
 default-features = false
 
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
 # / `Revision` cross the deployer boundary, so resolution must not pick an
-# older deploy-spec. Floor bumped to the Extension-slot publish that adds
-# `Environment.extensions` + `ExtensionRef` + `Environment::extension_for_ref`
-# — the `ext://` runtime resolver reads those, earlier publishes don't expose
-# them.
+# older deploy-spec. Floor bumped to the D.4 train-1 publish that adds
+# `BundleDeployment.config_overrides` — the egress projects per-pack
+# overrides into `SendPayloadInV1.config`; earlier publishes don't carry
+# the field and the route table would drop it on load.
 [dependencies.greentic-deploy-spec]
-version = ">=0.1.26948183687, <0.2"
+version = ">=0.1.27009344392, <0.2"
 
 [dependencies.greentic-setup]
 version = ">=1.1.0-dev, <1.2.0-0"
