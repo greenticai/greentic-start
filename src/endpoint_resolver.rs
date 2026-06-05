@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use greentic_runner_host::RunnerHost;
 use greentic_runner_host::pack::IdentifyOutcome;
+use serde_json::Value;
 
 use crate::endpoint_admit::EndpointAdmit;
 use crate::http_routes::RevisionScope;
@@ -165,20 +166,19 @@ fn should_probe(
 /// for the admit gate keeps the resolver's argument list short and binds
 /// the dispatched revision to the resolver call by construction.
 ///
-/// `build_payload` produces the M1 IID.4d wrapper bytes
-/// (`{headers: [{name,value}], body: <parsed-or-null>}` — see
-/// [`crate::identify_payload::build_identify_payload`]). It is invoked
-/// LAZILY — only after [`should_probe`] confirms the resolver will
-/// actually run a WASM probe. Public traffic, header-pinned eid, and
-/// no-endpoint envs all short-circuit before the body Value is cloned
-/// or re-serialized.
+/// `build_headers_body` produces the structured `(headers, body)` pair the
+/// per-provider wrapper is built from inside the runner host. It is invoked
+/// LAZILY — only after [`should_probe`] confirms the resolver will actually
+/// run a WASM probe. Public traffic, header-pinned eid, and no-endpoint envs
+/// all short-circuit before the body Value is cloned.
 ///
-/// The WIT contract is opaque `list<u8>`, so the resolver passes
-/// `build_payload`'s output through unmodified — providers whose
-/// discriminator lives in the body (Teams, Slack, Webex, etc.) read
-/// `body.<field>`; providers whose discriminator lives in HTTP headers
-/// (Telegram via `x-telegram-bot-api-secret-token`) read
-/// `headers[name=…].value`.
+/// The runner-host `_scoped` variant builds the wrapper PER PROVIDER from
+/// each component's cached `describe-identify-instance` hint: hinted
+/// components receive ONLY the headers their hint declares; unhinted
+/// components receive every header passed in (back-compat). This is the
+/// per-provider scoping that lets header-discriminated providers (Telegram
+/// via `x-telegram-bot-api-secret-token`) keep working without leaking the
+/// allowlist to every other probed `provider_type`.
 ///
 /// Returns the [`ResolverOutcome`] for the serve site to act on. Component
 /// traps / infrastructure errors bubble as `Err`; the caller distinguishes
@@ -191,25 +191,26 @@ pub(crate) async fn resolve<F>(
     admit: &EndpointAdmit,
     header_eid: Option<&str>,
     peer_is_loopback: bool,
-    build_payload: F,
+    build_headers_body: F,
 ) -> anyhow::Result<ResolverOutcome>
 where
-    F: FnOnce() -> Vec<u8>,
+    F: FnOnce() -> (Vec<(String, String)>, Value),
 {
     let provider_types: Vec<&str> = admit.provider_types().collect();
     if let Some(outcome) = should_probe(peer_is_loopback, header_eid, provider_types.len()) {
         return Ok(outcome);
     }
 
-    let payload = build_payload();
+    let (headers, body) = build_headers_body();
     let outcomes = host
-        .identify_messaging_endpoints_for_revision(
+        .identify_messaging_endpoints_for_revision_scoped(
             tenant,
             scope.deployment_id,
             scope.bundle_id.clone(),
             scope.revision_id,
             &provider_types,
-            &payload,
+            &headers,
+            &body,
         )
         .await?;
 
