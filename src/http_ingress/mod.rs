@@ -2311,7 +2311,7 @@ mod tests {
             // No revision-scoped routes declared → forces the fail-closed path.
             http_routes: HttpRouteTable::default(),
             deployment_routes,
-            bundle_config_overrides: Arc::default(),
+            deployment_config_overrides: Arc::default(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
@@ -2353,7 +2353,7 @@ mod tests {
             endpoint_admit: Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             http_routes: HttpRouteTable::default(),
             deployment_routes,
-            bundle_config_overrides: Arc::default(),
+            deployment_config_overrides: Arc::default(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));

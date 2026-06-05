@@ -1894,8 +1894,8 @@ async fn run_reply_egress(
     // the Greentic envelope body so the provider's `load_config` sees
     // the same shape the legacy path produces.
     let pack_overrides = crate::deployment_routes::pack_config_overrides_as_json(
-        &activation.routing.bundle_config_overrides,
-        &bundle_id,
+        &activation.routing.deployment_config_overrides,
+        deployment_id,
         pack_id,
     );
     let send = crate::messaging_egress::build_send_payload(
@@ -3362,7 +3362,7 @@ mod tests {
                 http_routes: HttpRouteTable::from_descriptors(Vec::new()),
                 deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
-                bundle_config_overrides: std::sync::Arc::default(),
+                deployment_config_overrides: std::sync::Arc::default(),
             }),
         }
     }
@@ -3951,7 +3951,7 @@ mod tests {
                 Vec::new(),
             )]),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
-            bundle_config_overrides: std::sync::Arc::default(),
+            deployment_config_overrides: std::sync::Arc::default(),
         });
         let activation = Activation {
             host: base.host,

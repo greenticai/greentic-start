@@ -44,7 +44,7 @@ use greentic_runner_host::storage::{
 use greentic_runner_host::{HostBuilder, HostConfig, RunnerHost, TenantBindings};
 
 use crate::deployment_routes::{
-    DeploymentRouteTable, RevisionIngressRouting, bundle_config_overrides_from_environment,
+    DeploymentRouteTable, RevisionIngressRouting, deployment_config_overrides_from_environment,
 };
 use crate::endpoint_admit::EndpointAdmit;
 use crate::http_routes::{
@@ -285,7 +285,7 @@ pub(crate) async fn activate_runtime_config(
         http_routes: HttpRouteTable::from_descriptors(scoped_routes),
         deployment_routes: DeploymentRouteTable::from_environment(env),
         endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),
-        bundle_config_overrides: Arc::new(bundle_config_overrides_from_environment(env)),
+        deployment_config_overrides: Arc::new(deployment_config_overrides_from_environment(env)),
     };
 
     Ok(RuntimeConfigActivation { host, routing })
