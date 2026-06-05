@@ -1,32 +1,19 @@
-//! M1 IID.4d wrapper-payload construction for `identify-instance` probes.
+//! M1 IID.4 header-allowlist for `identify-instance` probes.
 //!
-//! The host forwards `payload` opaque to every probed provider component
-//! (see [`crate::endpoint_resolver::resolve`]); the wrapper convention
-//! defined here gives header-discriminated providers (Telegram via
-//! `x-telegram-bot-api-secret-token`) access to the routing-relevant
-//! request headers without breaking body-discriminated providers (Teams,
-//! Slack, Webex, etc.) — components that ignore the wrapper continue
-//! reading from `body`.
+//! [`collect_identify_headers`] is the start-side trust gate: only headers
+//! whose name appears in [`IDENTIFY_HEADER_ALLOWLIST`] are forwarded to the
+//! resolver. The runner then builds the per-provider wrapper from the
+//! component's `describe-identify-instance` hint (see
+//! [`RunnerHost::identify_messaging_endpoints_for_revision_scoped`]) — each
+//! probed `provider_type` only sees the headers its hint declares. This
+//! module owns the start-side allowlist (which headers may LEAVE
+//! greentic-start at all); the runner owns the per-provider scoping (which
+//! of those headers each component actually receives).
 //!
-//! Wrapper shape:
-//!
-//! ```json
-//! {
-//!   "headers": [ { "name": "x-…", "value": "…" } ],
-//!   "body":    <the parsed request body, or null>
-//! }
-//! ```
-//!
-//! See `greentic:provider-instance-identity@0.1.0/identify-instance` for
-//! the contract docstring.
-//!
-//! Headers ride the wrapper via an **explicit per-header allowlist**
-//! ([`IDENTIFY_HEADER_ALLOWLIST`]) — not a prefix match. See that
-//! constant's doc-comment for the contents, the rationale, and the
-//! threat model around extending it.
+//! [`RunnerHost::identify_messaging_endpoints_for_revision_scoped`]:
+//!     greentic_runner_host::RunnerHost::identify_messaging_endpoints_for_revision_scoped
 
 use hyper::HeaderMap;
-use serde_json::{Value, json};
 
 /// Explicit allowlist of HTTP header names forwarded to identify-instance
 /// probes. Names MUST be lowercase ASCII (the [`HeaderMap`] yields
@@ -39,10 +26,11 @@ use serde_json::{Value, json};
 ///   secret, set by the operator at `setWebhook` time. Telegram is the
 ///   only provider whose discriminator does not live in the body.
 ///
-/// Adding an entry expands the cross-provider blast radius — every
-/// probed `provider_type` receives the SAME wrapper, so any allowlisted
-/// header is visible to EVERY probed component. Keep this list minimal
-/// and stop adding to it once per-provider scoping ships in Phase D.
+/// Adding an entry expands the trust surface — every probed component
+/// can read it via its hint. Per-provider scoping (the runner's
+/// `describe-identify-instance` cache) narrows which component receives
+/// which header, but only headers in this allowlist can EVER reach a
+/// probe in the first place. Keep this list minimal.
 ///
 /// Categories that MUST never be added here, regardless of any future
 /// provider need:
@@ -56,14 +44,13 @@ use serde_json::{Value, json};
 const IDENTIFY_HEADER_ALLOWLIST: &[&str] = &["x-telegram-bot-api-secret-token"];
 
 /// Collect the routing-relevant request headers in `(name_lowercase, value)`
-/// form for inclusion in the identify-instance wrapper. Forwards ONLY
-/// headers whose lowercase name appears in [`IDENTIFY_HEADER_ALLOWLIST`].
+/// form for the identify-instance resolver. Forwards ONLY headers whose
+/// lowercase name appears in [`IDENTIFY_HEADER_ALLOWLIST`].
 ///
 /// Multi-value headers are flattened — each occurrence becomes its own
-/// `(name, value)` pair. Headers with non-UTF-8 values are dropped (the
-/// wrapper is JSON; `identify-instance` is a non-authoritative routing
-/// hint, so silently skipping malformed values is safer than producing
-/// `Err`).
+/// `(name, value)` pair. Headers with non-UTF-8 values are dropped
+/// (`identify-instance` is a non-authoritative routing hint, so silently
+/// skipping malformed values is safer than producing `Err`).
 pub(crate) fn collect_identify_headers(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
@@ -76,22 +63,6 @@ pub(crate) fn collect_identify_headers(headers: &HeaderMap) -> Vec<(String, Stri
             Some((name, value))
         })
         .collect()
-}
-
-/// Build the M1 IID.4d wrapper bytes from a header list and the parsed
-/// request body. `body` is the [`Value`] revision_serve already parsed
-/// from the raw bytes — bodies that didn't parse as JSON were normalized
-/// to [`Value::Null`] by the caller, so the wrapper's `body` field is
-/// guaranteed to round-trip through `serde_json`.
-pub(crate) fn build_identify_payload(headers: &[(String, String)], body: &Value) -> Vec<u8> {
-    let wrapper = json!({
-        "headers": headers
-            .iter()
-            .map(|(name, value)| json!({ "name": name, "value": value }))
-            .collect::<Vec<_>>(),
-        "body": body,
-    });
-    serde_json::to_vec(&wrapper).expect("wrapper payload always serializes")
 }
 
 #[cfg(test)]
@@ -206,32 +177,5 @@ mod tests {
                 ),
             ]
         );
-    }
-
-    #[test]
-    fn build_identify_payload_emits_wrapper_with_object_body() {
-        let headers = vec![(
-            "x-telegram-bot-api-secret-token".to_string(),
-            "tok-1".to_string(),
-        )];
-        let body = json!({ "update_id": 42, "message": { "text": "hi" } });
-        let bytes = build_identify_payload(&headers, &body);
-        let parsed: Value = serde_json::from_slice(&bytes).expect("wrapper parses");
-        assert_eq!(
-            parsed["headers"],
-            json!([{ "name": "x-telegram-bot-api-secret-token", "value": "tok-1" }])
-        );
-        assert_eq!(
-            parsed["body"],
-            json!({ "update_id": 42, "message": { "text": "hi" } })
-        );
-    }
-
-    #[test]
-    fn build_identify_payload_passes_null_body_through() {
-        let bytes = build_identify_payload(&[], &Value::Null);
-        let parsed: Value = serde_json::from_slice(&bytes).expect("wrapper parses");
-        assert_eq!(parsed["headers"], json!([]));
-        assert_eq!(parsed["body"], Value::Null);
     }
 }

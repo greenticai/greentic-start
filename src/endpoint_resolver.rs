@@ -4,11 +4,13 @@
 //! `endpoint_id`.
 //!
 //! The resolver is a thin coordinator over
-//! [`RunnerHost::identify_messaging_endpoints_for_revision`]: it picks the
-//! [`EndpointAdmit::provider_types`] set to probe, hands the host the request
-//! body, and folds the per-`provider_type` outcomes against the admit table to
-//! yield a [`ResolverOutcome`]. The resolver does **not** decide HTTP status
-//! codes or telemetry envelopes — that policy lives at the
+//! [`RunnerHost::identify_messaging_endpoints_for_revision_scoped`]: it picks
+//! the [`EndpointAdmit::provider_types`] set to probe, preflights hint
+//! coverage so unhinted siblings don't see allowlisted headers, hands the
+//! host the structured `(headers, body)` pair, and folds the per-
+//! `provider_type` outcomes against the admit table to yield a
+//! [`ResolverOutcome`]. The resolver does **not** decide HTTP status codes
+//! or telemetry envelopes — that policy lives at the
 //! `revision_serve::serve` call site.
 //!
 //! Distinct conditions are surfaced as distinct outcomes (rather than
@@ -38,10 +40,13 @@
 //!   is nothing to resolve. Cheaper than running an empty probe; also keeps
 //!   telemetry honest (we did not "miss", we never tried).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use greentic_runner_host::RunnerHost;
+use greentic_runner_host::identify_hint::IdentifyInstanceHint;
 use greentic_runner_host::pack::IdentifyOutcome;
+use serde_json::Value;
 
 use crate::endpoint_admit::EndpointAdmit;
 use crate::http_routes::RevisionScope;
@@ -144,6 +149,31 @@ fn should_probe(
     None
 }
 
+/// Preflight header scoping: pass `headers` through when ALL probed
+/// `provider_type`s are hinted; strip to empty when ANY is unhinted. Closes
+/// the runner-host's back-compat pass-through
+/// (`None => headers.iter().collect()` in `build_scoped_identify_payload`),
+/// which would otherwise leak allowlisted headers (e.g. the Telegram secret
+/// token) to sibling providers that don't declare them.
+///
+/// Returns the (possibly empty) header list and the unhinted `provider_type`
+/// names (borrowed from `hints`, empty when all hinted) — the caller logs
+/// them in the one-per-probe warning when stripping kicks in.
+fn scope_headers_to_hinted<'a>(
+    headers: Vec<(String, String)>,
+    hints: &'a HashMap<String, Option<IdentifyInstanceHint>>,
+) -> (Vec<(String, String)>, Vec<&'a str>) {
+    let unhinted: Vec<&'a str> = hints
+        .iter()
+        .filter_map(|(provider_type, hint)| hint.is_none().then_some(provider_type.as_str()))
+        .collect();
+    if unhinted.is_empty() {
+        (headers, unhinted)
+    } else {
+        (Vec::new(), unhinted)
+    }
+}
+
 /// Resolve the messaging endpoint for a dispatched request.
 ///
 /// `header_eid` is the validated eid the caller asserted via
@@ -165,20 +195,14 @@ fn should_probe(
 /// for the admit gate keeps the resolver's argument list short and binds
 /// the dispatched revision to the resolver call by construction.
 ///
-/// `build_payload` produces the M1 IID.4d wrapper bytes
-/// (`{headers: [{name,value}], body: <parsed-or-null>}` — see
-/// [`crate::identify_payload::build_identify_payload`]). It is invoked
-/// LAZILY — only after [`should_probe`] confirms the resolver will
-/// actually run a WASM probe. Public traffic, header-pinned eid, and
-/// no-endpoint envs all short-circuit before the body Value is cloned
-/// or re-serialized.
-///
-/// The WIT contract is opaque `list<u8>`, so the resolver passes
-/// `build_payload`'s output through unmodified — providers whose
-/// discriminator lives in the body (Teams, Slack, Webex, etc.) read
-/// `body.<field>`; providers whose discriminator lives in HTTP headers
-/// (Telegram via `x-telegram-bot-api-secret-token`) read
-/// `headers[name=…].value`.
+/// `build_headers_body` produces the structured `(headers, body)` pair the
+/// per-provider wrapper is built from inside the runner host. It is invoked
+/// LAZILY — only after [`should_probe`] confirms a probe is needed. Public
+/// traffic, header-pinned eid, and no-endpoint envs all short-circuit before
+/// the body Value is cloned. The runner-host's `_scoped` variant filters
+/// headers per-provider from each component's `describe-identify-instance`
+/// hint; greentic-start additionally strips headers when any probed
+/// provider is unhinted — see [`scope_headers_to_hinted`].
 ///
 /// Returns the [`ResolverOutcome`] for the serve site to act on. Component
 /// traps / infrastructure errors bubble as `Err`; the caller distinguishes
@@ -191,25 +215,49 @@ pub(crate) async fn resolve<F>(
     admit: &EndpointAdmit,
     header_eid: Option<&str>,
     peer_is_loopback: bool,
-    build_payload: F,
+    build_headers_body: F,
 ) -> anyhow::Result<ResolverOutcome>
 where
-    F: FnOnce() -> Vec<u8>,
+    F: FnOnce() -> (Vec<(String, String)>, Value),
 {
     let provider_types: Vec<&str> = admit.provider_types().collect();
     if let Some(outcome) = should_probe(peer_is_loopback, header_eid, provider_types.len()) {
         return Ok(outcome);
     }
 
-    let payload = build_payload();
-    let outcomes = host
-        .identify_messaging_endpoints_for_revision(
+    // Hint preflight feeds [`scope_headers_to_hinted`] — see that helper
+    // for the strip policy.
+    let hints = host
+        .describe_identify_instances_for_revision(
             tenant,
             scope.deployment_id,
             scope.bundle_id.clone(),
             scope.revision_id,
             &provider_types,
-            &payload,
+        )
+        .await?;
+
+    let (headers, body) = build_headers_body();
+    let (scoped_headers, unhinted) = scope_headers_to_hinted(headers, &hints);
+
+    if !unhinted.is_empty() {
+        tracing::warn!(
+            target: "greentic_start::endpoint_resolver",
+            unhinted_providers = ?unhinted,
+            "headers stripped for identify-instance probe: provider(s) lack a \
+             describe-identify-instance hint — add a hint to receive secret-token headers"
+        );
+    }
+
+    let outcomes = host
+        .identify_messaging_endpoints_for_revision_scoped(
+            tenant,
+            scope.deployment_id,
+            scope.bundle_id.clone(),
+            scope.revision_id,
+            &provider_types,
+            &scoped_headers,
+            &body,
         )
         .await?;
 
@@ -513,6 +561,76 @@ mod tests {
         assert_eq!(
             outcome,
             Some(ResolverOutcome::HeaderWins("teams-legal".into()))
+        );
+    }
+
+    // -- scope_headers_to_hinted pure-helper tests --
+
+    fn make_hint(header_names: &[&str]) -> IdentifyInstanceHint {
+        use greentic_runner_host::identify_hint::HintSource;
+        IdentifyInstanceHint {
+            sources: header_names
+                .iter()
+                .map(|name| HintSource::Header {
+                    name: (*name).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn scope_headers_passes_through_when_all_provider_types_hinted() {
+        let headers = vec![(
+            "x-telegram-bot-api-secret-token".to_string(),
+            "tok".to_string(),
+        )];
+        let hints = HashMap::from([
+            (
+                "telegram".to_string(),
+                Some(make_hint(&["x-telegram-bot-api-secret-token"])),
+            ),
+            ("teams".to_string(), Some(make_hint(&[]))),
+        ]);
+        let (out, unhinted) = scope_headers_to_hinted(headers.clone(), &hints);
+        assert!(unhinted.is_empty());
+        assert_eq!(out, headers, "all-hinted should pass headers through");
+    }
+
+    #[test]
+    fn scope_headers_drops_all_when_any_provider_type_unhinted() {
+        let headers = vec![(
+            "x-telegram-bot-api-secret-token".to_string(),
+            "tok".to_string(),
+        )];
+        let hints = HashMap::from([
+            (
+                "telegram".to_string(),
+                Some(make_hint(&["x-telegram-bot-api-secret-token"])),
+            ),
+            ("slack".to_string(), None), // unhinted
+        ]);
+        let (out, unhinted) = scope_headers_to_hinted(headers, &hints);
+        assert_eq!(unhinted, vec!["slack"]);
+        assert!(out.is_empty(), "any unhinted type should strip all headers");
+    }
+
+    #[test]
+    fn scope_headers_drops_all_when_no_hints_at_all() {
+        // Simulates an old revision where no provider ships a hint.
+        let headers = vec![(
+            "x-telegram-bot-api-secret-token".to_string(),
+            "tok".to_string(),
+        )];
+        let hints = HashMap::from([
+            ("telegram".to_string(), None),
+            ("slack".to_string(), None),
+            ("webex".to_string(), None),
+        ]);
+        let (out, unhinted) = scope_headers_to_hinted(headers, &hints);
+        assert_eq!(unhinted.len(), 3);
+        assert!(
+            out.is_empty(),
+            "fully unhinted env should strip all headers"
         );
     }
 }

@@ -801,15 +801,17 @@ async fn serve(
     };
 
     // M1 IID.4 resolver + M1.4c-ii admit + M1.5 welcome hint — shared with the
-    // provider-route arm; see [`resolve_endpoint_for_scope`]. The identify
-    // payload is built lazily from the already-parsed JSON body.
+    // provider-route arm; see [`resolve_endpoint_for_scope`]. The structured
+    // `(headers, body)` pair is built lazily from the already-parsed JSON body
+    // and the allowlisted header list; the runner builds the per-provider
+    // wrapper from each component's describe-identify-instance hint.
     let (endpoint_id, welcome_hint) = resolve_endpoint_for_scope(
         &activation,
         &tenant,
         &scope,
         header_endpoint_id.as_deref(),
         peer_is_loopback,
-        || identify_payload::build_identify_payload(&identify_headers, &payload),
+        || (identify_headers.clone(), payload.clone()),
     )
     .await?;
 
@@ -1478,9 +1480,11 @@ pub(crate) fn resolve_bind_addr(host_config: Option<&EnvironmentHostConfig>) -> 
 /// `caller_identity` gates the header path — a remote caller posting a forged
 /// payload with a discriminator a component identifies (e.g. a Teams
 /// serviceUrl) must not derive an endpoint; the resolver short-circuits to
-/// `PublicSkipped` off-loopback. `build_payload` produces the M1 IID.4d
-/// `{headers, body}` wrapper LAZILY — public traffic, header-pinned eids, and
-/// no-endpoint envs never pay for it.
+/// `PublicSkipped` off-loopback. `build_headers_body` produces the structured
+/// `(headers, body)` pair LAZILY — public traffic, header-pinned eids, and
+/// no-endpoint envs never pay for it. The runner builds the per-provider
+/// wrapper from each component's `describe-identify-instance` hint, so each
+/// probed `provider_type` only sees the headers its hint declares.
 ///
 /// The `gt.endpoint_resolution` telemetry is a structured event (tracing's
 /// macro grammar can't take dotted field names); the downstream flow span
@@ -1500,10 +1504,10 @@ async fn resolve_endpoint_for_scope<F>(
     scope: &RevisionScope,
     header_endpoint_id: Option<&str>,
     peer_is_loopback: bool,
-    build_payload: F,
+    build_headers_body: F,
 ) -> Result<(Option<String>, Option<WelcomeFlowHint>), Response<Full<Bytes>>>
 where
-    F: FnOnce() -> Vec<u8>,
+    F: FnOnce() -> (Vec<(String, String)>, Value),
 {
     let resolution = endpoint_resolver::resolve(
         &activation.host,
@@ -1512,7 +1516,7 @@ where
         activation.routing.endpoint_admit.as_ref(),
         header_endpoint_id,
         peer_is_loopback,
-        build_payload,
+        build_headers_body,
     )
     .await
     .map_err(|err| {
@@ -1618,7 +1622,7 @@ async fn dispatch_provider_route(
         peer_is_loopback,
         || {
             let body_value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-            identify_payload::build_identify_payload(identify_headers, &body_value)
+            (identify_headers.to_vec(), body_value)
         },
     )
     .await?;
