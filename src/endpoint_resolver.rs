@@ -38,9 +38,11 @@
 //!   is nothing to resolve. Cheaper than running an empty probe; also keeps
 //!   telemetry honest (we did not "miss", we never tried).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use greentic_runner_host::RunnerHost;
+use greentic_runner_host::identify_hint::IdentifyInstanceHint;
 use greentic_runner_host::pack::IdentifyOutcome;
 use serde_json::Value;
 
@@ -145,6 +147,35 @@ fn should_probe(
     None
 }
 
+/// Preflight header scoping: if ALL probed `provider_type`s are hinted
+/// (the `describe_identify_instances_for_revision` map returns `Some(hint)`
+/// for every key), the caller's `headers` pass through unchanged — the
+/// runner-host's per-provider scoping narrows them further at wrapper-build
+/// time. If ANY type is unhinted (`None`), headers are stripped to an empty
+/// list. This prevents the runner-host's back-compat pass-through
+/// (`None => headers.iter().collect()` in `build_scoped_identify_payload`)
+/// from leaking allowlisted headers (e.g. the Telegram secret token) to
+/// sibling providers that have no use for them.
+///
+/// Returns the (possibly empty) header list, plus the set of unhinted
+/// `provider_type` names (empty when all hinted). The caller uses the
+/// unhinted set for the one-per-probe warning log.
+fn scope_headers_to_hinted(
+    headers: Vec<(String, String)>,
+    hints: &HashMap<String, Option<IdentifyInstanceHint>>,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let unhinted: Vec<String> = hints
+        .iter()
+        .filter(|(_, hint)| hint.is_none())
+        .map(|(provider_type, _)| provider_type.clone())
+        .collect();
+    if unhinted.is_empty() {
+        (headers, unhinted)
+    } else {
+        (Vec::new(), unhinted)
+    }
+}
+
 /// Resolve the messaging endpoint for a dispatched request.
 ///
 /// `header_eid` is the validated eid the caller asserted via
@@ -175,10 +206,15 @@ fn should_probe(
 /// The runner-host `_scoped` variant builds the wrapper PER PROVIDER from
 /// each component's cached `describe-identify-instance` hint: hinted
 /// components receive ONLY the headers their hint declares; unhinted
-/// components receive every header passed in (back-compat). This is the
-/// per-provider scoping that lets header-discriminated providers (Telegram
-/// via `x-telegram-bot-api-secret-token`) keep working without leaking the
-/// allowlist to every other probed `provider_type`.
+/// components receive every header passed in (back-compat). To close that
+/// back-compat leak at the greentic-start altitude, the resolver preflights
+/// hint coverage via
+/// [`RunnerHost::describe_identify_instances_for_revision`]: when ANY probed
+/// provider is unhinted, headers are stripped to empty BEFORE calling the
+/// scoped variant. All-hinted revisions keep their headers. This ensures
+/// header-discriminated providers (Telegram via
+/// `x-telegram-bot-api-secret-token`) MUST ship hints to receive headers,
+/// and unhinted siblings never see them.
 ///
 /// Returns the [`ResolverOutcome`] for the serve site to act on. Component
 /// traps / infrastructure errors bubble as `Err`; the caller distinguishes
@@ -201,7 +237,33 @@ where
         return Ok(outcome);
     }
 
+    // Preflight: discover which probed provider_types have a
+    // describe-identify-instance hint. Unhinted providers would receive ALL
+    // passed headers via the runner-host's back-compat path — strip headers
+    // to empty when any provider is unhinted so secrets don't leak across
+    // sibling providers.
+    let hints = host
+        .describe_identify_instances_for_revision(
+            tenant,
+            scope.deployment_id,
+            scope.bundle_id.clone(),
+            scope.revision_id,
+            &provider_types,
+        )
+        .await?;
+
     let (headers, body) = build_headers_body();
+    let (scoped_headers, unhinted) = scope_headers_to_hinted(headers, &hints);
+
+    if !unhinted.is_empty() {
+        tracing::warn!(
+            target: "greentic_start::endpoint_resolver",
+            unhinted_providers = ?unhinted,
+            "headers stripped for identify-instance probe: provider(s) lack a \
+             describe-identify-instance hint — add a hint to receive secret-token headers"
+        );
+    }
+
     let outcomes = host
         .identify_messaging_endpoints_for_revision_scoped(
             tenant,
@@ -209,7 +271,7 @@ where
             scope.bundle_id.clone(),
             scope.revision_id,
             &provider_types,
-            &headers,
+            &scoped_headers,
             &body,
         )
         .await?;
@@ -514,6 +576,76 @@ mod tests {
         assert_eq!(
             outcome,
             Some(ResolverOutcome::HeaderWins("teams-legal".into()))
+        );
+    }
+
+    // -- scope_headers_to_hinted pure-helper tests --
+
+    fn make_hint(header_names: &[&str]) -> IdentifyInstanceHint {
+        use greentic_runner_host::identify_hint::HintSource;
+        IdentifyInstanceHint {
+            sources: header_names
+                .iter()
+                .map(|name| HintSource::Header {
+                    name: (*name).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn scope_headers_passes_through_when_all_provider_types_hinted() {
+        let headers = vec![(
+            "x-telegram-bot-api-secret-token".to_string(),
+            "tok".to_string(),
+        )];
+        let hints = HashMap::from([
+            (
+                "telegram".to_string(),
+                Some(make_hint(&["x-telegram-bot-api-secret-token"])),
+            ),
+            ("teams".to_string(), Some(make_hint(&[]))),
+        ]);
+        let (out, unhinted) = scope_headers_to_hinted(headers.clone(), &hints);
+        assert!(unhinted.is_empty());
+        assert_eq!(out, headers, "all-hinted should pass headers through");
+    }
+
+    #[test]
+    fn scope_headers_drops_all_when_any_provider_type_unhinted() {
+        let headers = vec![(
+            "x-telegram-bot-api-secret-token".to_string(),
+            "tok".to_string(),
+        )];
+        let hints = HashMap::from([
+            (
+                "telegram".to_string(),
+                Some(make_hint(&["x-telegram-bot-api-secret-token"])),
+            ),
+            ("slack".to_string(), None), // unhinted
+        ]);
+        let (out, unhinted) = scope_headers_to_hinted(headers, &hints);
+        assert_eq!(unhinted, vec!["slack".to_string()]);
+        assert!(out.is_empty(), "any unhinted type should strip all headers");
+    }
+
+    #[test]
+    fn scope_headers_drops_all_when_no_hints_at_all() {
+        // Simulates an old revision where no provider ships a hint.
+        let headers = vec![(
+            "x-telegram-bot-api-secret-token".to_string(),
+            "tok".to_string(),
+        )];
+        let hints = HashMap::from([
+            ("telegram".to_string(), None),
+            ("slack".to_string(), None),
+            ("webex".to_string(), None),
+        ]);
+        let (out, unhinted) = scope_headers_to_hinted(headers, &hints);
+        assert_eq!(unhinted.len(), 3);
+        assert!(
+            out.is_empty(),
+            "fully unhinted env should strip all headers"
         );
     }
 }

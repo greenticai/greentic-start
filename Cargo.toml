@@ -109,12 +109,15 @@ version = ">=1.1.0-dev, <1.2.0-0"
 version = ">=1.1.0-dev, <1.2.0-0"
 
 # Floor pinned to the Phase D.2 publish (greentic-runner#397) that exposes
-# both `RunnerHost::invoke_provider_for_revision` (per-revision provider
-# invocation primitive consumed by the `ProviderRoute` admission arm) AND
+# `RunnerHost::invoke_provider_for_revision` (per-revision provider
+# invocation primitive consumed by the `ProviderRoute` admission arm),
 # `RunnerHost::identify_messaging_endpoints_for_revision_scoped` (M1 IID
 # PR-B2a, the per-provider scoped identify variant consumed by
-# `endpoint_resolver`). Earlier publishes still satisfy the unscoped
-# resolver floor (#390) but lack one or both of these surfaces.
+# `endpoint_resolver`), AND
+# `RunnerHost::describe_identify_instances_for_revision` (hint preflight
+# consumed by `endpoint_resolver` to strip headers for unhinted providers).
+# Earlier publishes still satisfy the unscoped resolver floor (#390) but
+# lack one or more of these surfaces.
 [dependencies.greentic-runner-host]
 version = ">=1.1.0-dev.26895901753, <1.2.0-0"
 
