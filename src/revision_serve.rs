@@ -1590,7 +1590,6 @@ async fn dispatch_provider_route(
         ));
     };
 
-    let descriptor_pack_id = route_match.descriptor.pack_id.clone();
     let Some(provider_type) = route_match.descriptor.provider_type.clone() else {
         return Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
@@ -1598,6 +1597,7 @@ async fn dispatch_provider_route(
              handles greentic.provider-extension.v1 synthesized routes",
         ));
     };
+    let descriptor_pack_id = route_match.descriptor.pack_id.clone();
     let provider_op = route_match.descriptor.provider_op.clone();
     let deployment_id = scope.deployment_id;
     let bundle_id = scope.bundle_id.clone();
@@ -1710,7 +1710,6 @@ async fn dispatch_provider_route(
         let pipeline_tenant = tenant.to_string();
         let pipeline_provider = provider_type.clone();
         let pipeline_bundle = bundle_id.clone();
-        let pipeline_pack = descriptor_pack_id.clone();
         tokio::spawn(async move {
             run_provider_inbound_pipeline(
                 pipeline_activation,
@@ -1718,7 +1717,7 @@ async fn dispatch_provider_route(
                 deployment_id,
                 pipeline_bundle,
                 revision_id,
-                pipeline_pack,
+                descriptor_pack_id,
                 pipeline_provider,
                 ingress_envelopes,
                 endpoint_id,
@@ -1893,7 +1892,7 @@ async fn run_reply_egress(
     // `messaging_egress::build_send_payload`, which injects them into
     // the Greentic envelope body so the provider's `load_config` sees
     // the same shape the legacy path produces.
-    let pack_overrides = crate::deployment_routes::pack_config_overrides_as_json(
+    let pack_overrides = crate::messaging_egress::pack_config_overrides_as_json(
         &activation.routing.deployment_config_overrides,
         deployment_id,
         pack_id,

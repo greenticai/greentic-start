@@ -21,31 +21,24 @@ use crate::http_routes::HttpRouteTable;
 use crate::revision_dispatcher::RevisionDispatcher;
 
 /// Per-deployment, per-pack non-secret config overrides projected from each
-/// active `BundleDeployment.config_overrides` (D.4). The outer key is the
-/// deployment id (NOT the bundle id — two deployments can bind the same
-/// bundle with different per-customer overrides, e.g. multi-tenant SaaS); the
-/// next level is the bundle-relative pack id slug; the inner map is
+/// active `BundleDeployment.config_overrides` (D.4). Outer key is the
+/// deployment id, NOT the bundle id — two deployments can bind the same
+/// bundle with different per-customer overrides (multi-tenant SaaS,
+/// blue/green rollouts), and keying on bundle would silently drop one set.
+/// Next level is the bundle-relative pack id slug; inner map is
 /// `{config_field → JSON value}`. The egress path consults this table to
 /// inject overrides into `SendPayloadInV1.config` before each `send_payload`
-/// invocation — see [`crate::messaging_egress::build_send_payload`].
+/// invocation — see [`crate::messaging_egress::build_send_payload`] and
+/// [`crate::messaging_egress::pack_config_overrides_as_json`].
 ///
 /// Non-Active deployments are skipped to match
 /// [`DeploymentRouteTable::from_environment`]: if a deployment is not
-/// routable, its overrides are not reachable at egress time either, so the
-/// table only carries the rows the runtime can actually consult.
+/// routable, its overrides are not reachable at egress time either.
 pub type DeploymentConfigOverrides =
     BTreeMap<DeploymentId, BTreeMap<String, BTreeMap<String, JsonValue>>>;
 
-/// Build the per-deployment override table from an `Environment`'s active
-/// bundle deployments. Active-only mirrors
-/// [`DeploymentRouteTable::from_environment`] so override visibility and
-/// route visibility stay aligned: a request that can't reach a paused
-/// deployment won't accidentally pick up its stale overrides either.
-///
-/// Keyed on `DeploymentId` rather than `BundleId` so two active deployments
-/// of the same bundle keep distinct override sets — otherwise the projection
-/// would lose one deployment's overrides on collision and `run_reply_egress`
-/// could leak deployment A's egress config into deployment B's replies.
+/// Build a [`DeploymentConfigOverrides`] from an `Environment`. See the type
+/// alias for the keying and Active-only filter rationale.
 pub fn deployment_config_overrides_from_environment(
     env: &Environment,
 ) -> DeploymentConfigOverrides {
@@ -55,23 +48,6 @@ pub fn deployment_config_overrides_from_environment(
         .filter(|dep| !dep.config_overrides.is_empty())
         .map(|dep| (dep.deployment_id, dep.config_overrides.clone()))
         .collect()
-}
-
-/// Pick the override map for a `(deployment_id, pack_id)` pair, materialized
-/// as a JSON object ready to hand to `messaging_egress::build_send_payload`.
-/// Returns `None` when no overrides are configured for the pack or the map
-/// is empty — the egress path skips config injection in that case (preserves
-/// the legacy "no config" behaviour for packs the operator hasn't touched).
-pub fn pack_config_overrides_as_json(
-    table: &DeploymentConfigOverrides,
-    deployment_id: DeploymentId,
-    pack_id: &str,
-) -> Option<JsonValue> {
-    table
-        .get(&deployment_id)
-        .and_then(|by_pack| by_pack.get(pack_id))
-        .filter(|cfg| !cfg.is_empty())
-        .map(|cfg| JsonValue::Object(cfg.iter().map(|(k, v)| (k.clone(), v.clone())).collect()))
 }
 
 /// One Active deployment's public route binding, in matchable form.
@@ -263,15 +239,9 @@ pub struct RevisionIngressRouting {
     /// a request carries `x-greentic-messaging-endpoint-id`. Travels with the
     /// other routing artifacts so a reload swaps them as one coherent unit.
     pub endpoint_admit: Arc<crate::endpoint_admit::EndpointAdmit>,
-    /// D.4 per-deployment per-pack config overrides projected from each
-    /// Active `BundleDeployment.config_overrides`. Consulted in
-    /// [`crate::revision_serve`]'s reply-egress path to inject overrides
-    /// into the WASM provider's `send_payload` `config` field. Wrapped in
-    /// `Arc` because a reload swaps the whole `RevisionIngressRouting` but
-    /// the override map is read on every egress invocation — cheap snapshot
-    /// avoids cloning the inner `BTreeMap`. Keyed by `DeploymentId`, NOT
-    /// `BundleId`: two deployments of the same bundle keep distinct
-    /// overrides (multi-tenant SaaS, blue/green rollouts).
+    /// See [`DeploymentConfigOverrides`]. `Arc` so the override map outlives
+    /// the routing-table swap a reload performs — the egress reads it on
+    /// every reply.
     pub deployment_config_overrides: Arc<DeploymentConfigOverrides>,
 }
 
@@ -663,90 +633,14 @@ mod tests {
         let table = deployment_config_overrides_from_environment(&env);
         assert_eq!(table.len(), 2, "each deployment must contribute a row");
 
-        let config_a = pack_config_overrides_as_json(&table, dep_a, pack_id)
-            .expect("deployment A must keep its own overrides");
-        let config_b = pack_config_overrides_as_json(&table, dep_b, pack_id)
-            .expect("deployment B must keep its own overrides");
+        let config_a =
+            crate::messaging_egress::pack_config_overrides_as_json(&table, dep_a, pack_id)
+                .expect("deployment A must keep its own overrides");
+        let config_b =
+            crate::messaging_egress::pack_config_overrides_as_json(&table, dep_b, pack_id)
+                .expect("deployment B must keep its own overrides");
         assert_eq!(config_a["api_base_url"], "https://a.example.com");
         assert_eq!(config_b["api_base_url"], "https://b.example.com");
-    }
-
-    #[test]
-    fn pack_config_overrides_round_trip_through_send_payload_body() {
-        // End-to-end projection: BundleDeployment.config_overrides →
-        // routing.deployment_config_overrides → pack_config_overrides_as_json →
-        // build_send_payload → injected into the envelope body. This is the
-        // chain run_reply_egress walks at egress time.
-        use base64::Engine as _;
-        use base64::engine::general_purpose::STANDARD;
-
-        let pack_id = "telegram-pack";
-        let dep_id = DeploymentId::new();
-        let mut packs = BTreeMap::new();
-        packs.insert(
-            pack_id.to_string(),
-            BTreeMap::from([
-                (
-                    "api_base_url".to_string(),
-                    JsonValue::String("https://staging.example.com".to_string()),
-                ),
-                (
-                    "default_chat_id".to_string(),
-                    JsonValue::String("-100123".to_string()),
-                ),
-            ]),
-        );
-        let env = env(vec![deployment_with_overrides(
-            dep_id,
-            "live",
-            BundleDeploymentStatus::Active,
-            packs,
-        )]);
-        let table = deployment_config_overrides_from_environment(&env);
-
-        // Lookup: matched pack → JSON object carrying the override pairs.
-        let config = pack_config_overrides_as_json(&table, dep_id, pack_id)
-            .expect("override config must be present for the matched pack");
-        assert_eq!(
-            config["api_base_url"], "https://staging.example.com",
-            "api_base_url must survive the projection unchanged"
-        );
-
-        // Cross-deployment lookup: a different deployment finds nothing.
-        assert!(
-            pack_config_overrides_as_json(&table, DeploymentId::new(), pack_id).is_none(),
-            "another deployment's id must not cross-pollinate overrides"
-        );
-        // Cross-pack lookup: the deployment exists but a different pack is unset.
-        assert!(pack_config_overrides_as_json(&table, dep_id, "slack-pack").is_none());
-
-        // Round-trip through build_send_payload: the override pairs must land
-        // inside the Greentic envelope's "config" object.
-        let envelope = serde_json::json!({
-            "tenant": {"tenant": "demo"},
-            "session_id": "s-1",
-            "text": "hello",
-        });
-        let payload = crate::messaging_dto::ProviderPayloadV1 {
-            content_type: "application/json".to_string(),
-            body_b64: STANDARD.encode(serde_json::to_vec(&envelope).unwrap()),
-            metadata_json: None,
-            metadata: None,
-        };
-        let send = crate::messaging_egress::build_send_payload(
-            payload,
-            "messaging-telegram",
-            "demo",
-            None,
-            Some(config),
-        );
-        let body = STANDARD.decode(&send.payload.body_b64).unwrap();
-        let body: JsonValue = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            body["config"]["api_base_url"], "https://staging.example.com",
-            "config_overrides must reach the WASM provider via the envelope body"
-        );
-        assert_eq!(body["config"]["default_chat_id"], "-100123");
     }
 
     #[test]
