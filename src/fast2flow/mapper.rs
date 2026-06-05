@@ -1,6 +1,8 @@
 //! Map Fast2Flow's `RoutingDirective` into the existing `ControlDirective`.
-//! Tenant/team inherit from the request context. FIXME(observability):
-//! confidence + reason are dropped — emit a tracing span carrying both.
+//! Tenant/team inherit from the request context. Confidence + reason are not
+//! carried into `ControlDirective`; the caller (`try_for_request`) emits them
+//! via `tracing`/operator_log before this mapping, so the routing decision is
+//! observable without threading them through the dispatch type.
 
 use crate::ingress::control_directive::{
     ControlDirective, DispatchTarget, IngressReply, PrefillEntity,
