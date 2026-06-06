@@ -623,6 +623,7 @@ mod tests {
             provider_type: "teams".to_string(),
             display_name: "Legal".to_string(),
             secret_refs: Vec::new(),
+            webhook_secret_ref: None,
             linked_bundles: linked_bundles.iter().map(|b| BundleId::new(*b)).collect(),
             welcome_flow: None,
             generation: 1,

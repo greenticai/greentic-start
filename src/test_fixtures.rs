@@ -12,7 +12,7 @@
 
 use greentic_deploy_spec::{
     BundleId, Environment, EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId,
-    SchemaVersion,
+    SchemaVersion, SecretRef,
 };
 use greentic_types::EnvId;
 
@@ -41,6 +41,7 @@ pub(crate) fn endpoint_typed(
         provider_type: provider_type.to_string(),
         display_name: provider_id.to_string(),
         secret_refs: Vec::new(),
+        webhook_secret_ref: None,
         linked_bundles: bundles.iter().map(|b| BundleId::new(*b)).collect(),
         welcome_flow: None,
         generation: 1,
@@ -48,6 +49,28 @@ pub(crate) fn endpoint_typed(
         updated_at: now,
         updated_by: "test".to_string(),
     }
+}
+
+/// Build a Telegram-class endpoint with a `webhook_secret_ref` set. The
+/// returned URI is well-formed for the current env id (`local`) and
+/// matches the deployer's auto-gen URI scheme; tests that need to
+/// resolve it through a `SecretsManager` must seed the value at the
+/// canonical 5-segment dev-store path (`secrets://...`).
+pub(crate) fn telegram_endpoint_with_webhook_secret(
+    provider_id: &str,
+    bundles: &[&str],
+) -> MessagingEndpoint {
+    let mut ep = endpoint_typed("telegram", provider_id, bundles);
+    let eid_lower = ep.endpoint_id.to_string().to_lowercase();
+    ep.webhook_secret_ref = Some(
+        SecretRef::try_new(format!(
+            "secret://{}/default/_/messaging-{}/webhook_secret",
+            env_id(),
+            eid_lower
+        ))
+        .expect("well-formed secret ref"),
+    );
+    ep
 }
 
 /// Build a minimal `Environment` carrying just the messaging endpoints — the

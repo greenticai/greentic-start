@@ -32,12 +32,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use greentic_deploy_spec::{BundleId, Environment, WelcomeFlowRef};
+use greentic_deploy_spec::{BundleId, Environment, SecretRef, WelcomeFlowRef};
 
 /// The per-endpoint state the revision ingress needs at request time:
-/// the `linked_bundles` ACL plus the M1.5 welcome-flow ref (if declared).
-/// Co-locating these prevents drift between two parallel maps keyed on the
-/// same endpoint id.
+/// the `linked_bundles` ACL plus the M1.5 welcome-flow ref (if declared) plus
+/// the optional [`webhook_secret_ref`] for IID-by-secret matching. Co-locating
+/// these prevents drift between parallel maps keyed on the same endpoint id.
+///
+/// [`webhook_secret_ref`]: greentic_deploy_spec::MessagingEndpoint::webhook_secret_ref
 #[derive(Clone, Debug)]
 struct EndpointEntry {
     linked_bundles: HashSet<String>,
@@ -45,6 +47,15 @@ struct EndpointEntry {
     /// cloned in so the lookup is one map. Read by the producer at
     /// `revision_serve::serve` to build the per-request `WelcomeFlowHint`.
     welcome_flow: Option<WelcomeFlowRef>,
+    /// [`MessagingEndpoint::webhook_secret_ref`](greentic_deploy_spec::MessagingEndpoint::webhook_secret_ref)
+    /// — `secret://` URI the runtime resolves through the env's secrets backend
+    /// to the actual webhook secret value. `Some(_)` means this endpoint
+    /// participates in webhook-secret auth (Telegram `setup_webhook` installs
+    /// the resolved value as `secret_token`; the auth gate constant-time
+    /// compares the inbound `x-telegram-bot-api-secret-token` header against
+    /// it). `None` means the endpoint stays on the legacy posture where
+    /// `provider_id` is the discriminator-and-authenticator.
+    webhook_secret_ref: Option<SecretRef>,
 }
 
 /// Per-endpoint ACL projection of `Environment.messaging_endpoints` consulted
@@ -92,6 +103,7 @@ impl EndpointAdmit {
                         .map(|b| b.as_str().to_string())
                         .collect(),
                     welcome_flow: ep.welcome_flow.clone(),
+                    webhook_secret_ref: ep.webhook_secret_ref.clone(),
                 },
             );
             by_provider_type
@@ -143,6 +155,41 @@ impl EndpointAdmit {
         self.by_id.get(endpoint_id).map(|e| &e.linked_bundles)
     }
 
+    /// Iterate `(endpoint_id, provider_type, webhook_secret_ref)` for every
+    /// endpoint whose [`webhook_secret_ref`] is `Some(_)`. Drives the
+    /// [`dispatch_provider_route`] auth gate: callers filter by provider
+    /// class via [`derive_provider_name`] (so a route descriptor
+    /// `messaging.telegram.bot` matches a stored endpoint `telegram`) and
+    /// then resolve each ref through the secrets manager. Endpoints without
+    /// a ref are skipped — they stay on the legacy posture and do not opt
+    /// into the gate.
+    ///
+    /// Returning `provider_type` here keeps `EndpointAdmit` a pure
+    /// projection: it carries no knowledge of `derive_provider_name`'s
+    /// canonicalization rules, and consumers that don't care about class
+    /// (e.g. iterating all secret-bearing endpoints for a metrics export)
+    /// can use the same iterator.
+    ///
+    /// [`webhook_secret_ref`]: MessagingEndpoint::webhook_secret_ref
+    /// [`dispatch_provider_route`]: crate::revision_serve
+    /// [`derive_provider_name`]: crate::http_routes::derive_provider_name
+    pub(crate) fn endpoints_with_webhook_secret_ref(
+        &self,
+    ) -> impl Iterator<Item = (&str, &str, &SecretRef)> + '_ {
+        self.by_provider_type
+            .iter()
+            .flat_map(|(provider_type, ids)| {
+                ids.values()
+                    .map(move |eid| (provider_type.as_str(), eid.as_str()))
+            })
+            .filter_map(|(provider_type, eid)| {
+                self.by_id
+                    .get(eid)
+                    .and_then(|e| e.webhook_secret_ref.as_ref())
+                    .map(|ref_| (eid, provider_type, ref_))
+            })
+    }
+
     /// Look up the raw M1.5 welcome-flow ref for `endpoint_id`, if the
     /// endpoint is declared AND has `welcome_flow` set. Returns `None` for
     /// both unknown endpoints and known-but-unset welcome flows — the
@@ -185,7 +232,9 @@ impl EndpointAdmit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{endpoint, endpoint_typed, env_with};
+    use crate::test_fixtures::{
+        endpoint, endpoint_typed, env_with, telegram_endpoint_with_webhook_secret,
+    };
     use greentic_deploy_spec::{BundleId, PackId};
 
     #[test]
@@ -325,6 +374,39 @@ mod tests {
         let mut types: Vec<&str> = admit.provider_types().collect();
         types.sort_unstable();
         assert_eq!(types, vec!["slack", "teams"]);
+    }
+
+    #[test]
+    fn endpoints_with_webhook_secret_ref_surfaces_only_endpoints_that_have_one() {
+        let telegram_with = telegram_endpoint_with_webhook_secret("tg-legal", &["legal"]);
+        let telegram_without = endpoint_typed("telegram", "tg-acct", &["acct"]);
+        let teams_with = {
+            // Distinct provider_type so the caller's `derive_provider_name`
+            // filter is the source of truth for "telegram-class" — the
+            // iterator itself is class-agnostic.
+            let mut t = telegram_endpoint_with_webhook_secret("teams-bot", &["legal"]);
+            t.provider_type = "teams".to_string();
+            t
+        };
+        let tg_with_id = telegram_with.endpoint_id.to_string();
+        let teams_with_id = teams_with.endpoint_id.to_string();
+        let admit = EndpointAdmit::from_environment(&env_with(vec![
+            telegram_with,
+            telegram_without,
+            teams_with,
+        ]));
+
+        let mut surfaced: Vec<(String, String)> = admit
+            .endpoints_with_webhook_secret_ref()
+            .map(|(eid, pt, _)| (eid.to_string(), pt.to_string()))
+            .collect();
+        surfaced.sort();
+        let mut expected = vec![
+            (tg_with_id, "telegram".to_string()),
+            (teams_with_id, "teams".to_string()),
+        ];
+        expected.sort();
+        assert_eq!(surfaced, expected);
     }
 
     #[test]
