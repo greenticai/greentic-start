@@ -1,7 +1,7 @@
 # AW Hosted Runner Enablement (run-from-store E2E) — Design
 
 - **Date:** 2026-06-06
-- **Status:** Approved
+- **Status:** Executed 2026-06-06 as **prep + handoff** (see Execution record)
 - **Scope:** Operational enablement of the deployed hosted runner (Cloud Run
   `greentic-webchat`) so that agents registered by the store's run-from-store
   hand-off (M5) are resolvable and executable. No code changes expected.
@@ -88,6 +88,33 @@ Discovery-first; pick the cheapest sufficient path:
 No new automated tests: zero code change (paths A/B). The smoke checklist is
 the acceptance gate; `scripts/smoke-agent-deploy.sh` already automates the
 registry-contract half and can be reused during step 5.
+
+## Execution record (2026-06-06)
+
+Discovery overturned the runbook's assumption that a deployed Cloud Run
+`greentic-webchat` service exists and is reachable from this operator's
+credentials:
+
+- No Cloud Run service named `greentic-webchat` in any of the ~35 GCP projects
+  visible to the preparing operator; `greentic-489320` has the Cloud Run and
+  Artifact Registry APIs disabled and none of the prerequisite infra (VPC,
+  Memorystore, runtime SA).
+- `ghcr.io/greenticai/greentic-start-distroless:latest` is built from `main`
+  (v0.5.38) and contains no agentic-worker support; the research line had
+  never been image-built.
+
+Per operator decision, scope changed from "deploy + smoke" to **prep +
+handoff**:
+
+- Published `ghcr.io/greenticai/greentic-start-distroless:research` (research
+  @ `00c38d6`, runner pin `74dff3f`) via `publish-distroless`
+  workflow_dispatch. Two latent CI bugs fixed on the way (PR #235): `:latest`
+  clobber on branch dispatch, and the Dockerfile bench-strip perl hack that
+  broke against the reformatted research manifest.
+- Wrote `docs/aw-hosted-runner-handoff.md` — image ref, key issuance for the
+  `store-runs` tenant, env table (incl. the `GREENTIC_AW_REDIS_URL` hard
+  gate), smoke checklist, failure semantics. Tasks 2, 4, 5 of the plan
+  transfer to the infra owner via that doc.
 
 ## Follow-ups (out of scope)
 
