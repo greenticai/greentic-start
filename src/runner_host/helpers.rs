@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use greentic_runner_host::config::{
-    FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
-    WebhookPolicy,
+    Fast2FlowRoutingConfig, FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy,
+    StateStorePolicy, WebhookPolicy,
 };
 use greentic_runner_host::trace::TraceConfig;
 use greentic_runner_host::validate::ValidationConfig;
@@ -261,6 +261,7 @@ pub(super) fn build_demo_host_config(tenant: &str) -> HostConfig {
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        fast2flow: Fast2FlowRoutingConfig::default(),
     }
 }
 
