@@ -1368,7 +1368,10 @@ fn text_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
         .expect("static response builder inputs are valid")
 }
 
-fn error_response(status: StatusCode, message: impl AsRef<str>) -> Response<Full<Bytes>> {
+pub(crate) fn error_response(
+    status: StatusCode,
+    message: impl AsRef<str>,
+) -> Response<Full<Bytes>> {
     text_response(status, message.as_ref())
 }
 

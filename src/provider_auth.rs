@@ -29,6 +29,7 @@ use subtle::ConstantTimeEq;
 use crate::endpoint_admit::EndpointAdmit;
 use crate::http_routes::RevisionScope;
 use crate::http_routes::derive_provider_name;
+use crate::revision_serve::error_response;
 use crate::secrets_gate::DynSecretsManager;
 use crate::webhook_secret_resolver::secret_ref_to_store_uri;
 
@@ -114,7 +115,8 @@ pub(crate) async fn authenticate_provider_webhook(
         // no token. Telegram would never deliver an update without it, so
         // this is either a misconfiguration on the provider side OR an
         // unauthenticated direct hit. Reject.
-        return Err(unauthorized_response(
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
             "missing x-telegram-bot-api-secret-token header",
         ));
     };
@@ -135,7 +137,8 @@ pub(crate) async fn authenticate_provider_webhook(
         }
     }
 
-    Err(unauthorized_response(
+    Err(error_response(
+        StatusCode::UNAUTHORIZED,
         "x-telegram-bot-api-secret-token did not match any registered endpoint",
     ))
 }
@@ -147,40 +150,15 @@ fn find_header_value<'a>(headers: &'a [(String, String)], target: &str) -> Optio
         .map(|(_, v)| v.as_str())
 }
 
-fn unauthorized_response(body: &str) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(body.to_string())))
-        .expect("static unauthorized response builder cannot fail")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{endpoint_typed, env_with, telegram_endpoint_with_webhook_secret};
+    use crate::test_fixtures::{
+        FakeSecrets, endpoint_typed, env_with, telegram_endpoint_with_webhook_secret,
+    };
     use greentic_deploy_spec::{BundleId, DeploymentId, RevisionId, SecretRef};
-    use greentic_secrets_lib::{Result as SecretResult, SecretError, SecretsManager};
     use std::collections::HashMap;
     use std::sync::Arc;
-
-    struct FakeSecrets(HashMap<String, Vec<u8>>);
-
-    #[async_trait::async_trait]
-    impl SecretsManager for FakeSecrets {
-        async fn read(&self, path: &str) -> SecretResult<Vec<u8>> {
-            self.0
-                .get(path)
-                .cloned()
-                .ok_or_else(|| SecretError::NotFound(path.to_string()))
-        }
-        async fn write(&self, _: &str, _: &[u8]) -> SecretResult<()> {
-            Err(SecretError::Permission("read-only".into()))
-        }
-        async fn delete(&self, _: &str) -> SecretResult<()> {
-            Err(SecretError::Permission("read-only".into()))
-        }
-    }
 
     fn scope_for(bundle: &str) -> RevisionScope {
         RevisionScope {

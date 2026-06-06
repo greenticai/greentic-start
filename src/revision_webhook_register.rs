@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures_util::future::join_all;
 use greentic_deploy_spec::{DeploymentId, Environment, MessagingEndpoint, SecretRef};
 use serde_json::{Value, json};
 
@@ -155,110 +156,128 @@ pub(crate) async fn register_new_model_webhooks(
 
     let secrets = activation.host.secrets_manager();
 
-    for plan in plans {
-        if plan.extra_endpoints > 0 {
+    // Plans are independent — different `(deployment, provider)` tuples with
+    // no shared state. Run them concurrently so N providers don't add
+    // N × SETUP_WEBHOOK_TIMEOUT to boot/reload latency. `join_all` runs each
+    // plan-future on the current task without spawning, keeping log ordering
+    // attached to this caller's tracing context.
+    join_all(
+        plans
+            .into_iter()
+            .map(|plan| register_one(activation, &secrets, plan)),
+    )
+    .await;
+}
+
+/// Resolve + invoke `setup_webhook` for a single plan. Errors are logged here
+/// and never bubble out — registration is best-effort, the next reload retries.
+async fn register_one(
+    activation: &Activation,
+    secrets: &DynSecretsManager,
+    plan: WebhookRegistration,
+) {
+    if plan.extra_endpoints > 0 {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "provider={} bundle has {} additional endpoint(s) linked beyond the one \
+                 auto-registered; a bot has a single webhook — register the others manually",
+                plan.provider_name, plan.extra_endpoints,
+            ),
+        );
+    }
+    let resolved_token = resolve_secret_token_source(&plan, secrets).await;
+    let token_value = match resolved_token {
+        ResolvedSecretToken::Ready(ref v) => v.as_deref(),
+        ResolvedSecretToken::Unresolved => {
+            // The endpoint declared a webhook_secret_ref but the secrets
+            // backend couldn't resolve it. SKIP registration entirely:
+            // invoking setup_webhook URL-only would mutate the provider
+            // to stop sending the secret-token header, while the auth
+            // gate still enforces the ref → 401 on every delivery.
+            // The provider's existing config stays intact until the next
+            // reload successfully resolves the value.
             operator_log::warn(
                 module_path!(),
                 format!(
-                    "provider={} bundle has {} additional endpoint(s) linked beyond the one \
-                     auto-registered; a bot has a single webhook — register the others manually",
-                    plan.provider_name, plan.extra_endpoints,
+                    "skipping webhook registration for provider={} url={} deployment={}: \
+                     webhook_secret_ref could not be resolved \
+                     (provider keeps existing config until next reload)",
+                    plan.provider_name, plan.webhook_url, plan.deployment_id,
+                ),
+            );
+            return;
+        }
+    };
+    let payload = plan.payload(token_value);
+    let invoke = activation.host.invoke_provider_for_revision(
+        &plan.tenant,
+        plan.deployment_id,
+        plan.bundle_id.clone(),
+        plan.revision_id,
+        &plan.provider_type,
+        SETUP_WEBHOOK_OP,
+        payload,
+        None,
+        None,
+    );
+    match tokio::time::timeout(SETUP_WEBHOOK_TIMEOUT, invoke).await {
+        Err(_elapsed) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "webhook registration timed out after {}s: provider={} url={} \
+                     (the provider may or may not have stored the webhook)",
+                    SETUP_WEBHOOK_TIMEOUT.as_secs(),
+                    plan.provider_name,
+                    plan.webhook_url,
                 ),
             );
         }
-        let resolved_token = resolve_secret_token_source(&plan, &secrets).await;
-        let token_value = match resolved_token {
-            ResolvedSecretToken::Ready(ref v) => v.as_deref(),
-            ResolvedSecretToken::Unresolved => {
-                // The endpoint declared a webhook_secret_ref but the secrets
-                // backend couldn't resolve it. SKIP registration entirely:
-                // invoking setup_webhook URL-only would mutate the provider
-                // to stop sending the secret-token header, while the auth
-                // gate still enforces the ref → 401 on every delivery.
-                // The provider's existing config stays intact until the next
-                // reload successfully resolves the value.
-                operator_log::warn(
+        Ok(Ok(output)) => {
+            // `setup_webhook` may run yet report a logical failure as
+            // `{"ok": false}` (bad token, provider API error, ...).
+            let ok = output.get("ok").and_then(Value::as_bool).unwrap_or(true);
+            if ok {
+                let token_source = match &plan.secret_token_source {
+                    SecretTokenSource::WebhookSecretRef(_) => "webhook_secret_ref",
+                    SecretTokenSource::ProviderIdFallback(_) => "provider_id",
+                    SecretTokenSource::None => "none",
+                };
+                operator_log::info(
                     module_path!(),
                     format!(
-                        "skipping webhook registration for provider={} url={} deployment={}: \
-                         webhook_secret_ref could not be resolved \
-                         (provider keeps existing config until next reload)",
-                        plan.provider_name, plan.webhook_url, plan.deployment_id,
-                    ),
-                );
-                continue;
-            }
-        };
-        let payload = plan.payload(token_value);
-        let invoke = activation.host.invoke_provider_for_revision(
-            &plan.tenant,
-            plan.deployment_id,
-            plan.bundle_id.clone(),
-            plan.revision_id,
-            &plan.provider_type,
-            SETUP_WEBHOOK_OP,
-            payload,
-            None,
-            None,
-        );
-        match tokio::time::timeout(SETUP_WEBHOOK_TIMEOUT, invoke).await {
-            Err(_elapsed) => {
-                operator_log::warn(
-                    module_path!(),
-                    format!(
-                        "webhook registration timed out after {}s: provider={} url={} \
-                         (the provider may or may not have stored the webhook)",
-                        SETUP_WEBHOOK_TIMEOUT.as_secs(),
+                        "webhook registered: provider={} url={} deployment={} \
+                         secret_token={} token_source={token_source}",
                         plan.provider_name,
                         plan.webhook_url,
+                        plan.deployment_id,
+                        token_value.is_some(),
                     ),
                 );
-            }
-            Ok(Ok(output)) => {
-                // `setup_webhook` may run yet report a logical failure as
-                // `{"ok": false}` (bad token, provider API error, ...).
-                let ok = output.get("ok").and_then(Value::as_bool).unwrap_or(true);
-                if ok {
-                    let token_source = match &plan.secret_token_source {
-                        SecretTokenSource::WebhookSecretRef(_) => "webhook_secret_ref",
-                        SecretTokenSource::ProviderIdFallback(_) => "provider_id",
-                        SecretTokenSource::None => "none",
-                    };
-                    operator_log::info(
-                        module_path!(),
-                        format!(
-                            "webhook registered: provider={} url={} deployment={} \
-                             secret_token={} token_source={token_source}",
-                            plan.provider_name,
-                            plan.webhook_url,
-                            plan.deployment_id,
-                            token_value.is_some(),
-                        ),
-                    );
-                } else {
-                    let err = output
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
-                    operator_log::warn(
-                        module_path!(),
-                        format!(
-                            "webhook registration reported failure: provider={} url={} error={}",
-                            plan.provider_name, plan.webhook_url, err,
-                        ),
-                    );
-                }
-            }
-            Ok(Err(err)) => {
-                // No `setup_webhook` op, missing creds, etc. — not fatal.
-                operator_log::debug(
+            } else {
+                let err = output
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                operator_log::warn(
                     module_path!(),
                     format!(
-                        "setup_webhook unavailable for provider={} deployment={}: {err:#}",
-                        plan.provider_name, plan.deployment_id,
+                        "webhook registration reported failure: provider={} url={} error={}",
+                        plan.provider_name, plan.webhook_url, err,
                     ),
                 );
             }
+        }
+        Ok(Err(err)) => {
+            // No `setup_webhook` op, missing creds, etc. — not fatal.
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "setup_webhook unavailable for provider={} deployment={}: {err:#}",
+                    plan.provider_name, plan.deployment_id,
+                ),
+            );
         }
     }
 }
@@ -475,7 +494,9 @@ fn load_environment(store_root: &Path, env_id: &str) -> Result<Environment> {
 mod tests {
     use super::*;
     use crate::http_routes::{RevisionScope, provider_descriptor_for_test};
-    use crate::test_fixtures::{endpoint_typed as endpoint, telegram_endpoint_with_webhook_secret};
+    use crate::test_fixtures::{
+        FakeSecrets, endpoint_typed as endpoint, telegram_endpoint_with_webhook_secret,
+    };
     use greentic_deploy_spec::{BundleId, DeploymentId, RevisionId};
 
     fn scope(deployment: DeploymentId, bundle: &str, revision: RevisionId) -> RevisionScope {
@@ -568,32 +589,6 @@ mod tests {
             plans[0].extra_endpoints, 1,
             "second endpoint counted as extra"
         );
-    }
-
-    /// In-memory `SecretsManager` for `resolve_secret_token_source` tests.
-    /// Keyed on the canonical dev-store URI (`secrets://...`), so seeding
-    /// uses `secret_ref_to_store_uri` for parity with the real
-    /// producer/consumer flow.
-    struct FakeSecrets(HashMap<String, Vec<u8>>);
-
-    #[async_trait::async_trait]
-    impl greentic_secrets_lib::SecretsManager for FakeSecrets {
-        async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
-            self.0
-                .get(path)
-                .cloned()
-                .ok_or_else(|| greentic_secrets_lib::SecretError::NotFound(path.to_string()))
-        }
-        async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
-            Err(greentic_secrets_lib::SecretError::Permission(
-                "read-only".into(),
-            ))
-        }
-        async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
-            Err(greentic_secrets_lib::SecretError::Permission(
-                "read-only".into(),
-            ))
-        }
     }
 
     fn plan_with_source(source: SecretTokenSource) -> WebhookRegistration {

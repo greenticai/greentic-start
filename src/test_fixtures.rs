@@ -10,10 +10,13 @@
 //! [`endpoint_admit::tests`]: crate::endpoint_admit
 //! [`endpoint_resolver::tests`]: crate::endpoint_resolver
 
+use std::collections::HashMap;
+
 use greentic_deploy_spec::{
     BundleId, Environment, EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId,
     SchemaVersion, SecretRef,
 };
+use greentic_secrets_lib::{Result as SecretResult, SecretError, SecretsManager};
 use greentic_types::EnvId;
 
 pub(crate) fn env_id() -> EnvId {
@@ -71,6 +74,31 @@ pub(crate) fn telegram_endpoint_with_webhook_secret(
         .expect("well-formed secret ref"),
     );
     ep
+}
+
+/// In-memory `SecretsManager` for tests. Keyed on the canonical dev-store
+/// URI (`secrets://...`), so seeding uses
+/// [`crate::webhook_secret_resolver::secret_ref_to_store_uri`] for parity
+/// with the real producer/consumer flow. Centralized here to avoid drift
+/// when the `SecretsManager` trait gains required methods — three modules
+/// (`provider_auth::tests`, `revision_webhook_register::tests`, and any
+/// future webhook-secret consumer) share the same mock.
+pub(crate) struct FakeSecrets(pub(crate) HashMap<String, Vec<u8>>);
+
+#[async_trait::async_trait]
+impl SecretsManager for FakeSecrets {
+    async fn read(&self, path: &str) -> SecretResult<Vec<u8>> {
+        self.0
+            .get(path)
+            .cloned()
+            .ok_or_else(|| SecretError::NotFound(path.to_string()))
+    }
+    async fn write(&self, _: &str, _: &[u8]) -> SecretResult<()> {
+        Err(SecretError::Permission("read-only".into()))
+    }
+    async fn delete(&self, _: &str) -> SecretResult<()> {
+        Err(SecretError::Permission("read-only".into()))
+    }
 }
 
 /// Build a minimal `Environment` carrying just the messaging endpoints — the
