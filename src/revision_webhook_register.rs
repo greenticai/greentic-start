@@ -167,7 +167,29 @@ pub(crate) async fn register_new_model_webhooks(
             );
         }
         let resolved_token = resolve_secret_token_source(&plan, &secrets).await;
-        let payload = plan.payload(resolved_token.as_deref());
+        let token_value = match resolved_token {
+            ResolvedSecretToken::Ready(ref v) => v.as_deref(),
+            ResolvedSecretToken::Unresolved => {
+                // The endpoint declared a webhook_secret_ref but the secrets
+                // backend couldn't resolve it. SKIP registration entirely:
+                // invoking setup_webhook URL-only would mutate the provider
+                // to stop sending the secret-token header, while the auth
+                // gate still enforces the ref → 401 on every delivery.
+                // The provider's existing config stays intact until the next
+                // reload successfully resolves the value.
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "skipping webhook registration for provider={} url={} deployment={}: \
+                         webhook_secret_ref could not be resolved \
+                         (provider keeps existing config until next reload)",
+                        plan.provider_name, plan.webhook_url, plan.deployment_id,
+                    ),
+                );
+                continue;
+            }
+        };
+        let payload = plan.payload(token_value);
         let invoke = activation.host.invoke_provider_for_revision(
             &plan.tenant,
             plan.deployment_id,
@@ -210,7 +232,7 @@ pub(crate) async fn register_new_model_webhooks(
                             plan.provider_name,
                             plan.webhook_url,
                             plan.deployment_id,
-                            resolved_token.is_some(),
+                            token_value.is_some(),
                         ),
                     );
                 } else {
@@ -241,34 +263,60 @@ pub(crate) async fn register_new_model_webhooks(
     }
 }
 
+/// Outcome of resolving a plan's [`SecretTokenSource`] at invocation time.
+///
+/// Distinguishes "we deliberately have no secret_token (URL-only is correct)"
+/// from "we expected a secret_token but couldn't resolve it". The caller MUST
+/// skip `setup_webhook` on [`ResolvedSecretToken::Unresolved`]: invoking it
+/// URL-only would mutate the provider to stop sending the secret-token header,
+/// while the auth gate in `provider_auth.rs` still enforces the ref — every
+/// legitimate delivery would be rejected with 401 until a later successful
+/// re-registration.
+#[derive(Debug, Clone, PartialEq)]
+enum ResolvedSecretToken {
+    /// Secret token resolved (or deliberately absent). Safe to invoke
+    /// `setup_webhook` with `value.as_deref()`.
+    Ready(Option<String>),
+    /// A `WebhookSecretRef` was present but the secrets backend failed to
+    /// resolve it (read error or non-UTF8). The caller MUST skip registration
+    /// for this plan — the provider's existing webhook config stays intact
+    /// until the next reload picks up the resolved value.
+    Unresolved,
+}
+
 /// Resolve a plan's [`SecretTokenSource`] into the actual on-wire value at
 /// invocation time. `WebhookSecretRef` reads the dev-store backend; a read
-/// failure falls back to URL-only registration (Some `None` semantically — no
-/// `secret_token` is planted) rather than the legacy `provider_id` token,
-/// because mixing the two postures would silently break the dispatcher's auth
-/// gate (it would expect the new secret while the provider sends the old one).
+/// failure returns [`ResolvedSecretToken::Unresolved`] so the caller skips
+/// registration rather than mutating the provider to a URL-only posture that
+/// the auth gate will reject. We never fall back to the legacy `provider_id`
+/// token, because mixing the two postures would silently break the
+/// dispatcher's auth gate (it would expect the new secret while the provider
+/// sends the old one).
 async fn resolve_secret_token_source(
     plan: &WebhookRegistration,
     secrets: &DynSecretsManager,
-) -> Option<String> {
+) -> ResolvedSecretToken {
     match &plan.secret_token_source {
-        SecretTokenSource::None => None,
-        SecretTokenSource::ProviderIdFallback(value) => Some(value.clone()),
+        SecretTokenSource::None => ResolvedSecretToken::Ready(None),
+        SecretTokenSource::ProviderIdFallback(value) => {
+            ResolvedSecretToken::Ready(Some(value.clone()))
+        }
         SecretTokenSource::WebhookSecretRef(secret_ref) => {
             let uri = secret_ref_to_store_uri(secret_ref);
             match secrets.read(&uri).await {
                 Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(value) => Some(value),
+                    Ok(value) => ResolvedSecretToken::Ready(Some(value)),
                     Err(_) => {
                         operator_log::warn(
                             module_path!(),
                             format!(
                                 "webhook secret at `{uri}` is not valid UTF-8; \
-                                 registering provider={} url={} URL-only",
+                                 skipping registration for provider={} url={} \
+                                 (provider keeps existing webhook config until next reload)",
                                 plan.provider_name, plan.webhook_url
                             ),
                         );
-                        None
+                        ResolvedSecretToken::Unresolved
                     }
                 },
                 Err(err) => {
@@ -276,11 +324,12 @@ async fn resolve_secret_token_source(
                         module_path!(),
                         format!(
                             "could not resolve webhook secret at `{uri}`: {err}; \
-                             registering provider={} url={} URL-only",
+                             skipping registration for provider={} url={} \
+                             (provider keeps existing webhook config until next reload)",
                             plan.provider_name, plan.webhook_url
                         ),
                     );
-                    None
+                    ResolvedSecretToken::Unresolved
                 }
             }
         }
@@ -575,7 +624,7 @@ mod tests {
         let plan = plan_with_source(SecretTokenSource::WebhookSecretRef(ref_));
         assert_eq!(
             resolve_secret_token_source(&plan, &secrets).await,
-            Some("resolved-value".to_string())
+            ResolvedSecretToken::Ready(Some("resolved-value".to_string()))
         );
     }
 
@@ -587,23 +636,64 @@ mod tests {
         ));
         assert_eq!(
             resolve_secret_token_source(&plan, &secrets).await,
-            Some("legacy-tok".to_string())
+            ResolvedSecretToken::Ready(Some("legacy-tok".to_string()))
         );
     }
 
     #[tokio::test]
-    async fn missing_webhook_secret_resolves_to_none_not_provider_id_fallback() {
+    async fn missing_webhook_secret_returns_unresolved_so_caller_skips_setup_webhook() {
         // Source is WebhookSecretRef but the store has nothing at that URI:
-        // the resolver returns None (URL-only registration). Falling back to
-        // `provider_id` would silently break the auth gate, which expects the
-        // new value.
+        // the resolver returns Unresolved so the caller skips `setup_webhook`
+        // entirely. Invoking URL-only would mutate the provider to stop
+        // sending the secret-token header, while the auth gate still enforces
+        // the ref — every delivery would be rejected with 401. Falling back
+        // to `provider_id` would silently break the auth gate too, which
+        // expects the new value.
         let ref_ = SecretRef::try_new(
             "secret://local/default/_/messaging-missing/webhook_secret".to_string(),
         )
         .unwrap();
         let secrets: DynSecretsManager = std::sync::Arc::new(FakeSecrets(HashMap::new()));
         let plan = plan_with_source(SecretTokenSource::WebhookSecretRef(ref_));
-        assert!(resolve_secret_token_source(&plan, &secrets).await.is_none());
+        assert_eq!(
+            resolve_secret_token_source(&plan, &secrets).await,
+            ResolvedSecretToken::Unresolved
+        );
+    }
+
+    #[tokio::test]
+    async fn non_utf8_webhook_secret_returns_unresolved_so_caller_skips_setup_webhook() {
+        // The secrets backend returns raw bytes that aren't valid UTF-8.
+        // Same safety invariant as a missing secret: the caller MUST skip
+        // `setup_webhook` rather than registering URL-only, which would
+        // mutate the provider to stop sending the secret-token header while
+        // the auth gate still enforces the ref.
+        let ref_ =
+            SecretRef::try_new("secret://local/default/_/messaging-bad/webhook_secret".to_string())
+                .unwrap();
+        let uri = crate::webhook_secret_resolver::secret_ref_to_store_uri(&ref_);
+        let secrets: DynSecretsManager = std::sync::Arc::new(FakeSecrets(HashMap::from([(
+            uri,
+            vec![0xFF, 0xFE, 0x00], // invalid UTF-8
+        )])));
+        let plan = plan_with_source(SecretTokenSource::WebhookSecretRef(ref_));
+        assert_eq!(
+            resolve_secret_token_source(&plan, &secrets).await,
+            ResolvedSecretToken::Unresolved
+        );
+    }
+
+    #[tokio::test]
+    async fn no_endpoint_source_resolves_to_ready_none() {
+        // SecretTokenSource::None means no endpoint links this bundle (single
+        // bundle, no IID). The resolver returns Ready(None) — URL-only
+        // registration is deliberately correct, not a resolution failure.
+        let secrets: DynSecretsManager = std::sync::Arc::new(FakeSecrets(HashMap::new()));
+        let plan = plan_with_source(SecretTokenSource::None);
+        assert_eq!(
+            resolve_secret_token_source(&plan, &secrets).await,
+            ResolvedSecretToken::Ready(None)
+        );
     }
 
     #[test]
