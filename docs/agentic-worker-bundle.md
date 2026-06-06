@@ -4,7 +4,9 @@ The agentic worker (`DwAgent` flow nodes) requires the `agentic-worker` feature,
 which is **only** present in the git-sourced `greentic-runner-host` /
 `greentic-runner-desktop` (the published `1.2.x-research` crates strip it, along
 with `greentic-aw-runtime` / `greentic-ext-runtime`). greentic-start therefore
-pins the runner via git **tag `aw-overlay-v1`** with `features =
+pins the runner via git **rev `74dff3f`** (research line, successor of the
+`aw-overlay-v1` tag; adds the admin-registry HTTP config provider read from
+`GREENTIC_AW_ADMIN_ENDPOINT` / `GREENTIC_AW_ADMIN_TOKEN`) with `features =
 ["agentic-worker"]` on both crates (see `Cargo.toml`).
 
 ## Dependency notes
