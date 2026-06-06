@@ -69,6 +69,7 @@ use crate::ingress_dispatch::parse_dispatch_result;
 use crate::ingress_types::IngressHttpResponse;
 use crate::messaging_dto::HttpInV1;
 use crate::operator_log;
+use crate::provider_auth;
 use crate::revision_dispatcher::{
     DispatchRequest, RevisionDispatcher, RevisionKey, SetCookieDirective, cookie_name,
 };
@@ -1367,7 +1368,10 @@ fn text_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
         .expect("static response builder inputs are valid")
 }
 
-fn error_response(status: StatusCode, message: impl AsRef<str>) -> Response<Full<Bytes>> {
+pub(crate) fn error_response(
+    status: StatusCode,
+    message: impl AsRef<str>,
+) -> Response<Full<Bytes>> {
     text_response(status, message.as_ref())
 }
 
@@ -1607,6 +1611,31 @@ async fn dispatch_provider_route(
     let bundle_id = scope.bundle_id.clone();
     let revision_id = scope.revision_id;
 
+    // Phase D.3 / M1 IID auth gate: for provider classes whose endpoint
+    // declares `webhook_secret_ref`, constant-time compare the inbound
+    // discriminator header (Telegram: `x-telegram-bot-api-secret-token`)
+    // against the resolved per-endpoint secret. Runs BEFORE the IID resolver
+    // because a matched secret is BOTH an authenticator AND the routing
+    // discriminator — no need to invoke `identify-instance` after.
+    //
+    // [`provider_auth::AuthOutcome::Skipped`] is the back-compat path:
+    // endpoints provisioned before PR #246 have no `webhook_secret_ref` and
+    // continue to identify-route by `provider_id`.
+    let secrets = activation.host.secrets_manager();
+    let header_endpoint_id_authenticated = match provider_auth::authenticate_provider_webhook(
+        activation.routing.endpoint_admit.as_ref(),
+        &secrets,
+        scope,
+        &provider_type,
+        request_headers,
+    )
+    .await
+    {
+        Ok(provider_auth::AuthOutcome::Authenticated(eid)) => Some(eid),
+        Ok(provider_auth::AuthOutcome::Skipped) => None,
+        Err(response) => return Err(response),
+    };
+
     // M1 IID.4 resolver + admit + welcome hint — shared with the generic-JSON
     // branch; see [`resolve_endpoint_for_scope`]. This is what makes the
     // auto-registered IID `secret_token` (see `revision_webhook_register`)
@@ -1614,11 +1643,18 @@ async fn dispatch_provider_route(
     // not necessarily JSON (form-urlencoded, signature blobs) — identify is
     // best-effort on the body; the header set (e.g. Telegram's secret-token)
     // is always carried.
+    //
+    // When the auth gate authenticated above, that endpoint id wins — passed
+    // as the resolver's header override so the IID probe is skipped (the
+    // resolver still validates ACL membership of the dispatched bundle).
+    let header_endpoint_id_for_resolver = header_endpoint_id_authenticated
+        .as_deref()
+        .or(header_endpoint_id);
     let (endpoint_id, welcome_hint) = resolve_endpoint_for_scope(
         &activation,
         tenant,
         scope,
-        header_endpoint_id,
+        header_endpoint_id_for_resolver,
         peer_is_loopback,
         || {
             let body_value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
@@ -2346,6 +2382,7 @@ mod tests {
             provider_type: "teams".to_string(),
             display_name: "Legal".to_string(),
             secret_refs: Vec::new(),
+            webhook_secret_ref: None,
             linked_bundles,
             welcome_flow,
             generation: 1,
@@ -2627,6 +2664,7 @@ mod tests {
             provider_type: "teams".to_string(),
             display_name: "Legal".to_string(),
             secret_refs: Vec::new(),
+            webhook_secret_ref: None,
             linked_bundles: vec![BundleId::new("legal-bundle")],
             welcome_flow: None,
             generation: 1,

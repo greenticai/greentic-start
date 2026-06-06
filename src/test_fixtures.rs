@@ -10,10 +10,13 @@
 //! [`endpoint_admit::tests`]: crate::endpoint_admit
 //! [`endpoint_resolver::tests`]: crate::endpoint_resolver
 
+use std::collections::HashMap;
+
 use greentic_deploy_spec::{
     BundleId, Environment, EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId,
-    SchemaVersion,
+    SchemaVersion, SecretRef,
 };
+use greentic_secrets_lib::{Result as SecretResult, SecretError, SecretsManager};
 use greentic_types::EnvId;
 
 pub(crate) fn env_id() -> EnvId {
@@ -41,12 +44,60 @@ pub(crate) fn endpoint_typed(
         provider_type: provider_type.to_string(),
         display_name: provider_id.to_string(),
         secret_refs: Vec::new(),
+        webhook_secret_ref: None,
         linked_bundles: bundles.iter().map(|b| BundleId::new(*b)).collect(),
         welcome_flow: None,
         generation: 1,
         created_at: now,
         updated_at: now,
         updated_by: "test".to_string(),
+    }
+}
+
+/// Build a Telegram-class endpoint with a `webhook_secret_ref` set. The
+/// returned URI is well-formed for the current env id (`local`) and
+/// matches the deployer's auto-gen URI scheme; tests that need to
+/// resolve it through a `SecretsManager` must seed the value at the
+/// canonical 5-segment dev-store path (`secrets://...`).
+pub(crate) fn telegram_endpoint_with_webhook_secret(
+    provider_id: &str,
+    bundles: &[&str],
+) -> MessagingEndpoint {
+    let mut ep = endpoint_typed("telegram", provider_id, bundles);
+    let eid_lower = ep.endpoint_id.to_string().to_lowercase();
+    ep.webhook_secret_ref = Some(
+        SecretRef::try_new(format!(
+            "secret://{}/default/_/messaging-{}/webhook_secret",
+            env_id(),
+            eid_lower
+        ))
+        .expect("well-formed secret ref"),
+    );
+    ep
+}
+
+/// In-memory `SecretsManager` for tests. Keyed on the canonical dev-store
+/// URI (`secrets://...`), so seeding uses
+/// [`crate::webhook_secret_resolver::secret_ref_to_store_uri`] for parity
+/// with the real producer/consumer flow. Centralized here to avoid drift
+/// when the `SecretsManager` trait gains required methods — three modules
+/// (`provider_auth::tests`, `revision_webhook_register::tests`, and any
+/// future webhook-secret consumer) share the same mock.
+pub(crate) struct FakeSecrets(pub(crate) HashMap<String, Vec<u8>>);
+
+#[async_trait::async_trait]
+impl SecretsManager for FakeSecrets {
+    async fn read(&self, path: &str) -> SecretResult<Vec<u8>> {
+        self.0
+            .get(path)
+            .cloned()
+            .ok_or_else(|| SecretError::NotFound(path.to_string()))
+    }
+    async fn write(&self, _: &str, _: &[u8]) -> SecretResult<()> {
+        Err(SecretError::Permission("read-only".into()))
+    }
+    async fn delete(&self, _: &str) -> SecretResult<()> {
+        Err(SecretError::Permission("read-only".into()))
     }
 }
 

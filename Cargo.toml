@@ -55,6 +55,7 @@ serde_json = "1.0"
 sys-locale = "0.3"
 sysinfo = "0.39"
 sha2 = "0.11"
+subtle = "2"
 tokio-rustls = "0.26"
 tokio-tungstenite = "0.29"
 tar = "0.4"
@@ -90,7 +91,7 @@ features = [
 # is read here at egress time, so the deployer + deploy-spec must both
 # expose the field.
 [dependencies.greentic-deployer]
-version = ">=1.1.0-dev.27009344392, <1.2.0-0"
+version = ">=1.1.0-dev.27032942340, <1.2.0-0"
 default-features = false
 
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
@@ -100,7 +101,7 @@ default-features = false
 # overrides into `SendPayloadInV1.config`; earlier publishes don't carry
 # the field and the route table would drop it on load.
 [dependencies.greentic-deploy-spec]
-version = ">=0.1.27009344392, <0.2"
+version = ">=0.1.27032942340, <0.2"
 
 [dependencies.greentic-setup]
 version = ">=1.1.0-dev, <1.2.0-0"

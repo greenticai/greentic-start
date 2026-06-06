@@ -49,6 +49,7 @@ pub mod perf_harness;
 mod port_utils;
 mod post_ingress_hooks;
 mod project;
+mod provider_auth;
 pub mod provider_config_envelope;
 mod qa_persist;
 mod revision_boot;
@@ -88,6 +89,7 @@ mod test_fixtures;
 mod timer_scheduler;
 mod tunnel_prompt;
 mod warmup;
+mod webhook_secret_resolver;
 mod webhook_updater;
 #[doc(hidden)]
 pub mod ws_test_support;
