@@ -81,15 +81,19 @@ version = ">=1.1.0-dev, <1.2.0-0"
 [dependencies.axum]
 version = "0.8"
 
+# Pinned to the runner research rev that adds the admin-registry HTTP config
+# provider (GREENTIC_AW_ADMIN_ENDPOINT / GREENTIC_AW_ADMIN_TOKEN, runner PR
+# #385) so deployed greentic-start can pull agent configs registered by the
+# store's run-from-store endpoint. Successor of the aw-overlay-v1 tag.
 [dependencies.greentic-runner-desktop]
 git = "https://github.com/greenticai/greentic-runner.git"
-tag = "aw-overlay-v1"
+rev = "74dff3fb7ae6f21d9efcb79c04d9598d0daaccb8"
 default-features = false
 features = ["agentic-worker"]
 
 [dependencies.greentic-runner-host]
 git = "https://github.com/greenticai/greentic-runner.git"
-tag = "aw-overlay-v1"
+rev = "74dff3fb7ae6f21d9efcb79c04d9598d0daaccb8"
 default-features = false
 features = ["agentic-worker"]
 
@@ -156,7 +160,7 @@ features = [
 criterion = "0.8"
 tempfile = "3"
 
-# greentic-runner (git tag aw-overlay-v1) pulls greentic-ext-runtime
+# greentic-runner (git rev 74dff3f, research line) pulls greentic-ext-runtime
 # v1.2.14-research, which requires greentic-extension-sdk-contract
 # =1.2.4-research. That SDK version is git-tagged only (never republished to
 # crates.io), so the runner workspace redirects it via [patch.crates-io].
