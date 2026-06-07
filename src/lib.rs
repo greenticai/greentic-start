@@ -446,11 +446,13 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             // deployment, new endpoint) re-registers webhooks against the
             // freshly-served activation — AFTER the swap, so the registered
             // URL is live before the provider validates or delivers to it.
+            // The URL is resolved freshly from the reloaded environment.json
+            // (with env-var fallback), so `gtc op env set-public-url` takes
+            // effect on the next reload without a process restart.
             // Idempotent for unchanged routes (same URL + secret_token).
             revision_webhook_register::post_reload_registration(
                 store_root.clone(),
                 env_id.clone(),
-                public_base_url,
                 activation_rt.handle().clone(),
             ),
         )
