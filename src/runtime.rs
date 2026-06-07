@@ -1008,23 +1008,35 @@ pub fn demo_up_services(
     // Precedence: tunnel > env-store > env var > local-listener derived.
     // env-store wins over env var: it's the persisted operator intent set via
     // `gtc op env set-public-url`, while the env var is a process-level override.
-    let public_base_url = tunnel_public_base_url
+    //
+    // Source attribution is computed in the same pass so the URL value and its
+    // `RuntimePublicBaseUrlSource` tag can't drift — adding a fifth source is
+    // one new `.or_else` arm instead of two parallel chains.
+    let derived_local_url = if ingress_server.is_some() && enable_static_routes {
+        let host = &config.services.gateway.listen_addr;
+        let port = ingress_server
+            .as_ref()
+            .map(|server| server.actual_port)
+            .unwrap_or(config.services.gateway.port);
+        Some(format!("http://{}:{}", host, port))
+    } else {
+        None
+    };
+    let url_with_source: Option<(String, RuntimePublicBaseUrlSource)> = tunnel_public_base_url
         .clone()
-        .or(env_store_public_base_url.clone())
-        .or(configured_public_base_url.clone())
+        .map(|u| (u, RuntimePublicBaseUrlSource::Tunnel))
         .or_else(|| {
-            // Fallback: derive from local HTTP listener if static routes are enabled
-            if ingress_server.is_some() && enable_static_routes {
-                let host = &config.services.gateway.listen_addr;
-                let port = ingress_server
-                    .as_ref()
-                    .map(|server| server.actual_port)
-                    .unwrap_or(config.services.gateway.port);
-                Some(format!("http://{}:{}", host, port))
-            } else {
-                None
-            }
-        });
+            env_store_public_base_url
+                .clone()
+                .map(|u| (u, RuntimePublicBaseUrlSource::EnvStore))
+        })
+        .or_else(|| {
+            configured_public_base_url
+                .clone()
+                .map(|u| (u, RuntimePublicBaseUrlSource::Configured))
+        })
+        .or_else(|| derived_local_url.map(|u| (u, RuntimePublicBaseUrlSource::Derived)));
+    let public_base_url = url_with_source.as_ref().map(|(u, _)| u.clone());
 
     // Auto-update webhooks if public URL changed
     let webhook_summary = if let Some(ref new_url) = public_base_url {
@@ -1077,35 +1089,9 @@ pub fn demo_up_services(
     // asset_serving_enabled: true if bundle declares static routes we're enabling
     let http_listener_enabled = ingress_server.is_some();
     let asset_serving_enabled = enable_static_routes;
-    let runtime_config = if let Some(url) = tunnel_public_base_url {
-        Some(RuntimeConfig {
-            public_base_url: Some(RuntimePublicBaseUrl {
-                value: url,
-                source: RuntimePublicBaseUrlSource::Tunnel,
-            }),
-        })
-    } else if let Some(url) = env_store_public_base_url {
-        Some(RuntimeConfig {
-            public_base_url: Some(RuntimePublicBaseUrl {
-                value: url,
-                source: RuntimePublicBaseUrlSource::EnvStore,
-            }),
-        })
-    } else if let Some(url) = configured_public_base_url {
-        Some(RuntimeConfig {
-            public_base_url: Some(RuntimePublicBaseUrl {
-                value: url,
-                source: RuntimePublicBaseUrlSource::Configured,
-            }),
-        })
-    } else {
-        public_base_url.clone().map(|url| RuntimeConfig {
-            public_base_url: Some(RuntimePublicBaseUrl {
-                value: url,
-                source: RuntimePublicBaseUrlSource::Derived,
-            }),
-        })
-    };
+    let runtime_config = url_with_source.map(|(value, source)| RuntimeConfig {
+        public_base_url: Some(RuntimePublicBaseUrl { value, source }),
+    });
 
     let startup_contract = resolve_startup_contract(
         static_routes,

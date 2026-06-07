@@ -393,14 +393,10 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // provider API call must not delay the watcher spawn or Ctrl+C
         // handling; each invocation is bounded by `SETUP_WEBHOOK_TIMEOUT`.
         //
-        // Precedence (no tunnel on this path): env-store > env var. The
-        // env-store value comes straight off the loaded `environment` we
-        // already have in hand; no extra disk read.
-        let public_base_url = environment
-            .host_config
-            .public_base_url
-            .clone()
-            .or(startup_contract::configured_public_base_url_from_env()?);
+        // Precedence (no tunnel on this path): env-store > env var. Delegated
+        // to the canonical helper in `startup_contract` so this path stays in
+        // lockstep with the reload path in `revision_webhook_register`.
+        let public_base_url = startup_contract::resolve_public_base_url(&environment)?;
         if revision_count > 0 {
             let boot_activation = std::sync::Arc::clone(&activation);
             let boot_url = public_base_url.clone();

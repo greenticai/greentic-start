@@ -176,6 +176,22 @@ pub fn configured_public_base_url_from_env_store(env_id: &str) -> anyhow::Result
     Ok(environment.host_config.public_base_url)
 }
 
+/// Single point of truth for the env-derived precedence:
+/// `host_config.public_base_url > PUBLIC_BASE_URL env var`.
+///
+/// Returns `Err` only when the env var is set but malformed; the caller picks
+/// the error policy. The boot-time bundle-less path propagates with `?`; the
+/// reload hook in `revision_webhook_register` discards with `.ok().flatten()`
+/// because the watcher is intentionally fail-soft.
+pub fn resolve_public_base_url(
+    env: &greentic_deploy_spec::Environment,
+) -> anyhow::Result<Option<String>> {
+    if let Some(url) = env.host_config.public_base_url.as_deref() {
+        return Ok(Some(url.to_string()));
+    }
+    configured_public_base_url_from_env()
+}
+
 fn collect_bundle_packs(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut packs = Vec::new();
     for dir in [root.join("providers"), root.join("packs")] {

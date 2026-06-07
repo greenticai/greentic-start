@@ -486,16 +486,15 @@ pub(crate) fn post_reload_registration(
 }
 
 /// Resolve the public base URL from a freshly-loaded environment, with a
-/// fallback to the `PUBLIC_BASE_URL` env var. Same precedence as the boot-time
-/// path in `lib.rs` (env-store > env var), but `.ok().flatten()` on the
-/// env-var branch so a malformed value is treated as "no URL" rather than
-/// failing the reload — the watcher is intentionally fail-soft.
+/// fallback to the `PUBLIC_BASE_URL` env var. Delegates to the canonical
+/// helper in `startup_contract` and discards any error via `.ok().flatten()` —
+/// the watcher is intentionally fail-soft (see header in `revision_reload`),
+/// so a malformed env var is treated as "no URL" rather than failing the
+/// reload. The boot path in `lib.rs` calls the same helper and propagates.
 fn resolve_public_base_url_for_reload(env: &Environment) -> Option<String> {
-    env.host_config.public_base_url.clone().or_else(|| {
-        crate::startup_contract::configured_public_base_url_from_env()
-            .ok()
-            .flatten()
-    })
+    crate::startup_contract::resolve_public_base_url(env)
+        .ok()
+        .flatten()
 }
 
 /// Load the env the same way the bundle-less cold start does.
