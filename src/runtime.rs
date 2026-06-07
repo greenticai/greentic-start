@@ -752,6 +752,7 @@ pub fn demo_up_services(
     config: &DemoConfig,
     static_routes: &BundleStaticRoutesInspection,
     configured_public_base_url: Option<String>,
+    env_store_public_base_url: Option<String>,
     cloudflared: Option<CloudflaredConfig>,
     ngrok: Option<NgrokConfig>,
     restart: &BTreeSet<String>,
@@ -1003,9 +1004,13 @@ pub fn demo_up_services(
     let previous_public_url =
         crate::webhook_updater::read_previous_public_url(&paths.runtime_root());
 
-    // Resolve public_base_url with fallback to local HTTP listener for local dev
+    // Resolve public_base_url with fallback to local HTTP listener for local dev.
+    // Precedence: tunnel > env-store > env var > local-listener derived.
+    // env-store wins over env var: it's the persisted operator intent set via
+    // `gtc op env set-public-url`, while the env var is a process-level override.
     let public_base_url = tunnel_public_base_url
         .clone()
+        .or(env_store_public_base_url.clone())
         .or(configured_public_base_url.clone())
         .or_else(|| {
             // Fallback: derive from local HTTP listener if static routes are enabled
@@ -1077,6 +1082,13 @@ pub fn demo_up_services(
             public_base_url: Some(RuntimePublicBaseUrl {
                 value: url,
                 source: RuntimePublicBaseUrlSource::Tunnel,
+            }),
+        })
+    } else if let Some(url) = env_store_public_base_url {
+        Some(RuntimeConfig {
+            public_base_url: Some(RuntimePublicBaseUrl {
+                value: url,
+                source: RuntimePublicBaseUrlSource::EnvStore,
             }),
         })
     } else if let Some(url) = configured_public_base_url {
@@ -2232,6 +2244,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &restart,
             None,
             &log_dir,
@@ -2298,6 +2311,7 @@ mod tests {
             &config_path,
             &config,
             &static_routes,
+            None,
             None,
             None,
             None,
