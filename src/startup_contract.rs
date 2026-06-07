@@ -48,6 +48,7 @@ pub struct RuntimePublicBaseUrl {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimePublicBaseUrlSource {
     Configured,
+    EnvStore,
     Tunnel,
     Derived,
 }
@@ -146,6 +147,49 @@ pub fn configured_public_base_url_from_env() -> anyhow::Result<Option<String>> {
         return Ok(None);
     };
     normalize_public_base_url(&raw).map(Some)
+}
+
+/// Reads the persisted `public_base_url` from the deployer-managed env store.
+///
+/// Returns `Ok(None)` when the env directory is missing (cold start before
+/// `gtc op env init`), the environment has no persisted URL, or the home dir
+/// cannot be resolved (headless CI). Returns `Err` when an env directory
+/// exists but is malformed (`environment.json` unreadable or corrupt).
+///
+/// The deploy-spec validator (`validate_public_base_url`) already gates
+/// writes, so no second normalization is needed here.
+pub fn configured_public_base_url_from_env_store(env_id: &str) -> anyhow::Result<Option<String>> {
+    use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
+    use greentic_types::EnvId;
+
+    let Some(root) = LocalFsStore::default_root() else {
+        return Ok(None);
+    };
+    if !root.join(env_id).is_dir() {
+        return Ok(None);
+    }
+    let env_typed =
+        EnvId::new(env_id).with_context(|| format!("invalid environment id `{env_id}`"))?;
+    let store = LocalFsStore::new(root);
+    let environment = EnvironmentStore::load(&store, &env_typed)
+        .with_context(|| format!("loading environment `{env_id}` for public_base_url"))?;
+    Ok(environment.host_config.public_base_url)
+}
+
+/// Single point of truth for the env-derived precedence:
+/// `host_config.public_base_url > PUBLIC_BASE_URL env var`.
+///
+/// Returns `Err` only when the env var is set but malformed; the caller picks
+/// the error policy. The boot-time bundle-less path propagates with `?`; the
+/// reload hook in `revision_webhook_register` discards with `.ok().flatten()`
+/// because the watcher is intentionally fail-soft.
+pub fn resolve_public_base_url(
+    env: &greentic_deploy_spec::Environment,
+) -> anyhow::Result<Option<String>> {
+    if let Some(url) = env.host_config.public_base_url.as_deref() {
+        return Ok(Some(url.to_string()));
+    }
+    configured_public_base_url_from_env()
 }
 
 fn collect_bundle_packs(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -347,6 +391,68 @@ mod tests {
         let err = normalize_public_base_url("https://example.com/path")
             .expect_err("expected invalid path");
         assert!(err.to_string().contains("without a path"));
+    }
+
+    /// Round-trips an EnvStore-source URL through `resolve` so the new enum
+    /// variant survives serde + the same precedence-preserving identity that
+    /// `Tunnel` already has. Pure runtime-config flow — no disk I/O.
+    #[test]
+    fn resolve_surfaces_env_store_source_from_runtime_config() -> anyhow::Result<()> {
+        let contract = resolve(StartupContractInput {
+            bundle_has_static_routes: true,
+            http_listener_enabled: true,
+            asset_serving_enabled: true,
+            public_base_url: Some("https://from-env-var.example.com".to_string()),
+            runtime_config: Some(RuntimeConfig {
+                public_base_url: Some(RuntimePublicBaseUrl {
+                    value: "https://persisted.example.com".to_string(),
+                    source: RuntimePublicBaseUrlSource::EnvStore,
+                }),
+            }),
+        })?;
+        assert_eq!(
+            contract.public_base_url.as_deref(),
+            Some("https://persisted.example.com")
+        );
+        assert_eq!(
+            contract
+                .runtime_config
+                .as_ref()
+                .and_then(|config| config.public_base_url.as_ref())
+                .map(|entry| entry.source),
+            Some(RuntimePublicBaseUrlSource::EnvStore)
+        );
+        let json = serde_json::to_string(&contract)?;
+        assert!(
+            json.contains("\"env_store\""),
+            "expected snake_case env_store in: {json}"
+        );
+        Ok(())
+    }
+
+    /// Cold-start guard: with no env directory on disk, the reader returns
+    /// `Ok(None)` rather than failing. Mirrors the helper's contract for the
+    /// pre-init case (no `gtc op env init` yet, no `~/.greentic/environments/`).
+    #[test]
+    fn env_store_reader_returns_none_for_missing_env_dir() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        // Point HOME at an empty temp dir so `LocalFsStore::default_root` resolves
+        // to a real path but no env subdirectory exists. `set_var` is `unsafe` on
+        // Rust 2024; safe here because the test does not spawn child threads
+        // that read HOME concurrently.
+        let prev = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+        }
+        let result = configured_public_base_url_from_env_store("local");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(result?, None);
+        Ok(())
     }
 
     fn write_pack(path: &Path, with_static_routes: bool) -> anyhow::Result<()> {

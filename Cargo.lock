@@ -2174,14 +2174,15 @@ dependencies = [
 
 [[package]]
 name = "greentic-deploy-spec"
-version = "0.1.27033365433"
+version = "0.1.27092623472"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "452d9cd2f98e1e43d9cd5c442dd0b8fa018961e95d12e818fd4e58aa9a3e3b18"
+checksum = "7a70a9e79d4f2365ebbed76a6a72dca74e4120e3864af041ecffb1643e48bfa7"
 dependencies = [
  "chrono",
  "greentic-config-types",
  "greentic-types",
  "hex",
+ "http",
  "semver",
  "serde",
  "serde_json",
@@ -2193,9 +2194,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.1.0-dev.27033365433"
+version = "1.1.0-dev.27092623472"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a7ffcda6e6fb9c7c93daea72df30561672b783109c06d276bed1ba6909f1ef8"
+checksum = "a2633bbaf8f8c96c1890fe7f0b0d03281360f7b4b5218132139ccff34c3d905a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2616,9 +2617,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-setup"
-version = "1.1.0-dev.27012833285"
+version = "1.1.0-dev.27093775683"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f13fa336301824eab4faabb4207262bb29d0f2b77e421a0024e49c520803fd79"
+checksum = "6787c574d7897d871e69bbc2f09ce758b26cca570175d19a9531366c58cf77cf"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",

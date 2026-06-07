@@ -87,24 +87,29 @@ features = [
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
 # (per-env trust root + operator key, deployer #226). Floor bumped to the
-# D.4 train-2 publish (deployer #243) — `BundleDeployment.config_overrides`
-# is read here at egress time, so the deployer + deploy-spec must both
-# expose the field.
+# Change-C-part-1 publish (deployer #250) — `EnvironmentHostConfig.public_base_url`
+# is consumed here in `configured_public_base_url_from_env_store` and the
+# `ensure_local_environment` call now passes the 2-arg signature; earlier
+# publishes lack both surfaces.
 [dependencies.greentic-deployer]
-version = ">=1.1.0-dev.27032942340, <1.2.0-0"
+version = ">=1.1.0-dev.27092623472, <1.2.0-0"
 default-features = false
 
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
 # / `Revision` cross the deployer boundary, so resolution must not pick an
-# older deploy-spec. Floor bumped to the D.4 train-1 publish that adds
-# `BundleDeployment.config_overrides` — the egress projects per-pack
-# overrides into `SendPayloadInV1.config`; earlier publishes don't carry
-# the field and the route table would drop it on load.
+# older deploy-spec. Floor bumped to the Change-C-part-1 publish that adds
+# `EnvironmentHostConfig.public_base_url` (the persisted operator-set URL);
+# earlier publishes don't carry the field and the env-store reader would
+# silently return `None` for valid env directories.
 [dependencies.greentic-deploy-spec]
-version = ">=0.1.27032942340, <0.2"
+version = ">=0.1.27092623472, <0.2"
 
+# Lower bound pinned to the publish that updates the bootstrap call site for
+# the deployer's 2-arg `ensure_local_environment` (greentic-setup#134).
+# Earlier publishes have the 1-arg call against the new deployer floor and
+# would fail to compile in the resolved graph.
 [dependencies.greentic-setup]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-dev.27093775683, <1.2.0-0"
 
 [dependencies.greentic-runner-desktop]
 version = ">=1.1.0-dev, <1.2.0-0"

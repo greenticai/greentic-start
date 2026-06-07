@@ -386,13 +386,17 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         println!("\n{banner}. Press Ctrl+C to stop.");
 
         // Phase D: auto-register provider webhooks for the served revisions.
-        // Gated on a configured PUBLIC_BASE_URL — the bundle-less boot runs no
-        // tunnel, so a configured public address is the only one we can hand to
-        // a provider. With none, registration is skipped (register manually).
+        // Gated on a public_base_url — the bundle-less boot runs no tunnel, so
+        // a persisted or env-var-supplied address is the only one we can hand
+        // to a provider. With none, registration is skipped (register manually).
         // Detached: the server is already listening, and a slow or stuck
         // provider API call must not delay the watcher spawn or Ctrl+C
         // handling; each invocation is bounded by `SETUP_WEBHOOK_TIMEOUT`.
-        let public_base_url = startup_contract::configured_public_base_url_from_env()?;
+        //
+        // Precedence (no tunnel on this path): env-store > env var. Delegated
+        // to the canonical helper in `startup_contract` so this path stays in
+        // lockstep with the reload path in `revision_webhook_register`.
+        let public_base_url = startup_contract::resolve_public_base_url(&environment)?;
         if revision_count > 0 {
             let boot_activation = std::sync::Arc::clone(&activation);
             let boot_url = public_base_url.clone();
@@ -438,11 +442,13 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             // deployment, new endpoint) re-registers webhooks against the
             // freshly-served activation — AFTER the swap, so the registered
             // URL is live before the provider validates or delivers to it.
+            // The URL is resolved freshly from the reloaded environment.json
+            // (with env-var fallback), so `gtc op env set-public-url` takes
+            // effect on the next reload without a process restart.
             // Idempotent for unchanged routes (same URL + secret_token).
             revision_webhook_register::post_reload_registration(
                 store_root.clone(),
                 env_id.clone(),
-                public_base_url,
                 activation_rt.handle().clone(),
             ),
         )
@@ -572,6 +578,21 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     apply_nats_overrides(&mut demo_config, &request);
     let static_routes = startup_contract::inspect_bundle(&config_dir)?;
     let configured_public_base_url = startup_contract::configured_public_base_url_from_env()?;
+    // Persisted public_base_url from `gtc op env set-public-url`. Sits between
+    // the tunnel-discovered URL (always wins) and the `PUBLIC_BASE_URL` env var
+    // in the precedence chain. Failing to read this is non-fatal: a corrupt env
+    // store should not block a foreground startup, so we log and fall back.
+    let env_store_public_base_url =
+        match startup_contract::configured_public_base_url_from_env_store(&resolve_env(None)) {
+            Ok(value) => value,
+            Err(err) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!("failed to read env-store public_base_url, falling back: {err:#}"),
+                );
+                None
+            }
+        };
     let tenant = demo_config.tenant.clone();
     let team = demo_config.team.clone();
     let runtime_paths =
@@ -692,6 +713,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         &demo_config,
         &static_routes,
         configured_public_base_url,
+        env_store_public_base_url,
         cloudflared,
         ngrok,
         &restart,
@@ -887,7 +909,7 @@ fn bootstrap_local_environment() -> anyhow::Result<()> {
     let root = LocalFsStore::default_root()
         .context("Cannot determine default environment store root (no home directory).")?;
     let store = LocalFsStore::new(root.clone());
-    let (_env, outcome) = ensure_local_environment(&store)
+    let (_env, outcome) = ensure_local_environment(&store, None)
         .with_context(|| format!("Bootstrapping `local` environment at {}", root.display()))?;
     if outcome == LocalEnvOutcome::Created {
         operator_log::info(

@@ -453,10 +453,14 @@ fn plan_webhook_registrations(
 /// thread stays free to process the next reload event. Idempotent for
 /// unchanged paths; covers hot-attached deployments; failures are best-effort
 /// logged — the next config reload re-registers.
+///
+/// The public URL is resolved freshly on each reload from the just-loaded
+/// `environment.json`, with a fallback to the `PUBLIC_BASE_URL` env var.
+/// This ensures that `gtc op env set-public-url <NEW>` takes effect on the
+/// next reload without a process restart.
 pub(crate) fn post_reload_registration(
     store_root: PathBuf,
     env_id: String,
-    public_base_url: Option<String>,
     rt: tokio::runtime::Handle,
 ) -> impl FnMut(&Activation) + Send + 'static {
     move |activation: &Activation| {
@@ -473,12 +477,24 @@ pub(crate) fn post_reload_registration(
                 return;
             }
         };
+        let public_base_url = resolve_public_base_url_for_reload(&env);
         let activation = activation.clone();
-        let public_base_url = public_base_url.clone();
         rt.spawn(async move {
             register_new_model_webhooks(&activation, &env, public_base_url.as_deref()).await;
         });
     }
+}
+
+/// Resolve the public base URL from a freshly-loaded environment, with a
+/// fallback to the `PUBLIC_BASE_URL` env var. Delegates to the canonical
+/// helper in `startup_contract` and discards any error via `.ok().flatten()` —
+/// the watcher is intentionally fail-soft (see header in `revision_reload`),
+/// so a malformed env var is treated as "no URL" rather than failing the
+/// reload. The boot path in `lib.rs` calls the same helper and propagates.
+fn resolve_public_base_url_for_reload(env: &Environment) -> Option<String> {
+    crate::startup_contract::resolve_public_base_url(env)
+        .ok()
+        .flatten()
 }
 
 /// Load the env the same way the bundle-less cold start does.
@@ -495,7 +511,7 @@ mod tests {
     use super::*;
     use crate::http_routes::{RevisionScope, provider_descriptor_for_test};
     use crate::test_fixtures::{
-        FakeSecrets, endpoint_typed as endpoint, telegram_endpoint_with_webhook_secret,
+        FakeSecrets, endpoint_typed as endpoint, env_with, telegram_endpoint_with_webhook_secret,
     };
     use greentic_deploy_spec::{BundleId, DeploymentId, RevisionId};
 
@@ -756,5 +772,28 @@ mod tests {
         // tenant map does NOT contain `dep` → skipped (no tenant to run under)
         let plans = plan_webhook_registrations(&routes, &[], &HashMap::new(), "https://host");
         assert!(plans.is_empty());
+    }
+
+    #[test]
+    fn resolve_public_base_url_uses_fresh_env_not_captured_boot_value() {
+        // Regression: `post_reload_registration` used to capture the boot-time
+        // `public_base_url` and reuse it on every reload, ignoring changes
+        // written to `environment.json` by `gtc op env set-public-url`. The
+        // helper `resolve_public_base_url_for_reload` now reads the URL from
+        // the freshly-loaded env on each call.
+        let mut env_old = env_with(vec![]);
+        env_old.host_config.public_base_url = Some("https://old.example.com".to_string());
+        assert_eq!(
+            resolve_public_base_url_for_reload(&env_old),
+            Some("https://old.example.com".to_string()),
+        );
+
+        let mut env_new = env_with(vec![]);
+        env_new.host_config.public_base_url = Some("https://new.example.com".to_string());
+        assert_eq!(
+            resolve_public_base_url_for_reload(&env_new),
+            Some("https://new.example.com".to_string()),
+            "must reflect the freshly-loaded env, not a stale captured value",
+        );
     }
 }

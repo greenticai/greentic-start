@@ -354,6 +354,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: None,
+                public_base_url: None,
             },
             packs: Vec::new(),
             messaging_endpoints: Vec::new(),

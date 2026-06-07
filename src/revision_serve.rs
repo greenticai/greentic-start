@@ -2399,6 +2399,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: None,
+                public_base_url: None,
             },
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
@@ -2681,6 +2682,7 @@ mod tests {
                 region: None,
                 tenant_org_id: None,
                 listen_addr: None,
+                public_base_url: None,
             },
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
@@ -3346,6 +3348,7 @@ mod tests {
             region: None,
             tenant_org_id: None,
             listen_addr: addr,
+            public_base_url: None,
         }
     }
 
