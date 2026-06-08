@@ -44,6 +44,7 @@ use notify_debouncer_full::{
 
 use greentic_deploy_spec::Environment;
 use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
+use greentic_runner_host::runtime_refs::RuntimeRefResolver;
 use greentic_types::EnvId;
 
 /// Keep in sync with `greentic-deployer/src/environment/store.rs::environment_path`.
@@ -270,16 +271,27 @@ pub(crate) fn default_rebuild(
     store_root: PathBuf,
     env_id: String,
     secrets: DynSecretsManager,
+    runtime_ref_resolver: Arc<dyn RuntimeRefResolver>,
     activation_rt: tokio::runtime::Handle,
 ) -> impl FnMut() -> Result<Option<Activation>> + Send + 'static {
     let mut last: Option<LastReloadInputs> = None;
-    move || rebuild_once(&store_root, &env_id, &secrets, &activation_rt, &mut last)
+    move || {
+        rebuild_once(
+            &store_root,
+            &env_id,
+            &secrets,
+            &runtime_ref_resolver,
+            &activation_rt,
+            &mut last,
+        )
+    }
 }
 
 fn rebuild_once(
     store_root: &Path,
     env_id: &str,
     secrets: &DynSecretsManager,
+    runtime_ref_resolver: &Arc<dyn RuntimeRefResolver>,
     activation_rt: &tokio::runtime::Handle,
     last: &mut Option<LastReloadInputs>,
 ) -> Result<Option<Activation>> {
@@ -301,9 +313,14 @@ fn rebuild_once(
     {
         return Ok(None);
     }
-    let RuntimeConfigActivation { host, routing } = activation_rt.block_on(
-        revision_boot::activate_runtime_config(store_root, &rc, Arc::clone(secrets), &environment),
-    )?;
+    let RuntimeConfigActivation { host, routing } =
+        activation_rt.block_on(revision_boot::activate_runtime_config(
+            store_root,
+            &rc,
+            Arc::clone(secrets),
+            &environment,
+            Arc::clone(runtime_ref_resolver),
+        ))?;
     *last = Some(LastReloadInputs {
         rc,
         env: environment,
