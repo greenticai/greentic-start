@@ -635,6 +635,7 @@ impl DemoRunnerHost {
                 Some(exec_ctx),
                 Some(component_ref),
                 true,
+                None,
             )?;
             let store_state =
                 ComponentState::new(host_state, Arc::new(RunnerWasiPolicy::default()))?;
@@ -731,6 +732,7 @@ impl DemoRunnerHost {
                 Some(exec_ctx),
                 Some(extension.component_ref.clone()),
                 true,
+                None,
             )?;
             let store_state =
                 ComponentState::new(host_state, Arc::new(RunnerWasiPolicy::default()))?;
