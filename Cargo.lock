@@ -2270,9 +2270,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-flow"
-version = "1.1.0-dev.27001972969"
+version = "1.1.0-dev.27132529466"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e220e66a4b987415556d33ea5e87fbbef0b8f31df0b85d65d4f7582b98952e7"
+checksum = "59c70cc22b6a21b9a727d4d8d53f200ff5579b0dd6d6eef12963b7f400275cb0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2325,9 +2325,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-interfaces"
-version = "1.1.0-dev.26993916101"
+version = "1.1.0-dev.27127755811"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "200a88575ee91a8ce1ea0ce00851de4582bbf7d48409b9885bd07d14d828639a"
+checksum = "c529dbde9ec0a596469ebce690a45d4dce6bf6089925cf23924bcbb01882369c"
 dependencies = [
  "anyhow",
  "constant_time_eq 0.4.2",
@@ -2369,9 +2369,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-interfaces-wasmtime"
-version = "1.1.0-dev.26993916101"
+version = "1.1.0-dev.27127755811"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfe092a984ea64c11afa9a23dea925b4ab1908e78a3ef5703374a9087922ff4f"
+checksum = "64c924cff3bad011bb2f3dfb0f2625160163bc45af42a9255ab6970a98e1caf6"
 dependencies = [
  "anyhow",
  "camino",
@@ -2432,9 +2432,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "1.1.0-dev.27007625967"
+version = "1.1.0-dev.27142002147"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e024b8856e46081c7e84ffcf0e2261c34bcfd650359ac215262d4d61ec88bb1e"
+checksum = "608fdc3f90e65e70415606f0fabd3ec10491de91637b4dda29f1750fbbfaae8f"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -2453,9 +2453,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "1.1.0-dev.27007625967"
+version = "1.1.0-dev.27142002147"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce693f75fe8bf6c5c86f493395a6167f9cd40f19221c0e4dee73c868f0d81c5e"
+checksum = "2db684f2f185e404d17077ec0a2f1f537abaecd155c6b0aeafeb14d7d942151c"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5093,9 +5093,9 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "1.1.0-dev.27007625967"
+version = "1.1.0-dev.27142002147"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb031c0f9ca5649fda0b2f05d3dfda7a26879e12c7e59ef2c11798622cc923d9"
+checksum = "aba8b5438c3eff3f6fba864fb48a2abcfc0edcd8da85990bc411493bf53a4575"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
