@@ -66,6 +66,7 @@ mod runner_host;
 mod runner_integration;
 pub mod runtime;
 mod runtime_config;
+mod runtime_refs_store;
 pub mod runtime_state;
 mod secret_name;
 mod secret_requirements;
@@ -339,6 +340,28 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             greentic_deployer::environment::EnvironmentStore::load(&env_store, &env_typed)
                 .with_context(|| format!("loading environment `{env_id}` for bundle-less boot"))?;
 
+        // C5: open the env's runtime.json snapshot once and share it across
+        // every activation rebuild + the `runtime://` resolver every loaded
+        // pack reaches. The store is `Arc`-shared so a single in-memory
+        // snapshot is hot-reloaded on every `runtime.json` write — the
+        // watcher below calls `store.reload()` without rebuilding the full
+        // activation. The resolver implements
+        // `greentic_runner_host::runtime_refs::RuntimeRefResolver`, lives
+        // for the env's lifetime, and is cloned (refcount bump) into each
+        // revision's load.
+        let runtime_refs_store =
+            crate::runtime_refs_store::EnvironmentRuntimeStore::open(&env_dir, env_typed.clone())
+                .with_context(|| format!("opening runtime.json snapshot for env `{env_id}`"))?;
+        // The same `Arc` flows into BOTH the cold-start activation AND each
+        // reload-rebuilt activation (via the watcher's `default_rebuild`) so
+        // every revision in the env resolves `runtime://` URIs through one
+        // store — a snapshot flip is visible to the next request.
+        let runtime_ref_resolver: std::sync::Arc<
+            dyn greentic_runner_host::runtime_refs::RuntimeRefResolver,
+        > = std::sync::Arc::new(crate::runtime_refs_store::StartRuntimeRefResolver::new(
+            std::sync::Arc::clone(&runtime_refs_store),
+        ));
+
         let activation_rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -348,6 +371,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             &rc,
             secrets,
             &environment,
+            std::sync::Arc::clone(&runtime_ref_resolver),
         ))?;
 
         // Execution bridge: serve the activated revisions over a slim HTTP
@@ -414,15 +438,21 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // reload can free the superseded activation after its drain window.
         drop(activation);
 
-        // N2.2: spawn the runtime-config watcher. As the deployer rewrites
-        // `<env_dir>/runtime-config.json` (via `gtc op bundles add`,
-        // `revisions stage/warm`, `traffic set`), the watcher rebuilds the
-        // activation and hands it to `RevisionServer::reload` so the
-        // running server picks up new revisions / traffic splits without a
-        // process restart. Wrapped in `Arc` so the watcher can call
-        // `server.reload()` from its worker thread while the main thread
-        // still owns the original handle for the shutdown path.
+        // N2.2 + C5: spawn the unified env-dir watcher. Dispatches per
+        // debounced batch:
+        //   - `runtime-config.json` / `environment.json` → rebuild the
+        //     activation + swap into the `RevisionServer` (the N2.2 flow:
+        //     `gtc op bundles add`, `revisions stage/warm`, `traffic set`,
+        //     `op messaging endpoint *`).
+        //   - `runtime.json` → refresh the in-memory `EnvironmentRuntime`
+        //     snapshot the resolver reads (cheap; no activation rebuild).
+        //     The deployer re-emits discovered values on every apply, so
+        //     coupling them to a full rebuild would churn cookies/pins.
+        // The server `Arc` lets the worker thread call `server.reload()`
+        // while the main thread still owns the original handle for
+        // shutdown.
         let server = std::sync::Arc::new(server);
+        let snapshot_store_for_watcher = std::sync::Arc::clone(&runtime_refs_store);
         let watcher = revision_reload::spawn_runtime_config_watcher(
             env_dir.clone(),
             revision_reload::DEFAULT_DEBOUNCE,
@@ -436,6 +466,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 store_root.clone(),
                 env_id.clone(),
                 watcher_secrets,
+                std::sync::Arc::clone(&runtime_ref_resolver),
                 activation_rt.handle().clone(),
             ),
             // Each reload that actually changed config (hot-attached
@@ -451,6 +482,8 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 env_id.clone(),
                 activation_rt.handle().clone(),
             ),
+            // C5 snapshot-reload arm: pure `store.reload()` call.
+            move || snapshot_store_for_watcher.reload(),
         )
         .context("spawning runtime-config watcher")?;
 
@@ -462,7 +495,9 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         }
         // Drop the watcher before stopping the server so the watcher's
         // worker can't call `server.reload()` on a server that's already
-        // half-torn-down.
+        // half-torn-down. Snapshot reloads and activation rebuilds share
+        // the same watcher (one debouncer, two dispatch arms), so this
+        // single drop suffices.
         drop(watcher);
         // Recover sole ownership for `stop()`. Any in-flight drain task
         // spawned by N2.1's `reload()` owns an `Arc<Activation>`, NOT an

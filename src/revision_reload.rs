@@ -44,6 +44,7 @@ use notify_debouncer_full::{
 
 use greentic_deploy_spec::Environment;
 use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
+use greentic_runner_host::runtime_refs::RuntimeRefResolver;
 use greentic_types::EnvId;
 
 /// Keep in sync with `greentic-deployer/src/environment/store.rs::environment_path`.
@@ -102,15 +103,27 @@ impl Drop for WatcherHandle {
 
 /// Spawn the runtime-config file-watcher.
 ///
-/// `rebuild` is the rebuild closure: invoked once per debounced event for
-/// `<env_dir>/runtime-config.json`. It returns:
+/// One `notify-debouncer-full` instance watches the env directory and
+/// dispatches per-batch to TWO independent actions:
+///
+/// 1. `rebuild` + `server.reload` + `post_reload` — when an event touches
+///    `runtime-config.json` or `environment.json` (the activation-bearing
+///    files). Identical to the pre-C5 behaviour.
+/// 2. `snapshot_reload` — when an event touches `runtime.json` (the C5
+///    `EnvironmentRuntime` sidecar). Cheap snapshot swap; no activation
+///    rebuild.
+///
+/// Both can fire from a single debounced batch (the deployer's `apply` writes
+/// runtime-config.json AND runtime.json together). Coalescing them onto one
+/// debouncer halves the inotify watches + worker threads vs spawning two.
+///
+/// `rebuild` returns:
 /// - `Ok(Some(activation))` to swap the new activation into `server`,
 /// - `Ok(None)` to skip the swap (e.g. hash-skip on identical content),
 /// - `Err(_)` to log + keep the previous activation serving.
 ///
-/// The watcher takes ownership of `rebuild` and `server` for the worker's
-/// lifetime; both are dropped when the returned [`WatcherHandle`] is
-/// dropped.
+/// The watcher takes ownership of every closure for the worker's lifetime;
+/// they are dropped when the returned [`WatcherHandle`] is dropped.
 ///
 /// `post_reload` runs AFTER `server.reload` swapped the new activation in.
 /// Side effects that need the new routes to be live (e.g. provider webhook
@@ -118,26 +131,32 @@ impl Drop for WatcherHandle {
 /// immediately) belong there, never inside `rebuild` — the server still
 /// serves the OLD activation while `rebuild` runs, so a slow side effect
 /// inside `rebuild` would also delay the swap itself.
-pub(crate) fn spawn_runtime_config_watcher<R, P>(
+pub(crate) fn spawn_runtime_config_watcher<R, P, S>(
     env_dir: PathBuf,
     debounce: Duration,
     drain_window: Duration,
     server: Arc<RevisionServer>,
     rebuild: R,
     post_reload: P,
+    snapshot_reload: S,
 ) -> Result<WatcherHandle>
 where
     R: FnMut() -> Result<Option<Activation>> + Send + 'static,
     P: FnMut(&Activation) + Send + 'static,
+    S: FnMut() + Send + 'static,
 {
-    // Trigger set: paths whose mutations must invalidate the activation.
-    // `runtime-config.json` is the original trigger; `environment.json` is
-    // the M1.4c-ii fix so messaging endpoint mutations (which only touch
-    // env.json + the messaging projection) re-activate the admit table.
-    let target_files = vec![
+    // Activation triggers: paths whose mutations must invalidate the
+    // RevisionServer's current activation. `runtime-config.json` is the
+    // original trigger; `environment.json` is the M1.4c-ii fix so messaging
+    // endpoint mutations (which only touch env.json + the messaging
+    // projection) re-activate the admit table.
+    let activation_targets = vec![
         env_dir.join(runtime_config::RUNTIME_CONFIG_FILE),
         env_dir.join(ENVIRONMENT_FILE),
     ];
+    // Snapshot triggers: paths whose mutations must refresh the C5
+    // `EnvironmentRuntime` snapshot used by the `runtime://` resolver.
+    let snapshot_targets = vec![env_dir.join(crate::runtime_refs_store::RUNTIME_FILE)];
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
 
     // notify watches the env DIR (not the file): the deployer rewrites
@@ -158,7 +177,16 @@ where
     let worker = thread::Builder::new()
         .name("revision-reload".to_string())
         .spawn(move || {
-            reload_worker(rx, target_files, drain_window, server, rebuild, post_reload);
+            reload_worker(
+                rx,
+                activation_targets,
+                snapshot_targets,
+                drain_window,
+                server,
+                rebuild,
+                post_reload,
+                snapshot_reload,
+            );
         })
         .context("spawning runtime-config reload worker")?;
 
@@ -168,22 +196,28 @@ where
     })
 }
 
-/// The worker loop. Reads debounced batches off `rx`, filters for events
-/// touching any of `target_files`, and on each matching batch calls `rebuild`
-/// then `server.reload` with whatever activation the rebuild produced.
+/// The worker loop. Reads debounced batches off `rx`, classifies the touched
+/// paths against `activation_targets` and `snapshot_targets`, and dispatches:
+/// snapshot_reload fires first (cheap, makes new discovered values visible to
+/// any in-flight invocation about to run on the swapped activation); rebuild
+/// + server.reload + post_reload fire second.
 ///
 /// Extracted from `spawn_runtime_config_watcher` so tests can drive the
 /// worker directly without going through `notify`.
-fn reload_worker<R, P>(
+#[allow(clippy::too_many_arguments)]
+fn reload_worker<R, P, S>(
     rx: mpsc::Receiver<DebounceEventResult>,
-    target_files: Vec<PathBuf>,
+    activation_targets: Vec<PathBuf>,
+    snapshot_targets: Vec<PathBuf>,
     drain_window: Duration,
     server: Arc<RevisionServer>,
     mut rebuild: R,
     mut post_reload: P,
+    mut snapshot_reload: S,
 ) where
     R: FnMut() -> Result<Option<Activation>> + Send + 'static,
     P: FnMut(&Activation) + Send + 'static,
+    S: FnMut() + Send + 'static,
 {
     for result in rx {
         let events = match result {
@@ -198,18 +232,30 @@ fn reload_worker<R, P>(
                 continue;
             }
         };
-        // Filter: only fire when an event actually touches one of our targets.
-        // `notify` reports every event under the watched directory; an
-        // unrelated `revision-signing.key` write must NOT trigger reload.
-        // Backup files (`environment.json.<ts>.bak`) don't match either —
-        // path equality, not prefix matching.
-        let relevant = events.iter().any(|ev| {
-            ev.event
-                .paths
-                .iter()
-                .any(|p| target_files.iter().any(|t| p == t))
-        });
-        if !relevant {
+        // Classify: which target sets did this batch touch? `notify` reports
+        // every event under the watched directory; an unrelated
+        // `revision-signing.key` write must NOT trigger anything. Backup
+        // files (`environment.json.<ts>.bak`) don't match either — path
+        // equality, not prefix matching.
+        let touches = |targets: &[PathBuf]| {
+            events.iter().any(|ev| {
+                ev.event
+                    .paths
+                    .iter()
+                    .any(|p| targets.iter().any(|t| p == t))
+            })
+        };
+        let touches_snapshot = touches(&snapshot_targets);
+        let touches_activation = touches(&activation_targets);
+        if !touches_snapshot && !touches_activation {
+            continue;
+        }
+        // Snapshot first: cheap, makes new discovered values visible before
+        // the activation rebuild that might run against them.
+        if touches_snapshot {
+            snapshot_reload();
+        }
+        if !touches_activation {
             continue;
         }
         match rebuild() {
@@ -270,16 +316,27 @@ pub(crate) fn default_rebuild(
     store_root: PathBuf,
     env_id: String,
     secrets: DynSecretsManager,
+    runtime_ref_resolver: Arc<dyn RuntimeRefResolver>,
     activation_rt: tokio::runtime::Handle,
 ) -> impl FnMut() -> Result<Option<Activation>> + Send + 'static {
     let mut last: Option<LastReloadInputs> = None;
-    move || rebuild_once(&store_root, &env_id, &secrets, &activation_rt, &mut last)
+    move || {
+        rebuild_once(
+            &store_root,
+            &env_id,
+            &secrets,
+            &runtime_ref_resolver,
+            &activation_rt,
+            &mut last,
+        )
+    }
 }
 
 fn rebuild_once(
     store_root: &Path,
     env_id: &str,
     secrets: &DynSecretsManager,
+    runtime_ref_resolver: &Arc<dyn RuntimeRefResolver>,
     activation_rt: &tokio::runtime::Handle,
     last: &mut Option<LastReloadInputs>,
 ) -> Result<Option<Activation>> {
@@ -301,9 +358,14 @@ fn rebuild_once(
     {
         return Ok(None);
     }
-    let RuntimeConfigActivation { host, routing } = activation_rt.block_on(
-        revision_boot::activate_runtime_config(store_root, &rc, Arc::clone(secrets), &environment),
-    )?;
+    let RuntimeConfigActivation { host, routing } =
+        activation_rt.block_on(revision_boot::activate_runtime_config(
+            store_root,
+            &rc,
+            Arc::clone(secrets),
+            &environment,
+            Arc::clone(runtime_ref_resolver),
+        ))?;
     *last = Some(LastReloadInputs {
         rc,
         env: environment,
@@ -415,6 +477,44 @@ mod tests {
         )
     }
 
+    /// C5: runtime.json writes fire `snapshot_reload` and NOT `rebuild`.
+    #[test]
+    fn watcher_dispatches_runtime_json_to_snapshot_only() {
+        let env = fresh_env_dir();
+        let rebuild_counter = Arc::new(AtomicUsize::new(0));
+        let snapshot_counter = Arc::new(AtomicUsize::new(0));
+        let snapshot_counter_for_closure = Arc::clone(&snapshot_counter);
+        let _handle = spawn_runtime_config_watcher(
+            env.path().to_path_buf(),
+            Duration::from_millis(50),
+            Duration::ZERO,
+            placeholder_server(),
+            counting_rebuild(Arc::clone(&rebuild_counter)),
+            |_: &Activation| {},
+            move || {
+                snapshot_counter_for_closure.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .expect("spawn watcher");
+
+        std::fs::write(
+            env.path().join(crate::runtime_refs_store::RUNTIME_FILE),
+            br#"{"schema":"x"}"#,
+        )
+        .expect("write runtime.json");
+        std::thread::sleep(Duration::from_millis(400));
+
+        assert!(
+            snapshot_counter.load(Ordering::SeqCst) >= 1,
+            "runtime.json write must invoke snapshot_reload"
+        );
+        assert_eq!(
+            rebuild_counter.load(Ordering::SeqCst),
+            0,
+            "runtime.json write must NOT invoke rebuild"
+        );
+    }
+
     #[test]
     fn watcher_fires_on_runtime_config_create() {
         let env = fresh_env_dir();
@@ -426,6 +526,7 @@ mod tests {
             placeholder_server(),
             channel_rebuild(tx),
             |_: &Activation| {},
+            || {},
         )
         .expect("spawn watcher");
 
@@ -451,6 +552,7 @@ mod tests {
             placeholder_server(),
             channel_rebuild(tx),
             |_: &Activation| {},
+            || {},
         )
         .expect("spawn watcher");
 
@@ -474,6 +576,7 @@ mod tests {
             placeholder_server(),
             counting_rebuild(Arc::clone(&counter)),
             |_: &Activation| {},
+            || {},
         )
         .expect("spawn watcher");
 
@@ -507,6 +610,7 @@ mod tests {
             placeholder_server(),
             channel_rebuild(tx),
             |_: &Activation| {},
+            || {},
         )
         .expect("spawn watcher");
 
@@ -530,6 +634,7 @@ mod tests {
             placeholder_server(),
             counting_rebuild(Arc::clone(&counter)),
             |_: &Activation| {},
+            || {},
         )
         .expect("spawn watcher");
 
@@ -557,6 +662,7 @@ mod tests {
             placeholder_server(),
             counting_rebuild(Arc::clone(&counter)),
             |_: &Activation| {},
+            || {},
         )
         .expect("spawn watcher");
 
@@ -677,6 +783,7 @@ mod tests {
                 }
             },
             |_: &Activation| {},
+            || {},
         )
         .expect("spawn watcher");
 

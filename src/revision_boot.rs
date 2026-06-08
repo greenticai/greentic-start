@@ -39,6 +39,7 @@ use greentic_deploy_spec::{
 };
 use greentic_deployer::path_safety::normalize_under_root;
 use greentic_runner_host::runtime::{RevisionPackRef, TenantRuntime};
+use greentic_runner_host::runtime_refs::RuntimeRefResolver;
 use greentic_runner_host::storage::{
     new_session_store, new_state_store, session_host_from, state_host_from,
 };
@@ -105,6 +106,7 @@ pub(crate) async fn activate_runtime_config(
     rc: &LoadedRuntimeConfig,
     secrets: DynSecretsManager,
     env: &Environment,
+    runtime_ref_resolver: Arc<dyn RuntimeRefResolver>,
 ) -> anyhow::Result<RuntimeConfigActivation> {
     // `env_dir_in` validates `rc.env_id` as a safe directory segment via
     // `EnvId::new`; no separate `EnvId::new` call is needed.
@@ -215,14 +217,18 @@ pub(crate) async fn activate_runtime_config(
                 format!("reading pinned packs for revision `{}`", block.revision_id)
             })?;
 
-        // C4.3: materialize `pack-config.v1.non_secret` for each pack in this
-        // revision. The map is keyed by `pack_id`; `TenantRuntime::load_revision`
-        // routes the entry matching each loaded pack's id into the C4.2
-        // `RuntimeConfigHost` seam via `PackRuntime::set_runtime_config_non_secret`.
-        let runtime_configs_by_pack_id =
-            read_revision_pack_configs(&revision_id, &block.pack_config_refs).with_context(
-                || format!("reading pack configs for revision `{}`", block.revision_id),
-            )?;
+        // C4.3 + C5: materialize per-pack `pack-config.v1.non_secret` and
+        // `pack-config.v1.runtime_refs` for each pack in this revision in a
+        // single disk pass. Maps are keyed by `pack_id`;
+        // `TenantRuntime::load_revision` routes each pack's entries into the
+        // C4.2 `RuntimeConfigHost` seam (`set_runtime_config_non_secret`)
+        // and the C5 runtime-refs seam (`set_runtime_refs`).
+        let RevisionPackConfigs {
+            non_secret_by_pack_id,
+            runtime_refs_by_pack_id,
+        } = read_revision_pack_configs(&revision_id, &block.pack_config_refs).with_context(
+            || format!("reading pack configs for revision `{}`", block.revision_id),
+        )?;
 
         // Discover this revision's HTTP routes in a single per-pack manifest
         // read: declared (`greentic.http-routes.v1`) AND synthesized provider
@@ -270,7 +276,9 @@ pub(crate) async fn activate_runtime_config(
             bundle_id.clone(),
             revision_id,
             Some(meta.customer_id.clone()),
-            &runtime_configs_by_pack_id,
+            &non_secret_by_pack_id,
+            &runtime_refs_by_pack_id,
+            Some(Arc::clone(&runtime_ref_resolver)),
         )
         .await
         .with_context(|| format!("loading revision `{}`", block.revision_id))?;
@@ -378,22 +386,49 @@ fn read_revision_pack_refs(
     Ok(refs)
 }
 
+/// Per-pack maps materialized from one revision's `pack-config.v1` files. Both
+/// are keyed by `pack_id`; [`TenantRuntime::load_revision`] routes the matching
+/// entry into [`crate::runner_host`]'s seam for each loaded pack.
+///
+/// Either map may be empty: the runner host short-circuits both lookups when
+/// no entry is bound for a pack id.
+#[derive(Debug)]
+pub(crate) struct RevisionPackConfigs {
+    /// `pack_id → Arc<pack-config.v1.non_secret>` for the C4.2
+    /// `RuntimeConfigHost` non-secret arm.
+    pub(crate) non_secret_by_pack_id: BTreeMap<String, Arc<BTreeMap<String, Value>>>,
+    /// `pack_id → Arc<pack-config.v1.runtime_refs>` (key → URI string) for
+    /// the C5 `RuntimeRefResolver` arm. The URIs are opaque strings (the
+    /// runner host hands them to the env-shared resolver verbatim).
+    pub(crate) runtime_refs_by_pack_id: BTreeMap<String, Arc<BTreeMap<String, String>>>,
+}
+
 /// Read a revision's `pack-config.v1` files (already resolved + verified to
-/// exist by B0) and build the `pack_id → Arc<non_secret>` map that
+/// exist by B0) and build the per-pack non-secret + runtime-refs maps that
 /// [`TenantRuntime::load_revision`] routes into the C4.2 `RuntimeConfigHost`
-/// seam. Each [`PackConfig`]'s `revision_id` must match `expected` so a
-/// misplaced or cross-revision config file is rejected rather than silently
-/// activated. Duplicate `pack_id` entries across a revision's config files
-/// are likewise rejected: each pack gets at most one config per revision
-/// (deploy-spec §5.6), so a duplicate would mean a malformed or tampered
-/// materialization. Empty `non_secret` maps are NOT inserted — they would
-/// just trigger an empty injection on the runner side that the C4.2 host
-/// also short-circuits on lookup.
+/// seam and the C5 `RuntimeRefResolver` seam. Each [`PackConfig`]'s
+/// `revision_id` must match `expected` so a misplaced or cross-revision
+/// config file is rejected rather than silently activated. Duplicate
+/// `pack_id` entries across a revision's config files are likewise rejected:
+/// each pack gets at most one config per revision (deploy-spec §5.6), so a
+/// duplicate would mean a malformed or tampered materialization. Empty
+/// `non_secret` / `runtime_refs` maps are NOT inserted — they would just
+/// trigger an empty injection on the runner side that the host also
+/// short-circuits on lookup. Single pass over the file list: a file with
+/// EITHER channel populated parses once, contributes to whichever sub-map
+/// is non-empty, and is dedup-checked once.
 fn read_revision_pack_configs(
     expected: &RevisionId,
     config_paths: &[PathBuf],
-) -> anyhow::Result<BTreeMap<String, Arc<BTreeMap<String, Value>>>> {
-    let mut configs: BTreeMap<String, Arc<BTreeMap<String, Value>>> = BTreeMap::new();
+) -> anyhow::Result<RevisionPackConfigs> {
+    let mut non_secret_by_pack_id: BTreeMap<String, Arc<BTreeMap<String, Value>>> = BTreeMap::new();
+    let mut runtime_refs_by_pack_id: BTreeMap<String, Arc<BTreeMap<String, String>>> =
+        BTreeMap::new();
+    // Unified dedup tracker across both output channels: a pack_id that
+    // appears in two config files — even if one populated only
+    // runtime_refs and the other only non_secret — must still fail closed
+    // (deploy-spec §5.6: one config per pack per revision).
+    let mut seen_pack_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for config_path in config_paths {
         let bytes = std::fs::read(config_path)
             .with_context(|| format!("reading pack-config `{}`", config_path.display()))?;
@@ -407,22 +442,31 @@ fn read_revision_pack_configs(
                 expected
             );
         }
-        if parsed.non_secret.is_empty() {
-            continue;
-        }
-        match configs.entry(parsed.pack_id.as_str().to_string()) {
-            std::collections::btree_map::Entry::Occupied(entry) => bail!(
+        let pack_id = parsed.pack_id.as_str().to_string();
+        if !seen_pack_ids.insert(pack_id.clone()) {
+            bail!(
                 "revision `{}` has duplicate pack-config entries for pack `{}` (second seen in `{}`)",
                 expected,
-                entry.key(),
+                pack_id,
                 config_path.display()
-            ),
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(Arc::new(parsed.non_secret));
-            }
+            );
+        }
+        if !parsed.non_secret.is_empty() {
+            non_secret_by_pack_id.insert(pack_id.clone(), Arc::new(parsed.non_secret));
+        }
+        if !parsed.runtime_refs.is_empty() {
+            let refs: BTreeMap<String, String> = parsed
+                .runtime_refs
+                .into_iter()
+                .map(|(k, v)| (k, v.as_str().to_string()))
+                .collect();
+            runtime_refs_by_pack_id.insert(pack_id, Arc::new(refs));
         }
     }
-    Ok(configs)
+    Ok(RevisionPackConfigs {
+        non_secret_by_pack_id,
+        runtime_refs_by_pack_id,
+    })
 }
 
 /// Load the per-env revision-dispatcher signing key, creating it on first use.
@@ -701,10 +745,22 @@ mod tests {
         abs
     }
 
-    fn pack_config(pack_id: &str, revision_id: RevisionId, non_secret_keys: &[&str]) -> PackConfig {
+    fn pack_config_with(
+        pack_id: &str,
+        revision_id: RevisionId,
+        non_secret_keys: &[&str],
+        runtime_refs: &[(&str, &str)],
+    ) -> PackConfig {
         let mut non_secret: BTreeMap<String, Value> = BTreeMap::new();
         for key in non_secret_keys {
             non_secret.insert((*key).to_string(), Value::String(format!("v-{key}")));
+        }
+        let mut refs: BTreeMap<String, greentic_deploy_spec::RuntimeRef> = BTreeMap::new();
+        for (k, uri) in runtime_refs {
+            refs.insert(
+                (*k).to_string(),
+                greentic_deploy_spec::RuntimeRef::try_new(*uri).expect("valid runtime ref"),
+            );
         }
         PackConfig {
             schema: SchemaVersion::new(SchemaVersion::PACK_CONFIG_V1),
@@ -712,14 +768,19 @@ mod tests {
             revision_id,
             non_secret,
             secret_refs: BTreeMap::new(),
-            runtime_refs: BTreeMap::new(),
+            runtime_refs: refs,
         }
+    }
+
+    fn pack_config(pack_id: &str, revision_id: RevisionId, non_secret_keys: &[&str]) -> PackConfig {
+        pack_config_with(pack_id, revision_id, non_secret_keys, &[])
     }
 
     #[test]
     fn read_pack_configs_returns_empty_map_for_no_refs() {
-        let map = read_revision_pack_configs(&RevisionId::new(), &[]).unwrap();
-        assert!(map.is_empty());
+        let cfgs = read_revision_pack_configs(&RevisionId::new(), &[]).unwrap();
+        assert!(cfgs.non_secret_by_pack_id.is_empty());
+        assert!(cfgs.runtime_refs_by_pack_id.is_empty());
     }
 
     #[test]
@@ -733,18 +794,25 @@ mod tests {
         let path_a = write_pack_config(env_dir, "revisions/r/alpha/pack-config.json", &cfg_a);
         let path_b = write_pack_config(env_dir, "revisions/r/bravo/pack-config.json", &cfg_b);
 
-        let map = read_revision_pack_configs(&rev, &[path_a, path_b]).unwrap();
-        assert_eq!(map.len(), 2);
-        let a = map.get("alpha").expect("alpha present");
+        let cfgs = read_revision_pack_configs(&rev, &[path_a, path_b]).unwrap();
+        assert_eq!(cfgs.non_secret_by_pack_id.len(), 2);
+        let a = cfgs
+            .non_secret_by_pack_id
+            .get("alpha")
+            .expect("alpha present");
         assert_eq!(
             a.get("default_locale").and_then(Value::as_str),
             Some("v-default_locale")
         );
-        let b = map.get("bravo").expect("bravo present");
+        let b = cfgs
+            .non_secret_by_pack_id
+            .get("bravo")
+            .expect("bravo present");
         assert_eq!(
             b.get("feature_flag").and_then(Value::as_str),
             Some("v-feature_flag")
         );
+        assert!(cfgs.runtime_refs_by_pack_id.is_empty());
     }
 
     #[test]
@@ -759,8 +827,70 @@ mod tests {
         let cfg = pack_config("alpha", rev, &[]);
         let path = write_pack_config(env_dir, "revisions/r/alpha/pack-config.json", &cfg);
 
-        let map = read_revision_pack_configs(&rev, &[path]).unwrap();
-        assert!(map.is_empty());
+        let cfgs = read_revision_pack_configs(&rev, &[path]).unwrap();
+        assert!(cfgs.non_secret_by_pack_id.is_empty());
+        assert!(cfgs.runtime_refs_by_pack_id.is_empty());
+    }
+
+    #[test]
+    fn read_pack_configs_extracts_runtime_refs_by_pack_id() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let rev = RevisionId::new();
+
+        let cfg = pack_config_with(
+            "alpha",
+            rev,
+            &[],
+            &[
+                ("alb_dns", "runtime://local/discovered/alb_dns"),
+                ("cluster", "runtime://local/discovered/cluster"),
+            ],
+        );
+        let path = write_pack_config(env_dir, "revisions/r/alpha/pack-config.json", &cfg);
+
+        let cfgs = read_revision_pack_configs(&rev, &[path]).unwrap();
+        assert!(cfgs.non_secret_by_pack_id.is_empty());
+        let refs = cfgs
+            .runtime_refs_by_pack_id
+            .get("alpha")
+            .expect("alpha refs present");
+        assert_eq!(refs.len(), 2);
+        assert_eq!(
+            refs.get("alb_dns").map(String::as_str),
+            Some("runtime://local/discovered/alb_dns")
+        );
+        assert_eq!(
+            refs.get("cluster").map(String::as_str),
+            Some("runtime://local/discovered/cluster")
+        );
+    }
+
+    #[test]
+    fn read_pack_configs_dedups_pack_id_across_channels() {
+        // Same pack_id appearing in two files — once with only non_secret,
+        // once with only runtime_refs — must still surface the duplicate
+        // bail. Defence-in-depth: one pack-config per pack per revision
+        // (deploy-spec §5.6); a tampered or malformed materialization that
+        // splits the channels across files must fail closed.
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let rev = RevisionId::new();
+
+        let cfg1 = pack_config("alpha", rev, &["k1"]);
+        let cfg2 = pack_config_with(
+            "alpha",
+            rev,
+            &[],
+            &[("alb_dns", "runtime://local/discovered/alb_dns")],
+        );
+        let path1 = write_pack_config(env_dir, "revisions/r/alpha-a/pack-config.json", &cfg1);
+        let path2 = write_pack_config(env_dir, "revisions/r/alpha-b/pack-config.json", &cfg2);
+
+        let err = read_revision_pack_configs(&rev, &[path1, path2]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("duplicate pack-config"), "got: {msg}");
+        assert!(msg.contains("alpha"), "got: {msg}");
     }
 
     #[test]
@@ -877,6 +1007,24 @@ mod tests {
         std::sync::Arc::new(greentic_secrets_lib::env::EnvSecretsManager)
     }
 
+    /// Real `RuntimeRefResolver` over a throw-away tempdir, for activation
+    /// tests that don't exercise runtime-ref resolution. Reuses the
+    /// production [`crate::runtime_refs_store::StartRuntimeRefResolver`]
+    /// rather than introducing a separate test-only impl.
+    fn dummy_resolver() -> std::sync::Arc<dyn greentic_runner_host::runtime_refs::RuntimeRefResolver>
+    {
+        let dir = tempdir().expect("tempdir for dummy resolver");
+        let store = crate::runtime_refs_store::EnvironmentRuntimeStore::open(dir.path(), env_id())
+            .expect("dummy env runtime store");
+        // tempdir leak intentional — it lives as long as the resolver
+        // (which never reads from disk because the activation tests bail
+        // before pack loading).
+        std::mem::forget(dir);
+        std::sync::Arc::new(crate::runtime_refs_store::StartRuntimeRefResolver::new(
+            store,
+        ))
+    }
+
     #[test]
     fn activate_errors_when_env_id_does_not_match_runtime_config() {
         // The caller passes a pre-loaded Environment; activation must reject
@@ -893,6 +1041,7 @@ mod tests {
             &rc,
             dummy_secrets(),
             &mismatched,
+            dummy_resolver(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -916,6 +1065,7 @@ mod tests {
             &rc,
             dummy_secrets(),
             &env,
+            dummy_resolver(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -945,6 +1095,7 @@ mod tests {
             &rc,
             dummy_secrets(),
             &env,
+            dummy_resolver(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -972,6 +1123,7 @@ mod tests {
             &rc,
             dummy_secrets(),
             &env,
+            dummy_resolver(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1002,6 +1154,7 @@ mod tests {
             &rc,
             dummy_secrets(),
             &env,
+            dummy_resolver(),
         )) {
             Ok(_) => panic!("expected activation to fail at pack reading"),
             Err(e) => e,
@@ -1034,6 +1187,7 @@ mod tests {
             &rc,
             dummy_secrets(),
             &env,
+            dummy_resolver(),
         ))
         .expect("empty rc activates");
         assert_eq!(activation.routing.dispatcher.deployment_count(), 0);
