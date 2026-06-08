@@ -136,7 +136,32 @@ pub fn try_for_request(
     };
 
     let out = invoke_routing_host(&cfg.host_bin, &input)?;
-    let directive = map_directive_to_control(out.directive, ctx);
+    let routing = out.directive;
+    // Observability: surface the matcher's decision (target + confidence + reason)
+    // before `map_directive_to_control` collapses it. Emitted via `tracing` so it
+    // reaches OTLP (and Loki/whatever the collector fans out to), and via
+    // operator_log for the local operator.log.
+    if let contracts::RoutingDirective::Dispatch {
+        target,
+        confidence,
+        reason,
+        ..
+    } = &routing
+    {
+        tracing::info!(
+            target: "greentic.fast2flow",
+            tenant = %ctx.tenant,
+            route_target = %target,
+            confidence = *confidence,
+            reason = %reason,
+            "fast2flow dispatch"
+        );
+        operator_log::info(
+            module_path!(),
+            format_dispatch_log(target, *confidence, reason),
+        );
+    }
+    let directive = map_directive_to_control(routing, ctx);
     operator_log::info(
         module_path!(),
         format!("[fast2flow] directive={directive:?}"),
@@ -146,6 +171,13 @@ pub fn try_for_request(
         ControlDirective::Continue => None,
         actionable => Some(actionable),
     }
+}
+
+/// Human-readable operator.log line for a fast2flow dispatch decision. Kept as a
+/// pure helper so the exact wire format (which downstream log scrapers / e2e
+/// tests grep for) is pinned by a unit test.
+fn format_dispatch_log(target: &str, confidence: f32, reason: &str) -> String {
+    format!("[fast2flow] dispatch target={target} confidence={confidence:.3} reason={reason:?}")
 }
 
 /// Copy `assets/intent-index.json` out of the pack zip into `target_index`.
@@ -185,6 +217,19 @@ fn materialize_index_from_pack(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_log_pins_target_confidence_reason() {
+        let line = format_dispatch_log(
+            "greentic.pet-daycare.demo/default/attendance_card",
+            0.5,
+            "bm25",
+        );
+        assert_eq!(
+            line,
+            "[fast2flow] dispatch target=greentic.pet-daycare.demo/default/attendance_card confidence=0.500 reason=\"bm25\""
+        );
+    }
 
     #[test]
     fn scope_uses_default_team_when_absent() {
