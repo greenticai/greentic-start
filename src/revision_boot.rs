@@ -424,11 +424,11 @@ fn read_revision_pack_configs(
     let mut non_secret_by_pack_id: BTreeMap<String, Arc<BTreeMap<String, Value>>> = BTreeMap::new();
     let mut runtime_refs_by_pack_id: BTreeMap<String, Arc<BTreeMap<String, String>>> =
         BTreeMap::new();
-    // Tracks the first config-file path seen per pack_id so a duplicate
-    // (across files OR sub-maps) bails with a clear "second seen in" message
-    // even when the first occurrence populated only runtime_refs and the
-    // second only non_secret.
-    let mut seen_pack_ids: BTreeMap<String, PathBuf> = BTreeMap::new();
+    // Unified dedup tracker across both output channels: a pack_id that
+    // appears in two config files — even if one populated only
+    // runtime_refs and the other only non_secret — must still fail closed
+    // (deploy-spec §5.6: one config per pack per revision).
+    let mut seen_pack_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for config_path in config_paths {
         let bytes = std::fs::read(config_path)
             .with_context(|| format!("reading pack-config `{}`", config_path.display()))?;
@@ -443,17 +443,14 @@ fn read_revision_pack_configs(
             );
         }
         let pack_id = parsed.pack_id.as_str().to_string();
-        if let Some(first) = seen_pack_ids.get(&pack_id) {
+        if !seen_pack_ids.insert(pack_id.clone()) {
             bail!(
-                "revision `{}` has duplicate pack-config entries for pack `{}` \
-                 (first seen in `{}`, second in `{}`)",
+                "revision `{}` has duplicate pack-config entries for pack `{}` (second seen in `{}`)",
                 expected,
                 pack_id,
-                first.display(),
                 config_path.display()
             );
         }
-        seen_pack_ids.insert(pack_id.clone(), config_path.clone());
         if !parsed.non_secret.is_empty() {
             non_secret_by_pack_id.insert(pack_id.clone(), Arc::new(parsed.non_secret));
         }
@@ -1010,24 +1007,22 @@ mod tests {
         std::sync::Arc::new(greentic_secrets_lib::env::EnvSecretsManager)
     }
 
-    /// A `RuntimeRefResolver` that fails closed on every URI it sees.
-    /// Activation-failure tests don't reach pack loading, so the resolver is
-    /// never invoked; constructing one here just satisfies the new
-    /// [`activate_runtime_config`] signature.
-    #[derive(Debug)]
-    struct PanickingResolver;
-    impl greentic_runner_host::runtime_refs::RuntimeRefResolver for PanickingResolver {
-        fn resolve(
-            &self,
-            _: &str,
-        ) -> Result<Option<Value>, greentic_runner_host::runtime_refs::RuntimeRefResolverError>
-        {
-            panic!("activation tests must not reach runtime-ref resolution")
-        }
-    }
+    /// Real `RuntimeRefResolver` over a throw-away tempdir, for activation
+    /// tests that don't exercise runtime-ref resolution. Reuses the
+    /// production [`crate::runtime_refs_store::StartRuntimeRefResolver`]
+    /// rather than introducing a separate test-only impl.
     fn dummy_resolver() -> std::sync::Arc<dyn greentic_runner_host::runtime_refs::RuntimeRefResolver>
     {
-        std::sync::Arc::new(PanickingResolver)
+        let dir = tempdir().expect("tempdir for dummy resolver");
+        let store = crate::runtime_refs_store::EnvironmentRuntimeStore::open(dir.path(), env_id())
+            .expect("dummy env runtime store");
+        // tempdir leak intentional — it lives as long as the resolver
+        // (which never reads from disk because the activation tests bail
+        // before pack loading).
+        std::mem::forget(dir);
+        std::sync::Arc::new(crate::runtime_refs_store::StartRuntimeRefResolver::new(
+            store,
+        ))
     }
 
     #[test]

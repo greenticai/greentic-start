@@ -29,19 +29,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc;
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
-use arc_swap::ArcSwap;
-use greentic_deploy_spec::EnvironmentRuntime;
+use arc_swap::ArcSwapOption;
+use greentic_deploy_spec::{EnvironmentRuntime, RuntimeRef, SchemaVersion};
 use greentic_runner_host::runtime_refs::{RuntimeRefResolver, RuntimeRefResolverError};
 use greentic_types::EnvId;
-use notify_debouncer_full::notify::RecursiveMode;
-use notify_debouncer_full::{
-    DebounceEventResult, Debouncer, RecommendedCache, new_debouncer, notify::RecommendedWatcher,
-};
 use serde_json::Value;
 
 use crate::operator_log;
@@ -70,7 +63,7 @@ const DISCOVERED_SEGMENT: &str = "discovered";
 pub(crate) struct EnvironmentRuntimeStore {
     env_id: EnvId,
     runtime_path: PathBuf,
-    snapshot: ArcSwap<Option<EnvironmentRuntime>>,
+    snapshot: ArcSwapOption<EnvironmentRuntime>,
 }
 
 impl EnvironmentRuntimeStore {
@@ -79,11 +72,11 @@ impl EnvironmentRuntimeStore {
     /// return `Ok(None)` until the deployer emits one).
     pub(crate) fn open(env_dir: &Path, env_id: EnvId) -> Result<Arc<Self>> {
         let runtime_path = env_dir.join(RUNTIME_FILE);
-        let initial = load_runtime_if_present(&runtime_path, &env_id)?;
+        let initial = load_runtime_if_present(&runtime_path, &env_id)?.map(Arc::new);
         Ok(Arc::new(Self {
             env_id,
             runtime_path,
-            snapshot: ArcSwap::from_pointee(initial),
+            snapshot: ArcSwapOption::from(initial),
         }))
     }
 
@@ -95,7 +88,7 @@ impl EnvironmentRuntimeStore {
     pub(crate) fn reload(&self) {
         match load_runtime_if_present(&self.runtime_path, &self.env_id) {
             Ok(loaded) => {
-                self.snapshot.store(Arc::new(loaded));
+                self.snapshot.store(loaded.map(Arc::new));
             }
             Err(err) => {
                 operator_log::warn(
@@ -108,9 +101,10 @@ impl EnvironmentRuntimeStore {
 
     /// Cheap snapshot accessor — used both by [`StartRuntimeRefResolver`] on
     /// every URI lookup and by tests that want to read the current discovered
-    /// map.
-    fn current(&self) -> arc_swap::Guard<Arc<Option<EnvironmentRuntime>>> {
-        self.snapshot.load()
+    /// map. `None` means the file hasn't been emitted yet (or was emitted
+    /// then deleted).
+    fn current(&self) -> Option<Arc<EnvironmentRuntime>> {
+        self.snapshot.load_full()
     }
 }
 
@@ -141,6 +135,17 @@ fn load_runtime_if_present(
             expected_env
         );
     }
+    // Mirror `LocalFsStore::load_runtime`'s schema-version check
+    // (greentic-deployer/src/environment/store.rs:312) so a future schema
+    // bump can't be silently accepted by this code path.
+    if parsed.schema.as_str() != SchemaVersion::ENVIRONMENT_RUNTIME_V1 {
+        anyhow::bail!(
+            "runtime.json `{}` declares schema `{}`, expected `{}`",
+            path.display(),
+            parsed.schema.as_str(),
+            SchemaVersion::ENVIRONMENT_RUNTIME_V1
+        );
+    }
     Ok(Some(parsed))
 }
 
@@ -155,16 +160,15 @@ pub(crate) struct StartRuntimeRefResolver {
 }
 
 impl StartRuntimeRefResolver {
-    pub(crate) fn new(store: Arc<EnvironmentRuntimeStore>) -> Arc<Self> {
-        Arc::new(Self { store })
+    pub(crate) fn new(store: Arc<EnvironmentRuntimeStore>) -> Self {
+        Self { store }
     }
 }
 
 impl RuntimeRefResolver for StartRuntimeRefResolver {
     fn resolve(&self, runtime_ref: &str) -> Result<Option<Value>, RuntimeRefResolverError> {
         let key = parse_discovered_key(runtime_ref, self.store.env_id.as_str())?;
-        let snapshot = self.store.current();
-        let Some(runtime) = snapshot.as_ref() else {
+        let Some(runtime) = self.store.current() else {
             return Ok(None);
         };
         Ok(runtime.discovered.get(key).cloned())
@@ -174,31 +178,38 @@ impl RuntimeRefResolver for StartRuntimeRefResolver {
 /// Parse `runtime://<env>/discovered/<key>` and return the `<key>` slice,
 /// validating that `<env>` matches `expected_env`.
 ///
+/// Scheme + env-segment validation is delegated to
+/// [`RuntimeRef::try_new`] (the canonical grammar lives there); the only
+/// hand-rolled work is the `discovered/<key>` tail extraction since the
+/// deploy-spec type has no accessor below the env segment.
+///
 /// The grammar accepted here is intentionally narrower than
-/// [`greentic_deploy_spec::RuntimeRef`] permits: we only resolve
-/// `discovered/` URIs (the only address space C5 wires up). Any other
-/// second-segment value, an env mismatch, or a missing key fails
-/// [`RuntimeRefResolverError::Invalid`] so the runner host maps it to
-/// `ConfigError::InvalidKey`.
+/// `RuntimeRef` permits: we only resolve `discovered/` URIs (the only
+/// address space C5 wires up). Any other second-segment value, an env
+/// mismatch, or a missing key fails [`RuntimeRefResolverError::Invalid`] so
+/// the runner host maps it to `ConfigError::InvalidKey`.
 fn parse_discovered_key<'a>(
     raw: &'a str,
     expected_env: &str,
 ) -> Result<&'a str, RuntimeRefResolverError> {
-    let after_scheme = raw.strip_prefix(RUNTIME_SCHEME).ok_or_else(|| {
-        RuntimeRefResolverError::Invalid(format!(
-            "runtime-ref `{raw}` must start with `{RUNTIME_SCHEME}`"
-        ))
+    let parsed = RuntimeRef::try_new(raw).map_err(|e| {
+        RuntimeRefResolverError::Invalid(format!("runtime-ref `{raw}` is malformed: {e}"))
     })?;
-    let (env_seg, rest) = after_scheme.split_once('/').ok_or_else(|| {
+    if parsed.env_segment() != expected_env {
+        return Err(RuntimeRefResolverError::Invalid(format!(
+            "runtime-ref `{raw}` env segment `{}` does not match env `{expected_env}`",
+            parsed.env_segment()
+        )));
+    }
+    // `RuntimeRef::try_new` proves `<scheme><env>/...` so this strip is
+    // infallible; we still write it as a fallible step to avoid an
+    // `unwrap()` that future grammar changes could destabilize.
+    let scheme_and_env = format!("{RUNTIME_SCHEME}{expected_env}/");
+    let rest = raw.strip_prefix(&scheme_and_env).ok_or_else(|| {
         RuntimeRefResolverError::Invalid(format!(
             "runtime-ref `{raw}` is missing `/discovered/<key>`"
         ))
     })?;
-    if env_seg != expected_env {
-        return Err(RuntimeRefResolverError::Invalid(format!(
-            "runtime-ref `{raw}` env segment `{env_seg}` does not match env `{expected_env}`"
-        )));
-    }
     let (segment, key) = rest.split_once('/').ok_or_else(|| {
         RuntimeRefResolverError::Invalid(format!(
             "runtime-ref `{raw}` is missing `/<key>` after `discovered`"
@@ -216,100 +227,6 @@ fn parse_discovered_key<'a>(
         )));
     }
     Ok(key)
-}
-
-/// Owned cleanup handle for [`spawn_runtime_snapshot_watcher`]. Dropping it
-/// shuts the debouncer and joins the worker thread. Same drop-order
-/// discipline as [`crate::revision_reload::WatcherHandle`].
-pub(crate) struct RuntimeSnapshotWatcherHandle {
-    debouncer: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
-    worker: Option<JoinHandle<()>>,
-}
-
-impl Drop for RuntimeSnapshotWatcherHandle {
-    fn drop(&mut self) {
-        drop(self.debouncer.take());
-        if let Some(h) = self.worker.take()
-            && let Err(err) = h.join()
-        {
-            operator_log::warn(
-                module_path!(),
-                format!("runtime.json watcher worker panicked: {err:?}"),
-            );
-        }
-    }
-}
-
-/// Default debounce window for coalescing back-to-back `runtime.json`
-/// rewrites (the deployer's env-pack apply may write more than once during
-/// a single dry-run / commit / sidecar update sequence).
-pub(crate) const DEFAULT_RUNTIME_DEBOUNCE: Duration = Duration::from_millis(250);
-
-/// Spawn a notify-debouncer-backed watcher that calls `store.reload()` on
-/// every `runtime.json` write under `env_dir`.
-///
-/// Watches the env DIR (not the file) so an atomic-rename rewrite still
-/// fires — `notify` reports the rename-into-place as a directory event on
-/// the basename. The trigger filter is exact path equality so a write to
-/// `runtime-config.json` or a backup file does NOT spuriously trigger a
-/// snapshot reload.
-pub(crate) fn spawn_runtime_snapshot_watcher(
-    env_dir: PathBuf,
-    debounce: Duration,
-    store: Arc<EnvironmentRuntimeStore>,
-) -> Result<RuntimeSnapshotWatcherHandle> {
-    let target_file = env_dir.join(RUNTIME_FILE);
-    let (tx, rx) = mpsc::channel::<DebounceEventResult>();
-    let mut debouncer = new_debouncer(debounce, None, move |res| {
-        let _ = tx.send(res);
-    })
-    .context("creating runtime.json debouncer")?;
-    debouncer
-        .watch(&env_dir, RecursiveMode::NonRecursive)
-        .with_context(|| {
-            format!(
-                "watching env directory {} for runtime.json",
-                env_dir.display()
-            )
-        })?;
-
-    let worker = thread::Builder::new()
-        .name("runtime-snapshot-reload".to_string())
-        .spawn(move || snapshot_reload_worker(rx, target_file, store))
-        .context("spawning runtime.json reload worker")?;
-
-    Ok(RuntimeSnapshotWatcherHandle {
-        debouncer: Some(debouncer),
-        worker: Some(worker),
-    })
-}
-
-fn snapshot_reload_worker(
-    rx: mpsc::Receiver<DebounceEventResult>,
-    target_file: PathBuf,
-    store: Arc<EnvironmentRuntimeStore>,
-) {
-    for result in rx {
-        let events = match result {
-            Ok(events) => events,
-            Err(errs) => {
-                for err in errs {
-                    operator_log::warn(
-                        module_path!(),
-                        format!("runtime.json watcher notify error: {err}"),
-                    );
-                }
-                continue;
-            }
-        };
-        let relevant = events
-            .iter()
-            .any(|ev| ev.event.paths.iter().any(|p| p == &target_file));
-        if !relevant {
-            continue;
-        }
-        store.reload();
-    }
 }
 
 #[cfg(test)]
@@ -360,8 +277,7 @@ mod tests {
         write_runtime(dir.path(), &sample_runtime(discovered));
 
         let store = EnvironmentRuntimeStore::open(dir.path(), env_id()).unwrap();
-        let snap = store.current();
-        let snap = snap.as_ref().as_ref().expect("snapshot loaded");
+        let snap = store.current().expect("snapshot loaded");
         assert_eq!(
             snap.discovered.get("alb_dns").and_then(Value::as_str),
             Some("alb.example.com")
@@ -392,11 +308,7 @@ mod tests {
         discovered.insert("alb_dns".to_string(), json!("alb-1.example.com"));
         write_runtime(dir.path(), &sample_runtime(discovered));
         store.reload();
-        let snap = store.current();
-        let snap = snap
-            .as_ref()
-            .as_ref()
-            .expect("snapshot loaded after reload");
+        let snap = store.current().expect("snapshot loaded after reload");
         assert_eq!(
             snap.discovered.get("alb_dns").and_then(Value::as_str),
             Some("alb-1.example.com")
@@ -406,8 +318,7 @@ mod tests {
         discovered.insert("alb_dns".to_string(), json!("alb-2.example.com"));
         write_runtime(dir.path(), &sample_runtime(discovered));
         store.reload();
-        let snap = store.current();
-        let snap = snap.as_ref().as_ref().expect("snapshot reloaded");
+        let snap = store.current().expect("snapshot reloaded");
         assert_eq!(
             snap.discovered.get("alb_dns").and_then(Value::as_str),
             Some("alb-2.example.com")
@@ -426,8 +337,7 @@ mod tests {
         store.reload();
 
         // Previous snapshot survived the bad write.
-        let snap = store.current();
-        let snap = snap.as_ref().as_ref().expect("previous snapshot preserved");
+        let snap = store.current().expect("previous snapshot preserved");
         assert_eq!(
             snap.discovered.get("alb_dns").and_then(Value::as_str),
             Some("alb.example.com")
@@ -435,7 +345,7 @@ mod tests {
     }
 
     fn make_resolver(store: Arc<EnvironmentRuntimeStore>) -> StartRuntimeRefResolver {
-        StartRuntimeRefResolver { store }
+        StartRuntimeRefResolver::new(store)
     }
 
     #[test]
