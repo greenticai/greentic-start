@@ -28,13 +28,14 @@
 //! the remaining step; until then the caller activates, reports, and drops the
 //! host. The activation is a self-contained, testable unit.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow, bail};
 use greentic_deploy_spec::{
-    BundleDeploymentStatus, BundleId, DeploymentId, Environment, PackListLock, RevisionId,
+    BundleDeploymentStatus, BundleId, DeploymentId, Environment, PackConfig, PackListLock,
+    RevisionId,
 };
 use greentic_deployer::path_safety::normalize_under_root;
 use greentic_runner_host::runtime::{RevisionPackRef, TenantRuntime};
@@ -42,6 +43,7 @@ use greentic_runner_host::storage::{
     new_session_store, new_state_store, session_host_from, state_host_from,
 };
 use greentic_runner_host::{HostBuilder, HostConfig, RunnerHost, TenantBindings};
+use serde_json::Value;
 
 use crate::deployment_routes::{
     DeploymentRouteTable, RevisionIngressRouting, deployment_config_overrides_from_environment,
@@ -213,6 +215,15 @@ pub(crate) async fn activate_runtime_config(
                 format!("reading pinned packs for revision `{}`", block.revision_id)
             })?;
 
+        // C4.3: materialize `pack-config.v1.non_secret` for each pack in this
+        // revision. The map is keyed by `pack_id`; `TenantRuntime::load_revision`
+        // routes the entry matching each loaded pack's id into the C4.2
+        // `RuntimeConfigHost` seam via `PackRuntime::set_runtime_config_non_secret`.
+        let runtime_configs_by_pack_id =
+            read_revision_pack_configs(&revision_id, &block.pack_config_refs).with_context(
+                || format!("reading pack configs for revision `{}`", block.revision_id),
+            )?;
+
         // Discover this revision's HTTP routes in a single per-pack manifest
         // read: declared (`greentic.http-routes.v1`) AND synthesized provider
         // webhooks (`greentic.provider-extension.v1` with `ingest_http`,
@@ -259,6 +270,7 @@ pub(crate) async fn activate_runtime_config(
             bundle_id.clone(),
             revision_id,
             Some(meta.customer_id.clone()),
+            &runtime_configs_by_pack_id,
         )
         .await
         .with_context(|| format!("loading revision `{}`", block.revision_id))?;
@@ -364,6 +376,53 @@ fn read_revision_pack_refs(
         bail!("revision `{expected}` resolved to no pinned packs");
     }
     Ok(refs)
+}
+
+/// Read a revision's `pack-config.v1` files (already resolved + verified to
+/// exist by B0) and build the `pack_id → Arc<non_secret>` map that
+/// [`TenantRuntime::load_revision`] routes into the C4.2 `RuntimeConfigHost`
+/// seam. Each [`PackConfig`]'s `revision_id` must match `expected` so a
+/// misplaced or cross-revision config file is rejected rather than silently
+/// activated. Duplicate `pack_id` entries across a revision's config files
+/// are likewise rejected: each pack gets at most one config per revision
+/// (deploy-spec §5.6), so a duplicate would mean a malformed or tampered
+/// materialization. Empty `non_secret` maps are NOT inserted — they would
+/// just trigger an empty injection on the runner side that the C4.2 host
+/// also short-circuits on lookup.
+fn read_revision_pack_configs(
+    expected: &RevisionId,
+    config_paths: &[PathBuf],
+) -> anyhow::Result<BTreeMap<String, Arc<BTreeMap<String, Value>>>> {
+    let mut configs: BTreeMap<String, Arc<BTreeMap<String, Value>>> = BTreeMap::new();
+    for config_path in config_paths {
+        let bytes = std::fs::read(config_path)
+            .with_context(|| format!("reading pack-config `{}`", config_path.display()))?;
+        let parsed: PackConfig = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing pack-config `{}`", config_path.display()))?;
+        if &parsed.revision_id != expected {
+            bail!(
+                "pack-config `{}` pins revision `{}` but is referenced by revision `{}`",
+                config_path.display(),
+                parsed.revision_id,
+                expected
+            );
+        }
+        if parsed.non_secret.is_empty() {
+            continue;
+        }
+        match configs.entry(parsed.pack_id.as_str().to_string()) {
+            std::collections::btree_map::Entry::Occupied(entry) => bail!(
+                "revision `{}` has duplicate pack-config entries for pack `{}` (second seen in `{}`)",
+                expected,
+                entry.key(),
+                config_path.display()
+            ),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Arc::new(parsed.non_secret));
+            }
+        }
+    }
+    Ok(configs)
 }
 
 /// Load the per-env revision-dispatcher signing key, creating it on first use.
@@ -633,6 +692,124 @@ mod tests {
         let lock_path = write_lock(&env_dir, "pack-list.lock", &lock);
 
         assert!(read_revision_pack_refs(&env_dir, &rev, &[lock_path]).is_err());
+    }
+
+    fn write_pack_config(env_dir: &Path, rel: &str, cfg: &PackConfig) -> PathBuf {
+        let abs = env_dir.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, serde_json::to_vec(cfg).unwrap()).unwrap();
+        abs
+    }
+
+    fn pack_config(pack_id: &str, revision_id: RevisionId, non_secret_keys: &[&str]) -> PackConfig {
+        let mut non_secret: BTreeMap<String, Value> = BTreeMap::new();
+        for key in non_secret_keys {
+            non_secret.insert((*key).to_string(), Value::String(format!("v-{key}")));
+        }
+        PackConfig {
+            schema: SchemaVersion::new(SchemaVersion::PACK_CONFIG_V1),
+            pack_id: PackId::new(pack_id),
+            revision_id,
+            non_secret,
+            secret_refs: BTreeMap::new(),
+            runtime_refs: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn read_pack_configs_returns_empty_map_for_no_refs() {
+        let map = read_revision_pack_configs(&RevisionId::new(), &[]).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn read_pack_configs_builds_map_keyed_by_pack_id() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let rev = RevisionId::new();
+
+        let cfg_a = pack_config("alpha", rev, &["default_locale"]);
+        let cfg_b = pack_config("bravo", rev, &["feature_flag"]);
+        let path_a = write_pack_config(env_dir, "revisions/r/alpha/pack-config.json", &cfg_a);
+        let path_b = write_pack_config(env_dir, "revisions/r/bravo/pack-config.json", &cfg_b);
+
+        let map = read_revision_pack_configs(&rev, &[path_a, path_b]).unwrap();
+        assert_eq!(map.len(), 2);
+        let a = map.get("alpha").expect("alpha present");
+        assert_eq!(
+            a.get("default_locale").and_then(Value::as_str),
+            Some("v-default_locale")
+        );
+        let b = map.get("bravo").expect("bravo present");
+        assert_eq!(
+            b.get("feature_flag").and_then(Value::as_str),
+            Some("v-feature_flag")
+        );
+    }
+
+    #[test]
+    fn read_pack_configs_skips_empty_non_secret() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let rev = RevisionId::new();
+
+        // A pack-config with `non_secret: {}` produces no map entry: the runner
+        // host short-circuits empty lookups anyway, so threading an empty Arc
+        // through is pure overhead.
+        let cfg = pack_config("alpha", rev, &[]);
+        let path = write_pack_config(env_dir, "revisions/r/alpha/pack-config.json", &cfg);
+
+        let map = read_revision_pack_configs(&rev, &[path]).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn read_pack_configs_rejects_revision_id_mismatch() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let cfg_rev = RevisionId::new();
+        let cfg = pack_config("alpha", cfg_rev, &["k"]);
+        let path = write_pack_config(env_dir, "revisions/r/alpha/pack-config.json", &cfg);
+
+        // Reference under a different revision id; defence-in-depth check must fire.
+        let other = RevisionId::new();
+        let err = read_revision_pack_configs(&other, &[path]).unwrap_err();
+        assert!(
+            err.to_string().contains("pins revision"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_pack_configs_rejects_duplicate_pack_id_across_files() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let rev = RevisionId::new();
+
+        let cfg1 = pack_config("alpha", rev, &["k1"]);
+        let cfg2 = pack_config("alpha", rev, &["k2"]);
+        let path1 = write_pack_config(env_dir, "revisions/r/alpha/pack-config.json", &cfg1);
+        let path2 = write_pack_config(env_dir, "revisions/r/alpha-2/pack-config.json", &cfg2);
+
+        let err = read_revision_pack_configs(&rev, &[path1, path2]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("duplicate pack-config"), "got: {msg}");
+        assert!(msg.contains("alpha"), "got: {msg}");
+    }
+
+    #[test]
+    fn read_pack_configs_rejects_malformed_json() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let path = env_dir.join("revisions/r/alpha/pack-config.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{not json").unwrap();
+
+        let err = read_revision_pack_configs(&RevisionId::new(), &[path]).unwrap_err();
+        assert!(
+            err.to_string().contains("parsing pack-config"),
+            "got: {err}"
+        );
     }
 
     #[test]
