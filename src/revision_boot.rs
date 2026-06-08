@@ -410,16 +410,17 @@ fn read_revision_pack_configs(
         if parsed.non_secret.is_empty() {
             continue;
         }
-        let pack_id = parsed.pack_id.as_str().to_string();
-        if configs.contains_key(&pack_id) {
-            bail!(
+        match configs.entry(parsed.pack_id.as_str().to_string()) {
+            std::collections::btree_map::Entry::Occupied(entry) => bail!(
                 "revision `{}` has duplicate pack-config entries for pack `{}` (second seen in `{}`)",
                 expected,
-                pack_id,
+                entry.key(),
                 config_path.display()
-            );
+            ),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Arc::new(parsed.non_secret));
+            }
         }
-        configs.insert(pack_id, Arc::new(parsed.non_secret));
     }
     Ok(configs)
 }
