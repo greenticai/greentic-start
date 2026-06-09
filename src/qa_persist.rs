@@ -205,9 +205,25 @@ pub async fn persist_qa_results(
         }
     }
 
+    let config_written = if config.as_object().is_some_and(|m| !m.is_empty()) {
+        persist_qa_config(
+            providers_root,
+            provider_id,
+            config,
+            pack_path,
+            form_spec,
+            backup,
+        )?;
+        true
+    } else {
+        false
+    };
+
     // C7: emit `pack-config-input.v1` so the deployer can populate the
-    // `pack-config.v1.non_secret` channel at revision-create. Soft-fail —
-    // the C4.2 compat shim still serves these keys from DevStore (already
+    // `pack-config.v1.non_secret` channel at revision-create. Runs AFTER
+    // persist_qa_config so a config-write failure aborts before any C7
+    // artifact lands on disk. Emit failures soft-fail with a warn — the
+    // C4.2 compat shim still serves these keys from DevStore (already
     // populated above), so a wizard run does not regress on emit failure.
     let bundle_id = infer_bundle_id(bundle_root);
     if let Err(err) = emit_pack_config_input(
@@ -227,20 +243,6 @@ pub async fn persist_qa_results(
             "pack-config-input emission failed; runtime falls back to legacy DevStore reads via C4.2 compat shim",
         );
     }
-
-    let config_written = if config.as_object().is_some_and(|m| !m.is_empty()) {
-        persist_qa_config(
-            providers_root,
-            provider_id,
-            config,
-            pack_path,
-            form_spec,
-            backup,
-        )?;
-        true
-    } else {
-        false
-    };
 
     Ok((saved_secrets, config_written))
 }
@@ -415,10 +417,20 @@ pub fn emit_pack_config_input(
     validate_segment("bundle_id", bundle_id)?;
     validate_segment("pack_id", pack_id)?;
 
+    // Pre-compute the on-disk path so every Ok(None) early-return path can
+    // tombstone any stale file left behind by an earlier wizard run that
+    // had visible/non-empty answers. Without this, clearing answers (or
+    // hiding them via `visible_if`) would leave the previous file for the
+    // deployer to consume on the next revision-create.
+    let dir = bundle_root.join(PACK_CONFIG_INPUT_DIR);
+    let path = dir.join(format!("{pack_id}.json"));
+
     let Some(config_map) = config.as_object() else {
+        remove_stale_pack_config_input(&path)?;
         return Ok(None);
     };
     if config_map.is_empty() {
+        remove_stale_pack_config_input(&path)?;
         return Ok(None);
     }
 
@@ -461,6 +473,7 @@ pub fn emit_pack_config_input(
     }
 
     if non_secret.is_empty() && secret_refs.is_empty() {
+        remove_stale_pack_config_input(&path)?;
         return Ok(None);
     }
 
@@ -473,10 +486,8 @@ pub fn emit_pack_config_input(
         secret_refs,
     };
 
-    let dir = bundle_root.join(PACK_CONFIG_INPUT_DIR);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create pack-config-input dir {}", dir.display()))?;
-    let path = dir.join(format!("{pack_id}.json"));
     let body = serde_json::to_string_pretty(&input).context("serialize pack-config-input.v1")?;
     std::fs::write(&path, format!("{body}\n"))
         .with_context(|| format!("write pack-config-input {}", path.display()))?;
@@ -491,6 +502,25 @@ pub fn emit_pack_config_input(
         "wizard emitted pack-config-input.v1 (C7) for deployer pickup",
     );
     Ok(Some(path))
+}
+
+/// Remove a stale pack-config-input file when the current wizard state has
+/// no visible/non-empty entries. Returns `Ok(())` if the file is already
+/// gone (NotFound). Any other I/O error propagates so the caller sees the
+/// staleness risk instead of silently emitting an inconsistent revision.
+fn remove_stale_pack_config_input(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            tracing::debug!(
+                path = %path.display(),
+                "removed stale pack-config-input.v1 (current answers produced no entries)"
+            );
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(anyhow::Error::from(err))
+            .with_context(|| format!("remove stale pack-config-input {}", path.display())),
+    }
 }
 
 /// Reject empty, `/`-bearing, or relative-component (`.`, `..`) identifiers —
@@ -941,5 +971,98 @@ mod tests {
         fs::create_dir_all(&nested).expect("nested");
         assert_eq!(infer_bundle_id(&nested), "my-bundle");
         assert_eq!(infer_bundle_id(Path::new("/")), "bundle");
+    }
+
+    /// Stale-file cleanup: when an earlier wizard run wrote a
+    /// pack-config-input.v1 file and a subsequent run produces no visible /
+    /// non-empty entries, the existing file must be removed so the deployer
+    /// does not pick up stale answers on the next revision-create.
+    #[test]
+    fn emit_pack_config_input_removes_stale_file_when_answers_clear() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let form = make_form_spec(vec![question("enabled", false)]);
+
+        // First run: produces a file.
+        let path =
+            emit_pack_config_input(root, "local", "b", "p", &json!({"enabled": true}), &form)
+                .expect("emit-first")
+                .expect("path");
+        assert!(path.exists(), "first run must write the file");
+
+        // Second run: empty config → file must be removed.
+        let empty = json!({});
+        assert!(
+            emit_pack_config_input(root, "local", "b", "p", &empty, &form)
+                .expect("emit-empty")
+                .is_none()
+        );
+        assert!(
+            !path.exists(),
+            "stale pack-config-input survived after empty re-run: {}",
+            path.display()
+        );
+
+        // Third run: rewrite, then a run where every value is empty/null →
+        // file must again be removed (post-filter Ok(None) path).
+        emit_pack_config_input(root, "local", "b", "p", &json!({"enabled": true}), &form)
+            .expect("emit-third")
+            .expect("path-third");
+        assert!(path.exists());
+        assert!(
+            emit_pack_config_input(root, "local", "b", "p", &json!({"enabled": ""}), &form)
+                .expect("emit-blank")
+                .is_none()
+        );
+        assert!(
+            !path.exists(),
+            "stale pack-config-input survived after all-empty re-run: {}",
+            path.display()
+        );
+    }
+
+    /// Visibility-driven empty result also tombstones any stale file.
+    #[test]
+    fn emit_pack_config_input_removes_stale_file_when_visibility_clears_all() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let form = make_form_spec(vec![question("mode", false), {
+            let mut q = question("token", true);
+            q.visible_if = Some(qa_spec::Expr::Eq {
+                left: Box::new(qa_spec::Expr::Answer {
+                    path: "mode".into(),
+                }),
+                right: Box::new(qa_spec::Expr::Literal {
+                    value: Value::String("advanced".into()),
+                }),
+            });
+            q
+        }]);
+
+        // First run: mode=advanced → token visible → file written.
+        let path = emit_pack_config_input(
+            root,
+            "local",
+            "b",
+            "p",
+            &json!({"mode": "advanced", "token": "shhh"}),
+            &form,
+        )
+        .expect("emit-first")
+        .expect("path");
+        assert!(path.exists());
+
+        // Second run: every visible answer absent → file must be removed.
+        let absent = json!({});
+        assert!(
+            emit_pack_config_input(root, "local", "b", "p", &absent, &form)
+                .expect("emit-absent")
+                .is_none()
+        );
+        assert!(
+            !path.exists(),
+            "stale pack-config-input survived after visibility-empty re-run: {}",
+            path.display()
+        );
     }
 }
