@@ -11,6 +11,7 @@ mod bin_resolver;
 mod bundle_config;
 mod bundle_ref;
 mod capabilities;
+pub mod capability_discovery;
 mod cards;
 mod cli_args;
 mod cloudflared;
