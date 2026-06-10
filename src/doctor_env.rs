@@ -52,6 +52,21 @@ use crate::doctor::{Diagnostic, DiagnosticComponent, Severity};
 use crate::runtime_config::LoadedRuntimeConfig;
 use crate::webhook_secret_resolver::secret_ref_to_store_uri;
 
+/// Check id for environment resolution (id validity, store presence).
+pub(crate) const CHECK_ENV_RESOLVE: &str = "start.env.resolve";
+/// Check id for loading + validating `environment.json`.
+pub(crate) const CHECK_ENV_LOAD: &str = "start.env.load";
+
+/// True for diagnostics that mean the env checks could not run at all
+/// (environment missing, unsafe id, malformed store file). `run_doctor`
+/// must push these past the `--stage` filter — classification lives here,
+/// next to the producers, so the routing can't drift out of sync with the
+/// check ids.
+pub(crate) fn is_prerequisite_failure(diagnostic: &Diagnostic) -> bool {
+    diagnostic.severity == Severity::Error
+        && (diagnostic.check_id == CHECK_ENV_RESOLVE || diagnostic.check_id == CHECK_ENV_LOAD)
+}
+
 /// Run the environment-store readiness checks for `env_id` under
 /// `store_root`, returning the diagnostics for the caller to push through
 /// the doctor's stage filter. Read-only: never creates the env dir, the
@@ -63,7 +78,7 @@ pub(crate) fn environment_diagnostics(store_root: &Path, env_id: &str) -> Vec<Di
         Ok(dir) => dir,
         Err(err) => {
             out.push(error(
-                "start.env.resolve",
+                CHECK_ENV_RESOLVE,
                 DiagnosticComponent::Runtime,
                 "Environment id is not a safe store directory segment.",
                 json!({ "env_id": env_id, "error": format!("{err:#}") }),
@@ -79,7 +94,7 @@ pub(crate) fn environment_diagnostics(store_root: &Path, env_id: &str) -> Vec<Di
 
     if !env_dir.join("environment.json").exists() {
         out.push(error(
-            "start.env.resolve",
+            CHECK_ENV_RESOLVE,
             DiagnosticComponent::Runtime,
             "Environment is not initialized in the local store.",
             json!({ "env_id": env_id, "env_dir": env_dir }),
@@ -99,7 +114,7 @@ pub(crate) fn environment_diagnostics(store_root: &Path, env_id: &str) -> Vec<Di
             // `env_dir_in` already validated the segment; this only fires if
             // the two validators ever diverge.
             out.push(error(
-                "start.env.resolve",
+                CHECK_ENV_RESOLVE,
                 DiagnosticComponent::Runtime,
                 "Environment id failed typed-id validation.",
                 json!({ "env_id": env_id, "error": err.to_string() }),
@@ -116,7 +131,7 @@ pub(crate) fn environment_diagnostics(store_root: &Path, env_id: &str) -> Vec<Di
         Ok(env) => env,
         Err(err) => {
             out.push(error(
-                "start.env.load",
+                CHECK_ENV_LOAD,
                 DiagnosticComponent::Runtime,
                 "Environment could not be loaded from the store.",
                 json!({ "env_id": env_id, "error": err.to_string() }),
@@ -127,7 +142,7 @@ pub(crate) fn environment_diagnostics(store_root: &Path, env_id: &str) -> Vec<Di
         }
     };
     out.push(info(
-        "start.env.load",
+        CHECK_ENV_LOAD,
         DiagnosticComponent::Runtime,
         "Environment loaded and validated.",
         json!({
@@ -303,17 +318,17 @@ fn check_endpoint_linkage(
     }
 
     for endpoint in &env.messaging_endpoints {
-        let endpoint_label = json!({
-            "endpoint_id": endpoint.endpoint_id.to_string(),
-            "provider_type": endpoint.provider_type,
-            "provider_id": endpoint.provider_id,
-        });
+        let eid = endpoint.endpoint_id.to_string();
         if endpoint.linked_bundles.is_empty() {
             out.push(warn(
                 "start.env.endpoint_links",
                 DiagnosticComponent::Routes,
                 "Messaging endpoint has no linked bundles — the admit gate fail-closes every request asserting it.",
-                endpoint_label,
+                json!({
+                    "endpoint_id": eid,
+                    "provider_type": endpoint.provider_type,
+                    "provider_id": endpoint.provider_id,
+                }),
                 Some("Link a deployed bundle: `gtc op messaging endpoint link-bundle`."),
             ));
             continue;
@@ -322,16 +337,14 @@ fn check_endpoint_linkage(
         let mut total_deployments = 0usize;
         let mut serving_deployments = 0usize;
         for bundle_id in &endpoint.linked_bundles {
+            let bid = bundle_id.to_string();
             let states = bundle_deployment_states(env, bundle_id, runtime_cfg);
             if states.is_empty() {
                 out.push(error(
                     "start.env.endpoint_links",
                     DiagnosticComponent::Routes,
                     "Endpoint links a bundle with no deployment in this environment.",
-                    json!({
-                        "endpoint_id": endpoint.endpoint_id.to_string(),
-                        "bundle_id": bundle_id.to_string(),
-                    }),
+                    json!({ "endpoint_id": eid, "bundle_id": bid }),
                     (
                         json!({ "deployment_exists": true }),
                         json!({ "deployment_exists": false }),
@@ -342,43 +355,44 @@ fn check_endpoint_linkage(
             }
             for (deployment_id, state) in &states {
                 total_deployments += 1;
-                match state {
-                    ServingState::Serving => serving_deployments += 1,
-                    ServingState::DeploymentNotActive(status) => out.push(warn(
-                        "start.env.endpoint_links",
-                        DiagnosticComponent::Routes,
-                        "Endpoint links a bundle whose deployment is not Active \u{2014} requests for it will not route.",
-                        json!({
-                            "endpoint_id": endpoint.endpoint_id.to_string(),
-                            "bundle_id": bundle_id.to_string(),
-                            "deployment_id": deployment_id.to_string(),
-                            "status": format!("{status:?}"),
-                        }),
-                        Some("Reactivate the deployment or unlink the bundle from the endpoint."),
-                    )),
-                    ServingState::NoReadyTraffic => out.push(warn(
-                        "start.env.endpoint_links",
-                        DiagnosticComponent::Routes,
+                // The non-serving variants differ only in message, fix hint,
+                // and one extra evidence key; emit them through one site.
+                let (message, hint, status) = match state {
+                    ServingState::Serving => {
+                        serving_deployments += 1;
+                        continue;
+                    }
+                    ServingState::DeploymentNotActive(status) => (
+                        "Endpoint links a bundle whose deployment is not Active — requests for it will not route.",
+                        "Reactivate the deployment or unlink the bundle from the endpoint.",
+                        Some(format!("{status:?}")),
+                    ),
+                    ServingState::NoReadyTraffic => (
                         "Endpoint links a bundle with no Ready revision receiving traffic.",
-                        json!({
-                            "endpoint_id": endpoint.endpoint_id.to_string(),
-                            "bundle_id": bundle_id.to_string(),
-                            "deployment_id": deployment_id.to_string(),
-                        }),
-                        Some("Deploy and warm a revision, then route traffic to it (`gtc op deploy` / `gtc op traffic`)."),
-                    )),
-                    ServingState::NotMaterialized => out.push(warn(
-                        "start.env.endpoint_links",
-                        DiagnosticComponent::Routes,
-                        "Environment claims Ready traffic for this deployment but the materialized runtime-config has no serving revision block \u{2014} the runtime will not route it.",
-                        json!({
-                            "endpoint_id": endpoint.endpoint_id.to_string(),
-                            "bundle_id": bundle_id.to_string(),
-                            "deployment_id": deployment_id.to_string(),
-                        }),
-                        Some("Re-apply traffic to re-materialize the runtime-config (`gtc op traffic` / `gtc op env apply`)."),
-                    )),
+                        "Deploy and warm a revision, then route traffic to it (`gtc op deploy` / `gtc op traffic`).",
+                        None,
+                    ),
+                    ServingState::NotMaterialized => (
+                        "Environment claims Ready traffic for this deployment but the materialized runtime-config has no serving revision block — the runtime will not route it.",
+                        "Re-apply traffic to re-materialize the runtime-config (`gtc op traffic` / `gtc op env apply`).",
+                        None,
+                    ),
+                };
+                let mut evidence = json!({
+                    "endpoint_id": eid,
+                    "bundle_id": bid,
+                    "deployment_id": deployment_id.to_string(),
+                });
+                if let Some(status) = status {
+                    evidence["status"] = Value::String(status);
                 }
+                out.push(warn(
+                    "start.env.endpoint_links",
+                    DiagnosticComponent::Routes,
+                    message,
+                    evidence,
+                    Some(hint),
+                ));
             }
         }
         if total_deployments > 0 && serving_deployments == total_deployments {
@@ -453,6 +467,10 @@ fn deployment_serving_state(
     if deployment.status != BundleDeploymentStatus::Active {
         return ServingState::DeploymentNotActive(deployment.status);
     }
+    // Only `Ready` revisions count toward serving. The runtime also keeps
+    // draining (non-Ready) revisions in its routing for their wind-down
+    // window — deliberately not counted here, since they take no NEW
+    // traffic; don't "fix" this to match revision_boot's wider filter.
     let has_ready_traffic = env
         .traffic_splits
         .iter()
@@ -473,12 +491,13 @@ fn deployment_serving_state(
     }
     // Cross-reference against the materialized runtime-config: the runtime
     // boots from that file, not from environment.json.
+    let deployment_id = deployment.deployment_id.to_string();
     let has_runtime_block = runtime_cfg.is_some_and(|cfg| {
         cfg.revisions.iter().any(|block| {
             // DeploymentId::Display and the block's deployment_id field are
             // both produced via the same ULID Display impl, so the string
             // comparison is casing-consistent.
-            block.deployment_id == deployment.deployment_id.to_string() && block.weight_bps > 0
+            block.deployment_id == deployment_id && block.weight_bps > 0
         })
     });
     if has_runtime_block {
@@ -623,7 +642,7 @@ fn check_secret_refs(out: &mut Vec<Diagnostic>, env_dir: &Path, env: &Environmen
     }
 }
 
-fn error(
+pub(crate) fn error(
     check_id: &str,
     component: DiagnosticComponent,
     message: &str,
@@ -795,6 +814,21 @@ mod tests {
             .unwrap();
     }
 
+    /// The recurring linked-bundle layout: one Active `fast2flow` deployment,
+    /// one revision at `lifecycle`, a full-weight split, plus `endpoints`.
+    fn env_with_linked_bundle(
+        lifecycle: RevisionLifecycle,
+        endpoints: Vec<greentic_deploy_spec::MessagingEndpoint>,
+    ) -> (Environment, BundleDeployment, Revision) {
+        let dep = deployment("fast2flow", BundleDeploymentStatus::Active);
+        let rev = revision(&dep, lifecycle);
+        let mut env = env_with(endpoints);
+        env.traffic_splits = vec![split(&dep, &rev)];
+        env.bundles = vec![dep.clone()];
+        env.revisions = vec![rev.clone()];
+        (env, dep, rev)
+    }
+
     /// Deterministic Ed25519 keypair: `(spki public PEM, key_id)`.
     fn trusted_keypair(seed: u8) -> (String, String) {
         use ed25519_dalek::SigningKey;
@@ -937,12 +971,7 @@ mod tests {
     #[test]
     fn empty_trust_root_is_error_once_revisions_exist() {
         let tmp = TempDir::new().unwrap();
-        let dep = deployment("fast2flow", BundleDeploymentStatus::Active);
-        let rev = revision(&dep, RevisionLifecycle::Ready);
-        let mut env = env_with(Vec::new());
-        env.traffic_splits = vec![split(&dep, &rev)];
-        env.bundles = vec![dep];
-        env.revisions = vec![rev];
+        let (env, _dep, _rev) = env_with_linked_bundle(RevisionLifecycle::Ready, Vec::new());
         save_env(tmp.path(), &env);
         let diags = environment_diagnostics(tmp.path(), ENV_ID);
         let trust = by_id(&diags, "start.env.trust_root");
@@ -1013,12 +1042,10 @@ mod tests {
     #[test]
     fn linked_endpoint_with_ready_traffic_passes() {
         let tmp = TempDir::new().unwrap();
-        let dep = deployment("fast2flow", BundleDeploymentStatus::Active);
-        let rev = revision(&dep, RevisionLifecycle::Ready);
-        let mut env = env_with(vec![endpoint("legal-bot", &["fast2flow"])]);
-        env.traffic_splits = vec![split(&dep, &rev)];
-        env.bundles = vec![dep.clone()];
-        env.revisions = vec![rev.clone()];
+        let (env, dep, rev) = env_with_linked_bundle(
+            RevisionLifecycle::Ready,
+            vec![endpoint("legal-bot", &["fast2flow"])],
+        );
         save_env(tmp.path(), &env);
         write_runtime_config(tmp.path(), &dep, &rev);
         let diags = environment_diagnostics(tmp.path(), ENV_ID);
@@ -1033,14 +1060,12 @@ mod tests {
     #[test]
     fn linked_endpoint_without_ready_revision_warns() {
         let tmp = TempDir::new().unwrap();
-        let dep = deployment("fast2flow", BundleDeploymentStatus::Active);
         // The split routes full weight to a revision that never reached
         // Ready — spec-valid state, but nothing will serve.
-        let rev = revision(&dep, RevisionLifecycle::Staged);
-        let mut env = env_with(vec![endpoint("legal-bot", &["fast2flow"])]);
-        env.traffic_splits = vec![split(&dep, &rev)];
-        env.bundles = vec![dep];
-        env.revisions = vec![rev];
+        let (env, _dep, _rev) = env_with_linked_bundle(
+            RevisionLifecycle::Staged,
+            vec![endpoint("legal-bot", &["fast2flow"])],
+        );
         save_env(tmp.path(), &env);
         let diags = environment_diagnostics(tmp.path(), ENV_ID);
         let links = by_id(&diags, "start.env.endpoint_links");
@@ -1145,14 +1170,12 @@ mod tests {
 
     #[test]
     fn ready_traffic_without_runtime_config_warns_not_materialized() {
-        // Test 1: env claims Ready traffic but NO runtime-config file exists.
+        // Env claims Ready traffic but NO runtime-config file exists.
         let tmp = TempDir::new().unwrap();
-        let dep = deployment("fast2flow", BundleDeploymentStatus::Active);
-        let rev = revision(&dep, RevisionLifecycle::Ready);
-        let mut env = env_with(vec![endpoint("legal-bot", &["fast2flow"])]);
-        env.traffic_splits = vec![split(&dep, &rev)];
-        env.bundles = vec![dep];
-        env.revisions = vec![rev];
+        let (env, _dep, _rev) = env_with_linked_bundle(
+            RevisionLifecycle::Ready,
+            vec![endpoint("legal-bot", &["fast2flow"])],
+        );
         save_env(tmp.path(), &env);
         // No runtime-config.json written.
         let diags = environment_diagnostics(tmp.path(), ENV_ID);
@@ -1168,14 +1191,12 @@ mod tests {
 
     #[test]
     fn ready_traffic_with_valid_runtime_config_serves() {
-        // Test 2: env + valid runtime-config → all-serving Info.
+        // Env + valid runtime-config → all-serving Info.
         let tmp = TempDir::new().unwrap();
-        let dep = deployment("fast2flow", BundleDeploymentStatus::Active);
-        let rev = revision(&dep, RevisionLifecycle::Ready);
-        let mut env = env_with(vec![endpoint("legal-bot", &["fast2flow"])]);
-        env.traffic_splits = vec![split(&dep, &rev)];
-        env.bundles = vec![dep.clone()];
-        env.revisions = vec![rev.clone()];
+        let (env, dep, rev) = env_with_linked_bundle(
+            RevisionLifecycle::Ready,
+            vec![endpoint("legal-bot", &["fast2flow"])],
+        );
         save_env(tmp.path(), &env);
         write_runtime_config(tmp.path(), &dep, &rev);
         let diags = environment_diagnostics(tmp.path(), ENV_ID);

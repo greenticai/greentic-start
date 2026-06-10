@@ -54,6 +54,15 @@ pub(crate) struct DoctorArgs {
     pub(crate) stage: DoctorStageArg,
 }
 
+impl DoctorArgs {
+    /// Whether this invocation runs the env-store readiness checks:
+    /// explicitly requested via `--env`, or by default when no bundle
+    /// target was given (mirroring the bundle-less `greentic-start` boot).
+    pub(crate) fn env_mode(&self) -> bool {
+        self.env.is_some() || self.bundle.is_none()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum DoctorStageArg {
     All,

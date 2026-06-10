@@ -118,11 +118,8 @@ pub fn run_doctor(args: DoctorArgs) -> anyhow::Result<bool> {
         run_bundle_checks(&mut ctx, bundle);
     }
 
-    // Env-store readiness checks (PR-3 of `plans/env-manifest-apply.md`):
-    // run when explicitly requested via `--env`, or by default when no
-    // bundle target was given — mirroring the bundle-less `greentic-start`
-    // boot, which serves the resolved env.
-    if args.env.is_some() || args.bundle.is_none() {
+    // Env-store readiness checks (PR-3 of `plans/env-manifest-apply.md`).
+    if args.env_mode() {
         let env_id = crate::resolve_env(args.env.as_deref());
         match greentic_deployer::environment::LocalFsStore::default_root() {
             Some(store_root) => {
@@ -134,11 +131,9 @@ pub fn run_doctor(args: DoctorArgs) -> anyhow::Result<bool> {
                     // Env prerequisite failures (resolve/load) must bypass
                     // the --stage filter — a filtered-out prerequisite Error
                     // silently produces exit 0 without running the requested
-                    // checks (Finding 4).
-                    let is_prerequisite_error = diagnostic.severity == Severity::Error
-                        && (diagnostic.check_id == "start.env.resolve"
-                            || diagnostic.check_id == "start.env.load");
-                    if is_prerequisite_error {
+                    // checks. Classification lives next to the producers in
+                    // `doctor_env` so this routing can't drift.
+                    if crate::doctor_env::is_prerequisite_failure(&diagnostic) {
                         ctx.push_unfiltered(diagnostic);
                     } else {
                         ctx.push(diagnostic);
@@ -146,27 +141,19 @@ pub fn run_doctor(args: DoctorArgs) -> anyhow::Result<bool> {
                 }
             }
             None => {
-                // No home directory — this is a prerequisite failure that
-                // must bypass the stage filter (Finding 4).
-                let diagnostic = Diagnostic {
-                    check_id: "start.env.resolve".to_string(),
-                    severity: Severity::Error,
-                    component: DiagnosticComponent::Runtime,
-                    message:
-                        "Cannot determine the default environment store root (no home directory)."
-                            .to_string(),
-                    evidence: json!({ "env_id": env_id }),
-                    expected: json!({ "store_root_resolves": true }),
-                    actual: json!({ "store_root_resolves": false }),
-                    fix_hint: Some(
-                        "Run with a resolvable HOME so ~/.greentic/environments/ can be located."
-                            .to_string(),
+                // No home directory — a prerequisite failure that must
+                // bypass the stage filter, like the resolve/load errors.
+                ctx.push_unfiltered(crate::doctor_env::error(
+                    crate::doctor_env::CHECK_ENV_RESOLVE,
+                    DiagnosticComponent::Runtime,
+                    "Cannot determine the default environment store root (no home directory).",
+                    json!({ "env_id": env_id }),
+                    (
+                        json!({ "store_root_resolves": true }),
+                        json!({ "store_root_resolves": false }),
                     ),
-                    related_file: None,
-                    related_pack: None,
-                    related_component: None,
-                };
-                ctx.push_unfiltered(diagnostic);
+                    Some("Run with a resolvable HOME so ~/.greentic/environments/ can be located."),
+                ));
             }
         }
     }
