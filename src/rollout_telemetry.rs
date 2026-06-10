@@ -133,6 +133,7 @@ mod tests {
 
     fn sample_revision() -> Revision {
         Revision {
+            pack_config_refs: Vec::new(),
             schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
             revision_id: RevisionId::new(),
             env_id: EnvId::try_from("prod-eu").unwrap(),

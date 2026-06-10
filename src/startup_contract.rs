@@ -476,6 +476,7 @@ mod tests {
             );
         }
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::new("demo.static").expect("pack id"),
             name: None,

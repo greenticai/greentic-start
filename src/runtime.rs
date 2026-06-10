@@ -2428,6 +2428,7 @@ mod tests {
             },
         );
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::new("messaging-webchat-gui")?,
             name: Some("messaging-webchat-gui".to_string()),
@@ -2459,6 +2460,7 @@ mod tests {
             metadata: Default::default(),
         };
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::new("demo-app")?,
             name: Some("demo-app".to_string()),

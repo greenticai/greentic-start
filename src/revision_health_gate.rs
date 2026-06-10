@@ -408,6 +408,7 @@ mod tests {
 
     fn make_revision(sig_ref: PathBuf) -> Revision {
         Revision {
+            pack_config_refs: Vec::new(),
             schema: SchemaVersion::new(SchemaVersion::REVISION_V1),
             revision_id: RevisionId::new(),
             env_id: env_id(),
