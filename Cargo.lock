@@ -2490,7 +2490,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-start"
-version = "0.5.38"
+version = "0.5.39"
 dependencies = [
  "anyhow",
  "async-trait",

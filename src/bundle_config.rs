@@ -133,6 +133,12 @@ pub struct BundleTelemetryConfig {
     pub endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
+    /// Base tracing filter applied to BOTH the `system.log` file appender and
+    /// the OTLP exporter when `RUST_LOG` is unset. An `EnvFilter` directive
+    /// string such as `"trace"`, `"debug"`, or `"info,greentic.fast2flow=trace"`.
+    /// `RUST_LOG` (when set) always wins. Noisy-target clamps still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<String>,
     #[serde(default = "default_sampling", skip_serializing_if = "is_one")]
     pub sampling: f64,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -212,6 +218,10 @@ pub(crate) fn peek_sidecar_telemetry(bundle_root: &Path) -> Option<BundleTelemet
         .get("service_name")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let log_level = obj
+        .get("log_level")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let headers = obj
         .get("headers")
         .and_then(|v| v.as_object())
@@ -226,6 +236,7 @@ pub(crate) fn peek_sidecar_telemetry(bundle_root: &Path) -> Option<BundleTelemet
         exporter,
         endpoint,
         service_name,
+        log_level,
         sampling: 1.0,
         headers,
     })
