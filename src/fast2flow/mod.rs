@@ -14,12 +14,14 @@ pub mod config;
 pub mod contracts;
 pub mod gate;
 pub mod host_process;
+pub mod llm_router;
 pub mod mapper;
 
 pub use config::Fast2FlowConfig;
 pub use contracts::{Fast2FlowHookInV1, MessageEnvelope};
 pub use gate::{FAST2FLOW_CAPABILITY, Fast2FlowGate};
 pub use host_process::invoke_routing_host;
+pub use llm_router::try_llm_route;
 pub use mapper::map_directive_to_control;
 
 /// Scope key for the Fast2Flow index. Env partitioning lives at the
@@ -27,6 +29,39 @@ pub use mapper::map_directive_to_control;
 pub fn scope_for(ctx: &OperatorContext) -> String {
     let team = ctx.team.as_deref().unwrap_or("default");
     format!("{}:{}", ctx.tenant, team)
+}
+
+/// Resolve `<indexes_path>/<scope>/index.json`, materializing it from the
+/// pack's `assets/intent-index.json` when absent. Returns the index file path
+/// when present (or just materialized), else `None`. Shared by the host probe
+/// and the embedded LLM fallback so both route against the same catalog.
+pub fn resolve_index_path(
+    cfg: &Fast2FlowConfig,
+    ctx: &OperatorContext,
+    pack_path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let indexes_path = cfg.indexes_path.as_ref()?;
+    let scope = scope_for(ctx);
+    let index_path = indexes_path.join(&scope).join("index.json");
+    let mut exists = index_path.is_file();
+    if !exists && materialize_index_from_pack(pack_path, &index_path) {
+        exists = true;
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[fast2flow:gate] materialized index from pack -> {}",
+                index_path.display()
+            ),
+        );
+    }
+    operator_log::info(
+        module_path!(),
+        format!(
+            "[fast2flow:gate] index_check path={} exists={exists}",
+            index_path.display()
+        ),
+    );
+    exists.then_some(index_path)
 }
 
 /// Eligibility + invoke + map. Returns `Some` only for actionable
@@ -74,34 +109,9 @@ pub fn try_for_request(
         }
     };
     let scope = scope_for(ctx);
-    let index_path = indexes_path.join(&scope).join("index.json");
-    let mut exists = index_path.is_file();
-    if !exists {
-        // Fallback: materialize from the pack's own assets/intent-index.json.
-        // Lets packs ship their routing index self-contained without the
-        // operator having to populate `<indexes_path>/<scope>/index.json`
-        // out-of-band. Materialised once; subsequent requests reuse the file.
-        if materialize_index_from_pack(pack_path, &index_path) {
-            exists = true;
-            operator_log::info(
-                module_path!(),
-                format!(
-                    "[fast2flow:gate] materialized index from pack -> {}",
-                    index_path.display()
-                ),
-            );
-        }
-    }
-    operator_log::info(
-        module_path!(),
-        format!(
-            "[fast2flow:gate] index_check path={} exists={exists}",
-            index_path.display()
-        ),
-    );
-    if !exists {
-        return None;
-    }
+    // Resolve (and materialize) the scope index; short-circuit before spawning
+    // the host when it's absent. Shared with the embedded LLM fallback.
+    resolve_index_path(cfg, ctx, pack_path)?;
 
     let text = envelope.text.clone().unwrap_or_default();
     let locale = envelope

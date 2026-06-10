@@ -31,6 +31,7 @@ mod http_routes;
 mod ingress;
 mod ingress_dispatch;
 mod ingress_types;
+mod llm;
 mod messaging_app;
 mod messaging_dto;
 mod messaging_egress;
@@ -258,6 +259,19 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
 
     let mut demo_config = bundle_config::load_runtime_demo_config(&demo_paths, &request)?;
     apply_nats_overrides(&mut demo_config, &request);
+
+    // Make the bundle's `llm:` instance available to every LLM consumer (the
+    // Fast2Flow routing fallback today; other features later). Peeked once at
+    // startup, mirroring the telemetry peek.
+    let llm_cfg = bundle_config::peek_bundle_llm(&config_dir.join("bundle.yaml"))
+        .or_else(|| bundle_config::peek_bundle_llm(&config_path));
+    llm::set_config(llm_cfg);
+    // Resolve the LLM credential once (a `secrets://` dev-store ref or an env-var
+    // name) so keyed providers (OpenAI/Anthropic/…) work; Ollama needs none.
+    if let Some(cfg) = llm::config() {
+        let key = llm::resolve_credential(cfg, &config_dir);
+        llm::set_resolved_api_key(key);
+    }
     let static_routes = startup_contract::inspect_bundle(&config_dir)?;
     let configured_public_base_url = startup_contract::configured_public_base_url_from_env()?;
     let tenant = demo_config.tenant.clone();

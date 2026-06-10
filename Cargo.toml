@@ -1,6 +1,6 @@
 [package]
 name = "greentic-start"
-version = "0.5.39"
+version = "0.5.40"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -21,6 +21,7 @@ dashmap = "6"
 flate2 = "1"
 futures-util = "0.3"
 greentic-distributor-client = { version = "0.5", default-features = false, features = ["pack-fetch"] }
+greentic-llm = { version = "1" }
 greentic-runner-desktop = { version = "0.5" }
 greentic-runner-host = { version = "0.5" }
 greentic-secrets-lib = { version = "0.5", features = ["providers-dev"] }
@@ -75,6 +76,9 @@ zstd = "0.13"
 
 [dev-dependencies]
 criterion = "0.8"
+# Enable greentic-llm's scriptable test double (TestLlmProvider) for unit tests
+# only — `test-mock` stays out of release builds.
+greentic-llm = { version = "1", features = ["test-mock"] }
 tempfile = "3"
 
 [[bench]]
