@@ -659,6 +659,7 @@ mod tests {
             metadata: Default::default(),
         };
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".into(),
             pack_id: PackId::new("demo-app").expect("pack id"),
             name: Some("demo-app".into()),

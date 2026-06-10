@@ -22,6 +22,7 @@ mod deployment_routes;
 mod dev_store_path;
 mod discovery;
 mod doctor;
+mod doctor_env;
 mod domains;
 mod endpoint_admit;
 mod endpoint_resolver;

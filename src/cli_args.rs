@@ -27,12 +27,20 @@ pub(crate) enum Command {
 
 #[derive(Parser, Clone)]
 pub(crate) struct DoctorArgs {
-    /// Bundle reference or extracted bundle directory to inspect.
-    pub(crate) bundle: String,
+    /// Bundle reference or extracted bundle directory to inspect. When
+    /// omitted, doctor checks the environment-store readiness of `--env`
+    /// (or the resolved default env) instead.
+    pub(crate) bundle: Option<String>,
+    /// Environment id whose store-backed runtime readiness should be
+    /// checked (trust root, messaging-endpoint linkage, secret-ref
+    /// resolvability). Defaults to `$GREENTIC_ENV` / `local` when no
+    /// bundle is given.
+    #[arg(long)]
+    pub(crate) env: Option<String>,
     /// Emit stable machine-readable JSON.
     #[arg(long)]
     pub(crate) json: bool,
-    /// Promote drift/tag/cache warnings to errors.
+    /// Promote drift/tag/cache and env-readiness warnings to errors.
     #[arg(long)]
     pub(crate) strict: bool,
     /// Include longer remediation hints in human output.
@@ -44,6 +52,15 @@ pub(crate) struct DoctorArgs {
     /// Restrict checks to one diagnostic stage.
     #[arg(long, value_enum, default_value_t = DoctorStageArg::All)]
     pub(crate) stage: DoctorStageArg,
+}
+
+impl DoctorArgs {
+    /// Whether this invocation runs the env-store readiness checks:
+    /// explicitly requested via `--env`, or by default when no bundle
+    /// target was given (mirroring the bundle-less `greentic-start` boot).
+    pub(crate) fn env_mode(&self) -> bool {
+        self.env.is_some() || self.bundle.is_none()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]

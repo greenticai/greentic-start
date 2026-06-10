@@ -1547,6 +1547,7 @@ mod tests {
             },
         );
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "1".to_string(),
             pack_id: "messaging-teams".parse()?,
             name: None,
@@ -1609,6 +1610,7 @@ mod tests {
             },
         );
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "1".to_string(),
             pack_id: "messaging-teams".parse()?,
             name: None,
