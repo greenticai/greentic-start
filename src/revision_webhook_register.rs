@@ -8,9 +8,10 @@
 //! `secret_token`, so inbound webhooks land on the right route and the M1 IID
 //! resolver can identify the endpoint.
 //!
-//! Gated on a configured `PUBLIC_BASE_URL`: the bundle-less boot runs no tunnel,
-//! so a configured public address is the only thing we can hand to a provider.
-//! With none, registration is skipped (register manually, e.g. via `curl`).
+//! Gated on a resolved public base URL — a tunnel started by the boot
+//! (`--cloudflared on` / `--ngrok on`, see `env_tunnel`), else the env-store
+//! `public_base_url`, else the `PUBLIC_BASE_URL` env var. With none,
+//! registration is skipped (register manually, e.g. via `curl`).
 //!
 //! Runs at boot (after the revision server is listening) and after every
 //! config reload (hot-attach) — see [`post_reload_registration`], which fires
@@ -454,14 +455,17 @@ fn plan_webhook_registrations(
 /// unchanged paths; covers hot-attached deployments; failures are best-effort
 /// logged — the next config reload re-registers.
 ///
-/// The public URL is resolved freshly on each reload from the just-loaded
-/// `environment.json`, with a fallback to the `PUBLIC_BASE_URL` env var.
-/// This ensures that `gtc op env set-public-url <NEW>` takes effect on the
-/// next reload without a process restart.
+/// URL precedence per reload: `tunnel_url` (a tunnel started by this boot —
+/// process-local, never persisted) wins; otherwise the URL is resolved
+/// freshly from the just-loaded `environment.json`, with a fallback to the
+/// `PUBLIC_BASE_URL` env var. The fresh resolve ensures that
+/// `gtc op env set-public-url <NEW>` takes effect on the next reload without
+/// a process restart (when no tunnel is running).
 pub(crate) fn post_reload_registration(
     store_root: PathBuf,
     env_id: String,
     rt: tokio::runtime::Handle,
+    tunnel_url: Option<String>,
 ) -> impl FnMut(&Activation) + Send + 'static {
     move |activation: &Activation| {
         let env = match load_environment(&store_root, &env_id) {
@@ -477,12 +481,21 @@ pub(crate) fn post_reload_registration(
                 return;
             }
         };
-        let public_base_url = resolve_public_base_url_for_reload(&env);
+        let public_base_url = reload_public_base_url(tunnel_url.as_deref(), &env);
         let activation = activation.clone();
         rt.spawn(async move {
             register_new_model_webhooks(&activation, &env, public_base_url.as_deref()).await;
         });
     }
+}
+
+/// Per-reload URL precedence: a boot-started tunnel (process-local) wins,
+/// else the freshly-loaded environment / env var via
+/// [`resolve_public_base_url_for_reload`].
+fn reload_public_base_url(tunnel_url: Option<&str>, env: &Environment) -> Option<String> {
+    tunnel_url
+        .map(str::to_string)
+        .or_else(|| resolve_public_base_url_for_reload(env))
 }
 
 /// Resolve the public base URL from a freshly-loaded environment, with a
@@ -794,6 +807,23 @@ mod tests {
             resolve_public_base_url_for_reload(&env_new),
             Some("https://new.example.com".to_string()),
             "must reflect the freshly-loaded env, not a stale captured value",
+        );
+    }
+
+    #[test]
+    fn reload_url_precedence_tunnel_wins_over_env_store() {
+        let mut env = env_with(vec![]);
+        env.host_config.public_base_url = Some("https://persisted.example.com".to_string());
+
+        assert_eq!(
+            reload_public_base_url(Some("https://live.trycloudflare.com"), &env),
+            Some("https://live.trycloudflare.com".to_string()),
+            "a boot-started tunnel must win over the persisted env-store URL",
+        );
+        assert_eq!(
+            reload_public_base_url(None, &env),
+            Some("https://persisted.example.com".to_string()),
+            "without a tunnel the persisted env-store URL applies",
         );
     }
 }

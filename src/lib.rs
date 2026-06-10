@@ -26,6 +26,7 @@ mod doctor_env;
 mod domains;
 mod endpoint_admit;
 mod endpoint_resolver;
+mod env_tunnel;
 mod event_router;
 mod extension_resolver;
 pub(crate) mod flow_log;
@@ -217,8 +218,59 @@ pub fn run_restart_request(mut request: StartRequest) -> anyhow::Result<()> {
 }
 
 pub fn run_stop_request(request: StopRequest) -> anyhow::Result<()> {
+    // New-model stop: with no explicit target and no legacy `./state` layout
+    // in the CWD, stop the bundle-less env runtime instead — signal its serve
+    // loop via the env-rooted stop-request file and tear down env-rooted
+    // tunnel children (pidfile-scoped; a hand-started tunnel is not ours to
+    // kill). Explicit `--bundle` / `--state-dir` always means the legacy path.
+    if request.bundle.is_none()
+        && request.state_dir.is_none()
+        && !std::path::Path::new("state").exists()
+        && let Some(root) = greentic_deployer::environment::LocalFsStore::default_root()
+    {
+        let env_id = resolve_env(None);
+        let env_dir = root.join(&env_id);
+        if env_dir.is_dir() {
+            return stop_env_runtime(&env_dir, &env_id);
+        }
+    }
     let state_dir = resolve_state_dir(request.state_dir, request.bundle.as_deref())?;
     runtime::demo_down_runtime(&state_dir, &request.tenant, &request.team, false)
+}
+
+/// Stop the bundle-less env runtime: write the stop-request file its serve
+/// loop polls (observed within ~250ms when one is running; a stale file is
+/// cleared by the next boot) and stop env-rooted tunnel children.
+fn stop_env_runtime(env_dir: &std::path::Path, env_id: &str) -> anyhow::Result<()> {
+    let paths = env_tunnel::env_runtime_paths(env_dir, env_id);
+    runtime_state::write_stop_request(
+        &paths,
+        &runtime_state::StopRequest {
+            requested_by: "greentic-start stop".to_string(),
+            reason: None,
+        },
+    )?;
+    let stopped = env_tunnel::stop_env_tunnels(&paths);
+    if stopped.is_empty() {
+        println!(
+            "{}",
+            operator_i18n::trf(
+                "revision.serve.stop_sent",
+                "stop requested for env `{}`; a serving greentic-start exits within ~1s (no tunnel children to stop).",
+                &[env_id]
+            )
+        );
+    } else {
+        println!(
+            "{}",
+            operator_i18n::trf(
+                "revision.serve.stop_sent_with_tunnels",
+                "stop requested for env `{}`; stopped tunnel(s): {}.",
+                &[env_id, &stopped.join(", ")]
+            )
+        );
+    }
+    Ok(())
 }
 
 pub fn run_from_env() -> anyhow::Result<()> {
@@ -318,6 +370,14 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let log_dir = operator_log::init(env_dir.join("logs"), log_level)?;
         let _trace_guard = init_trace_log(&log_dir);
 
+        // Env-rooted control paths: `greentic-start stop` signals this serve
+        // loop through the stop-request file under these paths (and stops any
+        // env-rooted tunnel children). Clear a stale request from a previous
+        // run up front — anything written after this point is a live stop
+        // request aimed at this process.
+        let shutdown_paths = env_tunnel::env_runtime_paths(&env_dir, &env_id);
+        runtime_state::clear_stop_request(&shutdown_paths)?;
+
         // Activate with the env's own DevStore secrets backend rather than
         // HostBuilder's default env-var backend (which rejects non-local
         // envs). A later step refines this to the per-tenant/pack-declared
@@ -410,18 +470,42 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         operator_log::info(module_path!(), banner.clone());
         println!("\n{banner}. Press Ctrl+C to stop.");
 
+        // `--cloudflared on` / `--ngrok on`: spawn the quick tunnel against
+        // the port the server actually bound (it can differ from the
+        // configured one) and surface the public URL. Spawned after the
+        // listener is up so the tunnel's first health probe has something to
+        // reach. Explicit flag + tunnel failure = hard error, never a silent
+        // local-only boot.
+        let tunnel = env_tunnel::start_env_tunnel(
+            &request,
+            &env_dir,
+            &env_id,
+            server.actual_port(),
+            &log_dir,
+        )?;
+        let tunnel_url = tunnel.map(|t| {
+            let line = format!("public URL: {} ({} tunnel)", t.url, t.service);
+            operator_log::info(module_path!(), line.clone());
+            println!("{line}");
+            t.url
+        });
+
         // Phase D: auto-register provider webhooks for the served revisions.
-        // Gated on a public_base_url — the bundle-less boot runs no tunnel, so
-        // a persisted or env-var-supplied address is the only one we can hand
-        // to a provider. With none, registration is skipped (register manually).
-        // Detached: the server is already listening, and a slow or stuck
-        // provider API call must not delay the watcher spawn or Ctrl+C
-        // handling; each invocation is bounded by `SETUP_WEBHOOK_TIMEOUT`.
+        // Gated on a public_base_url — with none, registration is skipped
+        // (register manually). Detached: the server is already listening, and
+        // a slow or stuck provider API call must not delay the watcher spawn
+        // or Ctrl+C handling; each invocation is bounded by
+        // `SETUP_WEBHOOK_TIMEOUT`.
         //
-        // Precedence (no tunnel on this path): env-store > env var. Delegated
-        // to the canonical helper in `startup_contract` so this path stays in
-        // lockstep with the reload path in `revision_webhook_register`.
-        let public_base_url = startup_contract::resolve_public_base_url(&environment)?;
+        // Precedence: tunnel-discovered URL (always wins) > env-store > env
+        // var — the same chain as the legacy bundle arm. The env-derived tail
+        // is delegated to the canonical helper in `startup_contract` so this
+        // path stays in lockstep with the reload path in
+        // `revision_webhook_register`.
+        let public_base_url = match tunnel_url.clone() {
+            Some(url) => Some(url),
+            None => startup_contract::resolve_public_base_url(&environment)?,
+        };
         if revision_count > 0 {
             let boot_activation = std::sync::Arc::clone(&activation);
             let boot_url = public_base_url.clone();
@@ -474,25 +558,56 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             // deployment, new endpoint) re-registers webhooks against the
             // freshly-served activation — AFTER the swap, so the registered
             // URL is live before the provider validates or delivers to it.
-            // The URL is resolved freshly from the reloaded environment.json
-            // (with env-var fallback), so `gtc op env set-public-url` takes
-            // effect on the next reload without a process restart.
-            // Idempotent for unchanged routes (same URL + secret_token).
+            // A tunnel started by this boot stays the highest-precedence URL
+            // across reloads (it is process-local, never persisted); without
+            // one, the URL is resolved freshly from the reloaded
+            // environment.json (with env-var fallback), so `gtc op env
+            // set-public-url` takes effect on the next reload without a
+            // process restart. Idempotent for unchanged routes (same URL +
+            // secret_token).
             revision_webhook_register::post_reload_registration(
                 store_root.clone(),
                 env_id.clone(),
                 activation_rt.handle().clone(),
+                tunnel_url,
             ),
             // C5 snapshot-reload arm: pure `store.reload()` call.
             move || snapshot_store_for_watcher.reload(),
         )
         .context("spawning runtime-config watcher")?;
 
-        if let Err(err) = activation_rt.block_on(tokio::signal::ctrl_c()) {
-            operator_log::warn(
-                module_path!(),
-                format!("revision serving Ctrl+C listener error: {err}"),
+        // Wait for either Ctrl+C or a stop-request file written by
+        // `greentic-start stop` (the bundle-less analogue of the legacy
+        // `wait_for_shutdown`). A corrupt stop file fails the wait loudly —
+        // same policy as the legacy path.
+        let reason = activation_rt.block_on(async {
+            loop {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        if let Err(err) = result {
+                            operator_log::warn(
+                                module_path!(),
+                                format!("revision serving Ctrl+C listener error: {err}"),
+                            );
+                        }
+                        return anyhow::Ok(ShutdownReason::CtrlC);
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                        if runtime_state::read_stop_request(&shutdown_paths)?.is_some() {
+                            return anyhow::Ok(ShutdownReason::AdminStop);
+                        }
+                    }
+                }
+            }
+        })?;
+        if matches!(reason, ShutdownReason::AdminStop) {
+            runtime_state::clear_stop_request(&shutdown_paths)?;
+            let line = operator_i18n::tr(
+                "revision.serve.stop_requested",
+                "stop requested via `greentic-start stop`; shutting down.",
             );
+            operator_log::info(module_path!(), line.clone());
+            println!("{line}");
         }
         // Drop the watcher before stopping the server so the watcher's
         // worker can't call `server.reload()` on a server that's already

@@ -118,6 +118,22 @@ Important automatic behavior from [src/lib.rs](/projects/ai/greentic-ng/greentic
 - if still not explicit, the runtime may prompt for tunnel selection in interactive use
 - if `--ngrok on` and `--cloudflared on` are both present, `ngrok` wins unless you intentionally override the combination
 
+Tunnels on the bundle-less (env-serving) boot, from `src/env_tunnel.rs`:
+
+- `--cloudflared on` / `--ngrok on` also work without `--bundle`: the tunnel
+  is spawned against the bound revision-serve port after the listener is up,
+  and its URL becomes the highest-precedence public base URL
+  (tunnel > env-store `public_base_url` > `PUBLIC_BASE_URL` env var) for
+  provider webhook auto-registration, including re-registration on config
+  reloads
+- there is no auto-enable and no interactive prompt on this path — tunnels
+  are off unless a flag asks for one, and a tunnel that fails to start fails
+  the boot (explicit opt-in, never a silent local-only fallback)
+- tunnel children are tracked under
+  `<env_dir>/state/pids/env.<env_id>/<service>.pid` and deliberately survive
+  Ctrl+C so a quick restart reuses the same URL; `greentic-start stop` tears
+  them down
+
 ### Runner selection
 
 - `--runner-binary <path>`
@@ -226,6 +242,14 @@ The `stop` command supports the flags defined in [src/cli_args.rs](/projects/ai/
 The stop request entrypoint is [src/lib.rs](/projects/ai/greentic-ng/greentic-start/src/lib.rs:93).
 
 Use `stop` when you want to shut down an already-running runtime cleanly.
+
+With no `--bundle` / `--state-dir` and no legacy `./state` directory in the
+CWD, `stop` targets the bundle-less env runtime instead: it writes a
+stop-request file under `<env_dir>/state/runtime/env.<env_id>/control/` (a
+serving `greentic-start` polls it every 250ms and exits cleanly) and stops
+env-rooted tunnel children via their pidfiles. It does NOT pkill arbitrary
+`cloudflared`/`ngrok` processes on this path — a hand-started tunnel is left
+alone, unlike the legacy bundle stop.
 
 ## Automatic Behaviors Agents Must Remember
 
