@@ -130,10 +130,10 @@ impl CapabilityDiscovery {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        if let Some((fetched_at, cached)) = guard.as_ref() {
-            if fetched_at.elapsed() < self.ttl {
-                return cached.clone();
-            }
+        if let Some((fetched_at, cached)) = guard.as_ref()
+            && fetched_at.elapsed() < self.ttl
+        {
+            return cached.clone();
         }
 
         match self.refresh(sorx_base_url) {
@@ -327,10 +327,10 @@ mod tests {
     impl SorxDiscoverySource for FakeSource {
         fn routing_table(&self, _base_url: &str) -> Result<Vec<RouteRow>, String> {
             let n = self.routing_calls.fetch_add(1, Ordering::SeqCst) + 1;
-            if let Some(limit) = self.fail_after_calls {
-                if n > limit {
-                    return Err("simulated routing-table outage".to_string());
-                }
+            if let Some(limit) = self.fail_after_calls
+                && n > limit
+            {
+                return Err("simulated routing-table outage".to_string());
             }
             Ok(self.routes.clone())
         }
