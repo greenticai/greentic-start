@@ -131,20 +131,43 @@ pub fn run_doctor(args: DoctorArgs) -> anyhow::Result<bool> {
                     store_root: store_root.clone(),
                 });
                 for diagnostic in crate::doctor_env::environment_diagnostics(&store_root, &env_id) {
-                    ctx.push(diagnostic);
+                    // Env prerequisite failures (resolve/load) must bypass
+                    // the --stage filter — a filtered-out prerequisite Error
+                    // silently produces exit 0 without running the requested
+                    // checks (Finding 4).
+                    let is_prerequisite_error = diagnostic.severity == Severity::Error
+                        && (diagnostic.check_id == "start.env.resolve"
+                            || diagnostic.check_id == "start.env.load");
+                    if is_prerequisite_error {
+                        ctx.push_unfiltered(diagnostic);
+                    } else {
+                        ctx.push(diagnostic);
+                    }
                 }
             }
-            None => ctx.error(
-                "start.env.resolve",
-                DiagnosticComponent::Runtime,
-                "Cannot determine the default environment store root (no home directory).",
-                json!({ "env_id": env_id }),
-                (
-                    json!({ "store_root_resolves": true }),
-                    json!({ "store_root_resolves": false }),
-                ),
-                Some("Run with a resolvable HOME so ~/.greentic/environments/ can be located."),
-            ),
+            None => {
+                // No home directory — this is a prerequisite failure that
+                // must bypass the stage filter (Finding 4).
+                let diagnostic = Diagnostic {
+                    check_id: "start.env.resolve".to_string(),
+                    severity: Severity::Error,
+                    component: DiagnosticComponent::Runtime,
+                    message:
+                        "Cannot determine the default environment store root (no home directory)."
+                            .to_string(),
+                    evidence: json!({ "env_id": env_id }),
+                    expected: json!({ "store_root_resolves": true }),
+                    actual: json!({ "store_root_resolves": false }),
+                    fix_hint: Some(
+                        "Run with a resolvable HOME so ~/.greentic/environments/ can be located."
+                            .to_string(),
+                    ),
+                    related_file: None,
+                    related_pack: None,
+                    related_component: None,
+                };
+                ctx.push_unfiltered(diagnostic);
+            }
         }
     }
 
@@ -267,6 +290,19 @@ impl DoctorCtx<'_> {
         self.report.diagnostics.push(diagnostic);
     }
 
+    /// Like [`push`](Self::push) but skips the `include()` stage filter.
+    /// Used for env prerequisite failures (`start.env.resolve`,
+    /// `start.env.load`) that must remain visible even when `--stage`
+    /// restricts output to a single component — otherwise a
+    /// missing/malformed env silently produces zero diagnostics and
+    /// exit 0 ("success") without running the requested checks.
+    fn push_unfiltered(&mut self, mut diagnostic: Diagnostic) {
+        if self.args.strict && should_promote_in_strict(&diagnostic) {
+            diagnostic.severity = Severity::Error;
+        }
+        self.report.diagnostics.push(diagnostic);
+    }
+
     fn error(
         &mut self,
         check_id: &str,
@@ -346,7 +382,8 @@ fn should_promote_in_strict(diagnostic: &Diagnostic) -> bool {
         && (diagnostic.check_id.contains(".tag_refs")
             || diagnostic.check_id.contains(".cache")
             || diagnostic.check_id.contains(".current")
-            || diagnostic.check_id.contains(".dependencies"))
+            || diagnostic.check_id.contains(".dependencies")
+            || diagnostic.check_id.starts_with("start.env."))
 }
 
 fn bundle_source_kind(input: &str) -> &'static str {
@@ -1214,4 +1251,95 @@ fn component_label(component: DiagnosticComponent) -> &'static str {
 
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "<unprintable>".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_diagnostic(check_id: &str, severity: Severity) -> Diagnostic {
+        Diagnostic {
+            check_id: check_id.to_string(),
+            severity,
+            component: DiagnosticComponent::Runtime,
+            message: "test".to_string(),
+            evidence: Value::Null,
+            expected: Value::Null,
+            actual: Value::Null,
+            fix_hint: None,
+            related_file: None,
+            related_pack: None,
+            related_component: None,
+        }
+    }
+
+    // ---- Finding 3: strict promotion for env warnings ---------------------
+
+    #[test]
+    fn strict_promotes_env_warnings() {
+        let warn = make_diagnostic("start.env.endpoint_links", Severity::Warn);
+        assert!(
+            should_promote_in_strict(&warn),
+            "start.env.* warnings should be promoted in strict mode"
+        );
+    }
+
+    #[test]
+    fn strict_does_not_promote_non_env_warnings() {
+        let warn = make_diagnostic("start.setup.completed", Severity::Warn);
+        assert!(
+            !should_promote_in_strict(&warn),
+            "start.setup.* warnings should NOT be promoted"
+        );
+    }
+
+    #[test]
+    fn strict_does_not_promote_env_errors() {
+        // Only Warn → Error promotion; an existing Error is untouched.
+        let err = make_diagnostic("start.env.trust_root", Severity::Error);
+        assert!(!should_promote_in_strict(&err));
+    }
+
+    // ---- Finding 4: stage-filter bypass for prerequisite errors -----------
+
+    #[test]
+    fn push_unfiltered_bypasses_stage_filter() {
+        let args = DoctorArgs {
+            bundle: None,
+            env: None,
+            json: false,
+            strict: false,
+            fix_hints: false,
+            show_info: false,
+            stage: DoctorStageArg::Routes,
+        };
+        let mut ctx = DoctorCtx {
+            report: DoctorReport {
+                schema_version: 1,
+                tool: "test".to_string(),
+                command: "doctor".to_string(),
+                bundle: None,
+                environment: None,
+                summary: DoctorSummary::default(),
+                diagnostics: Vec::new(),
+            },
+            args: &args,
+        };
+
+        // A Runtime-component Error through `push` is filtered out by
+        // --stage routes.
+        let filtered = make_diagnostic("start.env.resolve", Severity::Error);
+        assert!(!ctx.include(filtered.component));
+        ctx.push(filtered);
+        assert!(
+            ctx.report.diagnostics.is_empty(),
+            "push() should filter Runtime under --stage routes"
+        );
+
+        // The same diagnostic through `push_unfiltered` bypasses the filter.
+        let unfiltered = make_diagnostic("start.env.resolve", Severity::Error);
+        ctx.push_unfiltered(unfiltered);
+        assert_eq!(ctx.report.diagnostics.len(), 1);
+        assert_eq!(ctx.report.diagnostics[0].check_id, "start.env.resolve");
+    }
 }

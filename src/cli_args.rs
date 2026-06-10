@@ -40,7 +40,7 @@ pub(crate) struct DoctorArgs {
     /// Emit stable machine-readable JSON.
     #[arg(long)]
     pub(crate) json: bool,
-    /// Promote drift/tag/cache warnings to errors.
+    /// Promote drift/tag/cache and env-readiness warnings to errors.
     #[arg(long)]
     pub(crate) strict: bool,
     /// Include longer remediation hints in human output.
