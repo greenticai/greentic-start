@@ -70,7 +70,15 @@ pub(super) fn route_messaging_envelopes(
                 inject_prefill_metadata(&mut owned, &entities);
                 &owned
             }
-            _ => original,
+            // No deterministic node dispatch. Try the embedded LLM fallback
+            // (greentic-start's own greentic-llm capability) before giving up.
+            _ => match try_llm_fallback(ctx, &pack_info, &app_pack_path, original) {
+                Some(synth) => {
+                    owned = synth;
+                    &owned
+                }
+                None => original,
+            },
         };
         let outputs = if let Some(route_to_card) = envelope.metadata.get("routeToCardId") {
             match read_card_from_pack(&app_pack_path, route_to_card) {
@@ -361,6 +369,63 @@ fn inject_prefill_metadata(
                 value.clone(),
             );
         }
+    }
+}
+
+/// Embedded LLM routing fallback: when the deterministic tier yields no node
+/// dispatch for a Fast2Flow-capable pack and the bundle declared an `llm:`
+/// instance (with `fast2flow` enabled), ask [`crate::llm`] to pick a card and
+/// synthesize the same `routeToCardId` + prefill the host path produces. Needs
+/// no external binary, so it works embedded. `None` ⇒ fall through.
+fn try_llm_fallback(
+    ctx: &OperatorContext,
+    pack_info: &app::AppPackInfo,
+    app_pack_path: &Path,
+    original: &ChannelMessageEnvelope,
+) -> Option<ChannelMessageEnvelope> {
+    // The bundle's shared `llm:` instance, with the Fast2Flow consumer enabled.
+    let cfg = crate::llm::config()?;
+    if !cfg.fast2flow {
+        return None;
+    }
+    if !pack_info
+        .capabilities
+        .iter()
+        .any(|c| c == crate::fast2flow::FAST2FLOW_CAPABILITY)
+    {
+        return None;
+    }
+    let text = original
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())?;
+    let index_path = crate::fast2flow::resolve_index_path(
+        crate::fast2flow::Fast2FlowConfig::global(),
+        ctx,
+        app_pack_path,
+    )?;
+    match crate::fast2flow::try_llm_route(cfg, ctx, &index_path, text)? {
+        crate::ingress::control_directive::ControlDirective::Dispatch { target, entities }
+            if target.node.is_some() =>
+        {
+            let node = target.node.as_ref().expect("checked some").clone();
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[fast2flow:llm] dispatch -> routeToCardId={node} entities={} \
+                     (pack={} flow={:?})",
+                    entities.len(),
+                    target.pack,
+                    target.flow
+                ),
+            );
+            let mut owned = original.clone();
+            owned.metadata.insert("routeToCardId".to_string(), node);
+            inject_prefill_metadata(&mut owned, &entities);
+            Some(owned)
+        }
+        _ => None,
     }
 }
 
