@@ -118,6 +118,94 @@ fn normalized_bundle_has_runtime_payload(root_dir: &Path) -> bool {
     root_dir.join("bundle-manifest.json").exists() || root_dir.join("resolved").is_dir()
 }
 
+/// Optional `telemetry:` block carried inside a normalized `bundle.yaml`.
+///
+/// Backwards compatible: when the block is absent the deserializer skips it and
+/// callers see `None`, which preserves the legacy "file appender only" behavior.
+#[derive(Clone, Debug, Default, Deserialize, serde::Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct BundleTelemetryConfig {
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    #[serde(default = "default_exporter")]
+    pub exporter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    /// Base tracing filter applied to BOTH the `system.log` file appender and
+    /// the OTLP exporter when `RUST_LOG` is unset. An `EnvFilter` directive
+    /// string such as `"trace"`, `"debug"`, or `"info,greentic.fast2flow=trace"`.
+    /// `RUST_LOG` (when set) always wins. Noisy-target clamps still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<String>,
+    #[serde(default = "default_sampling", skip_serializing_if = "is_one")]
+    pub sampling: f64,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+/// The top-level `llm:` block — the **single LLM instance** the bundle
+/// references, shared by any greentic-start LLM use (not fast2flow-specific).
+/// Consumers are namespaced by prefix; the Fast2Flow routing fallback is the
+/// first, via the `fast2flow*` fields. Absent ⇒ no LLM features.
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct BundleLlmConfig {
+    /// Provider key resolved via `greentic-llm`
+    /// (`openai`, `anthropic`, `gemini`, `ollama`, …).
+    pub provider: String,
+    /// Model name. Optional; a per-provider default is used when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// API key reference — a `secrets://…` dev-store URI (operator-supplied) or
+    /// an env-var name. Falls back to `GREENTIC_LLM_API_KEY`. Keyless for Ollama.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_secret: Option<String>,
+    /// Provider base URL override (self-hosted / proxy; e.g. an Ollama endpoint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    // --- Consumer: Fast2Flow routing fallback ---
+    /// Whether the Fast2Flow fallback may use this LLM (default `true`; set
+    /// `false` to reserve it for other uses).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub fast2flow: bool,
+    /// Min confidence to accept the routing choice; below it the fallback
+    /// abstains (default 0.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast2flow_llm_min_confidence: Option<f32>,
+}
+
+impl Default for BundleLlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            model: None,
+            api_key_secret: None,
+            base_url: None,
+            fast2flow: true,
+            fast2flow_llm_min_confidence: None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn is_true(v: &bool) -> bool {
+    *v
+}
+fn default_exporter() -> String {
+    "none".to_string()
+}
+fn default_sampling() -> f64 {
+    1.0
+}
+fn is_one(v: &f64) -> bool {
+    (*v - 1.0).abs() < f64::EPSILON
+}
+
 /// Extended bundle.yaml structure with optional demo config fields
 #[derive(Debug, Deserialize)]
 struct ExtendedBundleYaml {
@@ -127,6 +215,10 @@ struct ExtendedBundleYaml {
     team: Option<String>,
     #[serde(default)]
     providers: Option<std::collections::BTreeMap<String, config::DemoProviderConfig>>,
+    #[serde(default)]
+    telemetry: Option<BundleTelemetryConfig>,
+    #[serde(default)]
+    llm: Option<BundleLlmConfig>,
 }
 
 /// Result of loading extended bundle.yaml
@@ -134,6 +226,74 @@ struct ExtendedBundleResult {
     tenant: Option<String>,
     team: Option<String>,
     providers: Option<std::collections::BTreeMap<String, config::DemoProviderConfig>>,
+    #[allow(dead_code)]
+    telemetry: Option<BundleTelemetryConfig>,
+}
+
+/// Read just the `telemetry:` block from a normalized bundle.yaml.
+pub(crate) fn peek_bundle_telemetry(bundle_path: &Path) -> Option<BundleTelemetryConfig> {
+    let raw = std::fs::read_to_string(bundle_path).ok()?;
+    let parsed: ExtendedBundleYaml = serde_yaml_bw::from_str(&raw).ok()?;
+    parsed.telemetry
+}
+
+/// Read just the top-level `llm:` block from a normalized bundle.yaml.
+pub(crate) fn peek_bundle_llm(bundle_path: &Path) -> Option<BundleLlmConfig> {
+    let raw = std::fs::read_to_string(bundle_path).ok()?;
+    let parsed: ExtendedBundleYaml = serde_yaml_bw::from_str(&raw).ok()?;
+    parsed.llm
+}
+
+/// Read the optional sidecar telemetry artifact persisted by `gtc setup` at
+/// `<bundle_root>/state/config/platform/telemetry.json`.
+pub(crate) fn peek_sidecar_telemetry(bundle_root: &Path) -> Option<BundleTelemetryConfig> {
+    let path = bundle_root
+        .join("state")
+        .join("config")
+        .join("platform")
+        .join("telemetry.json");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let obj = value.as_object()?;
+    let exporter = obj
+        .get("exporter")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none")
+        .to_string();
+    let enabled = obj
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(exporter != "none");
+    let endpoint = obj
+        .get("endpoint")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let service_name = obj
+        .get("service_name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let log_level = obj
+        .get("log_level")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let headers = obj
+        .get("headers")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(BundleTelemetryConfig {
+        enabled,
+        exporter,
+        endpoint,
+        service_name,
+        log_level,
+        sampling: 1.0,
+        headers,
+    })
 }
 
 /// Load extended config from bundle.yaml if present (tenant, team, providers)
@@ -170,6 +330,7 @@ fn load_extended_bundle_config(
         tenant: parsed.tenant,
         team: parsed.team,
         providers,
+        telemetry: parsed.telemetry,
     }))
 }
 
@@ -362,6 +523,45 @@ mod tests {
             admin_allowed_clients: Vec::new(),
             tunnel_explicit: true,
         }
+    }
+
+    #[test]
+    fn peek_bundle_llm_parses_block_and_fast2flow_consumer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle.yaml");
+        std::fs::write(
+            &bundle,
+            "bundle_id: demo\nllm:\n  provider: openai\n  model: gpt-4o\n  api_key_secret: MY_KEY\n  fast2flow_llm_min_confidence: 0.55\n",
+        )
+        .expect("write");
+        let llm = peek_bundle_llm(&bundle).expect("llm block present");
+        assert_eq!(llm.provider, "openai");
+        assert_eq!(llm.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(llm.api_key_secret.as_deref(), Some("MY_KEY"));
+        assert_eq!(llm.fast2flow_llm_min_confidence, Some(0.55));
+        // fast2flow consumer is opt-out: enabled unless explicitly disabled.
+        assert!(llm.fast2flow);
+    }
+
+    #[test]
+    fn peek_bundle_llm_fast2flow_can_be_disabled() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle.yaml");
+        std::fs::write(
+            &bundle,
+            "bundle_id: demo\nllm:\n  provider: openai\n  fast2flow: false\n",
+        )
+        .expect("write");
+        let llm = peek_bundle_llm(&bundle).expect("llm block present");
+        assert!(!llm.fast2flow);
+    }
+
+    #[test]
+    fn peek_bundle_llm_absent_block_is_none() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle.yaml");
+        std::fs::write(&bundle, "bundle_id: demo\n").expect("write");
+        assert!(peek_bundle_llm(&bundle).is_none());
     }
 
     #[test]

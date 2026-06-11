@@ -792,6 +792,8 @@ pub fn demo_up_services(
 
     let discovery = crate::discovery::discover(config_dir)?;
     crate::discovery::persist(config_dir, tenant, &discovery)?;
+    ensure_generated_provider_secrets(config_dir, tenant, team, &discovery)
+        .with_context(|| "failed to seed generated provider secrets")?;
     let secrets_handle = secrets_gate::resolve_secrets_manager(config_dir, tenant, Some(team))?;
     let runner_host = Arc::new(DemoRunnerHost::new(
         config_dir.to_path_buf(),
@@ -1466,6 +1468,38 @@ fn start_http_ingress_server(
     Ok(Some(server))
 }
 
+fn ensure_generated_provider_secrets(
+    bundle_root: &Path,
+    tenant: &str,
+    team: &str,
+    discovery: &crate::discovery::DiscoveryResult,
+) -> anyhow::Result<()> {
+    let env = crate::secrets_setup::resolve_env(None);
+    let setup = crate::secrets_setup::SecretsSetup::new(bundle_root, &env, tenant, Some(team))?;
+    let fut = async {
+        for provider in &discovery.providers {
+            setup
+                .ensure_pack_generated_secrets(&provider.pack_path, &provider.provider_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "seed generated secrets for provider {}",
+                        provider.provider_id
+                    )
+                })?;
+        }
+        anyhow::Ok(())
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build temporary tokio runtime for generated secrets")?
+            .block_on(fut),
+    }
+}
+
 pub fn demo_status_runtime(
     state_dir: &Path,
     tenant: &str,
@@ -1862,6 +1896,7 @@ mod tests {
     use crate::discovery::{DetectedDomains, DetectedProvider, DiscoveryResult, ProviderIdSource};
     use crate::domains::Domain;
     use crate::secrets_gate;
+    use greentic_secrets_lib::{DevStore, SecretsStore};
     use greentic_types::{
         ExtensionInline, ExtensionRef, Flow, FlowId, FlowKind, PackFlowEntry, PackId, PackKind,
         PackManifest, PackSignatures,
@@ -1917,6 +1952,96 @@ mod tests {
         assert_eq!(manifest.services.len(), 2);
         let expected_log_dir = dir.path().display().to_string();
         assert_eq!(manifest.log_dir.as_deref(), Some(expected_log_dir.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_seeds_generated_provider_secrets_from_cbor_metadata() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let pack_path = dir
+            .path()
+            .join("providers/messaging/messaging-webchat-gui.gtpack");
+        fs::create_dir_all(pack_path.parent().expect("provider dir"))?;
+        let mut extensions = BTreeMap::new();
+        extensions.insert(
+            "greentic.generated-secrets.v1".to_string(),
+            ExtensionRef {
+                kind: "greentic.generated-secrets.v1".to_string(),
+                version: "1".to_string(),
+                digest: None,
+                location: None,
+                inline: Some(ExtensionInline::Other(json!({
+                    "secrets": [{
+                        "key": "jwt_signing_key",
+                        "aliases": ["JWT_SIGNING_KEY"],
+                        "required": true,
+                        "policy": "random",
+                        "length": 20,
+                        "encoding": "raw_text",
+                        "scope": {
+                            "level": "tenant",
+                            "team": "_"
+                        },
+                        "regenerate_if_present": false
+                    }]
+                }))),
+            },
+        );
+        let manifest = PackManifest {
+            schema_version: "1".to_string(),
+            pack_id: PackId::new("messaging-webchat-gui")?,
+            name: None,
+            version: Version::parse("0.0.0")?,
+            kind: PackKind::Provider,
+            publisher: "test".to_string(),
+            components: Vec::new(),
+            flows: Vec::new(),
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            secret_requirements: Vec::new(),
+            signatures: PackSignatures::default(),
+            bootstrap: None,
+            extensions: Some(extensions),
+            agents: Default::default(),
+        };
+        write_pack_with_manifest(&pack_path, manifest, &[])?;
+
+        let discovery = DiscoveryResult {
+            domains: DetectedDomains {
+                messaging: true,
+                events: false,
+                oauth: false,
+            },
+            providers: vec![DetectedProvider {
+                provider_id: "messaging-webchat-gui".to_string(),
+                domain: "messaging".to_string(),
+                pack_path,
+                id_source: ProviderIdSource::Manifest,
+            }],
+        };
+
+        ensure_generated_provider_secrets(dir.path(), "demo", "default", &discovery)?;
+
+        let store = DevStore::with_path(dir.path().join(".greentic/dev/.dev.secrets.env"))?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        let env = crate::secrets_setup::resolve_env(None);
+        let uri = crate::secrets_gate::canonical_secret_uri(
+            &env,
+            "demo",
+            None,
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
+        let value = runtime.block_on(store.get(&uri))?;
+        let value = String::from_utf8(value)?;
+        assert_eq!(value.len(), 20);
+        assert!(!value.contains("placeholder"));
+        assert!(
+            !dir.path()
+                .join(".providers/messaging-webchat-gui/config.envelope.cbor")
+                .exists(),
+            "generated startup secrets must not be written into provider config"
+        );
         Ok(())
     }
 

@@ -431,10 +431,15 @@ where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
 {
+    let started = std::time::Instant::now();
+    let method = req.method().as_str().to_string();
+    let route = crate::metrics::normalise_route(req.uri().path());
     let response = match handle_request_inner(req, state).await {
         Ok(response) => with_cors(response),
         Err(response) => with_cors(response),
     };
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    crate::metrics::record_http_request(&method, &route, response.status().as_u16(), elapsed_ms);
     Ok(response)
 }
 
@@ -1740,17 +1745,34 @@ where
             .insert(key, result.response.clone());
     }
 
-    if request.path == "/token" && (200..300).contains(&result.response.status) {
+    if request.path == "/token" {
         let body = result.response.body.as_deref().unwrap_or_default();
-        let token_ok = serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("token")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
-            .is_some_and(|token| !token.trim().is_empty());
+        if !(200..300).contains(&result.response.status) {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "[webchat directline] token request failed provider={} tenant={} team={} status={} body={}",
+                    request.provider,
+                    request.tenant,
+                    request.team,
+                    result.response.status,
+                    String::from_utf8_lossy(body)
+                        .chars()
+                        .take(500)
+                        .collect::<String>()
+                ),
+            );
+        }
+        let token_ok = (200..300).contains(&result.response.status)
+            && serde_json::from_slice::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("token")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .is_some_and(|token| !token.trim().is_empty());
         if !token_ok {
             return Err(error_response(
                 StatusCode::BAD_GATEWAY,

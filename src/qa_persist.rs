@@ -31,6 +31,8 @@ use crate::secret_name::canonical_secret_name;
 use crate::secrets_gate::canonical_secret_uri;
 use crate::secrets_setup::resolve_env;
 
+use crate::component_qa_ops::APPLY_SECRETS_PATCH_KEY;
+
 /// Extract secret fields from the QA config output and write them to the dev store.
 ///
 /// Returns a list of secret keys that were persisted.
@@ -121,10 +123,11 @@ pub fn persist_qa_config(
         .map(|q| q.id.as_str())
         .collect();
 
+    let config = strip_apply_secrets_patch(config);
     let filtered_config = if secret_ids.is_empty() {
-        config.clone()
+        config
     } else {
-        filter_secrets(config, &secret_ids)
+        filter_secrets(&config, &secret_ids)
     };
 
     crate::provider_config_envelope::write_provider_config_envelope(
@@ -180,11 +183,18 @@ pub async fn persist_qa_results(
 
     let saved_secrets =
         persist_qa_secrets(&store, &env, tenant, team, provider_id, config, form_spec).await?;
+    let patched_secrets =
+        persist_apply_secrets_patch(&store, &env, tenant, team, provider_id, config).await?;
+    let saved_secrets = saved_secrets
+        .into_iter()
+        .chain(patched_secrets)
+        .collect::<Vec<_>>();
+    let config_for_persistence = strip_apply_secrets_patch(config);
 
     // Seed aliases from secret-requirements.json so WASM components can find
     // secrets by their canonical requirement key when provider metadata declares
     // a longer runtime key than the setup answer key.
-    if let Some(config_map) = config.as_object() {
+    if let Some(config_map) = config_for_persistence.as_object() {
         let alias_count = seed_secret_requirement_aliases(
             &store,
             config_map,
@@ -205,11 +215,14 @@ pub async fn persist_qa_results(
         }
     }
 
-    let config_written = if config.as_object().is_some_and(|m| !m.is_empty()) {
+    let config_written = if config_for_persistence
+        .as_object()
+        .is_some_and(|m| !m.is_empty())
+    {
         persist_qa_config(
             providers_root,
             provider_id,
-            config,
+            &config_for_persistence,
             pack_path,
             form_spec,
             backup,
@@ -245,6 +258,96 @@ pub async fn persist_qa_results(
     }
 
     Ok((saved_secrets, config_written))
+}
+
+async fn persist_apply_secrets_patch(
+    store: &DevStore,
+    env: &str,
+    tenant: &str,
+    team: Option<&str>,
+    provider_id: &str,
+    config: &Value,
+) -> Result<Vec<String>> {
+    let Some(set) = config
+        .get(APPLY_SECRETS_PATCH_KEY)
+        .and_then(|patch| patch.get("set"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut entries = Vec::new();
+    let mut saved_keys = Vec::new();
+    for (key, value) in set {
+        let text = value_to_text(value);
+        if text.is_empty() || text == "null" {
+            continue;
+        }
+        let canonical_key = canonical_secret_name(key);
+        push_secret_patch_entry(
+            &mut entries,
+            env,
+            tenant,
+            team,
+            provider_id,
+            &canonical_key,
+            &text,
+        );
+        if team.is_some() {
+            push_secret_patch_entry(
+                &mut entries,
+                env,
+                tenant,
+                None,
+                provider_id,
+                &canonical_key,
+                &text,
+            );
+        }
+        saved_keys.push(canonical_key);
+    }
+
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let report = apply_seed(store, &SeedDoc { entries }, ApplyOptions::default()).await;
+    if !report.failed.is_empty() {
+        return Err(anyhow::anyhow!(
+            "failed to persist {} patched secret(s): {:?}",
+            report.failed.len(),
+            report.failed
+        ));
+    }
+    Ok(saved_keys)
+}
+
+fn push_secret_patch_entry(
+    entries: &mut Vec<SeedEntry>,
+    env: &str,
+    tenant: &str,
+    team: Option<&str>,
+    provider_id: &str,
+    key: &str,
+    text: &str,
+) {
+    entries.push(SeedEntry {
+        uri: canonical_secret_uri(env, tenant, team, provider_id, key),
+        format: SecretFormat::Text,
+        value: SeedValue::Text {
+            text: text.to_string(),
+        },
+        description: Some(format!("from QA secrets_patch for {provider_id}")),
+    });
+}
+
+fn strip_apply_secrets_patch(config: &Value) -> Value {
+    let Some(map) = config.as_object() else {
+        return config.clone();
+    };
+    let mut filtered = map.clone();
+    filtered.remove(APPLY_SECRETS_PATCH_KEY);
+    Value::Object(filtered)
 }
 
 /// OAuth authorization stub.
@@ -760,6 +863,82 @@ mod tests {
             .expect("read retries");
         assert_eq!(bot, b"secret123".to_vec());
         assert_eq!(retries, b"3".to_vec());
+    }
+
+    #[test]
+    fn persist_qa_results_persists_apply_secrets_patch_and_strips_internal_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let providers_root = dir.path().join(".providers");
+        fs::create_dir_all(&providers_root).expect("providers");
+        let pack = dir.path().join("provider.gtpack");
+        fs::write(&pack, b"fixture").expect("pack");
+        let spec = make_form_spec(vec![question("public_base_url", false)]);
+        let runtime = Runtime::new().expect("runtime");
+
+        let (saved, written) = runtime
+            .block_on(persist_qa_results(
+                dir.path(),
+                &providers_root,
+                "demo",
+                Some("default"),
+                "messaging-webex",
+                &json!({
+                    "public_base_url": "https://example.com",
+                    APPLY_SECRETS_PATCH_KEY: {
+                        "set": {
+                            "WEBEX_WEBHOOK_SECRET": "generated-secret",
+                            "empty": ""
+                        },
+                        "delete": []
+                    }
+                }),
+                &pack,
+                &spec,
+                false,
+            ))
+            .expect("persist results");
+
+        assert_eq!(
+            saved,
+            vec![
+                "public_base_url".to_string(),
+                "webex_webhook_secret".to_string()
+            ]
+        );
+        assert!(written);
+
+        let env = resolve_env(None);
+        let store =
+            DevStore::with_path(dir.path().join(".greentic/dev/.dev.secrets.env")).expect("store");
+        let secret_uri = canonical_secret_uri(
+            &env,
+            "demo",
+            Some("default"),
+            "messaging-webex",
+            "webex_webhook_secret",
+        );
+        let secret = runtime.block_on(store.get(&secret_uri)).expect("secret");
+        assert_eq!(secret, b"generated-secret".to_vec());
+        let tenant_secret_uri = canonical_secret_uri(
+            &env,
+            "demo",
+            None,
+            "messaging-webex",
+            "webex_webhook_secret",
+        );
+        let tenant_secret = runtime
+            .block_on(store.get(&tenant_secret_uri))
+            .expect("tenant secret");
+        assert_eq!(tenant_secret, b"generated-secret".to_vec());
+
+        let envelope = crate::provider_config_envelope::read_provider_config_envelope(
+            &providers_root,
+            "messaging-webex",
+        )
+        .expect("read envelope")
+        .expect("envelope");
+        assert_eq!(envelope.config["public_base_url"], "https://example.com");
+        assert!(envelope.config.get(APPLY_SECRETS_PATCH_KEY).is_none());
     }
 
     #[test]

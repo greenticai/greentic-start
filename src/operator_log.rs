@@ -97,40 +97,81 @@ fn try_open_operator_log(log_dir: &Path) -> io::Result<File> {
     OpenOptions::new().create(true).append(true).open(&path)
 }
 
+/// Tracing target used to forward `operator_log` records into the tracing
+/// pipeline (and thus the OTLP/Loki exporter). The file `fmt` layer filters
+/// this target out (see `init_trace_log`) so the line `operator_log` already
+/// wrote to `system.log` is not duplicated there.
+pub(crate) const OTLP_BRIDGE_TARGET: &str = "greentic.operator";
+
 #[track_caller]
 pub fn log(level: Level, target: &str, message: String) {
     log_at(Location::caller(), level, target, message);
 }
 
 fn log_at(location: &Location<'_>, level: Level, target: &str, message: String) {
-    let slot = match logger_slot().lock() {
-        Ok(slot) => slot,
-        Err(_) => return,
-    };
-    let logger = match slot.as_ref() {
-        Some(logger) => logger,
-        None => return,
-    };
-    if level < logger.min_level {
-        return;
-    }
-    let mut writer = match logger.writer.lock() {
-        Ok(writer) => writer,
-        Err(_) => return,
-    };
-    let timestamp = Utc::now().to_rfc3339();
     let file = shorten_log_path(location.file());
     let line = location.line();
-    let _ = writeln!(
-        *writer,
-        "{timestamp} [{level:?}] {target} {file}:{line} - {message}",
-        level = level,
-        target = target,
-        file = file,
-        line = line,
-        message = message
-    );
-    let _ = writer.flush();
+    {
+        let slot = match logger_slot().lock() {
+            Ok(slot) => slot,
+            Err(_) => return,
+        };
+        let logger = match slot.as_ref() {
+            Some(logger) => logger,
+            None => return,
+        };
+        if level < logger.min_level {
+            return;
+        }
+        let mut writer = match logger.writer.lock() {
+            Ok(writer) => writer,
+            Err(_) => return,
+        };
+        let timestamp = Utc::now().to_rfc3339();
+        let _ = writeln!(
+            *writer,
+            "{timestamp} [{level:?}] {target} {file}:{line} - {message}",
+            level = level,
+            target = target,
+            file = file,
+            line = line,
+            message = message
+        );
+        let _ = writer.flush();
+    }
+    // Mirror the record into `tracing` so it reaches the OTLP exporter (Loki).
+    // Done after dropping the file locks; a no-op when no subscriber is installed
+    // (e.g. the `warmup` subprocess). The file `fmt` layer drops this target to
+    // avoid duplicating the line written above.
+    bridge_to_tracing(level, target, file, line, &message);
+}
+
+/// Re-emit an `operator_log` record as a `tracing` event on
+/// [`OTLP_BRIDGE_TARGET`]. The original module path, file, and line are carried
+/// as fields so they survive into Loki as structured metadata.
+fn bridge_to_tracing(level: Level, module: &str, file: &str, line: u32, message: &str) {
+    match level {
+        Level::Trace => tracing::trace!(
+            target: OTLP_BRIDGE_TARGET,
+            op_module = module, op_file = file, op_line = line, "{message}"
+        ),
+        Level::Debug => tracing::debug!(
+            target: OTLP_BRIDGE_TARGET,
+            op_module = module, op_file = file, op_line = line, "{message}"
+        ),
+        Level::Info => tracing::info!(
+            target: OTLP_BRIDGE_TARGET,
+            op_module = module, op_file = file, op_line = line, "{message}"
+        ),
+        Level::Warn => tracing::warn!(
+            target: OTLP_BRIDGE_TARGET,
+            op_module = module, op_file = file, op_line = line, "{message}"
+        ),
+        Level::Error => tracing::error!(
+            target: OTLP_BRIDGE_TARGET,
+            op_module = module, op_file = file, op_line = line, "{message}"
+        ),
+    }
 }
 
 /// Trim absolute paths emitted by `Location::caller()` down to a stable suffix

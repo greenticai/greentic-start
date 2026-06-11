@@ -29,6 +29,7 @@ mod endpoint_resolver;
 mod env_tunnel;
 mod event_router;
 mod extension_resolver;
+mod fast2flow;
 pub(crate) mod flow_log;
 mod gmap;
 mod http_ingress;
@@ -37,15 +38,18 @@ mod identify_payload;
 mod ingress;
 mod ingress_dispatch;
 mod ingress_types;
+mod llm;
 mod messaging_app;
 mod messaging_dto;
 mod messaging_egress;
+mod metrics;
 mod ngrok;
 pub mod notifier;
 mod offers;
 mod onboard;
 mod operator_i18n;
 mod operator_log;
+mod otlp_telemetry;
 #[doc(hidden)]
 pub mod perf_harness;
 mod port_utils;
@@ -405,7 +409,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             operator_log::Level::Info
         };
         let log_dir = operator_log::init(env_dir.join("logs"), log_level)?;
-        let _trace_guard = init_trace_log(&log_dir);
+        let _trace_guard = init_trace_log(&log_dir, None, "greentic-start");
 
         // Env-rooted control paths: `greentic-start stop` signals this serve
         // loop through the stop-request file under these paths (and stops any
@@ -692,12 +696,14 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     });
     let log_dir = operator_log::init(early_log_dir, log_level)?;
 
+    let (peeked_telemetry, peeked_service_name) = peek_startup_telemetry(&request);
+
     // Install a tracing subscriber that writes RUST_LOG-filtered events to
-    // <log_dir>/trace.log. Without this, every `tracing::*` call in greentic
-    // crates (notably greentic-runner-host) is dropped because no subscriber
-    // is registered. We bind the appender guard to a long-lived `static` so
-    // background tasks can flush throughout the process lifetime.
-    let _trace_guard = init_trace_log(&log_dir);
+    // <log_dir>/system.log. When a bundle's `telemetry:` block (or the
+    // TELEMETRY_EXPORT/OTLP_ENDPOINT env vars) requests OTLP, an additional
+    // OpenTelemetry tracer + meter + logger layer is composed into the same
+    // subscriber. Absent → file-only, today's behaviour.
+    let _trace_guard = init_trace_log(&log_dir, peeked_telemetry.as_ref(), &peeked_service_name);
 
     let demo_paths = match bundle_config::resolve_demo_paths(
         request.config.clone(),
@@ -745,6 +751,19 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
 
     let mut demo_config = bundle_config::load_runtime_demo_config(&demo_paths, &request)?;
     apply_nats_overrides(&mut demo_config, &request);
+
+    // Make the bundle's `llm:` instance available to every LLM consumer (the
+    // Fast2Flow routing fallback today; other features later). Peeked once at
+    // startup, mirroring the telemetry peek.
+    let llm_cfg = bundle_config::peek_bundle_llm(&config_dir.join("bundle.yaml"))
+        .or_else(|| bundle_config::peek_bundle_llm(&config_path));
+    llm::set_config(llm_cfg);
+    // Resolve the LLM credential once (a `secrets://` dev-store ref or an env-var
+    // name) so keyed providers (OpenAI/Anthropic/…) work; Ollama needs none.
+    if let Some(cfg) = llm::config() {
+        let key = llm::resolve_credential(cfg, &config_dir);
+        llm::set_resolved_api_key(key);
+    }
     let static_routes = startup_contract::inspect_bundle(&config_dir)?;
     let configured_public_base_url = startup_contract::configured_public_base_url_from_env()?;
     // Persisted public_base_url from `gtc op env set-public-url`. Sits between
@@ -963,27 +982,73 @@ const NOISY_TRACE_TARGETS: &[&str] = &[
     "wasmtime_wasi",
     "wasi_common",
     "cranelift_codegen",
+    "cranelift_frontend",
     "cranelift_wasm",
     "regalloc2",
     "h2",
     "hyper",
     "hyper_util",
     "rustls",
+    "reqwest",
+    "tonic",
     "tokio_util",
     "tokio_tungstenite",
     "tungstenite",
     "want",
     "mio",
     "tower",
+    // The OTLP SDK logs about its own exports — clamp so telemetry plumbing
+    // doesn't feed itself back into Loki at debug/trace volume.
+    "opentelemetry",
+    "opentelemetry_sdk",
 ];
 
-/// Build the trace.log `EnvFilter`. Starts from `RUST_LOG` (or `info` when
-/// unset) and then forcibly clamps known-noisy crates (wasmtime, h2, hyper,
-/// rustls, etc.) to `warn`. EnvFilter resolves last-write-wins per target, so
-/// appending after the user's directives is what makes the clamp stick.
-fn build_trace_filter() -> tracing_subscriber::EnvFilter {
+/// Best-effort peek of the bundle's `telemetry:` block (or its sidecar
+/// artifact) before the tracing subscriber is installed.
+fn peek_startup_telemetry(
+    request: &StartRequest,
+) -> (Option<bundle_config::BundleTelemetryConfig>, String) {
+    let Ok(demo_paths) =
+        bundle_config::resolve_demo_paths(request.config.clone(), request.bundle.as_deref())
+    else {
+        return (None, "greentic".to_string());
+    };
+    let bundle_yaml = demo_paths.root_dir.join("bundle.yaml");
+    let telemetry = bundle_config::peek_bundle_telemetry(&bundle_yaml)
+        .or_else(|| bundle_config::peek_bundle_telemetry(&demo_paths.config_path))
+        .or_else(|| bundle_config::peek_sidecar_telemetry(&demo_paths.root_dir));
+    let service_name = telemetry
+        .as_ref()
+        .and_then(|t| t.service_name.clone())
+        .or_else(|| {
+            demo_paths
+                .root_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "greentic".to_string());
+    (telemetry, service_name)
+}
+
+/// Build the trace.log `EnvFilter`. Resolution order for the base directive:
+/// `RUST_LOG` (when set) → the bundle's `telemetry.log_level` → `info`. The
+/// base then has known-noisy crates (wasmtime, h2, hyper, rustls, etc.) forcibly
+/// clamped to `warn`. EnvFilter resolves last-write-wins per target, so
+/// appending the clamp after the user's directives is what makes it stick.
+///
+/// The resulting filter gates BOTH the `system.log` file appender and the OTLP
+/// exporter, so raising `telemetry.log_level` to `debug`/`trace` is what lets
+/// sub-INFO events reach Loki without exporting `RUST_LOG` on every run.
+fn build_trace_filter(bundle_level: Option<&str>) -> tracing_subscriber::EnvFilter {
     use tracing_subscriber::EnvFilter;
-    let base = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let base = if std::env::var_os("RUST_LOG").is_some() {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    } else if let Some(level) = bundle_level.map(str::trim).filter(|s| !s.is_empty()) {
+        EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"))
+    } else {
+        EnvFilter::new("info")
+    };
     NOISY_TRACE_TARGETS.iter().fold(base, |filter, target| {
         match format!("{target}=warn").parse() {
             Ok(directive) => filter.add_directive(directive),
@@ -992,18 +1057,19 @@ fn build_trace_filter() -> tracing_subscriber::EnvFilter {
     })
 }
 
-/// Install a `tracing` subscriber writing to `<log_dir>/trace.log`, filtered by
-/// `RUST_LOG` (defaults to `info`). Returns the appender guard, which must be
-/// kept alive for the process lifetime so the non-blocking writer flushes.
+/// Install a `tracing` subscriber writing to `<log_dir>/system.log`. When
+/// `telemetry` resolves to OTLP, an additional OpenTelemetry tracer + meter
+/// + logger layer is composed alongside the file appender.
 fn init_trace_log(
     log_dir: &std::path::Path,
+    telemetry: Option<&bundle_config::BundleTelemetryConfig>,
+    fallback_service_name: &str,
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use std::fs::OpenOptions;
+    use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    // Unified host log: operator_log writes here too; both formats co-exist
-    // line-by-line in append mode.
     let path = log_dir.join("system.log");
     let file = match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(f) => f,
@@ -1017,27 +1083,65 @@ fn init_trace_log(
     };
     let (nb, guard) = tracing_appender::non_blocking(file);
     let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "<unset>".to_string());
-    let filter = build_trace_filter();
-    let layer = tracing_subscriber::fmt::layer()
+    let bundle_level = telemetry.and_then(|t| t.log_level.as_deref());
+    let filter = build_trace_filter(bundle_level);
+    let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(nb)
         .with_ansi(false)
-        .with_target(true);
-    match tracing_subscriber::registry()
-        .with(filter)
-        .with(layer)
-        .try_init()
-    {
+        .with_target(true)
+        // operator_log already wrote these records to system.log directly; it
+        // also mirrors them onto OTLP_BRIDGE_TARGET so the OTLP exporter sees
+        // them. Drop that target here so the file does not get a duplicate line.
+        .with_filter(tracing_subscriber::filter::FilterFn::new(|meta| {
+            meta.target() != crate::operator_log::OTLP_BRIDGE_TARGET
+        }));
+
+    let resolved = otlp_telemetry::resolve(telemetry, fallback_service_name);
+    let otlp_layer = resolved
+        .as_ref()
+        .and_then(|r| match otlp_telemetry::install_layer(r) {
+            Ok(layer) => Some(layer),
+            Err(err) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "OTLP exporter init failed (endpoint={}); file logging only: {err:#}",
+                        r.endpoint
+                    ),
+                );
+                None
+            }
+        });
+    let otlp_summary = resolved
+        .as_ref()
+        .map(|r| format!("{:?} endpoint={}", r.exporter, r.endpoint))
+        .unwrap_or_else(|| "none".to_string());
+
+    let init_result = match otlp_layer {
+        Some(layer) => tracing_subscriber::registry()
+            .with(filter)
+            .with(file_layer)
+            .with(layer)
+            .try_init(),
+        None => tracing_subscriber::registry()
+            .with(filter)
+            .with(file_layer)
+            .try_init(),
+    };
+    match init_result {
         Ok(()) => {
             operator_log::info(
                 module_path!(),
                 format!(
-                    "tracing subscriber writing to {} (RUST_LOG={rust_log})",
-                    path.display()
+                    "tracing subscriber writing to {} (RUST_LOG={rust_log} bundle_log_level={} otlp={otlp_summary})",
+                    path.display(),
+                    bundle_level.unwrap_or("<unset>")
                 ),
             );
             tracing::info!(
                 target: "greentic_start",
                 rust_log = %rust_log,
+                otlp = %otlp_summary,
                 "tracing subscriber installed"
             );
         }
@@ -1193,7 +1297,7 @@ mod tests {
         let _guard = test_env_lock().lock().unwrap();
         // SAFETY: tests serialized via test_env_lock above.
         unsafe { std::env::remove_var("RUST_LOG") };
-        let filter = build_trace_filter();
+        let filter = build_trace_filter(None);
         let printed = filter.to_string();
         for target in NOISY_TRACE_TARGETS {
             assert!(
@@ -1208,13 +1312,48 @@ mod tests {
         let _guard = test_env_lock().lock().unwrap();
         // SAFETY: tests serialized via test_env_lock above.
         unsafe { std::env::set_var("RUST_LOG", "wasmtime=debug,info") };
-        let filter = build_trace_filter();
+        let filter = build_trace_filter(None);
         let printed = filter.to_string();
         // The clamp directive appended after the user's directive should win
         // because EnvFilter resolves last-write-wins per target.
         assert!(
             printed.contains("wasmtime=warn"),
             "wasmtime clamp must override RUST_LOG override, got: {printed}"
+        );
+        // SAFETY: serialized.
+        unsafe { std::env::remove_var("RUST_LOG") };
+    }
+
+    #[test]
+    fn build_trace_filter_uses_bundle_level_when_rust_log_unset() {
+        let _guard = test_env_lock().lock().unwrap();
+        // SAFETY: tests serialized via test_env_lock above.
+        unsafe { std::env::remove_var("RUST_LOG") };
+        let filter = build_trace_filter(Some("trace"));
+        let printed = filter.to_string();
+        // The bundle directive seeds the base level...
+        assert!(
+            printed.contains("trace"),
+            "expected bundle `trace` level in filter, got: {printed}"
+        );
+        // ...while the noisy clamps still apply on top of it.
+        assert!(
+            printed.contains("wasmtime=warn"),
+            "noisy clamp must still apply over bundle level, got: {printed}"
+        );
+    }
+
+    #[test]
+    fn build_trace_filter_prefers_rust_log_over_bundle_level() {
+        let _guard = test_env_lock().lock().unwrap();
+        // SAFETY: tests serialized via test_env_lock above.
+        unsafe { std::env::set_var("RUST_LOG", "warn") };
+        let filter = build_trace_filter(Some("trace"));
+        let printed = filter.to_string();
+        // RUST_LOG wins: the bundle's `trace` must not leak into the base.
+        assert!(
+            !printed.contains("trace"),
+            "RUST_LOG must override bundle level, got: {printed}"
         );
         // SAFETY: serialized.
         unsafe { std::env::remove_var("RUST_LOG") };
