@@ -907,10 +907,11 @@ mod tests {
         );
         assert!(written);
 
+        let env = resolve_env(None);
         let store =
             DevStore::with_path(dir.path().join(".greentic/dev/.dev.secrets.env")).expect("store");
         let secret_uri = canonical_secret_uri(
-            "dev",
+            &env,
             "demo",
             Some("default"),
             "messaging-webex",
@@ -919,7 +920,7 @@ mod tests {
         let secret = runtime.block_on(store.get(&secret_uri)).expect("secret");
         assert_eq!(secret, b"generated-secret".to_vec());
         let tenant_secret_uri = canonical_secret_uri(
-            "dev",
+            &env,
             "demo",
             None,
             "messaging-webex",

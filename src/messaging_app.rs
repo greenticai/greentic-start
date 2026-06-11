@@ -1671,6 +1671,7 @@ mod tests {
             signatures: PackSignatures::default(),
             bootstrap: None,
             extensions: None,
+            agents: Default::default(),
         };
         let cbor_bytes = encode_pack_manifest(&manifest).expect("encode manifest");
 

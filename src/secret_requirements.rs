@@ -628,6 +628,7 @@ mod tests {
             signatures: PackSignatures::default(),
             bootstrap: None,
             extensions: Some(extensions),
+            agents: Default::default(),
         };
         write_pack(
             &pack,

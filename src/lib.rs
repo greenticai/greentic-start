@@ -409,7 +409,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             operator_log::Level::Info
         };
         let log_dir = operator_log::init(env_dir.join("logs"), log_level)?;
-        let _trace_guard = init_trace_log(&log_dir);
+        let _trace_guard = init_trace_log(&log_dir, None, "greentic-start");
 
         // Env-rooted control paths: `greentic-start stop` signals this serve
         // loop through the stop-request file under these paths (and stops any

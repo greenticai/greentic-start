@@ -2002,6 +2002,7 @@ mod tests {
             signatures: PackSignatures::default(),
             bootstrap: None,
             extensions: Some(extensions),
+            agents: Default::default(),
         };
         write_pack_with_manifest(&pack_path, manifest, &[])?;
 
@@ -2023,8 +2024,9 @@ mod tests {
 
         let store = DevStore::with_path(dir.path().join(".greentic/dev/.dev.secrets.env"))?;
         let runtime = tokio::runtime::Runtime::new()?;
+        let env = crate::secrets_setup::resolve_env(None);
         let uri = crate::secrets_gate::canonical_secret_uri(
-            "dev",
+            &env,
             "demo",
             None,
             "messaging-webchat-gui",
