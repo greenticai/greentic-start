@@ -228,11 +228,25 @@ pub fn run_stop_request(request: StopRequest) -> anyhow::Result<()> {
         && !std::path::Path::new("state").exists()
         && let Some(root) = greentic_deployer::environment::LocalFsStore::default_root()
     {
-        let env_id = resolve_env(None);
+        let env_id = resolve_env(request.env.as_deref());
         let env_dir = root.join(&env_id);
         if env_dir.is_dir() {
             return stop_env_runtime(&env_dir, &env_id);
         }
+        // An explicit `--env` that names a non-existent env is a clear
+        // error, not a silent fall-through to the legacy `./state` path.
+        if request.env.is_some() {
+            anyhow::bail!(
+                "environment `{env_id}` has no store directory at `{}` — nothing to stop",
+                env_dir.display()
+            );
+        }
+    }
+    if request.env.is_some() {
+        tracing::warn!(
+            "--env is ignored on the legacy bundle/state-dir stop path (it has no \
+             environment concept)"
+        );
     }
     let state_dir = resolve_state_dir(request.state_dir, request.bundle.as_deref())?;
     runtime::demo_down_runtime(&state_dir, &request.tenant, &request.team, false)
@@ -327,6 +341,29 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         std::env::set_var("GREENTIC_PROVIDER_CORE_ONLY", "0");
     }
 
+    // `--env` on the bundle-less boot wins over an exported $GREENTIC_ENV
+    // (flag > env var > `local`) and is propagated INTO the process env:
+    // downstream resolution (runner-host paths, secret stores, startup
+    // contract) reads $GREENTIC_ENV directly, so a flag that only changed
+    // this function's locals would split-brain the boot. The legacy
+    // `--bundle` / `--config` path has no environment concept — there the
+    // flag is ignored with a warning and the env var is left alone.
+    // SAFETY: This is called early in single-threaded startup before spawning workers.
+    let bundle_less = request.bundle.is_none() && request.config.is_none();
+    if let Some(env) = request.env.as_deref() {
+        if bundle_less {
+            let resolved = resolve_env(Some(env));
+            unsafe {
+                std::env::set_var("GREENTIC_ENV", &resolved);
+            }
+        } else {
+            tracing::warn!(
+                "--env is ignored on the legacy bundle/config start path (it has no \
+                 environment concept)"
+            );
+        }
+    }
+
     // Set GREENTIC_ENV to the A4b default (`local`) if not already set.
     // A4's `bootstrap_local_environment` (below) creates `~/.greentic/environments/local/`
     // and downstream secret resolution keys off this env. If the user already exported
@@ -349,8 +386,8 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     // bundles are attached (hot-attach lands in N2). When the runtime-config is
     // populated, this is the same B0/B2/B3 path as before: load + validate, build
     // an embedded runner host, run requests through the revision dispatcher.
-    if request.bundle.is_none() && request.config.is_none() {
-        let env_id = resolve_env(None);
+    if bundle_less {
+        let env_id = resolve_env(request.env.as_deref());
         let rc = runtime_config::load_or_empty(&env_id)?;
         let store_root = greentic_deployer::environment::LocalFsStore::default_root()
             .context("cannot determine the default environment store root (no home directory)")?;
@@ -1188,6 +1225,7 @@ mod tests {
         let mut config = config::DemoConfig::default();
         let args = StartRequest {
             bundle: None,
+            env: None,
             tenant: None,
             team: None,
             no_nats: false,
@@ -1220,6 +1258,7 @@ mod tests {
         let mut config = config::DemoConfig::default();
         let args = StartRequest {
             bundle: None,
+            env: None,
             tenant: None,
             team: None,
             no_nats: false,
@@ -1260,6 +1299,7 @@ mod tests {
     fn make_start_request(bundle: &Path) -> StartRequest {
         StartRequest {
             bundle: Some(bundle.display().to_string()),
+            env: None,
             tenant: None,
             team: None,
             no_nats: false,

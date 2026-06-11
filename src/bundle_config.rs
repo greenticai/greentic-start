@@ -339,6 +339,7 @@ mod tests {
     fn make_test_request(bundle: Option<&str>) -> StartRequest {
         StartRequest {
             bundle: bundle.map(|s| s.to_string()),
+            env: None,
             tenant: None,
             team: None,
             no_nats: false,
