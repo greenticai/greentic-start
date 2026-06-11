@@ -93,6 +93,12 @@ pub(crate) struct WarmupArgs {
 pub(crate) struct StartArgs {
     #[arg(long)]
     bundle: Option<String>,
+    /// Environment id whose persisted state the bundle-less boot serves.
+    /// Wins over `$GREENTIC_ENV`; defaults to `local`. Ignored (with a
+    /// warning) on the legacy `--bundle` / `--config` path, which has no
+    /// environment concept.
+    #[arg(long)]
+    env: Option<String>,
     #[arg(long)]
     tenant: Option<String>,
     #[arg(long)]
@@ -147,6 +153,11 @@ pub(crate) struct StartArgs {
 pub(crate) struct StopArgs {
     #[arg(long)]
     bundle: Option<String>,
+    /// Environment id whose serving runtime should be stopped. Wins over
+    /// `$GREENTIC_ENV`; defaults to `local`. Ignored on the legacy
+    /// `--bundle` / `--state-dir` path.
+    #[arg(long)]
+    env: Option<String>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     #[arg(long, default_value = DEMO_DEFAULT_TENANT)]
@@ -198,6 +209,9 @@ pub enum RestartTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartRequest {
     pub bundle: Option<String>,
+    /// Environment id override for the bundle-less boot (flag >
+    /// `$GREENTIC_ENV` > `local` — precedence lives in `resolve_env`).
+    pub env: Option<String>,
     pub tenant: Option<String>,
     pub team: Option<String>,
     pub no_nats: bool,
@@ -226,6 +240,9 @@ pub struct StartRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StopRequest {
     pub bundle: Option<String>,
+    /// Environment id override for the bundle-less stop path (flag >
+    /// `$GREENTIC_ENV` > `local`).
+    pub env: Option<String>,
     pub state_dir: Option<PathBuf>,
     pub tenant: String,
     pub team: String,
@@ -234,6 +251,7 @@ pub struct StopRequest {
 pub(crate) fn start_request_from_args(args: StartArgs, tunnel_explicit: bool) -> StartRequest {
     StartRequest {
         bundle: args.bundle,
+        env: args.env,
         tenant: args.tenant,
         team: args.team,
         no_nats: args.no_nats,
@@ -261,6 +279,7 @@ pub(crate) fn start_request_from_args(args: StartArgs, tunnel_explicit: bool) ->
 pub(crate) fn stop_request_from_args(args: StopArgs) -> StopRequest {
     StopRequest {
         bundle: args.bundle,
+        env: args.env,
         state_dir: args.state_dir,
         tenant: args.tenant,
         team: args.team,
@@ -354,6 +373,7 @@ fn arg_takes_value(arg: &str) -> bool {
         arg,
         "--locale"
             | "--bundle"
+            | "--env"
             | "--tenant"
             | "--team"
             | "--nats"
@@ -397,6 +417,43 @@ mod tests {
         assert_eq!(args[0], "greentic-start");
         assert_eq!(args[1], "start");
         assert_eq!(args[2], "--tenant");
+    }
+
+    #[test]
+    fn start_and_stop_parse_env_flag_into_requests() {
+        let cli = Cli::try_parse_from(["greentic-start", "start", "--env", "staging"]).unwrap();
+        let Command::Start(args) = cli.command else {
+            panic!("expected start");
+        };
+        let req = start_request_from_args(args, false);
+        assert_eq!(req.env.as_deref(), Some("staging"));
+
+        let cli = Cli::try_parse_from(["greentic-start", "stop", "--env", "staging"]).unwrap();
+        let Command::Stop(args) = cli.command else {
+            panic!("expected stop");
+        };
+        let req = stop_request_from_args(args);
+        assert_eq!(req.env.as_deref(), Some("staging"));
+    }
+
+    #[test]
+    fn env_defaults_to_none_when_flag_absent() {
+        // `None` is load-bearing: it keeps `resolve_env`'s
+        // flag > $GREENTIC_ENV > `local` precedence intact.
+        let cli = Cli::try_parse_from(["greentic-start", "start"]).unwrap();
+        let Command::Start(args) = cli.command else {
+            panic!("expected start");
+        };
+        assert_eq!(start_request_from_args(args, false).env, None);
+    }
+
+    #[test]
+    fn normalize_args_treats_env_value_as_value_not_positional() {
+        // `--env demo`: "demo" is the flag's VALUE — it must be neither
+        // stripped as the legacy `demo` subcommand prefix nor mistaken for
+        // a positional when deciding to insert `start`.
+        let args = normalize_args(vec!["--env".into(), "demo".into()]);
+        assert_eq!(args, ["greentic-start", "start", "--env", "demo"]);
     }
 
     #[test]

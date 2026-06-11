@@ -72,6 +72,13 @@ These are the supported `start` and `restart` flags from [src/cli_args.rs](/proj
   Points at the bundle root to run.
 - `--config <path>`
   Uses an explicit runtime config path instead of bundle auto-resolution.
+- `--env <id>`
+  Environment id whose persisted state the bundle-less boot serves.
+  Precedence: flag > `$GREENTIC_ENV` > `local`. The resolved value is
+  propagated into `$GREENTIC_ENV` for the process so downstream resolution
+  (runner-host paths, secret stores, startup contract) agrees with the
+  boot. Ignored (with a warning) on the legacy `--bundle`/`--config` path,
+  which has no environment concept.
 - `--tenant <name>`
   Overrides the tenant.
 - `--team <name>`
@@ -235,6 +242,7 @@ Failure modes:
 The `stop` command supports the flags defined in [src/cli_args.rs](/projects/ai/greentic-ng/greentic-start/src/cli_args.rs:64).
 
 - `--bundle <path>`
+- `--env <id>`
 - `--state-dir <path>`
 - `--tenant <name>`
 - `--team <name>`
@@ -250,6 +258,11 @@ serving `greentic-start` polls it every 250ms and exits cleanly) and stops
 env-rooted tunnel children via their pidfiles. It does NOT pkill arbitrary
 `cloudflared`/`ngrok` processes on this path — a hand-started tunnel is left
 alone, unlike the legacy bundle stop.
+
+`--env <id>` picks which environment's runtime to stop (flag >
+`$GREENTIC_ENV` > `local`). An explicit `--env` naming an environment with
+no store directory is an error, not a fall-through to the legacy path; on
+the legacy `--bundle`/`--state-dir` path the flag is ignored with a warning.
 
 ## Automatic Behaviors Agents Must Remember
 
