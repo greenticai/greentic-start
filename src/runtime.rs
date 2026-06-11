@@ -452,7 +452,7 @@ fn looks_like_path(value: &str) -> bool {
     value.contains('/') || value.contains('\\') || Path::new(value).is_absolute()
 }
 
-fn should_restart(restart: &BTreeSet<String>, service: &str) -> bool {
+pub(crate) fn should_restart(restart: &BTreeSet<String>, service: &str) -> bool {
     restart.contains("all") || restart.contains(service)
 }
 
