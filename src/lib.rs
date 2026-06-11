@@ -502,8 +502,8 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // is delegated to the canonical helper in `startup_contract` so this
         // path stays in lockstep with the reload path in
         // `revision_webhook_register`.
-        let public_base_url = match tunnel_url.clone() {
-            Some(url) => Some(url),
+        let public_base_url = match &tunnel_url {
+            Some(url) => Some(url.clone()),
             None => startup_contract::resolve_public_base_url(&environment)?,
         };
         if revision_count > 0 {
@@ -577,29 +577,10 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         .context("spawning runtime-config watcher")?;
 
         // Wait for either Ctrl+C or a stop-request file written by
-        // `greentic-start stop` (the bundle-less analogue of the legacy
-        // `wait_for_shutdown`). A corrupt stop file fails the wait loudly —
-        // same policy as the legacy path.
-        let reason = activation_rt.block_on(async {
-            loop {
-                tokio::select! {
-                    result = tokio::signal::ctrl_c() => {
-                        if let Err(err) = result {
-                            operator_log::warn(
-                                module_path!(),
-                                format!("revision serving Ctrl+C listener error: {err}"),
-                            );
-                        }
-                        return anyhow::Ok(ShutdownReason::CtrlC);
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
-                        if runtime_state::read_stop_request(&shutdown_paths)?.is_some() {
-                            return anyhow::Ok(ShutdownReason::AdminStop);
-                        }
-                    }
-                }
-            }
-        })?;
+        // `greentic-start stop` — the same select loop the legacy bundle arm
+        // uses, run on the activation runtime this arm already owns. A
+        // corrupt stop file fails the wait loudly on both arms.
+        let reason = activation_rt.block_on(wait_for_shutdown_inner(&shutdown_paths))?;
         if matches!(reason, ShutdownReason::AdminStop) {
             runtime_state::clear_stop_request(&shutdown_paths)?;
             let line = operator_i18n::tr(
@@ -805,23 +786,12 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     // If the user didn't explicitly set a tunnel flag, prompt for tunnel selection
     tunnel_prompt::maybe_prompt_tunnel(&mut request);
 
-    // Mutual exclusivity: if ngrok is explicitly enabled, disable cloudflared
-    // This allows `--ngrok on` to work without needing `--cloudflared off`
-    let effective_cloudflared = match (&request.cloudflared, &request.ngrok) {
-        // ngrok explicitly enabled → disable cloudflared (unless cloudflared also explicitly set)
-        (CloudflaredModeArg::On, NgrokModeArg::On) => {
-            operator_log::info(
-                module_path!(),
-                "ngrok enabled, disabling cloudflared (use --cloudflared on --ngrok off to override)",
-            );
-            CloudflaredModeArg::Off
-        }
-        (mode, _) => *mode,
-    };
+    // Mutual exclusivity (ngrok wins over cloudflared): single shared policy
+    // with the bundle-less arm, owned by `env_tunnel::choose_tunnel`.
+    let tunnel_choice = env_tunnel::choose_tunnel(request.cloudflared, request.ngrok);
 
-    let cloudflared = match effective_cloudflared {
-        CloudflaredModeArg::Off => None,
-        CloudflaredModeArg::On => {
+    let cloudflared = match tunnel_choice {
+        env_tunnel::TunnelChoice::Cloudflared => {
             let explicit = request.cloudflared_binary.clone();
             let binary = bin_resolver::resolve_binary(
                 "cloudflared",
@@ -837,11 +807,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 restart: restart.contains("cloudflared"),
             })
         }
+        _ => None,
     };
 
-    let ngrok = match request.ngrok {
-        NgrokModeArg::Off => None,
-        NgrokModeArg::On => {
+    let ngrok = match tunnel_choice {
+        env_tunnel::TunnelChoice::Ngrok => {
             let explicit = request.ngrok_binary.clone();
             let binary = bin_resolver::resolve_binary(
                 "ngrok",
@@ -857,6 +827,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 restart: restart.contains("ngrok"),
             })
         }
+        _ => None,
     };
 
     let handles = runtime::demo_up_services(
@@ -1143,22 +1114,28 @@ impl ShutdownReason {
 fn wait_for_shutdown(paths: &runtime_state::RuntimePaths) -> anyhow::Result<ShutdownReason> {
     let runtime =
         tokio::runtime::Runtime::new().context("failed to spawn runtime for Ctrl+C listener")?;
-    let paths = paths.clone();
-    runtime.block_on(async move {
-        loop {
-            tokio::select! {
-                result = tokio::signal::ctrl_c() => {
-                    result.map_err(|err| anyhow!("failed to wait for Ctrl+C: {err}"))?;
-                    return Ok(ShutdownReason::CtrlC);
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
-                    if runtime_state::read_stop_request(&paths)?.is_some() {
-                        return Ok(ShutdownReason::AdminStop);
-                    }
+    runtime.block_on(wait_for_shutdown_inner(paths))
+}
+
+/// Core Ctrl+C / stop-request select loop, shared by the legacy bundle arm
+/// (via [`wait_for_shutdown`], on its own throwaway runtime) and the
+/// bundle-less env-serving arm (on the activation runtime it already owns).
+async fn wait_for_shutdown_inner(
+    paths: &runtime_state::RuntimePaths,
+) -> anyhow::Result<ShutdownReason> {
+    loop {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.map_err(|err| anyhow!("failed to wait for Ctrl+C: {err}"))?;
+                return Ok(ShutdownReason::CtrlC);
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                if runtime_state::read_stop_request(paths)?.is_some() {
+                    return Ok(ShutdownReason::AdminStop);
                 }
             }
         }
-    })
+    }
 }
 
 #[cfg(test)]

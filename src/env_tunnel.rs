@@ -41,8 +41,9 @@ pub(crate) fn env_runtime_paths(env_dir: &Path, env_id: &str) -> RuntimePaths {
     RuntimePaths::new(env_dir.join("state"), ENV_PATHS_TENANT, env_id)
 }
 
-/// Which tunnel a request asks for, after the same mutual-exclusivity rule as
-/// the legacy arm: explicit ngrok wins over cloudflared.
+/// Which tunnel a request asks for. Single owner of the mutual-exclusivity
+/// policy — explicit ngrok wins over cloudflared (logged when both are on) —
+/// shared by the legacy bundle arm and the bundle-less env-serving arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TunnelChoice {
     Off,
@@ -52,6 +53,13 @@ pub(crate) enum TunnelChoice {
 
 pub(crate) fn choose_tunnel(cloudflared: CloudflaredModeArg, ngrok: NgrokModeArg) -> TunnelChoice {
     match (cloudflared, ngrok) {
+        (CloudflaredModeArg::On, NgrokModeArg::On) => {
+            operator_log::info(
+                module_path!(),
+                "ngrok enabled, disabling cloudflared (use --cloudflared on --ngrok off to override)",
+            );
+            TunnelChoice::Ngrok
+        }
         (_, NgrokModeArg::On) => TunnelChoice::Ngrok,
         (CloudflaredModeArg::On, NgrokModeArg::Off) => TunnelChoice::Cloudflared,
         (CloudflaredModeArg::Off, NgrokModeArg::Off) => TunnelChoice::Off,
@@ -77,69 +85,52 @@ pub(crate) fn start_env_tunnel(
     log_dir: &Path,
 ) -> anyhow::Result<Option<EnvTunnelHandle>> {
     let choice = choose_tunnel(request.cloudflared, request.ngrok);
-    if choice == TunnelChoice::Off {
-        return Ok(None);
-    }
-    if request.cloudflared == CloudflaredModeArg::On && request.ngrok == NgrokModeArg::On {
-        operator_log::info(
-            module_path!(),
-            "ngrok enabled, disabling cloudflared (use --cloudflared on --ngrok off to override)",
-        );
-    }
+    let (service, explicit_binary) = match choice {
+        TunnelChoice::Off => return Ok(None),
+        TunnelChoice::Cloudflared => ("cloudflared", request.cloudflared_binary.clone()),
+        TunnelChoice::Ngrok => ("ngrok", request.ngrok_binary.clone()),
+    };
     let restart: BTreeSet<String> = request.restart.iter().map(restart_name).collect();
     let paths = env_runtime_paths(env_dir, env_id);
-
-    let handle = match choice {
-        TunnelChoice::Off => unreachable!("Off returns above"),
+    let binary = bin_resolver::resolve_binary(
+        service,
+        &bin_resolver::ResolveCtx {
+            config_dir: env_dir.to_path_buf(),
+            explicit_path: explicit_binary,
+        },
+    )?;
+    let log_path = operator_log::reserve_service_log(log_dir, service)?;
+    let restart_service = crate::runtime::should_restart(&restart, service);
+    let url = match choice {
+        TunnelChoice::Off => unreachable!("Off returned above"),
         TunnelChoice::Cloudflared => {
-            let binary = bin_resolver::resolve_binary(
-                "cloudflared",
-                &bin_resolver::ResolveCtx {
-                    config_dir: env_dir.to_path_buf(),
-                    explicit_path: request.cloudflared_binary.clone(),
-                },
-            )?;
-            let log_path = operator_log::reserve_service_log(log_dir, "cloudflared")?;
-            let tunnel = cloudflared::start_quick_tunnel(
+            cloudflared::start_quick_tunnel(
                 &paths,
                 &cloudflared::CloudflaredConfig {
                     binary,
                     local_port,
                     extra_args: Vec::new(),
-                    restart: restart.contains("cloudflared") || restart.contains("all"),
+                    restart: restart_service,
                 },
                 &log_path,
-            )?;
-            EnvTunnelHandle {
-                service: "cloudflared",
-                url: tunnel.url,
-            }
+            )?
+            .url
         }
         TunnelChoice::Ngrok => {
-            let binary = bin_resolver::resolve_binary(
-                "ngrok",
-                &bin_resolver::ResolveCtx {
-                    config_dir: env_dir.to_path_buf(),
-                    explicit_path: request.ngrok_binary.clone(),
-                },
-            )?;
-            let log_path = operator_log::reserve_service_log(log_dir, "ngrok")?;
-            let tunnel = ngrok::start_tunnel(
+            ngrok::start_tunnel(
                 &paths,
                 &ngrok::NgrokConfig {
                     binary,
                     local_port,
                     extra_args: Vec::new(),
-                    restart: restart.contains("ngrok") || restart.contains("all"),
+                    restart: restart_service,
                 },
                 &log_path,
-            )?;
-            EnvTunnelHandle {
-                service: "ngrok",
-                url: tunnel.url,
-            }
+            )?
+            .url
         }
     };
+    let handle = EnvTunnelHandle { service, url };
 
     // Reachability probe is best-effort (HEAD requests until the edge
     // answers), exactly like the legacy arm — the URL is already known, and
