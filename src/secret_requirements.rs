@@ -14,6 +14,44 @@ use zip::{ZipArchive, result::ZipError};
 type CborMap = BTreeMap<CborValue, CborValue>;
 const EXT_GENERATED_SECRETS_V1: &str = "greentic.generated-secrets.v1";
 
+/// Derive the set of secret-marked answer keys for a pack using the SAME
+/// source the B12a producer (greentic-setup) redacts from: `pack_to_form_spec`
+/// unions `setup.yaml` / `qa/*.json` questions flagged `secret: true` AND
+/// `assets/secret-requirements.json` entries (required and optional). Keys are
+/// canonicalized via `canonical_secret_name` so reader-side lookups line up
+/// with the producer's redaction and the dev-store URIs.
+///
+/// `load_secret_keys_from_pack` (below) is intentionally NOT used for B12a
+/// reader paths: it reads only the requirements asset, filtered to
+/// required-only, and lowercases (keeping `-`/`.`). That set is narrower than
+/// and normalized differently from the producer's, so a form-declared-only or
+/// optional secret would be stripped from disk yet never re-fetched. This
+/// helper closes that gap by reusing the producer's exact derivation.
+pub fn secret_answer_keys_for_pack(pack_path: &Path, provider_id: &str) -> BTreeSet<String> {
+    let Some(form) = greentic_setup::setup_to_formspec::pack_to_form_spec(pack_path, provider_id)
+    else {
+        return BTreeSet::new();
+    };
+    form.questions
+        .iter()
+        .filter(|q| q.secret)
+        .map(|q| greentic_setup::secret_name::canonical_secret_name(&q.id))
+        .collect()
+}
+
+/// True if `answer_key` is a secret per `secret_keys` (canonical set from
+/// [`secret_answer_keys_for_pack`]). Mirrors the producer's
+/// `is_secret_answer_key` exactly — canonical equality or a forward suffix
+/// match (secret key ends with the answer key, e.g. `webex_bot_token`
+/// satisfied by `bot_token`) — so the reader's defense-in-depth skip lines up
+/// with what the producer redacts and the dev store seeds.
+pub fn answer_key_is_secret(answer_key: &str, secret_keys: &BTreeSet<String>) -> bool {
+    let norm = greentic_setup::secret_name::canonical_secret_name(answer_key);
+    secret_keys
+        .iter()
+        .any(|secret| secret == &norm || secret.ends_with(&norm))
+}
+
 pub fn load_secret_keys_from_pack(pack_path: &Path) -> Result<Vec<String>> {
     Ok(load_secret_requirements_from_pack(pack_path)?
         .into_iter()

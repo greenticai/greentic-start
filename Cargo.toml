@@ -1,6 +1,10 @@
+bench = [
+    { name = "perf", harness = false },
+]
+
 [package]
 name = "greentic-start"
-version = "0.5.40"
+version = "1.1.0-dev.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -8,40 +12,42 @@ license = "MIT"
 repository = "https://github.com/greenticai/greentic-start"
 homepage = "https://github.com/greenticai/greentic-start"
 readme = "README.md"
-keywords = ["greentic", "cli", "lifecycle", "orchestration"]
-categories = ["command-line-utilities", "development-tools"]
+keywords = [
+    "greentic",
+    "cli",
+    "lifecycle",
+    "orchestration",
+]
+categories = [
+    "command-line-utilities",
+    "development-tools",
+]
 
 [dependencies]
 anyhow = "1.0"
+arc-swap = "1"
 async-trait = "0.1"
+backhand = "0.25"
 base64 = "0.22"
 chrono = "0.4"
-clap = { version = "4.5", features = ["derive"] }
 dashmap = "6"
 flate2 = "1"
 futures-util = "0.3"
-greentic-distributor-client = { version = "0.5", default-features = false, features = ["pack-fetch"] }
 greentic-llm = { version = "1" }
-greentic-runner-desktop = { version = "0.5" }
-greentic-runner-host = { version = "0.5" }
-greentic-secrets-lib = { version = "0.5", features = ["providers-dev"] }
-greentic-setup = { version = "0.5" }
-greentic-types = { version = "0.5", features = ["serde"] }
 hmac = "0.13"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["full"] }
 hyper-tungstenite = "0.20"
 hyper-util = "0.1"
 include_dir = "0.7"
 jsonschema = "0.46"
 libc = "0.2"
+notify-debouncer-full = "0.7"
 once_cell = "1.21"
 open = "5"
 opentelemetry = { version = "0.31", features = ["logs"] }
 opentelemetry-appender-tracing = "0.31"
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "logs"] }
-qa-spec = { version = ">=0.5.0, <0.6.0" }
 rand = "0.10"
 redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
@@ -49,30 +55,146 @@ rpassword = "7"
 rustls = "0.23"
 rustls-pemfile = "2"
 semver = "1"
-serde = { version = "1.0", features = ["derive"] }
 serde_cbor = "0.11"
 serde_json = "1.0"
-serde_yaml_bw = { package = "serde_yaml_gtc", version = "2.5.2" }
-sha2 = "0.11"
 sys-locale = "0.3"
 sysinfo = "0.39"
+sha2 = "0.11"
+subtle = "2"
+tokio-rustls = "0.26"
+tokio-tungstenite = "0.29"
 tar = "0.4"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "signal", "sync", "net"] }
-tokio-rustls = "0.26"
-tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-tungstenite = "0.29"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ulid = "1"
 unic-langid = "0.9"
-ureq = { version = "3", features = ["json"] }
 urlencoding = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
 wasmtime = { version = "45", default-features = false, features = ["component-model", "cranelift", "runtime"] }
 zip = "8"
 zstd = "0.13"
+
+[dependencies.clap]
+version = "4.5"
+features = [
+    "derive",
+]
+
+# Lower bound pinned to the first dev build exposing the `signing` module
+# (verify_artifact_dsse / TrustRoot); earlier 1.1.0-dev builds lack it.
+[dependencies.greentic-distributor-client]
+version = ">=1.1.0-dev.26402898736, <1.2.0-0"
+default-features = false
+features = [
+    "pack-fetch",
+]
+
+# Lower bound pinned to the first dev build re-exporting `load_trust_root`
+# (per-env trust root + operator key, deployer #226). Floor bumped to the
+# Change-C-part-1 publish (deployer #250) — `EnvironmentHostConfig.public_base_url`
+# is consumed here in `configured_public_base_url_from_env_store` and the
+# `ensure_local_environment` call now passes the 2-arg signature; earlier
+# publishes lack both surfaces.
+[dependencies.greentic-deployer]
+version = ">=1.1.0-dev.27092623472, <1.2.0-0"
+default-features = false
+
+# Matches the deploy-spec the pinned deployer was built against; `Environment`
+# / `Revision` cross the deployer boundary, so resolution must not pick an
+# older deploy-spec. Floor bumped to the Change-C-part-1 publish that adds
+# `EnvironmentHostConfig.public_base_url` (the persisted operator-set URL);
+# earlier publishes don't carry the field and the env-store reader would
+# silently return `None` for valid env directories.
+[dependencies.greentic-deploy-spec]
+version = ">=0.1.27092623472, <0.2"
+
+# Lower bound pinned to the publish that updates the bootstrap call site for
+# the deployer's 2-arg `ensure_local_environment` (greentic-setup#134).
+# Earlier publishes have the 1-arg call against the new deployer floor and
+# would fail to compile in the resolved graph.
+[dependencies.greentic-setup]
+version = ">=1.1.0-dev.27093775683, <1.2.0-0"
+
+[dependencies.greentic-runner-desktop]
+version = ">=1.1.0-dev, <1.2.0-0"
+
+# Floor pinned to the C5 publish (greentic-runner#424) that exposes the
+# `runtime_refs` module (`RuntimeRefResolver` trait + `RuntimeRefsInjection`)
+# and the expanded `TenantRuntime::load_revision` signature accepting the
+# per-pack runtime-refs map + env-shared resolver. Required by
+# `runtime_refs_store` and the C5 producer wiring in `revision_boot`.
+# Earlier publishes still satisfy the unscoped resolver floor (#390) and
+# C4.3a (#422) but lack the `runtime_refs` module entirely.
+[dependencies.greentic-runner-host]
+version = ">=1.1.0-dev.27156435059, <1.2.0-0"
+
+[dependencies.greentic-secrets-lib]
+version = ">=1.1.0-dev, <1.2.0-0"
+features = [
+    "providers-dev",
+]
+
+[dependencies.greentic-telemetry]
+# Floor pinned to the first dev publish that exposes `RolloutEvent` +
+# `emit_rollout_event` (C5.1); lower versions in the same range satisfy
+# `>=1.1.0-dev` but lack the rollout module.
+version = ">=1.1.0-dev.26432434860, <1.2.0-0"
+
+[dependencies.greentic-types]
+version = ">=1.1.0-dev, <1.2.0-0"
+features = [
+    "serde",
+]
+
+[dependencies.hyper]
+version = "1"
+features = [
+    "full",
+]
+
+[dependencies.qa-spec]
+version = ">=1.1.0-dev, <1.2.0-0"
+
+[dependencies.serde]
+version = "1.0"
+features = [
+    "derive",
+]
+
+[dependencies.serde_yaml_bw]
+package = "serde_yaml_gtc"
+version = "2.5.2"
+
+[dependencies.tokio]
+version = "1"
+features = [
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "net",
+    "macros",
+]
+
+[dependencies.tokio-stream]
+version = "0.1"
+features = [
+    "sync",
+]
+
+[dependencies.ureq]
+version = "3"
+features = [
+    "json",
+]
+
+[dependencies.uuid]
+version = "1"
+features = [
+    "v4",
+    "serde",
+]
 
 [dev-dependencies]
 criterion = "0.8"
@@ -80,7 +202,5 @@ criterion = "0.8"
 # only — `test-mock` stays out of release builds.
 greentic-llm = { version = "1", features = ["test-mock"] }
 tempfile = "3"
-
-[[bench]]
-name = "perf"
-harness = false
+tokio = { version = "1", features = ["test-util"] }
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }

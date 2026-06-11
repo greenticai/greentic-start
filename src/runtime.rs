@@ -452,7 +452,7 @@ fn looks_like_path(value: &str) -> bool {
     value.contains('/') || value.contains('\\') || Path::new(value).is_absolute()
 }
 
-fn should_restart(restart: &BTreeSet<String>, service: &str) -> bool {
+pub(crate) fn should_restart(restart: &BTreeSet<String>, service: &str) -> bool {
     restart.contains("all") || restart.contains(service)
 }
 
@@ -752,6 +752,7 @@ pub fn demo_up_services(
     config: &DemoConfig,
     static_routes: &BundleStaticRoutesInspection,
     configured_public_base_url: Option<String>,
+    env_store_public_base_url: Option<String>,
     cloudflared: Option<CloudflaredConfig>,
     ngrok: Option<NgrokConfig>,
     restart: &BTreeSet<String>,
@@ -1005,23 +1006,39 @@ pub fn demo_up_services(
     let previous_public_url =
         crate::webhook_updater::read_previous_public_url(&paths.runtime_root());
 
-    // Resolve public_base_url with fallback to local HTTP listener for local dev
-    let public_base_url = tunnel_public_base_url
+    // Resolve public_base_url with fallback to local HTTP listener for local dev.
+    // Precedence: tunnel > env-store > env var > local-listener derived.
+    // env-store wins over env var: it's the persisted operator intent set via
+    // `gtc op env set-public-url`, while the env var is a process-level override.
+    //
+    // Source attribution is computed in the same pass so the URL value and its
+    // `RuntimePublicBaseUrlSource` tag can't drift — adding a fifth source is
+    // one new `.or_else` arm instead of two parallel chains.
+    let derived_local_url = if ingress_server.is_some() && enable_static_routes {
+        let host = &config.services.gateway.listen_addr;
+        let port = ingress_server
+            .as_ref()
+            .map(|server| server.actual_port)
+            .unwrap_or(config.services.gateway.port);
+        Some(format!("http://{}:{}", host, port))
+    } else {
+        None
+    };
+    let url_with_source: Option<(String, RuntimePublicBaseUrlSource)> = tunnel_public_base_url
         .clone()
-        .or(configured_public_base_url.clone())
+        .map(|u| (u, RuntimePublicBaseUrlSource::Tunnel))
         .or_else(|| {
-            // Fallback: derive from local HTTP listener if static routes are enabled
-            if ingress_server.is_some() && enable_static_routes {
-                let host = &config.services.gateway.listen_addr;
-                let port = ingress_server
-                    .as_ref()
-                    .map(|server| server.actual_port)
-                    .unwrap_or(config.services.gateway.port);
-                Some(format!("http://{}:{}", host, port))
-            } else {
-                None
-            }
-        });
+            env_store_public_base_url
+                .clone()
+                .map(|u| (u, RuntimePublicBaseUrlSource::EnvStore))
+        })
+        .or_else(|| {
+            configured_public_base_url
+                .clone()
+                .map(|u| (u, RuntimePublicBaseUrlSource::Configured))
+        })
+        .or_else(|| derived_local_url.map(|u| (u, RuntimePublicBaseUrlSource::Derived)));
+    let public_base_url = url_with_source.as_ref().map(|(u, _)| u.clone());
 
     // Auto-update webhooks if public URL changed
     let webhook_summary = if let Some(ref new_url) = public_base_url {
@@ -1074,28 +1091,9 @@ pub fn demo_up_services(
     // asset_serving_enabled: true if bundle declares static routes we're enabling
     let http_listener_enabled = ingress_server.is_some();
     let asset_serving_enabled = enable_static_routes;
-    let runtime_config = if let Some(url) = tunnel_public_base_url {
-        Some(RuntimeConfig {
-            public_base_url: Some(RuntimePublicBaseUrl {
-                value: url,
-                source: RuntimePublicBaseUrlSource::Tunnel,
-            }),
-        })
-    } else if let Some(url) = configured_public_base_url {
-        Some(RuntimeConfig {
-            public_base_url: Some(RuntimePublicBaseUrl {
-                value: url,
-                source: RuntimePublicBaseUrlSource::Configured,
-            }),
-        })
-    } else {
-        public_base_url.clone().map(|url| RuntimeConfig {
-            public_base_url: Some(RuntimePublicBaseUrl {
-                value: url,
-                source: RuntimePublicBaseUrlSource::Derived,
-            }),
-        })
-    };
+    let runtime_config = url_with_source.map(|(value, source)| RuntimeConfig {
+        public_base_url: Some(RuntimePublicBaseUrl { value, source }),
+    });
 
     let startup_contract = resolve_startup_contract(
         static_routes,
@@ -1456,6 +1454,9 @@ fn start_http_ingress_server(
         tenant: config.tenant.clone(),
         public_base_url,
         notifier_config,
+        // Legacy single-bundle boot path: no materialized runtime-config, so
+        // revision routing is inert here.
+        revision_routing: None,
     })?;
     operator_log::info(
         module_path!(),
@@ -1791,6 +1792,44 @@ fn nats_started_marker(paths: &RuntimePaths) -> PathBuf {
     paths.runtime_root().join("nats.started")
 }
 
+// Hardened distroless host images ship no shell or interpreters. A script
+// helper (one with a `#!` shebang) cannot exec if its interpreter is absent,
+// and the kernel reports the missing *interpreter* as a "No such file" error
+// against the script itself — opaque to operators. Preflight the shebang and
+// fail with the ELF-only contract spelled out. No-op for ELF helpers and on
+// hosts that do have the interpreter, so normal dev runs are unaffected.
+fn preflight_interpreter(binary: &Path) -> anyhow::Result<()> {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(binary) else {
+        return Ok(());
+    };
+    let mut magic = [0u8; 2];
+    if file.read(&mut magic).unwrap_or(0) < 2 || &magic != b"#!" {
+        return Ok(());
+    }
+    let mut rest = Vec::new();
+    let mut byte = [0u8; 1];
+    while rest.len() < 256 {
+        match file.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => rest.push(byte[0]),
+            Err(_) => return Ok(()),
+        }
+    }
+    let line = String::from_utf8_lossy(&rest);
+    let interpreter = line.split_whitespace().next().unwrap_or("");
+    if interpreter.is_empty() || Path::new(interpreter).exists() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "service helper {} needs interpreter `{interpreter}`, which is not present. \
+         The hardened distroless runtime image ships no shell or interpreters — supply a \
+         statically-linked ELF helper, or run a runtime variant that includes `{interpreter}`.",
+        binary.display()
+    )
+}
+
 fn build_service_spec(
     config_dir: &Path,
     service_id: &str,
@@ -1815,6 +1854,7 @@ fn build_service_spec(
             explicit_path: explicit,
         },
     )?;
+    preflight_interpreter(&path)?;
     let mut argv = vec![path.to_string_lossy().to_string()];
     argv.extend(args.iter().cloned());
     Ok(supervisor::ServiceSpec {
@@ -2106,6 +2146,21 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn build_service_spec_rejects_script_with_missing_interpreter() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().expect("tempdir");
+        let helper = dir.path().join("runner.sh");
+        fs::write(&helper, "#!/nonexistent/xyz-interp\necho hi\n").expect("write helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let err = build_service_spec(dir.path(), "runner", "./runner.sh", &[], &BTreeMap::new())
+            .expect_err("missing interpreter must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("interpreter"), "got: {msg}");
+        assert!(msg.contains("distroless"), "got: {msg}");
+    }
+
     #[test]
     fn tenant_log_path_creates_file() -> anyhow::Result<()> {
         let dir = tempdir()?;
@@ -2298,6 +2353,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &restart,
             None,
             &log_dir,
@@ -2364,6 +2420,7 @@ mod tests {
             &config_path,
             &config,
             &static_routes,
+            None,
             None,
             None,
             None,
@@ -2494,6 +2551,7 @@ mod tests {
             },
         );
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::new("messaging-webchat-gui")?,
             name: Some("messaging-webchat-gui".to_string()),
@@ -2525,6 +2583,7 @@ mod tests {
             metadata: Default::default(),
         };
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::new("demo-app")?,
             name: Some("demo-app".to_string()),

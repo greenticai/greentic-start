@@ -3,7 +3,8 @@
 use anyhow::Context;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use greentic_types::ChannelMessageEnvelope;
+use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
+use greentic_types::{ChannelMessageEnvelope, EnvId};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::fs;
 use std::path::Path;
@@ -17,7 +18,8 @@ use crate::operator_log;
 use crate::post_ingress_hooks::apply_post_ingress_hooks_dispatch;
 use crate::provider_config_envelope::read_provider_config_envelope;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
-use crate::secret_requirements::load_secret_keys_from_pack;
+use crate::secret_requirements::{answer_key_is_secret, secret_answer_keys_for_pack};
+use std::collections::BTreeSet;
 
 pub fn dispatch_http_ingress(
     runner_host: &DemoRunnerHost,
@@ -60,16 +62,17 @@ pub fn dispatch_http_ingress_with_op(
     // Inject secrets into config for providers running in provider_core_only mode.
     // Fall back to a minimal config for events providers that require a non-null
     // config object even when no secrets or setup have been configured yet.
-    let config = build_injected_config(runner_host, domain, &request.provider, ctx).or_else(|| {
-        if matches!(domain, Domain::Events) {
-            Some(json!({
-                "target_url": "http://0.0.0.0:0/events/noop",
-                "timeout_ms": 1
-            }))
-        } else {
-            None
-        }
-    });
+    let config =
+        build_injected_config(runner_host, domain, &request.provider, ctx)?.or_else(|| {
+            if matches!(domain, Domain::Events) {
+                Some(json!({
+                    "target_url": "http://0.0.0.0:0/events/noop",
+                    "timeout_ms": 1
+                }))
+            } else {
+                None
+            }
+        });
 
     let http_in = build_ingress_request(
         &request.provider,
@@ -195,41 +198,44 @@ pub(crate) fn build_injected_config(
     domain: Domain,
     provider: &str,
     ctx: &OperatorContext,
-) -> Option<JsonValue> {
+) -> anyhow::Result<Option<JsonValue>> {
     // Get the pack path for this provider
-    let pack_path = runner_host.get_provider_pack_path(domain, provider)?;
+    let Some(pack_path) = runner_host.get_provider_pack_path(domain, provider) else {
+        return Ok(None);
+    };
 
     let mut config_map = serde_json::Map::new();
 
+    // Secret-marked keys, derived from the SAME source the producer redacts
+    // from (form `secret:true` + secret-requirements). Computed up front so
+    // the config-value injection below can SKIP them: after B12a the envelope
+    // carries `secrets://` URI references for secret keys, and a stale bundle
+    // may still carry plaintext in setup-answers.json. Either way we must NOT
+    // base64-encode that into `<key>_b64` — the contains_key guard on the
+    // fetch loop would then skip the real `get_secret` and hand the component
+    // a base64'd URI (or stale plaintext) instead of the resolved secret.
+    let secret_keys = secret_answer_keys_for_pack(pack_path, provider);
+
     // Prefer already-materialized runtime config over live secret-store reads.
     // This keeps hot ingress paths off the dev-store for cloud targets like AWS.
-    if let Some(envelope_config) =
-        load_provider_config_from_envelope(runner_host.bundle_root(), provider)
-    {
-        inject_config_values(&mut config_map, &envelope_config);
+    let mut envelope_config =
+        load_provider_config_from_envelope(runner_host.bundle_root(), provider);
+    let mut setup_answers = load_provider_setup_answers(runner_host.bundle_root(), provider);
+
+    // Path 3: substitute any `ext://<path>[/<instance>]` config value with the
+    // bound extension's resolved config/answers blob before it is encoded for
+    // the component — the open-namespace analogue of the `secrets://`
+    // resolution below. Fail-closed: a value naming an unbound extension errors
+    // the ingress rather than handing the component an opaque `ext://` string.
+    resolve_ext_refs_in_sources(&mut envelope_config, &mut setup_answers)?;
+
+    if let Some(envelope_config) = &envelope_config {
+        inject_config_values(&mut config_map, envelope_config, &secret_keys);
     }
-    if let Some(setup_answers) = load_provider_setup_answers(runner_host.bundle_root(), provider) {
-        inject_config_values(&mut config_map, &setup_answers);
+    if let Some(setup_answers) = &setup_answers {
+        inject_config_values(&mut config_map, setup_answers, &secret_keys);
     }
     inject_runtime_env_config(&mut config_map, provider);
-
-    // Load secret requirements from the pack
-    let secret_keys = match load_secret_keys_from_pack(pack_path) {
-        Ok(keys) => keys,
-        Err(err) => {
-            operator_log::debug(
-                module_path!(),
-                format!(
-                    "failed to load secret requirements for {provider}: {err}, skipping injection"
-                ),
-            );
-            return if config_map.is_empty() {
-                None
-            } else {
-                Some(JsonValue::Object(config_map))
-            };
-        }
-    };
 
     for key in &secret_keys {
         let key_b64 = format!("{key}_b64");
@@ -261,10 +267,54 @@ pub(crate) fn build_injected_config(
     }
 
     if !config_map.is_empty() {
-        Some(JsonValue::Object(config_map))
+        Ok(Some(JsonValue::Object(config_map)))
     } else {
-        None
+        Ok(None)
     }
+}
+
+/// Resolve `ext://` references that may appear in a provider's config sources,
+/// loading the active environment **only** when a reference is actually present
+/// (the env-store read stays off the common ingress path, which carries none).
+/// Fail-closed — a stale or invalid reference is an error, never a
+/// pass-through. See [`crate::extension_resolver`].
+fn resolve_ext_refs_in_sources(
+    envelope_config: &mut Option<JsonValue>,
+    setup_answers: &mut Option<JsonValue>,
+) -> anyhow::Result<()> {
+    let any_ext_ref = [envelope_config.as_ref(), setup_answers.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_object)
+        .any(crate::extension_resolver::map_has_ext_ref);
+    if !any_ext_ref {
+        return Ok(());
+    }
+
+    let env_id = crate::resolve_env(None);
+    let store_root = LocalFsStore::default_root()
+        .context("resolving environment store root for ext:// resolution")?;
+    let env_dir = crate::runtime_config::env_dir_in(&store_root, &env_id)?;
+    let env_typed =
+        EnvId::new(&env_id).with_context(|| format!("invalid environment id `{env_id}`"))?;
+    let store = LocalFsStore::new(store_root);
+    let environment = EnvironmentStore::load(&store, &env_typed)
+        .with_context(|| format!("loading environment `{env_id}` for ext:// resolution"))?;
+
+    // One memo across both sources: the same `ext://` ref under several keys
+    // (or in both envelope and setup-answers) reads its blob once per ingress.
+    let mut resolved = std::collections::HashMap::new();
+    for source in [envelope_config, setup_answers] {
+        if let Some(map) = source.as_mut().and_then(JsonValue::as_object_mut) {
+            crate::extension_resolver::rewrite_ext_refs(
+                map,
+                &environment,
+                &env_dir,
+                &mut resolved,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn inject_runtime_env_config(config_map: &mut JsonMap<String, JsonValue>, provider: &str) {
@@ -319,23 +369,37 @@ fn load_provider_config_from_envelope(bundle_root: &Path, provider: &str) -> Opt
         .map(|envelope| envelope.config)
 }
 
+/// After B12a, `setup-answers.json` carries **non-secret** provider config only.
+/// Secret material is fetched from `SecretsManager` in `build_injected_config`
+/// via `runner_host.get_secret`. The file remains a transitional sink for
+/// non-secret runtime config until `pack-config.v1` ships.
 fn load_provider_setup_answers(bundle_root: &Path, provider: &str) -> Option<JsonValue> {
     let path = bundle_root
         .join("state")
         .join("config")
         .join(provider)
         .join("setup-answers.json");
-    let bytes = fs::read(path).ok()?;
+    let bytes = fs::read(&path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-fn inject_config_values(config_map: &mut JsonMap<String, JsonValue>, value: &JsonValue) {
+fn inject_config_values(
+    config_map: &mut JsonMap<String, JsonValue>,
+    value: &JsonValue,
+    secret_keys: &BTreeSet<String>,
+) {
     let Some(obj) = value.as_object() else {
         return;
     };
 
     for (key, value) in obj {
         if value.is_null() {
+            continue;
+        }
+        // Secret-marked keys are populated from SecretsManager by the fetch
+        // loop in build_injected_config — never from the envelope/setup-answers
+        // value (which is a `secrets://` URI ref or stale plaintext).
+        if answer_key_is_secret(key, secret_keys) {
             continue;
         }
         let encoded = match value {
@@ -386,7 +450,7 @@ fn build_ingress_request(
     }
 }
 
-fn parse_dispatch_result(value: &JsonValue) -> anyhow::Result<IngressDispatchResult> {
+pub(crate) fn parse_dispatch_result(value: &JsonValue) -> anyhow::Result<IngressDispatchResult> {
     if let Some(body) = value.as_str() {
         return Ok(IngressDispatchResult {
             response: IngressHttpResponse {
@@ -642,6 +706,59 @@ mod tests {
             },
             "payload": {"id": "1"}
         })
+    }
+
+    // xhigh review C2 regression. After B12a the config envelope carries
+    // `secrets://` URI refs for secret-marked keys. inject_config_values must
+    // NOT base64-encode those into `<key>_b64` — otherwise the contains_key
+    // guard in build_injected_config skips the real get_secret and the
+    // component receives base64("secrets://…") instead of the credential.
+    #[test]
+    fn inject_config_values_skips_secret_marked_keys() {
+        use base64::engine::general_purpose::STANDARD;
+
+        let mut secret_keys = BTreeSet::new();
+        secret_keys.insert("api_key".to_string());
+
+        let envelope = json!({
+            "model": "gpt-4o-mini",
+            "api_key": "secrets://dev/demo/_/openai-llm/api_key"
+        });
+
+        let mut config_map = JsonMap::new();
+        inject_config_values(&mut config_map, &envelope, &secret_keys);
+
+        // Non-secret key is injected (base64'd).
+        assert_eq!(
+            config_map.get("model_b64").and_then(|v| v.as_str()),
+            Some(STANDARD.encode("gpt-4o-mini").as_str()),
+        );
+        // Secret key is NOT injected from the envelope — the fetch loop
+        // populates api_key_b64 from SecretsManager instead.
+        assert!(
+            !config_map.contains_key("api_key_b64"),
+            "secret key must not be base64-injected from the envelope URI ref: {config_map:?}",
+        );
+        // And the raw URI never reaches the config map under any key.
+        let dump = serde_json::to_string(&config_map).unwrap();
+        assert!(
+            !dump.contains("secrets://"),
+            "URI ref leaked into config: {dump}"
+        );
+    }
+
+    #[test]
+    fn inject_config_values_skips_aliased_secret_keys() {
+        // Forward-suffix alias: requirement webex_bot_token, answer bot_token.
+        let mut secret_keys = BTreeSet::new();
+        secret_keys.insert("webex_bot_token".to_string());
+        let envelope = json!({"bot_token": "secrets://dev/demo/_/messaging-webex/bot_token"});
+        let mut config_map = JsonMap::new();
+        inject_config_values(&mut config_map, &envelope, &secret_keys);
+        assert!(
+            !config_map.contains_key("bot_token_b64"),
+            "aliased secret key must be skipped: {config_map:?}",
+        );
     }
 
     #[test]

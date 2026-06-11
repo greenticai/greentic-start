@@ -127,7 +127,15 @@ pub(super) fn route_messaging_envelopes(
                             route_to_card
                         ),
                     );
-                    run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
+                    run_app_flow_safe(
+                        runner_host,
+                        bundle,
+                        ctx,
+                        &app_pack_path,
+                        &pack_info,
+                        flow,
+                        envelope,
+                    )
                 }
             }
         } else if pack_info
@@ -159,7 +167,15 @@ pub(super) fn route_messaging_envelopes(
             );
             vec![reply]
         } else {
-            run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
+            run_app_flow_safe(
+                runner_host,
+                bundle,
+                ctx,
+                &app_pack_path,
+                &pack_info,
+                flow,
+                envelope,
+            )
         };
 
         for mut out_envelope in outputs {
@@ -257,7 +273,7 @@ pub(super) fn route_messaging_envelopes(
             };
 
             let provider_type = runner_host.canonical_provider_type(Domain::Messaging, provider);
-            let config = build_injected_config(runner_host, Domain::Messaging, provider, ctx)
+            let config = build_injected_config(runner_host, Domain::Messaging, provider, ctx)?
                 .map(decode_injected_config_for_provider);
             let send_input = egress::build_send_payload(
                 payload,
@@ -489,6 +505,7 @@ fn read_card_from_pack(pack_path: &Path, card_key: &str) -> Option<serde_json::V
 }
 
 fn run_app_flow_safe(
+    runner_host: &DemoRunnerHost,
     bundle: &Path,
     ctx: &OperatorContext,
     app_pack_path: &Path,
@@ -497,6 +514,7 @@ fn run_app_flow_safe(
     envelope: &ChannelMessageEnvelope,
 ) -> Vec<ChannelMessageEnvelope> {
     match app::run_app_flow(
+        runner_host,
         bundle,
         ctx,
         app_pack_path,
@@ -911,6 +929,7 @@ mod tests {
             metadata: Default::default(),
         };
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".into(),
             pack_id: PackId::new("demo-app").expect("pack id"),
             name: Some("demo-app".into()),
@@ -961,8 +980,21 @@ mod tests {
     #[test]
     fn run_app_flow_safe_falls_back_to_original_envelope_on_errors() {
         let dir = tempdir().expect("tempdir");
+        let discovery = crate::discovery::discover(dir.path()).expect("discovery");
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
+                .expect("secrets handle");
+        let runner_host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )
+        .expect("runner host");
         let original = envelope();
         let outputs = run_app_flow_safe(
+            &runner_host,
             dir.path(),
             &OperatorContext {
                 tenant: "demo".to_string(),
