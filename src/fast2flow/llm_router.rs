@@ -388,4 +388,88 @@ mod tests {
         assert!(candidates_from_index(b"{\"entries\":[]}").is_empty());
         assert!(candidates_from_index(b"not json").is_empty());
     }
+
+    #[test]
+    fn candidates_use_legacy_titles_tags_and_trimmed_targets() {
+        let bytes = br#"{
+            "entries": [
+                {
+                    "target": "/legacy/flow/",
+                    "titles": ["Legacy title"],
+                    "node_ids": [" first_card "],
+                    "utterances": ["open legacy"],
+                    "tags": ["legacy", "sales"]
+                },
+                {"target": "   ", "title": "ignored"}
+            ]
+        }"#;
+
+        let c = candidates_from_index(bytes);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].target, "legacy/flow/first_card");
+        assert_eq!(c[0].title, "Legacy title");
+        assert_eq!(
+            c[0].hints,
+            vec![
+                "open legacy".to_string(),
+                "legacy".to_string(),
+                "sales".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn candidates_are_capped_to_prompt_limit() {
+        let entries = (0..(MAX_CANDIDATES + 5))
+            .map(|idx| {
+                format!(
+                    r#"{{"target":"pack/flow_{idx}","node_ids":["card"],"title":"Flow {idx}"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let manifest = format!(r#"{{"entries":[{entries}]}}"#);
+
+        let c = candidates_from_index(manifest.as_bytes());
+        assert_eq!(c.len(), MAX_CANDIDATES);
+        assert_eq!(
+            c.last().map(|candidate| candidate.target.as_str()),
+            Some("pack/flow_39/card")
+        );
+    }
+
+    #[test]
+    fn decide_returns_none_when_response_has_no_json() {
+        let provider = TestLlmProviderBuilder::new()
+            .script_response(ChatResponse {
+                content: "I would route to sales".into(),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+            })
+            .build();
+
+        assert!(decide(&provider, &candidates(), "show my deals").is_none());
+    }
+
+    #[test]
+    fn resolve_model_uses_provider_defaults_and_explicit_override() {
+        let cfg = BundleLlmConfig {
+            provider: "openai".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_model(&cfg), "gpt-4o-mini");
+
+        let cfg = BundleLlmConfig {
+            provider: "ollama".to_string(),
+            model: Some(" custom-model ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_model(&cfg), "custom-model");
+
+        let cfg = BundleLlmConfig {
+            provider: "unknown".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_model(&cfg), "");
+    }
 }

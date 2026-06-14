@@ -22,6 +22,7 @@ pub struct SecretsManagerSelection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectedKind {
+    Binding,
     TenantTeam,
     Tenant,
     Default,
@@ -97,6 +98,7 @@ pub fn select_secrets_manager(
                     SelectedKind::TenantTeam => "tenant/team secrets manager pack".to_string(),
                     SelectedKind::Tenant => "tenant secrets manager pack".to_string(),
                     SelectedKind::Default => "default secrets manager pack".to_string(),
+                    SelectedKind::Binding => "secrets provider binding".to_string(),
                     _ => "secrets manager pack".to_string(),
                 },
             });

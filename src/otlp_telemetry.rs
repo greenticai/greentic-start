@@ -249,3 +249,128 @@ impl PushMetricExporter for TokioMetricExporter {
         self.inner.temporality()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn clear_env() -> Vec<EnvGuard> {
+        vec![
+            EnvGuard::remove("TELEMETRY_EXPORT"),
+            EnvGuard::remove("OTLP_ENDPOINT"),
+            EnvGuard::remove("OTEL_EXPORTER_OTLP_ENDPOINT"),
+            EnvGuard::remove("OTEL_SERVICE_NAME"),
+        ]
+    }
+
+    #[test]
+    fn resolve_returns_none_without_opt_in() {
+        let _lock = env_lock();
+        let _env = clear_env();
+        assert!(resolve(None, "fallback-service").is_none());
+        assert!(
+            resolve(
+                Some(&BundleTelemetryConfig {
+                    enabled: false,
+                    exporter: "otlp-grpc".to_string(),
+                    ..Default::default()
+                }),
+                "fallback-service"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_uses_bundle_grpc_defaults() {
+        let _lock = env_lock();
+        let _env = clear_env();
+        let resolved = resolve(
+            Some(&BundleTelemetryConfig {
+                enabled: true,
+                exporter: "otlp".to_string(),
+                service_name: Some("bundle-service".to_string()),
+                ..Default::default()
+            }),
+            "fallback-service",
+        )
+        .expect("resolved telemetry");
+
+        assert_eq!(resolved.exporter, ExporterKind::OtlpGrpc);
+        assert_eq!(resolved.endpoint, "http://localhost:4317");
+        assert_eq!(resolved.service_name, "bundle-service");
+    }
+
+    #[test]
+    fn resolve_uses_env_overrides_and_http_default() {
+        let _lock = env_lock();
+        let _env = clear_env();
+        let _export = EnvGuard::set("TELEMETRY_EXPORT", "otlp-http");
+        let _service = EnvGuard::set("OTEL_SERVICE_NAME", "env-service");
+
+        let resolved = resolve(None, "fallback-service").expect("env opt-in");
+        assert_eq!(resolved.exporter, ExporterKind::OtlpHttp);
+        assert_eq!(resolved.endpoint, "http://localhost:4318");
+        assert_eq!(resolved.service_name, "env-service");
+    }
+
+    #[test]
+    fn resolve_prefers_env_endpoint_over_bundle_endpoint() {
+        let _lock = env_lock();
+        let _env = clear_env();
+        let _endpoint = EnvGuard::set("OTLP_ENDPOINT", "http://collector:9999");
+
+        let resolved = resolve(
+            Some(&BundleTelemetryConfig {
+                enabled: true,
+                exporter: "otlp-grpc".to_string(),
+                endpoint: Some("http://bundle:4317".to_string()),
+                ..Default::default()
+            }),
+            "fallback-service",
+        )
+        .expect("resolved telemetry");
+
+        assert_eq!(resolved.endpoint, "http://collector:9999");
+    }
+}
