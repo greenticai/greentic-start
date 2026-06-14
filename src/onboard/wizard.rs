@@ -1020,6 +1020,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_request_top_level_scope_wins_over_answer_scope_and_mode_variants() {
+        let params = parse_request(&json!({
+            "provider_id": "events-calendar",
+            "domain": "events",
+            "tenant": "TenantTop",
+            "team": "TeamTop",
+            "mode": "remove",
+            "answers": {
+                "_scope_tenant": "TenantAnswer",
+                "_scope_team": "TeamAnswer",
+                "enabled": false
+            }
+        }))
+        .expect("request params");
+
+        assert_eq!(params.domain, Domain::Events);
+        assert_eq!(params.tenant(), "tenanttop");
+        assert_eq!(params.team(), Some("teamtop"));
+        assert_eq!(params.mode, QaMode::Remove);
+        assert_eq!(params.answers["enabled"], false);
+    }
+
+    #[test]
     fn parse_request_rejects_missing_provider_and_invalid_domain() {
         assert!(parse_request(&json!({"domain": "messaging"})).is_err());
         assert!(
@@ -1036,6 +1059,8 @@ mod tests {
         assert_eq!(parse_mode(&json!({})), QaMode::Setup);
         assert_eq!(parse_mode(&json!({"mode": "upgrade"})), QaMode::Upgrade);
         assert_eq!(parse_mode(&json!({"mode": "remove"})), QaMode::Remove);
+        assert_eq!(parse_mode(&json!({"mode": "default"})), QaMode::Default);
+        assert_eq!(parse_mode(&json!({"mode": "unknown"})), QaMode::Setup);
 
         let spec = make_minimal_form_spec(
             "provider-a",
@@ -1060,6 +1085,11 @@ mod tests {
         assert_eq!(
             gmap,
             std::path::Path::new("/bundle/tenants/tenant-a/teams/team-b/team.gmap")
+        );
+        let tenant_gmap = resolve_gmap_path(std::path::Path::new("/bundle"), "tenant-a", None);
+        assert_eq!(
+            tenant_gmap,
+            std::path::Path::new("/bundle/tenants/tenant-a/tenant.gmap")
         );
 
         let payload = build_setup_flow_input(
@@ -1109,6 +1139,24 @@ mod tests {
         assert_eq!(merged["bot_token"], "stored-token");
         assert_eq!(merged["workspace"], "fresh-workspace");
         assert_eq!(merged["channel"], "alerts");
+    }
+
+    #[test]
+    fn merge_existing_config_returns_answers_when_no_valid_envelope_exists() {
+        let dir = tempdir().unwrap();
+        let answers = json!({"fresh": true});
+        assert_eq!(
+            merge_existing_config(dir.path(), "missing-provider", &answers),
+            answers
+        );
+
+        let providers_root = dir.path().join(".providers").join("broken-provider");
+        std::fs::create_dir_all(&providers_root).unwrap();
+        std::fs::write(providers_root.join("config.envelope.cbor"), b"not cbor").unwrap();
+        assert_eq!(
+            merge_existing_config(dir.path(), "broken-provider", &json!({"fallback": 1})),
+            json!({"fallback": 1})
+        );
     }
 
     #[test]

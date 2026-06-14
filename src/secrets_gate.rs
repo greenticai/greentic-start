@@ -26,6 +26,7 @@ use crate::secret_value::SecretValue;
 use crate::secrets_backend::SecretsBackendKind;
 use crate::secrets_client::SecretsClient;
 use crate::secrets_manager;
+use crate::secrets_provider_binding::SecretsProviderBinding;
 
 type CborMap = BTreeMap<CborValue, CborValue>;
 
@@ -226,11 +227,13 @@ fn team_wildcard_fallback(path: &str) -> Option<String> {
     ))
 }
 const ENV_ALLOW_ENV_SECRETS: &str = "GREENTIC_ALLOW_ENV_SECRETS";
+const ENV_REQUIRE_PROVIDER_BINDING: &str = "GREENTIC_REQUIRE_SECRETS_PROVIDER_BINDING";
 
 #[derive(Clone)]
 pub struct SecretsManagerHandle {
     manager: DynSecretsManager,
     pub selection: secrets_manager::SecretsManagerSelection,
+    pub provider_binding: Option<SecretsProviderBinding>,
     pub dev_store_path: Option<PathBuf>,
     pub canonical_team: String,
     pub using_env_fallback: bool,
@@ -257,8 +260,19 @@ pub fn resolve_secrets_manager(
 ) -> AnyhowResult<SecretsManagerHandle> {
     let canonical_team = secrets_manager::canonical_team(team);
     let team_owned = canonical_team.into_owned();
-    let selection = secrets_manager::select_secrets_manager(bundle_root, tenant, &team_owned)?;
     let allow_env = matches!(env::var(ENV_ALLOW_ENV_SECRETS).as_deref(), Ok("1"));
+    if let Some((binding_path, binding)) = SecretsProviderBinding::load_from_bundle(bundle_root)? {
+        return resolve_bound_secrets_manager(bundle_root, team, allow_env, binding_path, binding);
+    }
+    if matches!(
+        env::var(ENV_REQUIRE_PROVIDER_BINDING).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    ) {
+        return Err(anyhow!(
+            "cloud secrets mode requires a secrets provider binding at state/config/platform/secrets-provider.json"
+        ));
+    }
+    let selection = secrets_manager::select_secrets_manager(bundle_root, tenant, &team_owned)?;
     let pack_desc = selection
         .pack_path
         .as_ref()
@@ -331,8 +345,111 @@ pub fn resolve_secrets_manager(
     Ok(SecretsManagerHandle {
         manager,
         selection,
+        provider_binding: None,
         dev_store_path: store_path,
         canonical_team: team_owned,
+        using_env_fallback,
+    })
+}
+
+fn resolve_bound_secrets_manager(
+    bundle_root: &Path,
+    team: Option<&str>,
+    allow_env: bool,
+    binding_path: PathBuf,
+    binding: SecretsProviderBinding,
+) -> AnyhowResult<SecretsManagerHandle> {
+    let canonical_team = secrets_manager::canonical_team(team).into_owned();
+    let pack_path = binding.resolved_pack_path(bundle_root);
+    let selection = secrets_manager::SecretsManagerSelection {
+        scope: secrets_manager::SelectedKind::Binding,
+        pack_path: pack_path.clone(),
+        reason: format!(
+            "secrets provider binding {} selected provider {}",
+            binding_path.display(),
+            binding.provider_id
+        ),
+    };
+    let pack_desc = pack_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<none>".to_string());
+    operator_log::info(
+        module_path!(),
+        format!(
+            "secrets provider binding selected: path={} provider_id={} pack_path={}",
+            binding_path.display(),
+            binding.provider_id,
+            pack_desc,
+        ),
+    );
+
+    let backend_kind = binding.backend_kind(bundle_root);
+    let backend_label = backend_kind
+        .as_ref()
+        .map(|kind| match kind {
+            Some(kind) => kind.to_string(),
+            None => format!("binding:{}", binding.provider_id),
+        })
+        .unwrap_or_else(|err| format!("ERR({err})"));
+    let (manager, store_path, using_env_fallback) = match backend_kind {
+        Ok(Some(kind)) => match instantiate_manager_for_backend(bundle_root, &selection, kind) {
+            Ok((manager, path)) => Ok((manager, path, false)),
+            Err(err) => fallback_to_env(allow_env, kind.to_string(), &pack_desc, err),
+        },
+        Ok(None) => {
+            let err = anyhow!(
+                "secrets provider binding {} does not declare a supported runtime backend; provider_id={} requires a linked greentic-secrets provider adapter",
+                binding_path.display(),
+                binding.provider_id
+            );
+            fallback_to_env(
+                allow_env,
+                format!("binding:{}", binding.provider_id),
+                &pack_desc,
+                err,
+            )
+        }
+        Err(err) => fallback_to_env(
+            allow_env,
+            format!("binding:{}", binding.provider_id),
+            &pack_desc,
+            err,
+        ),
+    }?;
+
+    operator_log::info(
+        module_path!(),
+        format!(
+            "secrets runtime backend chosen from binding: provider_id={} backend={} dev_store_path={} using_env_fallback={}",
+            binding.provider_id,
+            backend_label,
+            store_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            using_env_fallback
+        ),
+    );
+    eprintln!(
+        "secrets: binding_provider={} backend={} using_env_fallback={} dev_store_path={} selection_pack={}",
+        binding.provider_id,
+        backend_label,
+        using_env_fallback,
+        store_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        pack_desc,
+    );
+
+    let manager = CachingSecretsManager::wrap(manager);
+    Ok(SecretsManagerHandle {
+        manager,
+        selection,
+        provider_binding: Some(binding),
+        dev_store_path: store_path,
+        canonical_team,
         using_env_fallback,
     })
 }
@@ -1040,6 +1157,119 @@ mod tests {
     }
 
     #[test]
+    fn provider_binding_env_backend_accepts_arbitrary_provider_id() -> anyhow::Result<()> {
+        let bundle_root = tempdir()?;
+        write_provider_binding(
+            bundle_root.path(),
+            "greentic.secrets.custom-vendor",
+            r#""backend":"env""#,
+            None,
+        )?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+        }
+        let handle = resolve_secrets_manager(bundle_root.path(), "demo", Some("default"))?;
+        drop(env_guard);
+
+        assert_eq!(
+            handle.selection.scope,
+            secrets_manager::SelectedKind::Binding
+        );
+        assert_eq!(
+            handle
+                .provider_binding
+                .as_ref()
+                .map(|binding| binding.provider_id.as_str()),
+            Some("greentic.secrets.custom-vendor")
+        );
+        assert!(handle.dev_store_path.is_none());
+        assert!(!handle.using_env_fallback);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_binding_wins_over_scoped_pack_discovery() -> anyhow::Result<()> {
+        let bundle_root = tempdir()?;
+        write_provider_binding(
+            bundle_root.path(),
+            "greentic.secrets.custom-vendor",
+            r#""backend":"env""#,
+            None,
+        )?;
+        let pack_dir = secrets_pack_dir(bundle_root.path(), "demo", "default");
+        let _ = write_secrets_pack(
+            &pack_dir,
+            "dev-backend.gtpack",
+            r#"{"backend":"dev-store"}"#,
+        )?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+        }
+        let handle = resolve_secrets_manager(bundle_root.path(), "demo", Some("default"))?;
+        drop(env_guard);
+
+        assert_eq!(
+            handle.selection.scope,
+            secrets_manager::SelectedKind::Binding
+        );
+        assert!(handle.dev_store_path.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn cloud_mode_requires_provider_binding_when_flagged() -> anyhow::Result<()> {
+        let bundle_root = tempdir()?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+            env::set_var(ENV_REQUIRE_PROVIDER_BINDING, "1");
+        }
+        let err = match resolve_secrets_manager(bundle_root.path(), "demo", Some("default")) {
+            Ok(_) => anyhow!("expected provider binding requirement to fail"),
+            Err(err) => err,
+        };
+        unsafe {
+            env::remove_var(ENV_REQUIRE_PROVIDER_BINDING);
+        }
+        drop(env_guard);
+
+        assert!(
+            err.to_string()
+                .contains("requires a secrets provider binding")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_binding_without_supported_backend_fails_clearly() -> anyhow::Result<()> {
+        let bundle_root = tempdir()?;
+        write_provider_binding(
+            bundle_root.path(),
+            "greentic.secrets.aws-sm",
+            r#""region":"eu-north-1""#,
+            None,
+        )?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+            env::remove_var(ENV_ALLOW_ENV_SECRETS);
+        }
+        let err = match resolve_secrets_manager(bundle_root.path(), "demo", Some("default")) {
+            Ok(_) => anyhow!("expected unsupported provider binding to fail"),
+            Err(err) => err,
+        };
+        drop(env_guard);
+
+        assert!(
+            err.to_string()
+                .contains("requires a linked greentic-secrets provider adapter")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn env_selection_pack_uses_env_manager() -> anyhow::Result<()> {
         let bundle_root = tempdir()?;
         let tenant = "demo";
@@ -1131,6 +1361,32 @@ mod tests {
         zip.write_all(backend_config.as_bytes())?;
         zip.finish()?;
         Ok(pack_path)
+    }
+
+    fn write_provider_binding(
+        bundle_root: &Path,
+        provider_id: &str,
+        config_fields: &str,
+        pack: Option<&str>,
+    ) -> anyhow::Result<PathBuf> {
+        let binding_dir = bundle_root.join("state/config/platform");
+        fs::create_dir_all(&binding_dir)?;
+        let binding_path = binding_dir.join("secrets-provider.json");
+        let pack_field = pack
+            .map(|pack| format!(r#","pack":"{}""#, pack))
+            .unwrap_or_default();
+        fs::write(
+            &binding_path,
+            format!(
+                r#"{{
+                  "schema_version":"greentic.secrets.binding.v1",
+                  "provider_id":"{}"{},
+                  "config":{{{}}}
+                }}"#,
+                provider_id, pack_field, config_fields
+            ),
+        )?;
+        Ok(binding_path)
     }
 
     fn secrets_pack_dir(bundle_root: &Path, tenant: &str, team: &str) -> PathBuf {

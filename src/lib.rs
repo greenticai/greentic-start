@@ -62,6 +62,7 @@ mod secrets_backend;
 mod secrets_client;
 mod secrets_gate;
 mod secrets_manager;
+mod secrets_provider_binding;
 mod secrets_setup;
 mod services;
 mod setup_input;
