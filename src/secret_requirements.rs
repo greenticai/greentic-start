@@ -6,6 +6,9 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
+use greentic_secrets_lib::{
+    GeneratedSecretRequirement, GeneratedSecretScope, PackSecretRequirement,
+};
 use greentic_types::{ExtensionInline, decode_pack_manifest};
 use serde::Deserialize;
 use serde_cbor::value::Value as CborValue;
@@ -59,7 +62,7 @@ pub fn load_secret_keys_from_pack(pack_path: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-pub fn load_secret_requirements_from_pack(pack_path: &Path) -> Result<Vec<SecretRequirement>> {
+pub fn load_secret_requirements_from_pack(pack_path: &Path) -> Result<Vec<PackSecretRequirement>> {
     let mut requirements = load_generated_requirements_from_extensions(pack_path)?;
     let asset_requirements = load_requirements_from_assets(pack_path)?;
     if !asset_requirements.is_empty() {
@@ -77,8 +80,8 @@ pub fn load_secret_requirements_from_pack(pack_path: &Path) -> Result<Vec<Secret
 }
 
 fn merge_requirements(
-    requirements: &mut Vec<SecretRequirement>,
-    additional: Vec<SecretRequirement>,
+    requirements: &mut Vec<PackSecretRequirement>,
+    additional: Vec<PackSecretRequirement>,
 ) {
     for mut next in additional {
         if let Some(existing) = requirements
@@ -97,28 +100,6 @@ fn merge_requirements(
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SecretRequirement {
-    pub key: String,
-    pub aliases: Vec<String>,
-    pub generated: Option<GeneratedSecretRequirement>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct GeneratedSecretRequirement {
-    pub policy: String,
-    pub length: usize,
-    pub encoding: String,
-    pub scope: GeneratedSecretScope,
-    pub regenerate_if_present: bool,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct GeneratedSecretScope {
-    pub level: String,
-    pub team: Option<String>,
-}
-
 #[allow(dead_code)]
 pub fn load_secret_keys_from_pack_legacy(pack_path: &Path) -> Result<Vec<String>> {
     let keys = load_keys_from_assets(pack_path)?;
@@ -132,7 +113,9 @@ pub fn load_secret_keys_from_pack_legacy(pack_path: &Path) -> Result<Vec<String>
     load_keys_from_component_manifests(pack_path)
 }
 
-fn load_generated_requirements_from_extensions(pack_path: &Path) -> Result<Vec<SecretRequirement>> {
+fn load_generated_requirements_from_extensions(
+    pack_path: &Path,
+) -> Result<Vec<PackSecretRequirement>> {
     if let Some(requirements) = load_generated_requirements_from_manifest_cbor(pack_path)? {
         return Ok(requirements);
     }
@@ -141,7 +124,7 @@ fn load_generated_requirements_from_extensions(pack_path: &Path) -> Result<Vec<S
 
 fn load_generated_requirements_from_manifest_cbor(
     pack_path: &Path,
-) -> Result<Option<Vec<SecretRequirement>>> {
+) -> Result<Option<Vec<PackSecretRequirement>>> {
     let file = File::open(pack_path)?;
     let mut archive = ZipArchive::new(file)?;
     let mut manifest = match archive.by_name("manifest.cbor") {
@@ -170,7 +153,7 @@ fn load_generated_requirements_from_manifest_cbor(
 
 fn load_generated_requirements_from_manifest_json(
     pack_path: &Path,
-) -> Result<Vec<SecretRequirement>> {
+) -> Result<Vec<PackSecretRequirement>> {
     let file = File::open(pack_path)?;
     let mut archive = ZipArchive::new(file)?;
     let mut manifest = match archive.by_name("pack.manifest.json") {
@@ -191,15 +174,18 @@ fn load_generated_requirements_from_manifest_json(
     parse_generated_secrets_extension(value.clone())
 }
 
-fn parse_generated_secrets_extension(value: serde_json::Value) -> Result<Vec<SecretRequirement>> {
+fn parse_generated_secrets_extension(
+    value: serde_json::Value,
+) -> Result<Vec<PackSecretRequirement>> {
     let extension: GeneratedSecretsExtension = serde_json::from_value(value)?;
     Ok(extension
         .secrets
         .into_iter()
         .filter(|secret| secret.required.unwrap_or(true))
-        .map(|secret| SecretRequirement {
+        .map(|secret| PackSecretRequirement {
             key: secret.key.to_lowercase(),
             aliases: secret.aliases,
+            required: true,
             generated: Some(GeneratedSecretRequirement {
                 policy: secret.policy.unwrap_or_else(|| "random".to_string()),
                 length: secret.length.unwrap_or(20),
@@ -218,7 +204,7 @@ fn parse_generated_secrets_extension(value: serde_json::Value) -> Result<Vec<Sec
         .collect())
 }
 
-fn load_requirements_from_assets(pack_path: &Path) -> Result<Vec<SecretRequirement>> {
+fn load_requirements_from_assets(pack_path: &Path) -> Result<Vec<PackSecretRequirement>> {
     let file = File::open(pack_path)?;
     let mut archive = ZipArchive::new(file)?;
     const ASSET_PATHS: &[&str] = &[
@@ -242,11 +228,12 @@ fn load_requirements_from_assets(pack_path: &Path) -> Result<Vec<SecretRequireme
     Ok(Vec::new())
 }
 
-fn asset_requirement_to_requirement(req: AssetSecretRequirement) -> Option<SecretRequirement> {
+fn asset_requirement_to_requirement(req: AssetSecretRequirement) -> Option<PackSecretRequirement> {
     let key = req.key.or(req.name)?;
-    Some(SecretRequirement {
+    Some(PackSecretRequirement {
         key: key.to_lowercase(),
         aliases: req.aliases,
+        required: true,
         generated: req.generated.map(|generated| GeneratedSecretRequirement {
             policy: generated.policy.unwrap_or_else(|| "random".to_string()),
             length: generated.length.unwrap_or(32),
@@ -291,13 +278,14 @@ fn load_keys_from_assets(pack_path: &Path) -> Result<Vec<String>> {
     Ok(Vec::new())
 }
 
-fn load_requirements_from_manifest(pack_path: &Path) -> Result<Vec<SecretRequirement>> {
+fn load_requirements_from_manifest(pack_path: &Path) -> Result<Vec<PackSecretRequirement>> {
     let keys = load_keys_from_manifest(pack_path)?;
     Ok(keys
         .into_iter()
-        .map(|key| SecretRequirement {
+        .map(|key| PackSecretRequirement {
             key,
             aliases: Vec::new(),
+            required: true,
             generated: None,
         })
         .collect())
@@ -320,13 +308,16 @@ fn load_keys_from_manifest(pack_path: &Path) -> Result<Vec<String>> {
     Ok(Vec::new())
 }
 
-fn load_requirements_from_component_manifests(pack_path: &Path) -> Result<Vec<SecretRequirement>> {
+fn load_requirements_from_component_manifests(
+    pack_path: &Path,
+) -> Result<Vec<PackSecretRequirement>> {
     let keys = load_keys_from_component_manifests(pack_path)?;
     Ok(keys
         .into_iter()
-        .map(|key| SecretRequirement {
+        .map(|key| PackSecretRequirement {
             key,
             aliases: Vec::new(),
+            required: true,
             generated: None,
         })
         .collect())
