@@ -142,6 +142,7 @@ pub fn run_from_env() -> anyhow::Result<()> {
             cache_dir: args.cache_dir,
             strict: args.strict,
         }),
+        Command::ResolveSecret(args) => run_resolve_secret(args),
         Command::Doctor(args) => {
             let has_errors = crate::doctor::run_doctor(args)?;
             if has_errors {
@@ -150,6 +151,27 @@ pub fn run_from_env() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_resolve_secret(args: cli_args::ResolveSecretArgs) -> anyhow::Result<()> {
+    let handle =
+        secrets_gate::resolve_secrets_manager(&args.bundle, &args.tenant, Some(&args.team))
+            .with_context(|| {
+                format!(
+                    "resolve secrets manager for bundle={} tenant={} team={}",
+                    args.bundle.display(),
+                    args.tenant,
+                    args.team
+                )
+            })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create secret resolver runtime")?;
+    runtime
+        .block_on(async { handle.manager().read(&args.uri).await })
+        .map_err(|err| anyhow!("resolve secret {}: {err}", args.uri))?;
+    Ok(())
 }
 
 fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
