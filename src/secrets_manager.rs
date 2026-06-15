@@ -50,13 +50,17 @@ impl SecretsManagerSelection {
     }
 }
 
+/// Canonicalize a team value for secret scoping, rendering the default/empty
+/// team as the `_` placeholder.
+///
+/// Delegates the normalization rule to `greentic-secrets`
+/// ([`greentic_secrets_lib::normalize_team`]) — the single source of truth for
+/// the "`_` everywhere" convention — so `default` and `_` can never diverge
+/// across producers and readers.
 pub fn canonical_team<'a>(team: Option<&'a str>) -> Cow<'a, str> {
-    match team
-        .map(|value| value.trim())
-        .filter(|trimmed| !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("default"))
-    {
-        Some(value) => Cow::Borrowed(value),
-        None => Cow::Borrowed("_"),
+    match greentic_secrets_lib::normalize_team(team) {
+        Some(value) => Cow::Owned(value),
+        None => Cow::Borrowed(greentic_secrets_lib::TEAM_PLACEHOLDER),
     }
 }
 

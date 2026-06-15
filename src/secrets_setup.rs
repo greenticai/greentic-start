@@ -23,19 +23,16 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use greentic_secrets_lib::core::Error as SecretError;
 use greentic_secrets_lib::{
-    ApplyOptions, DevStore, SecretFormat, SecretsStore, SeedDoc, SeedEntry, SeedValue, apply_seed,
+    ApplyOptions, DevStore, GeneratedSecretRequirement, PackSecretRequirement, SecretFormat,
+    SecretsStore, SeedDoc, SeedEntry, SeedValue, apply_seed, generate_secret_value,
+    generated_scope_team,
 };
-use rand::RngExt as _;
 use tracing::{debug, info};
 
 use crate::{
-    dev_store_path,
-    secret_requirements::{
-        GeneratedSecretRequirement, SecretRequirement, load_secret_requirements_from_pack,
-    },
+    dev_store_path, secret_requirements::load_secret_requirements_from_pack,
     secrets_gate::canonical_secret_uri,
 };
 
@@ -99,7 +96,7 @@ impl SecretsSetup {
     async fn ensure_requirements(
         &self,
         provider_id: &str,
-        requirements: Vec<SecretRequirement>,
+        requirements: Vec<PackSecretRequirement>,
     ) -> Result<()> {
         if requirements.is_empty() {
             return Ok(());
@@ -149,7 +146,7 @@ impl SecretsSetup {
     async fn requirement_exists(
         &self,
         provider_id: &str,
-        requirement: &SecretRequirement,
+        requirement: &PackSecretRequirement,
     ) -> Result<bool> {
         for key in std::iter::once(requirement.key.as_str())
             .chain(requirement.aliases.iter().map(String::as_str))
@@ -181,7 +178,7 @@ impl SecretsSetup {
     fn seed_entry_for_requirement(
         &self,
         uri: String,
-        requirement: &SecretRequirement,
+        requirement: &PackSecretRequirement,
     ) -> Result<SeedEntry> {
         if let Some(generated) = &requirement.generated {
             return generated_entry(uri, generated);
@@ -194,23 +191,11 @@ impl SecretsSetup {
     }
 }
 
-fn requirement_allows_regeneration(requirement: &SecretRequirement) -> bool {
+fn requirement_allows_regeneration(requirement: &PackSecretRequirement) -> bool {
     requirement
         .generated
         .as_ref()
         .is_some_and(|generated| generated.regenerate_if_present)
-}
-
-fn generated_scope_team<'a>(
-    generated: &'a GeneratedSecretRequirement,
-    default_team: Option<&'a str>,
-) -> Option<&'a str> {
-    if generated.scope.level.eq_ignore_ascii_case("tenant")
-        || generated.scope.team.as_deref() == Some("_")
-    {
-        return None;
-    }
-    generated.scope.team.as_deref().or(default_team)
 }
 
 fn load_seed_entries(bundle_root: &Path) -> Result<HashMap<String, SeedEntry>> {
@@ -246,52 +231,16 @@ fn placeholder_entry(uri: String) -> SeedEntry {
 }
 
 fn generated_entry(uri: String, generated: &GeneratedSecretRequirement) -> Result<SeedEntry> {
-    let text = generated_secret_value(generated)?;
+    let (bytes, format) = generate_secret_value(generated)
+        .map_err(|err| anyhow!("failed to generate secret for {uri}: {err}"))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|err| anyhow!("generated secret for {uri} was not valid UTF-8: {err}"))?;
     Ok(SeedEntry {
         uri,
-        format: SecretFormat::Text,
+        format,
         value: SeedValue::Text { text },
         description: Some("auto-generated provider runtime secret".to_string()),
     })
-}
-
-fn generated_secret_value(generated: &GeneratedSecretRequirement) -> Result<String> {
-    if !generated.policy.eq_ignore_ascii_case("random") {
-        return Err(anyhow!(
-            "unsupported generated secret policy `{}`",
-            generated.policy
-        ));
-    }
-    let length = generated.length.max(1);
-    match generated.encoding.as_str() {
-        "raw_text" => Ok(random_ascii(length)),
-        "base64url" => {
-            let mut bytes = vec![0u8; length];
-            rand::rng().fill(&mut bytes[..]);
-            Ok(URL_SAFE_NO_PAD.encode(bytes))
-        }
-        "hex" => {
-            let mut bytes = vec![0u8; length];
-            rand::rng().fill(&mut bytes[..]);
-            let mut out = String::with_capacity(bytes.len() * 2);
-            for byte in bytes {
-                use std::fmt::Write as _;
-                let _ = write!(out, "{byte:02x}");
-            }
-            Ok(out)
-        }
-        other => Err(anyhow!("unsupported generated secret encoding `{other}`")),
-    }
-}
-
-fn random_ascii(length: usize) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
-    let mut bytes = vec![0u8; length];
-    rand::rng().fill(&mut bytes[..]);
-    bytes
-        .into_iter()
-        .map(|byte| ALPHABET[usize::from(byte) % ALPHABET.len()] as char)
-        .collect()
 }
 
 fn placeholder_text_for_uri(uri: &str) -> String {
