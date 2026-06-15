@@ -14,7 +14,12 @@ Options:
   --tenant <tenant>                   Tenant passed to the deployer (default: demo).
   --team <team>                       Team used for local smoke metadata (default: default).
   --environment <env>                 Environment passed to the deployer (default: dev).
-  --mode <generate|local-smoke|apply> Validation mode (default: generate).
+  --mode <runtime-contract|generate|local-smoke|apply>
+                                      Validation mode (default: runtime-contract). runtime-contract also
+                                      asks greentic-start to resolve a required runtime secret.
+  --skip-runtime-contract             Alias for --mode generate; validates deployer output only.
+  --runtime-secret-uri <uri>           Secret URI resolved in runtime-contract mode
+                                      (default: secrets://<env>/<tenant>/_/messaging-webchat-gui/jwt_signing_key).
   --expect-secrets-provider <id>      Override the expected generated secrets provider binding provider_id.
   --expect-no-runtime-secret-env      Fail if generated output injects GREENTIC_SECRET__ runtime env vars.
   --allow-runtime-secret-env          Allow GREENTIC_SECRET__ output for cloud targets.
@@ -25,7 +30,7 @@ Options:
 Environment:
   GREENTIC_BUNDLE_BIN                 Bundle builder executable (default: greentic-bundle).
   GREENTIC_DEPLOYER_BIN               Deployer executable (default: greentic-deployer).
-  GREENTIC_START_BIN                  Runtime executable for local-smoke (default: greentic-start).
+  GREENTIC_START_BIN                  Runtime executable for local-smoke/runtime-contract (default: greentic-start).
   GREENTIC_DEPLOYER_EXTRA_ARGS        Extra args appended to deployer invocation.
 USAGE
 }
@@ -52,11 +57,101 @@ copy_file_into_dir() {
 
 find_binding_file() {
   local root="$1"
-  find "$root" -type f \( \
-    -path '*/state/config/platform/secrets-provider.json' -o \
-    -path '*/config/platform/secrets-provider.json' -o \
-    -name 'secrets-provider.json' \
-  \) | sort | head -n 1
+  local relative
+  local match
+
+  for relative in \
+    ".providers/platform/secrets-provider.json" \
+    "state/config/platform/secrets-provider.json" \
+    "config/platform/secrets-provider.json"; do
+    match="$(find "$root" -type f -path "*/$relative" | sort | head -n 1)"
+    if [[ -n "$match" ]]; then
+      echo "$match"
+      return 0
+    fi
+  done
+
+  find "$root" -type f -name 'secrets-provider.json' | sort | head -n 1
+}
+
+runtime_binding_file() {
+  local root="$1"
+
+  for relative in \
+    ".providers/platform/secrets-provider.json" \
+    "state/config/platform/secrets-provider.json" \
+    "config/platform/secrets-provider.json"; do
+    if [[ -f "$root/$relative" ]]; then
+      echo "$root/$relative"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+archive_contains_runtime_binding() {
+  local artifact="$1"
+  local listing
+
+  if command -v unzip >/dev/null 2>&1 && listing="$(unzip -Z1 "$artifact" 2>/dev/null)"; then
+    grep -Eq '(^|/)\.providers/platform/secrets-provider\.json$|(^|/)state/config/platform/secrets-provider\.json$|(^|/)config/platform/secrets-provider\.json$' <<<"$listing"
+    return
+  fi
+
+  if command -v unsquashfs >/dev/null 2>&1 && listing="$(unsquashfs -ll "$artifact" 2>/dev/null)"; then
+    grep -Eq '(^|/)\.providers/platform/secrets-provider\.json$|(^|/)state/config/platform/secrets-provider\.json$|(^|/)config/platform/secrets-provider\.json$' <<<"$listing"
+    return
+  fi
+
+  python3 - "$artifact" <<'PY'
+import sys
+import zipfile
+
+artifact = sys.argv[1]
+expected = {
+    ".providers/platform/secrets-provider.json",
+    "state/config/platform/secrets-provider.json",
+    "config/platform/secrets-provider.json",
+}
+with zipfile.ZipFile(artifact) as archive:
+    names = {name.strip("/") for name in archive.namelist()}
+for name in names:
+    if name in expected or any(name.endswith("/" + item) for item in expected):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+validate_binding_file() {
+  local binding_file="$1"
+  local expected_provider="$2"
+
+  json_field_equals "$binding_file" "schema_version" "greentic.secrets.binding.v1" \
+    || die "binding $binding_file does not use schema_version greentic.secrets.binding.v1"
+  json_field_equals "$binding_file" "provider_id" "$expected_provider" \
+    || die "binding $binding_file provider_id does not match $expected_provider"
+}
+
+artifact_digest() {
+  local artifact_path="$1"
+
+  case "$(uname -s)" in
+    Darwin)
+      echo "sha256:$(shasum -a 256 "$artifact_path" | awk '{print $1}')"
+      ;;
+    *)
+      echo "sha256:$(sha256sum "$artifact_path" | awk '{print $1}')"
+      ;;
+  esac
+}
+
+build_bundle_artifact() {
+  local root="$1"
+  local artifact_path="$2"
+
+  "$bundle_bin" build --root "$root" --output "$artifact_path" >/dev/null
+  [[ -f "$artifact_path" ]] || die "bundle build did not create $artifact_path"
 }
 
 deployer_metadata_dir() {
@@ -235,7 +330,8 @@ secrets_pack=""
 tenant="demo"
 team="default"
 environment="dev"
-mode="generate"
+mode="runtime-contract"
+runtime_secret_uri=""
 expect_secrets_provider=""
 expect_no_runtime_secret_env=0
 allow_runtime_secret_env=0
@@ -274,6 +370,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --mode)
       mode="${2:-}"
+      shift 2
+      ;;
+    --skip-runtime-contract)
+      mode="generate"
+      shift
+      ;;
+    --runtime-secret-uri)
+      runtime_secret_uri="${2:-}"
       shift 2
       ;;
     --expect-secrets-provider)
@@ -317,7 +421,7 @@ done
 [[ -n "$bundle" ]] || die "--bundle is required"
 [[ -z "$target" || "$target" =~ ^(local|aws|gcp|azure)$ ]] || die "--target must be local, aws, gcp, or azure"
 [[ -z "$deployer_pack" || -n "$target" ]] || die "--deployer-pack requires --target"
-[[ "$mode" =~ ^(generate|local-smoke|apply)$ ]] || die "--mode must be generate, local-smoke, or apply"
+[[ "$mode" =~ ^(runtime-contract|generate|local-smoke|apply)$ ]] || die "--mode must be runtime-contract, generate, local-smoke, or apply"
 [[ "$mode" != "apply" || "$allow_apply" == "1" ]] || die "--mode apply requires --allow-apply"
 [[ -e "$bundle" ]] || die "bundle not found: $bundle"
 [[ -z "$deployer_pack" || -f "$deployer_pack" ]] || die "deployer pack not found: $deployer_pack"
@@ -329,9 +433,14 @@ start_bin="${GREENTIC_START_BIN:-greentic-start}"
 
 require_cmd "$bundle_bin"
 require_cmd "$deployer_bin"
-if [[ "$mode" == "local-smoke" ]]; then
+if [[ "$mode" == "local-smoke" || "$mode" == "runtime-contract" ]]; then
   require_cmd "$start_bin"
+fi
+if [[ "$mode" == "local-smoke" ]]; then
   require_cmd curl
+fi
+if ! command -v unzip >/dev/null 2>&1; then
+  require_cmd python3
 fi
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/greentic-deploy-test.XXXXXX")"
@@ -365,17 +474,8 @@ if [[ -n "$secrets_pack" ]]; then
 fi
 
 log "building normalized bundle artifact"
-"$bundle_bin" build --root "$bundle_root" --output "$artifact" >/dev/null
-[[ -f "$artifact" ]] || die "bundle build did not create $artifact"
-
-case "$(uname -s)" in
-  Darwin)
-    digest="sha256:$(shasum -a 256 "$artifact" | awk '{print $1}')"
-    ;;
-  *)
-    digest="sha256:$(sha256sum "$artifact" | awk '{print $1}')"
-    ;;
-esac
+build_bundle_artifact "$bundle_root" "$artifact"
+digest="$(artifact_digest "$artifact")"
 
 selected_deployers=()
 if [[ -n "$deployer_pack" ]]; then
@@ -402,7 +502,7 @@ for entry in "${selected_deployers[@]}"; do
   enforce_no_runtime_secret_env="$expect_no_runtime_secret_env"
   deployer_mode="$mode"
 
-  if [[ "$deployer_mode" == "local-smoke" ]]; then
+  if [[ "$deployer_mode" == "local-smoke" || "$deployer_mode" == "runtime-contract" ]]; then
     deployer_mode="generate"
   fi
 
@@ -485,10 +585,7 @@ for entry in "${selected_deployers[@]}"; do
       [[ -z "$binding_file" ]] || break
     done
     [[ -n "$binding_file" ]] || die "expected secrets provider binding for $run_target, but none was generated"
-    json_field_equals "$binding_file" "schema_version" "greentic.secrets.binding.v1" \
-      || die "binding $binding_file does not use schema_version greentic.secrets.binding.v1"
-    json_field_equals "$binding_file" "provider_id" "$expected_provider" \
-      || die "binding $binding_file provider_id does not match $expected_provider"
+    validate_binding_file "$binding_file" "$expected_provider"
     if is_cloud_target "$run_target"; then
       binding_pack="$(json_field_value "$binding_file" "pack" || true)"
       [[ -n "$binding_pack" ]] || die "binding $binding_file does not name a secrets provider pack"
@@ -498,6 +595,15 @@ for entry in "${selected_deployers[@]}"; do
         binding_pack_path="$bundle_root/$binding_pack"
       fi
       [[ -f "$binding_pack_path" ]] || die "binding $binding_file points to missing secrets provider pack: $binding_pack"
+
+      runtime_binding="$(runtime_binding_file "$bundle_root" || true)"
+      [[ -n "$runtime_binding" ]] || die "expected runtime bundle root to contain .providers/platform/secrets-provider.json for $run_target"
+      validate_binding_file "$runtime_binding" "$expected_provider"
+      log "rebuilding normalized bundle artifact after $run_target secrets provider binding materialization"
+      build_bundle_artifact "$bundle_root" "$artifact"
+      digest="$(artifact_digest "$artifact")"
+      archive_contains_runtime_binding "$artifact" \
+        || die "expected built bundle artifact $artifact to contain .providers/platform/secrets-provider.json for $run_target"
     fi
     log "validated $run_target secrets provider binding: $binding_file"
   fi
@@ -509,6 +615,21 @@ for entry in "${selected_deployers[@]}"; do
         die "generated output for $run_target still injects per-secret runtime environment variables"
       fi
     done
+  fi
+
+  if [[ "$mode" == "runtime-contract" ]]; then
+    secret_uri="$runtime_secret_uri"
+    if [[ -z "$secret_uri" ]]; then
+      secret_uri="secrets://$environment/$tenant/_/messaging-webchat-gui/jwt_signing_key"
+    fi
+    log "checking runtime secret resolution for $run_target: $secret_uri"
+    GREENTIC_REQUIRE_SECRETS_PROVIDER_BINDING=1 \
+      "$start_bin" resolve-secret \
+        --bundle "$bundle_root" \
+        --tenant "$tenant" \
+        --team "$team" \
+        --uri "$secret_uri" \
+        >/dev/null
   fi
 done
 

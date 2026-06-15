@@ -163,7 +163,23 @@ fn find_best_pack(dir: &Path) -> Result<Option<PathBuf>> {
             .unwrap_or(false)
             && path.is_file()
         {
-            packs.push(path);
+            match secrets_backend::backend_kind_from_pack(&path) {
+                Ok(_) => packs.push(path),
+                Err(err)
+                    if err
+                        .to_string()
+                        .contains("missing secrets backend config in pack") =>
+                {
+                    operator_log::debug(
+                        module_path!(),
+                        format!(
+                            "ignoring secrets provider adapter pack without local backend config: {}",
+                            path.display()
+                        ),
+                    );
+                }
+                Err(err) => return Err(err),
+            }
         }
     }
     if packs.is_empty() {
@@ -190,7 +206,11 @@ fn find_best_pack(dir: &Path) -> Result<Option<PathBuf>> {
 mod tests {
     use super::*;
     use std::env;
+    use std::fs::File;
+    use std::io::Write;
     use tempfile::tempdir;
+    use zip::ZipWriter;
+    use zip::write::FileOptions;
 
     #[test]
     fn canonical_team_maps_default_and_empty_to_underscore() {
@@ -209,11 +229,11 @@ mod tests {
         fs::create_dir_all(base.join("tenant")).unwrap();
         fs::create_dir_all(&base).unwrap();
         let team_pack = base.join("tenant").join("team").join("foo.gtpack");
-        fs::write(&team_pack, "").unwrap();
+        write_backend_pack(&team_pack, "dev-store");
         let tenant_pack = base.join("tenant").join("bar.gtpack");
-        fs::write(&tenant_pack, "").unwrap();
+        write_backend_pack(&tenant_pack, "dev-store");
         let default_pack = base.join("default.gtpack");
-        fs::write(&default_pack, "").unwrap();
+        write_backend_pack(&default_pack, "dev-store");
         let selection = select_secrets_manager(dir.path(), "tenant", "team").unwrap();
         assert_eq!(selection.scope, SelectedKind::TenantTeam);
         assert_eq!(
@@ -227,7 +247,7 @@ mod tests {
         let _env_guard = crate::test_env_lock().lock().unwrap();
         let dir = tempdir().unwrap();
         let alt = dir.path().join("alt.gtpack");
-        fs::write(&alt, "").unwrap();
+        write_backend_pack(&alt, "env");
         unsafe {
             env::set_var(OVERRIDE_ENV, alt.strip_prefix(dir.path()).unwrap());
         }
@@ -282,12 +302,64 @@ mod tests {
         fs::create_dir_all(&base).unwrap();
         let alpha = base.join("alpha.gtpack");
         let zeta = base.join("zeta.gtpack");
-        fs::write(&zeta, "").unwrap();
-        fs::write(&alpha, "").unwrap();
+        write_backend_pack(&zeta, "dev-store");
+        write_backend_pack(&alpha, "dev-store");
 
         let selection = select_secrets_manager(dir.path(), "tenant", "team").unwrap();
 
         assert_eq!(selection.scope, SelectedKind::Default);
         assert_eq!(selection.pack_path.unwrap(), alpha);
+    }
+
+    #[test]
+    fn default_discovery_ignores_cloud_provider_adapter_packs_without_local_backend_config() {
+        let _env_guard = crate::test_env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let base = dir.path().join(DEFAULT_SECRETS_DIR);
+        fs::create_dir_all(&base).unwrap();
+        write_provider_adapter_pack(&base.join("aws-sm.gtpack"));
+        write_provider_adapter_pack(&base.join("azure-kv.gtpack"));
+        write_provider_adapter_pack(&base.join("gcp-sm.gtpack"));
+
+        let selection = select_secrets_manager(dir.path(), "tenant", "team").unwrap();
+
+        assert_eq!(selection.scope, SelectedKind::None);
+        assert!(selection.pack_path.is_none());
+        assert_eq!(selection.kind().unwrap(), SecretsBackendKind::DevStore);
+    }
+
+    #[test]
+    fn default_discovery_still_errors_on_invalid_local_backend_config() {
+        let _env_guard = crate::test_env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let base = dir.path().join(DEFAULT_SECRETS_DIR);
+        fs::create_dir_all(&base).unwrap();
+        write_backend_pack(&base.join("bad.gtpack"), "vault");
+
+        let err = select_secrets_manager(dir.path(), "tenant", "team").unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(message.contains("unsupported secrets backend 'vault'"));
+    }
+
+    fn write_backend_pack(path: &Path, backend: &str) {
+        let file = File::create(path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> = FileOptions::default();
+        zip.start_file("assets/secrets_backend.json", options)
+            .unwrap();
+        zip.write_all(format!(r#"{{"backend":"{backend}"}}"#).as_bytes())
+            .unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn write_provider_adapter_pack(path: &Path) {
+        let file = File::create(path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> = FileOptions::default();
+        zip.start_file("pack.json", options).unwrap();
+        zip.write_all(br#"{"pack_id":"greentic.secrets.aws-sm"}"#)
+            .unwrap();
+        zip.finish().unwrap();
     }
 }

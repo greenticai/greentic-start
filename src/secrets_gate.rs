@@ -269,10 +269,30 @@ pub fn resolve_secrets_manager(
         Ok("1") | Ok("true") | Ok("TRUE")
     ) {
         return Err(anyhow!(
-            "cloud secrets mode requires a secrets provider binding at state/config/platform/secrets-provider.json"
+            "cloud secrets mode requires a secrets provider binding at .providers/platform/secrets-provider.json"
         ));
     }
-    let selection = secrets_manager::select_secrets_manager(bundle_root, tenant, &team_owned)?;
+    let selection = match secrets_manager::select_secrets_manager(bundle_root, tenant, &team_owned)
+    {
+        Ok(selection) => selection,
+        Err(err) => {
+            let (manager, store_path, using_env_fallback) =
+                fallback_to_env(allow_env, "<selection>".to_string(), "<none>", err)?;
+            let manager = CachingSecretsManager::wrap(manager);
+            return Ok(SecretsManagerHandle {
+                manager,
+                selection: secrets_manager::SecretsManagerSelection {
+                    scope: secrets_manager::SelectedKind::None,
+                    pack_path: None,
+                    reason: "secrets manager selection failed; using env fallback".to_string(),
+                },
+                provider_binding: None,
+                dev_store_path: store_path,
+                canonical_team: team_owned,
+                using_env_fallback,
+            });
+        }
+    };
     let pack_desc = selection
         .pack_path
         .as_ref()
@@ -1157,6 +1177,30 @@ mod tests {
     }
 
     #[test]
+    fn local_runtime_ignores_cloud_provider_packs_and_defaults_to_devstore() -> anyhow::Result<()> {
+        let bundle_root = tempdir()?;
+        let providers_secrets = bundle_root.path().join("providers").join("secrets");
+        write_cloud_provider_pack(&providers_secrets, "aws-sm.gtpack")?;
+        write_cloud_provider_pack(&providers_secrets, "azure-kv.gtpack")?;
+        write_cloud_provider_pack(&providers_secrets, "gcp-sm.gtpack")?;
+
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+            env::remove_var(ENV_REQUIRE_PROVIDER_BINDING);
+        }
+        let handle = resolve_secrets_manager(bundle_root.path(), "demo", Some("default"))?;
+        drop(env_guard);
+
+        assert_eq!(handle.selection.scope, secrets_manager::SelectedKind::None);
+        assert!(handle.selection.pack_path.is_none());
+        assert!(handle.provider_binding.is_none());
+        assert!(handle.dev_store_path.is_some());
+        assert!(!handle.using_env_fallback);
+        Ok(())
+    }
+
+    #[test]
     fn provider_binding_env_backend_accepts_arbitrary_provider_id() -> anyhow::Result<()> {
         let bundle_root = tempdir()?;
         write_provider_binding(
@@ -1219,8 +1263,75 @@ mod tests {
     }
 
     #[test]
+    fn explicit_provider_binding_wins_over_cloud_provider_packs() -> anyhow::Result<()> {
+        let bundle_root = tempdir()?;
+        let providers_secrets = bundle_root.path().join("providers").join("secrets");
+        write_cloud_provider_pack(&providers_secrets, "aws-sm.gtpack")?;
+        write_cloud_provider_pack(&providers_secrets, "azure-kv.gtpack")?;
+        write_cloud_provider_pack(&providers_secrets, "gcp-sm.gtpack")?;
+        write_provider_binding(
+            bundle_root.path(),
+            "greentic.secrets.aws-sm",
+            r#""backend":"env""#,
+            Some("providers/secrets/aws-sm.gtpack"),
+        )?;
+
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+            env::remove_var(ENV_REQUIRE_PROVIDER_BINDING);
+        }
+        let handle = resolve_secrets_manager(bundle_root.path(), "demo", Some("default"))?;
+        drop(env_guard);
+
+        assert_eq!(
+            handle.selection.scope,
+            secrets_manager::SelectedKind::Binding
+        );
+        assert_eq!(
+            handle
+                .provider_binding
+                .as_ref()
+                .map(|binding| binding.provider_id.as_str()),
+            Some("greentic.secrets.aws-sm")
+        );
+        assert!(handle.dev_store_path.is_none());
+        assert!(!handle.using_env_fallback);
+        Ok(())
+    }
+
+    #[test]
     fn cloud_mode_requires_provider_binding_when_flagged() -> anyhow::Result<()> {
         let bundle_root = tempdir()?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+            env::set_var(ENV_REQUIRE_PROVIDER_BINDING, "1");
+        }
+        let err = match resolve_secrets_manager(bundle_root.path(), "demo", Some("default")) {
+            Ok(_) => anyhow!("expected provider binding requirement to fail"),
+            Err(err) => err,
+        };
+        unsafe {
+            env::remove_var(ENV_REQUIRE_PROVIDER_BINDING);
+        }
+        drop(env_guard);
+
+        assert!(
+            err.to_string()
+                .contains("requires a secrets provider binding")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cloud_mode_requires_provider_binding_even_with_cloud_provider_packs() -> anyhow::Result<()> {
+        let bundle_root = tempdir()?;
+        let providers_secrets = bundle_root.path().join("providers").join("secrets");
+        write_cloud_provider_pack(&providers_secrets, "aws-sm.gtpack")?;
+        write_cloud_provider_pack(&providers_secrets, "azure-kv.gtpack")?;
+        write_cloud_provider_pack(&providers_secrets, "gcp-sm.gtpack")?;
+
         let env_guard = crate::test_env_lock().lock().unwrap();
         unsafe {
             env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
@@ -1359,6 +1470,18 @@ mod tests {
         let options: FileOptions<'_, ()> = FileOptions::default();
         zip.start_file("assets/secrets_backend.json", options)?;
         zip.write_all(backend_config.as_bytes())?;
+        zip.finish()?;
+        Ok(pack_path)
+    }
+
+    fn write_cloud_provider_pack(dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
+        fs::create_dir_all(dir)?;
+        let pack_path = dir.join(name);
+        let file = File::create(&pack_path)?;
+        let mut zip = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> = FileOptions::default();
+        zip.start_file("pack.json", options)?;
+        zip.write_all(br#"{"pack_id":"greentic.secrets.adapter"}"#)?;
         zip.finish()?;
         Ok(pack_path)
     }
