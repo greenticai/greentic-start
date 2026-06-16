@@ -625,7 +625,15 @@ async fn serve(
     // before deployment-route resolution — so a broad `/`-prefix route binding
     // can't shadow it (same reason `/workers/invoke` short-circuits below). The
     // page POSTs to that same loopback `/workers/invoke` endpoint.
+    //
+    // Loopback-gated, matching the loopback-only `/workers/invoke` it drives: on
+    // a public bind (a non-local env that opted the GUI in) the console is only
+    // served to co-located callers, so a remote client never receives the page
+    // (it falls through to deployment routing → 404). The page also carries
+    // anti-framing headers (see `asset_response`) so a cross-site iframe can't
+    // load it and auto-drive the worker endpoint.
     if state.gui_enabled
+        && peer_is_loopback
         && let Some(response) = try_chat_asset_response(&path, &method)
     {
         return Ok(response);
@@ -1425,10 +1433,18 @@ fn try_chat_asset_response(path: &str, method: &hyper::Method) -> Option<Respons
 /// Build a `200 OK` response for an embedded `'static` asset. The body is a
 /// zero-copy [`Bytes::from_static`] view, so serving the ~440 KB renderer adds
 /// no per-request allocation.
+///
+/// Sends anti-framing headers (`X-Frame-Options: DENY` +
+/// `Content-Security-Policy: frame-ancestors 'none'`) so the console page can't
+/// be embedded in a cross-site iframe — which would otherwise load it as
+/// `127.0.0.1` and let the page's on-open `send({})` drive the loopback
+/// `/workers/invoke` endpoint from a malicious origin.
 fn asset_response(content_type: &'static str, body: &'static str) -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
+        .header(header::X_FRAME_OPTIONS, "DENY")
+        .header(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'")
         .body(Full::new(Bytes::from_static(body.as_bytes())))
         .expect("static response builder inputs are valid")
 }
@@ -3560,6 +3576,20 @@ mod tests {
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok()),
             Some("text/html; charset=utf-8"),
+        );
+        // Anti-framing headers must be present so a cross-site iframe can't load
+        // the console and auto-drive the loopback worker endpoint.
+        assert_eq!(
+            page.headers()
+                .get(header::X_FRAME_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("DENY"),
+        );
+        assert_eq!(
+            page.headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("frame-ancestors 'none'"),
         );
         // The page must POST to the loopback worker endpoint, not a gui gateway.
         assert!(body_string(page).contains("/workers/invoke"));
