@@ -103,12 +103,12 @@ default-features = false
 
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
 # / `Revision` cross the deployer boundary, so resolution must not pick an
-# older deploy-spec. Floor bumped to the Change-C-part-1 publish that adds
-# `EnvironmentHostConfig.public_base_url` (the persisted operator-set URL);
-# earlier publishes don't carry the field and the env-store reader would
-# silently return `None` for valid env directories.
+# older deploy-spec. Floor bumped to the publish that adds
+# `EnvironmentHostConfig.gui_enabled` + `resolved_gui_enabled()` (deployer#322);
+# greentic-start reads the resolver at boot to gate the built-in webchat
+# console, and earlier publishes lack both the field and the method.
 [dependencies.greentic-deploy-spec]
-version = ">=0.1.27092623472, <0.2"
+version = ">=0.1.27625833333, <0.2"
 
 # Lower bound pinned to the publish that updates the bootstrap call site for
 # the deployer's 2-arg `ensure_local_environment` (greentic-setup#134).

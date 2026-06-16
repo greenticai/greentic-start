@@ -104,6 +104,11 @@ pub(crate) struct Activation {
 pub(crate) struct RevisionServeConfig {
     pub bind_addr: SocketAddr,
     pub activation: Arc<Activation>,
+    /// Serve the built-in webchat console (`GET /chat` + `/adaptivecards.min.js`)
+    /// over this listener. Resolved from `host_config.resolved_gui_enabled()` at
+    /// boot (on by default for the `local` env, off elsewhere unless the operator
+    /// opts in). When false the chat paths fall through to deployment routing.
+    pub gui_enabled: bool,
 }
 
 /// Per-connection shared state. Holds the live activation behind an
@@ -118,6 +123,9 @@ struct ServeState {
     /// Reported by `/status` so operators see the actual interface + port
     /// rather than what the user requested.
     bound_addr: SocketAddr,
+    /// Whether the built-in webchat console is served on this listener. Read on
+    /// every request (a cheap `Copy` bool) to gate the chat-asset short-circuit.
+    gui_enabled: bool,
 }
 
 impl ServeState {
@@ -325,6 +333,7 @@ impl RevisionServer {
         let state = Arc::new(ServeState {
             slot: ArcSwap::new(config.activation),
             bound_addr: addr,
+            gui_enabled: config.gui_enabled,
         });
         // Cloned into the listener thread; the original lives on as the
         // [`RevisionServer::state`] handle so [`reload`] / [`counts`] read the
@@ -608,6 +617,25 @@ async fn serve(
     let path = req.uri().path().to_string();
 
     if let Some(response) = try_probe_response(&path, &state) {
+        return Ok(response);
+    }
+
+    // Built-in webchat console: serve the static `/chat` page and its renderer
+    // when the env has the GUI enabled. Short-circuited here — after probes,
+    // before deployment-route resolution — so a broad `/`-prefix route binding
+    // can't shadow it (same reason `/workers/invoke` short-circuits below). The
+    // page POSTs to that same loopback `/workers/invoke` endpoint.
+    //
+    // Loopback-gated, matching the loopback-only `/workers/invoke` it drives: on
+    // a public bind (a non-local env that opted the GUI in) the console is only
+    // served to co-located callers, so a remote client never receives the page
+    // (it falls through to deployment routing → 404). The page also carries
+    // anti-framing headers (see `asset_response`) so a cross-site iframe can't
+    // load it and auto-drive the worker endpoint.
+    if state.gui_enabled
+        && peer_is_loopback
+        && let Some(response) = try_chat_asset_response(&path, &method)
+    {
         return Ok(response);
     }
 
@@ -1373,6 +1401,52 @@ pub(crate) fn error_response(
     message: impl AsRef<str>,
 ) -> Response<Full<Bytes>> {
     text_response(status, message.as_ref())
+}
+
+/// The built-in webchat console page, embedded so the binary serves it with no
+/// working directory or network access. It POSTs to the loopback
+/// `/workers/invoke` endpoint on the same origin.
+const CHAT_HTML: &str = include_str!("../assets/chat.html");
+/// Vendored Adaptive Cards renderer the chat page loads from `/adaptivecards.min.js`.
+const ADAPTIVE_CARDS_JS: &str = include_str!("../assets/adaptivecards.min.js");
+
+/// Serve the built-in webchat console: `GET /chat` returns the HTML page and
+/// `GET /adaptivecards.min.js` returns the vendored renderer. A non-GET method
+/// on either path is a `405`. Returns `None` for any other path so the caller
+/// falls through to deployment routing. Reached only when the env has the GUI
+/// enabled ([`ServeState::gui_enabled`]).
+fn try_chat_asset_response(path: &str, method: &hyper::Method) -> Option<Response<Full<Bytes>>> {
+    let (content_type, body) = match path {
+        "/chat" => ("text/html; charset=utf-8", CHAT_HTML),
+        "/adaptivecards.min.js" => ("application/javascript; charset=utf-8", ADAPTIVE_CARDS_JS),
+        _ => return None,
+    };
+    if *method != hyper::Method::GET {
+        return Some(error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "the webchat console is served over GET",
+        ));
+    }
+    Some(asset_response(content_type, body))
+}
+
+/// Build a `200 OK` response for an embedded `'static` asset. The body is a
+/// zero-copy [`Bytes::from_static`] view, so serving the ~440 KB renderer adds
+/// no per-request allocation.
+///
+/// Sends anti-framing headers (`X-Frame-Options: DENY` +
+/// `Content-Security-Policy: frame-ancestors 'none'`) so the console page can't
+/// be embedded in a cross-site iframe — which would otherwise load it as
+/// `127.0.0.1` and let the page's on-open `send({})` drive the loopback
+/// `/workers/invoke` endpoint from a malicious origin.
+fn asset_response(content_type: &'static str, body: &'static str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::X_FRAME_OPTIONS, "DENY")
+        .header(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'")
+        .body(Full::new(Bytes::from_static(body.as_bytes())))
+        .expect("static response builder inputs are valid")
 }
 
 /// `/livez`, `/readyz`, `/healthz`, `/health` return `200 ok`; `/status`
@@ -2400,6 +2474,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
@@ -2683,6 +2758,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
@@ -3349,6 +3425,7 @@ mod tests {
             tenant_org_id: None,
             listen_addr: addr,
             public_base_url: None,
+            gui_enabled: None,
         }
     }
 
@@ -3433,6 +3510,7 @@ mod tests {
         ServeState {
             slot: ArcSwap::new(std::sync::Arc::new(empty_activation(env_id))),
             bound_addr: bound,
+            gui_enabled: false,
         }
     }
 
@@ -3487,6 +3565,55 @@ mod tests {
         assert!(try_probe_response("/api/chat", &state).is_none());
         assert!(try_probe_response("/livez/sub", &state).is_none());
         assert!(try_probe_response("/", &state).is_none());
+    }
+
+    #[test]
+    fn try_chat_asset_serves_console_page_and_renderer_on_get() {
+        let page = try_chat_asset_response("/chat", &hyper::Method::GET).expect("chat page");
+        assert_eq!(page.status(), StatusCode::OK);
+        assert_eq!(
+            page.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+        );
+        // Anti-framing headers must be present so a cross-site iframe can't load
+        // the console and auto-drive the loopback worker endpoint.
+        assert_eq!(
+            page.headers()
+                .get(header::X_FRAME_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("DENY"),
+        );
+        assert_eq!(
+            page.headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("frame-ancestors 'none'"),
+        );
+        // The page must POST to the loopback worker endpoint, not a gui gateway.
+        assert!(body_string(page).contains("/workers/invoke"));
+
+        let js = try_chat_asset_response("/adaptivecards.min.js", &hyper::Method::GET)
+            .expect("renderer");
+        assert_eq!(js.status(), StatusCode::OK);
+        assert_eq!(
+            js.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/javascript; charset=utf-8"),
+        );
+        assert!(!body_string(js).is_empty());
+    }
+
+    #[test]
+    fn try_chat_asset_rejects_non_get_and_ignores_other_paths() {
+        let not_allowed =
+            try_chat_asset_response("/chat", &hyper::Method::POST).expect("405 for non-GET");
+        assert_eq!(not_allowed.status(), StatusCode::METHOD_NOT_ALLOWED);
+        // Non-asset paths fall through so deployment routing still handles them.
+        assert!(try_chat_asset_response("/", &hyper::Method::GET).is_none());
+        assert!(try_chat_asset_response("/workers/invoke", &hyper::Method::POST).is_none());
     }
 
     // --- N1.2: listen-address resolution ----------------------------------
@@ -3787,6 +3914,7 @@ mod tests {
         let state = std::sync::Arc::new(ServeState {
             slot: ArcSwap::new(std::sync::Arc::new(act1)),
             bound_addr: bound,
+            gui_enabled: false,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -3879,6 +4007,7 @@ mod tests {
         let state = std::sync::Arc::new(ServeState {
             slot: ArcSwap::new(std::sync::Arc::new(act1)),
             bound_addr: bound,
+            gui_enabled: false,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -4137,6 +4266,7 @@ mod tests {
         std::sync::Arc::new(ServeState {
             slot: ArcSwap::new(std::sync::Arc::new(activation)),
             bound_addr: bound,
+            gui_enabled: false,
         })
     }
 
