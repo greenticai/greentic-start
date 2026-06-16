@@ -21,8 +21,11 @@ ENV CARGO_TARGET_DIR=/tmp/target
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY i18n ./i18n
-
-RUN perl -0pi -e 's/\n\[\[bench\]\]\nname = "perf"\nharness = false\n//' Cargo.toml
+# benches/ is only needed so the manifest's bench target validates; it is not
+# compiled by `cargo build --bin`. Copying it replaces the old perl hack that
+# stripped the [[bench]] section and silently broke when the manifest was
+# reformatted to the top-level `bench = [...]` style.
+COPY benches ./benches
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
