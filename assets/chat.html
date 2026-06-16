@@ -110,9 +110,7 @@
         if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + (await resp.text()));
         renderMessages(await resp.json());
       } catch (e) {
-        const r = row('err'); const b = document.createElement('div'); b.className = 'bubble';
-        b.textContent = '⚠️ ' + e.message + ' — is a bundle deployed? Try: gtc op deploy --bundle <file>';
-        r.appendChild(b); scroll();
+        bubble('err', '⚠️ ' + e.message + ' — is a bundle deployed? Try: gtc op deploy --bundle <file>');
       }
     }
 
