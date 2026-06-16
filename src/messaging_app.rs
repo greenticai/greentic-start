@@ -1478,6 +1478,7 @@ mod tests {
                     kind: "messaging".to_string(),
                 },
             ],
+            capabilities: Vec::new(),
         };
         assert_eq!(
             select_app_flow(&info)
@@ -1506,10 +1507,14 @@ mod tests {
                     kind: "messaging".to_string(),
                 },
             ],
+            capabilities: Vec::new(),
         };
         let err = select_app_flow(&info)
             .expect_err("non-messaging `main` should not satisfy the fallback");
-        assert!(err.to_string().contains("alpha, beta"));
+        assert!(
+            err.to_string()
+                .contains("alpha (kind=messaging), beta (kind=messaging)")
+        );
     }
 
     #[test]
