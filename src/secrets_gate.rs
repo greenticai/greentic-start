@@ -551,33 +551,15 @@ pub fn canonical_secret_uri(
     )
 }
 
+/// Derive the env-var lookup key for a 5-segment `secrets://` store URI.
+///
+/// Delegates to `greentic-secrets`
+/// ([`greentic_secrets_lib::canonical_secret_store_key`]) — the single shared
+/// definition the runtime reader and the deployer's resolver both use, so a
+/// secret exported as an env var is found under exactly the key it was written
+/// as.
 pub fn canonical_secret_store_key(uri: &str) -> Option<String> {
-    let trimmed = uri.strip_prefix("secrets://")?;
-    let segments: Vec<&str> = trimmed.split('/').collect();
-    if segments.len() != 5 {
-        return None;
-    }
-    let normalized = segments
-        .into_iter()
-        .map(normalize_store_segment)
-        .collect::<Vec<_>>();
-    let mut parts = vec!["GREENTIC_SECRET".to_string()];
-    parts.extend(normalized);
-    Some(parts.join("__"))
-}
-
-fn normalize_store_segment(segment: &str) -> String {
-    let mut normalized = String::with_capacity(segment.len());
-    for ch in segment.chars() {
-        let replacement = match ch {
-            'A'..='Z' | '0'..='9' => ch,
-            'a'..='z' => ch.to_ascii_uppercase(),
-            '_' => '_',
-            _ => '_',
-        };
-        normalized.push(replacement);
-    }
-    normalized
+    greentic_secrets_lib::canonical_secret_store_key(uri)
 }
 
 fn secret_uri_candidates(
