@@ -484,6 +484,10 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // assets under revisions stay on the legacy `--bundle` ingress.
         let revision_boot::RuntimeConfigActivation { host, routing } = activation;
         let bind_addr = revision_serve::resolve_bind_addr(Some(&environment.host_config));
+        // On by default for the `local` env, off elsewhere unless the operator
+        // opted in (`op config set gui_enabled` / env-manifest). When on, the
+        // server serves the built-in webchat console at `/chat`.
+        let gui_enabled = environment.host_config.resolved_gui_enabled();
         let activation = std::sync::Arc::new(revision_serve::Activation {
             host: std::sync::Arc::new(host),
             routing: std::sync::Arc::new(routing),
@@ -491,6 +495,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let server = revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
             bind_addr,
             activation: std::sync::Arc::clone(&activation),
+            gui_enabled,
         })
         .context("starting the revision ingress server")?;
         let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
@@ -510,6 +515,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         };
         operator_log::info(module_path!(), banner.clone());
         println!("\n{banner}. Press Ctrl+C to stop.");
+        if gui_enabled {
+            let chat = format!("webchat console enabled — open http://{listen}/chat");
+            operator_log::info(module_path!(), chat.clone());
+            println!("{chat}");
+        }
 
         // `--cloudflared on` / `--ngrok on`: spawn the quick tunnel against
         // the port the server actually bound (it can differ from the

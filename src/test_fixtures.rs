@@ -115,6 +115,7 @@ pub(crate) fn env_with(endpoints: Vec<MessagingEndpoint>) -> Environment {
             tenant_org_id: None,
             listen_addr: None,
             public_base_url: None,
+            gui_enabled: None,
         },
         packs: Vec::new(),
         messaging_endpoints: endpoints,

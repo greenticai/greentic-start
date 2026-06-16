@@ -472,6 +472,7 @@ mod tests {
             RevisionServer::start(RevisionServeConfig {
                 bind_addr: bind,
                 activation,
+                gui_enabled: false,
             })
             .expect("placeholder server"),
         )
@@ -702,6 +703,7 @@ mod tests {
                 tenant_org_id: None,
                 listen_addr: None,
                 public_base_url: None,
+                gui_enabled: None,
             },
             packs: Vec::new(),
             messaging_endpoints: endpoints,
