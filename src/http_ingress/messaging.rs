@@ -80,7 +80,12 @@ pub(super) fn route_messaging_envelopes(
                 None => original,
             },
         };
-        let outputs = if let Some(route_to_card) = envelope.metadata.get("routeToCardId") {
+        let outputs = if let Some(route_to_card) = envelope
+            .metadata
+            .get("routeToCardId")
+            .or_else(|| envelope.metadata.get("toCardId"))
+            .or_else(|| envelope.metadata.get("nextCardId"))
+        {
             match read_card_from_pack(&app_pack_path, route_to_card) {
                 Some(mut card_json) => {
                     operator_log::info(
@@ -522,6 +527,7 @@ use anyhow::Context;
 const ROUTING_META_KEYS: &[&str] = &[
     "routeToCardId",
     "toCardId",
+    "nextCardId",
     "action_id",
     "adaptive_card",
     "locale",
@@ -1080,6 +1086,74 @@ mod tests {
             result.is_err(),
             "expected error because no messaging provider pack is available"
         );
+    }
+
+    #[test]
+    fn route_messaging_envelopes_card_routing_accepts_next_card_id_alias() {
+        // The designer emits card navigation under `nextCardId`; the demo host
+        // must treat it as an alias for `routeToCardId` and take the same
+        // card-routing fast-path. Without a provider pack, egress fails — which
+        // confirms the fast-path (read_card_from_pack) was entered rather than
+        // falling through to the app flow.
+        let dir = tempdir().expect("tempdir");
+        let packs_dir = dir.path().join("packs");
+        std::fs::create_dir_all(&packs_dir).expect("packs dir");
+        let app_pack = packs_dir.join("default.gtpack");
+        write_test_app_pack(&app_pack);
+
+        let discovery = crate::discovery::discover(dir.path()).expect("discovery");
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
+                .expect("secrets");
+        let runner_host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )
+        .expect("runner host");
+
+        let mut card_routed = envelope();
+        card_routed
+            .metadata
+            .insert("nextCardId".to_string(), "welcome".to_string());
+
+        let result = route_messaging_envelopes(
+            dir.path(),
+            &runner_host,
+            "messaging-webchat",
+            &OperatorContext {
+                tenant: "demo".to_string(),
+                team: Some("default".to_string()),
+                correlation_id: None,
+            },
+            vec![card_routed],
+        );
+        assert!(
+            result.is_err(),
+            "expected egress error, proving the nextCardId alias took the card-routing fast-path"
+        );
+    }
+
+    #[test]
+    fn next_card_id_is_a_routing_key_and_not_carried_as_form_data() {
+        assert!(ROUTING_META_KEYS.contains(&"nextCardId"));
+
+        let mut card = json!({
+            "actions": [
+                { "type": "Action.Submit", "data": { "nextCardId": "second" } }
+            ]
+        });
+        let mut meta = std::collections::BTreeMap::new();
+        meta.insert("full_name".to_string(), "Alice".to_string());
+        meta.insert("nextCardId".to_string(), "second".to_string());
+
+        carry_form_data_to_actions(&mut card, &meta);
+
+        let data = &card["actions"][0]["data"];
+        assert_eq!(data["full_name"], "Alice", "form data is carried forward");
+        assert_eq!(data["nextCardId"], "second");
     }
 
     use std::io::Write;
