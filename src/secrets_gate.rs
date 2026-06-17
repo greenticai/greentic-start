@@ -315,6 +315,12 @@ pub fn resolve_secrets_manager(
             let (manager, store_path, using_env_fallback) =
                 fallback_to_env(allow_env, "<selection>".to_string(), "<none>", err)?;
             let manager = CachingSecretsManager::wrap(manager);
+            let manager = crate::oauth_secret_bridge::OAuthBridgingSecretsManager::wrap(
+                manager,
+                Some(Arc::new(
+                    crate::oauth_secret_bridge::NoopProviderTokenResolver,
+                )),
+            );
             return Ok(SecretsManagerHandle {
                 manager,
                 selection: secrets_manager::SecretsManagerSelection {
@@ -398,6 +404,16 @@ pub fn resolve_secrets_manager(
         );
     }
     let manager = CachingSecretsManager::wrap(manager);
+    // OAuth bake-in (host resolver): intercept `auth.oauth2.*.access_token` reads
+    // and resolve a valid token via greentic-oauth (mint/refresh). With the no-op
+    // resolver these fall through to the store unchanged; the greentic-oauth-backed
+    // resolver is wired in separately.
+    let manager = crate::oauth_secret_bridge::OAuthBridgingSecretsManager::wrap(
+        manager,
+        Some(Arc::new(
+            crate::oauth_secret_bridge::NoopProviderTokenResolver,
+        )),
+    );
     Ok(SecretsManagerHandle {
         manager,
         selection,
@@ -500,6 +516,16 @@ fn resolve_bound_secrets_manager(
     );
 
     let manager = CachingSecretsManager::wrap(manager);
+    // OAuth bake-in (host resolver): intercept `auth.oauth2.*.access_token` reads
+    // and resolve a valid token via greentic-oauth (mint/refresh). With the no-op
+    // resolver these fall through to the store unchanged; the greentic-oauth-backed
+    // resolver is wired in separately.
+    let manager = crate::oauth_secret_bridge::OAuthBridgingSecretsManager::wrap(
+        manager,
+        Some(Arc::new(
+            crate::oauth_secret_bridge::NoopProviderTokenResolver,
+        )),
+    );
     Ok(SecretsManagerHandle {
         manager,
         selection,
