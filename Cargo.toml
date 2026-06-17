@@ -84,3 +84,11 @@ tempfile = "3"
 [[bench]]
 name = "perf"
 harness = false
+
+# Local override: build against the in-tree greentic-runner that fixes the
+# reverse-DNS component-id truncation (ai.greentic.* -> ai.greentic). Local
+# only — not for commit.
+[patch.crates-io]
+greentic-runner-host = { path = "../greentic-runner/crates/greentic-runner-host" }
+greentic-runner-desktop = { path = "../greentic-runner/crates/greentic-runner-desktop" }
+runner-core = { path = "../greentic-runner/crates/runner-core" }

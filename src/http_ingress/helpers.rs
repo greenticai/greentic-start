@@ -237,6 +237,182 @@ where
     }
 }
 
+/// URL-decode a query component (minimal: handles %XX and `+`).
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(b);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let mut it = pair.splitn(2, '=');
+        if it.next()? == key {
+            Some(url_decode(it.next().unwrap_or("")))
+        } else {
+            None
+        }
+    })
+}
+
+/// Our own OAuth callback: `GET /oauth/callback/<provider>?code=&state=`.
+/// `state` is the host-minted signed token (see `crate::oauth_state`) carrying
+/// the full context. We verify it, read the PACK-SCOPED `client_id`/`client_secret`
+/// the bundle author provided at setup, exchange the code, and persist the token
+/// at the pack-scoped `access_token` key the MCP adapter reads — for any pack /
+/// provider / tenant, with CSRF protection from the signature.
+pub(super) async fn handle_oauth_callback(
+    query: &str,
+    _provider: &str,
+    manager: crate::secrets_gate::DynSecretsManager,
+) -> Response<Full<Bytes>> {
+    let code = query_param(query, "code").unwrap_or_default();
+    let state = query_param(query, "state").unwrap_or_default();
+    if code.is_empty() {
+        return oauth_callback_page(false, "Missing authorization code.");
+    }
+    let Some(ctx) = crate::oauth_state::verify(&state) else {
+        return oauth_callback_page(
+            false,
+            "Invalid or expired sign-in state — please retry sign-in from the chat.",
+        );
+    };
+
+    // Same env resolution the runner scopes component secrets with, so the key we
+    // write matches the key the adapter reads.
+    let env = crate::secrets_setup::resolve_env(None);
+    let team_seg = crate::oauth_state::team_segment(&ctx.team);
+    // Pack-scoped secret URI for `auth.oauth2.<scheme>.<suffix>`.
+    let key_uri = |suffix: &str| -> String {
+        let canon = crate::oauth_state::canonical_secret_name(&format!(
+            "auth.oauth2.{}.{}",
+            ctx.scheme, suffix
+        ));
+        format!(
+            "secrets://{}/{}/{}/{}/{}",
+            env, ctx.tenant, team_seg, ctx.pack, canon
+        )
+    };
+    let read = |uri: String| {
+        let m = manager.clone();
+        async move {
+            m.read(&uri)
+                .await
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+        }
+    };
+    let cid = read(key_uri("client_id")).await.unwrap_or_default();
+    let csec = read(key_uri("client_secret")).await.unwrap_or_default();
+    if cid.is_empty() || csec.is_empty() {
+        return oauth_callback_page(
+            false,
+            "OAuth client_id/secret not configured for this pack — run gtc setup and enter them.",
+        );
+    }
+
+    let token_url = match ctx.provider.as_str() {
+        "github" => "https://github.com/login/oauth/access_token".to_string(),
+        _ => return oauth_callback_page(false, "Unsupported provider."),
+    };
+    fn enc(s: &str) -> String {
+        s.chars()
+            .map(|c| match c {
+                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+                _ => format!("%{:02X}", c as u8),
+            })
+            .collect()
+    }
+    // No redirect_uri: the authorize request omitted it, so the provider used the
+    // OAuth App's registered callback — the exchange must omit it too.
+    let form = format!(
+        "grant_type=authorization_code&code={}&client_id={}&client_secret={}",
+        enc(&code),
+        enc(&cid),
+        enc(&csec),
+    );
+
+    let token_url_owned = token_url.clone();
+    let exchanged = tokio::task::spawn_blocking(move || {
+        ureq::post(&token_url_owned)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .send(form.as_bytes())
+            .and_then(|mut r| r.body_mut().read_to_string())
+    })
+    .await;
+
+    let body = match exchanged {
+        Ok(Ok(body)) => body,
+        Ok(Err(err)) => {
+            return oauth_callback_page(false, &format!("Token exchange failed: {err}"));
+        }
+        Err(err) => return oauth_callback_page(false, &format!("Exchange task error: {err}")),
+    };
+    let access_token = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("access_token")
+                .and_then(|t| t.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_default();
+    if access_token.is_empty() {
+        return oauth_callback_page(false, &format!("No access_token in response: {body}"));
+    }
+
+    // Persist at the pack-scoped access_token key the MCP adapter reads directly.
+    let key = key_uri("access_token");
+    if let Err(err) = manager.write(&key, access_token.as_bytes()).await {
+        return oauth_callback_page(false, &format!("Failed to persist token: {err}"));
+    }
+    crate::operator_log::info(
+        module_path!(),
+        format!("[oauth-callback] persisted {} token at {key}", ctx.provider),
+    );
+    oauth_callback_page(true, "Signed in. Return to the chat and ask again.")
+}
+
+fn oauth_callback_page(ok: bool, msg: &str) -> Response<Full<Bytes>> {
+    let title = if ok { "Connected" } else { "Sign-in failed" };
+    let html = format!(
+        "<!doctype html><html><head><meta charset=utf-8><title>{title}</title></head>\
+         <body style=\"font-family:system-ui;max-width:32rem;margin:4rem auto;text-align:center\">\
+         <h2>{title}</h2><p>{msg}</p><p>You can close this tab.</p></body></html>"
+    );
+    Response::builder()
+        .status(if ok {
+            StatusCode::OK
+        } else {
+            StatusCode::BAD_REQUEST
+        })
+        .header("Content-Type", "text/html; charset=utf-8")
+        .body(Full::new(Bytes::from(html)))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from(msg.to_string()))))
+}
+
 use crate::domains::Domain;
 
 pub(super) fn parse_domain(value: &str) -> Option<Domain> {

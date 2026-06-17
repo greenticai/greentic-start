@@ -300,13 +300,114 @@ pub fn run_app_flow(
         return parse_envelopes(&error_value, envelope);
     }
 
-    let value = collect_transcript_outputs_with_retry(
+    let mut value = collect_transcript_outputs_with_retry(
         &output.run_dir,
         target_node.map(|s| s.as_str()),
         envelope,
     )?
     .ok_or_else(|| anyhow::anyhow!("app flow produced no outputs"))?;
+    // OAuth bake-in: the adapter's Connect card carries a `scheme|provider` state;
+    // mint a signed state token (host knows pack/tenant/team) so /oauth/callback
+    // can resolve pack-scoped creds + persist the token.
+    augment_oauth_connect_state(
+        &mut value,
+        pack_id,
+        &ctx.tenant,
+        ctx.team.as_deref().unwrap_or("default"),
+    );
     parse_envelopes(&value, envelope)
+}
+
+/// Replace the adapter's `state=scheme|provider` in a Connect card's authorize URL
+/// with a host-signed `crate::oauth_state` token carrying the full context.
+fn augment_oauth_connect_state(value: &mut JsonValue, pack_id: &str, tenant: &str, team: &str) {
+    let Some(actions) = value
+        .pointer_mut("/renderedCard/actions")
+        .and_then(|a| a.as_array_mut())
+    else {
+        return;
+    };
+    for action in actions.iter_mut() {
+        let Some(url) = action.get("url").and_then(|u| u.as_str()).map(String::from) else {
+            continue;
+        };
+        if !url.contains("oauth/authorize") {
+            continue;
+        }
+        let Some(raw_state) = url_query_value(&url, "state") else {
+            continue;
+        };
+        let Some((scheme, provider)) = raw_state.split_once('|') else {
+            continue;
+        };
+        if scheme.is_empty() || provider.is_empty() {
+            continue;
+        }
+        let signed = crate::oauth_state::mint(&crate::oauth_state::OAuthStateContext {
+            pack: pack_id.to_string(),
+            scheme: scheme.to_string(),
+            provider: provider.to_string(),
+            tenant: tenant.to_string(),
+            team: team.to_string(),
+            subject: "user".to_string(),
+            exp: chrono::Utc::now().timestamp() + 600,
+        });
+        let new_url = replace_query_value(&url, "state", &signed);
+        action["url"] = JsonValue::String(new_url);
+    }
+}
+
+/// Minimal `%XX`/`+` decode for a query value.
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                Ok(v) => {
+                    out.push(v);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn url_query_value(url: &str, key: &str) -> Option<String> {
+    let q = url.split_once('?')?.1;
+    q.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| pct_decode(v))
+    })
+}
+
+/// Replace `key=<old>` with `key=<new>` (new is URL-safe; written verbatim).
+fn replace_query_value(url: &str, key: &str, new: &str) -> String {
+    let Some((base, q)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let rebuilt: Vec<String> = q
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((k, _)) if k == key => format!("{key}={new}"),
+            _ => pair.to_string(),
+        })
+        .collect();
+    format!("{base}?{}", rebuilt.join("&"))
 }
 
 /// Merge top-level keys from `<bundle>/state/config/<pack_id>/setup-answers.json`

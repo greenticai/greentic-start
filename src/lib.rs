@@ -39,6 +39,7 @@ mod metrics;
 mod ngrok;
 pub mod notifier;
 mod oauth_secret_bridge;
+mod oauth_state;
 mod offers;
 mod onboard;
 mod operator_i18n;

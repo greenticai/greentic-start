@@ -43,8 +43,8 @@ use admin_relay::{
 use conv_dedup::{ConversationDedupCache, DedupKey, extract_user_id};
 use helpers::{
     build_http_response, collect_headers, collect_queries, cors_preflight_response, domain_name,
-    error_response, handle_builtin_health_request, handle_oauth_token_exchange, parse_domain,
-    parse_route_segments, with_cors,
+    error_response, handle_builtin_health_request, handle_oauth_callback,
+    handle_oauth_token_exchange, parse_domain, parse_route_segments, with_cors,
 };
 use messaging::route_messaging_envelopes;
 use static_handler::serve_static_route;
@@ -464,6 +464,19 @@ where
         return crate::onboard::api::handle_onboard_request(req, &path, &state.runner_host)
             .await
             .map_err(|err| *err);
+    }
+
+    // Our own OAuth callback: GET /oauth/callback/<provider> — exchanges the code
+    // and persists the token at oauth/<provider>/access_token (read by the MCP
+    // bake-in resolver). This is the bake-in card flow's redirect target.
+    if path.starts_with("/oauth/callback/") && req.method() == Method::GET {
+        let provider = path
+            .trim_start_matches("/oauth/callback/")
+            .trim_end_matches('/')
+            .to_string();
+        let query = req.uri().query().unwrap_or("").to_string();
+        let manager = state.runner_host.secrets_manager();
+        return Ok(handle_oauth_callback(&query, &provider, manager).await);
     }
 
     // OAuth token exchange proxy: /v1/messaging/webchat/{tenant}/oauth/token-exchange

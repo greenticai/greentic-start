@@ -404,16 +404,14 @@ pub fn resolve_secrets_manager(
         );
     }
     let manager = CachingSecretsManager::wrap(manager);
-    // OAuth bake-in (host resolver): intercept `auth.oauth2.*.access_token` reads
-    // and resolve a valid token via greentic-oauth (mint/refresh). With the no-op
-    // resolver these fall through to the store unchanged; the greentic-oauth-backed
-    // resolver is wired in separately.
-    let manager = crate::oauth_secret_bridge::OAuthBridgingSecretsManager::wrap(
-        manager,
-        Some(Arc::new(
-            crate::oauth_secret_bridge::NoopProviderTokenResolver,
-        )),
-    );
+    // OAuth bake-in (Phase 4, signed-state flow): our `/oauth/callback` now
+    // persists the token at the SAME pack-scoped key the adapter reads
+    // (`secrets://<env>/<tenant>/<team>/<pack>/auth_oauth2_<scheme>_access_token`),
+    // so the component's natural scoped read resolves it directly — no bridge.
+    // (The interim provider-scoped redirect lives in `oauth_secret_bridge`; pass
+    // `None` to keep it dormant and avoid a stale provider-scoped token shadowing
+    // the freshly minted pack-scoped one.)
+    let manager = crate::oauth_secret_bridge::OAuthBridgingSecretsManager::wrap(manager, None);
     Ok(SecretsManagerHandle {
         manager,
         selection,

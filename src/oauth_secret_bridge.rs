@@ -1,5 +1,11 @@
 //! OAuth bake-in token bridge (host resolver — "Option A").
 //!
+//! Retained as a dormant fallback: the Phase 4 signed-state flow persists the
+//! token directly at the adapter's pack-scoped key, so `secrets_gate` wires this
+//! bridge with `resolver = None`. The provider-scoped resolver below is kept for
+//! the broker-backed (greentic-oauth refresh) path and its tests.
+#![allow(dead_code)]
+//!
 //! The MCP bake-in adapter/router read an OAuth access token from the secret
 //! store under a per-tool key like `auth.oauth2.<scheme>.access_token` (scoped to
 //! `secrets://<env>/<tenant>/<team>/<segment>/auth_oauth2_<scheme>_access_token`).
@@ -42,9 +48,6 @@ impl OAuthTokenKey {
     /// security-scheme name (e.g. `githuboauth`); the broker is keyed by provider
     /// id (e.g. `github`). Default heuristic: drop a trailing `oauth`/`oidc`
     /// suffix; otherwise use the scheme as-is. Callers can override via a map.
-    // Used by tests + the BrokerTokenResolver; the broker resolver is wired into
-    // production in the next phase (currently the no-op resolver is active).
-    #[allow(dead_code)]
     pub fn provider_id(&self) -> String {
         let s = self.scheme.as_str();
         for suffix in ["_oauth", "oauth", "_oidc", "oidc"] {
@@ -73,8 +76,6 @@ pub trait ProviderTokenResolver: Send + Sync {
 /// greentic-oauth-broker; kept as a seam so this module stays free of the broker
 /// dependency and is unit-testable. `subject = None` is the shared-credential
 /// mode; `Some(subject)` is user-owned (per the credential-modes design).
-// Implemented over greentic-oauth-broker and wired into production next phase.
-#[allow(dead_code)]
 #[async_trait]
 pub trait ProviderTokenFetch: Send + Sync {
     async fn fetch(
@@ -88,15 +89,11 @@ pub trait ProviderTokenFetch: Send + Sync {
 
 /// [`ProviderTokenResolver`] that maps the MCP key to a broker token request and
 /// delegates to a [`ProviderTokenFetch`] (the greentic-oauth-broker integration).
-// Constructed in production once the broker ProviderTokenFetch is wired (next
-// phase); currently exercised by tests + the NoopProviderTokenResolver is active.
-#[allow(dead_code)]
 pub struct BrokerTokenResolver<F: ProviderTokenFetch> {
     fetch: F,
 }
 
 impl<F: ProviderTokenFetch> BrokerTokenResolver<F> {
-    #[allow(dead_code)]
     pub fn new(fetch: F) -> Self {
         Self { fetch }
     }
@@ -110,6 +107,48 @@ impl<F: ProviderTokenFetch> ProviderTokenResolver for BrokerTokenResolver<F> {
         self.fetch
             .fetch(&key.provider_id(), &key.tenant, &key.team, None)
             .await
+    }
+}
+
+/// Canonical secret URI where our own OAuth callback persists a provider access
+/// token: `secrets://<env>/<tenant>/<team>/oauth/<provider>/access_token`.
+/// Shared by the callback (write) and the resolver (read).
+pub fn provider_token_uri(env: &str, tenant: &str, team: &str, provider_id: &str) -> String {
+    // Store URI is exactly secrets://<env>/<tenant>/<team>/<provider>/<key> (5
+    // segments); the provider segment is the provider id, the key is access_token.
+    format!("secrets://{env}/{tenant}/{team}/{provider_id}/access_token")
+}
+
+/// Resolver for our own OAuth card flow: when the MCP component reads
+/// `auth.oauth2.<scheme>.access_token`, return the token our `/oauth/callback`
+/// persisted at `oauth/<provider>/access_token` (scheme→provider mapped). Reads
+/// the inner secret store directly (no broker, no host call → no chicken-egg).
+pub struct SecretStoreResolver {
+    inner: DynSecretsManager,
+}
+
+impl SecretStoreResolver {
+    pub fn new(inner: DynSecretsManager) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl ProviderTokenResolver for SecretStoreResolver {
+    async fn resolve_access_token(&self, key: &OAuthTokenKey) -> Option<String> {
+        let uri = provider_token_uri(&key.env, &key.tenant, &key.team, &key.provider_id());
+        match self.inner.read(&uri).await {
+            Ok(bytes) => {
+                let token = String::from_utf8(bytes).ok()?;
+                let token = token.trim();
+                if token.is_empty() {
+                    None
+                } else {
+                    Some(token.to_string())
+                }
+            }
+            Err(_) => None,
+        }
     }
 }
 
@@ -301,11 +340,10 @@ mod tests {
     }
 
     /// (provider_id, tenant, team, subject) captured by the stub.
-    type SeenCall = (String, String, String, Option<String>);
-
+    type SeenFetch = (String, String, String, Option<String>);
     struct StubFetch {
         token: Option<String>,
-        seen: Mutex<Option<SeenCall>>,
+        seen: Mutex<Option<SeenFetch>>,
     }
     #[async_trait]
     impl ProviderTokenFetch for StubFetch {
