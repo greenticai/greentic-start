@@ -539,10 +539,14 @@ pub fn canonical_secret_uri(
     key: &str,
 ) -> String {
     let team_segment = secrets_manager::canonical_team(team);
+    // Normalize the provider segment the same way as the key (and as the cloud
+    // secret name / env-bridge key already do), so a value written under a
+    // provider id like `messaging-webchat-gui` resolves when a component fetches
+    // it under `messaging.webchat-gui` — both collapse to `messaging_webchat_gui`.
     let provider_segment = if provider.is_empty() {
         "messaging".to_string()
     } else {
-        provider.to_string()
+        secret_name::canonical_secret_name(provider)
     };
     let normalized_key = secret_name::canonical_secret_name(key);
     format!(
@@ -955,6 +959,32 @@ mod tests {
     fn canonical_uri_uses_team_placeholder() {
         let uri = canonical_secret_uri("demo", "acme", None, "messaging", "FOO");
         assert_eq!(uri, "secrets://demo/acme/_/messaging/foo");
+    }
+
+    #[test]
+    fn canonical_uri_normalizes_provider_segment() {
+        // A secret stored under the pack provider id `messaging-webchat-gui`
+        // must resolve when a component fetches it under its dotted manifest id
+        // `messaging.webchat-gui` — both collapse to `messaging_webchat_gui`.
+        let stored = canonical_secret_uri(
+            "dev",
+            "demo",
+            None,
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
+        let fetched = canonical_secret_uri(
+            "dev",
+            "demo",
+            None,
+            "messaging.webchat-gui",
+            "jwt_signing_key",
+        );
+        assert_eq!(stored, fetched);
+        assert_eq!(
+            stored,
+            "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key"
+        );
     }
 
     #[test]
