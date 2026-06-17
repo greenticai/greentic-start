@@ -174,21 +174,34 @@ impl SecretsManager for LoggingSecretsManager {
                 Ok(value)
             }
             Err(err) => {
-                // Fallback: if team-specific secret not found, try team="_" (wildcard).
-                // Secrets saved at tenant-level (no team) live under "_" but runtime
-                // may read with a specific team from the routing context.
+                // Fallback candidates. The dev store canonicalizes the provider/key
+                // segments at write time (setup uses canonical_secret_name), but the
+                // WASM provider-invoke path in the external runner-host crate requests
+                // the raw pack-stem provider (e.g. `messaging-webchat-gui`), so a
+                // verbatim lookup misses the stored `messaging_webchat_gui`. Try the
+                // canonicalized URI, plus the team="_" wildcard variants (secrets saved
+                // at tenant-level live under "_" but the runtime may read with a
+                // specific team from the routing context).
+                let mut candidates: Vec<String> = Vec::new();
+                if let Some(canon) = canonicalize_provider_segment(path) {
+                    candidates.push(canon);
+                }
                 if let Some(fallback_path) = team_wildcard_fallback(path) {
+                    if let Some(canon_fb) = canonicalize_provider_segment(&fallback_path) {
+                        candidates.push(canon_fb);
+                    }
+                    candidates.push(fallback_path);
+                }
+                for candidate in candidates {
                     operator_log::info(
                         module_path!(),
-                        format!(
-                            "WASM secrets read fallback: team-specific not found, trying uri={fallback_path}",
-                        ),
+                        format!("WASM secrets read fallback: trying uri={candidate}"),
                     );
-                    if let Ok(value) = self.inner.read(&fallback_path).await {
+                    if let Ok(value) = self.inner.read(&candidate).await {
                         operator_log::debug(
                             module_path!(),
                             format!(
-                                "WASM secrets read fallback resolved uri={fallback_path}; value={}",
+                                "WASM secrets read fallback resolved uri={candidate}; value={}",
                                 SecretValue::new(value.as_slice()),
                             ),
                         );
@@ -224,6 +237,29 @@ fn team_wildcard_fallback(path: &str) -> Option<String> {
     Some(format!(
         "secrets://{}/{}/{}/{}/{}",
         segments[0], segments[1], "_", segments[3], segments[4]
+    ))
+}
+
+/// If `path` is `secrets://env/tenant/team/provider/key`, return the same URI with the
+/// provider and key segments canonicalized (lowercase, `-`/`.`/`/`/space -> `_`) to match
+/// how setup/store keys are normalized at write time. Returns None if it is already
+/// canonical or not a 5-segment `secrets://` URI. This bridges the external runner-host
+/// requesting a raw pack-stem provider (e.g. `messaging-webchat-gui`) against a store
+/// keyed by the canonical `messaging_webchat_gui`.
+fn canonicalize_provider_segment(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("secrets://")?;
+    let segments: Vec<&str> = trimmed.split('/').collect();
+    if segments.len() != 5 {
+        return None;
+    }
+    let canonical_provider = secret_name::canonical_secret_name(segments[3]);
+    let canonical_key = secret_name::canonical_secret_name(segments[4]);
+    if canonical_provider == segments[3] && canonical_key == segments[4] {
+        return None;
+    }
+    Some(format!(
+        "secrets://{}/{}/{}/{}/{}",
+        segments[0], segments[1], segments[2], canonical_provider, canonical_key
     ))
 }
 const ENV_ALLOW_ENV_SECRETS: &str = "GREENTIC_ALLOW_ENV_SECRETS";
@@ -985,6 +1021,42 @@ mod tests {
             stored,
             "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key"
         );
+    }
+
+    #[test]
+    fn canonicalize_provider_segment_normalizes_provider_and_key() {
+        // The external runner-host requests the raw pack-stem provider; the read
+        // chokepoint must canonicalize it to match the stored key.
+        assert_eq!(
+            canonicalize_provider_segment(
+                "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key"
+            ),
+            Some("secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key".to_string())
+        );
+        // Dotted manifest id collapses the same way.
+        assert_eq!(
+            canonicalize_provider_segment(
+                "secrets://dev/demo/team-a/messaging.webchat-gui/JWT-Signing-Key"
+            ),
+            Some("secrets://dev/demo/team-a/messaging_webchat_gui/jwt_signing_key".to_string())
+        );
+    }
+
+    #[test]
+    fn canonicalize_provider_segment_skips_already_canonical_and_malformed() {
+        // Already canonical -> None (no redundant retry).
+        assert_eq!(
+            canonicalize_provider_segment(
+                "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key"
+            ),
+            None
+        );
+        // Not a 5-segment secrets URI -> None.
+        assert_eq!(
+            canonicalize_provider_segment("secrets://dev/demo/_/key"),
+            None
+        );
+        assert_eq!(canonicalize_provider_segment("not-a-secret-uri"), None);
     }
 
     #[test]
