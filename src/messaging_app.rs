@@ -254,7 +254,8 @@ pub fn run_app_flow(
     let target_node = envelope_for_flow
         .metadata
         .get("routeToCardId")
-        .or_else(|| envelope_for_flow.metadata.get("toCardId"));
+        .or_else(|| envelope_for_flow.metadata.get("toCardId"))
+        .or_else(|| envelope_for_flow.metadata.get("nextCardId"));
     operator_log::info(
         module_path!(),
         format!(
