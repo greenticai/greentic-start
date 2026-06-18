@@ -214,17 +214,16 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
 
     // Initialize operator.log before any fallible setup so startup failures (bad
     // bundle.yaml, missing config, unreadable paths) leave an on-disk trace.
-    let early_log_dir = request.log_dir.clone().unwrap_or_else(|| {
-        request
-            .bundle
-            .as_deref()
-            .map(|b| PathBuf::from(b).join("logs"))
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join("logs")
-            })
-    });
+    //
+    // Default log dir selection must never resolve to an unwritable path: in
+    // cloud/operator mode `--bundle` is a URL or a read-only mount, and the root
+    // filesystem may be read-only for security, so `<bundle>/logs` and `<cwd>/logs`
+    // both fail and the operator blocks at log init. Only use `<bundle>/logs` when
+    // the bundle is an existing local directory (local dev); otherwise fall back to
+    // a writable scratch dir under the system temp dir. Operators can always pin it
+    // explicitly with `--log-dir`.
+    let early_log_dir =
+        default_operator_log_dir(request.log_dir.clone(), request.bundle.as_deref());
     let log_dir = operator_log::init(early_log_dir, log_level)?;
 
     let (peeked_telemetry, peeked_service_name) = peek_startup_telemetry(&request);
@@ -721,6 +720,27 @@ fn resolve_state_dir(state_dir: Option<PathBuf>, bundle: Option<&str>) -> anyhow
     Ok(PathBuf::from("state"))
 }
 
+/// Choose the operator log directory without ever resolving to an unwritable path.
+///
+/// Honors an explicit `--log-dir`. Otherwise it uses `<bundle>/logs` only when the
+/// bundle is an existing local directory (local dev, where users expect logs beside
+/// the bundle); for a URL / `.gtbundle` file / read-only mount — i.e. cloud/operator
+/// mode, possibly under a read-only root filesystem — it falls back to a writable
+/// scratch dir under the system temp dir instead of an unwritable `<bundle>/logs` or
+/// `<cwd>/logs`.
+fn default_operator_log_dir(log_dir: Option<PathBuf>, bundle: Option<&str>) -> PathBuf {
+    if let Some(dir) = log_dir {
+        return dir;
+    }
+    if let Some(bundle) = bundle {
+        let candidate = PathBuf::from(bundle);
+        if candidate.is_dir() {
+            return candidate.join("logs");
+        }
+    }
+    std::env::temp_dir().join("greentic-start").join("logs")
+}
+
 /// Tunnel configuration loaded from `.greentic/tunnel.json`.
 /// Written by `greentic-setup` when `platform_setup.tunnel` is present in
 /// the setup answers document.
@@ -922,6 +942,37 @@ mod tests {
         let state_dir =
             resolve_state_dir(None, Some(bundle.to_string_lossy().as_ref())).expect("state dir");
         assert_eq!(state_dir, bundle.join("state"));
+    }
+
+    #[test]
+    fn default_operator_log_dir_honors_explicit_override() {
+        let explicit = PathBuf::from("/var/run/greentic/logs");
+        assert_eq!(
+            default_operator_log_dir(Some(explicit.clone()), Some("/some/bundle")),
+            explicit
+        );
+    }
+
+    #[test]
+    fn default_operator_log_dir_uses_bundle_logs_for_local_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        assert_eq!(
+            default_operator_log_dir(None, Some(bundle.to_string_lossy().as_ref())),
+            bundle.join("logs")
+        );
+    }
+
+    #[test]
+    fn default_operator_log_dir_falls_back_to_temp_for_non_local_bundle() {
+        // A URL or a read-only mount is not an existing directory, so the default
+        // must land in a writable temp scratch dir, never an unwritable path.
+        let expected = std::env::temp_dir().join("greentic-start").join("logs");
+        assert_eq!(
+            default_operator_log_dir(None, Some("https://example.com/bundle.gtbundle?x=1")),
+            expected
+        );
+        assert_eq!(default_operator_log_dir(None, None), expected);
     }
 
     fn make_start_request(bundle: &Path) -> StartRequest {
