@@ -26,7 +26,15 @@ impl SorInvokeHttp for UreqSorInvoke {
         headers: &[(String, String)],
         body: &str,
     ) -> Result<(u16, String), String> {
-        let mut req = ureq::post(url).header("Content-Type", "application/json");
+        // ureq 3.x treats non-2xx as `Err` by default, which would drop the
+        // SoR error-envelope body and misreport a 4xx/5xx as a transport
+        // failure. Disable that so every HTTP response (incl. 4xx/5xx) comes
+        // back as `Ok(resp)` and the status+body are mapped uniformly.
+        let mut req = ureq::post(url)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .header("Content-Type", "application/json");
         for (k, v) in headers {
             req = req.header(k.as_str(), v.as_str());
         }
@@ -177,5 +185,70 @@ mod tests {
         let out = invoke_remote_sor_with(&http, &target(), "cap://x/v1", b"{}", &ctx());
         assert!(!out.success);
         assert!(out.error.is_some());
+    }
+
+    /// Live end-to-end: drives the REAL discovery client + remote executor
+    /// against a running SoRX. Ignored by default (needs an instance on
+    /// 127.0.0.1:9080 with a routable deployment). Run with:
+    /// `cargo test -p greentic-start --lib live_e2e_discover_and_invoke -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "live: requires a SoRX instance on 127.0.0.1:9080"]
+    fn live_e2e_discover_and_invoke() {
+        let base = "http://127.0.0.1:9080";
+
+        // 1. discover over real HTTP (routing-table + /admin/v1/capabilities)
+        let disco = crate::capability_discovery::CapabilityDiscovery::new(
+            Box::new(crate::capability_discovery::HttpSorxDiscoverySource),
+            std::time::Duration::from_secs(60),
+        );
+        let instances = disco.instances(base);
+        assert!(!instances.is_empty(), "expected >=1 discovered instance");
+        let bf_cap = instances
+            .iter()
+            .flat_map(|i| &i.capabilities)
+            .find(|c| c.contains("business-functions"))
+            .cloned()
+            .expect("a business-function capability id");
+        eprintln!(
+            "LIVE discover: {} instance(s); business-function cap = {bf_cap}",
+            instances.len()
+        );
+
+        // 2. register as remote offers + resolve a remote binding (real path)
+        let mut reg = crate::capabilities::CapabilityRegistry::default();
+        reg.register_remote_offers(&instances, base);
+        let scope = crate::capabilities::ResolveScope {
+            env: None,
+            tenant: None,
+            team: None,
+        };
+        let binding = reg.resolve(&bf_cap, None, &scope).expect("remote binding");
+        let remote = binding.remote.clone().expect("binding must be remote");
+        assert_eq!(remote.sor_base_url, base);
+
+        // 3. invoke live over real HTTP POST to /admin/v1/capabilities/invoke
+        let ctx = OperatorContext {
+            tenant: "tenant-e2e".into(),
+            team: None,
+            correlation_id: None,
+        };
+        let out = invoke_remote_sor_with(
+            &UreqSorInvoke,
+            &remote,
+            &binding.cap_id,
+            br#"{"amount":100,"currency":"USD"}"#,
+            &ctx,
+        );
+        eprintln!(
+            "LIVE invoke: success={} error={:?} raw={:?} mode={:?}",
+            out.success, out.error, out.raw, out.mode
+        );
+        // The POST reached the SoR and was processed (success, or a meaningful
+        // SoR error/approval envelope) — either proves the discover->invoke chain.
+        assert_eq!(out.mode, RunnerExecutionMode::RemoteSor);
+        assert!(
+            out.raw.is_some() || out.error.is_some(),
+            "expected a response from the SoR"
+        );
     }
 }
