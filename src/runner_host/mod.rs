@@ -276,6 +276,7 @@ impl DemoRunnerHost {
                 version: offer.version,
                 requires_setup: offer.requires_setup,
                 setup_qa_ref: offer.setup_qa_ref,
+                remote: offer.remote,
             })
             .collect()
     }
