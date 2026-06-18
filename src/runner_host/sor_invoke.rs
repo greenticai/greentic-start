@@ -64,7 +64,13 @@ pub(crate) fn invoke_remote_sor_with(
     } else {
         serde_json::from_slice(payload_bytes).unwrap_or(Value::Null)
     };
-    let body = json!({ "capability": cap_id, "input": input }).to_string();
+    let mut body_obj = json!({ "capability": cap_id, "input": input });
+    // Thread an idempotency key from the operation's correlation id when
+    // present — required by SoR actions whose `idempotency.required` is set.
+    if let Some(corr) = ctx.correlation_id.as_ref().filter(|c| !c.is_empty()) {
+        body_obj["idempotency_key"] = json!(corr);
+    }
+    let body = body_obj.to_string();
     let url = format!(
         "{}/admin/v1/capabilities/invoke",
         target.sor_base_url.trim_end_matches('/')
@@ -185,6 +191,35 @@ mod tests {
         let out = invoke_remote_sor_with(&http, &target(), "cap://x/v1", b"{}", &ctx());
         assert!(!out.success);
         assert!(out.error.is_some());
+    }
+
+    #[test]
+    fn threads_idempotency_key_from_correlation_id() {
+        let http = FakeHttp {
+            status: 200,
+            body: "{}".into(),
+            seen: RefCell::new(None),
+        };
+        let ctx_with_corr = OperatorContext {
+            tenant: "acme".into(),
+            team: None,
+            correlation_id: Some("corr-123".into()),
+        };
+        invoke_remote_sor_with(&http, &target(), "cap://x/v1", b"{}", &ctx_with_corr);
+        let (_, _, body) = http.seen.borrow().clone().unwrap();
+        let bv: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(bv["idempotency_key"], "corr-123");
+
+        // absent correlation id => no idempotency_key field
+        let http2 = FakeHttp {
+            status: 200,
+            body: "{}".into(),
+            seen: RefCell::new(None),
+        };
+        invoke_remote_sor_with(&http2, &target(), "cap://x/v1", b"{}", &ctx());
+        let (_, _, body2) = http2.seen.borrow().clone().unwrap();
+        let bv2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        assert!(bv2.get("idempotency_key").is_none());
     }
 
     /// Live end-to-end: drives the REAL discovery client + remote executor
