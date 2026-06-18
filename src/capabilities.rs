@@ -233,6 +233,50 @@ impl CapabilityRegistry {
             .unwrap_or_default()
     }
 
+    /// Merge discovered SoRLa capabilities as remote offers. Each
+    /// `DiscoveredInstance.capabilities` cap id becomes a remote
+    /// `CapabilityOfferRecord` pointing at `sor_base_url`. Remote offers are
+    /// given the lowest precedence (`priority = i32::MAX`) so a locally
+    /// installed pack offering the same cap id always resolves first.
+    pub fn register_remote_offers(
+        &mut self,
+        instances: &[crate::capability_discovery::DiscoveredInstance],
+        sor_base_url: &str,
+    ) {
+        for instance in instances {
+            for cap_id in &instance.capabilities {
+                self.by_cap_id
+                    .entry(cap_id.clone())
+                    .or_default()
+                    .push(CapabilityOfferRecord {
+                        stable_id: format!("remote::{}::{}", instance.deployment_id, cap_id),
+                        pack_id: format!("sorx::{}", instance.sor_name),
+                        domain: Domain::Messaging,
+                        pack_path: std::path::PathBuf::from("<remote-sor>"),
+                        cap_id: cap_id.clone(),
+                        version: instance.pack_version.clone(),
+                        provider_component_ref: String::new(),
+                        provider_op: String::new(),
+                        priority: i32::MAX,
+                        requires_setup: false,
+                        setup_qa_ref: None,
+                        scope: CapabilityScopeV1::default(),
+                        applies_to_ops: Vec::new(),
+                        remote: Some(RemoteSorTarget {
+                            sor_base_url: sor_base_url.to_string(),
+                        }),
+                    });
+            }
+        }
+        for offers in self.by_cap_id.values_mut() {
+            offers.sort_by(|a, b| {
+                a.priority
+                    .cmp(&b.priority)
+                    .then_with(|| a.stable_id.cmp(&b.stable_id))
+            });
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn insert_record_for_test(&mut self, r: CapabilityOfferRecord) {
         self.by_cap_id.entry(r.cap_id.clone()).or_default().push(r);
@@ -698,16 +742,77 @@ mod tests {
             setup_qa_ref: None,
             scope: CapabilityScopeV1::default(),
             applies_to_ops: Vec::new(),
-            remote: Some(RemoteSorTarget { sor_base_url: "http://sorx:9080".into() }),
+            remote: Some(RemoteSorTarget {
+                sor_base_url: "http://sorx:9080".into(),
+            }),
         });
         let b = reg
             .resolve(
                 "cap://greentic/business-functions/landlord/pay/v1",
                 None,
-                &ResolveScope { env: None, tenant: None, team: None },
+                &ResolveScope {
+                    env: None,
+                    tenant: None,
+                    team: None,
+                },
             )
             .expect("binding");
         assert_eq!(b.remote.as_ref().unwrap().sor_base_url, "http://sorx:9080");
+    }
+
+    #[test]
+    fn register_remote_offers_adds_caps_and_local_shadows_remote() {
+        use crate::capability_discovery::DiscoveredInstance;
+        let mut reg = CapabilityRegistry::default();
+        // a local offer for cap X (priority 10)
+        reg.insert_record_for_test(CapabilityOfferRecord {
+            stable_id: "local::x".into(),
+            pack_id: "localpack".into(),
+            domain: Domain::Messaging,
+            pack_path: std::path::PathBuf::from("local.gtpack"),
+            cap_id: "cap://greentic/business-functions/p/x/v1".into(),
+            version: "1.0.0".into(),
+            provider_component_ref: "comp".into(),
+            provider_op: "op".into(),
+            priority: 10,
+            requires_setup: false,
+            setup_qa_ref: None,
+            scope: CapabilityScopeV1::default(),
+            applies_to_ops: Vec::new(),
+            remote: None,
+        });
+        let inst = DiscoveredInstance {
+            tenant_id: "acme".into(),
+            sor_name: "landlord".into(),
+            alias: "stable".into(),
+            deployment_id: "d1".into(),
+            pack_name: "landlord".into(),
+            pack_version: "0.1.0".into(),
+            base_path: "/acme/landlord".into(),
+            capabilities: vec![
+                "cap://greentic/business-functions/p/x/v1".into(), // collides with local
+                "cap://greentic/business-functions/p/y/v1".into(), // remote-only
+            ],
+        };
+        reg.register_remote_offers(&[inst], "http://sorx:9080");
+        let scope = ResolveScope {
+            env: None,
+            tenant: None,
+            team: None,
+        };
+        // collision: local wins (non-remote)
+        let bx = reg
+            .resolve("cap://greentic/business-functions/p/x/v1", None, &scope)
+            .unwrap();
+        assert!(
+            bx.remote.is_none(),
+            "local offer must shadow remote on collision"
+        );
+        // remote-only: remote binding
+        let by = reg
+            .resolve("cap://greentic/business-functions/p/y/v1", None, &scope)
+            .unwrap();
+        assert_eq!(by.remote.as_ref().unwrap().sor_base_url, "http://sorx:9080");
     }
 
     fn write_gtpack_with_oauth_capabilities(path: &Path) -> anyhow::Result<()> {
