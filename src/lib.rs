@@ -63,6 +63,7 @@ mod revision_dispatcher;
 mod revision_drain;
 pub mod revision_health_gate;
 mod revision_pin;
+mod revision_pull;
 mod revision_reload;
 mod revision_serve;
 mod revision_webhook_register;
@@ -441,6 +442,35 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let environment =
             greentic_deployer::environment::EnvironmentStore::load(&env_store, &env_typed)
                 .with_context(|| format!("loading environment `{env_id}` for bundle-less boot"))?;
+
+        // M2: pull packs for a freshly-seeded worker. When no runtime-config
+        // is staged yet (the K8s ConfigMap ships only `environment.json`) but
+        // the environment's revisions were resolved from a bundle source,
+        // fetch each `.gtbundle` and materialize its packs + runtime-config
+        // into the env dir, then re-load the now-populated runtime-config so
+        // activation serves real revisions instead of probes only. A worker
+        // whose packs already sit on a persisted volume has a non-empty
+        // runtime-config and skips the pull.
+        let rc = if rc.revisions.is_empty() {
+            let pulled = revision_pull::pull_and_materialize_bundle_revisions(
+                &env_store,
+                &env_typed,
+                &environment,
+            )?;
+            if pulled > 0 {
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "materialized {pulled} revision(s) from bundle sources for env `{env_id}`"
+                    ),
+                );
+                runtime_config::load_or_empty(&env_id)?
+            } else {
+                rc
+            }
+        } else {
+            rc
+        };
 
         // C5: open the env's runtime.json snapshot once and share it across
         // every activation rebuild + the `runtime://` resolver every loaded

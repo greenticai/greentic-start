@@ -77,6 +77,37 @@ pub fn resolve_bundle_ref(reference: &str) -> anyhow::Result<ResolvedBundle> {
     extract_bundle_archive(&fetched, trimmed)
 }
 
+/// Fetch a bundle reference to a local `.gtbundle` archive **file** (not an
+/// extracted directory).
+///
+/// [`resolve_bundle_ref`] extracts the archive and hands back a directory, but
+/// the M2 worker-boot path ([`crate::revision_pull`]) feeds the raw archive to
+/// the deployer's `materialize_revision_from_bundle`, which does its own
+/// copy + content-hash + unbundle and integrity-gates the staged digest against
+/// the revision's pinned `bundle_digest`. So this returns the raw file and does
+/// **no** digest check of its own: an `oci://…@sha256:…` resolved digest is the
+/// manifest digest, not the `.gtbundle` byte digest, so checking it here would
+/// false-negative — the deployer's content-hash gate is the authority.
+///
+/// A local directory reference is rejected: materialization needs an archive
+/// file, and the worker's `bundle_source_uri` is always a remote ref.
+pub fn fetch_bundle_to_file(reference: &str) -> anyhow::Result<PathBuf> {
+    let trimmed = reference.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("bundle reference cannot be empty");
+    }
+    if let Some(path) = parse_local_bundle_ref(trimmed) {
+        if path.is_dir() {
+            anyhow::bail!(
+                "bundle reference {trimmed} is a directory; a .gtbundle archive file is \
+                 required for worker materialization"
+            );
+        }
+        return Ok(path);
+    }
+    Ok(fetch_remote_bundle(trimmed)?.path)
+}
+
 pub fn parse_local_bundle_ref(reference: &str) -> Option<PathBuf> {
     if let Some(value) = reference.strip_prefix("file://") {
         let path = PathBuf::from(value);
@@ -1013,6 +1044,28 @@ mod tests {
     fn empty_and_unsupported_bundle_references_error() {
         assert!(resolve_bundle_ref("   ").is_err());
         assert!(map_remote_bundle_ref("ftp://example.com/demo").is_err());
+    }
+
+    #[test]
+    fn fetch_bundle_to_file_returns_local_archive_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = dir.path().join("demo.gtbundle");
+        fs::write(&bundle, b"PK\x03\x04local-bytes").expect("write bundle");
+        let resolved = fetch_bundle_to_file(bundle.to_string_lossy().as_ref()).expect("fetch");
+        assert_eq!(resolved, bundle);
+    }
+
+    #[test]
+    fn fetch_bundle_to_file_rejects_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = fetch_bundle_to_file(dir.path().to_string_lossy().as_ref())
+            .expect_err("a directory is not a bundle archive");
+        assert!(format!("{err:#}").contains("directory"));
+    }
+
+    #[test]
+    fn fetch_bundle_to_file_rejects_empty_reference() {
+        assert!(fetch_bundle_to_file("   ").is_err());
     }
 
     #[test]
