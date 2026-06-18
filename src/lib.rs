@@ -455,6 +455,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             let pulled = revision_pull::pull_and_materialize_bundle_revisions(
                 &env_store,
                 &env_typed,
+                &env_dir,
                 &environment,
             )?;
             if pulled > 0 {
