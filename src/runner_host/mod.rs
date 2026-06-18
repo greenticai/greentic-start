@@ -4,6 +4,7 @@ mod dispatch;
 mod helpers;
 mod hooks;
 mod sor_discovery;
+mod sor_invoke;
 mod token_validation;
 mod types;
 
