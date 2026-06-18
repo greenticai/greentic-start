@@ -3,6 +3,7 @@
 mod dispatch;
 mod helpers;
 mod hooks;
+mod sor_discovery;
 mod token_validation;
 mod types;
 
@@ -189,7 +190,8 @@ impl DemoRunnerHost {
                 }
             }
         }
-        let capability_registry = CapabilityRegistry::build_from_pack_index(&pack_index)?;
+        let mut capability_registry = CapabilityRegistry::build_from_pack_index(&pack_index)?;
+        sor_discovery::discover_and_register_remote_offers(&mut capability_registry);
         Ok(Self {
             bundle_root,
             runner_mode: mode,
