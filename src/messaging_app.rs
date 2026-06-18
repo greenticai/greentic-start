@@ -320,41 +320,52 @@ pub fn run_app_flow(
 
 /// Replace the adapter's `state=scheme|provider` in a Connect card's authorize URL
 /// with a host-signed `crate::oauth_state` token carrying the full context.
+///
+/// `renderedCard` can be nested anywhere in the node output, so we walk the whole
+/// value and rewrite the `state` of any `oauth/authorize` URL we find.
 fn augment_oauth_connect_state(value: &mut JsonValue, pack_id: &str, tenant: &str, team: &str) {
-    let Some(actions) = value
-        .pointer_mut("/renderedCard/actions")
-        .and_then(|a| a.as_array_mut())
-    else {
-        return;
-    };
-    for action in actions.iter_mut() {
-        let Some(url) = action.get("url").and_then(|u| u.as_str()).map(String::from) else {
-            continue;
-        };
-        if !url.contains("oauth/authorize") {
-            continue;
+    match value {
+        JsonValue::Object(map) => {
+            if let Some(url) = map.get("url").and_then(|u| u.as_str()).map(String::from)
+                && let Some(new_url) = sign_authorize_url_state(&url, pack_id, tenant, team)
+            {
+                map.insert("url".to_string(), JsonValue::String(new_url));
+            }
+            for (_, v) in map.iter_mut() {
+                augment_oauth_connect_state(v, pack_id, tenant, team);
+            }
         }
-        let Some(raw_state) = url_query_value(&url, "state") else {
-            continue;
-        };
-        let Some((scheme, provider)) = raw_state.split_once('|') else {
-            continue;
-        };
-        if scheme.is_empty() || provider.is_empty() {
-            continue;
+        JsonValue::Array(arr) => {
+            for v in arr.iter_mut() {
+                augment_oauth_connect_state(v, pack_id, tenant, team);
+            }
         }
-        let signed = crate::oauth_state::mint(&crate::oauth_state::OAuthStateContext {
-            pack: pack_id.to_string(),
-            scheme: scheme.to_string(),
-            provider: provider.to_string(),
-            tenant: tenant.to_string(),
-            team: team.to_string(),
-            subject: "user".to_string(),
-            exp: chrono::Utc::now().timestamp() + 600,
-        });
-        let new_url = replace_query_value(&url, "state", &signed);
-        action["url"] = JsonValue::String(new_url);
+        _ => {}
     }
+}
+
+/// If `url` is an OAuth `authorize` URL carrying a `state=scheme|provider`, return
+/// the same URL with `state` replaced by a signed `crate::oauth_state` token; else
+/// `None`.
+fn sign_authorize_url_state(url: &str, pack_id: &str, tenant: &str, team: &str) -> Option<String> {
+    if !url.contains("oauth/authorize") {
+        return None;
+    }
+    let raw_state = url_query_value(url, "state")?;
+    let (scheme, provider) = raw_state.split_once('|')?;
+    if scheme.is_empty() || provider.is_empty() {
+        return None;
+    }
+    let signed = crate::oauth_state::mint(&crate::oauth_state::OAuthStateContext {
+        pack: pack_id.to_string(),
+        scheme: scheme.to_string(),
+        provider: provider.to_string(),
+        tenant: tenant.to_string(),
+        team: team.to_string(),
+        subject: "user".to_string(),
+        exp: chrono::Utc::now().timestamp() + 600,
+    });
+    Some(replace_query_value(url, "state", &signed))
 }
 
 /// Minimal `%XX`/`+` decode for a query value.
