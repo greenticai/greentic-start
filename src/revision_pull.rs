@@ -63,7 +63,7 @@ pub(crate) fn pull_and_materialize_bundle_revisions(
     environment: &Environment,
 ) -> anyhow::Result<usize> {
     let routed = routed_revision_ids(environment);
-    let mut materialized = 0usize;
+    let mut materialized = 0;
     for revision in &environment.revisions {
         if !routed.contains(&revision.revision_id) {
             continue;
