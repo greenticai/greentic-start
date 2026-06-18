@@ -8,7 +8,7 @@ use crate::capabilities::RemoteSorTarget;
 use crate::runner_host::types::{FlowOutcome, OperatorContext, RunnerExecutionMode};
 
 /// Outbound HTTP seam (so the executor is unit-testable without a network).
-pub(super) trait SorInvokeHttp {
+pub(crate) trait SorInvokeHttp {
     fn post_invoke(
         &self,
         url: &str,
@@ -17,7 +17,7 @@ pub(super) trait SorInvokeHttp {
     ) -> Result<(u16, String), String>;
 }
 
-pub(super) struct UreqSorInvoke;
+pub(crate) struct UreqSorInvoke;
 
 impl SorInvokeHttp for UreqSorInvoke {
     fn post_invoke(
@@ -44,7 +44,7 @@ impl SorInvokeHttp for UreqSorInvoke {
 /// Build the capability-invoke request, POST it, and map the SoR response to a
 /// `FlowOutcome`. 200 → success; anything else → unsuccessful (4xx/5xx carry the
 /// error envelope text).
-pub(super) fn invoke_remote_sor_with(
+pub(crate) fn invoke_remote_sor_with(
     http: &dyn SorInvokeHttp,
     target: &RemoteSorTarget,
     cap_id: &str,

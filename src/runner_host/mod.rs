@@ -249,6 +249,19 @@ impl DemoRunnerHost {
             .resolve(cap_id, min_version, &scope)
     }
 
+    /// Register remote offers directly into the host's capability registry.
+    /// Only available in test builds; used to inject remote offers without
+    /// needing a running SoRX instance.
+    #[cfg(test)]
+    pub(super) fn register_remote_offers_for_test(
+        &mut self,
+        instances: &[crate::capability_discovery::DiscoveredInstance],
+        sor_base_url: &str,
+    ) {
+        self.capability_registry
+            .register_remote_offers(instances, sor_base_url);
+    }
+
     pub fn resolve_hook_chain(&self, stage: HookStage, op_name: &str) -> Vec<CapabilityBinding> {
         self.capability_registry.resolve_hook_chain(stage, op_name)
     }
@@ -316,6 +329,19 @@ impl DemoRunnerHost {
         payload_bytes: &[u8],
         ctx: &OperatorContext,
     ) -> anyhow::Result<FlowOutcome> {
+        self.invoke_capability_with_http(&sor_invoke::UreqSorInvoke, cap_id, op, payload_bytes, ctx)
+    }
+
+    /// Testable inner: identical to `invoke_capability` but accepts an injected
+    /// HTTP seam so tests can drive the remote-SoR branch without a live network.
+    pub(super) fn invoke_capability_with_http(
+        &self,
+        http: &dyn sor_invoke::SorInvokeHttp,
+        cap_id: &str,
+        op: &str,
+        payload_bytes: &[u8],
+        ctx: &OperatorContext,
+    ) -> anyhow::Result<FlowOutcome> {
         let requested_op = op.trim();
         if cap_id == CAP_OAUTH_BROKER_V1 {
             if requested_op.is_empty() {
@@ -359,26 +385,23 @@ impl DemoRunnerHost {
         let Some(binding) = binding else {
             return Ok(missing_capability_outcome(cap_id, op, None));
         };
-        if !is_binding_ready(
-            &self.bundle_root,
-            &ctx.tenant,
-            ctx.team.as_deref(),
-            &binding,
-        )? {
+
+        // Local-only pre-checks: remote bindings skip the install-record and
+        // pack-path lookups — the SoR operator owns those concerns.
+        if binding.remote.is_none()
+            && !is_binding_ready(
+                &self.bundle_root,
+                &ctx.tenant,
+                ctx.team.as_deref(),
+                &binding,
+            )?
+        {
             return Ok(capability_not_installed_outcome(
                 cap_id,
                 op,
                 &binding.stable_id,
             ));
         }
-
-        let Some(pack) = self.packs_by_path.get(&binding.pack_path) else {
-            return Ok(capability_route_error_outcome(
-                cap_id,
-                op,
-                format!("resolved pack not found at {}", binding.pack_path.display()),
-            ));
-        };
 
         let target_op = if cap_id == CAP_OAUTH_BROKER_V1 || requested_op.is_empty() {
             // OAuth broker cap.invoke always routes through the selected provider op.
@@ -415,14 +438,27 @@ impl DemoRunnerHost {
             ));
         }
 
-        let outcome = self.invoke_provider_component_op(
-            binding.domain,
-            pack,
-            &binding.pack_id,
-            target_op,
-            payload_bytes,
-            ctx,
-        )?;
+        // Executor branch: remote bindings delegate to the SoR over HTTP;
+        // local bindings look up the pack and invoke the WASM component op.
+        let outcome = if let Some(remote) = binding.remote.clone() {
+            sor_invoke::invoke_remote_sor_with(http, &remote, &binding.cap_id, payload_bytes, ctx)
+        } else {
+            let Some(pack) = self.packs_by_path.get(&binding.pack_path) else {
+                return Ok(capability_route_error_outcome(
+                    cap_id,
+                    target_op,
+                    format!("resolved pack not found at {}", binding.pack_path.display()),
+                ));
+            };
+            self.invoke_provider_component_op(
+                binding.domain,
+                pack,
+                &binding.pack_id,
+                target_op,
+                payload_bytes,
+                ctx,
+            )?
+        };
 
         envelope.status = if outcome.success {
             OperationStatus::Ok
@@ -597,5 +633,48 @@ mod tests {
                 .unwrap_or_default()
                 .contains("unsupported oauth broker op")
         );
+    }
+
+    #[test]
+    fn invoke_capability_routes_remote_binding_to_sor() {
+        use crate::capability_discovery::DiscoveredInstance;
+
+        let mut host = empty_host_for_tests();
+        host.register_remote_offers_for_test(
+            &[DiscoveredInstance {
+                tenant_id: "acme".into(),
+                sor_name: "landlord".into(),
+                alias: "stable".into(),
+                deployment_id: "d1".into(),
+                pack_name: "landlord".into(),
+                pack_version: "0.1.0".into(),
+                base_path: "/acme/landlord".into(),
+                capabilities: vec!["cap://x/v1".into()],
+            }],
+            "http://sorx:9080",
+        );
+
+        struct FakeHttp;
+        impl sor_invoke::SorInvokeHttp for FakeHttp {
+            fn post_invoke(
+                &self,
+                _url: &str,
+                _headers: &[(String, String)],
+                _body: &str,
+            ) -> Result<(u16, String), String> {
+                Ok((200, r#"{"ok":true}"#.into()))
+            }
+        }
+
+        let ctx = OperatorContext {
+            tenant: "acme".into(),
+            team: None,
+            correlation_id: None,
+        };
+        let out = host
+            .invoke_capability_with_http(&FakeHttp, "cap://x/v1", "", b"{}", &ctx)
+            .unwrap();
+        assert!(out.success);
+        assert_eq!(out.mode, RunnerExecutionMode::RemoteSor);
     }
 }
