@@ -29,7 +29,19 @@ pub(super) fn discover_and_register_remote_offers(registry: &mut CapabilityRegis
     register_from_discovery(registry, &discovery, &base_url);
 }
 
+/// Thin wrapper over [`CapabilityDiscovery::missing_capabilities`] for the
+/// startup diagnostic; kept separate so it is unit-testable.
+fn unmet_required(
+    discovery: &CapabilityDiscovery,
+    sor_base_url: &str,
+    required: &[String],
+) -> Vec<String> {
+    discovery.missing_capabilities(sor_base_url, required)
+}
+
 /// Testable core: poll `discovery` for `sor_base_url`, log, and merge.
+/// Emits a `warn!` for each unmet required capability, sourced from
+/// `SORX_REQUIRED_CAPABILITIES` (comma-separated). Startup is never blocked.
 fn register_from_discovery(
     registry: &mut CapabilityRegistry,
     discovery: &CapabilityDiscovery,
@@ -43,6 +55,29 @@ fn register_from_discovery(
         capabilities = cap_total,
         "discovered SoRLa instances"
     );
+
+    // Non-blocking diagnostic: warn on any unmet required capabilities.
+    // Required caps are sourced from the SORX_REQUIRED_CAPABILITIES env var
+    // (comma-separated list). Hookup to dependency_resolver's pack-manifest
+    // required_capabilities is deferred (see task-A4-report.md).
+    let required: Vec<String> = std::env::var("SORX_REQUIRED_CAPABILITIES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    if !required.is_empty() {
+        for missing in unmet_required(discovery, sor_base_url, &required) {
+            tracing::warn!(
+                sor_base_url,
+                capability = %missing,
+                "required SoRLa capability not available at startup (non-blocking)"
+            );
+        }
+    }
+
     registry.register_remote_offers(&instances, sor_base_url);
 }
 
@@ -75,6 +110,20 @@ mod tests {
                 "cap://greentic/business-functions/landlord/pay/v1".into(),
             ])
         }
+    }
+
+    #[test]
+    fn missing_required_capabilities_are_reported() {
+        let disco = CapabilityDiscovery::new(Box::new(FakeSource), Duration::from_secs(60));
+        let required = vec![
+            "cap://greentic/business-functions/landlord/pay/v1".to_string(), // present
+            "cap://greentic/business-functions/landlord/evict/v1".to_string(), // missing
+        ];
+        let missing = unmet_required(&disco, "http://sorx:9080", &required);
+        assert_eq!(
+            missing,
+            vec!["cap://greentic/business-functions/landlord/evict/v1".to_string()]
+        );
     }
 
     #[test]
