@@ -83,9 +83,14 @@ features = [
 ]
 
 # Lower bound pinned to the first dev build exposing the `signing` module
-# (verify_artifact_dsse / TrustRoot); earlier 1.1.0-dev builds lack it.
+# (verify_artifact_dsse / TrustRoot); earlier 1.1.0-dev builds lack it. Floor
+# bumped to the publish that adds
+# `DefaultRegistryClient::with_insecure_registries` (distributor-client#168) —
+# `bundle_ref::fetch_remote_bundle` calls it when
+# GREENTIC_OCI_INSECURE_REGISTRIES is set so listed registries are pulled over
+# plain HTTP; earlier publishes lack that constructor.
 [dependencies.greentic-distributor-client]
-version = ">=1.1.0-dev.26402898736, <1.2.0-0"
+version = ">=1.1.0-dev.27832309681, <1.2.0-0"
 default-features = false
 features = [
     "pack-fetch",
