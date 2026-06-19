@@ -38,6 +38,7 @@ mod messaging_egress;
 mod metrics;
 mod ngrok;
 pub mod notifier;
+mod oauth_engine;
 mod oauth_secret_bridge;
 mod oauth_state;
 mod offers;
