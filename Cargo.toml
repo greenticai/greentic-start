@@ -126,15 +126,17 @@ version = ">=1.1.0-dev.27093775683, <1.2.0-0"
 [dependencies.greentic-runner-desktop]
 version = ">=1.1.0-dev, <1.2.0-0"
 
-# Floor pinned to the C5 publish (greentic-runner#424) that exposes the
-# `runtime_refs` module (`RuntimeRefResolver` trait + `RuntimeRefsInjection`)
-# and the expanded `TenantRuntime::load_revision` signature accepting the
-# per-pack runtime-refs map + env-shared resolver. Required by
-# `runtime_refs_store` and the C5 producer wiring in `revision_boot`.
-# Earlier publishes still satisfy the unscoped resolver floor (#390) and
-# C4.3a (#422) but lack the `runtime_refs` module entirely.
+# Floor pinned to the greentic-runner#466 publish that fixes flow-node
+# component-id resolution: `HostNode::from` no longer splits a resolved
+# component symbol on its last dot when the operation is carried structurally
+# (in `component.operation` or the input mapping), and `invoke_component`
+# falls back to the legacy `<comp>.<op>` form only when the stripped suffix is
+# the operation. Earlier publishes mis-resolve any dotted component id (e.g.
+# `ai.greentic.component-templates` → `ai.greentic`) and fail flow execution
+# with "component '…' not found in pack". This floor supersedes (and still
+# satisfies) the C5 `runtime_refs` floor (#424).
 [dependencies.greentic-runner-host]
-version = ">=1.1.0-dev.27156435059, <1.2.0-0"
+version = ">=1.1.0-dev.27823510319, <1.2.0-0"
 
 [dependencies.greentic-secrets-lib]
 version = ">=1.1.0-dev.27563392344, <1.2.0-0"
