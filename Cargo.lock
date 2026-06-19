@@ -2150,9 +2150,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle"
-version = "1.2.0-dev.27526177406"
+version = "1.1.0-dev.27812212358"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69525de4b067fa582932fa78690bdadbb28cfc29bc6e3648c8f48393d5666f59"
+checksum = "5a61b433dc401a2ebd53b951147fe4f65d824ed5993ffaba041757a0769fce3a"
 dependencies = [
  "anyhow",
  "backhand",
@@ -2184,9 +2184,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-bundle-reader"
-version = "1.2.0-dev.27526177406"
+version = "1.1.0-dev.27812212358"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d7f7e1e0ba3ad8f4fe54d1f38cdbdf7450670fbaab3d4dc5c26d281ae5bf4cf"
+checksum = "56044b2ba987803201b2ebe4e7a3540789b6e4d60e4ac3d78c411ea884a4109a"
 dependencies = [
  "backhand",
  "serde",
@@ -2249,9 +2249,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.1.0-dev.27745539530"
+version = "1.1.0-dev.27818762095"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "366c88813ea0fef723c428d9a43aa80199188f62f9734aa7fe88d6eff9df9428"
+checksum = "111fb3ebac21254644e12244a77c4c1d62ccb141d7bb53b39122de103b11dabf"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4735,7 +4735,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn",
