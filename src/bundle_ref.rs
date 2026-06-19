@@ -160,11 +160,23 @@ fn fetch_remote_bundle(reference: &str) -> anyhow::Result<FetchedBundle> {
         .enable_all()
         .build()
         .context("build tokio runtime for bundle resolution")?;
-    let fetcher: OciPackFetcher<DefaultRegistryClient> = OciPackFetcher::new(PackFetchOptions {
+    let opts = PackFetchOptions {
         allow_tags: true,
         offline: false,
         ..PackFetchOptions::default()
-    });
+    };
+    // Registries listed in GREENTIC_OCI_INSECURE_REGISTRIES are pulled over
+    // plain HTTP (for in-cluster / air-gapped registries that terminate HTTP);
+    // every other registry stays HTTPS. Unset/empty => HTTPS everywhere.
+    let insecure_registries = insecure_oci_registries_from_env();
+    let fetcher: OciPackFetcher<DefaultRegistryClient> = if insecure_registries.is_empty() {
+        OciPackFetcher::new(opts)
+    } else {
+        OciPackFetcher::with_client(
+            DefaultRegistryClient::with_insecure_registries(insecure_registries),
+            opts,
+        )
+    };
     let fetched = rt
         .block_on(fetcher.fetch_pack_to_cache(&mapped_ref))
         .with_context(|| format!("fetch bundle reference {reference}"))?;
@@ -175,6 +187,25 @@ fn fetch_remote_bundle(reference: &str) -> anyhow::Result<FetchedBundle> {
         path: fetched.path,
         kind,
     })
+}
+
+/// Read the `GREENTIC_OCI_INSECURE_REGISTRIES` allow-list. Unset or empty
+/// yields an empty list (HTTPS for every registry, the default).
+fn insecure_oci_registries_from_env() -> Vec<String> {
+    std::env::var("GREENTIC_OCI_INSECURE_REGISTRIES")
+        .ok()
+        .map(|raw| parse_insecure_registries(&raw))
+        .unwrap_or_default()
+}
+
+/// Parse the comma-separated insecure-registry allow-list into `host[:port]`
+/// entries. Blank entries (and surrounding whitespace) are dropped.
+fn parse_insecure_registries(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn fetch_http_bundle(reference: &str) -> anyhow::Result<FetchedBundle> {
@@ -932,6 +963,26 @@ mod tests {
         let file_ref = format!("file://{}", dir.path().display());
         let file = parse_local_bundle_ref(&file_ref);
         assert_eq!(file.as_deref(), Some(dir.path()));
+    }
+
+    #[test]
+    fn insecure_registry_list_is_empty_for_blank_input() {
+        assert!(parse_insecure_registries("").is_empty());
+        assert!(parse_insecure_registries("   ").is_empty());
+        assert!(parse_insecure_registries(", ,").is_empty());
+    }
+
+    #[test]
+    fn insecure_registry_list_trims_and_drops_blanks() {
+        assert_eq!(
+            parse_insecure_registries(
+                " localhost:5000 , ,gtc-oci-registry.gtc-local.svc.cluster.local:5000"
+            ),
+            vec![
+                "localhost:5000".to_string(),
+                "gtc-oci-registry.gtc-local.svc.cluster.local:5000".to_string(),
+            ]
+        );
     }
 
     #[test]
