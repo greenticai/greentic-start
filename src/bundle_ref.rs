@@ -73,7 +73,9 @@ pub fn resolve_bundle_ref(reference: &str) -> anyhow::Result<ResolvedBundle> {
         );
     }
 
-    let fetched = fetch_remote_bundle(trimmed)?;
+    // Non-boot resolution: the extracted bytes are served directly with no
+    // downstream digest gate, so insecure transport is never allowed here.
+    let fetched = fetch_remote_bundle(trimmed, false)?;
     extract_bundle_archive(&fetched, trimmed)
 }
 
@@ -105,7 +107,10 @@ pub fn fetch_bundle_to_file(reference: &str) -> anyhow::Result<PathBuf> {
         }
         return Ok(path);
     }
-    Ok(fetch_remote_bundle(trimmed)?.path)
+    // Boot-pull: the deployer re-hashes the returned archive against the
+    // revision's pinned `bundle_digest`, so insecure-registry transport is
+    // safe here (a forged bundle fails the digest gate).
+    Ok(fetch_remote_bundle(trimmed, true)?.path)
 }
 
 pub fn parse_local_bundle_ref(reference: &str) -> Option<PathBuf> {
@@ -151,7 +156,7 @@ pub fn map_remote_bundle_ref(reference: &str) -> anyhow::Result<(String, BundleS
     );
 }
 
-fn fetch_remote_bundle(reference: &str) -> anyhow::Result<FetchedBundle> {
+fn fetch_remote_bundle(reference: &str, allow_insecure: bool) -> anyhow::Result<FetchedBundle> {
     let (mapped_ref, kind) = map_remote_bundle_ref(reference)?;
     if kind == BundleSourceKind::Http {
         return fetch_http_bundle(reference);
@@ -167,8 +172,9 @@ fn fetch_remote_bundle(reference: &str) -> anyhow::Result<FetchedBundle> {
     };
     // Registries listed in GREENTIC_OCI_INSECURE_REGISTRIES are pulled over
     // plain HTTP (for in-cluster / air-gapped registries that terminate HTTP);
-    // every other registry stays HTTPS. Unset/empty => HTTPS everywhere.
-    let insecure_registries = insecure_oci_registries_from_env();
+    // every other registry stays HTTPS. Honored only when `allow_insecure` is
+    // set — i.e. the digest-gated boot-pull. Unset/empty => HTTPS everywhere.
+    let insecure_registries = insecure_registries_for_fetch(allow_insecure);
     let fetcher: OciPackFetcher<DefaultRegistryClient> = if insecure_registries.is_empty() {
         OciPackFetcher::new(opts)
     } else {
@@ -196,6 +202,22 @@ fn insecure_oci_registries_from_env() -> Vec<String> {
         .ok()
         .map(|raw| parse_insecure_registries(&raw))
         .unwrap_or_default()
+}
+
+/// The insecure-registry allow-list is honored only for fetches that are
+/// followed by a byte-level integrity gate: the worker boot-pull, whose pulled
+/// `.gtbundle` is re-hashed against `revision.bundle_digest` by the deployer
+/// (`materialize_revision_from_bundle`, fail-closed). Non-boot resolution
+/// (`start --bundle`, doctor, `bundle_config`) extracts and serves the fetched
+/// bytes with no such gate — over plain HTTP a network attacker could forge an
+/// unverified bundle — so it never downgrades transport. When `allow_insecure`
+/// is false this returns empty (HTTPS everywhere) regardless of the env var.
+fn insecure_registries_for_fetch(allow_insecure: bool) -> Vec<String> {
+    if allow_insecure {
+        insecure_oci_registries_from_env()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Parse the comma-separated insecure-registry allow-list into `host[:port]`
@@ -983,6 +1005,26 @@ mod tests {
                 "gtc-oci-registry.gtc-local.svc.cluster.local:5000".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn insecure_registries_honored_only_for_digest_gated_boot_fetch() {
+        // Single owner of this env var across the test module, so mutating it
+        // here is not racy with other tests.
+        unsafe {
+            std::env::set_var("GREENTIC_OCI_INSECURE_REGISTRIES", "localhost:5000");
+        }
+        // Boot-pull (digest-gated downstream) honors the allow-list.
+        assert_eq!(
+            insecure_registries_for_fetch(true),
+            vec!["localhost:5000".to_string()]
+        );
+        // Non-boot resolution has no integrity gate, so transport never
+        // downgrades even when the env var is set.
+        assert!(insecure_registries_for_fetch(false).is_empty());
+        unsafe {
+            std::env::remove_var("GREENTIC_OCI_INSECURE_REGISTRIES");
+        }
     }
 
     #[test]
