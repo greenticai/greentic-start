@@ -356,6 +356,7 @@ fn sign_authorize_url_state(url: &str, pack_id: &str, tenant: &str, team: &str) 
     if scheme.is_empty() || provider.is_empty() {
         return None;
     }
+    let jti = uuid::Uuid::new_v4().to_string();
     let signed = crate::oauth_state::mint(&crate::oauth_state::OAuthStateContext {
         pack: pack_id.to_string(),
         scheme: scheme.to_string(),
@@ -363,9 +364,30 @@ fn sign_authorize_url_state(url: &str, pack_id: &str, tenant: &str, team: &str) 
         tenant: tenant.to_string(),
         team: team.to_string(),
         subject: "user".to_string(),
+        jti: jti.clone(),
         exp: chrono::Utc::now().timestamp() + 600,
     });
-    Some(replace_query_value(url, "state", &signed))
+    let mut new_url = replace_query_value(url, "state", &signed);
+    // Layer on the provider profile: PKCE challenge (verifier stashed server-side,
+    // keyed by jti) + provider-specific authorize params (e.g. Google offline).
+    if let Some(profile) = crate::oauth_engine::provider_profile(provider) {
+        if profile.uses_pkce {
+            let pkce = crate::oauth_engine::pkce();
+            crate::oauth_engine::store_verifier(&jti, &pkce.verifier);
+            new_url.push_str(&format!(
+                "&code_challenge={}&code_challenge_method=S256",
+                crate::oauth_engine::enc(&pkce.challenge)
+            ));
+        }
+        for (k, v) in profile.authorize_extra {
+            new_url.push_str(&format!(
+                "&{}={}",
+                crate::oauth_engine::enc(k),
+                crate::oauth_engine::enc(v)
+            ));
+        }
+    }
+    Some(new_url)
 }
 
 /// Minimal `%XX`/`+` decode for a query value.

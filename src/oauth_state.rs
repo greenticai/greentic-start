@@ -26,6 +26,10 @@ pub struct OAuthStateContext {
     pub tenant: String,
     pub team: String,
     pub subject: String,
+    /// Unique id binding a server-side PKCE verifier to this sign-in (empty when
+    /// the provider doesn't use PKCE).
+    #[serde(default)]
+    pub jti: String,
     /// Expiry (unix seconds).
     pub exp: i64,
 }
@@ -107,6 +111,7 @@ mod tests {
             tenant: "demo".into(),
             team: "_".into(),
             subject: "user".into(),
+            jti: String::new(),
             exp: chrono::Utc::now().timestamp() + 600,
         };
         let tok = mint(&ctx);
@@ -124,6 +129,7 @@ mod tests {
             tenant: "demo".into(),
             team: "_".into(),
             subject: "user".into(),
+            jti: String::new(),
             exp: chrono::Utc::now().timestamp() + 600,
         };
         let tok = mint(&ctx);

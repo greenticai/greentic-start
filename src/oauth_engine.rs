@@ -162,6 +162,64 @@ pub fn refresh(
     post_form(token_url, form)
 }
 
+/// Per-provider OAuth profile. `token_url` is the token endpoint; `uses_pkce`
+/// drives the no-secret public-client flow; `authorize_extra` are provider-specific
+/// authorize-request params (e.g. Google's offline-access knobs for a refresh token).
+pub struct ProviderProfile {
+    pub token_url: &'static str,
+    pub uses_pkce: bool,
+    pub authorize_extra: &'static [(&'static str, &'static str)],
+}
+
+/// Look up the OAuth profile for a provider id, or `None` if unsupported.
+pub fn provider_profile(provider: &str) -> Option<ProviderProfile> {
+    match provider {
+        // GitHub OAuth apps require the client_secret and don't support PKCE.
+        "github" => Some(ProviderProfile {
+            token_url: "https://github.com/login/oauth/access_token",
+            uses_pkce: false,
+            authorize_extra: &[],
+        }),
+        // Google public (Desktop) client: PKCE, no secret; offline for a refresh token.
+        "google" => Some(ProviderProfile {
+            token_url: "https://oauth2.googleapis.com/token",
+            uses_pkce: true,
+            authorize_extra: &[("access_type", "offline"), ("prompt", "consent")],
+        }),
+        _ => None,
+    }
+}
+
+// --- PKCE verifier store ----------------------------------------------------
+// The verifier is generated when the consent URL is built and must NOT travel the
+// front channel, so we hold it server-side keyed by the state's `jti` until the
+// callback exchanges the code. In-process + TTL'd (a dev runtime is single-process).
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+fn verifier_store() -> &'static Mutex<HashMap<String, (String, Instant)>> {
+    static S: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Stash a PKCE verifier under the state `jti` (evicts entries older than 10 min).
+pub fn store_verifier(jti: &str, verifier: &str) {
+    let mut m = verifier_store().lock().expect("verifier store poisoned");
+    let now = Instant::now();
+    m.retain(|_, (_, t)| now.duration_since(*t) < Duration::from_secs(600));
+    m.insert(jti.to_string(), (verifier.to_string(), now));
+}
+
+/// Take (consume) the PKCE verifier for a state `jti`, if present.
+pub fn take_verifier(jti: &str) -> Option<String> {
+    verifier_store()
+        .lock()
+        .expect("verifier store poisoned")
+        .remove(jti)
+        .map(|(v, _)| v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

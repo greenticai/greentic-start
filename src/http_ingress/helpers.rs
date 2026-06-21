@@ -333,20 +333,22 @@ pub(super) async fn handle_oauth_callback(
         );
     }
 
-    // Token endpoint per provider. (auth_url/token_url move into the signed state in
-    // a later step so this is fully data-driven rather than a match.)
-    let token_url = match ctx.provider.as_str() {
-        "github" => "https://github.com/login/oauth/access_token",
-        "google" => "https://oauth2.googleapis.com/token",
-        _ => return oauth_callback_page(false, "Unsupported provider."),
-    }
-    .to_string();
+    // Provider profile drives the token endpoint + whether this is a PKCE flow.
+    let Some(profile) = crate::oauth_engine::provider_profile(&ctx.provider) else {
+        return oauth_callback_page(false, "Unsupported provider.");
+    };
+    let token_url = profile.token_url.to_string();
 
     // client_secret is optional — omit it for a PKCE public client (e.g. Google
-    // Desktop). No redirect_uri: the authorize request omitted it, so the provider
-    // used the app's registered callback and the exchange must omit it too. The PKCE
-    // code_verifier (from the verifier store) is wired in the next step.
+    // Desktop). For PKCE we replay the server-side verifier stashed under the state
+    // `jti`. No redirect_uri: the authorize request omitted it, so the provider used
+    // the app's registered callback and the exchange must omit it too.
     let secret_owned: Option<String> = (!csec.is_empty()).then(|| csec.clone());
+    let verifier_owned: Option<String> = if profile.uses_pkce {
+        crate::oauth_engine::take_verifier(&ctx.jti)
+    } else {
+        None
+    };
     let code_owned = code.clone();
     let cid_owned = cid.clone();
     let exchanged = tokio::task::spawn_blocking(move || {
@@ -356,7 +358,7 @@ pub(super) async fn handle_oauth_callback(
             &cid_owned,
             secret_owned.as_deref(),
             None,
-            None,
+            verifier_owned.as_deref(),
         )
     })
     .await;
