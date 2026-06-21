@@ -368,6 +368,9 @@ fn sign_authorize_url_state(url: &str, pack_id: &str, tenant: &str, team: &str) 
         team: team.to_string(),
         subject: "user".to_string(),
         jti: jti.clone(),
+        // Threaded from the messaging ingress in a follow-up so /oauth/callback can
+        // push a resume into the originating webchat conversation (auto-advance).
+        conv: None,
         exp: chrono::Utc::now().timestamp() + 600,
     });
     let mut new_url = replace_query_value(url, "state", &signed);

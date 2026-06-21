@@ -30,6 +30,11 @@ pub struct OAuthStateContext {
     /// the provider doesn't use PKCE).
     #[serde(default)]
     pub jti: String,
+    /// DirectLine conversation id that surfaced the Connect card, so `/oauth/callback`
+    /// can push a synthetic resume into that live conversation once the token is
+    /// persisted (auto-advance to the next card). `None` for non-webchat surfaces.
+    #[serde(default)]
+    pub conv: Option<String>,
     /// Expiry (unix seconds).
     pub exp: i64,
 }
@@ -112,6 +117,7 @@ mod tests {
             team: "_".into(),
             subject: "user".into(),
             jti: String::new(),
+            conv: None,
             exp: chrono::Utc::now().timestamp() + 600,
         };
         let tok = mint(&ctx);
@@ -130,6 +136,7 @@ mod tests {
             team: "_".into(),
             subject: "user".into(),
             jti: String::new(),
+            conv: None,
             exp: chrono::Utc::now().timestamp() + 600,
         };
         let tok = mint(&ctx);
