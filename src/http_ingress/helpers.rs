@@ -326,67 +326,58 @@ pub(super) async fn handle_oauth_callback(
     };
     let cid = read(key_uri("client_id")).await.unwrap_or_default();
     let csec = read(key_uri("client_secret")).await.unwrap_or_default();
-    if cid.is_empty() || csec.is_empty() {
+    if cid.is_empty() {
         return oauth_callback_page(
             false,
-            "OAuth client_id/secret not configured for this pack — run gtc setup and enter them.",
+            "OAuth client_id not configured for this pack — run gtc setup and enter it.",
         );
     }
 
+    // Token endpoint per provider. (auth_url/token_url move into the signed state in
+    // a later step so this is fully data-driven rather than a match.)
     let token_url = match ctx.provider.as_str() {
-        "github" => "https://github.com/login/oauth/access_token".to_string(),
+        "github" => "https://github.com/login/oauth/access_token",
+        "google" => "https://oauth2.googleapis.com/token",
         _ => return oauth_callback_page(false, "Unsupported provider."),
-    };
-    fn enc(s: &str) -> String {
-        s.chars()
-            .map(|c| match c {
-                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-                _ => format!("%{:02X}", c as u8),
-            })
-            .collect()
     }
-    // No redirect_uri: the authorize request omitted it, so the provider used the
-    // OAuth App's registered callback — the exchange must omit it too.
-    let form = format!(
-        "grant_type=authorization_code&code={}&client_id={}&client_secret={}",
-        enc(&code),
-        enc(&cid),
-        enc(&csec),
-    );
+    .to_string();
 
-    let token_url_owned = token_url.clone();
+    // client_secret is optional — omit it for a PKCE public client (e.g. Google
+    // Desktop). No redirect_uri: the authorize request omitted it, so the provider
+    // used the app's registered callback and the exchange must omit it too. The PKCE
+    // code_verifier (from the verifier store) is wired in the next step.
+    let secret_owned: Option<String> = (!csec.is_empty()).then(|| csec.clone());
+    let code_owned = code.clone();
+    let cid_owned = cid.clone();
     let exchanged = tokio::task::spawn_blocking(move || {
-        ureq::post(&token_url_owned)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .header("Accept", "application/json")
-            .send(form.as_bytes())
-            .and_then(|mut r| r.body_mut().read_to_string())
+        crate::oauth_engine::exchange_code(
+            &token_url,
+            &code_owned,
+            &cid_owned,
+            secret_owned.as_deref(),
+            None,
+            None,
+        )
     })
     .await;
-
-    let body = match exchanged {
-        Ok(Ok(body)) => body,
+    let tokens = match exchanged {
+        Ok(Ok(t)) => t,
         Ok(Err(err)) => {
             return oauth_callback_page(false, &format!("Token exchange failed: {err}"));
         }
         Err(err) => return oauth_callback_page(false, &format!("Exchange task error: {err}")),
     };
-    let access_token = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.get("access_token")
-                .and_then(|t| t.as_str())
-                .map(String::from)
-        })
-        .unwrap_or_default();
-    if access_token.is_empty() {
-        return oauth_callback_page(false, &format!("No access_token in response: {body}"));
-    }
 
-    // Persist at the pack-scoped access_token key the MCP adapter reads directly.
+    // Persist at the pack-scoped keys the MCP adapter reads. Store the refresh token
+    // too (when the provider returns one) so the runtime can refresh silently later.
     let key = key_uri("access_token");
-    if let Err(err) = manager.write(&key, access_token.as_bytes()).await {
+    if let Err(err) = manager.write(&key, tokens.access_token.as_bytes()).await {
         return oauth_callback_page(false, &format!("Failed to persist token: {err}"));
+    }
+    if let Some(rt) = tokens.refresh_token.as_deref() {
+        let _ = manager
+            .write(&key_uri("refresh_token"), rt.as_bytes())
+            .await;
     }
     crate::operator_log::info(
         module_path!(),
