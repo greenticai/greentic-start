@@ -348,9 +348,12 @@ fn augment_oauth_connect_state(value: &mut JsonValue, pack_id: &str, tenant: &st
 /// the same URL with `state` replaced by a signed `crate::oauth_state` token; else
 /// `None`.
 fn sign_authorize_url_state(url: &str, pack_id: &str, tenant: &str, team: &str) -> Option<String> {
-    if !url.contains("oauth/authorize") {
-        return None;
-    }
+    // Trigger on the adapter's raw `state=<scheme>|<provider>` marker rather than a
+    // provider-specific authorize path: GitHub uses `.../oauth/authorize` but Google
+    // uses `.../oauth2/v2/auth`, so a path check skips Google entirely (no signed
+    // state, no PKCE, no redirect_uri). The `scheme|provider` split below is the real
+    // gate — only the adapter's OAuth card emits it, and an already-signed JWT state
+    // (no `|`) returns None here, so we never double-augment.
     let raw_state = url_query_value(url, "state")?;
     let (scheme, provider) = raw_state.split_once('|')?;
     if scheme.is_empty() || provider.is_empty() {

@@ -93,7 +93,6 @@ impl DemoRunnerHost {
         key: &str,
         ctx: &OperatorContext,
     ) -> anyhow::Result<Option<Vec<u8>>> {
-        use crate::secrets_gate::canonical_secret_uri;
         use crate::secrets_setup::resolve_env;
 
         if let Some(bytes) = load_setup_answer_secret(&self.bundle_root, provider, key) {
@@ -101,25 +100,41 @@ impl DemoRunnerHost {
         }
 
         let env = resolve_env(None);
-        let uri = canonical_secret_uri(&env, &ctx.tenant, ctx.team.as_deref(), provider, key);
+        // Try BOTH provider string forms (raw `messaging-webchat-gui` + canonical
+        // `messaging_webchat_gui`): generated secrets like `jwt_signing_key` are
+        // persisted under the RAW provider segment, but a canonical-only URI would
+        // miss it and return None — silently disabling the DirectLine token-renewal
+        // preflight, so a conv-less (refreshed) WebChat token never gets re-bound and
+        // the provider 403s every send. See `secrets_gate::secret_uri_candidates`.
+        let canonical_team = crate::secrets_manager::canonical_team(ctx.team.as_deref());
+        let candidates = crate::secrets_gate::secret_uri_candidates(
+            &env,
+            &ctx.tenant,
+            canonical_team.as_ref(),
+            key,
+            provider,
+        );
 
         make_runtime_or_thread_scope(|rt| {
             rt.block_on(async {
-                match self.secrets_handle.manager().read(&uri).await {
-                    Ok(bytes) => Ok(Some(bytes)),
-                    Err(err) => {
-                        let err_str = err.to_string();
-                        if err_str.contains("not found")
-                            || err_str.contains("NotFound")
-                            || err_str.contains("not-found")
-                            || err_str.contains("not provisioned")
-                        {
-                            Ok(None)
-                        } else {
-                            Err(anyhow::anyhow!("secret read failed: {}", err))
+                for uri in &candidates {
+                    match self.secrets_handle.manager().read(uri).await {
+                        Ok(bytes) => return Ok(Some(bytes)),
+                        Err(err) => {
+                            let err_str = err.to_string();
+                            if err_str.contains("not found")
+                                || err_str.contains("NotFound")
+                                || err_str.contains("not-found")
+                                || err_str.contains("not provisioned")
+                            {
+                                continue;
+                            } else {
+                                return Err(anyhow::anyhow!("secret read failed: {}", err));
+                            }
                         }
                     }
                 }
+                Ok(None)
             })
         })
     }
