@@ -339,16 +339,19 @@ pub(super) async fn handle_oauth_callback(
     };
     let token_url = profile.token_url.to_string();
 
-    // client_secret is optional — omit it for a PKCE public client (e.g. Google
-    // Desktop). For PKCE we replay the server-side verifier stashed under the state
-    // `jti`. No redirect_uri: the authorize request omitted it, so the provider used
-    // the app's registered callback and the exchange must omit it too.
+    // client_secret is optional — omit it for a PKCE public client. For PKCE we
+    // replay the server-side verifier stashed under the state `jti`. redirect_uri is
+    // sent only when the provider requires it (Google) and must match the authorize
+    // request + the registered URI; GitHub omits it (implicit registered callback).
     let secret_owned: Option<String> = (!csec.is_empty()).then(|| csec.clone());
     let verifier_owned: Option<String> = if profile.uses_pkce {
         crate::oauth_engine::take_verifier(&ctx.jti)
     } else {
         None
     };
+    let redirect_owned: Option<String> = profile
+        .redirect_uri_required
+        .then(|| crate::oauth_engine::callback_redirect_uri(&ctx.provider));
     let code_owned = code.clone();
     let cid_owned = cid.clone();
     let exchanged = tokio::task::spawn_blocking(move || {
@@ -357,7 +360,7 @@ pub(super) async fn handle_oauth_callback(
             &code_owned,
             &cid_owned,
             secret_owned.as_deref(),
-            None,
+            redirect_owned.as_deref(),
             verifier_owned.as_deref(),
         )
     })

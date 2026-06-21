@@ -386,6 +386,12 @@ fn sign_authorize_url_state(url: &str, pack_id: &str, tenant: &str, team: &str) 
                 crate::oauth_engine::enc(v)
             ));
         }
+        if profile.redirect_uri_required {
+            new_url.push_str(&format!(
+                "&redirect_uri={}",
+                crate::oauth_engine::enc(&crate::oauth_engine::callback_redirect_uri(provider))
+            ));
+        }
     }
     Some(new_url)
 }

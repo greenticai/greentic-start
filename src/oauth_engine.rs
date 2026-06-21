@@ -168,26 +168,44 @@ pub fn refresh(
 pub struct ProviderProfile {
     pub token_url: &'static str,
     pub uses_pkce: bool,
+    /// Whether `redirect_uri` must be sent on the authorize + token requests and
+    /// match a registered URI (Google requires it; GitHub lets it be implicit).
+    pub redirect_uri_required: bool,
     pub authorize_extra: &'static [(&'static str, &'static str)],
 }
 
 /// Look up the OAuth profile for a provider id, or `None` if unsupported.
 pub fn provider_profile(provider: &str) -> Option<ProviderProfile> {
     match provider {
-        // GitHub OAuth apps require the client_secret and don't support PKCE.
+        // GitHub OAuth apps require the client_secret, don't support PKCE, and let
+        // the registered callback be implicit (no redirect_uri on the request).
         "github" => Some(ProviderProfile {
             token_url: "https://github.com/login/oauth/access_token",
             uses_pkce: false,
+            redirect_uri_required: false,
             authorize_extra: &[],
         }),
-        // Google public (Desktop) client: PKCE, no secret; offline for a refresh token.
+        // Google (Desktop client): PKCE + offline for a refresh token, and it
+        // REQUIRES redirect_uri on both authorize + token (must match registered).
         "google" => Some(ProviderProfile {
             token_url: "https://oauth2.googleapis.com/token",
             uses_pkce: true,
+            redirect_uri_required: true,
             authorize_extra: &[("access_type", "offline"), ("prompt", "consent")],
         }),
         _ => None,
     }
+}
+
+/// The OAuth callback URL the runtime serves for `provider` (`/oauth/callback/<provider>`),
+/// used as `redirect_uri` for providers that require it. Base from
+/// `GREENTIC_PUBLIC_BASE_URL` (set this for ngrok/public), else the loopback default.
+pub fn callback_redirect_uri(provider: &str) -> String {
+    let base = std::env::var("GREENTIC_PUBLIC_BASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+    format!("{}/oauth/callback/{provider}", base.trim_end_matches('/'))
 }
 
 // --- PKCE verifier store ----------------------------------------------------
