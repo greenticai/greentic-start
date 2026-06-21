@@ -629,7 +629,14 @@ pub fn canonical_secret_store_key(uri: &str) -> Option<String> {
     greentic_secrets_lib::canonical_secret_store_key(uri)
 }
 
-fn secret_uri_candidates(
+/// Store-key candidates for a secret, reconciling differing provider string forms
+/// (raw `messaging-webchat-gui` vs canonical `messaging_webchat_gui`). The raw
+/// provider form is first; the canonical (underscored) form is added when it
+/// differs. This is the canonicalization middleware for read/existence CRITICAL
+/// PATHS — without it a writer and reader that disagree on the provider segment
+/// resolve different keys (e.g. a regenerated `jwt_signing_key` → a minted token
+/// that fails to verify → 401).
+pub fn secret_uri_candidates(
     env: &str,
     tenant: &str,
     canonical_team: &str,
@@ -638,7 +645,15 @@ fn secret_uri_candidates(
 ) -> Vec<String> {
     let normalized_key = secret_name::canonical_secret_name(key);
     let prefix = format!("secrets://{}/{}/{}/", env, tenant, canonical_team);
-    vec![format!("{prefix}{provider_id}/{normalized_key}")]
+    let mut out = vec![format!("{prefix}{provider_id}/{normalized_key}")];
+    let canonical_provider = secret_name::canonical_secret_name(provider_id);
+    if canonical_provider != provider_id {
+        let canon = format!("{prefix}{canonical_provider}/{normalized_key}");
+        if !out.contains(&canon) {
+            out.push(canon);
+        }
+    }
+    out
 }
 
 fn display_secret_candidates(
