@@ -164,6 +164,95 @@ impl ProviderTokenResolver for NoopProviderTokenResolver {
     }
 }
 
+/// Refresh-on-read resolver: serves the stored pack-scoped access token, refreshing
+/// it via the native OAuth engine when it's near expiry — using the sibling
+/// `refresh_token` / `client_id` / `client_secret` secrets and the provider's token
+/// endpoint. Tokens with no recorded `expires_at` (e.g. GitHub classic) are returned
+/// as-is. Returns `None` only when there's nothing to serve, so the bridge falls
+/// through to the inner store.
+pub struct RefreshingResolver {
+    inner: DynSecretsManager,
+}
+
+impl RefreshingResolver {
+    pub fn new(inner: DynSecretsManager) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl ProviderTokenResolver for RefreshingResolver {
+    async fn resolve_access_token(&self, key: &OAuthTokenKey) -> Option<String> {
+        let base = key.scoped_key.strip_suffix("_access_token")?;
+        let sib = |suffix: &str| format!("{base}_{suffix}");
+        let read = |uri: String| {
+            let m = self.inner.clone();
+            async move {
+                m.read(&uri)
+                    .await
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            }
+        };
+
+        let access = read(key.scoped_key.clone()).await;
+        let now = chrono::Utc::now().timestamp();
+        let expired = match read(sib("expires_at"))
+            .await
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            Some(exp) => now >= exp - 60, // 60s skew
+            None => false,                // no expiry recorded => treat as long-lived
+        };
+        if let Some(tok) = &access
+            && !expired
+        {
+            return Some(tok.clone());
+        }
+
+        // Expired (or missing) + refreshable: refresh via the engine and persist.
+        let refresh_token = read(sib("refresh_token")).await?;
+        let client_id = read(sib("client_id")).await?;
+        let client_secret = read(sib("client_secret")).await;
+        let token_url = crate::oauth_engine::provider_profile(&key.provider_id())?.token_url;
+        let (turl, cid, csec, rt) = (
+            token_url.to_string(),
+            client_id,
+            client_secret,
+            refresh_token,
+        );
+        let refreshed = tokio::task::spawn_blocking(move || {
+            crate::oauth_engine::refresh(&turl, &cid, csec.as_deref(), &rt)
+        })
+        .await
+        .ok()?
+        .ok()?;
+
+        let _ = self
+            .inner
+            .write(&key.scoped_key, refreshed.access_token.as_bytes())
+            .await;
+        if let Some(secs) = refreshed.expires_in {
+            let _ = self
+                .inner
+                .write(
+                    &sib("expires_at"),
+                    (now + secs as i64).to_string().as_bytes(),
+                )
+                .await;
+        }
+        if let Some(new_rt) = &refreshed.refresh_token {
+            let _ = self
+                .inner
+                .write(&sib("refresh_token"), new_rt.as_bytes())
+                .await;
+        }
+        Some(refreshed.access_token)
+    }
+}
+
 /// Parse a scoped secret key into an [`OAuthTokenKey`] when it names an oauth2
 /// access token (`auth_oauth2_<scheme>_access_token`), else `None`.
 pub fn parse_oauth_access_token_key(scoped_key: &str) -> Option<OAuthTokenKey> {

@@ -381,6 +381,13 @@ pub(super) async fn handle_oauth_callback(
             .write(&key_uri("refresh_token"), rt.as_bytes())
             .await;
     }
+    // Persist absolute expiry so the runtime can refresh-on-read before it lapses.
+    if let Some(secs) = tokens.expires_in {
+        let exp = chrono::Utc::now().timestamp() + secs as i64;
+        let _ = manager
+            .write(&key_uri("expires_at"), exp.to_string().as_bytes())
+            .await;
+    }
     crate::operator_log::info(
         module_path!(),
         format!("[oauth-callback] persisted {} token at {key}", ctx.provider),

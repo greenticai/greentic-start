@@ -404,14 +404,17 @@ pub fn resolve_secrets_manager(
         );
     }
     let manager = CachingSecretsManager::wrap(manager);
-    // OAuth bake-in (Phase 4, signed-state flow): our `/oauth/callback` now
-    // persists the token at the SAME pack-scoped key the adapter reads
-    // (`secrets://<env>/<tenant>/<team>/<pack>/auth_oauth2_<scheme>_access_token`),
-    // so the component's natural scoped read resolves it directly — no bridge.
-    // (The interim provider-scoped redirect lives in `oauth_secret_bridge`; pass
-    // `None` to keep it dormant and avoid a stale provider-scoped token shadowing
-    // the freshly minted pack-scoped one.)
-    let manager = crate::oauth_secret_bridge::OAuthBridgingSecretsManager::wrap(manager, None);
+    // OAuth bake-in: refresh-on-read. `/oauth/callback` persists the token at the
+    // pack-scoped key the adapter reads; this resolver serves it and silently
+    // refreshes via the native OAuth engine when it's near expiry (using the sibling
+    // refresh_token/client_id/secret). Non-OAuth keys and tokens without an
+    // `expires_at` fall through unchanged.
+    let resolver: std::sync::Arc<dyn crate::oauth_secret_bridge::ProviderTokenResolver> =
+        std::sync::Arc::new(crate::oauth_secret_bridge::RefreshingResolver::new(
+            manager.clone(),
+        ));
+    let manager =
+        crate::oauth_secret_bridge::OAuthBridgingSecretsManager::wrap(manager, Some(resolver));
     Ok(SecretsManagerHandle {
         manager,
         selection,
