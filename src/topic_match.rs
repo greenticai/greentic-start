@@ -24,8 +24,14 @@ mod tests {
 
     #[test]
     fn topic_matches_exact_prefix_and_catchall() {
-        assert!(topic_matches("subscription.created", "subscription.created"));
-        assert!(!topic_matches("subscription.created", "subscription.updated"));
+        assert!(topic_matches(
+            "subscription.created",
+            "subscription.created"
+        ));
+        assert!(!topic_matches(
+            "subscription.created",
+            "subscription.updated"
+        ));
         assert!(topic_matches("subscription.*", "subscription.created"));
         assert!(topic_matches("subscription.*", "subscription.created.v2"));
         assert!(topic_matches("*", "anything.at.all"));

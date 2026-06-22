@@ -81,9 +81,8 @@ pub fn route_events(
                     input,
                     dist_offline: true,
                 };
-                runner_exec::run_provider_pack_flow(request).with_context(|| {
-                    format!("route event {} -> {}", event.event_type, flow.id)
-                })?;
+                runner_exec::run_provider_pack_flow(request)
+                    .with_context(|| format!("route event {} -> {}", event.event_type, flow.id))?;
                 routed += 1;
             }
         }
@@ -146,7 +145,10 @@ mod tests {
     fn select_target_flows_returns_empty_for_unsubscribed_topic() {
         let info = make_pack();
         let matched = select_target_flows(&info, "random");
-        assert!(matched.is_empty(), "unmatched topic must yield empty vec for fallback");
+        assert!(
+            matched.is_empty(),
+            "unmatched topic must yield empty vec for fallback"
+        );
     }
 
     #[test]
@@ -180,13 +182,11 @@ mod tests {
     fn select_target_flows_exact_match_does_not_bleed_into_other_prefixes() {
         let info = AppPackInfo {
             pack_id: "exact-pack".to_string(),
-            flows: vec![
-                AppFlowInfo {
-                    id: "billing_flow".to_string(),
-                    kind: "messaging".to_string(),
-                    subscribes_to: vec!["billing.*".to_string()],
-                },
-            ],
+            flows: vec![AppFlowInfo {
+                id: "billing_flow".to_string(),
+                kind: "messaging".to_string(),
+                subscribes_to: vec!["billing.*".to_string()],
+            }],
         };
         // "subscription.created" must NOT match "billing.*"
         let matched = select_target_flows(&info, "subscription.created");

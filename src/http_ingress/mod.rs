@@ -796,9 +796,7 @@ where
             .filter_map(|value| serde_json::from_value(value).ok())
             .collect();
         std::thread::spawn(move || {
-            if let Err(err) =
-                crate::event_router::route_events(&bundle, &ctx, &events)
-            {
+            if let Err(err) = crate::event_router::route_events(&bundle, &ctx, &events) {
                 crate::operator_log::warn(module_path!(), format!("event routing failed: {err:#}"));
             }
         });
