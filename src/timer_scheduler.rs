@@ -12,7 +12,7 @@ use zip::ZipArchive;
 
 use crate::discovery;
 use crate::domains::Domain;
-use crate::event_router::route_events_to_default_flow;
+use crate::event_router::route_events;
 use crate::ingress_types::EventEnvelopeV1;
 use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
@@ -198,7 +198,7 @@ fn run_timer_handler(
     let output = outcome.output.unwrap_or_else(|| json!({}));
     let events = parse_events(&output)?;
     if !events.is_empty() {
-        route_events_to_default_flow(scheduler.runner_host.bundle_root(), &context, &events)?;
+        route_events(scheduler.runner_host.bundle_root(), &context, &events)?;
     }
     timer.last_run_rfc3339 = Some(occurred_at);
     Ok(())
