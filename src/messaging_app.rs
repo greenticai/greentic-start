@@ -28,6 +28,9 @@ pub struct AppPackInfo {
 pub struct AppFlowInfo {
     pub id: String,
     pub kind: String,
+    /// Event topic patterns this flow subscribes to (e.g. `["orders.*"]`).
+    /// An empty vec means the flow has no topic-based subscription filter.
+    pub subscribes_to: Vec<String>,
 }
 
 pub fn resolve_app_pack_path(
@@ -372,10 +375,29 @@ fn parse_flow_entry(value: &CborValue) -> Option<AppFlowInfo> {
     } else {
         extract_text_from_map(map, "kind")
     };
+    let subscribes_to = extract_string_array_from_map(map, "subscribes_to");
     Some(AppFlowInfo {
         id,
         kind: kind.unwrap_or_else(|| "messaging".to_string()),
+        subscribes_to,
     })
+}
+
+fn extract_string_array_from_map(map: &BTreeMap<CborValue, CborValue>, key: &str) -> Vec<String> {
+    map.get(&CborValue::Text(key.to_string()))
+        .and_then(|v| match v {
+            CborValue::Array(items) => Some(
+                items
+                    .iter()
+                    .filter_map(|item| match item {
+                        CborValue::Text(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn extract_text_from_map(map: &BTreeMap<CborValue, CborValue>, key: &str) -> Option<String> {
@@ -1027,10 +1049,12 @@ mod tests {
                 AppFlowInfo {
                     id: "alternate".to_string(),
                     kind: "messaging".to_string(),
+                    subscribes_to: vec![],
                 },
                 AppFlowInfo {
                     id: "default".to_string(),
                     kind: "workflow".to_string(),
+                    subscribes_to: vec![],
                 },
             ],
         };
@@ -1042,10 +1066,12 @@ mod tests {
                 AppFlowInfo {
                     id: "notify".to_string(),
                     kind: "messaging".to_string(),
+                    subscribes_to: vec![],
                 },
                 AppFlowInfo {
                     id: "wizard".to_string(),
                     kind: "setup".to_string(),
+                    subscribes_to: vec![],
                 },
             ],
         };
@@ -1065,10 +1091,12 @@ mod tests {
                 AppFlowInfo {
                     id: "one".to_string(),
                     kind: "messaging".to_string(),
+                    subscribes_to: vec![],
                 },
                 AppFlowInfo {
                     id: "two".to_string(),
                     kind: "messaging".to_string(),
+                    subscribes_to: vec![],
                 },
             ],
         };
@@ -1648,6 +1676,43 @@ mod tests {
         assert_eq!(
             metadata.get("user_question").map(String::as_str),
             Some("hello")
+        );
+    }
+
+    #[test]
+    fn extract_flows_parses_subscribes_to_and_defaults_to_empty() {
+        // Flow with subscribes_to present
+        let subscribed_flow = CborValue::Map(BTreeMap::from([
+            cbor_text("id", "order-handler"),
+            cbor_text("kind", "messaging"),
+            (
+                CborValue::Text("subscribes_to".to_string()),
+                CborValue::Array(vec![CborValue::Text("orders.*".to_string())]),
+            ),
+        ]));
+        // Flow with subscribes_to absent
+        let plain_flow = CborValue::Map(BTreeMap::from([
+            cbor_text("id", "default"),
+            cbor_text("kind", "messaging"),
+        ]));
+
+        let manifest = CborValue::Map(BTreeMap::from([(
+            CborValue::Text("flows".to_string()),
+            CborValue::Array(vec![subscribed_flow, plain_flow]),
+        )]));
+
+        let flows = extract_flows(&manifest);
+        assert_eq!(flows.len(), 2);
+
+        let subscribed = &flows[0];
+        assert_eq!(subscribed.id, "order-handler");
+        assert_eq!(subscribed.subscribes_to, vec!["orders.*".to_string()]);
+
+        let plain = &flows[1];
+        assert_eq!(plain.id, "default");
+        assert!(
+            plain.subscribes_to.is_empty(),
+            "absent subscribes_to must yield empty vec"
         );
     }
 }

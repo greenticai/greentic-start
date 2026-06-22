@@ -22,6 +22,7 @@ use crate::startup_contract::{
     StartupContract, StartupContractInput,
 };
 use crate::supervisor;
+use crate::timer_scheduler::{TimerScheduler, TimerSchedulerConfig, discover_timer_handlers};
 use anyhow::Context;
 
 use crate::cloudflared::{self, CloudflaredConfig};
@@ -36,12 +37,16 @@ use crate::subscriptions_universal::{
 #[derive(Default)]
 pub struct ForegroundRuntimeHandles {
     pub ingress_server: Option<HttpIngressServer>,
+    pub timer_scheduler: Option<TimerScheduler>,
 }
 
 impl ForegroundRuntimeHandles {
     pub fn stop(mut self) -> anyhow::Result<()> {
         if let Some(server) = self.ingress_server.take() {
             server.stop()?;
+        }
+        if let Some(scheduler) = self.timer_scheduler.take() {
+            scheduler.stop()?;
         }
         Ok(())
     }
@@ -829,6 +834,47 @@ pub fn demo_up_services(
     )
     .with_context(|| "failed to start local HTTP ingress server")?;
 
+    // ── Timer scheduler (optional) ─────────────────────────────────────────
+    // Discover any event-domain providers that declare timer handlers and start
+    // the background scheduler thread. If no timer providers are present the
+    // scheduler is not started, leaving the startup path unaffected. Discovery
+    // or start failures are non-fatal: they warn and leave the scheduler absent
+    // so HTTP ingress (webchat/messaging) is not affected.
+    const DEFAULT_TIMER_INTERVAL_SECONDS: u64 = 60;
+    let timer_scheduler =
+        match discover_timer_handlers(&discovery, DEFAULT_TIMER_INTERVAL_SECONDS) {
+            Err(err) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!("timer scheduler disabled: {err:#}"),
+                );
+                None
+            }
+            Ok(timer_handlers) if timer_handlers.is_empty() => None,
+            Ok(timer_handlers) => {
+                match TimerScheduler::start(TimerSchedulerConfig {
+                    runner_host: Arc::clone(&runner_host),
+                    tenant: tenant.to_string(),
+                    team: if team.is_empty() {
+                        None
+                    } else {
+                        Some(team.to_string())
+                    },
+                    handlers: timer_handlers,
+                    debug_enabled,
+                }) {
+                    Ok(scheduler) => Some(scheduler),
+                    Err(err) => {
+                        operator_log::warn(
+                            module_path!(),
+                            format!("timer scheduler disabled: {err:#}"),
+                        );
+                        None
+                    }
+                }
+            }
+        };
+
     // ── SQL gateway (optional) ─────────────────────────────────────────────
     // When `demo_config.sql` is set, resolve secrets and spawn a dedicated
     // localhost axum server serving `/sql/<conn>/schema` + `/sql/<conn>/query`.
@@ -1388,7 +1434,10 @@ pub fn demo_up_services(
         operator_log::warn(module_path!(), format!("failed to open browser: {err}"));
     }
 
-    Ok(ForegroundRuntimeHandles { ingress_server })
+    Ok(ForegroundRuntimeHandles {
+        ingress_server,
+        timer_scheduler,
+    })
 }
 
 fn validate_messaging_app_route(
