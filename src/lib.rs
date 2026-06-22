@@ -69,6 +69,7 @@ mod static_routes;
 mod subscriptions_universal;
 pub mod supervisor;
 mod timer_scheduler;
+pub(crate) mod topic_match;
 mod tunnel_prompt;
 mod warmup;
 mod webhook_updater;
