@@ -837,27 +837,43 @@ pub fn demo_up_services(
     // ── Timer scheduler (optional) ─────────────────────────────────────────
     // Discover any event-domain providers that declare timer handlers and start
     // the background scheduler thread. If no timer providers are present the
-    // scheduler is not started, leaving the startup path unaffected.
+    // scheduler is not started, leaving the startup path unaffected. Discovery
+    // or start failures are non-fatal: they warn and leave the scheduler absent
+    // so HTTP ingress (webchat/messaging) is not affected.
     const DEFAULT_TIMER_INTERVAL_SECONDS: u64 = 60;
-    let timer_handlers = discover_timer_handlers(&discovery, DEFAULT_TIMER_INTERVAL_SECONDS)
-        .context("discover timer handlers")?;
-    let timer_scheduler = if timer_handlers.is_empty() {
-        None
-    } else {
-        let scheduler = TimerScheduler::start(TimerSchedulerConfig {
-            runner_host: Arc::clone(&runner_host),
-            tenant: tenant.to_string(),
-            team: if team.is_empty() {
+    let timer_scheduler =
+        match discover_timer_handlers(&discovery, DEFAULT_TIMER_INTERVAL_SECONDS) {
+            Err(err) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!("timer scheduler disabled: {err:#}"),
+                );
                 None
-            } else {
-                Some(team.to_string())
-            },
-            handlers: timer_handlers,
-            debug_enabled,
-        })
-        .context("start timer scheduler")?;
-        Some(scheduler)
-    };
+            }
+            Ok(timer_handlers) if timer_handlers.is_empty() => None,
+            Ok(timer_handlers) => {
+                match TimerScheduler::start(TimerSchedulerConfig {
+                    runner_host: Arc::clone(&runner_host),
+                    tenant: tenant.to_string(),
+                    team: if team.is_empty() {
+                        None
+                    } else {
+                        Some(team.to_string())
+                    },
+                    handlers: timer_handlers,
+                    debug_enabled,
+                }) {
+                    Ok(scheduler) => Some(scheduler),
+                    Err(err) => {
+                        operator_log::warn(
+                            module_path!(),
+                            format!("timer scheduler disabled: {err:#}"),
+                        );
+                        None
+                    }
+                }
+            }
+        };
 
     // ── SQL gateway (optional) ─────────────────────────────────────────────
     // When `demo_config.sql` is set, resolve secrets and spawn a dedicated

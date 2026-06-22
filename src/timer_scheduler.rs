@@ -203,7 +203,11 @@ fn run_timer_handler(
 }
 
 fn parse_events(output: &JsonValue) -> anyhow::Result<Vec<EventEnvelopeV1>> {
-    let Some(array) = output.get("events").and_then(JsonValue::as_array) else {
+    let Some(array) = output
+        .get("events")
+        .or_else(|| output.get("emitted_events"))
+        .and_then(JsonValue::as_array)
+    else {
         return Ok(Vec::new());
     };
     let mut events = Vec::with_capacity(array.len());
@@ -578,5 +582,32 @@ mod tests {
         assert_eq!(alias_handler.op_id, "timer_sync");
         assert_eq!(alias_handler.handler_id, "default");
         assert_eq!(alias_handler.interval_seconds, 5);
+    }
+
+    #[test]
+    fn parse_events_accepts_emitted_events_key() {
+        let event = json!({
+            "event_id": "evt-2",
+            "event_type": "timer.fired",
+            "occurred_at": "2026-04-01T00:00:00Z",
+            "source": {
+                "domain": "events",
+                "provider": "events-email",
+                "handler_id": "digest"
+            },
+            "scope": {
+                "tenant": "demo",
+                "team": "default"
+            },
+            "payload": {"ok": true}
+        });
+        // "emitted_events" key must be treated as a fallback for "events"
+        let parsed =
+            parse_events(&json!({"emitted_events": [event.clone()]})).expect("emitted_events key");
+        assert_eq!(parsed.len(), 1, "emitted_events not picked up as fallback");
+        // "events" takes precedence when both are present
+        let parsed2 = parse_events(&json!({"events": [event.clone()], "emitted_events": [event]}))
+            .expect("both keys");
+        assert_eq!(parsed2.len(), 1, "should read events key, not emitted_events");
     }
 }
