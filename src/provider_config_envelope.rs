@@ -250,6 +250,10 @@ fn read_pack_provenance(
             })
             .unwrap_or_default(),
         config_schema: SchemaIr::Null,
+        // Additive 0.6.x field: a pack manifest carries no outcomes vocabulary,
+        // so the provenance describe mirrors the empty default older descriptors
+        // decode to.
+        outcomes: Vec::new(),
     };
     let describe_hash = hash_canonical(&describe)?;
 
