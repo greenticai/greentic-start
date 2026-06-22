@@ -533,11 +533,24 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             host: std::sync::Arc::new(host),
             routing: std::sync::Arc::new(routing),
         });
+        // When a tunnel fronts the main listener, also run a loopback-only
+        // admin/console listener so `/chat` + `/workers/invoke` stay reachable
+        // to a genuine local caller (a `kubectl port-forward` on K8s) while the
+        // public face refuses them. The tunnel targets the main port only, so
+        // nothing external can reach this one. Defaults to `127.0.0.1:<main+1>`;
+        // `find_available_port` inside `start` bumps it if taken.
+        let admin_bind_addr = will_tunnel.then(|| {
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                bind_addr.port().saturating_add(1),
+            )
+        });
         let server = revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
             bind_addr,
             activation: std::sync::Arc::clone(&activation),
             gui_enabled,
             trust_loopback_peers: !will_tunnel,
+            admin_bind_addr,
         })
         .context("starting the revision ingress server")?;
         let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
@@ -558,7 +571,18 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         operator_log::info(module_path!(), banner.clone());
         println!("\n{banner}. Press Ctrl+C to stop.");
         if gui_enabled {
-            let chat = format!("webchat console enabled — open http://{listen}/chat");
+            // With a tunnel up, the console lives on the loopback admin listener
+            // (the public port serves provider webhooks only); point operators
+            // at the port to forward. Otherwise it's on the main port.
+            let chat = match server.admin_port() {
+                Some(admin) => format!(
+                    "webchat console enabled on the loopback admin listener — \
+                     open http://127.0.0.1:{admin}/chat (port-forward it on K8s); \
+                     the public listener on http://{listen} serves provider \
+                     webhooks only while a tunnel is up"
+                ),
+                None => format!("webchat console enabled — open http://{listen}/chat"),
+            };
             operator_log::info(module_path!(), chat.clone());
             println!("{chat}");
         }

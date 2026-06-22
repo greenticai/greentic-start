@@ -2228,9 +2228,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deploy-spec"
-version = "0.1.27935290387"
+version = "0.1.27955766640"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6bf0a7d0bef3a194547d15a18b17bfe8b7b26d68672bff777e48ae7d2867a74"
+checksum = "6c08bebd1c96e27ef3ae53e504fd6afa3cef93f21fd74fdd320db0560bbf5ce3"
 dependencies = [
  "chrono",
  "greentic-config-types",
@@ -2249,12 +2249,13 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.1.0-dev.27935290387"
+version = "1.1.0-dev.27955766640"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e081f3ae5aa2b9aa93b9487bc5723b8834aa546a10f1589154c004d98e093eb3"
+checksum = "89342c1b980e77541309a8f05890da53825af24d543b665e39545d632b767a8d"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "ed25519-dalek",
@@ -2461,9 +2462,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-operator-trust"
-version = "0.1.27935290387"
+version = "0.1.27955766640"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd6f46e395cd821c7d8a9f786c08115df83df474d6361c0ed51bc665d58e2cb8"
+checksum = "2f1fc2bc797cb24f2fbdb06ddd4b6dd40344ba95b30558d7f747b26dc6f95de5"
 dependencies = [
  "chrono",
  "ed25519-dalek",
@@ -5359,9 +5360,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
  "aws-lc-rs",
  "log",
