@@ -109,6 +109,13 @@ pub(crate) struct RevisionServeConfig {
     /// boot (on by default for the `local` env, off elsewhere unless the operator
     /// opts in). When false the chat paths fall through to deployment routing.
     pub gui_enabled: bool,
+    /// Whether a loopback TCP peer may be granted the trust the loopback gate
+    /// confers (`/chat`, `/workers/invoke`, caller-asserted identity). Set
+    /// `false` when a public tunnel (cloudflared/ngrok) fronts this listener:
+    /// the tunnel forwards external traffic to `127.0.0.1:<port>`, so a
+    /// tunneled request's peer reads as loopback and would otherwise inherit
+    /// that trust. See [`peer_is_loopback_trusted`].
+    pub trust_loopback_peers: bool,
 }
 
 /// Per-connection shared state. Holds the live activation behind an
@@ -339,6 +346,10 @@ impl RevisionServer {
         // [`RevisionServer::state`] handle so [`reload`] / [`counts`] read the
         // same slot the running listener reads.
         let listener_state = Arc::clone(&state);
+        // Captured into the accept loop: a listener-thread concern (not
+        // per-request state), so it lives as a thread-local rather than on
+        // `ServeState`. AND-ed into the per-connection loopback decision below.
+        let trust_loopback_peers = config.trust_loopback_peers;
 
         let (tx, rx) = oneshot::channel();
         // The startup channel ships the Tokio runtime handle alongside the
@@ -382,11 +393,11 @@ impl RevisionServer {
                                 Ok((stream, peer)) => {
                                     let connection_state = listener_state.clone();
                                     // Caller-asserted identity (see `serve`) is only
-                                    // honoured from loopback peers; capture it here.
-                                    // `to_canonical` so an IPv4-mapped IPv6 peer
-                                    // (`::ffff:127.0.0.1`, seen under an IPv6 bind)
-                                    // still reads as loopback.
-                                    let peer_is_loopback = peer.ip().to_canonical().is_loopback();
+                                    // honoured from loopback peers; decide it here.
+                                    // Refuses loopback trust when a tunnel fronts
+                                    // this listener — see [`peer_is_loopback_trusted`].
+                                    let peer_is_loopback =
+                                        peer_is_loopback_trusted(trust_loopback_peers, peer.ip());
                                     tokio::spawn(async move {
                                         let service = service_fn(move |req| {
                                             handle_connection(
@@ -591,6 +602,22 @@ impl RevisionServer {
         }
         Ok(())
     }
+}
+
+/// Decide whether a connection's peer should be granted loopback trust.
+///
+/// Trust is the AND of two facts: the TCP peer is a loopback address, AND this
+/// listener is not fronted by a public tunnel. A cloudflared/ngrok quick tunnel
+/// forwards external traffic to `127.0.0.1:<port>`, so every tunneled request
+/// would otherwise read as a loopback peer and inherit the trust the loopback
+/// gate confers on `/chat`, `/workers/invoke`, and caller-asserted identity.
+/// When a tunnel fronts the listener we refuse loopback trust outright
+/// (`trust_loopback_peers = false`): those endpoints become unavailable for the
+/// tunnel's lifetime rather than publicly reachable. `to_canonical` keeps an
+/// IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`, seen under an IPv6 bind)
+/// reading as loopback.
+fn peer_is_loopback_trusted(trust_loopback_peers: bool, peer: std::net::IpAddr) -> bool {
+    trust_loopback_peers && peer.to_canonical().is_loopback()
 }
 
 /// `service_fn` adapter: collapse the `Ok`/`Err` response halves into the single
@@ -2599,6 +2626,27 @@ mod tests {
         assert_eq!(user, None);
         assert_eq!(session, None);
         assert!(endpoint.is_none());
+    }
+
+    #[test]
+    fn loopback_trust_requires_both_a_loopback_peer_and_no_tunnel() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mapped_loopback = IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+        let public = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+
+        // No tunnel: only genuine loopback peers are trusted (an IPv4-mapped
+        // IPv6 loopback still counts; a public peer never does).
+        assert!(peer_is_loopback_trusted(true, loopback));
+        assert!(peer_is_loopback_trusted(true, mapped_loopback));
+        assert!(!peer_is_loopback_trusted(true, public));
+
+        // Tunnel fronting the listener: every peer is untrusted, including a
+        // loopback one — the tunnel forwards public traffic over loopback, so
+        // the peer address can no longer prove the caller is local.
+        assert!(!peer_is_loopback_trusted(false, loopback));
+        assert!(!peer_is_loopback_trusted(false, mapped_loopback));
+        assert!(!peer_is_loopback_trusted(false, public));
     }
 
     #[test]

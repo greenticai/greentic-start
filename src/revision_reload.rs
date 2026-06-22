@@ -473,6 +473,7 @@ mod tests {
                 bind_addr: bind,
                 activation,
                 gui_enabled: false,
+                trust_loopback_peers: true,
             })
             .expect("placeholder server"),
         )
