@@ -353,12 +353,19 @@ impl RevisionServer {
         // Optional loopback-only admin/console listener. Its port is resolved
         // here (same synchronous probe as the main port) so the bound port is
         // known before the serving thread starts and can be surfaced to the
-        // boot banner.
+        // boot banner. The search starts at `actual_port + 1` when the
+        // originally requested admin port would collide with the resolved
+        // main port (e.g. the main port was bumped into the admin range).
         let admin_addr = match config.admin_bind_addr {
             Some(requested) => {
+                let admin_start = if requested.port() <= actual_port {
+                    actual_port.saturating_add(1)
+                } else {
+                    requested.port()
+                };
                 let admin_port = crate::port_utils::find_available_port(
                     &requested.ip().to_string(),
-                    requested.port(),
+                    admin_start,
                     10,
                 )
                 .context("failed to find available port for admin/console listener")?;
@@ -2786,6 +2793,38 @@ mod tests {
             get_status(admin, "/chat"),
             200,
             "loopback admin listener must serve the console"
+        );
+
+        server.stop().expect("stop server");
+    }
+
+    #[test]
+    fn admin_port_skips_bumped_main_port() {
+        // Regression: when the requested main port is busy,
+        // `find_available_port` bumps it (e.g. N → N+1). The admin listener
+        // defaults to N+1, so a naïve probe would also pick N+1 — then the
+        // serving thread binds both to the same port and the second bind
+        // fails. The fix starts the admin search from `actual_port + 1`.
+        let base: u16 = 17810;
+        // Hold the base port so the main listener bumps to base+1.
+        let _hold = std::net::TcpListener::bind(format!("127.0.0.1:{base}")).expect("hold base");
+        let server = RevisionServer::start(RevisionServeConfig {
+            bind_addr: format!("127.0.0.1:{base}").parse().unwrap(),
+            activation: std::sync::Arc::new(empty_activation("port-bump")),
+            gui_enabled: true,
+            trust_loopback_peers: false,
+            // Admin requested at base+1 — exactly where the main listener
+            // will land after bumping past the held base port.
+            admin_bind_addr: Some(format!("127.0.0.1:{}", base + 1).parse().unwrap()),
+        })
+        .expect("start must succeed even when main bumps into admin range");
+
+        let main = server.actual_port();
+        let admin = server.admin_port().expect("admin bound");
+        assert_eq!(main, base + 1, "main should have bumped to base+1");
+        assert!(
+            admin > main,
+            "admin ({admin}) must be above the bumped main ({main})"
         );
 
         server.stop().expect("stop server");
