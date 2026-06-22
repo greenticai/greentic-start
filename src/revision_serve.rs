@@ -110,12 +110,20 @@ pub(crate) struct RevisionServeConfig {
     /// opts in). When false the chat paths fall through to deployment routing.
     pub gui_enabled: bool,
     /// Whether a loopback TCP peer may be granted the trust the loopback gate
-    /// confers (`/chat`, `/workers/invoke`, caller-asserted identity). Set
-    /// `false` when a public tunnel (cloudflared/ngrok) fronts this listener:
-    /// the tunnel forwards external traffic to `127.0.0.1:<port>`, so a
-    /// tunneled request's peer reads as loopback and would otherwise inherit
-    /// that trust. See [`peer_is_loopback_trusted`].
+    /// confers (`/chat`, `/workers/invoke`, caller-asserted identity) on the
+    /// main listener. Set `false` when a public tunnel (cloudflared/ngrok)
+    /// fronts it: the tunnel forwards external traffic to `127.0.0.1:<port>`,
+    /// so a tunneled request's peer reads as loopback and would otherwise
+    /// inherit that trust. See [`peer_is_loopback_trusted`].
     pub trust_loopback_peers: bool,
+    /// Optional second, loopback-scoped admin/console listener that runs
+    /// alongside the main one and *always* trusts loopback peers. Set when a
+    /// tunnel fronts the main listener (`trust_loopback_peers = false`): the
+    /// tunnel targets the main port only, so this listener — reachable solely
+    /// via a local port-forward / in-pod loopback — keeps serving `/chat` +
+    /// `/workers/invoke` to a genuine local caller while the public face
+    /// refuses them. `None` = single listener (the non-tunnel default).
+    pub admin_bind_addr: Option<SocketAddr>,
 }
 
 /// Per-connection shared state. Holds the live activation behind an
@@ -277,6 +285,11 @@ pub(crate) struct RevisionServer {
     shutdown: Option<oneshot::Sender<()>>,
     handle: Option<JoinHandle<Result<()>>>,
     actual_port: u16,
+    /// Port the loopback-only admin/console listener bound, when one was
+    /// requested (a tunnel fronts the main listener). `None` = single
+    /// listener. Surfaced so the boot banner can point operators at the
+    /// console port to port-forward.
+    admin_port: Option<u16>,
     /// Shared state holding the [`ArcSwap`] activation slot. Kept here so
     /// [`reload`](Self::reload) can swap a new [`Activation`] in and
     /// [`counts`](Self::counts) can read the live snapshot.
@@ -337,6 +350,31 @@ impl RevisionServer {
         }
         let addr = SocketAddr::new(listen_ip, actual_port);
 
+        // Optional loopback-only admin/console listener. Its port is resolved
+        // here (same synchronous probe as the main port) so the bound port is
+        // known before the serving thread starts and can be surfaced to the
+        // boot banner. The search starts at `actual_port + 1` when the
+        // originally requested admin port would collide with the resolved
+        // main port (e.g. the main port was bumped into the admin range).
+        let admin_addr = match config.admin_bind_addr {
+            Some(requested) => {
+                let admin_start = if requested.port() <= actual_port {
+                    actual_port.saturating_add(1)
+                } else {
+                    requested.port()
+                };
+                let admin_port = crate::port_utils::find_available_port(
+                    &requested.ip().to_string(),
+                    admin_start,
+                    10,
+                )
+                .context("failed to find available port for admin/console listener")?;
+                Some(SocketAddr::new(requested.ip(), admin_port))
+            }
+            None => None,
+        };
+        let admin_port = admin_addr.map(|a| a.port());
+
         let state = Arc::new(ServeState {
             slot: ArcSwap::new(config.activation),
             bound_addr: addr,
@@ -380,48 +418,59 @@ impl RevisionServer {
                             return Err(err);
                         }
                     };
+                    let admin_listener = match admin_addr {
+                        Some(a) => match TcpListener::bind(a)
+                            .await
+                            .context("failed to bind admin/console listener")
+                        {
+                            Ok(l) => Some(l),
+                            Err(err) => {
+                                let _ = startup_tx.send(Err(anyhow::anyhow!("{err:#}")));
+                                return Err(err);
+                            }
+                        },
+                        None => None,
+                    };
                     let _ = startup_tx.send(Ok(runtime_handle));
                     operator_log::info(
                         module_path!(),
                         format!("revision ingress listening on http://{addr}"),
                     );
+                    if let Some(a) = admin_addr {
+                        operator_log::info(
+                            module_path!(),
+                            format!("revision ingress admin/console listening on http://{a}"),
+                        );
+                    }
                     let mut shutdown = rx;
                     loop {
                         tokio::select! {
                             _ = &mut shutdown => break,
-                            accept = listener.accept() => match accept {
-                                Ok((stream, peer)) => {
-                                    let connection_state = listener_state.clone();
-                                    // Caller-asserted identity (see `serve`) is only
-                                    // honoured from loopback peers; decide it here.
-                                    // Refuses loopback trust when a tunnel fronts
-                                    // this listener — see [`peer_is_loopback_trusted`].
-                                    let peer_is_loopback =
-                                        peer_is_loopback_trusted(trust_loopback_peers, peer.ip());
-                                    tokio::spawn(async move {
-                                        let service = service_fn(move |req| {
-                                            handle_connection(
-                                                req,
-                                                connection_state.clone(),
-                                                peer_is_loopback,
-                                            )
-                                        });
-                                        let io = TokioIo::new(stream);
-                                        if let Err(err) =
-                                            Http1Builder::new().serve_connection(io, service).await
-                                        {
-                                            operator_log::error(
-                                                module_path!(),
-                                                format!("revision ingress connection error: {err}"),
-                                            );
-                                        }
-                                    });
+                            // Main listener: the loopback gate + caller-asserted
+                            // identity (see `serve`) honour `trust_loopback_peers`,
+                            // which is false when a tunnel fronts this port.
+                            accept = listener.accept() => {
+                                spawn_revision_connection(
+                                    accept,
+                                    &listener_state,
+                                    trust_loopback_peers,
+                                );
+                            }
+                            // Admin/console listener (when bound): loopback-scoped
+                            // and unreachable from the tunnel, so it always trusts
+                            // loopback peers. `pending()` disables this arm when no
+                            // admin listener exists.
+                            accept = async {
+                                match admin_listener.as_ref() {
+                                    Some(l) => l.accept().await,
+                                    None => std::future::pending::<
+                                        std::io::Result<(tokio::net::TcpStream, SocketAddr)>,
+                                    >()
+                                    .await,
                                 }
-                                Err(err) => operator_log::error(
-                                    module_path!(),
-                                    format!("revision ingress accept error: {err}"),
-                                ),
-                            },
+                            } => {
+                                spawn_revision_connection(accept, &listener_state, true);
+                            }
                         }
                     }
                     Ok(())
@@ -447,6 +496,7 @@ impl RevisionServer {
             shutdown: Some(tx),
             handle: Some(handle),
             actual_port,
+            admin_port,
             state,
             runtime_handle,
             reload_lock: std::sync::Mutex::new(()),
@@ -455,9 +505,15 @@ impl RevisionServer {
     }
 
     /// The port the server actually bound (may differ from the request if it was
-    /// taken).
+    /// taken). This is the port a tunnel targets.
     pub(crate) fn actual_port(&self) -> u16 {
         self.actual_port
+    }
+
+    /// The loopback admin/console listener's port, when one was bound (a tunnel
+    /// fronts the main listener). `None` = single listener.
+    pub(crate) fn admin_port(&self) -> Option<u16> {
+        self.admin_port
     }
 
     /// `(deployment_count, revision_count)` from a single snapshot of the
@@ -618,6 +674,39 @@ impl RevisionServer {
 /// reading as loopback.
 fn peer_is_loopback_trusted(trust_loopback_peers: bool, peer: std::net::IpAddr) -> bool {
     trust_loopback_peers && peer.to_canonical().is_loopback()
+}
+
+/// Accept-loop helper: spawn a task to serve one accepted connection, deciding
+/// loopback trust from this listener's `trust_loopback_peers` and the peer IP.
+/// Shared by the main listener and the optional loopback admin listener so each
+/// applies its own trust to the same [`ServeState`]/app.
+fn spawn_revision_connection(
+    accept: std::io::Result<(tokio::net::TcpStream, SocketAddr)>,
+    state: &Arc<ServeState>,
+    trust_loopback_peers: bool,
+) {
+    match accept {
+        Ok((stream, peer)) => {
+            let connection_state = Arc::clone(state);
+            let peer_is_loopback = peer_is_loopback_trusted(trust_loopback_peers, peer.ip());
+            tokio::spawn(async move {
+                let service = service_fn(move |req| {
+                    handle_connection(req, connection_state.clone(), peer_is_loopback)
+                });
+                let io = TokioIo::new(stream);
+                if let Err(err) = Http1Builder::new().serve_connection(io, service).await {
+                    operator_log::error(
+                        module_path!(),
+                        format!("revision ingress connection error: {err}"),
+                    );
+                }
+            });
+        }
+        Err(err) => operator_log::error(
+            module_path!(),
+            format!("revision ingress accept error: {err}"),
+        ),
+    }
 }
 
 /// `service_fn` adapter: collapse the `Ok`/`Err` response halves into the single
@@ -2650,6 +2739,98 @@ mod tests {
     }
 
     #[test]
+    fn tunneled_split_serves_console_on_admin_listener_only() {
+        use std::io::{Read, Write};
+        use std::net::SocketAddr;
+
+        // Status code of `GET <path>` over a fresh loopback connection.
+        fn get_status(port: u16, path: &str) -> u16 {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            s.write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .expect("write request");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).expect("read response");
+            let head = String::from_utf8_lossy(&buf);
+            head.lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse().ok())
+                .unwrap_or_else(|| panic!("no status line in response: {head:?}"))
+        }
+
+        // A tunnel fronts the main listener (trust_loopback_peers = false), with
+        // a loopback-only admin listener alongside it. Far-apart base ports so
+        // the two `find_available_port` ranges can't overlap.
+        let server = RevisionServer::start(RevisionServeConfig {
+            bind_addr: "127.0.0.1:17780".parse::<SocketAddr>().unwrap(),
+            activation: std::sync::Arc::new(empty_activation("split-test")),
+            gui_enabled: true,
+            trust_loopback_peers: false,
+            admin_bind_addr: Some("127.0.0.1:17900".parse::<SocketAddr>().unwrap()),
+        })
+        .expect("start split server");
+
+        let main = server.actual_port();
+        let admin = server.admin_port().expect("admin listener bound");
+        assert_ne!(main, admin, "admin listener must be a distinct port");
+
+        // Both listeners are live: the ungated probe answers on each.
+        assert_eq!(get_status(main, "/healthz"), 200, "main /healthz");
+        assert_eq!(get_status(admin, "/healthz"), 200, "admin /healthz");
+
+        // The whole point of the split: the console is refused on the public
+        // (tunneled, untrusted) listener but served on the loopback admin
+        // listener — webchat and a tunnelled provider face at the same time.
+        assert_ne!(
+            get_status(main, "/chat"),
+            200,
+            "public listener must NOT serve the console"
+        );
+        assert_eq!(
+            get_status(admin, "/chat"),
+            200,
+            "loopback admin listener must serve the console"
+        );
+
+        server.stop().expect("stop server");
+    }
+
+    #[test]
+    fn admin_port_skips_bumped_main_port() {
+        // Regression: when the requested main port is busy,
+        // `find_available_port` bumps it (e.g. N → N+1). The admin listener
+        // defaults to N+1, so a naïve probe would also pick N+1 — then the
+        // serving thread binds both to the same port and the second bind
+        // fails. The fix starts the admin search from `actual_port + 1`.
+        let base: u16 = 17810;
+        // Hold the base port so the main listener bumps to base+1.
+        let _hold = std::net::TcpListener::bind(format!("127.0.0.1:{base}")).expect("hold base");
+        let server = RevisionServer::start(RevisionServeConfig {
+            bind_addr: format!("127.0.0.1:{base}").parse().unwrap(),
+            activation: std::sync::Arc::new(empty_activation("port-bump")),
+            gui_enabled: true,
+            trust_loopback_peers: false,
+            // Admin requested at base+1 — exactly where the main listener
+            // will land after bumping past the held base port.
+            admin_bind_addr: Some(format!("127.0.0.1:{}", base + 1).parse().unwrap()),
+        })
+        .expect("start must succeed even when main bumps into admin range");
+
+        let main = server.actual_port();
+        let admin = server.admin_port().expect("admin bound");
+        assert_eq!(main, base + 1, "main should have bumped to base+1");
+        assert!(
+            admin > main,
+            "admin ({admin}) must be above the bumped main ({main})"
+        );
+
+        server.stop().expect("stop server");
+    }
+
+    #[test]
     fn caller_identity_returns_messaging_endpoint_from_loopback_header() {
         let payload = json!({});
         let (_, _, endpoint) =
@@ -3833,6 +4014,7 @@ mod tests {
             shutdown: None,
             handle: None,
             actual_port: 0,
+            admin_port: None,
             state,
             runtime_handle: Handle::current(),
             reload_lock: std::sync::Mutex::new(()),

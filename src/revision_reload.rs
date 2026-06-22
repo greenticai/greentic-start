@@ -474,6 +474,7 @@ mod tests {
                 activation,
                 gui_enabled: false,
                 trust_loopback_peers: true,
+                admin_bind_addr: None,
             })
             .expect("placeholder server"),
         )
