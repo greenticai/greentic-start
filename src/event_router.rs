@@ -100,15 +100,6 @@ pub fn route_events(
     Ok(routed)
 }
 
-/// Backward-compatible shim — delegates to `route_events`.
-pub fn route_events_to_default_flow(
-    bundle: &Path,
-    ctx: &OperatorContext,
-    events: &[EventEnvelopeV1],
-) -> anyhow::Result<usize> {
-    route_events(bundle, ctx, events)
-}
-
 fn build_event_flow_input(event: &EventEnvelopeV1, ctx: &OperatorContext) -> JsonValue {
     json!({
         "event": event,
