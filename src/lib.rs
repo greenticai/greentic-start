@@ -519,6 +519,16 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // opted in (`op config set gui_enabled` / env-manifest). When on, the
         // server serves the built-in webchat console at `/chat`.
         let gui_enabled = environment.host_config.resolved_gui_enabled();
+        // A public tunnel (`--cloudflared on` / `--ngrok on`) forwards external
+        // traffic to this listener over loopback, so a tunneled request's TCP
+        // peer reads as 127.0.0.1 and would defeat the loopback trust gate on
+        // `/chat`, `/workers/invoke`, and caller-asserted identity. When a tunnel
+        // is requested, refuse to derive loopback trust at all (the sensitive
+        // endpoints become unavailable while the tunnel is up rather than
+        // publicly reachable). Mirrors `env_tunnel::choose_tunnel`'s `Off`
+        // condition without re-running its both-on log line.
+        let will_tunnel = matches!(request.cloudflared, CloudflaredModeArg::On)
+            || matches!(request.ngrok, NgrokModeArg::On);
         let activation = std::sync::Arc::new(revision_serve::Activation {
             host: std::sync::Arc::new(host),
             routing: std::sync::Arc::new(routing),
@@ -527,6 +537,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             bind_addr,
             activation: std::sync::Arc::clone(&activation),
             gui_enabled,
+            trust_loopback_peers: !will_tunnel,
         })
         .context("starting the revision ingress server")?;
         let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
