@@ -98,19 +98,19 @@ fn timer_fired_does_not_match_unrelated_subscriber() {
     );
 }
 
-/// End-to-end emit→subscribe routing proof (selection layer).
+/// Selection-layer assertion: a flow-emitted `orders.created` event routes to
+/// the `orders.*` subscriber (`flow_b`) and NOT back to the non-subscribing
+/// emitter (`flow_a`).
 ///
-/// Models a pack where `flow_a` (the default messaging flow, no subscription) emits
-/// `orders.created`, and `flow_b` subscribes to `orders.*`.  Simulates the
-/// host-side routing step that `route_events` (A5) performs after collecting
-/// `RunResult.emitted_events` from `flow_a`: it calls `select_target_flows`
-/// with the emitted event's type to find which flow(s) to invoke next.
-///
-/// The assertion proves that the emitted `orders.created` topic is routed
-/// exclusively to `flow_b`, not back to `flow_a` (which carries no subscription
-/// filter), satisfying the A1–A5 wiring contract at the selection seam.
+/// This test verifies only the `select_target_flows` call — the selection seam
+/// inside `route_events_inner` — using a pre-built `EventEnvelopeV1` as a
+/// stand-in for what `mint_event_envelope` would produce.  It does NOT exercise
+/// the full emit→mint→reroute chain through `route_events`; that path requires a
+/// live WASM runner and is not covered here.  See the
+/// `mint_then_select_routes_emitted_partial_to_subscriber` unit test in
+/// `src/event_router.rs` for the in-process mint→select seam.
 #[test]
-fn flow_emitted_event_is_routed_to_subscriber() {
+fn emitted_event_type_selects_subscriber_not_emitter() {
     // Pack with two flows:
     //   flow_a — default messaging flow (emitter); no subscribes_to
     //   flow_b — event subscriber for orders.*

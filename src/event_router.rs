@@ -394,6 +394,62 @@ mod tests {
         assert!(mint_event_envelope(&partial, &ctx, "f", None).is_none());
     }
 
+    /// Proves the partial → mint (A5) → event_type → select_target_flows chain
+    /// entirely in-process.
+    ///
+    /// 1. Build a partial as `RunResult.emitted_events` carries it.
+    /// 2. Call `mint_event_envelope` to produce a full `EventEnvelopeV1`.
+    /// 3. Assert the minted envelope carries the correct `event_type`.
+    /// 4. Call `select_target_flows` with that `event_type` and assert only
+    ///    the `orders.*` subscriber (`flow_b`) is returned, not the emitter
+    ///    (`flow_a`, which has no subscription).
+    #[test]
+    fn mint_then_select_routes_emitted_partial_to_subscriber() {
+        let partial = serde_json::json!({
+            "event_type": "orders.created",
+            "payload": { "id": "o1" }
+        });
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            correlation_id: None,
+        };
+
+        // Step A5: mint a full envelope from the partial emitted by flow_a.
+        let envelope = mint_event_envelope(&partial, &ctx, "flow_a", None)
+            .expect("partial with event_type must mint a full envelope");
+        assert_eq!(
+            envelope.event_type, "orders.created",
+            "minted envelope must preserve the emitted event_type"
+        );
+
+        // Selection: build a pack with flow_a (no subscription) and flow_b (orders.*).
+        let pack = AppPackInfo {
+            pack_id: "emit-unit-pack".to_string(),
+            flows: vec![
+                AppFlowInfo {
+                    id: "flow_a".to_string(),
+                    kind: "messaging".to_string(),
+                    subscribes_to: vec![],
+                },
+                AppFlowInfo {
+                    id: "flow_b".to_string(),
+                    kind: "events".to_string(),
+                    subscribes_to: vec!["orders.*".to_string()],
+                },
+            ],
+        };
+
+        let matched = select_target_flows(&pack, &envelope.event_type);
+        let ids: Vec<&str> = matched.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["flow_b"],
+            "orders.created must route to flow_b (orders.* subscriber) only; \
+             flow_a (no subscription) must be excluded"
+        );
+    }
+
     #[test]
     fn route_depth_constant_is_bounded() {
         // Guard against accidental unbounded recursion via a 0 or huge constant.
