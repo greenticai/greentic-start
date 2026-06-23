@@ -240,6 +240,9 @@ fn read_pack_provenance(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
+        // Synthetic setup-side envelope declares no routing outcomes; the
+        // real set is carried by the component's own describe at runtime.
+        outcomes: Vec::new(),
         config_schema: SchemaIr::Null,
     };
     let describe_hash = hash_canonical(&describe)?;

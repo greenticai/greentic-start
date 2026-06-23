@@ -261,6 +261,8 @@ pub(super) fn build_demo_host_config(tenant: &str) -> HostConfig {
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        // No agent-graphs in the synthetic demo host config.
+        graphs: HashMap::new(),
         // Populated below from GREENTIC_AW_AGENTS_FILE when set. greentic-start
         // builds a synthetic HostConfig (there is no bindings-YAML path here),
         // so Digital Worker agents for the agentic worker are sourced from that
