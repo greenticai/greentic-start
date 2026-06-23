@@ -315,6 +315,12 @@ pub fn resolve_secrets_manager(
             let (manager, store_path, using_env_fallback) =
                 fallback_to_env(allow_env, "<selection>".to_string(), "<none>", err)?;
             let manager = CachingSecretsManager::wrap(manager);
+            let manager = crate::oauth_secret_bridge::OAuthBridgingSecretsManager::wrap(
+                manager,
+                Some(Arc::new(
+                    crate::oauth_secret_bridge::NoopProviderTokenResolver,
+                )),
+            );
             return Ok(SecretsManagerHandle {
                 manager,
                 selection: secrets_manager::SecretsManagerSelection {
@@ -398,6 +404,17 @@ pub fn resolve_secrets_manager(
         );
     }
     let manager = CachingSecretsManager::wrap(manager);
+    // OAuth bake-in: refresh-on-read. `/oauth/callback` persists the token at the
+    // pack-scoped key the adapter reads; this resolver serves it and silently
+    // refreshes via the native OAuth engine when it's near expiry (using the sibling
+    // refresh_token/client_id/secret). Non-OAuth keys and tokens without an
+    // `expires_at` fall through unchanged.
+    let resolver: std::sync::Arc<dyn crate::oauth_secret_bridge::ProviderTokenResolver> =
+        std::sync::Arc::new(crate::oauth_secret_bridge::RefreshingResolver::new(
+            manager.clone(),
+        ));
+    let manager =
+        crate::oauth_secret_bridge::OAuthBridgingSecretsManager::wrap(manager, Some(resolver));
     Ok(SecretsManagerHandle {
         manager,
         selection,
@@ -500,6 +517,16 @@ fn resolve_bound_secrets_manager(
     );
 
     let manager = CachingSecretsManager::wrap(manager);
+    // OAuth bake-in (host resolver): intercept `auth.oauth2.*.access_token` reads
+    // and resolve a valid token via greentic-oauth (mint/refresh). With the no-op
+    // resolver these fall through to the store unchanged; the greentic-oauth-backed
+    // resolver is wired in separately.
+    let manager = crate::oauth_secret_bridge::OAuthBridgingSecretsManager::wrap(
+        manager,
+        Some(Arc::new(
+            crate::oauth_secret_bridge::NoopProviderTokenResolver,
+        )),
+    );
     Ok(SecretsManagerHandle {
         manager,
         selection,
@@ -602,7 +629,14 @@ pub fn canonical_secret_store_key(uri: &str) -> Option<String> {
     greentic_secrets_lib::canonical_secret_store_key(uri)
 }
 
-fn secret_uri_candidates(
+/// Store-key candidates for a secret, reconciling differing provider string forms
+/// (raw `messaging-webchat-gui` vs canonical `messaging_webchat_gui`). The raw
+/// provider form is first; the canonical (underscored) form is added when it
+/// differs. This is the canonicalization middleware for read/existence CRITICAL
+/// PATHS — without it a writer and reader that disagree on the provider segment
+/// resolve different keys (e.g. a regenerated `jwt_signing_key` → a minted token
+/// that fails to verify → 401).
+pub fn secret_uri_candidates(
     env: &str,
     tenant: &str,
     canonical_team: &str,
@@ -611,7 +645,15 @@ fn secret_uri_candidates(
 ) -> Vec<String> {
     let normalized_key = secret_name::canonical_secret_name(key);
     let prefix = format!("secrets://{}/{}/{}/", env, tenant, canonical_team);
-    vec![format!("{prefix}{provider_id}/{normalized_key}")]
+    let mut out = vec![format!("{prefix}{provider_id}/{normalized_key}")];
+    let canonical_provider = secret_name::canonical_secret_name(provider_id);
+    if canonical_provider != provider_id {
+        let canon = format!("{prefix}{canonical_provider}/{normalized_key}");
+        if !out.contains(&canon) {
+            out.push(canon);
+        }
+    }
+    out
 }
 
 fn display_secret_candidates(
