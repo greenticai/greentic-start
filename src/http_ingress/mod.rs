@@ -476,7 +476,7 @@ where
             .to_string();
         let query = req.uri().query().unwrap_or("").to_string();
         let manager = state.runner_host.secrets_manager();
-        return Ok(handle_oauth_callback(&query, &provider, manager).await);
+        return Ok(handle_oauth_callback(&query, &provider, manager, &state).await);
     }
 
     // OAuth token exchange proxy: /v1/messaging/webchat/{tenant}/oauth/token-exchange
@@ -1016,6 +1016,99 @@ where
         StatusCode::NOT_FOUND,
         "provider does not implement directline_http or ingest_http",
     ))
+}
+
+/// Auto-resume the webchat conversation that surfaced an OAuth Connect card, once
+/// `/oauth/callback` has persisted the token. Re-runs the app flow against a
+/// synthetic inbound envelope (bound to the conversation via `session_id`) through
+/// the SAME pipeline an inbound message uses — `route_messaging_envelopes` runs the
+/// flow (token now present) and egresses the next card to the conversation's store,
+/// which the client's open stream/poll picks up. No user re-type.
+/// Best-effort: logs and returns on any miss (no conversation, no provider).
+async fn trigger_oauth_resume(
+    state: &Arc<HttpIngressState>,
+    ctx: &crate::oauth_state::OAuthStateContext,
+) {
+    let Some(conv) = ctx.conv.as_deref().filter(|c| !c.is_empty()) else {
+        operator_log::info(
+            module_path!(),
+            "[oauth-resume] no conversation id in state; skipping auto-advance",
+        );
+        return;
+    };
+    let Some(provider) = ["messaging-webchat", "messaging-webchat-gui"]
+        .into_iter()
+        .find(|p| {
+            state
+                .runner_host
+                .get_provider_pack_path(Domain::Messaging, p)
+                .is_some()
+        })
+    else {
+        operator_log::warn(
+            module_path!(),
+            "[oauth-resume] no webchat provider found; skipping auto-advance",
+        );
+        return;
+    };
+    let team_str = if ctx.team.is_empty() || ctx.team == "_" {
+        "default"
+    } else {
+        ctx.team.as_str()
+    };
+    let op_ctx = OperatorContext {
+        tenant: ctx.tenant.clone(),
+        team: Some(team_str.to_string()),
+        correlation_id: None,
+    };
+    let env = crate::secrets_setup::resolve_env(None);
+    // Synthetic inbound envelope bound to the conversation via `session_id`; empty
+    // text re-triggers the flow's gate node (which now resolves the persisted token).
+    let envelope: greentic_types::ChannelMessageEnvelope = match serde_json::from_value(
+        serde_json::json!({
+            "id": format!("oauth-resume-{conv}"),
+            "tenant": { "env": env, "tenant": ctx.tenant, "tenant_id": ctx.tenant, "team": team_str, "attempt": 0 },
+            "channel": conv,
+            "session_id": conv,
+            "from": { "id": "oauth-resume", "kind": "user" },
+            "text": "",
+            "metadata": { "tenant": ctx.tenant, "team": team_str, "oauth_resume": "true" }
+        }),
+    ) {
+        Ok(e) => e,
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!("[oauth-resume] could not build resume envelope for {conv}: {err}"),
+            );
+            return;
+        }
+    };
+    operator_log::info(
+        module_path!(),
+        format!(
+            "[oauth-resume] token persisted for {} — re-running flow to auto-advance conversation {conv} (provider={provider}, tenant={}, team={team_str})",
+            ctx.provider, ctx.tenant
+        ),
+    );
+    let bundle = state.runner_host.bundle_root().to_path_buf();
+    let runner_host = state.runner_host.clone();
+    let provider = provider.to_string();
+    let conv_id = conv.to_string();
+    // Run off the callback's request thread so the "Signed in" page returns promptly;
+    // the flow + egress (list + render the next card) take ~1s.
+    std::thread::spawn(move || {
+        match route_messaging_envelopes(&bundle, &runner_host, &provider, &op_ctx, vec![envelope]) {
+            Ok(()) => operator_log::info(
+                module_path!(),
+                format!("[oauth-resume] auto-advance delivered to conversation {conv_id}"),
+            ),
+            Err(err) => operator_log::warn(
+                module_path!(),
+                format!("[oauth-resume] auto-advance flow/delivery failed for {conv_id}: {err}"),
+            ),
+        }
+    });
 }
 
 async fn handle_websocket_upgrade<B>(

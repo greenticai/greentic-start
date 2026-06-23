@@ -206,29 +206,112 @@ impl ProviderTokenResolver for RefreshingResolver {
             Some(exp) => now >= exp - 60, // 60s skew
             None => false,                // no expiry recorded => treat as long-lived
         };
+        // Off by default (refresh only when expired). Set GREENTIC_OAUTH_FORCE_REFRESH
+        // to force a refresh on every read — useful for verifying the refresh path.
+        let force_refresh = std::env::var("GREENTIC_OAUTH_FORCE_REFRESH").is_ok();
+        crate::operator_log::info(
+            module_path!(),
+            format!(
+                "[oauth-refresh] resolve key={} provider={} access_present={} expired={} force_refresh={}",
+                key.scoped_key,
+                key.provider_id(),
+                access.is_some(),
+                expired,
+                force_refresh,
+            ),
+        );
         if let Some(tok) = &access
             && !expired
+            && !force_refresh
         {
             return Some(tok.clone());
         }
 
-        // Expired (or missing) + refreshable: refresh via the engine and persist.
-        let refresh_token = read(sib("refresh_token")).await?;
-        let client_id = read(sib("client_id")).await?;
+        // Expired (or missing/forced) + refreshable: refresh via the engine and persist.
+        let Some(refresh_token) = read(sib("refresh_token")).await else {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "[oauth-refresh] no refresh_token for {} — using existing access token",
+                    key.scoped_key
+                ),
+            );
+            return access;
+        };
+        let Some(client_id) = read(sib("client_id")).await else {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "[oauth-refresh] no client_id for {} — using existing access token",
+                    key.scoped_key
+                ),
+            );
+            return access;
+        };
         let client_secret = read(sib("client_secret")).await;
-        let token_url = crate::oauth_engine::provider_profile(&key.provider_id())?.token_url;
+        let Some(profile) = crate::oauth_engine::provider_profile(&key.provider_id()) else {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "[oauth-refresh] no provider profile for {} — using existing access token",
+                    key.provider_id()
+                ),
+            );
+            return access;
+        };
+        let token_url = profile.token_url;
+        crate::operator_log::info(
+            module_path!(),
+            format!(
+                "[oauth-refresh] refreshing {} via {} (client_secret={})",
+                key.provider_id(),
+                token_url,
+                client_secret.is_some(),
+            ),
+        );
         let (turl, cid, csec, rt) = (
             token_url.to_string(),
             client_id,
             client_secret,
             refresh_token,
         );
-        let refreshed = tokio::task::spawn_blocking(move || {
+        let refreshed = match tokio::task::spawn_blocking(move || {
             crate::oauth_engine::refresh(&turl, &cid, csec.as_deref(), &rt)
         })
         .await
-        .ok()?
-        .ok()?;
+        {
+            Ok(Ok(t)) => t,
+            Ok(Err(err)) => {
+                crate::operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "[oauth-refresh] refresh FAILED for {}: {err} — using existing access token",
+                        key.provider_id()
+                    ),
+                );
+                return access;
+            }
+            Err(err) => {
+                crate::operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "[oauth-refresh] refresh task panicked for {}: {err}",
+                        key.provider_id()
+                    ),
+                );
+                return access;
+            }
+        };
+        crate::operator_log::info(
+            module_path!(),
+            format!(
+                "[oauth-refresh] refresh OK for {} — new access_token (len={}), expires_in={:?}, rotated_refresh_token={}",
+                key.provider_id(),
+                refreshed.access_token.len(),
+                refreshed.expires_in,
+                refreshed.refresh_token.is_some(),
+            ),
+        );
 
         let _ = self
             .inner

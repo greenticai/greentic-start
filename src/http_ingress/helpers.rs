@@ -287,6 +287,7 @@ pub(super) async fn handle_oauth_callback(
     query: &str,
     _provider: &str,
     manager: crate::secrets_gate::DynSecretsManager,
+    ingress: &std::sync::Arc<super::HttpIngressState>,
 ) -> Response<Full<Bytes>> {
     let code = query_param(query, "code").unwrap_or_default();
     let state = query_param(query, "state").unwrap_or_default();
@@ -395,6 +396,14 @@ pub(super) async fn handle_oauth_callback(
         module_path!(),
         format!("[oauth-callback] persisted {} token at {key}", ctx.provider),
     );
+    // Auto-advance: if the Connect card came from a live webchat conversation, push a
+    // synthetic resume into it so the flow re-runs (token now present) and the next
+    // card lands without the user re-typing. Best-effort — the page below is the
+    // fallback when there's no conversation to resume.
+    if ctx.conv.is_some() {
+        super::trigger_oauth_resume(ingress, &ctx).await;
+        return oauth_callback_page(true, "Signed in — returning you to the chat…");
+    }
     oauth_callback_page(true, "Signed in. Return to the chat and ask again.")
 }
 

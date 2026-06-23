@@ -314,6 +314,7 @@ pub fn run_app_flow(
         pack_id,
         &ctx.tenant,
         ctx.team.as_deref().unwrap_or("default"),
+        (!envelope.session_id.is_empty()).then_some(envelope.session_id.as_str()),
     );
     parse_envelopes(&value, envelope)
 }
@@ -323,21 +324,27 @@ pub fn run_app_flow(
 ///
 /// `renderedCard` can be nested anywhere in the node output, so we walk the whole
 /// value and rewrite the `state` of any `oauth/authorize` URL we find.
-fn augment_oauth_connect_state(value: &mut JsonValue, pack_id: &str, tenant: &str, team: &str) {
+fn augment_oauth_connect_state(
+    value: &mut JsonValue,
+    pack_id: &str,
+    tenant: &str,
+    team: &str,
+    conv: Option<&str>,
+) {
     match value {
         JsonValue::Object(map) => {
             if let Some(url) = map.get("url").and_then(|u| u.as_str()).map(String::from)
-                && let Some(new_url) = sign_authorize_url_state(&url, pack_id, tenant, team)
+                && let Some(new_url) = sign_authorize_url_state(&url, pack_id, tenant, team, conv)
             {
                 map.insert("url".to_string(), JsonValue::String(new_url));
             }
             for (_, v) in map.iter_mut() {
-                augment_oauth_connect_state(v, pack_id, tenant, team);
+                augment_oauth_connect_state(v, pack_id, tenant, team, conv);
             }
         }
         JsonValue::Array(arr) => {
             for v in arr.iter_mut() {
-                augment_oauth_connect_state(v, pack_id, tenant, team);
+                augment_oauth_connect_state(v, pack_id, tenant, team, conv);
             }
         }
         _ => {}
@@ -347,7 +354,13 @@ fn augment_oauth_connect_state(value: &mut JsonValue, pack_id: &str, tenant: &st
 /// If `url` is an OAuth `authorize` URL carrying a `state=scheme|provider`, return
 /// the same URL with `state` replaced by a signed `crate::oauth_state` token; else
 /// `None`.
-fn sign_authorize_url_state(url: &str, pack_id: &str, tenant: &str, team: &str) -> Option<String> {
+fn sign_authorize_url_state(
+    url: &str,
+    pack_id: &str,
+    tenant: &str,
+    team: &str,
+    conv: Option<&str>,
+) -> Option<String> {
     // Trigger on the adapter's raw `state=<scheme>|<provider>` marker rather than a
     // provider-specific authorize path: GitHub uses `.../oauth/authorize` but Google
     // uses `.../oauth2/v2/auth`, so a path check skips Google entirely (no signed
@@ -368,9 +381,9 @@ fn sign_authorize_url_state(url: &str, pack_id: &str, tenant: &str, team: &str) 
         team: team.to_string(),
         subject: "user".to_string(),
         jti: jti.clone(),
-        // Threaded from the messaging ingress in a follow-up so /oauth/callback can
-        // push a resume into the originating webchat conversation (auto-advance).
-        conv: None,
+        // Carries the originating webchat conversation id so /oauth/callback can push
+        // a synthetic resume into it once the token is persisted (auto-advance).
+        conv: conv.map(str::to_string),
         exp: chrono::Utc::now().timestamp() + 600,
     });
     let mut new_url = replace_query_value(url, "state", &signed);
