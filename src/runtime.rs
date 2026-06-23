@@ -248,6 +248,46 @@ fn spawn_supervised_service(
     Ok(summary)
 }
 
+/// Result of probing a freshly-started tunnel for reachability.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TunnelHealth {
+    Reachable,
+    Unreachable,
+}
+
+/// Probe whether a freshly-started tunnel is reachable and surface the result
+/// loudly.
+///
+/// An unreachable tunnel used to produce only a `Warn` line buried in
+/// `system.log` ("continuing anyway"), so inbound messaging/events webhooks
+/// routed through the tunnel would silently never arrive. Now an unreachable
+/// tunnel is logged at `error` level with its consequence and remedy, and the
+/// caller flags it in the run summary. Startup still continues — this only
+/// makes the failure visible, it does not turn it into a hard error.
+fn verify_tunnel_ready(url: &str, label: &str) -> TunnelHealth {
+    match cloudflared::wait_tunnel_ready(url, std::time::Duration::from_secs(30)) {
+        Ok(()) => {
+            operator_log::info(
+                module_path!(),
+                format!("{label} tunnel verified reachable url={url}"),
+            );
+            TunnelHealth::Reachable
+        }
+        Err(err) => {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "{label} tunnel at {url} is NOT reachable: {err}. Inbound \
+                     messaging/events webhooks routed through this tunnel will not be delivered. \
+                     Check the tunnel log and retry, or set PUBLIC_BASE_URL to a stable public \
+                     origin (use `No tunnel` for cloud/AWS deployments)."
+                ),
+            );
+            TunnelHealth::Unreachable
+        }
+    }
+}
+
 fn print_service_summary(summaries: &[ServiceSummary]) {
     if summaries.is_empty() {
         return;
@@ -515,17 +555,7 @@ pub fn demo_up(
             ),
         );
         // Wait for the tunnel to become reachable before declaring it ready.
-        match cloudflared::wait_tunnel_ready(&handle.url, std::time::Duration::from_secs(30)) {
-            Ok(()) => {
-                operator_log::info(module_path!(), "cloudflared tunnel verified reachable");
-            }
-            Err(err) => {
-                operator_log::warn(
-                    module_path!(),
-                    format!("cloudflared tunnel not yet reachable, continuing anyway: {err}"),
-                );
-            }
-        }
+        let tunnel_health = verify_tunnel_ready(&handle.url, "cloudflared");
         if debug_enabled {
             operator_log::debug(
                 module_path!(),
@@ -541,14 +571,14 @@ pub fn demo_up(
         let url = handle.url.clone();
         let log_path = handle.log_path.clone();
         service_tracker.record_with_log("cloudflared", "cloudflared", Some(&log_path))?;
-        let summary = ServiceSummary::with_details(
-            "cloudflared",
-            Some(handle.pid),
-            vec![
-                format!("url={}", url),
-                format!("log={}", log_path.display()),
-            ],
-        );
+        let mut details = vec![
+            format!("url={}", url),
+            format!("log={}", log_path.display()),
+        ];
+        if tunnel_health == TunnelHealth::Unreachable {
+            details.push("status=UNREACHABLE".to_string());
+        }
+        let summary = ServiceSummary::with_details("cloudflared", Some(handle.pid), details);
         service_summaries.push(summary);
         public_base_url = Some(url.clone());
     } else if let Some(config) = ngrok {
@@ -890,17 +920,7 @@ pub fn demo_up_services(
             );
             let handle = cloudflared::start_quick_tunnel(&paths, &cfg, &cloudflared_log)?;
             // Wait for the tunnel to become reachable before declaring it ready.
-            match cloudflared::wait_tunnel_ready(&handle.url, std::time::Duration::from_secs(30)) {
-                Ok(()) => {
-                    operator_log::info(module_path!(), "cloudflared tunnel verified reachable");
-                }
-                Err(err) => {
-                    operator_log::warn(
-                        module_path!(),
-                        format!("cloudflared tunnel not yet reachable, continuing anyway: {err}"),
-                    );
-                }
-            }
+            verify_tunnel_ready(&handle.url, "cloudflared");
             let mut domain_labels = Vec::new();
             if discovery.domains.messaging {
                 domain_labels.push("messaging");
@@ -1897,6 +1917,21 @@ mod tests {
         detailed.add_detail("mode=embedded");
         assert!(detailed.describe().contains("pid=42"));
         assert!(detailed.describe().contains("mode=embedded"));
+
+        // An unreachable tunnel is flagged in the run summary; a reachable one is not.
+        let summarize = |health: TunnelHealth| {
+            let mut s = ServiceSummary::with_details(
+                "cloudflared",
+                Some(7),
+                vec!["url=https://x".to_string()],
+            );
+            if health == TunnelHealth::Unreachable {
+                s.add_detail("status=UNREACHABLE");
+            }
+            s.describe()
+        };
+        assert!(summarize(TunnelHealth::Unreachable).contains("status=UNREACHABLE"));
+        assert!(!summarize(TunnelHealth::Reachable).contains("status=UNREACHABLE"));
 
         let dir = tempdir()?;
         let paths = RuntimePaths::new(dir.path().join("state"), "demo", "default");
