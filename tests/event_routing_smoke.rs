@@ -98,6 +98,55 @@ fn timer_fired_does_not_match_unrelated_subscriber() {
     );
 }
 
+/// Selection-layer assertion: a flow-emitted `orders.created` event routes to
+/// the `orders.*` subscriber (`flow_b`) and NOT back to the non-subscribing
+/// emitter (`flow_a`).
+///
+/// This test verifies only the `select_target_flows` call — the selection seam
+/// inside `route_events_inner` — using a pre-built `EventEnvelopeV1` as a
+/// stand-in for what `mint_event_envelope` would produce.  It does NOT exercise
+/// the full emit→mint→reroute chain through `route_events`; that path requires a
+/// live WASM runner and is not covered here.  See the
+/// `mint_then_select_routes_emitted_partial_to_subscriber` unit test in
+/// `src/event_router.rs` for the in-process mint→select seam.
+#[test]
+fn emitted_event_type_selects_subscriber_not_emitter() {
+    // Pack with two flows:
+    //   flow_a — default messaging flow (emitter); no subscribes_to
+    //   flow_b — event subscriber for orders.*
+    let pack = AppPackInfo {
+        pack_id: "emit-smoke-pack".to_string(),
+        flows: vec![
+            AppFlowInfo {
+                id: "flow_a".to_string(),
+                kind: "messaging".to_string(),
+                subscribes_to: vec![],
+            },
+            AppFlowInfo {
+                id: "flow_b".to_string(),
+                kind: "events".to_string(),
+                subscribes_to: vec!["orders.*".to_string()],
+            },
+        ],
+    };
+
+    // The emitted event produced by flow_a (as route_events would receive it
+    // from RunResult.emitted_events after minting via mint_event_envelope).
+    let emitted = make_event("orders.created");
+
+    // Simulate the routing step inside route_events_inner: call
+    // select_target_flows with the emitted event_type to discover subscribers.
+    let matched = select_target_flows(&pack, &emitted.event_type);
+    let matched_ids: Vec<&str> = matched.iter().map(|f| f.id.as_str()).collect();
+
+    assert_eq!(
+        matched_ids,
+        vec!["flow_b"],
+        "orders.created emitted by flow_a must route exclusively to flow_b (orders.* subscriber); \
+         flow_a (no subscription) must not be re-invoked"
+    );
+}
+
 /// Multiple flows can subscribe to overlapping patterns; all matching ones are returned.
 #[test]
 fn multiple_flows_can_subscribe_to_same_timer_pattern() {
