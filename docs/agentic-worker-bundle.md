@@ -59,6 +59,14 @@ agents) rather than failing `gtc start`. An optional `<agent_id>.json` manifest 
 the manifests dir overlays the tool set onto each agent — see greentic-runner
 `docs/agentic-worker-tools.md`.
 
+Agents are now **also** sourced automatically from any `DwApplication` app-pack
+in the bundle (`tenants/<tenant>/packs/*.gtpack` or `packs/*.gtpack`):
+greentic-start reads each pack's `manifest.json`, converts it via
+`greentic_aw_runtime::dw::agent_config_from_dw_manifest`, and registers it into
+`HostConfig.agents`. `GREENTIC_AW_AGENTS_FILE` remains supported and, when set,
+overrides/supplements the bundle-derived agents by id (bundle agents are
+inserted first; the env-file map is applied afterward).
+
 ## Smoke test (manual)
 
 With a bundle that declares an agent in its bindings YAML and an installed
