@@ -370,7 +370,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "aw-event-bridge"
 version = "1.2.0-research"
-source = "git+https://github.com/greenticai/greentic-runner.git?rev=dd6924c8f26fc2028372771dede2adcecd99da8c#dd6924c8f26fc2028372771dede2adcecd99da8c"
+source = "git+https://github.com/greenticai/greentic-runner.git?rev=ad08c976483c33e4af37876670a2696dbcd4cbc0#ad08c976483c33e4af37876670a2696dbcd4cbc0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -2366,7 +2366,7 @@ dependencies = [
 [[package]]
 name = "greentic-aw-runtime"
 version = "1.2.0-research"
-source = "git+https://github.com/greenticai/greentic-runner.git?rev=dd6924c8f26fc2028372771dede2adcecd99da8c#dd6924c8f26fc2028372771dede2adcecd99da8c"
+source = "git+https://github.com/greenticai/greentic-runner.git?rev=ad08c976483c33e4af37876670a2696dbcd4cbc0#ad08c976483c33e4af37876670a2696dbcd4cbc0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -2916,7 +2916,7 @@ dependencies = [
 [[package]]
 name = "greentic-runner-desktop"
 version = "1.2.0-research"
-source = "git+https://github.com/greenticai/greentic-runner.git?rev=dd6924c8f26fc2028372771dede2adcecd99da8c#dd6924c8f26fc2028372771dede2adcecd99da8c"
+source = "git+https://github.com/greenticai/greentic-runner.git?rev=ad08c976483c33e4af37876670a2696dbcd4cbc0#ad08c976483c33e4af37876670a2696dbcd4cbc0"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -3003,7 +3003,7 @@ dependencies = [
 [[package]]
 name = "greentic-runner-host"
 version = "1.2.0-research"
-source = "git+https://github.com/greenticai/greentic-runner.git?rev=dd6924c8f26fc2028372771dede2adcecd99da8c#dd6924c8f26fc2028372771dede2adcecd99da8c"
+source = "git+https://github.com/greenticai/greentic-runner.git?rev=ad08c976483c33e4af37876670a2696dbcd4cbc0#ad08c976483c33e4af37876670a2696dbcd4cbc0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3219,6 +3219,7 @@ dependencies = [
  "dashmap",
  "flate2",
  "futures-util",
+ "greentic-aw-runtime",
  "greentic-distributor-client",
  "greentic-runner-desktop",
  "greentic-runner-host 1.2.0-research",
@@ -5927,7 +5928,7 @@ dependencies = [
 [[package]]
 name = "runner-core"
 version = "1.2.0-research"
-source = "git+https://github.com/greenticai/greentic-runner.git?rev=dd6924c8f26fc2028372771dede2adcecd99da8c#dd6924c8f26fc2028372771dede2adcecd99da8c"
+source = "git+https://github.com/greenticai/greentic-runner.git?rev=ad08c976483c33e4af37876670a2696dbcd4cbc0#ad08c976483c33e4af37876670a2696dbcd4cbc0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

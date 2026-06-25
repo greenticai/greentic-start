@@ -88,19 +88,19 @@ version = "0.8"
 # route end-to-end. This rev is on the wasmtime-45 line (see wasmtime dep above).
 [dependencies.greentic-runner-desktop]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "dd6924c8f26fc2028372771dede2adcecd99da8c"
+rev = "ad08c976483c33e4af37876670a2696dbcd4cbc0"
 default-features = false
 features = ["agentic-worker"]
 
 [dependencies.greentic-runner-host]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "dd6924c8f26fc2028372771dede2adcecd99da8c"
+rev = "ad08c976483c33e4af37876670a2696dbcd4cbc0"
 default-features = false
 features = ["agentic-worker"]
 
 [dependencies.greentic-aw-runtime]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "dd6924c8f26fc2028372771dede2adcecd99da8c"
+rev = "ad08c976483c33e4af37876670a2696dbcd4cbc0"
 default-features = false
 
 [dependencies.greentic-secrets-lib]
@@ -172,7 +172,7 @@ features = [
 criterion = "0.8"
 tempfile = "3"
 
-# greentic-runner (rev dd6924c8) pulls greentic-extension-sdk-contract
+# greentic-runner (rev ad08c976) pulls greentic-extension-sdk-contract
 # =1.2.11-research and greentic-mcp-exec (list_tools), both git-tag/branch-only
 # (not republished to crates.io). Cargo [patch] does NOT propagate through git
 # dependencies, so greentic-start must declare the same redirects to resolve the
@@ -182,13 +182,3 @@ tempfile = "3"
 [patch.crates-io]
 greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.2.11-research" }
 greentic-mcp-exec = { git = "https://github.com/greenticai/greentic-mcp.git", rev = "450df805c395624041951f217c833884beb81440" }
-
-# LOCAL EXECUTION OVERRIDE (uncommitted-intent): build/test Phase B against the
-# local greentic-runner worktree that carries the new `dw` module (Phase A,
-# branch feat/dw-agent-from-manifest). At finishing time, after the runner
-# branch is pushed, replace this with a git `rev` bump on the deps above and
-# DELETE this patch section.
-[patch."https://github.com/greenticai/greentic-runner.git"]
-greentic-runner-host = { path = "../runner/crates/greentic-runner-host" }
-greentic-runner-desktop = { path = "../runner/crates/greentic-runner-desktop" }
-greentic-aw-runtime = { path = "../runner/crates/greentic-aw-runtime" }
