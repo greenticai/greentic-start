@@ -608,6 +608,10 @@ mod tests {
         // "events" takes precedence when both are present
         let parsed2 = parse_events(&json!({"events": [event.clone()], "emitted_events": [event]}))
             .expect("both keys");
-        assert_eq!(parsed2.len(), 1, "should read events key, not emitted_events");
+        assert_eq!(
+            parsed2.len(),
+            1,
+            "should read events key, not emitted_events"
+        );
     }
 }
