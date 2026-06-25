@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod dispatch;
+mod dw_agents;
 mod helpers;
 mod hooks;
 mod sor_discovery;
