@@ -242,7 +242,7 @@ pub(super) fn read_transcript_outputs(run_dir: &Path) -> anyhow::Result<Option<J
     Ok(last)
 }
 
-pub(super) fn build_demo_host_config(tenant: &str) -> HostConfig {
+pub(super) fn build_demo_host_config(tenant: &str, bundle_root: &std::path::Path) -> HostConfig {
     let mut config = HostConfig {
         tenant: tenant.to_string(),
         bindings_path: PathBuf::from("<demo-provider>"),
@@ -263,12 +263,16 @@ pub(super) fn build_demo_host_config(tenant: &str) -> HostConfig {
         operator_policy: OperatorPolicy::allow_all(),
         // No agent-graphs in the synthetic demo host config.
         graphs: HashMap::new(),
-        // Populated below from GREENTIC_AW_AGENTS_FILE when set. greentic-start
-        // builds a synthetic HostConfig (there is no bindings-YAML path here),
-        // so Digital Worker agents for the agentic worker are sourced from that
-        // env-pointed file rather than a bindings `agents:` section.
+        // Populated below: first from DwApplication packs in the bundle, then
+        // overridden/supplemented by GREENTIC_AW_AGENTS_FILE when set.
         agents: HashMap::new(),
     };
+    // Bundle-derived DwApplication agents are the primary source.
+    for (agent_id, cfg) in crate::runner_host::dw_agents::dw_agents_from_bundle(bundle_root, tenant)
+    {
+        config.agents.insert(agent_id, cfg);
+    }
+    // GREENTIC_AW_AGENTS_FILE (when set) overrides/supplements (dev workflow).
     apply_demo_agents(&mut config);
     config
 }
@@ -406,7 +410,7 @@ mod tests {
 
     #[test]
     fn parse_demo_agents_into_populates_agents_from_yaml() {
-        let mut config = build_demo_host_config("acme");
+        let mut config = build_demo_host_config("acme", std::path::Path::new("/nonexistent"));
         assert!(
             config.agents.is_empty(),
             "demo config starts with no agents"
@@ -435,7 +439,7 @@ research-bot:
 
     #[test]
     fn parse_demo_agents_into_is_fail_soft_on_garbage() {
-        let mut config = build_demo_host_config("acme");
+        let mut config = build_demo_host_config("acme", std::path::Path::new("/nonexistent"));
         parse_demo_agents_into(&mut config, "{not valid agents yaml", "test");
         assert!(
             config.agents.is_empty(),
@@ -468,6 +472,47 @@ research-bot:
             "secret store error while fetching key"
         ));
         assert!(!needs_secret_context("ordinary validation failure"));
+    }
+
+    /// Write a minimal DwApplication `.gtpack` (a zip) at `dest`.
+    fn write_dw_pack(dest: &std::path::Path) {
+        use std::io::Write as _;
+        let file = std::fs::File::create(dest).expect("create gtpack");
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+        zip.start_file("metadata.json", opts)
+            .expect("start metadata.json");
+        zip.write_all(br#"{"kind":"DwApplication"}"#)
+            .expect("write metadata.json");
+        zip.start_file("manifest.json", opts)
+            .expect("start manifest.json");
+        zip.write_all(br#"{"manifest_id":"onboarding-companion","manifest":{"capability_plan":{"default_provider_ids":{"cap://llm/chat":"provider.llm.deepseek.chat"}},"defaults":{"values":{"system_prompt":"hi","provider.llm.deepseek.chat::model":"deepseek-chat"}}}}"#)
+            .expect("write manifest.json");
+        zip.finish().expect("finish zip");
+    }
+
+    #[test]
+    fn build_demo_host_config_registers_bundle_dw_agent() {
+        let root = tempdir().expect("tempdir");
+        let packs_dir = root.path().join("tenants").join("acme").join("packs");
+        std::fs::create_dir_all(&packs_dir).expect("create packs dir");
+        write_dw_pack(&packs_dir.join("onboarding.gtpack"));
+
+        let config = build_demo_host_config("acme", root.path());
+
+        assert!(
+            config.agents.contains_key("onboarding-companion"),
+            "expected 'onboarding-companion' in config.agents; got keys: {:?}",
+            config.agents.keys().collect::<Vec<_>>()
+        );
+        let agent = config
+            .agents
+            .get("onboarding-companion")
+            .expect("agent present");
+        assert_eq!(
+            agent.llm.model, "deepseek-chat",
+            "expected llm.model=deepseek-chat"
+        );
     }
 
     #[test]

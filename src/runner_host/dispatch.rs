@@ -361,7 +361,7 @@ impl DemoRunnerHost {
         let payload = payload_bytes.to_vec();
         let result = make_runtime_or_thread_scope(|runtime| {
             runtime.block_on(async {
-                let host_config = Arc::new(build_demo_host_config(&ctx.tenant));
+                let host_config = Arc::new(build_demo_host_config(&ctx.tenant, &self.bundle_root));
                 // Reuse the cached secrets handle — the CachingSecretsManager
                 // layer handles TTL expiry and write-through invalidation, so
                 // newly-written secrets are picked up after cache expiry.
