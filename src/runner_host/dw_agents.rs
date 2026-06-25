@@ -16,10 +16,19 @@ pub(crate) fn dw_agents_from_bundle(
     bundle_root: &Path,
     tenant: &str,
 ) -> Vec<(String, AgentConfig)> {
-    let mut out = Vec::new();
+    let mut out: Vec<(String, AgentConfig)> = Vec::new();
     for pack in candidate_packs(bundle_root, tenant) {
         match agent_from_pack(&pack) {
-            Ok(Some(cfg)) => out.push((cfg.agent_id.clone(), cfg)),
+            Ok(Some(cfg)) => {
+                if out.iter().any(|(id, _)| id == &cfg.agent_id) {
+                    tracing::warn!(
+                        agent = %cfg.agent_id,
+                        pack = %pack.display(),
+                        "duplicate DwApplication agent_id across bundle packs; later pack wins"
+                    );
+                }
+                out.push((cfg.agent_id.clone(), cfg));
+            }
             Ok(None) => {}
             Err(error) => {
                 tracing::warn!(pack = %pack.display(), error = %error, "skipping DwApplication pack");
@@ -42,7 +51,10 @@ fn candidate_packs(bundle_root: &Path, tenant: &str) -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "gtpack") {
+            if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gtpack"))
+            {
                 packs.push(path);
             }
         }
@@ -140,5 +152,39 @@ mod tests {
             "exactly one agent — the DwApplication pack; the non-DW pack must be skipped"
         );
         assert_eq!(agents[0].0, "onboarding-companion");
+    }
+
+    #[test]
+    fn discovers_uppercase_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packs = tmp.path().join("tenants").join("greentic").join("packs");
+        std::fs::create_dir_all(&packs).unwrap();
+        write_dw_pack(&packs, "onboarding.GTPACK");
+
+        let agents = dw_agents_from_bundle(tmp.path(), "greentic");
+        assert_eq!(
+            agents.len(),
+            1,
+            "the `.gtpack` extension match must be case-insensitive"
+        );
+        assert_eq!(agents[0].0, "onboarding-companion");
+    }
+
+    #[test]
+    fn duplicate_agent_id_keeps_both_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packs = tmp.path().join("tenants").join("greentic").join("packs");
+        std::fs::create_dir_all(&packs).unwrap();
+        // Both packs declare manifest_id "onboarding-companion".
+        write_dw_pack(&packs, "a.gtpack");
+        write_dw_pack(&packs, "b.gtpack");
+
+        let agents = dw_agents_from_bundle(tmp.path(), "greentic");
+        assert_eq!(
+            agents.len(),
+            2,
+            "both duplicate-id entries are returned (warn emitted); HashMap insertion resolves last-wins"
+        );
+        assert!(agents.iter().all(|(id, _)| id == "onboarding-companion"));
     }
 }
