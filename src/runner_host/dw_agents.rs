@@ -93,6 +93,18 @@ mod tests {
         path
     }
 
+    /// Writes a non-DwApplication pack (different `kind`) — must be skipped by the kind-gate.
+    fn write_non_dw_pack(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+        zip.start_file("metadata.json", opts).unwrap();
+        zip.write_all(br#"{"kind":"FlowPack"}"#).unwrap();
+        zip.finish().unwrap();
+        path
+    }
+
     #[test]
     fn discovers_and_converts_dw_pack() {
         let tmp = tempfile::tempdir().unwrap();
@@ -111,5 +123,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // no packs dir at all → empty, no panic
         assert!(dw_agents_from_bundle(tmp.path(), "greentic").is_empty());
+    }
+
+    #[test]
+    fn dw_pack_wins_alongside_non_dw_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packs = tmp.path().join("tenants").join("greentic").join("packs");
+        std::fs::create_dir_all(&packs).unwrap();
+        write_dw_pack(&packs, "onboarding.gtpack");
+        write_non_dw_pack(&packs, "some-flow.gtpack");
+
+        let agents = dw_agents_from_bundle(tmp.path(), "greentic");
+        assert_eq!(
+            agents.len(),
+            1,
+            "exactly one agent — the DwApplication pack; the non-DW pack must be skipped"
+        );
+        assert_eq!(agents[0].0, "onboarding-companion");
     }
 }
