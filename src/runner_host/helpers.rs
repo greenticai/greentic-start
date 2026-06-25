@@ -474,6 +474,47 @@ research-bot:
         assert!(!needs_secret_context("ordinary validation failure"));
     }
 
+    /// Write a minimal DwApplication `.gtpack` (a zip) at `dest`.
+    fn write_dw_pack(dest: &std::path::Path) {
+        use std::io::Write as _;
+        let file = std::fs::File::create(dest).expect("create gtpack");
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+        zip.start_file("metadata.json", opts)
+            .expect("start metadata.json");
+        zip.write_all(br#"{"kind":"DwApplication"}"#)
+            .expect("write metadata.json");
+        zip.start_file("manifest.json", opts)
+            .expect("start manifest.json");
+        zip.write_all(br#"{"manifest_id":"onboarding-companion","manifest":{"capability_plan":{"default_provider_ids":{"cap://llm/chat":"provider.llm.deepseek.chat"}},"defaults":{"values":{"system_prompt":"hi","provider.llm.deepseek.chat::model":"deepseek-chat"}}}}"#)
+            .expect("write manifest.json");
+        zip.finish().expect("finish zip");
+    }
+
+    #[test]
+    fn build_demo_host_config_registers_bundle_dw_agent() {
+        let root = tempdir().expect("tempdir");
+        let packs_dir = root.path().join("tenants").join("acme").join("packs");
+        std::fs::create_dir_all(&packs_dir).expect("create packs dir");
+        write_dw_pack(&packs_dir.join("onboarding.gtpack"));
+
+        let config = build_demo_host_config("acme", root.path());
+
+        assert!(
+            config.agents.contains_key("onboarding-companion"),
+            "expected 'onboarding-companion' in config.agents; got keys: {:?}",
+            config.agents.keys().collect::<Vec<_>>()
+        );
+        let agent = config
+            .agents
+            .get("onboarding-companion")
+            .expect("agent present");
+        assert_eq!(
+            agent.llm.model, "deepseek-chat",
+            "expected llm.model=deepseek-chat"
+        );
+    }
+
     #[test]
     fn payload_preview_and_transcript_outputs_handle_text_binary_and_missing_files() {
         assert_eq!(payload_preview(b""), "<empty>");
