@@ -455,6 +455,18 @@ pub(super) struct ParsedIngressRoute {
     pub handler: Option<String>,
 }
 
+impl From<crate::http_routes::HttpRouteMatch<'_>> for ParsedIngressRoute {
+    fn from(m: crate::http_routes::HttpRouteMatch<'_>) -> Self {
+        Self {
+            domain: m.descriptor.domain,
+            provider: m.descriptor.pack_id.clone(),
+            tenant: m.tenant,
+            team: m.team,
+            handler: None,
+        }
+    }
+}
+
 pub(super) fn parse_route_segments(path: &str) -> Option<ParsedIngressRoute> {
     let segments = path
         .trim_start_matches('/')

@@ -1,15 +1,15 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::{env, fs};
 
 use anyhow::{Context, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use greentic_runner_host::config::{
-    FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
-    WebhookPolicy,
+    Fast2FlowRoutingConfig, FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy,
+    StateStorePolicy, WebhookPolicy,
 };
 use greentic_runner_host::trace::TraceConfig;
 use greentic_runner_host::validate::ValidationConfig;
@@ -261,6 +261,7 @@ pub(super) fn build_demo_host_config(tenant: &str) -> HostConfig {
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        fast2flow: Fast2FlowRoutingConfig::default(),
     }
 }
 
@@ -275,7 +276,7 @@ pub(super) fn secret_error_context(
     op_id: &str,
     pack: &ProviderPack,
 ) -> String {
-    let env = env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string());
+    let env = crate::resolve_env(None);
     let team = secrets_manager::canonical_team(ctx.team.as_deref()).into_owned();
     format!(
         "secret lookup context env={} tenant={} team={} provider={} flow={} pack_id={} pack_path={}",
@@ -363,6 +364,7 @@ pub(super) fn capability_route_error_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use tempfile::tempdir;
 
     #[test]

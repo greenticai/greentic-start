@@ -78,6 +78,7 @@ mod tests {
     fn make_request() -> StartRequest {
         StartRequest {
             bundle: None,
+            env: None,
             tenant: None,
             team: None,
             no_nats: false,

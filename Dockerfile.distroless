@@ -21,24 +21,44 @@ ENV CARGO_TARGET_DIR=/tmp/target
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY i18n ./i18n
-
-RUN perl -0pi -e 's/\n\[\[bench\]\]\nname = "perf"\nharness = false\n//' Cargo.toml
+# The revision-serve webchat console embeds these at compile time via
+# `include_str!("../assets/...")` (chat.html + adaptivecards.min.js), so the
+# directory must be present in the build context even for a `--bin` build.
+COPY assets ./assets
+# Manifest declares a `perf` bench; cargo validates the path at parse time even
+# for a `--bin` build, so the file must exist (it is not compiled here).
+COPY benches ./benches
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/tmp/target \
-    cargo build --release --target x86_64-unknown-linux-musl --bin greentic-start \
+    cargo build --release --target x86_64-unknown-linux-musl \
+    --config 'profile.release.strip=true' --bin greentic-start \
     && mkdir -p /out \
     && cp /tmp/target/x86_64-unknown-linux-musl/release/greentic-start /out/greentic-start
 
-FROM debian:bookworm-slim
+# cloudflared — static Go binary for the optional in-pod quick tunnel. The K8s
+# deployer boots the worker with `--cloudflared on --cloudflared-binary
+# /usr/local/bin/cloudflared`; greentic-start spawns it via direct `Command::new`
+# (no shell, distroless-safe) to obtain a public `*.trycloudflare.com` URL for
+# Telegram webhook auto-registration. Pinned + sha256-verified; bump both ARGs
+# together. Fetched in a throwaway stage so it never invalidates the Rust build.
+FROM debian:bookworm-slim AS cloudflared
+ARG CLOUDFLARED_VERSION=2026.6.1
+ARG CLOUDFLARED_SHA256=5861a10a438fe8ddcfebb3b830f83966cbf193edafce0fe2eeb198fbae1f7a22
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" -o /cloudflared \
+    && echo "${CLOUDFLARED_SHA256}  /cloudflared" | sha256sum -c - \
+    && chmod 0755 /cloudflared
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    squashfs-tools \
-    && rm -rf /var/lib/apt/lists/*
+# static-debian12:nonroot ships ca-certificates + a uid-65532 nonroot user and
+# no shell. The musl-static binary needs no runtime apt layer; squashfs-tools is
+# gone because bundle_ref.rs reads SquashFS in-process via `backhand` (P0.4).
+FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /out/greentic-start /usr/local/bin/greentic-start
+COPY --from=cloudflared /cloudflared /usr/local/bin/cloudflared
 
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/greentic-start"]

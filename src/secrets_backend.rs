@@ -15,6 +15,11 @@ const BACKEND_CONFIG_PATHS: &[&str] = &[
 pub enum SecretsBackendKind {
     DevStore,
     Env,
+    /// HashiCorp Vault KV v2, resolved at runtime under pod workload identity.
+    /// The pack only names the backend; the Vault connection (`VAULT_ADDR`,
+    /// `VAULT_K8S_ROLE`, mount/prefix) is supplied via pod environment rendered
+    /// by the deployer — see [`crate::secrets_gate::build_vault_manager`].
+    Vault,
 }
 
 impl std::fmt::Display for SecretsBackendKind {
@@ -22,6 +27,7 @@ impl std::fmt::Display for SecretsBackendKind {
         let label = match self {
             SecretsBackendKind::DevStore => "dev-store",
             SecretsBackendKind::Env => "env",
+            SecretsBackendKind::Vault => "vault",
         };
         f.write_str(label)
     }
@@ -32,6 +38,7 @@ impl SecretsBackendKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "default" | "dev-store" | "devstore" | "dev" => Ok(SecretsBackendKind::DevStore),
             "env" | "environment" => Ok(SecretsBackendKind::Env),
+            "vault" | "hashicorp-vault" => Ok(SecretsBackendKind::Vault),
             other => Err(anyhow!("unsupported secrets backend '{other}'")),
         }
     }
