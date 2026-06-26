@@ -144,9 +144,15 @@ version = ">=1.1.0-dev, <1.2.0-0"
 version = ">=1.1.0-dev.27823510319, <1.2.0-0"
 
 [dependencies.greentic-secrets-lib]
-version = ">=1.1.0-dev.27563392344, <1.2.0-0"
+# `providers-vault` brings in the HashiCorp Vault KV backend used for runtime
+# secret resolution under pod workload identity (Phase E). The Kubernetes-auth
+# token exchange it relies on landed in greentic-secrets#94, first published in
+# 1.1.0-dev.28218485692 (the floor below) — older publishes resolve a vault
+# provider that only supports a static VAULT_TOKEN, not the pod-identity login.
+version = ">=1.1.0-dev.28218485692, <1.2.0-0"
 features = [
     "providers-dev",
+    "providers-vault",
 ]
 
 [dependencies.greentic-telemetry]
