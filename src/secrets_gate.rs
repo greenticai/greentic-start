@@ -636,14 +636,23 @@ fn instantiate_manager_for_backend(
 /// whole-env team placeholder (tenant-level, no specific team). An unknown kind
 /// fails closed. HostBuilder's default env-var backend rejects non-local envs,
 /// so the serve path always supplies its own manager here.
+///
+/// Returns the manager and the tenant org it is scoped to: `Some(tenant)` for
+/// Vault (whose embedded `SecretsCore` resolves a single tenant org), `None`
+/// for the unscoped DevStore/Env backends. The serve path uses this scope to
+/// fail closed when a served deployment's tenant falls outside it (a single
+/// worker pod's Vault manager cannot resolve another tenant org's secrets) —
+/// see `activate_runtime_config`.
 pub fn resolve_serve_secrets_manager(
     env_dir: &Path,
     tenant: &str,
-) -> AnyhowResult<DynSecretsManager> {
+) -> AnyhowResult<(DynSecretsManager, Option<String>)> {
     let raw = env::var(ENV_SERVE_SECRETS_BACKEND).unwrap_or_default();
     let kind = SecretsBackendKind::parse(&raw)
         .with_context(|| format!("invalid {ENV_SERVE_SECRETS_BACKEND}={raw:?}"))?;
-    Ok(serve_secrets_manager_for_kind(kind, env_dir, tenant)?.0)
+    let (manager, _dev_store_path) = serve_secrets_manager_for_kind(kind, env_dir, tenant)?;
+    let tenant_scope = matches!(kind, SecretsBackendKind::Vault).then(|| tenant.to_string());
+    Ok((manager, tenant_scope))
 }
 
 /// Pure backend dispatch behind [`resolve_serve_secrets_manager`], split out so
@@ -1964,9 +1973,10 @@ mod tests {
         unsafe {
             env::remove_var(ENV_SERVE_SECRETS_BACKEND);
         }
-        let manager = resolve_serve_secrets_manager(env_dir.path(), "demo");
+        let resolved = resolve_serve_secrets_manager(env_dir.path(), "demo");
         drop(env_guard);
-        assert!(manager.is_ok());
+        let (_manager, tenant_scope) = resolved?;
+        assert!(tenant_scope.is_none(), "dev-store is tenant-unscoped");
         Ok(())
     }
 

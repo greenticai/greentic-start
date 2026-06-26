@@ -471,7 +471,8 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             .tenant_org_id
             .as_deref()
             .unwrap_or(crate::rollout_telemetry::LOCAL_TENANT_FALLBACK);
-        let secrets = crate::secrets_gate::resolve_serve_secrets_manager(&env_dir, tenant)?;
+        let (secrets, secrets_tenant_scope) =
+            crate::secrets_gate::resolve_serve_secrets_manager(&env_dir, tenant)?;
         // Clone for the runtime-config watcher's rebuild closure (N2.2): it
         // needs the same backend to rebuild activations after the deployer
         // rewrites `runtime-config.json`. `DynSecretsManager` is `Arc<dyn ...>`,
@@ -538,6 +539,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             &store_root,
             &rc,
             secrets,
+            secrets_tenant_scope.as_deref(),
             &environment,
             std::sync::Arc::clone(&runtime_ref_resolver),
         ))?;
@@ -703,6 +705,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 store_root.clone(),
                 env_id.clone(),
                 watcher_secrets,
+                secrets_tenant_scope,
                 std::sync::Arc::clone(&runtime_ref_resolver),
                 activation_rt.handle().clone(),
             ),
