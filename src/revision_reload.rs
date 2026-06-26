@@ -316,6 +316,7 @@ pub(crate) fn default_rebuild(
     store_root: PathBuf,
     env_id: String,
     secrets: DynSecretsManager,
+    secrets_tenant_scope: Option<String>,
     runtime_ref_resolver: Arc<dyn RuntimeRefResolver>,
     activation_rt: tokio::runtime::Handle,
 ) -> impl FnMut() -> Result<Option<Activation>> + Send + 'static {
@@ -325,6 +326,7 @@ pub(crate) fn default_rebuild(
             &store_root,
             &env_id,
             &secrets,
+            secrets_tenant_scope.as_deref(),
             &runtime_ref_resolver,
             &activation_rt,
             &mut last,
@@ -336,6 +338,7 @@ fn rebuild_once(
     store_root: &Path,
     env_id: &str,
     secrets: &DynSecretsManager,
+    secrets_tenant_scope: Option<&str>,
     runtime_ref_resolver: &Arc<dyn RuntimeRefResolver>,
     activation_rt: &tokio::runtime::Handle,
     last: &mut Option<LastReloadInputs>,
@@ -363,6 +366,7 @@ fn rebuild_once(
             store_root,
             &rc,
             Arc::clone(secrets),
+            secrets_tenant_scope,
             &environment,
             Arc::clone(runtime_ref_resolver),
         ))?;

@@ -105,6 +105,7 @@ pub(crate) async fn activate_runtime_config(
     store_root: &Path,
     rc: &LoadedRuntimeConfig,
     secrets: DynSecretsManager,
+    secrets_tenant_scope: Option<&str>,
     env: &Environment,
     runtime_ref_resolver: Arc<dyn RuntimeRefResolver>,
 ) -> anyhow::Result<RuntimeConfigActivation> {
@@ -160,6 +161,32 @@ pub(crate) async fn activate_runtime_config(
             );
         }
         tenants.insert(meta.tenant.as_str());
+    }
+
+    // When the secrets manager resolves a single tenant org (Vault under pod
+    // workload identity scopes its embedded `SecretsCore` to one tenant — a
+    // worker pod serves one tenant org), refuse to activate any deployment
+    // whose tenant falls outside that scope. The shared manager would
+    // otherwise silently fail every `secret://` read for the off-scope tenant
+    // at request time; fail closed at activation (cold-start AND hot-attach
+    // reload both route through here) instead. The unscoped DevStore/Env
+    // backends pass `None` and keep the prior multi-tenant tolerance.
+    if let Some(scope) = secrets_tenant_scope {
+        let mut outside: Vec<&str> = tenants
+            .iter()
+            .copied()
+            .filter(|tenant| *tenant != scope)
+            .collect();
+        if !outside.is_empty() {
+            outside.sort_unstable();
+            bail!(
+                "secrets backend is scoped to tenant `{scope}`, but environment `{}` serves \
+                 deployment(s) for tenant(s) {:?}; a single worker pod resolves secrets for one \
+                 tenant org — split tenants across environments or provision a tenant-wide backend",
+                rc.env_id,
+                outside
+            );
+        }
     }
 
     // One minimal HostConfig per tenant. Flow-type bindings (routing) are not
@@ -981,17 +1008,23 @@ mod tests {
     }
 
     /// A runtime-config with a single revision under `deployment_id`.
+    fn revision_block(
+        deployment_id: &DeploymentId,
+    ) -> crate::runtime_config::ResolvedRevisionBlock {
+        crate::runtime_config::ResolvedRevisionBlock {
+            deployment_id: deployment_id.to_string(),
+            revision_id: RevisionId::new().to_string(),
+            bundle_id: "fast2flow".to_string(),
+            pack_list_refs: Vec::new(),
+            pack_config_refs: Vec::new(),
+            weight_bps: 10_000,
+        }
+    }
+
     fn single_revision_rc(deployment_id: &DeploymentId) -> LoadedRuntimeConfig {
         LoadedRuntimeConfig {
             env_id: ENV_ID.to_string(),
-            revisions: vec![crate::runtime_config::ResolvedRevisionBlock {
-                deployment_id: deployment_id.to_string(),
-                revision_id: RevisionId::new().to_string(),
-                bundle_id: "fast2flow".to_string(),
-                pack_list_refs: Vec::new(),
-                pack_config_refs: Vec::new(),
-                weight_bps: 10_000,
-            }],
+            revisions: vec![revision_block(deployment_id)],
         }
     }
 
@@ -1041,6 +1074,7 @@ mod tests {
             dir.path(),
             &rc,
             dummy_secrets(),
+            None,
             &mismatched,
             dummy_resolver(),
         )) {
@@ -1065,6 +1099,7 @@ mod tests {
             dir.path(),
             &rc,
             dummy_secrets(),
+            None,
             &env,
             dummy_resolver(),
         )) {
@@ -1095,6 +1130,7 @@ mod tests {
             dir.path(),
             &rc,
             dummy_secrets(),
+            None,
             &env,
             dummy_resolver(),
         )) {
@@ -1123,6 +1159,7 @@ mod tests {
             dir.path(),
             &rc,
             dummy_secrets(),
+            None,
             &env,
             dummy_resolver(),
         )) {
@@ -1154,6 +1191,7 @@ mod tests {
             dir.path(),
             &rc,
             dummy_secrets(),
+            None,
             &env,
             dummy_resolver(),
         )) {
@@ -1187,6 +1225,7 @@ mod tests {
             dir.path(),
             &rc,
             dummy_secrets(),
+            None,
             &env,
             dummy_resolver(),
         ))
@@ -1196,5 +1235,89 @@ mod tests {
         assert_eq!(activation.routing.deployment_routes.len(), 0);
         // Placeholder tenant config keyed by env_id so `build()` succeeds.
         assert!(activation.host.tenant_configs().contains_key(ENV_ID));
+    }
+
+    #[test]
+    fn vault_scope_refuses_a_foreign_tenant_deployment() {
+        // Under a Vault serve scope (one tenant org per worker pod), an env that
+        // also serves a deployment for a different tenant must fail closed at
+        // activation: the pod's single-tenant Vault manager cannot resolve the
+        // foreign tenant's secrets, so silently 404-ing every read at request
+        // time is the worse alternative.
+        let dir = tempdir().unwrap();
+        seed_env_dir(dir.path());
+        let own = DeploymentId::new();
+        let foreign = DeploymentId::new();
+        let env = make_env(vec![
+            make_deployment(
+                own,
+                "acme",
+                "cust",
+                "fast2flow",
+                BundleDeploymentStatus::Active,
+            ),
+            make_deployment(
+                foreign,
+                "globex",
+                "cust",
+                "fast2flow",
+                BundleDeploymentStatus::Active,
+            ),
+        ]);
+        let rc = LoadedRuntimeConfig {
+            env_id: ENV_ID.to_string(),
+            revisions: vec![revision_block(&own), revision_block(&foreign)],
+        };
+
+        let err = match block_on(activate_runtime_config(
+            dir.path(),
+            &rc,
+            dummy_secrets(),
+            Some("acme"),
+            &env,
+            dummy_resolver(),
+        )) {
+            Ok(_) => panic!("expected activation to fail closed on a foreign tenant"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("scoped to tenant `acme`"), "got: {msg}");
+        assert!(msg.contains("globex"), "got: {msg}");
+    }
+
+    #[test]
+    fn vault_scope_admits_its_own_tenant() {
+        // A Vault scope matching the single served tenant passes the guard; the
+        // activation then proceeds and (with no pinned packs) fails later at
+        // pack reading — proving the guard does not block the served tenant's
+        // own secret URIs.
+        let dir = tempdir().unwrap();
+        seed_env_dir(dir.path());
+        let dep_id = DeploymentId::new();
+        let env = make_env(vec![make_deployment(
+            dep_id,
+            "acme",
+            "cust",
+            "fast2flow",
+            BundleDeploymentStatus::Active,
+        )]);
+        let rc = single_revision_rc(&dep_id);
+
+        let err = match block_on(activate_runtime_config(
+            dir.path(),
+            &rc,
+            dummy_secrets(),
+            Some("acme"),
+            &env,
+            dummy_resolver(),
+        )) {
+            Ok(_) => panic!("expected activation to pass the scope guard and reach pack reading"),
+            Err(e) => e,
+        };
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("no pinned packs"),
+            "expected the matching scope to pass the guard and reach pack reading, got: {chain}"
+        );
     }
 }

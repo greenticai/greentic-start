@@ -446,18 +446,6 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let shutdown_paths = env_tunnel::env_runtime_paths(&env_dir, &env_id);
         runtime_state::clear_stop_request(&shutdown_paths)?;
 
-        // Activate with the env's own DevStore secrets backend rather than
-        // HostBuilder's default env-var backend (which rejects non-local
-        // envs). A later step refines this to the per-tenant/pack-declared
-        // backend once the serving context is resolved.
-        let secrets: crate::secrets_gate::DynSecretsManager =
-            std::sync::Arc::new(crate::secrets_client::SecretsClient::open(&env_dir)?);
-        // Clone for the runtime-config watcher's rebuild closure (N2.2):
-        // it needs the same secrets backend to rebuild activations after
-        // the deployer rewrites `runtime-config.json`. `DynSecretsManager`
-        // is `Arc<dyn ...>`, so this is a refcount bump.
-        let watcher_secrets = std::sync::Arc::clone(&secrets);
-
         // Load the Environment so the bind address can layer on top of the
         // persisted `host_config.listen_addr`. The same `Environment` is
         // threaded into `activate_runtime_config` so the activation path
@@ -468,6 +456,28 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let environment =
             greentic_deployer::environment::EnvironmentStore::load(&env_store, &env_typed)
                 .with_context(|| format!("loading environment `{env_id}` for bundle-less boot"))?;
+
+        // Select the runtime secrets backend the deployer rendered onto this
+        // worker via `GREENTIC_SECRETS_BACKEND` (E.3b). Unset/`dev-store` keeps
+        // the env's own DevStore rooted at `env_dir` — byte-identical to the
+        // prior hardcoded boot; `vault` resolves `secret://` refs under the
+        // pod's workload identity, scoped to the env's single `tenant_org_id`
+        // (the env owner; `local` envs have none → the `local` tenant fallback).
+        // HostBuilder's default env-var backend rejects non-local envs, so the
+        // serve path always supplies its own manager. Loaded after the
+        // Environment so the Vault scope can key off `tenant_org_id`.
+        let tenant = environment
+            .host_config
+            .tenant_org_id
+            .as_deref()
+            .unwrap_or(crate::rollout_telemetry::LOCAL_TENANT_FALLBACK);
+        let (secrets, secrets_tenant_scope) =
+            crate::secrets_gate::resolve_serve_secrets_manager(&env_dir, tenant)?;
+        // Clone for the runtime-config watcher's rebuild closure (N2.2): it
+        // needs the same backend to rebuild activations after the deployer
+        // rewrites `runtime-config.json`. `DynSecretsManager` is `Arc<dyn ...>`,
+        // so this is a refcount bump.
+        let watcher_secrets = std::sync::Arc::clone(&secrets);
 
         // M2: pull packs for a freshly-seeded worker. When no runtime-config
         // is staged yet (the K8s ConfigMap ships only `environment.json`) but
@@ -529,6 +539,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             &store_root,
             &rc,
             secrets,
+            secrets_tenant_scope.as_deref(),
             &environment,
             std::sync::Arc::clone(&runtime_ref_resolver),
         ))?;
@@ -694,6 +705,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 store_root.clone(),
                 env_id.clone(),
                 watcher_secrets,
+                secrets_tenant_scope,
                 std::sync::Arc::clone(&runtime_ref_resolver),
                 activation_rt.handle().clone(),
             ),

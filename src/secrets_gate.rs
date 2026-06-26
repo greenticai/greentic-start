@@ -267,6 +267,12 @@ fn canonicalize_provider_segment(path: &str) -> Option<String> {
 }
 const ENV_ALLOW_ENV_SECRETS: &str = "GREENTIC_ALLOW_ENV_SECRETS";
 const ENV_REQUIRE_PROVIDER_BINDING: &str = "GREENTIC_REQUIRE_SECRETS_PROVIDER_BINDING";
+/// Selects the runtime secrets backend on the bundle-less `start --env` serve
+/// path. The deployer renders this onto the worker pod (E.3); unlike the
+/// `--bundle` path, the serve loop has no `.gtpack` to read a
+/// `secrets_backend.json` from, so the kind comes from the process environment
+/// instead. Absent/empty/`dev-store` keeps the env's own DevStore.
+pub const ENV_SERVE_SECRETS_BACKEND: &str = "GREENTIC_SECRETS_BACKEND";
 
 #[derive(Clone)]
 pub struct SecretsManagerHandle {
@@ -615,6 +621,67 @@ fn instantiate_manager_for_backend(
         SecretsBackendKind::Env => Ok((Arc::new(EnvSecretsManager) as DynSecretsManager, None)),
         SecretsBackendKind::Vault => build_vault_manager(tenant, canonical_team),
     }
+}
+
+/// Select the bundle-less serve-path secrets manager from
+/// [`ENV_SERVE_SECRETS_BACKEND`] (the env var the deployer renders onto the
+/// worker pod).
+///
+/// Unlike [`resolve_secrets_manager`], the `start --env` serve loop has no
+/// `.gtpack` to read a `secrets_backend.json` from, so the backend kind comes
+/// from the process environment. An absent/empty/`dev-store` value opens the
+/// env's own DevStore rooted at `env_dir` — byte-identical to the prior
+/// hardcoded boot. `vault` resolves `secret://` refs under the pod's workload
+/// identity, scoped to `tenant` (the env's single `tenant_org_id`) and the
+/// whole-env team placeholder (tenant-level, no specific team). An unknown kind
+/// fails closed. HostBuilder's default env-var backend rejects non-local envs,
+/// so the serve path always supplies its own manager here.
+///
+/// Returns the manager and the tenant org it is scoped to: `Some(tenant)` for
+/// Vault (whose embedded `SecretsCore` resolves a single tenant org), `None`
+/// for the unscoped DevStore/Env backends. The serve path uses this scope to
+/// fail closed when a served deployment's tenant falls outside it (a single
+/// worker pod's Vault manager cannot resolve another tenant org's secrets) —
+/// see `activate_runtime_config`.
+pub fn resolve_serve_secrets_manager(
+    env_dir: &Path,
+    tenant: &str,
+) -> AnyhowResult<(DynSecretsManager, Option<String>)> {
+    let raw = env::var(ENV_SERVE_SECRETS_BACKEND).unwrap_or_default();
+    let kind = SecretsBackendKind::parse(&raw)
+        .with_context(|| format!("invalid {ENV_SERVE_SECRETS_BACKEND}={raw:?}"))?;
+    let (manager, _dev_store_path) = serve_secrets_manager_for_kind(kind, env_dir, tenant)?;
+    let tenant_scope = matches!(kind, SecretsBackendKind::Vault).then(|| tenant.to_string());
+    Ok((manager, tenant_scope))
+}
+
+/// Pure backend dispatch behind [`resolve_serve_secrets_manager`], split out so
+/// the DevStore/Vault/Env mapping is unit-testable without mutating the
+/// process-wide [`ENV_SERVE_SECRETS_BACKEND`]. Returns the dev-store path (the
+/// `DevStore` arm only) for assertion + logging.
+fn serve_secrets_manager_for_kind(
+    kind: SecretsBackendKind,
+    env_dir: &Path,
+    tenant: &str,
+) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>)> {
+    let (manager, dev_store_path) = match kind {
+        SecretsBackendKind::DevStore => open_dev_store_manager(env_dir)?,
+        SecretsBackendKind::Env => (Arc::new(EnvSecretsManager) as DynSecretsManager, None),
+        SecretsBackendKind::Vault => {
+            build_vault_manager(tenant, greentic_secrets_lib::TEAM_PLACEHOLDER)?
+        }
+    };
+    operator_log::info(
+        module_path!(),
+        format!(
+            "serve-path secrets backend selected: kind={kind} tenant={tenant} dev_store_path={}",
+            dev_store_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+        ),
+    );
+    Ok((manager, dev_store_path))
 }
 
 fn open_dev_store_manager(
@@ -1872,6 +1939,60 @@ mod tests {
         });
         assert!(cross.is_err());
         assert!(!matches!(cross, Err(SecretError::NotFound(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn serve_secrets_manager_for_kind_dev_store_opens_env_dir() -> anyhow::Result<()> {
+        // DevStore is the byte-identical replacement for the prior hardcoded
+        // `SecretsClient::open(env_dir)` serve-path boot: it roots the dev store
+        // at the env dir and reports its path.
+        let env_dir = tempdir()?;
+        let (_manager, dev_store_path) =
+            serve_secrets_manager_for_kind(SecretsBackendKind::DevStore, env_dir.path(), "demo")?;
+        assert!(dev_store_path.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn serve_secrets_manager_for_kind_env_has_no_dev_store() -> anyhow::Result<()> {
+        let env_dir = tempdir()?;
+        let (_manager, dev_store_path) =
+            serve_secrets_manager_for_kind(SecretsBackendKind::Env, env_dir.path(), "demo")?;
+        assert!(dev_store_path.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_serve_secrets_manager_defaults_to_dev_store_when_unset() -> anyhow::Result<()> {
+        // Unset env var → DevStore (the deployer omits the var for dev-store
+        // envs). `parse("")` pins the default; the resolver then succeeds.
+        assert_eq!(SecretsBackendKind::parse("")?, SecretsBackendKind::DevStore);
+        let env_dir = tempdir()?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var(ENV_SERVE_SECRETS_BACKEND);
+        }
+        let resolved = resolve_serve_secrets_manager(env_dir.path(), "demo");
+        drop(env_guard);
+        let (_manager, tenant_scope) = resolved?;
+        assert!(tenant_scope.is_none(), "dev-store is tenant-unscoped");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_serve_secrets_manager_rejects_unknown_backend() -> anyhow::Result<()> {
+        let env_dir = tempdir()?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::set_var(ENV_SERVE_SECRETS_BACKEND, "bogus");
+        }
+        let result = resolve_serve_secrets_manager(env_dir.path(), "demo");
+        unsafe {
+            env::remove_var(ENV_SERVE_SECRETS_BACKEND);
+        }
+        drop(env_guard);
+        assert!(result.is_err());
         Ok(())
     }
 }
