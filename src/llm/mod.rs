@@ -201,6 +201,47 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn extracts_bare_object() {
@@ -227,5 +268,71 @@ mod tests {
     fn none_when_unbalanced_or_absent() {
         assert_eq!(extract_json_object("no json here"), None);
         assert_eq!(extract_json_object("{\"a\":1"), None);
+    }
+
+    #[test]
+    fn resolve_credential_reads_named_env_before_global_fallback() {
+        let _lock = env_lock();
+        let _named = EnvGuard::set("LLM_TEST_KEY", " named-secret ");
+        let _global = EnvGuard::set("GREENTIC_LLM_API_KEY", "global-secret");
+        let cfg = BundleLlmConfig {
+            provider: "openai".to_string(),
+            api_key_secret: Some("LLM_TEST_KEY".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_credential(&cfg, Path::new("/missing")).as_deref(),
+            Some("named-secret")
+        );
+    }
+
+    #[test]
+    fn resolve_credential_falls_back_to_global_env_and_ignores_blank_values() {
+        let _lock = env_lock();
+        let _named = EnvGuard::set("LLM_TEST_BLANK", "   ");
+        let _global = EnvGuard::set("GREENTIC_LLM_API_KEY", " global-secret ");
+        let cfg = BundleLlmConfig {
+            provider: "openai".to_string(),
+            api_key_secret: Some("LLM_TEST_BLANK".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_credential(&cfg, Path::new("/missing")).as_deref(),
+            Some("global-secret")
+        );
+    }
+
+    #[test]
+    fn resolve_credential_missing_secret_ref_returns_none_when_no_global_key() {
+        let _lock = env_lock();
+        let _global = EnvGuard::remove("GREENTIC_LLM_API_KEY");
+        let dir = tempdir().unwrap();
+        let cfg = BundleLlmConfig {
+            provider: "openai".to_string(),
+            api_key_secret: Some("secrets://dev/demo/_/missing".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(resolve_credential(&cfg, dir.path()), None);
+    }
+
+    #[test]
+    fn build_backend_rejects_unknown_provider() {
+        match build_backend("not-a-provider", "model", String::new(), None) {
+            Ok(_) => panic!("unsupported provider unexpectedly built a backend"),
+            Err(err) => assert!(err.to_string().contains("unsupported llm provider")),
+        }
+    }
+
+    #[test]
+    fn extract_json_object_handles_nested_objects_and_trailing_json() {
+        let content =
+            "prefix {\"outer\":{\"inner\":true},\"items\":[1,2]} suffix {\"ignored\":true}";
+        assert_eq!(
+            extract_json_object(content),
+            Some("{\"outer\":{\"inner\":true},\"items\":[1,2]}")
+        );
     }
 }

@@ -321,13 +321,172 @@ pub fn run_app_flow(
         return parse_envelopes(&error_value, envelope);
     }
 
-    let value = collect_transcript_outputs_with_retry(
+    let mut value = collect_transcript_outputs_with_retry(
         &output.run_dir,
         target_node.map(|s| s.as_str()),
         envelope,
     )?
     .ok_or_else(|| anyhow::anyhow!("app flow produced no outputs"))?;
+    // OAuth bake-in: the adapter's Connect card carries a `scheme|provider` state;
+    // mint a signed state token (host knows pack/tenant/team) so /oauth/callback
+    // can resolve pack-scoped creds + persist the token.
+    augment_oauth_connect_state(
+        &mut value,
+        pack_id,
+        &ctx.tenant,
+        ctx.team.as_deref().unwrap_or("default"),
+        (!envelope.session_id.is_empty()).then_some(envelope.session_id.as_str()),
+    );
     parse_envelopes(&value, envelope)
+}
+
+/// Replace the adapter's `state=scheme|provider` in a Connect card's authorize URL
+/// with a host-signed `crate::oauth_state` token carrying the full context.
+///
+/// `renderedCard` can be nested anywhere in the node output, so we walk the whole
+/// value and rewrite the `state` of any `oauth/authorize` URL we find.
+fn augment_oauth_connect_state(
+    value: &mut JsonValue,
+    pack_id: &str,
+    tenant: &str,
+    team: &str,
+    conv: Option<&str>,
+) {
+    match value {
+        JsonValue::Object(map) => {
+            if let Some(url) = map.get("url").and_then(|u| u.as_str()).map(String::from)
+                && let Some(new_url) = sign_authorize_url_state(&url, pack_id, tenant, team, conv)
+            {
+                map.insert("url".to_string(), JsonValue::String(new_url));
+            }
+            for (_, v) in map.iter_mut() {
+                augment_oauth_connect_state(v, pack_id, tenant, team, conv);
+            }
+        }
+        JsonValue::Array(arr) => {
+            for v in arr.iter_mut() {
+                augment_oauth_connect_state(v, pack_id, tenant, team, conv);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// If `url` is an OAuth `authorize` URL carrying a `state=scheme|provider`, return
+/// the same URL with `state` replaced by a signed `crate::oauth_state` token; else
+/// `None`.
+fn sign_authorize_url_state(
+    url: &str,
+    pack_id: &str,
+    tenant: &str,
+    team: &str,
+    conv: Option<&str>,
+) -> Option<String> {
+    // Trigger on the adapter's raw `state=<scheme>|<provider>` marker rather than a
+    // provider-specific authorize path: GitHub uses `.../oauth/authorize` but Google
+    // uses `.../oauth2/v2/auth`, so a path check skips Google entirely (no signed
+    // state, no PKCE, no redirect_uri). The `scheme|provider` split below is the real
+    // gate — only the adapter's OAuth card emits it, and an already-signed JWT state
+    // (no `|`) returns None here, so we never double-augment.
+    let raw_state = url_query_value(url, "state")?;
+    let (scheme, provider) = raw_state.split_once('|')?;
+    if scheme.is_empty() || provider.is_empty() {
+        return None;
+    }
+    let jti = uuid::Uuid::new_v4().to_string();
+    let signed = crate::oauth_state::mint(&crate::oauth_state::OAuthStateContext {
+        pack: pack_id.to_string(),
+        scheme: scheme.to_string(),
+        provider: provider.to_string(),
+        tenant: tenant.to_string(),
+        team: team.to_string(),
+        subject: "user".to_string(),
+        jti: jti.clone(),
+        // Carries the originating webchat conversation id so /oauth/callback can push
+        // a synthetic resume into it once the token is persisted (auto-advance).
+        conv: conv.map(str::to_string),
+        exp: chrono::Utc::now().timestamp() + 600,
+    });
+    let mut new_url = replace_query_value(url, "state", &signed);
+    // Layer on the provider profile: PKCE challenge (verifier stashed server-side,
+    // keyed by jti) + provider-specific authorize params (e.g. Google offline).
+    if let Some(profile) = crate::oauth_engine::provider_profile(provider) {
+        if profile.uses_pkce {
+            let pkce = crate::oauth_engine::pkce();
+            crate::oauth_engine::store_verifier(&jti, &pkce.verifier);
+            new_url.push_str(&format!(
+                "&code_challenge={}&code_challenge_method=S256",
+                crate::oauth_engine::enc(&pkce.challenge)
+            ));
+        }
+        for (k, v) in profile.authorize_extra {
+            new_url.push_str(&format!(
+                "&{}={}",
+                crate::oauth_engine::enc(k),
+                crate::oauth_engine::enc(v)
+            ));
+        }
+        if profile.redirect_uri_required {
+            new_url.push_str(&format!(
+                "&redirect_uri={}",
+                crate::oauth_engine::enc(&crate::oauth_engine::callback_redirect_uri(provider))
+            ));
+        }
+    }
+    Some(new_url)
+}
+
+/// Minimal `%XX`/`+` decode for a query value.
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                Ok(v) => {
+                    out.push(v);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn url_query_value(url: &str, key: &str) -> Option<String> {
+    let q = url.split_once('?')?.1;
+    q.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| pct_decode(v))
+    })
+}
+
+/// Replace `key=<old>` with `key=<new>` (new is URL-safe; written verbatim).
+fn replace_query_value(url: &str, key: &str, new: &str) -> String {
+    let Some((base, q)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let rebuilt: Vec<String> = q
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((k, _)) if k == key => format!("{key}={new}"),
+            _ => pair.to_string(),
+        })
+        .collect();
+    format!("{base}?{}", rebuilt.join("&"))
 }
 
 /// Merge pack-level config into `metadata` so flow templates can reference

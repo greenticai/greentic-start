@@ -60,9 +60,9 @@ Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is commi
 |-------|-----------|----------------|
 | Runtime orchestration | `runtime.rs`, `runtime_state.rs`, `supervisor.rs` | Starts/stops services (cloudflared, ngrok, NATS, gateway, egress, subscriptions), persists service manifests under `state/runtime/<tenant.team>` |
 | Bundle resolution | `bundle_ref.rs` | Resolves local dirs, archives (zip/tar/gzip/zstd), and remote refs (`oci://`, `repo://`, `store://`) |
-| HTTP ingress | `http_ingress.rs`, `ingress_dispatch.rs`, `ingress_types.rs` | Hyper-based HTTP server for provider ingress (`v1/{domain}/ingress/...`), onboarding endpoints (`/api/onboard`), static route serving |
+| HTTP ingress | `http_ingress/`, `ingress_dispatch.rs`, `ingress_types.rs` | Hyper-based HTTP server for provider ingress (`v1/{domain}/ingress/...`), onboarding endpoints (`/api/onboard`), static route serving |
 | Admin server | `admin_server.rs` | mTLS endpoint (default port 8443) for remote lifecycle control (`/admin/v1/start`, `/stop`, `/status`, `/list`) |
-| Runner host | `runner_host.rs`, `runner_exec.rs`, `runner_integration.rs` | Builds DemoRunnerHost over discovered packs, secrets, state stores. Supports in-process and external runner execution |
+| Runner host | `runner_host/`, `runner_exec.rs`, `runner_integration.rs` | Builds DemoRunnerHost over discovered packs, secrets, state stores. Supports in-process and external runner execution |
 | Startup contract | `startup_contract.rs` | Launch gating for bundles declaring `greentic.static-routes.v1`; resolves `PUBLIC_BASE_URL`, persists `startup_contract.json` |
 | Onboarding | `onboard/` | Provider listing, tenants/teams, deployment status, QA submit/spec/validate, webhook setup |
 | Secrets | `secrets_*.rs`, `secret_*.rs` | Backend selection (pack vs dev-store), secret URI handling, missing secret seeding |

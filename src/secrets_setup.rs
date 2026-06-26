@@ -148,14 +148,32 @@ impl SecretsSetup {
         provider_id: &str,
         requirement: &PackSecretRequirement,
     ) -> Result<bool> {
+        let team = if let Some(generated) = requirement.generated.as_ref() {
+            generated_scope_team(generated, self.team.as_deref())
+        } else {
+            self.team.as_deref()
+        };
+        let canonical_team = crate::secrets_manager::canonical_team(team);
         for key in std::iter::once(requirement.key.as_str())
             .chain(requirement.aliases.iter().map(String::as_str))
         {
-            let uri = self.requirement_uri(provider_id, key, requirement.generated.as_ref());
-            match self.store.get(&uri).await {
-                Ok(_) => return Ok(true),
-                Err(SecretError::NotFound { .. }) => continue,
-                Err(err) => return Err(anyhow!("failed to read secret {}: {err}", uri)),
+            // Reconcile differing provider string forms (raw `messaging-webchat-gui`
+            // vs canonical `messaging_webchat_gui`) via the canonicalization
+            // middleware, so a value persisted under one form is found here and we
+            // don't regenerate a duplicate under the other — which would make a
+            // minted token unverifiable (401). See `secrets_gate::secret_uri_candidates`.
+            for uri in crate::secrets_gate::secret_uri_candidates(
+                &self.env,
+                &self.tenant,
+                canonical_team.as_ref(),
+                key,
+                provider_id,
+            ) {
+                match self.store.get(&uri).await {
+                    Ok(_) => return Ok(true),
+                    Err(SecretError::NotFound { .. }) => continue,
+                    Err(err) => return Err(anyhow!("failed to read secret {}: {err}", uri)),
+                }
             }
         }
         Ok(false)
