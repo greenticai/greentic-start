@@ -292,6 +292,7 @@ pub fn resolve_secrets_manager(
     let (manager, store_path, using_env_fallback) = instantiate_manager_from_selection(
         bundle_root,
         tenant,
+        &team_owned,
         &selection,
         allow_env,
         &pack_desc,
@@ -344,16 +345,25 @@ pub fn resolve_secrets_manager(
 fn instantiate_manager_from_selection(
     bundle_root: &Path,
     tenant: &str,
+    canonical_team: &str,
     selection: &secrets_manager::SecretsManagerSelection,
     allow_env: bool,
     pack_desc: &str,
     backend_kind_result: Result<SecretsBackendKind, AnyhowError>,
 ) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>, bool)> {
     match backend_kind_result {
-        Ok(kind) => match instantiate_manager_for_backend(bundle_root, tenant, selection, kind) {
-            Ok((manager, path)) => Ok((manager, path, false)),
-            Err(err) => fallback_to_env(allow_env, kind.to_string(), pack_desc, err),
-        },
+        Ok(kind) => {
+            match instantiate_manager_for_backend(
+                bundle_root,
+                tenant,
+                canonical_team,
+                selection,
+                kind,
+            ) {
+                Ok((manager, path)) => Ok((manager, path, false)),
+                Err(err) => fallback_to_env(allow_env, kind.to_string(), pack_desc, err),
+            }
+        }
         Err(err) => fallback_to_env(allow_env, "<unknown>".to_string(), pack_desc, err),
     }
 }
@@ -382,13 +392,14 @@ fn fallback_to_env(
 fn instantiate_manager_for_backend(
     bundle_root: &Path,
     tenant: &str,
+    canonical_team: &str,
     _selection: &secrets_manager::SecretsManagerSelection,
     backend_kind: SecretsBackendKind,
 ) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>)> {
     match backend_kind {
         SecretsBackendKind::DevStore => open_dev_store_manager(bundle_root),
         SecretsBackendKind::Env => Ok((Arc::new(EnvSecretsManager) as DynSecretsManager, None)),
-        SecretsBackendKind::Vault => build_vault_manager(tenant),
+        SecretsBackendKind::Vault => build_vault_manager(tenant, canonical_team),
     }
 }
 
@@ -412,18 +423,33 @@ fn open_dev_store_manager(
 /// expected to grant read-only access to its KV path, so the resulting manager
 /// rejects writes.
 ///
+/// The core is scoped to `tenant` and — for a concrete team — to
+/// `canonical_team`, so it rejects reads of another team's
+/// `secrets://<env>/<tenant>/<other-team>/...` even when the pod's Vault role
+/// would permit the broader tenant path. The `_` placeholder means tenant-level
+/// (no specific team); it is left unscoped so the tenant-level wildcard (which
+/// parses to no team) still resolves — matching the dev-store manager.
+///
 /// `build_backend()` and `CoreBuilder::build()` are async, so the whole
 /// construction is driven via [`sync_await`] — which reuses the ambient Tokio
 /// runtime when present and otherwise spins the shared secrets runtime, never
 /// nesting runtimes.
-fn build_vault_manager(tenant: &str) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>)> {
+fn build_vault_manager(
+    tenant: &str,
+    canonical_team: &str,
+) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>)> {
     let tenant = tenant.to_string();
+    let team = (canonical_team != greentic_secrets_lib::TEAM_PLACEHOLDER)
+        .then(|| canonical_team.to_string());
     let core = sync_await(async move {
         let components = greentic_secrets_lib::vault::build_backend()
             .await
             .context("initialize vault secrets backend")?;
-        CoreBuilder::default()
-            .tenant(tenant)
+        let mut builder = CoreBuilder::default().tenant(tenant);
+        if let Some(team) = team {
+            builder = builder.team(team);
+        }
+        builder
             .backend(components.backend, components.key_provider)
             .build()
             .await
@@ -436,7 +462,7 @@ fn build_vault_manager(tenant: &str) -> AnyhowResult<(DynSecretsManager, Option<
 }
 
 /// Adapts an embedded [`SecretsCore`] — which envelope-decrypts records,
-/// enforces the tenant scope, and caches reads — to the runtime
+/// enforces the configured tenant/team scope, and caches reads — to the runtime
 /// [`SecretsManager`] interface. Backend-agnostic: the Vault wiring lives in
 /// [`build_vault_manager`]. Writes and deletes are rejected because runtime
 /// workloads resolve secrets under a read-only identity.
@@ -1266,6 +1292,49 @@ mod tests {
         assert!(matches!(write, Err(SecretError::Permission(_))));
         let delete = runtime.block_on(async { manager.delete(uri).await });
         assert!(matches!(delete, Err(SecretError::Permission(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn core_secrets_manager_enforces_team_scope() -> anyhow::Result<()> {
+        use greentic_secrets_lib::core::{MemoryBackend, MemoryKeyProvider};
+
+        let runtime = Runtime::new()?;
+        let own = "secrets://dev/acme/sales/messaging-telegram/telegram_bot_token";
+        let wildcard = "secrets://dev/acme/_/messaging-telegram/shared_token";
+
+        // A team-scoped core — what build_vault_manager configures for a
+        // concrete team: tenant `acme`, team `sales`.
+        let manager = runtime.block_on(async {
+            let core = CoreBuilder::default()
+                .tenant("acme")
+                .team("sales")
+                .backend(MemoryBackend::new(), MemoryKeyProvider::default())
+                .build()
+                .await?;
+            core.put_json(own, &serde_json::json!("S")).await?;
+            core.put_json(wildcard, &serde_json::json!("W")).await?;
+            anyhow::Ok(CoreSecretsManager { core })
+        })?;
+
+        // The configured team and the `_` wildcard (which parses to no team)
+        // both resolve.
+        assert!(runtime.block_on(async { manager.read(own).await }).is_ok());
+        assert!(
+            runtime
+                .block_on(async { manager.read(wildcard).await })
+                .is_ok()
+        );
+
+        // Another concrete team is refused by the scope guard before the backend
+        // is consulted — a hard denial, not a NotFound.
+        let cross = runtime.block_on(async {
+            manager
+                .read("secrets://dev/acme/marketing/messaging-telegram/telegram_bot_token")
+                .await
+        });
+        assert!(cross.is_err());
+        assert!(!matches!(cross, Err(SecretError::NotFound(_))));
         Ok(())
     }
 }
