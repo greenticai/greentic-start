@@ -631,13 +631,13 @@ mod tests {
             .block_on(async {
                 manager
                     .write(
-                        "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key",
+                        "secrets://local/demo/_/messaging-webchat-gui/jwt_signing_key",
                         b"raw-provider-key",
                     )
                     .await?;
                 manager
                     .write(
-                        "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key",
+                        "secrets://local/demo/_/messaging_webchat_gui/jwt_signing_key",
                         b"canonical-provider-key",
                     )
                     .await
