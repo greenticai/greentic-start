@@ -29,8 +29,10 @@ use greentic_deploy_spec::{BundleId, DeploymentId, Environment, Revision, Revisi
 use greentic_telemetry::{RolloutEvent, TelemetryCtx, emit_rollout_event};
 
 /// Fallback tenant for envs without an owner — matches the operator's
-/// single-process `local` convention.
-const LOCAL_TENANT_FALLBACK: &str = "local";
+/// single-process `local` convention. Shared with the serve-path secrets
+/// selection (`lib.rs`), which scopes a Vault backend to the same env-owner
+/// tenant.
+pub(crate) const LOCAL_TENANT_FALLBACK: &str = "local";
 
 /// Build the [`TelemetryCtx`] for a drain transition — tenant + env +
 /// deployment + bundle + revision. Pure, no I/O, so it can be inspected in
