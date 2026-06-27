@@ -132,6 +132,12 @@ struct LoggingSecretsManager {
     inner: DynSecretsManager,
     dev_store_path_display: String,
     using_env_fallback: bool,
+    /// App-pack provider id used by `gtc setup` when it persisted secrets under
+    /// the pack's own namespace. Used to reconstruct dev-store candidate paths.
+    pack_id: Option<String>,
+    /// Environment segment `gtc setup` wrote under (`GREENTIC_ENV` or `dev`),
+    /// which may differ from the canonical env a runtime read requests.
+    setup_env: String,
 }
 
 impl LoggingSecretsManager {
@@ -139,6 +145,8 @@ impl LoggingSecretsManager {
         inner: DynSecretsManager,
         dev_store_path: Option<&Path>,
         using_env_fallback: bool,
+        pack_id: Option<String>,
+        setup_env: String,
     ) -> Self {
         let dev_store_path_display = dev_store_path
             .map(|path| path.display().to_string())
@@ -147,6 +155,8 @@ impl LoggingSecretsManager {
             inner,
             dev_store_path_display,
             using_env_fallback,
+            pack_id,
+            setup_env,
         }
     }
 }
@@ -194,6 +204,32 @@ impl SecretsManager for LoggingSecretsManager {
                         return Ok(value);
                     }
                 }
+                // Zero-env reconciliation: `gtc setup` persists secrets under the
+                // app-pack provider at the setup env (e.g.
+                // `secrets://dev/{t}/_/{pack}/llm_deepseek`), while runtimes read
+                // canonical scopes (`secrets://default/{t}/_/llm/deepseek`). Try
+                // the bridged candidates before giving up so `gtc start` resolves
+                // store-provisioned secrets without runtime env vars.
+                for candidate in
+                    store_scope_candidates(path, self.pack_id.as_deref(), &self.setup_env)
+                {
+                    operator_log::info(
+                        module_path!(),
+                        format!(
+                            "WASM secrets read fallback: trying store-scope candidate uri={candidate}",
+                        ),
+                    );
+                    if let Ok(value) = self.inner.read(&candidate).await {
+                        operator_log::debug(
+                            module_path!(),
+                            format!(
+                                "WASM secrets read fallback resolved uri={candidate}; value={}",
+                                SecretValue::new(value.as_slice()),
+                            ),
+                        );
+                        return Ok(value);
+                    }
+                }
                 Err(err)
             }
         }
@@ -225,6 +261,79 @@ fn team_wildcard_fallback(path: &str) -> Option<String> {
         segments[0], segments[1], "_", segments[3], segments[4]
     ))
 }
+
+/// The environment segment `gtc setup` writes under: `GREENTIC_ENV` or `dev`.
+/// Mirrors `greentic_setup::resolve_env` so runtime reads can bridge to the
+/// scope setup actually persisted.
+fn resolve_setup_env() -> String {
+    env::var("GREENTIC_ENV")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "dev".to_string())
+}
+
+/// Build the ordered dev-store candidate URIs to try when a canonical runtime
+/// read (`secrets://default/{tenant}/_/llm/deepseek`) misses, because
+/// `gtc setup` persisted the value under the app-pack provider at the setup env
+/// (`secrets://{setup_env}/{tenant}/_/{pack}/llm_deepseek` plus the question-id
+/// alias `…/{pack}/deepseek`). Candidates vary three dimensions independently —
+/// env (`default`/`dev`/setup_env), team (requested or `_` wildcard), and the
+/// `{provider}/{key}` shape (canonical, or pack-namespaced with the joined and
+/// plain key) — and are de-duplicated, excluding the already-tried `path`.
+fn store_scope_candidates(path: &str, pack_id: Option<&str>, setup_env: &str) -> Vec<String> {
+    let Some(trimmed) = path.strip_prefix("secrets://") else {
+        return Vec::new();
+    };
+    let segments: Vec<&str> = trimmed.split('/').collect();
+    if segments.len() != 5 {
+        return Vec::new();
+    }
+    let (req_env, tenant, req_team, req_provider, req_key) = (
+        segments[0],
+        segments[1],
+        segments[2],
+        segments[3],
+        segments[4],
+    );
+
+    let mut envs = vec![req_env.to_string(), setup_env.to_string()];
+    envs.push("default".to_string());
+    envs.push("dev".to_string());
+
+    let mut teams = vec![req_team.to_string()];
+    if req_team != "_" {
+        teams.push("_".to_string());
+    }
+
+    // (provider, key) shapes the value may have been stored under.
+    let mut shapes: Vec<(String, String)> = vec![(req_provider.to_string(), req_key.to_string())];
+    if let Some(pack) = pack_id.filter(|pack| !pack.is_empty()) {
+        // Alias form: `{pack}/{provider}_{key}` (e.g. `{pack}/llm_deepseek`).
+        shapes.push((pack.to_string(), format!("{req_provider}_{req_key}")));
+        // Question-id form: `{pack}/{key}` (e.g. `{pack}/deepseek`).
+        shapes.push((pack.to_string(), req_key.to_string()));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut candidates = Vec::new();
+    for env_segment in &envs {
+        for team_segment in &teams {
+            for (provider_segment, key_segment) in &shapes {
+                let candidate = format!(
+                    "secrets://{env_segment}/{tenant}/{team_segment}/{provider_segment}/{key_segment}"
+                );
+                if candidate == path {
+                    continue;
+                }
+                if seen.insert(candidate.clone()) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+    candidates
+}
+
 const ENV_ALLOW_ENV_SECRETS: &str = "GREENTIC_ALLOW_ENV_SECRETS";
 
 #[derive(Clone)]
@@ -241,11 +350,13 @@ impl SecretsManagerHandle {
         self.manager.clone()
     }
 
-    pub fn runtime_manager(&self, _pack_id: Option<&str>) -> DynSecretsManager {
+    pub fn runtime_manager(&self, pack_id: Option<&str>) -> DynSecretsManager {
         Arc::new(LoggingSecretsManager::new(
             self.manager(),
             self.dev_store_path.as_deref(),
             self.using_env_fallback,
+            pack_id.map(|pack| pack.to_string()),
+            resolve_setup_env(),
         ))
     }
 }
@@ -836,6 +947,38 @@ mod tests {
     fn canonical_uri_uses_team_placeholder() {
         let uri = canonical_secret_uri("demo", "acme", None, "messaging", "FOO");
         assert_eq!(uri, "secrets://demo/acme/_/messaging/foo");
+    }
+
+    #[test]
+    fn store_scope_candidates_bridge_llm_credential_to_setup_scope() {
+        // Runtime reads the canonical LLM credential scope; `gtc setup` wrote it
+        // under the app-pack provider at the `dev` setup env.
+        let candidates = store_scope_candidates(
+            "secrets://default/acme/_/llm/deepseek",
+            Some("agentic-research-tavily-demo"),
+            "dev",
+        );
+        // The alias form (`{pack}/llm_deepseek`) and question-id form
+        // (`{pack}/deepseek`) at the setup env must both be offered.
+        assert!(candidates.contains(
+            &"secrets://dev/acme/_/agentic-research-tavily-demo/llm_deepseek".to_string()
+        ));
+        assert!(candidates.contains(
+            &"secrets://dev/acme/_/agentic-research-tavily-demo/deepseek".to_string()
+        ));
+        // The already-tried exact path is never re-offered.
+        assert!(!candidates.contains(&"secrets://default/acme/_/llm/deepseek".to_string()));
+    }
+
+    #[test]
+    fn store_scope_candidates_dedupe_and_ignore_non_canonical() {
+        // Non 5-segment paths yield nothing.
+        assert!(store_scope_candidates("secret://tavily/api_key", Some("p"), "dev").is_empty());
+        // Candidates are unique.
+        let candidates =
+            store_scope_candidates("secrets://default/acme/_/llm/deepseek", Some("p"), "dev");
+        let unique: std::collections::HashSet<_> = candidates.iter().collect();
+        assert_eq!(unique.len(), candidates.len());
     }
 
     #[test]
