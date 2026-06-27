@@ -4,7 +4,7 @@ bench = [
 
 [package]
 name = "greentic-start"
-version = "1.2.0-research.1"
+version = "1.2.0-research.2"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -111,19 +111,19 @@ version = "0.8"
 # the greentic-setup migration, PR greenticai/greentic-setup#162).
 [dependencies.greentic-runner-desktop]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "34e2d128ed9d286cfb16f2ee352b6b3ee82548fc"
+rev = "a110da7efebf49f485cd9159e91899a5621f3dcd"
 default-features = false
-features = ["agentic-worker", "greentic-llm-backend"]
+features = ["agentic-worker", "greentic-llm-backend", "desktop-agent-ephemeral"]
 
 [dependencies.greentic-runner-host]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "34e2d128ed9d286cfb16f2ee352b6b3ee82548fc"
+rev = "a110da7efebf49f485cd9159e91899a5621f3dcd"
 default-features = false
 features = ["agentic-worker", "greentic-llm-backend"]
 
 [dependencies.greentic-aw-runtime]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "34e2d128ed9d286cfb16f2ee352b6b3ee82548fc"
+rev = "a110da7efebf49f485cd9159e91899a5621f3dcd"
 default-features = false
 
 [dependencies.greentic-secrets-lib]
@@ -205,3 +205,4 @@ tempfile = "3"
 [patch.crates-io]
 greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.2.15-research" }
 greentic-mcp-exec = { git = "https://github.com/greenticai/greentic-mcp.git", rev = "f0d2f02b002b49612ce25a6af1901a5280757605" }
+
