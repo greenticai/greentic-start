@@ -4,7 +4,7 @@ bench = [
 
 [package]
 name = "greentic-start"
-version = "1.2.0-dev.0"
+version = "1.2.0-research.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -12,6 +12,23 @@ license = "MIT"
 repository = "https://github.com/greenticai/greentic-start"
 homepage = "https://github.com/greenticai/greentic-start"
 readme = "README.md"
+
+# cargo-binstall pulls the pre-built binary from the GitHub release tagged
+# `v{version}`. The research-branch binary is built from git deps (full runner
+# with agentic-worker + greentic-llm-backend), so it carries multi-provider
+# dw.agent — unlike any crates.io-source build (aw-runtime is publish=false).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tgz"
+pkg-fmt = "tgz"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+]
 keywords = [
     "greentic",
     "cli",
