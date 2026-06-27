@@ -981,6 +981,68 @@ mod tests {
         assert_eq!(unique.len(), candidates.len());
     }
 
+    /// End-to-end through the real read path: seed a dev store exactly the way
+    /// `gtc setup` does (pack-namespaced provider, setup env), then read the
+    /// canonical runtime scopes through `LoggingSecretsManager` and confirm the
+    /// candidate fallback bridges them. This is the binary-level proof of the
+    /// zero-env LLM credential + tool-secret resolution.
+    #[test]
+    fn logging_manager_bridges_setup_scope_to_canonical_runtime_reads() -> anyhow::Result<()> {
+        const PACK: &str = "agentic-research-tavily-demo";
+        let dir = tempdir()?;
+        let store_path = dir.path().join("secrets.env");
+        let store = DevStore::with_path(store_path.clone())?;
+        let runtime = Runtime::new()?;
+
+        // What `gtc setup` persists: the requirement alias (`{pack}/llm_deepseek`,
+        // `{pack}/tavily_api_key`) under the setup env `dev`.
+        let seed = SeedDoc {
+            entries: vec![
+                SeedEntry {
+                    uri: format!("secrets://dev/demo/_/{PACK}/llm_deepseek"),
+                    format: SecretFormat::Text,
+                    value: SeedValue::Text {
+                        text: "sk-deepseek-test".to_string(),
+                    },
+                    description: None,
+                },
+                SeedEntry {
+                    uri: format!("secrets://dev/demo/_/{PACK}/tavily_api_key"),
+                    format: SecretFormat::Text,
+                    value: SeedValue::Text {
+                        text: "tvly-test".to_string(),
+                    },
+                    description: None,
+                },
+            ],
+        };
+        let report =
+            runtime.block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
+        assert_eq!(report.ok, 2, "both secrets seeded");
+
+        let client = SecretsClient::open_with_path(store_path)?;
+        let manager: DynSecretsManager = Arc::new(LoggingSecretsManager::new(
+            Arc::new(client),
+            None,
+            false,
+            Some(PACK.to_string()),
+            "dev".to_string(),
+        ));
+
+        // LLM credential: runtime reads the canonical `default`/`llm` scope.
+        let llm = runtime
+            .block_on(async { manager.read("secrets://default/demo/_/llm/deepseek").await })?;
+        assert_eq!(String::from_utf8(llm)?, "sk-deepseek-test");
+
+        // Tool secret: `StoreToolSecretsBackend` hands the manager the canonical
+        // `secrets://dev/demo/_/tavily/api_key` scope.
+        let tavily =
+            runtime.block_on(async { manager.read("secrets://dev/demo/_/tavily/api_key").await })?;
+        assert_eq!(String::from_utf8(tavily)?, "tvly-test");
+
+        Ok(())
+    }
+
     #[test]
     fn provider_secrets_missing_when_unsupported() -> anyhow::Result<()> {
         let manager: DynSecretsManager = Arc::new(FakeManager::new(HashMap::new()));
