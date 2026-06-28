@@ -52,7 +52,7 @@ Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is commi
 - `src/main.rs` — trivial: calls `greentic_start::run_from_env()`
 - `src/lib.rs` — CLI parsing (clap derive), arg normalization (strips legacy `demo` subcommand prefix), dispatches to `run_start`, `run_restart_request`, `run_stop_request`
 - Public API: `StartRequest`, `StopRequest`, `run_start_request()`, `run_restart_request()`, `run_stop_request()`, `run_from_env()`
-- Public modules: `config`, `runtime`, `runtime_state`, `supervisor`
+- Public modules: `config`, `notifier`, `perf_harness`, `provider_config_envelope`, `revision_health_gate`, `runtime`, `runtime_state`, `supervisor`, `ws_test_support`
 
 ### Core Layers
 
@@ -68,6 +68,9 @@ Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is commi
 | Secrets | `secrets_*.rs`, `secret_*.rs` | Backend selection (pack vs dev-store), secret URI handling, missing secret seeding |
 | Services | `services/` | Individual service components: NATS, runner, components |
 | Subscriptions | `subscriptions_universal/` | Universal subscription runtime and persistence (e.g., Microsoft Graph) |
+| Revision engine | `revision_boot.rs`, `revision_serve.rs`, `revision_dispatcher.rs`, `revision_drain.rs`, `revision_pull.rs`, `revision_reload.rs`, `revision_pin.rs`, `revision_webhook_register.rs`, `revision_health_gate.rs` | Multi-revision hot-reload runtime (~13k LOC): boots revisions from env-store, dispatches ingress traffic to the active revision, drains old revisions, pulls remote bundles at startup, registers webhooks, and gates readiness |
+| Fast2Flow | `fast2flow/` | Chat-to-flow routing subsystem (gate, host_process, llm_router, mapper, contracts, config) — routes inbound chat messages to the matching flow via BM25 + optional LLM fallback |
+| LLM integration | `llm/` | Provider-agnostic LLM layer consumed by fast2flow and other subsystems; wraps `greentic-llm` crate |
 
 ### Key Patterns
 
@@ -79,12 +82,14 @@ Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is commi
 
 ## Dependencies (Greentic Crates)
 
+- `greentic-deployer` / `greentic-deploy-spec` — environment lifecycle, revision staging, deploy-spec types (floor-pinned ranges with per-publish rationale)
 - `greentic-distributor-client` — pack fetching (feature: `pack-fetch`)
+- `greentic-llm` — provider-agnostic LLM abstraction (dev-dep feature: `test-mock` for `TestLlmProvider` doubles)
 - `greentic-runner-host` / `greentic-runner-desktop` — runtime execution
 - `greentic-secrets-lib` — secrets management (feature: `providers-dev`)
-- `greentic-types` — common types (feature: `serde`)
 - `greentic-setup` — setup/admin contracts
-- `greentic-i18n` — i18n support
+- `greentic-telemetry` — tenant-aware tracing, OTLP export, rollout events
+- `greentic-types` — common types (feature: `serde`)
 - `qa-spec` — QA form specifications
 
 ## Conventions
