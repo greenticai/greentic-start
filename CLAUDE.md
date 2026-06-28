@@ -71,6 +71,9 @@ Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is commi
 | Revision engine | `revision_boot.rs`, `revision_serve.rs`, `revision_dispatcher.rs`, `revision_drain.rs`, `revision_pull.rs`, `revision_reload.rs`, `revision_pin.rs`, `revision_webhook_register.rs`, `revision_health_gate.rs` | Multi-revision hot-reload runtime (~13k LOC): boots revisions from env-store, dispatches ingress traffic to the active revision, drains old revisions, pulls remote bundles at startup, registers webhooks, and gates readiness |
 | Fast2Flow | `fast2flow/` | Chat-to-flow routing subsystem (gate, host_process, llm_router, mapper, contracts, config) — routes inbound chat messages to the matching flow via BM25 + optional LLM fallback |
 | LLM integration | `llm/` | Provider-agnostic LLM layer consumed by fast2flow and other subsystems; wraps `greentic-llm` crate |
+| OAuth engine | `oauth_engine.rs`, `oauth_secret_bridge.rs`, `oauth_state.rs` | Broker-side OAuth flow for provider connections: token exchange, secret bridging, per-provider state |
+| Doctor | `doctor.rs`, `doctor_env.rs` | Pre-flight environment readiness checks (pack presence, secrets, connectivity) |
+| Ingress control | `ingress/` | Control-directive routing layer (CBOR directives, allow/deny policy); separate from `http_ingress/` |
 
 ### Key Patterns
 
@@ -98,6 +101,7 @@ Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is commi
 - **Error handling**: `anyhow::Result<T>` with `.context()`
 - **i18n**: Source catalog at `i18n/en.json`. Translate via `tools/i18n.sh` (defaults: `LANGS=all`, `BATCH_SIZE=200`). Never hardcode user-facing strings.
 - **Docker**: `Dockerfile.distroless` builds a musl-static binary into a `gcr.io/distroless/static-debian12:nonroot` image (uid 65532, no shell; Chainguard is the optional hardened upgrade). The image is **ELF-only**: it ships no shell or interpreters, so bundle-supplied service helpers (gateway/egress/subscriptions/runner) must be statically-linked ELF binaries, not `#!`-scripts. `build_service_spec` preflights helper shebangs and fails with an actionable error when the interpreter is absent.
+- **Floor-pinned deps**: Cross-repo Greentic deps use `>=M.m.p-dev.RUNID, <M.(m+1).0-0` ranges with inline rationale comments in `Cargo.toml`. Bump the floor when a new publish adds a surface this crate consumes; the comment must explain which PR/feature the floor targets.
 
 ## Git Conventions
 
