@@ -148,6 +148,33 @@ pub fn run_from_env() -> anyhow::Result<()> {
     }
 }
 
+/// Best-effort TCP reachability probe for a Redis endpoint.
+///
+/// Parses `host:port` out of a `redis[s]://[user:pass@]host:port[/db]` URL and
+/// attempts a short-timeout TCP connect. Used only to decide whether the
+/// agentic worker should use Redis-backed state (durable across restarts) or
+/// the in-process fallback; a false result is never fatal.
+fn redis_endpoint_reachable(url: &str) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let without_scheme = url.split("://").nth(1).unwrap_or(url);
+    let after_auth = without_scheme.rsplit('@').next().unwrap_or(without_scheme);
+    let host_port = after_auth.split('/').next().unwrap_or(after_auth);
+    let host_port = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:6379")
+    };
+
+    match host_port.to_socket_addrs() {
+        Ok(addrs) => addrs
+            .into_iter()
+            .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()),
+        Err(_) => false,
+    }
+}
+
 fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     // Disable provider-core-only mode in demo so WASM components can access secrets directly.
     // Without this, the runner-host blocks secrets_store.get() calls from WASM.
@@ -162,6 +189,39 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     if std::env::var("GREENTIC_ENV").is_err() {
         unsafe {
             std::env::set_var("GREENTIC_ENV", "dev");
+        }
+    }
+
+    // Agentic Worker (dw.agent) state backend. Redis is OPTIONAL: when one is
+    // reachable we point the AW at it so conversation memory survives process
+    // restarts; when it isn't, the desktop runner uses a process-global
+    // in-memory store that keeps multi-turn memory alive for the lifetime of
+    // this `gtc start` process (no external infrastructure required). Either
+    // way a multi-turn agent can propose an action and act on the user's later
+    // "yes" — the difference is only durability across restarts.
+    // SAFETY: single-threaded startup, before any worker spawns.
+    if std::env::var("GREENTIC_AW_REDIS_URL").is_err() {
+        let candidate = std::env::var("REDIS_URL")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "redis://127.0.0.1:6379".to_string());
+        if redis_endpoint_reachable(&candidate) {
+            unsafe {
+                std::env::set_var("GREENTIC_AW_REDIS_URL", &candidate);
+            }
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "agentic worker state: using Redis at {candidate} (dw.agent memory persists across restarts)"
+                ),
+            );
+        } else {
+            operator_log::info(
+                module_path!(),
+                "agentic worker state: no Redis found; using in-process memory \
+                 (multi-turn dw.agent memory works for this session, reset on restart). \
+                 Set GREENTIC_AW_REDIS_URL to persist across restarts.",
+            );
         }
     }
 
