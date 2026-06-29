@@ -52,6 +52,7 @@ const ENVIRONMENT_FILE: &str = "environment.json";
 
 use crate::operator_log;
 use crate::revision_boot::{self, RuntimeConfigActivation};
+use crate::revision_pin::RevisionPinStore;
 use crate::revision_serve::{Activation, RevisionServer};
 use crate::runtime_config::{self, LoadedRuntimeConfig};
 use crate::secrets_gate::DynSecretsManager;
@@ -312,12 +313,17 @@ struct LastReloadInputs {
 /// built for cold-start activation; we re-use it so the rebuilt host is
 /// constructed on the same runtime that the original was — keeping any
 /// async resources affine to one runtime.
+///
+/// `pin_store` is the SAME `Arc` the cold-start activation was built with, so
+/// every rebuilt dispatcher shares one session-pin store across reloads (B1a).
+/// A reweight rebuilds the dispatcher but must not drop live pins.
 pub(crate) fn default_rebuild(
     store_root: PathBuf,
     env_id: String,
     secrets: DynSecretsManager,
     secrets_tenant_scope: Option<String>,
     runtime_ref_resolver: Arc<dyn RuntimeRefResolver>,
+    pin_store: Arc<dyn RevisionPinStore>,
     activation_rt: tokio::runtime::Handle,
 ) -> impl FnMut() -> Result<Option<Activation>> + Send + 'static {
     let mut last: Option<LastReloadInputs> = None;
@@ -328,18 +334,21 @@ pub(crate) fn default_rebuild(
             &secrets,
             secrets_tenant_scope.as_deref(),
             &runtime_ref_resolver,
+            &pin_store,
             &activation_rt,
             &mut last,
         )
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rebuild_once(
     store_root: &Path,
     env_id: &str,
     secrets: &DynSecretsManager,
     secrets_tenant_scope: Option<&str>,
     runtime_ref_resolver: &Arc<dyn RuntimeRefResolver>,
+    pin_store: &Arc<dyn RevisionPinStore>,
     activation_rt: &tokio::runtime::Handle,
     last: &mut Option<LastReloadInputs>,
 ) -> Result<Option<Activation>> {
@@ -369,6 +378,7 @@ fn rebuild_once(
             secrets_tenant_scope,
             &environment,
             Arc::clone(runtime_ref_resolver),
+            Arc::clone(pin_store),
         ))?;
     *last = Some(LastReloadInputs {
         rc,

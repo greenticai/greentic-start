@@ -532,6 +532,17 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             std::sync::Arc::clone(&runtime_refs_store),
         ));
 
+        // B1a: one session-pin store for the env's whole lifetime. The SAME
+        // `Arc` flows into BOTH the cold-start activation AND every
+        // reload-rebuilt activation (via the watcher's `default_rebuild`), so a
+        // traffic reweight — which rebuilds the dispatcher through reload — does
+        // not discard live session pins. Without this, every reweight would
+        // re-pick a fresh revision for in-flight conversations on connectors
+        // that hold no stickiness cookie (i.e. every messaging provider).
+        // In-memory today; the Redis-backed store swaps in here for multi-pod.
+        let pin_store: std::sync::Arc<dyn revision_pin::RevisionPinStore> =
+            std::sync::Arc::new(revision_pin::InMemoryPinStore::new());
+
         let activation_rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -543,6 +554,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             secrets_tenant_scope.as_deref(),
             &environment,
             std::sync::Arc::clone(&runtime_ref_resolver),
+            std::sync::Arc::clone(&pin_store),
         ))?;
 
         // Execution bridge: serve the activated revisions over a slim HTTP
@@ -708,6 +720,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 watcher_secrets,
                 secrets_tenant_scope,
                 std::sync::Arc::clone(&runtime_ref_resolver),
+                std::sync::Arc::clone(&pin_store),
                 activation_rt.handle().clone(),
             ),
             // Each reload that actually changed config (hot-attached
