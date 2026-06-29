@@ -4202,32 +4202,26 @@ mod tests {
     /// Build an [`Activation`] with a single deployment + revision, both
     /// taken as parameters so two activations can share IDs across a reload.
     /// The dispatcher carries the deployment at generation 1 (whatever
-    /// `apply_traffic_split(.., expected_generation=0)` yields).
+    /// `apply_traffic_split(.., expected_generation=0)` yields) on a fresh,
+    /// unshared pin store. Thin wrapper over [`activation_split_sharing_store`].
     fn activation_with_ids(
         env_id: &str,
         deployment_id: greentic_deploy_spec::ids::DeploymentId,
         revision_id: greentic_deploy_spec::ids::RevisionId,
         bundle_id: greentic_deploy_spec::ids::BundleId,
     ) -> Activation {
-        use crate::revision_dispatcher::{
-            RevisionDispatcher, RevisionDispatcherConfig, RevisionEntry,
-        };
-        let base = empty_activation(env_id);
-        let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new(env_id, [0u8; 32]));
-        let revisions = vec![RevisionEntry {
-            revision_id,
-            bundle_id: bundle_id.clone(),
-            weight_bps: 10_000,
-        }];
-        dispatcher
-            .apply_traffic_split(deployment_id, revisions, bundle_id, 0)
-            .expect("apply_traffic_split for shared-deployment activation");
-        activation_for_test(base.host, dispatcher)
+        activation_split_sharing_store(
+            env_id,
+            deployment_id,
+            &[(revision_id, 10_000)],
+            bundle_id,
+            std::sync::Arc::new(crate::revision_pin::InMemoryPinStore::new()),
+        )
     }
 
-    /// Like [`activation_with_ids`] but with a caller-chosen revision split and
-    /// a SHARED pin store, so two activations across a reload reuse one store
-    /// (mirroring the B1a boot wiring). Weights must sum to 10,000.
+    /// Build an [`Activation`] with a caller-chosen revision split and a
+    /// caller-supplied pin store, so two activations across a reload can reuse
+    /// one store (mirroring the B1a boot wiring). Weights must sum to 10,000.
     fn activation_split_sharing_store(
         env_id: &str,
         deployment_id: greentic_deploy_spec::ids::DeploymentId,
