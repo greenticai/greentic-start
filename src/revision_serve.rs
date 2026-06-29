@@ -1861,11 +1861,24 @@ async fn dispatch_provider_route(
         Err(response) => return Err(response),
     };
 
-    // Second half of the `defer_pin` two-phase write (A1 follow-up): the
-    // request just cleared the auth gate above, so it is now safe to pin the
-    // body-derived chat hint to the dispatched revision. A forged body that
-    // fails auth returns `Err` before reaching here and never seeds the store.
-    // No-op when there is no hint (e.g. an endpoint with no extractable chat id).
+    // Second half of the `defer_pin` two-phase write (A1 follow-up): commit the
+    // body-derived chat-stickiness pin now that the host gate above has admitted
+    // the request (a rejected request returns `Err` above and never pins).
+    //
+    // Trust boundary: the gate only *verifies* the body for providers with a
+    // host-side authenticator — today Telegram endpoints carrying a
+    // `webhook_secret_ref`, i.e. the `Authenticated` outcome. A `Skipped`
+    // outcome means the host had nothing to check the body against: either the
+    // provider verifies inside its own component (e.g. Slack signature), which
+    // runs *after* this point, or the endpoint is a legacy no-secret one. Those
+    // still pin here — unchanged from A1, which pinned them inline during
+    // dispatch — so the pin can precede (delegated) or lack (legacy)
+    // verification. Impact stays low: same-bundle version routing only,
+    // `try_pin` cannot overwrite an existing pin, and the store caps + TTL bound
+    // cardinality. Fully gating the delegated case would need the component to
+    // report its verification result back to the host (tracked separately).
+    //
+    // No-op when there is no hint (endpoint with no extractable chat id).
     if let Some(hint) = session_hint {
         activation
             .routing
