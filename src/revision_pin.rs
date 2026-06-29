@@ -340,6 +340,26 @@ pub(crate) fn redis_url_from_raw(raw: Option<String>) -> Option<String> {
     raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// Mask the `user:pass@` userinfo of a Redis URL so a credential in the
+/// connection string can never reach a log line or error context. A Redis
+/// URL embeds its password inline (`redis://:pass@host`), and `from_url`
+/// formats the URL into its error context on failure, so an operator log of
+/// that error would otherwise leak the password. Operates on the raw string:
+/// a value that lacks a `://` scheme (i.e. failed to parse as a URL) is
+/// returned fully masked rather than echoing possibly-secret bytes.
+pub(crate) fn redact_redis_url(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return "<redacted redis url>".to_string();
+    };
+    // `rsplit_once` splits at the last `@`, so a literal `@` inside the
+    // password (which a well-formed URL percent-encodes anyway) still masks
+    // the whole userinfo rather than leaking its tail.
+    match rest.rsplit_once('@') {
+        Some((_userinfo, host_part)) => format!("{scheme}://****@{host_part}"),
+        None => format!("{scheme}://{rest}"),
+    }
+}
+
 pub struct RedisPinStore {
     /// `ConnectionManager` is `Clone` and internally pipelines/multiplexes
     /// commands across a shared connection, so we hold it bare — no Mutex
@@ -364,7 +384,7 @@ impl RedisPinStore {
     /// build a [`ConnectionManager`] that handles reconnection transparently.
     pub async fn from_url(url: impl AsRef<str>) -> Result<Self> {
         let client = redis::Client::open(url.as_ref())
-            .with_context(|| format!("invalid redis url `{}`", url.as_ref()))?;
+            .with_context(|| format!("invalid redis url `{}`", redact_redis_url(url.as_ref())))?;
         let manager = ConnectionManager::new(client)
             .await
             .context("redis ConnectionManager init failed")?;
@@ -620,6 +640,26 @@ mod tests {
             redis_url_from_raw(Some("  redis://127.0.0.1:6379/0  ".to_string())),
             Some("redis://127.0.0.1:6379/0".to_string()),
         );
+    }
+
+    #[test]
+    fn redact_redis_url_masks_inline_credentials() {
+        // Password-only and user:pass userinfo are both masked whole.
+        assert_eq!(
+            redact_redis_url("redis://:s3cr3t@cache.internal:6379/0"),
+            "redis://****@cache.internal:6379/0",
+        );
+        assert_eq!(
+            redact_redis_url("rediss://admin:p@ss@cache:6380"),
+            "rediss://****@cache:6380",
+        );
+        // No userinfo: nothing secret to mask, returned intact.
+        assert_eq!(
+            redact_redis_url("redis://127.0.0.1:6379/0"),
+            "redis://127.0.0.1:6379/0",
+        );
+        // Unparseable (no scheme) is fully masked, never echoed.
+        assert_eq!(redact_redis_url(":s3cr3t@host"), "<redacted redis url>");
     }
 
     #[tokio::test]
