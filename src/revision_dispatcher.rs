@@ -244,9 +244,19 @@ impl RevisionDispatcher {
     /// duplicate revision id, weights sum to 10,000). We do not re-validate
     /// here — the boundary between B0 and B1 is internal. `apply_traffic_split`
     /// is the public mutation entry point and *does* re-validate.
+    ///
+    /// `pin_store` is supplied by the caller rather than constructed here so a
+    /// single store instance survives across hot-reloads: every reload rebuilds
+    /// a fresh dispatcher, but the boot path threads the SAME `Arc` through each
+    /// rebuild (see [`crate::revision_boot::activate_runtime_config`]). Without
+    /// this, a pure traffic reweight — which goes through reload, not
+    /// [`apply_traffic_split`](Self::apply_traffic_split) — would drop every
+    /// in-process session pin, defeating sticky routing for messaging
+    /// connectors that have no cookie to re-anchor.
     pub(crate) fn from_runtime_config(
         cfg: RevisionDispatcherConfig,
         rc: &LoadedRuntimeConfig,
+        pin_store: Arc<dyn RevisionPinStore>,
     ) -> anyhow::Result<Self> {
         let mut deployments: HashMap<DeploymentId, DeploymentEntry> = HashMap::new();
         for block in &rc.revisions {
@@ -268,7 +278,7 @@ impl RevisionDispatcher {
                     draining: HashSet::new(),
                 });
         }
-        let dispatcher = Self::new(cfg);
+        let dispatcher = Self::with_pin_store(cfg, pin_store);
         dispatcher
             .snapshot
             .store(std::sync::Arc::new(Snapshot { deployments }));
@@ -354,7 +364,7 @@ impl RevisionDispatcher {
     /// invalidate cookies signed before the removal: the re-added dispatcher
     /// is constructed fresh at generation 0, but the watermark still
     /// remembers its previous generation and forces a strict bump on top of
-    /// it. See [`Self::bump_generations_from_watermark`].
+    /// it. See [`Self::reanchor_generations`].
     pub(crate) fn absorb_into_watermark(
         &self,
         watermark: &mut std::collections::HashMap<DeploymentId, u64>,
@@ -366,30 +376,58 @@ impl RevisionDispatcher {
         }
     }
 
-    /// Bump each of this dispatcher's deployments whose id appears in the
-    /// `watermark` map: set its generation to `watermark[id] + 1` so that any
-    /// stickiness cookie or pin signed at the watermark's value (or below)
-    /// is rejected by [`Self::verify_cookie`] / pin `lookup` under the new
-    /// dispatcher's `expected_generation`.
+    /// The set of revisions currently taking traffic (`weight_bps > 0`) per
+    /// deployment. The reload path diffs this between the OLD and NEW
+    /// dispatchers to decide which deployments may carry their generation
+    /// forward (see [`Self::reanchor_generations`]); a revision at weight 0 is
+    /// excluded because [`has_revision`] refuses to route to it, so a pin to it
+    /// would flap exactly like a pin to a removed revision.
+    pub(crate) fn routable_revisions(
+        &self,
+    ) -> std::collections::HashMap<DeploymentId, HashSet<RevisionId>> {
+        let snap = self.snapshot.load();
+        snap.deployments
+            .iter()
+            .map(|(dep_id, entry)| {
+                let routable = entry
+                    .revisions
+                    .iter()
+                    .filter(|r| r.weight_bps > 0)
+                    .map(|r| r.revision_id)
+                    .collect();
+                (*dep_id, routable)
+            })
+            .collect()
+    }
+
+    /// Re-anchor each of this dispatcher's deployments against a server-level
+    /// generation high-`watermark`, BUMPING by default but CARRYING THE
+    /// GENERATION FORWARD for any deployment in `preserve`.
     ///
-    /// Called from the hot-reload path
-    /// ([`crate::revision_serve::RevisionServer::reload`]) after a new
-    /// dispatcher is built from a fresh runtime-config but BEFORE that
-    /// dispatcher is published to the live ingress slot. Deployments that
-    /// are NOT in the watermark (i.e. this server has never seen that id
-    /// before) keep the generation `from_runtime_config` assigned —
-    /// no client could be holding a cookie/pin for them yet.
+    /// A bump (`watermark[id] + 1`) makes every stickiness cookie or pin signed
+    /// at the watermark's value (or below) fail [`Self::verify_cookie`] / pin
+    /// `lookup` under the new dispatcher's `expected_generation`, forcing a
+    /// re-pick. Carrying forward (`= watermark[id]`) leaves those cookies/pins
+    /// valid so a session stays on its revision across the reload.
     ///
-    /// Bumps **unconditionally** for every deployment present in both this
-    /// dispatcher and the watermark, regardless of whether weights or
-    /// revisions actually differ: a reload is a deliberate operator action
-    /// and existing cookies/pins must yield to the new traffic split.
-    /// Distinguishing "identical config" from "changed config" is the
-    /// N2.2 watcher's job (hash-skip before invoking reload at all);
-    /// correctness of the swap primitive does not depend on it.
-    pub(crate) fn bump_generations_from_watermark(
+    /// `preserve` is computed by the caller
+    /// ([`crate::revision_serve::RevisionServer::reload`]) as the deployments
+    /// whose routable revision set was fully retained (a pure reweight or a
+    /// canary *addition* — every revision that was taking traffic still is).
+    /// B1: those keep their sessions sticky. Everything else bumps — a removed
+    /// or ramped-to-zero revision would otherwise leave its pins flapping, and
+    /// a deployment re-added after removal must land strictly above its
+    /// tombstoned generation (it is absent from the OLD dispatcher, so the
+    /// caller never places it in `preserve`).
+    ///
+    /// Deployments NOT in the watermark (never seen by this server) keep the
+    /// generation `from_runtime_config` assigned — no client holds a cookie/pin
+    /// for them yet. Called after the new dispatcher is built but BEFORE it is
+    /// published to the live ingress slot.
+    pub(crate) fn reanchor_generations(
         &self,
         watermark: &std::collections::HashMap<DeploymentId, u64>,
+        preserve: &HashSet<DeploymentId>,
     ) {
         // Defensive against a concurrent `apply_traffic_split`, even though
         // the canonical call site fires before `self` is published to the
@@ -400,7 +438,11 @@ impl RevisionDispatcher {
         let mut next = (*cur).clone();
         for (dep_id, entry) in next.deployments.iter_mut() {
             if let Some(&high) = watermark.get(dep_id) {
-                entry.generation = high.saturating_add(1);
+                entry.generation = if preserve.contains(dep_id) {
+                    high
+                } else {
+                    high.saturating_add(1)
+                };
             }
         }
         self.snapshot.store(std::sync::Arc::new(next));
@@ -1029,9 +1071,73 @@ mod tests {
                 },
             ],
         };
-        let d = RevisionDispatcher::from_runtime_config(cfg("local"), &rc).unwrap();
+        let d = RevisionDispatcher::from_runtime_config(
+            cfg("local"),
+            &rc,
+            Arc::new(InMemoryPinStore::new()),
+        )
+        .unwrap();
         assert_eq!(d.deployment_count(), 2);
         assert_eq!(d.revision_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn from_runtime_config_uses_provided_pin_store() {
+        // B1a: from_runtime_config must build the dispatcher on the SUPPLIED
+        // store, not a fresh one — so two dispatchers built from the same store
+        // (the boot path's reuse across reloads) share session pins. Pin via
+        // the first, resolve via the second.
+        let dep1 = Ulid::new();
+        let r1 = Ulid::new();
+        let r2 = Ulid::new();
+        let rc = LoadedRuntimeConfig {
+            env_id: "local".into(),
+            revisions: vec![
+                ResolvedRevisionBlock {
+                    deployment_id: dep1.to_string(),
+                    revision_id: r1.to_string(),
+                    bundle_id: "a".into(),
+                    pack_list_refs: vec![PathBuf::new()],
+                    pack_config_refs: vec![],
+                    weight_bps: 5000,
+                },
+                ResolvedRevisionBlock {
+                    deployment_id: dep1.to_string(),
+                    revision_id: r2.to_string(),
+                    bundle_id: "a".into(),
+                    pack_list_refs: vec![PathBuf::new()],
+                    pack_config_refs: vec![],
+                    weight_bps: 5000,
+                },
+            ],
+        };
+        let store: Arc<dyn RevisionPinStore> = Arc::new(InMemoryPinStore::new());
+        let d1 =
+            RevisionDispatcher::from_runtime_config(cfg("local"), &rc, Arc::clone(&store)).unwrap();
+        let d2 =
+            RevisionDispatcher::from_runtime_config(cfg("local"), &rc, Arc::clone(&store)).unwrap();
+
+        let dep_id = DeploymentId(dep1);
+        let req = DispatchRequest {
+            env_id: "local",
+            tenant: "t",
+            deployment_id: dep_id,
+            session_hint: Some("sess-shared"),
+            defer_pin: false,
+            trusted: false,
+            header_revision: None,
+            cookie: None,
+        };
+        let mut rng = StdRng::seed_from_u64(7);
+        let first = d1.dispatch(&req, &mut rng).await.unwrap();
+        assert_eq!(first.reason, SelectionReason::Weighted);
+
+        // d2 shares d1's store, so the SAME hint resolves to a pin (both built
+        // at from_runtime_config's generation 0) on the same revision.
+        let mut rng = StdRng::seed_from_u64(99);
+        let second = d2.dispatch(&req, &mut rng).await.unwrap();
+        assert_eq!(second.reason, SelectionReason::Pin);
+        assert_eq!(second.revision_id, first.revision_id);
     }
 
     #[test]
@@ -1044,7 +1150,12 @@ mod tests {
             env_id: "local".into(),
             revisions: Vec::new(),
         };
-        let d = RevisionDispatcher::from_runtime_config(cfg("local"), &rc).unwrap();
+        let d = RevisionDispatcher::from_runtime_config(
+            cfg("local"),
+            &rc,
+            Arc::new(InMemoryPinStore::new()),
+        )
+        .unwrap();
         assert_eq!(d.deployment_count(), 0);
         assert_eq!(d.revision_count(), 0);
     }
@@ -1062,7 +1173,12 @@ mod tests {
                 weight_bps: 10_000,
             }],
         };
-        let err = RevisionDispatcher::from_runtime_config(cfg("local"), &rc).unwrap_err();
+        let err = RevisionDispatcher::from_runtime_config(
+            cfg("local"),
+            &rc,
+            Arc::new(InMemoryPinStore::new()),
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("invalid deployment_id"), "{msg}");
     }
@@ -1411,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn bump_generations_from_watermark_only_touches_deployments_in_the_map() {
+    fn reanchor_generations_only_touches_deployments_in_the_map() {
         let dep1 = dep();
         let dep2 = dep();
         let r1 = rev();
@@ -1424,10 +1540,11 @@ mod tests {
 
         // Watermark knows only `dep1`. `dep2` is fresh and must be left
         // alone so cookies on a never-before-seen deployment id stay at
-        // the constructed generation.
+        // the constructed generation. Empty `preserve` → bump every watermark
+        // deployment (the pre-B1 unconditional behaviour).
         let mut watermark = std::collections::HashMap::new();
         watermark.insert(dep1, 4);
-        d.bump_generations_from_watermark(&watermark);
+        d.reanchor_generations(&watermark, &HashSet::new());
 
         // dep1: 4 + 1 = 5.
         assert_eq!(
@@ -1450,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn bump_generations_from_watermark_is_a_noop_for_disjoint_deployments() {
+    fn reanchor_generations_is_a_noop_for_disjoint_deployments() {
         // The cold-start case: server's watermark is empty, so the new
         // dispatcher's generations must be untouched.
         let dep1 = dep();
@@ -1466,7 +1583,7 @@ mod tests {
             .get(&dep1)
             .map(|e| e.generation)
             .unwrap();
-        d.bump_generations_from_watermark(&watermark);
+        d.reanchor_generations(&watermark, &HashSet::new());
         let gen_after = d
             .snapshot
             .load()
@@ -1475,6 +1592,48 @@ mod tests {
             .map(|e| e.generation)
             .unwrap();
         assert_eq!(gen_before, gen_after);
+    }
+
+    #[test]
+    fn reanchor_generations_carries_preserved_deployments_forward() {
+        // B1: a deployment in `preserve` keeps its watermark generation (NOT
+        // +1) so cookies/pins minted at that generation still verify after the
+        // reload; a deployment NOT in `preserve` bumps.
+        let preserved = dep();
+        let bumped = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = RevisionDispatcher::new(cfg("local"));
+        d.apply_traffic_split(preserved, vec![entry(r1, 10_000)], bundle(), 0)
+            .unwrap();
+        d.apply_traffic_split(bumped, vec![entry(r2, 10_000)], bundle(), 0)
+            .unwrap();
+
+        let mut watermark = std::collections::HashMap::new();
+        watermark.insert(preserved, 4);
+        watermark.insert(bumped, 4);
+        let mut preserve = HashSet::new();
+        preserve.insert(preserved);
+        d.reanchor_generations(&watermark, &preserve);
+
+        // preserved: carried forward to the watermark value (4), not bumped.
+        assert_eq!(
+            d.snapshot
+                .load()
+                .deployments
+                .get(&preserved)
+                .map(|e| e.generation),
+            Some(4)
+        );
+        // bumped: watermark + 1 = 5.
+        assert_eq!(
+            d.snapshot
+                .load()
+                .deployments
+                .get(&bumped)
+                .map(|e| e.generation),
+            Some(5)
+        );
     }
 
     #[tokio::test]

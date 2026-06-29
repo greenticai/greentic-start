@@ -166,6 +166,33 @@ fn removed_revisions(prev: &RevisionDispatcher, next: &RevisionDispatcher) -> Ve
         .collect()
 }
 
+/// Deployments whose session stickiness must survive the reload — every
+/// revision that was taking traffic in `prev` is still taking traffic in
+/// `next`. B1: a pure traffic reweight or a canary *addition* (the old
+/// revision stays routable, a new one joins) keeps existing sessions pinned;
+/// [`RevisionServer::reload`] hands this set to
+/// [`RevisionDispatcher::reanchor_generations`] so those deployments carry
+/// their generation forward instead of bumping.
+///
+/// A deployment is preserved only if it was present in `prev` AND
+/// `routable(prev) ⊆ routable(next)`. This excludes, by construction:
+/// a revision removed or ramped to weight 0 (its pins would flap → must bump),
+/// and a deployment re-added after removal (absent from `prev`, so its pre-
+/// removal cookies/pins must be tombstoned by a bump, not honored).
+fn deployments_preserving_stickiness(
+    prev: &RevisionDispatcher,
+    next: &RevisionDispatcher,
+) -> std::collections::HashSet<DeploymentId> {
+    let next_routable = next.routable_revisions();
+    prev.routable_revisions()
+        .into_iter()
+        .filter_map(|(deployment_id, prev_set)| {
+            let next_set = next_routable.get(&deployment_id)?;
+            prev_set.is_subset(next_set).then_some(deployment_id)
+        })
+        .collect()
+}
+
 /// Liveness probe handed to each drain coordinator so it can suppress a
 /// stale `RevisionEvicted` event when the revision it's draining is rolled
 /// back / re-added into a newer activation before the drain window elapses.
@@ -300,7 +327,7 @@ pub(crate) struct RevisionServer {
     /// same runtime that built them.
     runtime_handle: Handle,
     /// Serializes [`reload`](Self::reload) calls. Without it the
-    /// `load_full(prev) → bump_generations → swap(new)` sequence is not
+    /// `load_full(prev) → reanchor_generations → swap(new)` sequence is not
     /// atomic across concurrent producers: two reloads can both observe
     /// the same prev, both bump generations from it, then both swap — the
     /// second reload's generation bump is lost relative to the first's
@@ -544,23 +571,26 @@ impl RevisionServer {
     /// activation immediately (only safe in tests, where the producer
     /// controls request scheduling).
     ///
-    /// Per-deployment dispatcher generations are bumped against a
+    /// Per-deployment dispatcher generations are re-anchored against a
     /// server-level high-watermark BEFORE the swap (see
-    /// [`crate::revision_dispatcher::RevisionDispatcher::bump_generations_from_watermark`]
-    /// and [`Self::generation_watermark`]) so any stickiness cookie or
-    /// session pin minted against an earlier activation is invalidated and
-    /// the next request re-picks under the new traffic split. The
-    /// watermark tracks every deployment id this server has ever seen,
-    /// including ones that have been removed and re-added — so a
-    /// remove → re-add rollback within cookie/pin TTL doesn't leak
-    /// stickiness from before the removal.
+    /// [`crate::revision_dispatcher::RevisionDispatcher::reanchor_generations`]
+    /// and [`Self::generation_watermark`]). A deployment whose routable
+    /// revision set was fully retained — a pure reweight or a canary addition,
+    /// per [`deployments_preserving_stickiness`] — carries its generation
+    /// FORWARD so existing cookies/pins stay valid and sessions stay sticky
+    /// (B1). Every other deployment bumps, invalidating its stickiness so the
+    /// next request re-picks: a removed or ramped-to-zero revision (whose pins
+    /// would otherwise flap) and a re-added deployment alike. The watermark
+    /// tracks every deployment id this server has ever seen, including ones
+    /// removed and re-added — so a remove → re-add rollback within cookie/pin
+    /// TTL doesn't leak stickiness from before the removal.
     ///
     /// Holds the [`reload_lock`](Self::reload_lock) for the whole sequence
     /// so concurrent producers (file-watcher + admin signal) cannot race
-    /// the `load_full(prev) → bump_generations → swap(new)` steps and
+    /// the `load_full(prev) → reanchor_generations → swap(new)` steps and
     /// lose a generation bump.
     pub(crate) fn reload(&self, new: Activation, drain_window: Duration) -> ReloadReport {
-        // Serialize concurrent reloads so the load_full + bump_generations
+        // Serialize concurrent reloads so the load_full + reanchor_generations
         // + swap sequence is atomic relative to other producers. See the
         // field doc on `reload_lock`.
         let _reload_guard = self.reload_lock.lock().expect("reload lock poisoned");
@@ -582,12 +612,21 @@ impl RevisionServer {
             !Arc::ptr_eq(&prev.routing.dispatcher, &new_arc.routing.dispatcher),
             "reload must build a fresh dispatcher Arc (SlotLivenessProbe ptr_eq guard depends on it)"
         );
-        // Update the generation watermark and bump the new dispatcher off
-        // it. Absorbing prev → bump new → absorb new keeps the watermark
+        // Deployments whose routable revision set was fully retained from prev
+        // to new — these carry their generation forward (sticky sessions
+        // survive a reweight / canary addition); everything else bumps. Must
+        // run against `prev` while it is still the snapshot served until now.
+        let preserve = deployments_preserving_stickiness(
+            &prev.routing.dispatcher,
+            &new_arc.routing.dispatcher,
+        );
+        // Update the generation watermark and re-anchor the new dispatcher off
+        // it. Absorbing prev → reanchor new → absorb new keeps the watermark
         // strictly monotonic across every deployment id we've ever served
-        // (including ids that have been removed), so a re-introduced id
-        // always lands at a generation strictly greater than any cookie/pin
-        // could still be holding.
+        // (including ids that have been removed), so a re-introduced id always
+        // lands at a generation strictly greater than any cookie/pin could
+        // still be holding. Preserved deployments carry forward to (not past)
+        // the watermark, leaving their existing cookies/pins valid.
         {
             let mut watermark = self
                 .generation_watermark
@@ -599,7 +638,7 @@ impl RevisionServer {
             new_arc
                 .routing
                 .dispatcher
-                .bump_generations_from_watermark(&watermark);
+                .reanchor_generations(&watermark, &preserve);
             new_arc
                 .routing
                 .dispatcher
@@ -4163,37 +4202,63 @@ mod tests {
     /// Build an [`Activation`] with a single deployment + revision, both
     /// taken as parameters so two activations can share IDs across a reload.
     /// The dispatcher carries the deployment at generation 1 (whatever
-    /// `apply_traffic_split(.., expected_generation=0)` yields).
+    /// `apply_traffic_split(.., expected_generation=0)` yields) on a fresh,
+    /// unshared pin store. Thin wrapper over [`activation_split_sharing_store`].
     fn activation_with_ids(
         env_id: &str,
         deployment_id: greentic_deploy_spec::ids::DeploymentId,
         revision_id: greentic_deploy_spec::ids::RevisionId,
         bundle_id: greentic_deploy_spec::ids::BundleId,
     ) -> Activation {
+        activation_split_sharing_store(
+            env_id,
+            deployment_id,
+            &[(revision_id, 10_000)],
+            bundle_id,
+            std::sync::Arc::new(crate::revision_pin::InMemoryPinStore::new()),
+        )
+    }
+
+    /// Build an [`Activation`] with a caller-chosen revision split and a
+    /// caller-supplied pin store, so two activations across a reload can reuse
+    /// one store (mirroring the B1a boot wiring). Weights must sum to 10,000.
+    fn activation_split_sharing_store(
+        env_id: &str,
+        deployment_id: greentic_deploy_spec::ids::DeploymentId,
+        revisions: &[(greentic_deploy_spec::ids::RevisionId, u32)],
+        bundle_id: greentic_deploy_spec::ids::BundleId,
+        pin_store: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore>,
+    ) -> Activation {
         use crate::revision_dispatcher::{
             RevisionDispatcher, RevisionDispatcherConfig, RevisionEntry,
         };
         let base = empty_activation(env_id);
-        let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new(env_id, [0u8; 32]));
-        let revisions = vec![RevisionEntry {
-            revision_id,
-            bundle_id: bundle_id.clone(),
-            weight_bps: 10_000,
-        }];
+        let dispatcher = RevisionDispatcher::with_pin_store(
+            RevisionDispatcherConfig::new(env_id, [0u8; 32]),
+            pin_store,
+        );
+        let entries = revisions
+            .iter()
+            .map(|(revision_id, weight_bps)| RevisionEntry {
+                revision_id: *revision_id,
+                bundle_id: bundle_id.clone(),
+                weight_bps: *weight_bps,
+            })
+            .collect();
         dispatcher
-            .apply_traffic_split(deployment_id, revisions, bundle_id, 0)
-            .expect("apply_traffic_split for shared-deployment activation");
+            .apply_traffic_split(deployment_id, entries, bundle_id, 0)
+            .expect("apply_traffic_split for shared-store activation");
         activation_for_test(base.host, dispatcher)
     }
 
     #[tokio::test]
-    async fn reload_invalidates_pre_reload_cookie_for_persisted_deployment() {
-        // Regression test for the Codex finding on PR-N2.1: without the
-        // generation bump in reload(), a fresh dispatcher built from the
-        // same runtime-config would carry the same `apply_traffic_split`-
-        // from-zero default generation (1), and a cookie minted pre-reload
-        // would still verify post-reload — defeating canary weight cuts
-        // and partial rollbacks for already-cookie'd clients.
+    async fn reload_preserves_pre_reload_cookie_for_unchanged_routable_set() {
+        // B1: a reload that retains the deployment's routable revision set
+        // (here: the same single revision, the pure-reweight shape) must CARRY
+        // the generation FORWARD, so a stickiness cookie minted before the
+        // reload still verifies after it and the session stays on its revision.
+        // (Before B1 this bumped the generation and invalidated the cookie —
+        // which flapped sticky sessions on every canary weight nudge.)
         let env_id = "env-1";
         let tenant = "tenant-a";
         let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
@@ -4226,38 +4291,28 @@ mod tests {
             /* generation */ 1,
             /* expires_at */ 9_999_999_999,
         );
-        // Sanity: the cookie verifies against the pre-reload dispatcher at
-        // generation 1, the value `apply_traffic_split(.., 0)` produces.
-        assert_eq!(
-            act1_snap
-                .routing
-                .dispatcher
-                .verify_cookie(&cookie, env_id, tenant, dep_id, 1, 0),
-            Some(rev_id),
-            "pre-reload dispatcher must verify its own cookie"
-        );
 
         // Reload to a new activation that re-uses the SAME deployment + bundle
-        // + revision (only the dispatcher object is fresh). Carry-forward must
-        // bump the new dispatcher's generation so the cookie sealed under
-        // generation 1 no longer verifies.
+        // + revision (only the dispatcher object is fresh). The routable set is
+        // unchanged, so reanchor carries the generation forward to 1 (NOT 2):
+        // the cookie sealed under generation 1 must still verify.
         let act2 = activation_with_ids(env_id, dep_id, rev_id, bundle_id);
         server.reload(act2, Duration::ZERO);
 
         let act2_snap = state.current();
-        // The cookie's `g` is still 1, but the live dispatcher's expected
-        // generation is now 2 (1 + 1 from the watermark bump) → mismatch → None.
+        // Live generation is still 1 (carried forward) → the pre-reload cookie
+        // verifies, proving sticky sessions survive a pure reweight.
         assert_eq!(
             act2_snap
                 .routing
                 .dispatcher
-                .verify_cookie(&cookie, env_id, tenant, dep_id, 2, 0),
-            None,
-            "post-reload dispatcher must reject the pre-reload cookie"
+                .verify_cookie(&cookie, env_id, tenant, dep_id, 1, 0),
+            Some(rev_id),
+            "post-reload dispatcher must still honor the pre-reload cookie"
         );
-        // And the post-reload cookie minted against `act2`'s actual generation
-        // (2) does verify, proving the carry-forward landed at 2 specifically.
-        let post_cookie = act2_snap.routing.dispatcher.seal_cookie(
+        // And a cookie sealed at generation 2 must NOT verify — proving the
+        // carry-forward landed at 1 specifically, not a silent over-bump.
+        let bumped_cookie = act2_snap.routing.dispatcher.seal_cookie(
             env_id,
             tenant,
             dep_id,
@@ -4266,12 +4321,166 @@ mod tests {
             9_999_999_999,
         );
         assert_eq!(
+            act2_snap.routing.dispatcher.verify_cookie(
+                &bumped_cookie,
+                env_id,
+                tenant,
+                dep_id,
+                1,
+                0
+            ),
+            None,
+            "live generation must be 1 (carried forward), so a gen-2 cookie is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_keeps_session_pin_across_reweight() {
+        // B1a + B1b end-to-end. A messaging connector holds NO cookie, so a
+        // session pin is the only thing keeping its conversation on one
+        // revision. Establish a pin, reweight (same routable set), and the pin
+        // must still resolve — proving the shared store survived the dispatcher
+        // rebuild (B1a) AND the generation was carried forward (B1b).
+        use crate::revision_dispatcher::SelectionReason;
+        let env_id = "env-1";
+        let tenant = "t";
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let r1 = greentic_deploy_spec::ids::RevisionId::new();
+        let r2 = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("customer.support");
+        let store: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore> =
+            std::sync::Arc::new(crate::revision_pin::InMemoryPinStore::new());
+
+        let act1 = activation_split_sharing_store(
+            env_id,
+            dep_id,
+            &[(r1, 5000), (r2, 5000)],
+            bundle_id.clone(),
+            std::sync::Arc::clone(&store),
+        );
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(act1)),
+            bound_addr: bound,
+            gui_enabled: false,
+        });
+        let server = server_for_test(std::sync::Arc::clone(&state));
+
+        // First dispatch: weighted pick, writes the pin inline (defer_pin =
+        // false → trusted/loopback-style traffic).
+        let hint = "chat-42";
+        let req = DispatchRequest {
+            env_id,
+            tenant,
+            deployment_id: dep_id,
+            session_hint: Some(hint),
+            defer_pin: false,
+            trusted: false,
+            header_revision: None,
+            cookie: None,
+        };
+        let mut rng: rand::rngs::SmallRng = rand::make_rng();
+        let first = state
+            .current()
+            .routing
+            .dispatcher
+            .dispatch(&req, &mut rng)
+            .await
+            .unwrap();
+        assert_eq!(first.reason, SelectionReason::Weighted);
+        let pinned = first.revision_id;
+
+        // Reweight to a different split over the SAME routable set, sharing the
+        // store. Generation carries forward; the pin persists.
+        let act2 = activation_split_sharing_store(
+            env_id,
+            dep_id,
+            &[(r1, 9000), (r2, 1000)],
+            bundle_id,
+            std::sync::Arc::clone(&store),
+        );
+        server.reload(act2, Duration::ZERO);
+
+        // Second dispatch after the reweight: must hit the pin and land on the
+        // same revision the first request picked.
+        let mut rng: rand::rngs::SmallRng = rand::make_rng();
+        let second = state
+            .current()
+            .routing
+            .dispatcher
+            .dispatch(&req, &mut rng)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.reason,
+            SelectionReason::Pin,
+            "the pre-reweight pin must survive the reload"
+        );
+        assert_eq!(
+            second.revision_id, pinned,
+            "the surviving pin must resolve to the originally-pinned revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_bumps_generation_when_routable_revision_removed() {
+        // The bump branch: dropping a routable revision (promote r2 to 100%,
+        // r1 gone) must invalidate stickiness anchored at the old generation —
+        // a cookie pinned to the vanished r1 must NOT verify, so its holder
+        // re-picks instead of flapping on a revision that no longer routes.
+        let env_id = "env-1";
+        let tenant = "tenant-a";
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let r1 = greentic_deploy_spec::ids::RevisionId::new();
+        let r2 = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("customer.support");
+        let throwaway: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore> =
+            std::sync::Arc::new(crate::revision_pin::InMemoryPinStore::new());
+
+        let act1 = activation_split_sharing_store(
+            env_id,
+            dep_id,
+            &[(r1, 5000), (r2, 5000)],
+            bundle_id.clone(),
+            std::sync::Arc::clone(&throwaway),
+        );
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(act1)),
+            bound_addr: bound,
+            gui_enabled: false,
+        });
+        let server = server_for_test(std::sync::Arc::clone(&state));
+
+        // Cookie pinned to r1 at the pre-reload generation (1).
+        let cookie = state.current().routing.dispatcher.seal_cookie(
+            env_id,
+            tenant,
+            dep_id,
+            r1,
+            /* generation */ 1,
+            /* expires_at */ 9_999_999_999,
+        );
+
+        // Promote r2 to 100% — r1 leaves the routable set, so the deployment is
+        // NOT preserved and its generation bumps to 2.
+        let act2 = activation_split_sharing_store(
+            env_id,
+            dep_id,
+            &[(r2, 10_000)],
+            bundle_id,
+            std::sync::Arc::clone(&throwaway),
+        );
+        server.reload(act2, Duration::ZERO);
+
+        let act2_snap = state.current();
+        assert_eq!(
             act2_snap
                 .routing
                 .dispatcher
-                .verify_cookie(&post_cookie, env_id, tenant, dep_id, 2, 0),
-            Some(rev_id),
-            "post-reload dispatcher must verify a cookie minted at the new generation"
+                .verify_cookie(&cookie, env_id, tenant, dep_id, 2, 0),
+            None,
+            "a cookie pinned to the removed revision must not verify post-reload"
         );
     }
 

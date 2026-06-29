@@ -54,6 +54,7 @@ use crate::http_routes::{
     HttpRouteDescriptor, HttpRouteTable, RevisionScope, discover_revision_routes,
 };
 use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig, parse_ulid};
+use crate::revision_pin::RevisionPinStore;
 use crate::runtime_config::{LoadedRuntimeConfig, env_dir_in};
 use crate::secrets_gate::DynSecretsManager;
 
@@ -108,6 +109,7 @@ pub(crate) async fn activate_runtime_config(
     secrets_tenant_scope: Option<&str>,
     env: &Environment,
     runtime_ref_resolver: Arc<dyn RuntimeRefResolver>,
+    pin_store: Arc<dyn RevisionPinStore>,
 ) -> anyhow::Result<RuntimeConfigActivation> {
     // `env_dir_in` validates `rc.env_id` as a safe directory segment via
     // `EnvId::new`; no separate `EnvId::new` call is needed.
@@ -324,6 +326,7 @@ pub(crate) async fn activate_runtime_config(
     let dispatcher = RevisionDispatcher::from_runtime_config(
         RevisionDispatcherConfig::new(&rc.env_id, signing_key),
         rc,
+        pin_store,
     )
     .context("building revision dispatcher")?;
 
@@ -1059,6 +1062,10 @@ mod tests {
         ))
     }
 
+    fn dummy_pin_store() -> Arc<dyn RevisionPinStore> {
+        Arc::new(crate::revision_pin::InMemoryPinStore::new())
+    }
+
     #[test]
     fn activate_errors_when_env_id_does_not_match_runtime_config() {
         // The caller passes a pre-loaded Environment; activation must reject
@@ -1077,6 +1084,7 @@ mod tests {
             None,
             &mismatched,
             dummy_resolver(),
+            dummy_pin_store(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1102,6 +1110,7 @@ mod tests {
             None,
             &env,
             dummy_resolver(),
+            dummy_pin_store(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1133,6 +1142,7 @@ mod tests {
             None,
             &env,
             dummy_resolver(),
+            dummy_pin_store(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1162,6 +1172,7 @@ mod tests {
             None,
             &env,
             dummy_resolver(),
+            dummy_pin_store(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1194,6 +1205,7 @@ mod tests {
             None,
             &env,
             dummy_resolver(),
+            dummy_pin_store(),
         )) {
             Ok(_) => panic!("expected activation to fail at pack reading"),
             Err(e) => e,
@@ -1228,6 +1240,7 @@ mod tests {
             None,
             &env,
             dummy_resolver(),
+            dummy_pin_store(),
         ))
         .expect("empty rc activates");
         assert_eq!(activation.routing.dispatcher.deployment_count(), 0);
@@ -1276,6 +1289,7 @@ mod tests {
             Some("acme"),
             &env,
             dummy_resolver(),
+            dummy_pin_store(),
         )) {
             Ok(_) => panic!("expected activation to fail closed on a foreign tenant"),
             Err(e) => e,
@@ -1310,6 +1324,7 @@ mod tests {
             Some("acme"),
             &env,
             dummy_resolver(),
+            dummy_pin_store(),
         )) {
             Ok(_) => panic!("expected activation to pass the scope guard and reach pack reading"),
             Err(e) => e,
