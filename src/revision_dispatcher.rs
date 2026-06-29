@@ -776,28 +776,33 @@ impl RevisionDispatcher {
         if !has_revision(entry, revision) || entry.draining.contains(&revision) {
             return;
         }
-        let key = PinKey {
-            env_id: self.env_id.as_str(),
-            deployment_id,
-            tenant,
-            hint,
-        };
+        let key = self.pin_key_raw(self.env_id.as_str(), deployment_id, tenant, hint);
         let _ = self
             .pin_store
             .try_pin(key, revision, entry.generation, self.pin_ttl)
             .await;
     }
 
-    /// Build a borrowed [`PinKey`] from a dispatch request + the resolved
-    /// session hint. Centralizes the three borrow plumbings so the lookup
-    /// and try_pin sites can't drift on field order or selection.
-    fn pin_key<'a>(&self, req: &'a DispatchRequest<'_>, hint: &'a str) -> PinKey<'a> {
+    /// Single [`PinKey`] construction site so the lookup, try_pin, and
+    /// commit_pin call sites can't drift on field order or selection.
+    fn pin_key_raw<'a>(
+        &self,
+        env_id: &'a str,
+        deployment_id: DeploymentId,
+        tenant: &'a str,
+        hint: &'a str,
+    ) -> PinKey<'a> {
         PinKey {
-            env_id: req.env_id,
-            deployment_id: req.deployment_id,
-            tenant: req.tenant,
+            env_id,
+            deployment_id,
+            tenant,
             hint,
         }
+    }
+
+    /// Borrow a [`PinKey`] from a dispatch request + the resolved session hint.
+    fn pin_key<'a>(&self, req: &'a DispatchRequest<'_>, hint: &'a str) -> PinKey<'a> {
+        self.pin_key_raw(req.env_id, req.deployment_id, req.tenant, hint)
     }
 
     fn build_set_cookie(
