@@ -3,6 +3,15 @@
 //! The hint only needs to be stable per conversation and chat/channel granular;
 //! it need NOT equal the session_id the provider component later derives.
 //! Returns `None` for unknown providers or unparseable input.
+//!
+//! Altitude note (tech debt): this is host-side, provider-specific body parsing,
+//! which inverts the usual design where provider knowledge lives in the WASM
+//! provider components (`ingest_http`, `identify-instance`). It is a deliberate
+//! targeted fix so the deployed providers (Telegram, Slack) stop flapping across
+//! revisions; each new provider needs another arm here. The deeper fix is a
+//! revision-neutral WIT op — e.g. extend `identify-instance` to return an
+//! optional session-correlation key alongside the endpoint id — so the host
+//! stays generic and providers participate automatically.
 
 use serde_json::Value;
 
@@ -111,12 +120,14 @@ fn slack_channel_hint(channel: &str) -> Option<String> {
 }
 
 fn slack_hint(content_type: Option<&str>, body: &[u8]) -> Option<String> {
-    let is_form = content_type
-        .map(|ct| {
-            ct.to_ascii_lowercase()
-                .contains("application/x-www-form-urlencoded")
+    // Match the base media type only (ignoring any `; charset=…` parameters),
+    // case-insensitively, without allocating a lowercased copy.
+    let is_form = content_type.is_some_and(|ct| {
+        ct.split(';').next().is_some_and(|base| {
+            base.trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
         })
-        .unwrap_or(false);
+    });
 
     if is_form {
         slack_hint_form(body)
@@ -160,6 +171,9 @@ fn slack_hint_json(body: &[u8]) -> Option<String> {
 /// The `url` crate is not a dependency, so we do minimal manual key=value
 /// splitting with percent-decoding via the `urlencoding` crate (already a dep).
 /// The `payload` field's JSON is percent-decoded then parsed for `.channel.id`.
+/// `+`-as-space decoding is intentionally omitted: only Slack channel ids are
+/// read (`[A-Z][A-Z0-9]+`, no `+`/space), and Slack encodes payload JSON with
+/// `%20` rather than `+`.
 fn slack_hint_form(body: &[u8]) -> Option<String> {
     let body_str = std::str::from_utf8(body).ok()?;
     for pair in body_str.split('&') {
