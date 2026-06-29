@@ -892,6 +892,12 @@ async fn serve(
         tenant: &tenant,
         deployment_id,
         session_hint: session_hint.as_deref(),
+        // A1 derives this hint from the raw (not-yet-authenticated) provider
+        // body for non-loopback webhooks, so defer the pin write until the
+        // auth gate in `dispatch_provider_route` admits the request. Loopback /
+        // caller-asserted hints are trusted and pin inline. The pin LOOKUP is
+        // unaffected — a returning chat stays sticky either way.
+        defer_pin: !peer_is_loopback,
         // Public client traffic is never trusted: the header-pinned revision
         // override is a debug-only affordance.
         trusted: false,
@@ -948,6 +954,7 @@ async fn serve(
                 peer_is_loopback,
                 &identify_headers,
                 header_endpoint_id.as_deref(),
+                session_hint.as_deref(),
             )
             .await;
         }
@@ -1123,6 +1130,9 @@ async fn handle_worker_invoke(
         tenant: &tenant,
         deployment_id,
         session_hint: session_hint.as_deref(),
+        // Worker-invoke is loopback-gated (trusted caller), so the supplied
+        // session id pins inline like other caller-asserted hints.
+        defer_pin: false,
         trusted: false,
         header_revision: None,
         cookie: None,
@@ -1796,6 +1806,7 @@ async fn dispatch_provider_route(
     peer_is_loopback: bool,
     identify_headers: &[(String, String)],
     header_endpoint_id: Option<&str>,
+    session_hint: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
     let Some(route_match) = activation
         .routing
@@ -1849,6 +1860,19 @@ async fn dispatch_provider_route(
         Ok(provider_auth::AuthOutcome::Skipped) => None,
         Err(response) => return Err(response),
     };
+
+    // Second half of the `defer_pin` two-phase write (A1 follow-up): the
+    // request just cleared the auth gate above, so it is now safe to pin the
+    // body-derived chat hint to the dispatched revision. A forged body that
+    // fails auth returns `Err` before reaching here and never seeds the store.
+    // No-op when there is no hint (e.g. an endpoint with no extractable chat id).
+    if let Some(hint) = session_hint {
+        activation
+            .routing
+            .dispatcher
+            .commit_pin(tenant, deployment_id, hint, revision_id)
+            .await;
+    }
 
     // M1 IID.4 resolver + admit + welcome hint — shared with the generic-JSON
     // branch; see [`resolve_endpoint_for_scope`]. This is what makes the
