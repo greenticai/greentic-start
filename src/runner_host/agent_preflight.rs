@@ -65,8 +65,8 @@ impl MissingAgentRef {
     fn render(&self) -> String {
         format!(
             "agentic worker \"{}\" referenced by flow \"{}\" (node \"{}\") is not provided by this \
-             bundle — include the DwApplication pack that exports it (or define it in \
-             GREENTIC_AW_AGENTS_FILE), or remove the dw.agent node",
+             bundle — include the DwApplication pack, or declare it in the bundle's agent_packs \
+             mapping so it is auto-wired",
             self.agent_id, self.flow_id, self.node_id
         )
     }
@@ -378,6 +378,8 @@ mod tests {
         assert!(rendered.contains("demo_assistant"));
         assert!(rendered.contains("flowY"));
         assert!(rendered.contains("node1"));
+        assert!(rendered.contains("agent_packs"));
+        assert!(rendered.contains("auto-wired"));
     }
 
     #[test]
@@ -619,6 +621,14 @@ mod tests {
         assert!(message.contains("DW_AGENT_NOT_PROVIDED"), "got: {message}");
         assert!(message.contains("tavily_researcher"), "got: {message}");
         assert!(message.contains("on_message"), "got: {message}");
+        // SP2: the guard points operators at the bundle's agent_packs mapping.
+        assert!(
+            message.contains(
+                "include the DwApplication pack, or declare it in the bundle's agent_packs \
+                 mapping so it is auto-wired"
+            ),
+            "got: {message}"
+        );
     }
 
     #[test]
