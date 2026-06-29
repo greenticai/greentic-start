@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod agent_preflight;
 mod dispatch;
 mod dw_agents;
 mod helpers;
@@ -10,6 +11,9 @@ mod token_validation;
 mod types;
 
 pub use helpers::primary_provider_type;
+// Re-export the `dw.agent` pre-flight guard so the `gtc start` boot path
+// (`crate::runtime`) can call it before the HTTP ingress server serves.
+pub(crate) use agent_preflight::check_bundle_dw_agents;
 // RunnerExecutionMode is re-exported because it is a public field of FlowOutcome.
 #[allow(unused_imports)]
 pub use types::{FlowOutcome, OperatorContext, RunnerExecutionMode};
