@@ -100,6 +100,14 @@ pub struct DispatchRequest<'a> {
     pub tenant: &'a str,
     pub deployment_id: DeploymentId,
     pub session_hint: Option<&'a str>,
+    /// Defer the *pin write* to a post-verification [`RevisionDispatcher::commit_pin`]
+    /// call. When `true`, [`RevisionDispatcher::dispatch`] still *reads* an
+    /// existing pin (returning revisions stay sticky) but does NOT write a new
+    /// one — so an unverified request body cannot seed the pin store before the
+    /// provider auth gate runs. Set for non-loopback provider webhooks, whose
+    /// `session_hint` is derived from the raw (not-yet-authenticated) body;
+    /// loopback / caller-asserted traffic leaves it `false` and pins inline.
+    pub defer_pin: bool,
     /// `true` only for mTLS / authenticated admin / signed debug traffic. Public
     /// client traffic MUST set this to `false` — the header path is a debug
     /// affordance, not a public selector.
@@ -698,7 +706,11 @@ impl RevisionDispatcher {
             // this guard never fires. It's kept so that if the picker is
             // ever relaxed (e.g. draining-as-last-resort fallback), a fresh
             // session still won't be pinned to a doomed revision.
-            if entry.draining.contains(&selected) {
+            //
+            // `defer_pin`: the hint came from an unverified request body, so we
+            // route on `selected` but withhold the pin write — the caller binds
+            // it via `commit_pin` only after the provider auth gate succeeds.
+            if req.defer_pin || entry.draining.contains(&selected) {
                 selected
             } else {
                 match self
@@ -738,16 +750,59 @@ impl RevisionDispatcher {
         })
     }
 
-    /// Build a borrowed [`PinKey`] from a dispatch request + the resolved
-    /// session hint. Centralizes the three borrow plumbings so the lookup
-    /// and try_pin sites can't drift on field order or selection.
-    fn pin_key<'a>(&self, req: &'a DispatchRequest<'_>, hint: &'a str) -> PinKey<'a> {
+    /// Bind a deferred session pin after the request cleared the provider auth
+    /// gate. This is the second half of the `defer_pin` two-phase write: when
+    /// [`Self::dispatch`] ran with [`DispatchRequest::defer_pin`] set, it routed
+    /// the request but withheld the pin write so a forged webhook body could not
+    /// seed the pin store before verification. The provider-route handler calls
+    /// this once `authenticate_provider_webhook` has admitted the request.
+    ///
+    /// Idempotent and race-safe: it re-reads the current snapshot (so a reload
+    /// between dispatch and commit can't pin to a vanished revision) and uses
+    /// the insert-if-absent [`RevisionPinStore::try_pin`], so a concurrent
+    /// authenticated request that pinned first wins and later requests honor it.
+    /// No-op when the deployment/revision is gone or the revision is draining.
+    pub async fn commit_pin(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        hint: &str,
+        revision: RevisionId,
+    ) {
+        let snap = self.snapshot.load();
+        let Some(entry) = snap.deployments.get(&deployment_id) else {
+            return;
+        };
+        if !has_revision(entry, revision) || entry.draining.contains(&revision) {
+            return;
+        }
+        let key = self.pin_key_raw(self.env_id.as_str(), deployment_id, tenant, hint);
+        let _ = self
+            .pin_store
+            .try_pin(key, revision, entry.generation, self.pin_ttl)
+            .await;
+    }
+
+    /// Single [`PinKey`] construction site so the lookup, try_pin, and
+    /// commit_pin call sites can't drift on field order or selection.
+    fn pin_key_raw<'a>(
+        &self,
+        env_id: &'a str,
+        deployment_id: DeploymentId,
+        tenant: &'a str,
+        hint: &'a str,
+    ) -> PinKey<'a> {
         PinKey {
-            env_id: req.env_id,
-            deployment_id: req.deployment_id,
-            tenant: req.tenant,
+            env_id,
+            deployment_id,
+            tenant,
             hint,
         }
+    }
+
+    /// Borrow a [`PinKey`] from a dispatch request + the resolved session hint.
+    fn pin_key<'a>(&self, req: &'a DispatchRequest<'_>, hint: &'a str) -> PinKey<'a> {
+        self.pin_key_raw(req.env_id, req.deployment_id, req.tenant, hint)
     }
 
     fn build_set_cookie(
@@ -1078,6 +1133,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep(),
                     session_hint: None,
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: None,
@@ -1106,6 +1162,7 @@ mod tests {
                         tenant: "t",
                         deployment_id: dep_id,
                         session_hint: None,
+                        defer_pin: false,
                         trusted: false,
                         header_revision: None,
                         cookie: None,
@@ -1145,6 +1202,7 @@ mod tests {
                         tenant: "t",
                         deployment_id: dep_a,
                         session_hint: None,
+                        defer_pin: false,
                         trusted: false,
                         header_revision: None,
                         cookie: None,
@@ -1160,6 +1218,7 @@ mod tests {
                         tenant: "t",
                         deployment_id: dep_b,
                         session_hint: None,
+                        defer_pin: false,
                         trusted: false,
                         header_revision: None,
                         cookie: None,
@@ -1187,6 +1246,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: None,
+                    defer_pin: false,
                     trusted: true,
                     header_revision: Some(r2),
                     cookie: None,
@@ -1214,6 +1274,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: None,
+                    defer_pin: false,
                     trusted: false,
                     header_revision: Some(other),
                     cookie: None,
@@ -1240,6 +1301,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: None,
+                    defer_pin: false,
                     trusted: true,
                     header_revision: Some(ghost),
                     cookie: None,
@@ -1431,6 +1493,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: None,
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: Some(&cookie),
@@ -1466,6 +1529,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: None,
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: Some(&cookie),
@@ -1492,6 +1556,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: Some("sess-A"),
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: None,
@@ -1508,6 +1573,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: Some("sess-A"),
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: None,
@@ -1518,6 +1584,125 @@ mod tests {
             .unwrap();
         assert_eq!(second.reason, SelectionReason::Pin);
         assert_eq!(second.revision_id, first.revision_id);
+    }
+
+    #[tokio::test]
+    async fn defer_pin_withholds_in_dispatch_write_until_commit_pin() {
+        // A1 follow-up: a deferred dispatch routes the request but must NOT seed
+        // the pin store — so an unverified body cannot pre-pin a chat. Only the
+        // post-auth `commit_pin` binds the hint.
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        let mut rng = StdRng::seed_from_u64(11);
+        // Same deferred request shape for all three dispatches.
+        let req = DispatchRequest {
+            env_id: "local",
+            tenant: "t",
+            deployment_id: dep_id,
+            session_hint: Some("sess-A"),
+            defer_pin: true,
+            trusted: false,
+            header_revision: None,
+            cookie: None,
+        };
+        let first = d.dispatch(&req, &mut rng).await.unwrap();
+        assert_eq!(first.reason, SelectionReason::Weighted);
+        // No pin was written, so a second deferred request re-picks by weight
+        // rather than honoring a (non-existent) pin.
+        let second = d.dispatch(&req, &mut rng).await.unwrap();
+        assert_eq!(second.reason, SelectionReason::Weighted);
+
+        // The auth gate admitted the request → commit the deferred pin.
+        d.commit_pin("t", dep_id, "sess-A", first.revision_id).await;
+        let third = d.dispatch(&req, &mut rng).await.unwrap();
+        assert_eq!(third.reason, SelectionReason::Pin);
+        assert_eq!(third.revision_id, first.revision_id);
+    }
+
+    #[tokio::test]
+    async fn defer_pin_still_honors_an_existing_pin_on_lookup() {
+        // Deferral suppresses the WRITE, never the READ: a returning chat that
+        // was already pinned stays sticky even on deferred (unverified) traffic.
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 5000), entry(r2, 5000)]);
+        let mut rng = StdRng::seed_from_u64(11);
+        // Establish the pin via a trusted (non-deferred) dispatch.
+        let trusted = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: Some("sess-A"),
+                    defer_pin: false,
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(trusted.reason, SelectionReason::Weighted);
+        // A subsequent deferred request reads the existing pin.
+        let deferred = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: Some("sess-A"),
+                    defer_pin: true,
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deferred.reason, SelectionReason::Pin);
+        assert_eq!(deferred.revision_id, trusted.revision_id);
+    }
+
+    #[tokio::test]
+    async fn commit_pin_is_noop_for_unknown_deployment_or_missing_revision() {
+        let dep_id = dep();
+        let r1 = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r1, 10_000)]);
+        let mut rng = StdRng::seed_from_u64(3);
+
+        // Unknown deployment: silently ignored (no panic).
+        d.commit_pin("t", dep(), "sess-A", r1).await;
+        // Revision not in this deployment: must NOT write a dead pin, otherwise
+        // the insert-if-absent store would block the later valid commit.
+        d.commit_pin("t", dep_id, "sess-A", rev()).await;
+        // Now a valid commit for the same hint succeeds...
+        d.commit_pin("t", dep_id, "sess-A", r1).await;
+
+        let out = d
+            .dispatch(
+                &DispatchRequest {
+                    env_id: "local",
+                    tenant: "t",
+                    deployment_id: dep_id,
+                    session_hint: Some("sess-A"),
+                    defer_pin: true,
+                    trusted: false,
+                    header_revision: None,
+                    cookie: None,
+                },
+                &mut rng,
+            )
+            .await
+            .unwrap();
+        // ...proving the earlier no-op commits left the hint unpinned.
+        assert_eq!(out.reason, SelectionReason::Pin);
+        assert_eq!(out.revision_id, r1);
     }
 
     #[tokio::test]
@@ -1535,6 +1720,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: Some("sess-X"),
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: None,
@@ -1562,6 +1748,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: Some("sess-X"),
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: None,
@@ -1589,6 +1776,7 @@ mod tests {
                         tenant: "t",
                         deployment_id: dep_id,
                         session_hint: None,
+                        defer_pin: false,
                         trusted: false,
                         header_revision: None,
                         cookie: None,
@@ -1716,6 +1904,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: Some("sess-K"),
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: None,
@@ -1739,6 +1928,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: Some("sess-K"),
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: None,
@@ -1858,6 +2048,7 @@ mod tests {
                         tenant: "t",
                         deployment_id: dep_id,
                         session_hint: None,
+                        defer_pin: false,
                         trusted: false,
                         header_revision: None,
                         cookie: None,
@@ -1885,6 +2076,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: None,
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: None,
@@ -1917,6 +2109,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: None,
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: Some(&cookie),
@@ -1950,6 +2143,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: None,
+                    defer_pin: false,
                     trusted: true,
                     header_revision: Some(r2),
                     cookie: None,
@@ -1982,6 +2176,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: Some("sess-drain"),
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: None,
@@ -2000,6 +2195,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: Some("sess-drain"),
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: None,
@@ -2052,6 +2248,7 @@ mod tests {
                         tenant: "t",
                         deployment_id: dep_id,
                         session_hint: None,
+                        defer_pin: false,
                         trusted: false,
                         header_revision: None,
                         cookie: None,
@@ -2080,6 +2277,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: None,
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: Some(&cookie),
@@ -2110,6 +2308,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: None,
+                    defer_pin: false,
                     trusted: true,
                     header_revision: Some(r2),
                     cookie: None,
@@ -2138,6 +2337,7 @@ mod tests {
                     tenant: "t",
                     deployment_id: dep_id,
                     session_hint: None,
+                    defer_pin: false,
                     trusted: false,
                     header_revision: None,
                     cookie: None,
