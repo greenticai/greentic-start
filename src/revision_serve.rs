@@ -778,6 +778,7 @@ async fn serve(
 
     let host_header = header_str(req.headers(), header::HOST.as_str());
     let cookie_header = header_str(req.headers(), header::COOKIE.as_str());
+    let content_type_header = header_str(req.headers(), header::CONTENT_TYPE.as_str());
     let user_header = header_str(req.headers(), "x-greentic-user");
     let session_header = header_str(req.headers(), "x-greentic-session");
     let endpoint_header = header_str(req.headers(), "x-greentic-messaging-endpoint-id");
@@ -858,6 +859,29 @@ async fn serve(
         activation.routing.endpoint_admit.as_ref(),
     )
     .map_err(|boxed| *boxed)?;
+
+    // A1: external provider webhooks carry no caller-asserted session header and
+    // no stickiness cookie, so caller_identity yields None and every message would
+    // re-pick a revision at random, flapping a single chat between bundles. Derive
+    // a stable chat/channel-level hint from the webhook body so the pin store keeps
+    // the conversation on one revision. provider_type is revision-independent so it
+    // resolves before dispatch. Loopback callers already supply their own hint.
+    let session_hint = session_hint.or_else(|| {
+        if peer_is_loopback {
+            return None;
+        }
+        let provider_type = activation.routing.http_routes.provider_type_for(
+            &path,
+            method.as_str(),
+            deployment_id,
+        )?;
+        let provider = crate::http_routes::derive_provider_name(provider_type)?;
+        crate::session_hint_extractor::extract_session_hint(
+            &provider,
+            content_type_header.as_deref(),
+            &body_bytes,
+        )
+    });
 
     let cookie_value = cookie_header
         .as_deref()
