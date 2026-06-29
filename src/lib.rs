@@ -543,65 +543,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // traffic reweight — which rebuilds the dispatcher through reload — does
         // not discard live session pins. Without this, every reweight would
         // re-pick a fresh revision for in-flight conversations on connectors
-        // that hold no stickiness cookie (i.e. every messaging provider).
-        //
-        // B2: when `GREENTIC_REVISION_PIN_REDIS_URL` is set, back the store with
-        // Redis so pins survive a pod restart and are shared across a
-        // horizontally scaled fleet — the in-memory store is per-process, lost
-        // on restart and invisible to sibling pods. Fail open: an invalid or
-        // unreachable Redis at boot logs a warning and falls back to in-memory
-        // rather than blocking the serve loop, because pinning is a best-effort
-        // optimization (the stickiness cookie + weighted pick still route), so a
-        // transient Redis outage must not brick the worker.
-        let pin_store: std::sync::Arc<dyn revision_pin::RevisionPinStore> =
-            match revision_pin::redis_url_from_raw(
-                std::env::var(revision_pin::PIN_REDIS_URL_ENV).ok(),
-            ) {
-                Some(url) => {
-                    match activation_rt.block_on(revision_pin::RedisPinStore::from_url(&url)) {
-                        Ok(store) => {
-                            operator_log::info(
-                                module_path!(),
-                                "session-pin store: redis (multi-pod sticky routing)",
-                            );
-                            std::sync::Arc::new(store)
-                        }
-                        Err(err) => {
-                            let var = revision_pin::PIN_REDIS_URL_ENV;
-                            if revision_pin::is_tls_redis_url(&url)
-                                && !revision_pin::REDIS_TLS_SUPPORTED
-                            {
-                                // `rediss://` cannot connect without the redis TLS
-                                // features, and the bare `InvalidClientConfig` error
-                                // reads like a transient blip. Name the cause so the
-                                // operator does not think HA is working when it is not.
-                                operator_log::warn(
-                                    module_path!(),
-                                    format!(
-                                        "{var} points at a TLS endpoint ({}) but this build has \
-                                         no Redis TLS support; rebuild `redis` with the \
-                                         `tls-rustls` + `tokio-rustls-comp` features, or use a \
-                                         non-TLS `redis://` endpoint. Falling back to in-memory \
-                                         (pins will not survive a restart or share across pods)",
-                                        revision_pin::redact_redis_url(&url),
-                                    ),
-                                );
-                            } else {
-                                operator_log::warn(
-                                    module_path!(),
-                                    format!(
-                                        "{var} set but the Redis pin store is unavailable \
-                                         ({err:#}); falling back to in-memory (pins will not \
-                                         survive a restart or share across pods)"
-                                    ),
-                                );
-                            }
-                            std::sync::Arc::new(revision_pin::InMemoryPinStore::new())
-                        }
-                    }
-                }
-                None => std::sync::Arc::new(revision_pin::InMemoryPinStore::new()),
-            };
+        // that hold no stickiness cookie (i.e. every messaging provider). B2:
+        // `resolve_pin_store` backs it with Redis when
+        // `GREENTIC_REVISION_PIN_REDIS_URL` is configured (fail-open to
+        // in-memory); see that fn for the rationale.
+        let pin_store = revision_pin::resolve_pin_store(&activation_rt);
         let activation = activation_rt.block_on(revision_boot::activate_runtime_config(
             &store_root,
             &rc,

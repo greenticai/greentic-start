@@ -353,8 +353,9 @@ pub(crate) fn redis_url_from_raw(raw: Option<String>) -> Option<String> {
 /// returns a fully-masked placeholder rather than echoing possibly-secret
 /// bytes.
 pub(crate) fn redact_redis_url(raw: &str) -> String {
+    const REDACTED: &str = "<redacted redis url>";
     let Some((scheme, rest)) = raw.split_once("://") else {
-        return "<redacted redis url>".to_string();
+        return REDACTED.to_string();
     };
     // Authority = everything up to the first `/` (path) or `?` (query). Both
     // can carry secrets, so neither is kept — this also means a `@` sitting in
@@ -367,7 +368,7 @@ pub(crate) fn redact_redis_url(raw: &str) -> String {
         None => authority,
     };
     if host.is_empty() {
-        "<redacted redis url>".to_string()
+        REDACTED.to_string()
     } else {
         format!("{scheme}://{host}")
     }
@@ -387,6 +388,58 @@ pub(crate) const REDIS_TLS_SUPPORTED: bool = false;
 pub(crate) fn is_tls_redis_url(url: &str) -> bool {
     url.split_once("://")
         .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("rediss"))
+}
+
+/// Resolve the session-pin store backend for the serve loop (B2). Mirrors
+/// `secrets_gate::resolve_serve_secrets_manager`: reads its selecting env var
+/// ([`PIN_REDIS_URL_ENV`]) internally, connects or falls back, logs the
+/// outcome, and hands back a ready `Arc`. `rt` is the activation runtime the
+/// boot path already builds; the async [`RedisPinStore::from_url`] is driven on
+/// it.
+///
+/// Fail open: an invalid or unreachable Redis logs a warning and yields the
+/// in-memory store rather than aborting boot — pinning is best-effort (the
+/// stickiness cookie + weighted pick still route), so a transient Redis outage
+/// must not brick the worker.
+pub(crate) fn resolve_pin_store(
+    rt: &tokio::runtime::Runtime,
+) -> std::sync::Arc<dyn RevisionPinStore> {
+    use std::sync::Arc;
+    let Some(url) = redis_url_from_raw(std::env::var(PIN_REDIS_URL_ENV).ok()) else {
+        return Arc::new(InMemoryPinStore::new());
+    };
+    match rt.block_on(RedisPinStore::from_url(&url)) {
+        Ok(store) => {
+            crate::operator_log::info(
+                module_path!(),
+                "session-pin store: redis (multi-pod sticky routing)",
+            );
+            Arc::new(store)
+        }
+        Err(err) => {
+            // Fail open to in-memory; name the cause so a permanent misconfig
+            // is not mistaken for a transient blip.
+            let reason = if is_tls_redis_url(&url) && !REDIS_TLS_SUPPORTED {
+                // `rediss://` cannot connect without the redis TLS features.
+                format!(
+                    "{PIN_REDIS_URL_ENV} points at a TLS endpoint ({}) but this build has no \
+                     Redis TLS support; rebuild `redis` with the `tls-rustls` + \
+                     `tokio-rustls-comp` features, or use a non-TLS `redis://` endpoint",
+                    redact_redis_url(&url),
+                )
+            } else {
+                format!("{PIN_REDIS_URL_ENV} set but the Redis pin store is unavailable ({err:#})")
+            };
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "{reason}; falling back to in-memory (pins will not survive a restart or \
+                     share across pods)"
+                ),
+            );
+            Arc::new(InMemoryPinStore::new())
+        }
+    }
 }
 
 pub struct RedisPinStore {
