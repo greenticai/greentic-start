@@ -189,11 +189,17 @@ impl RevisionPinStore for InMemoryPinStore {
         let now = SystemTime::now();
         let mut guard = self.inner.lock().expect("pin mutex poisoned");
 
-        // Drop stale entry first so it doesn't block insert + so we honor the
-        // generation-mismatch eviction contract.
+        // Monotonic eviction: an at-or-newer generation already owns the slot,
+        // so report it and do NOT clobber. This covers same-generation (the
+        // original race-loser contract) AND a *newer* entry: with the pin store
+        // now shared across activations (B1a), an in-flight request from a
+        // pre-reload activation can reach here at an older generation while a
+        // post-reload request has already pinned the newer one — it must not
+        // overwrite that. Only a strictly-stale (older) or expired entry is
+        // dropped and replaced below.
         if let Some(existing) = guard.get(&map_key)
             && existing.expires_at > now
-            && existing.generation == generation
+            && existing.generation >= generation
         {
             return PinOutcome::Existing {
                 revision_id: existing.revision_id,
@@ -231,10 +237,16 @@ impl RevisionPinStore for InMemoryPinStore {
             Some(entry) if entry.expires_at > now && entry.generation == current_generation => {
                 Some(entry.revision_id)
             }
-            Some(_) => {
+            // Monotonic eviction: evict only what this caller may supersede —
+            // an expired entry, or a strictly-older generation. A *newer* entry
+            // (entry.generation > current_generation) belongs to a post-reload
+            // activation sharing this store (B1a); an older in-flight caller
+            // gets a miss but must leave it intact rather than delete it.
+            Some(entry) if entry.expires_at <= now || entry.generation < current_generation => {
                 guard.remove(&map_key);
                 None
             }
+            Some(_) => None,
             None => None,
         }
     }
@@ -244,11 +256,13 @@ impl RevisionPinStore for InMemoryPinStore {
 
 /// Lua script that atomically performs the `try_pin` contract:
 ///
-/// 1. If `KEYS[1]` already holds a pin AND it parses as a current-generation
-///    value, return `{1, value}` (caller gets `Existing`).
-/// 2. Otherwise — including stale-generation values — delete the existing
-///    key, check the tracking-set cardinality, and if under cap, write the
-///    new pin + add it to the tracking set + refresh the set's TTL. Return
+/// 1. If `KEYS[1]` already holds a pin at an AT-OR-NEWER generation
+///    (`stored_gen >= ARGV[1]`), return `{1, value}` (caller gets `Existing`).
+///    Monotonic: a stored newer generation belongs to a post-reload activation
+///    sharing this store, so an older in-flight caller must not clobber it.
+/// 2. Otherwise — a strictly-older (stale) stored generation — delete the
+///    existing key, check the tracking-set cardinality, and if under cap, write
+///    the new pin + add it to the tracking set + refresh the set's TTL. Return
 ///    `{0, value}` (caller gets `Inserted`).
 /// 3. If the tracking set is at cap, return `{2}` (caller gets a no-pin
 ///    fallthrough that becomes `Inserted` with the caller's own
@@ -269,7 +283,10 @@ const TRY_PIN_SCRIPT: &str = r#"
 local existing = redis.call('GET', KEYS[1])
 if existing then
   local _, gen = string.match(existing, '^([^|]+)|([^|]+)|')
-  if gen == ARGV[1] then
+  -- Monotonic: an at-or-newer stored generation owns the slot — report it
+  -- (Existing) and leave it intact. Only a strictly-older stored generation
+  -- is replaced.
+  if tonumber(gen) >= tonumber(ARGV[1]) then
     return {1, existing}
   end
   redis.call('DEL', KEYS[1])
@@ -523,11 +540,18 @@ impl RevisionPinStore for RedisPinStore {
             }
         };
         let (revision_id, generation, expires_at) = decode_value(&raw)?;
-        if generation != current_generation || expires_at <= now_secs() {
-            // Stale (generation bumped or clock-skew-expired): drop the key
-            // + its tracking-set membership best-effort. The Lua script in
-            // `try_pin` covers the re-pin path; this branch handles the
-            // narrow case of a lookup that's never followed by a re-pin.
+        if generation == current_generation && expires_at > now_secs() {
+            return Some(revision_id);
+        }
+        // Monotonic eviction (mirrors `InMemoryPinStore::lookup`): drop only an
+        // entry this caller may supersede — expired, or a strictly-older
+        // generation. A *newer* stored generation belongs to a post-reload
+        // activation sharing this store (B1a); an older in-flight caller misses
+        // but must leave it intact rather than DEL it.
+        if expires_at <= now_secs() || generation < current_generation {
+            // Drop the key + its tracking-set membership best-effort. The Lua
+            // script in `try_pin` covers the re-pin path; this branch handles
+            // the narrow case of a lookup that's never followed by a re-pin.
             let set_key = redis_tracking_key(key.env_id, key.deployment_id, key.tenant);
             let _ = tokio::time::timeout(self.op_timeout, async {
                 let mut c = self.conn.clone();
@@ -539,9 +563,8 @@ impl RevisionPinStore for RedisPinStore {
                 let _: redis::RedisResult<()> = srem_cmd.query_async(&mut c).await;
             })
             .await;
-            return None;
         }
-        Some(revision_id)
+        None
     }
 }
 
@@ -741,6 +764,50 @@ mod tests {
                 )
                 .await,
             Some(r2)
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_older_caller_cannot_evict_or_clobber_newer_pin() {
+        // B1a shares one store across activations. An in-flight request from a
+        // pre-reload activation reaches the store at an OLDER generation than a
+        // pin a post-reload request already wrote. It must neither evict (via
+        // lookup) nor overwrite (via try_pin) that newer pin — otherwise a
+        // freshly established post-reload pin is lost and the session flaps.
+        let store = InMemoryPinStore::new();
+        let dep_id = dep();
+        let newer = rev();
+        let k = || PinKey {
+            env_id: "local",
+            deployment_id: dep_id,
+            tenant: "t",
+            hint: "h",
+        };
+        // Post-reload pin at generation 2.
+        store.try_pin(k(), newer, 2, Duration::from_secs(60)).await;
+
+        // Old caller (generation 1) looks up: miss, but MUST NOT evict.
+        assert_eq!(store.lookup(k(), 1).await, None);
+        assert_eq!(
+            store.lookup(k(), 2).await,
+            Some(newer),
+            "an older-generation lookup must not evict the newer pin"
+        );
+
+        // Old caller (generation 1) tries to pin its own pick: must report the
+        // newer pin as Existing and leave it intact, not clobber it.
+        let older_pick = rev();
+        assert_eq!(
+            store
+                .try_pin(k(), older_pick, 1, Duration::from_secs(60))
+                .await,
+            PinOutcome::Existing { revision_id: newer },
+            "an older-generation try_pin must not overwrite the newer pin"
+        );
+        assert_eq!(
+            store.lookup(k(), 2).await,
+            Some(newer),
+            "the newer pin must survive an older-generation try_pin"
         );
     }
 
@@ -1136,6 +1203,50 @@ mod tests {
                 )
                 .await,
             Some(r2)
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_older_caller_cannot_evict_or_clobber_newer_pin() {
+        // Redis mirror of the in-memory monotonic-eviction contract (B1a shared
+        // store): an older-generation caller must neither DEL the newer pin via
+        // lookup nor overwrite it via the try_pin Lua script.
+        let Some(url) = redis_url_or_skip() else {
+            return;
+        };
+        let store = RedisPinStore::from_url(&url).await.expect("redis open");
+        let dep_id = dep();
+        let hint = unique_hint("monotonic");
+        let newer = rev();
+        let k = || PinKey {
+            env_id: "local",
+            deployment_id: dep_id,
+            tenant: "t",
+            hint: &hint,
+        };
+        store.try_pin(k(), newer, 2, Duration::from_secs(60)).await;
+
+        // Older-generation lookup: miss, but must not evict.
+        assert_eq!(store.lookup(k(), 1).await, None);
+        assert_eq!(
+            store.lookup(k(), 2).await,
+            Some(newer),
+            "an older-generation lookup must not evict the newer pin"
+        );
+
+        // Older-generation try_pin: reports the newer pin and leaves it intact.
+        let older_pick = rev();
+        assert_eq!(
+            store
+                .try_pin(k(), older_pick, 1, Duration::from_secs(60))
+                .await,
+            PinOutcome::Existing { revision_id: newer },
+            "an older-generation try_pin must not overwrite the newer pin"
+        );
+        assert_eq!(
+            store.lookup(k(), 2).await,
+            Some(newer),
+            "the newer pin must survive an older-generation try_pin"
         );
     }
 
