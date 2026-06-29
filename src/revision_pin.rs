@@ -25,14 +25,14 @@
 //! [`RevisionDispatcher::with_pin_store`](crate::revision_dispatcher::RevisionDispatcher::with_pin_store).
 
 // `RedisPinStore` has a live boot caller behind `PIN_REDIS_URL_ENV` (B2), but
-// its tuning setters (`with_op_timeout`, `with_cardinality_cap`) are exercised
-// only from tests. Same shape as `revision_dispatcher`'s pre-B3
-// `#![allow(dead_code)]`.
+// its tuning setters (`with_op_timeout`, `with_cardinality_cap`,
+// `with_rate_limit`) are exercised only from tests. Same shape as
+// `revision_dispatcher`'s pre-B3 `#![allow(dead_code)]`.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use greentic_deploy_spec::{DeploymentId, RevisionId};
@@ -52,6 +52,21 @@ pub(crate) const MAX_PINS: usize = 16_384;
 /// tenant is Phase D once session-aware ingress wires hints through.
 pub(crate) const MAX_PINS_PER_TENANT: usize = 4_096;
 
+/// Per-`(env, deployment, tenant)` cap on the number of pin WRITES allowed in a
+/// [`RATE_LIMIT_WINDOW`]. Complements [`MAX_PINS_PER_TENANT`] (a steady-state
+/// cardinality cap) by bounding write CHURN: a client rotating session hints
+/// fast can evict-and-refill under the cardinality cap indefinitely, so this
+/// caps how many *new* pins one tenant can mint per window. On the Redis
+/// backend the counter lives in shared Redis, so it is a cross-pod budget a
+/// per-pod ingress limit can't provide. A returning session takes the
+/// existing-pin fast path and does NOT consume budget — only a genuinely-new or
+/// generation-superseding write counts. Soft: exceeding it yields
+/// [`PinOutcome::Skipped`] (route the request, don't pin), never an error.
+pub(crate) const MAX_PINS_PER_WINDOW: usize = 1_024;
+
+/// Fixed-window reset interval for [`MAX_PINS_PER_WINDOW`].
+pub(crate) const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
 /// Cap on caller-supplied scope strings (tenant, hint) at the trait
 /// boundary. Defends against pathological clients that would otherwise
 /// produce unbounded Redis keys.
@@ -64,6 +79,7 @@ const REDIS_OP_TIMEOUT: Duration = Duration::from_millis(50);
 
 const REDIS_KEY_PREFIX: &str = "gt:rev_pin";
 const REDIS_TRACKING_PREFIX: &str = "gt:rev_pin_set";
+const REDIS_RATE_PREFIX: &str = "gt:rev_pin_rate";
 
 /// Identity of a pinned session: `(env, deployment, tenant, hint)`. Borrowed
 /// from the caller's request data so the trait surface stays alloc-free at
@@ -130,9 +146,10 @@ pub enum PinOutcome {
     /// A pin already existed; the value returned is what's now live.
     Existing { revision_id: RevisionId },
     /// The pin was NOT persisted (Redis timeout/error, cardinality cap
-    /// reached, or unsafe scope strings refused). The caller's
-    /// `revision_id` is still returned so dispatch can route this request,
-    /// but the next request with the same hint will not find a pin.
+    /// reached, per-tenant write-rate budget exhausted, or unsafe scope
+    /// strings refused). The caller's `revision_id` is still returned so
+    /// dispatch can route this request, but the next request with the same
+    /// hint will not find a pin.
     Skipped { revision_id: RevisionId },
 }
 
@@ -155,20 +172,77 @@ struct InMemoryEntry {
     expires_at: SystemTime,
 }
 
+/// Fixed-window write-rate counter for [`InMemoryPinStore`], one per
+/// `(env, deployment, tenant)` scope.
+#[derive(Clone, Copy, Debug)]
+struct RateWindow {
+    count: usize,
+    started: Instant,
+}
+
 /// Single-process pin store. Matches B1's bounded-map discipline:
 ///
 /// - hard cap at [`MAX_PINS`];
 /// - at-cap inserts first sweep expired entries, then evict the soonest-to-expire;
 /// - strictly-older (or expired) entries are dropped on lookup; a newer entry
-///   is a miss but is left intact (generation-monotonic — see the trait doc).
-#[derive(Debug, Default)]
+///   is a miss but is left intact (generation-monotonic — see the trait doc);
+/// - per-`(env, deployment, tenant)` write-rate budget ([`MAX_PINS_PER_WINDOW`]).
+#[derive(Debug)]
 pub struct InMemoryPinStore {
     inner: Mutex<HashMap<(DeploymentId, String, String, String), InMemoryEntry>>,
+    /// Write-rate counters keyed by `(deployment, env, tenant)` scope — NOT
+    /// per-hint, so the map is bounded by the deployment's tenant roster (not
+    /// pin cardinality) and needs no sweep.
+    rate: Mutex<HashMap<(DeploymentId, String, String), RateWindow>>,
+    rate_limit: usize,
+    rate_window: Duration,
+}
+
+impl Default for InMemoryPinStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InMemoryPinStore {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            rate: Mutex::new(HashMap::new()),
+            rate_limit: MAX_PINS_PER_WINDOW,
+            rate_window: RATE_LIMIT_WINDOW,
+        }
+    }
+
+    /// Override the per-`(env, deployment, tenant)` write-rate budget. Defaults
+    /// to [`MAX_PINS_PER_WINDOW`] writes per [`RATE_LIMIT_WINDOW`].
+    pub fn with_rate_limit(mut self, limit: usize, window: Duration) -> Self {
+        self.rate_limit = limit;
+        self.rate_window = window;
+        self
+    }
+
+    /// Consume one unit of the write-rate budget for `(deployment, env,
+    /// tenant)`. Returns `false` when this window's budget is exhausted. Fixed
+    /// window: the first write after [`Self::rate_window`] elapses resets it.
+    fn rate_budget_ok(&self, deployment_id: DeploymentId, env_id: &str, tenant: &str) -> bool {
+        let now = Instant::now();
+        let mut rates = self.rate.lock().expect("rate mutex poisoned");
+        let win = rates
+            .entry((deployment_id, env_id.to_string(), tenant.to_string()))
+            .or_insert(RateWindow {
+                count: 0,
+                started: now,
+            });
+        if now.duration_since(win.started) >= self.rate_window {
+            win.count = 0;
+            win.started = now;
+        }
+        if win.count >= self.rate_limit {
+            return false;
+        }
+        win.count += 1;
+        true
     }
 
     /// Test helper: number of live entries (post-eviction).
@@ -218,6 +292,20 @@ impl RevisionPinStore for InMemoryPinStore {
             return PinOutcome::Existing {
                 revision_id: existing.revision_id,
             };
+        }
+
+        // Write-rate budget (A3): only an actual write counts — the returning
+        // session above takes the fast path without consuming budget. Exhausting
+        // the per-tenant budget yields a soft Skipped (route, don't pin). Locks
+        // `rate` while `inner` is held; `inner → rate` is the ONLY lock ordering
+        // used (rate is touched nowhere else), so this cannot deadlock.
+        if !self.rate_budget_ok(key.deployment_id, key.env_id, key.tenant) {
+            tracing::warn!(
+                target: "greentic_start::revision_pin",
+                limit = self.rate_limit,
+                "rejecting pin: per-tenant write-rate budget exhausted",
+            );
+            return PinOutcome::Skipped { revision_id };
         }
         guard.remove(&map_key);
 
@@ -274,35 +362,55 @@ impl RevisionPinStore for InMemoryPinStore {
 ///    (`stored_gen >= ARGV[1]`), return `{1, value}` (caller gets `Existing`).
 ///    Monotonic: a stored newer generation belongs to a post-reload activation
 ///    sharing this store, so an older in-flight caller must not clobber it.
-/// 2. Otherwise — a strictly-older (stale) stored generation — delete the
-///    existing key, check the tracking-set cardinality, and if under cap, write
-///    the new pin + add it to the tracking set + refresh the set's TTL. Return
-///    `{0, value}` (caller gets `Inserted`).
-/// 3. If the tracking set is at cap, return `{2}` (caller gets a no-pin
+///    This is a pure read — it does NOT consume the write-rate budget, so a
+///    returning sticky session is never rate-limited or knocked off its pin.
+/// 2. Otherwise this request is about to WRITE (a fresh pin or one replacing a
+///    strictly-older stale generation). FIRST charge the per-`(env, deployment,
+///    tenant)` write-rate budget (`INCR` a windowed counter); if it exceeds
+///    `ARGV[5]` return `{3}` BEFORE any mutation, so a rate-denied request
+///    leaves all existing state intact (caller gets `Skipped`).
+/// 3. Then, if a strictly-older key existed, delete it; check the tracking-set
+///    cardinality, and if under cap, write the pin + track it + refresh the
+///    set's TTL. Return `{0, value}` (caller gets `Inserted`).
+/// 4. If the tracking set is at cap, return `{2}` (caller gets a no-pin
 ///    fallthrough that becomes `Inserted` with the caller's own
 ///    revision_id — see `RedisPinStore::try_pin`).
 ///
 /// Inputs:
 ///   KEYS[1] = pin key
 ///   KEYS[2] = tracking-set key (per-(env, deployment, tenant) scope)
+///   KEYS[3] = rate-counter key (per-(env, deployment, tenant) scope)
 ///   ARGV[1] = current_generation (string-encoded u64)
 ///   ARGV[2] = new value (`revision_id|generation|expires_at_unix_secs`)
 ///   ARGV[3] = ttl_secs (string-encoded u64)
 ///   ARGV[4] = cardinality cap (string-encoded usize)
+///   ARGV[5] = write-rate budget per window (string-encoded usize)
+///   ARGV[6] = rate window seconds (string-encoded u64)
 ///
 /// Why Lua: SET NX EX + GET is racy across stale generations.
 /// SCAN-based after-the-fact pruning is racy across cardinality.
-/// One atomic script collapses both into a single round-trip.
+/// One atomic script collapses all of it into a single round-trip.
 const TRY_PIN_SCRIPT: &str = r#"
 local existing = redis.call('GET', KEYS[1])
 if existing then
   local _, gen = string.match(existing, '^([^|]+)|([^|]+)|')
   -- Monotonic: an at-or-newer stored generation owns the slot — report it
-  -- (Existing) and leave it intact. Only a strictly-older stored generation
-  -- is replaced.
+  -- (Existing) and leave it intact. A pure read: it does NOT consume the
+  -- write-rate budget below. Only a strictly-older stored generation is replaced.
   if tonumber(gen) >= tonumber(ARGV[1]) then
     return {1, existing}
   end
+end
+-- About to WRITE. Charge the windowed write-rate budget BEFORE any mutation so
+-- a rate-denied request leaves the existing (stale) pin and tracking set intact.
+local rate = redis.call('INCR', KEYS[3])
+if rate == 1 then
+  redis.call('EXPIRE', KEYS[3], tonumber(ARGV[6]))
+end
+if rate > tonumber(ARGV[5]) then
+  return {3}
+end
+if existing then
   redis.call('DEL', KEYS[1])
   redis.call('SREM', KEYS[2], KEYS[1])
 end
@@ -425,6 +533,8 @@ pub struct RedisPinStore {
     conn: ConnectionManager,
     op_timeout: Duration,
     cardinality_cap: usize,
+    rate_limit: usize,
+    rate_window: Duration,
 }
 
 impl std::fmt::Debug for RedisPinStore {
@@ -432,6 +542,8 @@ impl std::fmt::Debug for RedisPinStore {
         f.debug_struct("RedisPinStore")
             .field("op_timeout", &self.op_timeout)
             .field("cardinality_cap", &self.cardinality_cap)
+            .field("rate_limit", &self.rate_limit)
+            .field("rate_window", &self.rate_window)
             .finish_non_exhaustive()
     }
 }
@@ -452,6 +564,8 @@ impl RedisPinStore {
             conn: manager,
             op_timeout: REDIS_OP_TIMEOUT,
             cardinality_cap: MAX_PINS_PER_TENANT,
+            rate_limit: MAX_PINS_PER_WINDOW,
+            rate_window: RATE_LIMIT_WINDOW,
         })
     }
 
@@ -468,6 +582,15 @@ impl RedisPinStore {
     /// tenant's session churn pushes against the default 4_096 ceiling.
     pub fn with_cardinality_cap(mut self, cap: usize) -> Self {
         self.cardinality_cap = cap;
+        self
+    }
+
+    /// Override the per-`(env, deployment, tenant)` write-rate budget. Defaults
+    /// to [`MAX_PINS_PER_WINDOW`] writes per [`RATE_LIMIT_WINDOW`]. The window
+    /// floors at 1s (the Redis `EXPIRE` granularity).
+    pub fn with_rate_limit(mut self, limit: usize, window: Duration) -> Self {
+        self.rate_limit = limit;
+        self.rate_window = window;
         self
     }
 }
@@ -515,6 +638,13 @@ fn redis_tracking_key(env_id: &str, deployment_id: DeploymentId, tenant: &str) -
     scope_prefix(REDIS_TRACKING_PREFIX, env_id, deployment_id, tenant)
 }
 
+/// Write-rate counter key: one windowed `INCR` counter per
+/// `(env, deployment, tenant)`, parallel to the tracking-set key. Bounds pin
+/// WRITE churn per tenant across the fleet (see [`MAX_PINS_PER_WINDOW`]).
+fn redis_rate_key(env_id: &str, deployment_id: DeploymentId, tenant: &str) -> String {
+    scope_prefix(REDIS_RATE_PREFIX, env_id, deployment_id, tenant)
+}
+
 /// Shared `{prefix}:{env}:{deployment}:{urlenc tenant}` builder so the two
 /// key constructors can't drift in their escaping discipline.
 fn scope_prefix(prefix: &str, env_id: &str, deployment_id: DeploymentId, tenant: &str) -> String {
@@ -559,6 +689,7 @@ impl RevisionPinStore for RedisPinStore {
         }
         let pin_key = redis_key(key.env_id, key.deployment_id, key.tenant, key.hint);
         let set_key = redis_tracking_key(key.env_id, key.deployment_id, key.tenant);
+        let rate_key = redis_rate_key(key.env_id, key.deployment_id, key.tenant);
         let ttl_secs = ttl.as_secs().max(1);
         let value = encode_value(revision_id, generation, SystemTime::now() + ttl);
 
@@ -566,10 +697,13 @@ impl RevisionPinStore for RedisPinStore {
         invocation
             .key(&pin_key)
             .key(&set_key)
+            .key(&rate_key)
             .arg(generation.to_string())
             .arg(&value)
             .arg(ttl_secs.to_string())
-            .arg(self.cardinality_cap.to_string());
+            .arg(self.cardinality_cap.to_string())
+            .arg(self.rate_limit.to_string())
+            .arg(self.rate_window.as_secs().max(1).to_string());
         let mut conn = self.conn.clone();
         let fut = invocation.invoke_async::<(i64, Option<String>)>(&mut conn);
 
@@ -587,6 +721,16 @@ impl RevisionPinStore for RedisPinStore {
                     cap = self.cardinality_cap,
                     pin_key = %pin_key,
                     "rejecting pin: cardinality cap reached for (env, deployment, tenant)",
+                );
+                PinOutcome::Skipped { revision_id }
+            }
+            Ok(Ok((3, _))) => {
+                tracing::warn!(
+                    target: "greentic_start::revision_pin",
+                    limit = self.rate_limit,
+                    window_secs = self.rate_window.as_secs(),
+                    pin_key = %pin_key,
+                    "rejecting pin: per-tenant write-rate budget exhausted",
                 );
                 PinOutcome::Skipped { revision_id }
             }
@@ -1071,6 +1215,84 @@ mod tests {
                 .await,
             Some(r_b)
         );
+    }
+
+    #[tokio::test]
+    async fn in_memory_rate_budget_rejects_burst_but_spares_returning_sessions() {
+        // Budget of 3 writes/window. Three new hints pin; the fourth new hint is
+        // rate-denied (Skipped). A returning session (existing pin, same-or-newer
+        // generation) takes the read fast path and is NOT charged — so it still
+        // resolves even after the budget is spent.
+        let store = InMemoryPinStore::new().with_rate_limit(3, Duration::from_secs(60));
+        let dep_id = dep();
+        let key = |hint| PinKey {
+            env_id: "local",
+            deployment_id: dep_id,
+            tenant: "t",
+            hint,
+        };
+        let (a, b, c, d) = (rev(), rev(), rev(), rev());
+
+        assert_eq!(
+            store.try_pin(key("a"), a, 1, Duration::from_secs(60)).await,
+            PinOutcome::Inserted { revision_id: a }
+        );
+        assert_eq!(
+            store.try_pin(key("b"), b, 1, Duration::from_secs(60)).await,
+            PinOutcome::Inserted { revision_id: b }
+        );
+        assert_eq!(
+            store.try_pin(key("c"), c, 1, Duration::from_secs(60)).await,
+            PinOutcome::Inserted { revision_id: c }
+        );
+        // Budget exhausted: a fourth NEW hint is denied (routes, doesn't pin).
+        assert_eq!(
+            store.try_pin(key("d"), d, 1, Duration::from_secs(60)).await,
+            PinOutcome::Skipped { revision_id: d }
+        );
+        // A returning session for an already-pinned hint is the read fast path —
+        // it does not consume budget and still returns the live pin.
+        assert_eq!(
+            store
+                .try_pin(key("a"), rev(), 1, Duration::from_secs(60))
+                .await,
+            PinOutcome::Existing { revision_id: a }
+        );
+        // And the denied hint genuinely left no pin behind.
+        assert_eq!(store.lookup(key("d"), 1).await, None);
+    }
+
+    #[tokio::test]
+    async fn in_memory_rate_budget_resets_after_window() {
+        // A 1-write budget over a tiny window: the second write is denied, then
+        // after the window elapses a fresh write is admitted again.
+        let store = InMemoryPinStore::new().with_rate_limit(1, Duration::from_millis(20));
+        let dep_id = dep();
+        let key = |hint| PinKey {
+            env_id: "local",
+            deployment_id: dep_id,
+            tenant: "t",
+            hint,
+        };
+        assert!(matches!(
+            store
+                .try_pin(key("a"), rev(), 1, Duration::from_secs(60))
+                .await,
+            PinOutcome::Inserted { .. }
+        ));
+        assert!(matches!(
+            store
+                .try_pin(key("b"), rev(), 1, Duration::from_secs(60))
+                .await,
+            PinOutcome::Skipped { .. }
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(matches!(
+            store
+                .try_pin(key("c"), rev(), 1, Duration::from_secs(60))
+                .await,
+            PinOutcome::Inserted { .. }
+        ));
     }
 
     #[test]
@@ -1581,6 +1803,65 @@ mod tests {
                 .await,
             None,
             "5th distinct hint must not be persisted past the cap",
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_rate_budget_bounds_write_churn_but_spares_returning_sessions() {
+        let Some(url) = redis_url_or_skip() else {
+            return;
+        };
+        // Budget of 3 writes/window; fresh deployment + tenant isolate the
+        // windowed counter from other test runs.
+        let store = RedisPinStore::from_url(&url)
+            .await
+            .expect("redis open")
+            .with_rate_limit(3, Duration::from_secs(60));
+        let dep_id = dep();
+        let tenant = format!("tenant-rate-{}", Ulid::new());
+        let key = |hint: &'static str| PinKey {
+            env_id: "local",
+            deployment_id: dep_id,
+            tenant: &tenant,
+            hint,
+        };
+        let a = rev();
+
+        // First three NEW hints consume the budget and persist.
+        assert_eq!(
+            store.try_pin(key("a"), a, 1, Duration::from_secs(60)).await,
+            PinOutcome::Inserted { revision_id: a }
+        );
+        assert!(matches!(
+            store
+                .try_pin(key("b"), rev(), 1, Duration::from_secs(60))
+                .await,
+            PinOutcome::Inserted { .. }
+        ));
+        assert!(matches!(
+            store
+                .try_pin(key("c"), rev(), 1, Duration::from_secs(60))
+                .await,
+            PinOutcome::Inserted { .. }
+        ));
+        // Fourth NEW hint is rate-denied — routed, not persisted.
+        let d = rev();
+        assert_eq!(
+            store.try_pin(key("d"), d, 1, Duration::from_secs(60)).await,
+            PinOutcome::Skipped { revision_id: d }
+        );
+        assert_eq!(
+            store.lookup(key("d"), 1).await,
+            None,
+            "rate-denied hint must not be persisted",
+        );
+        // A returning session (existing pin, same generation) is the read fast
+        // path: it bypasses the spent budget and still resolves.
+        assert_eq!(
+            store
+                .try_pin(key("a"), rev(), 1, Duration::from_secs(60))
+                .await,
+            PinOutcome::Existing { revision_id: a }
         );
     }
 
