@@ -192,6 +192,15 @@ impl HttpRouteTable {
         })
     }
 
+    /// Resolve the provider_type for an inbound (path, method) BEFORE a revision
+    /// is dispatched. Provider ingress routes are synthesized identically across
+    /// a deployment's revisions, so provider_type is revision-independent. Returns
+    /// `None` for non-provider paths (caller then keeps weighted-random dispatch).
+    pub fn provider_type_for(&self, path: &str, method: &str) -> Option<&str> {
+        self.match_first(path, method, |route| route.provider_type.is_some())
+            .and_then(|m| m.descriptor.provider_type.as_deref())
+    }
+
     fn match_first(
         &self,
         path: &str,
@@ -1363,5 +1372,32 @@ pub(crate) mod tests {
                 .match_request("/bot/webhook/telegram", "POST")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn provider_type_for_returns_provider_type_for_provider_route() {
+        let scope = scope_for(DeploymentId::new(), RevisionId::new());
+        let provider_route =
+            provider_descriptor_for_test("/bot/webhook/telegram", "messaging.telegram.bot", scope);
+        let generic_route = descriptor_for_test(
+            "/v1/messaging/webchat/{tenant}/token",
+            &["GET"],
+            Domain::Messaging,
+            None,
+        );
+        let table = HttpRouteTable::from_descriptors(vec![provider_route, generic_route]);
+
+        // Provider path returns the provider_type.
+        assert_eq!(
+            table.provider_type_for("/bot/webhook/telegram", "POST"),
+            Some("messaging.telegram.bot"),
+        );
+        // Generic/legacy path returns None.
+        assert_eq!(
+            table.provider_type_for("/v1/messaging/webchat/demo/token", "GET"),
+            None,
+        );
+        // Non-matching path returns None.
+        assert_eq!(table.provider_type_for("/healthz", "GET"), None);
     }
 }

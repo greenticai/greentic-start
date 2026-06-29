@@ -88,6 +88,7 @@ mod secrets_manager;
 mod secrets_provider_binding;
 mod secrets_setup;
 mod services;
+mod session_hint_extractor;
 mod setup_input;
 mod setup_to_formspec;
 mod startup_contract;
