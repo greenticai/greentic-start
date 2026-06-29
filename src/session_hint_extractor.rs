@@ -75,14 +75,9 @@ fn telegram_hint(body: &[u8]) -> Option<String> {
         }
     }
 
-    // 4. poll_answer uses `.user.id`.
-    if let Some(id) = root
-        .get("poll_answer")
-        .and_then(|v| v.get("user"))
-        .and_then(user_id)
-    {
-        return Some(format!("telegram:{id}"));
-    }
+    // poll_answer is intentionally skipped: it keys on `.user.id` (not
+    // `.chat.id`), so it cannot be correlated to the originating chat and
+    // would route the conversation to a different revision.
 
     None
 }
@@ -98,6 +93,22 @@ fn user_id(user: &Value) -> Option<i64> {
 }
 
 // ── Slack ───────────────────────────────────────────────────────────────────
+
+/// Maximum byte length for a Slack channel ID accepted as a session hint.
+/// Real IDs are 9-13 uppercase alphanumeric characters; 64 bytes gives ample
+/// headroom for Enterprise Grid or future format changes while bounding the
+/// size of the in-memory pin store key.
+const MAX_SLACK_CHANNEL_LEN: usize = 64;
+
+/// Build a `"slack:{channel}"` hint only when the channel string is non-empty
+/// and within the length cap. Returns `None` for empty or oversized values,
+/// preventing attacker-controlled bodies from inflating pin-store keys.
+fn slack_channel_hint(channel: &str) -> Option<String> {
+    if channel.is_empty() || channel.len() > MAX_SLACK_CHANNEL_LEN {
+        return None;
+    }
+    Some(format!("slack:{channel}"))
+}
 
 fn slack_hint(content_type: Option<&str>, body: &[u8]) -> Option<String> {
     let is_form = content_type
@@ -121,21 +132,23 @@ fn slack_hint_json(body: &[u8]) -> Option<String> {
     let root: Value = serde_json::from_slice(body).ok()?;
 
     // Events API: { "event": { "channel": "C0123" } }
-    if let Some(ch) = root
+    if let Some(hint) = root
         .get("event")
         .and_then(|e| e.get("channel"))
         .and_then(Value::as_str)
+        .and_then(slack_channel_hint)
     {
-        return Some(format!("slack:{ch}"));
+        return Some(hint);
     }
 
     // Interactive messages (JSON variant): { "channel": { "id": "C0123" } }
-    if let Some(ch) = root
+    if let Some(hint) = root
         .get("channel")
         .and_then(|c| c.get("id"))
         .and_then(Value::as_str)
+        .and_then(slack_channel_hint)
     {
-        return Some(format!("slack:{ch}"));
+        return Some(hint);
     }
 
     None
@@ -158,8 +171,8 @@ fn slack_hint_form(body: &[u8]) -> Option<String> {
                 let Ok(decoded) = urlencoding::decode(value) else {
                     continue;
                 };
-                if !decoded.is_empty() {
-                    return Some(format!("slack:{decoded}"));
+                if let Some(hint) = slack_channel_hint(&decoded) {
+                    return Some(hint);
                 }
             }
             "payload" => {
@@ -167,12 +180,13 @@ fn slack_hint_form(body: &[u8]) -> Option<String> {
                     continue;
                 };
                 let parsed: Value = serde_json::from_str(&decoded).ok()?;
-                if let Some(ch) = parsed
+                if let Some(hint) = parsed
                     .get("channel")
                     .and_then(|c| c.get("id"))
                     .and_then(Value::as_str)
+                    .and_then(slack_channel_hint)
                 {
-                    return Some(format!("slack:{ch}"));
+                    return Some(hint);
                 }
             }
             _ => {}
@@ -272,14 +286,16 @@ mod tests {
     }
 
     #[test]
-    fn telegram_poll_answer_uses_user() {
+    fn telegram_poll_answer_returns_none() {
+        // poll_answer keys on user.id, not chat.id — cannot be correlated to
+        // the originating chat, so we intentionally return None.
         let body = serde_json::json!({
             "update_id": 7,
             "poll_answer": { "poll_id": "p1", "user": { "id": 55 }, "option_ids": [0] }
         });
         assert_eq!(
             extract_session_hint("telegram", None, body.to_string().as_bytes()),
-            Some("telegram:55".to_string()),
+            None,
         );
     }
 
@@ -404,6 +420,40 @@ mod tests {
         assert_eq!(
             extract_session_hint("slack", Some("application/json"), b"{{bad json"),
             None,
+        );
+    }
+
+    #[test]
+    fn slack_overlength_channel_returns_none() {
+        let long_channel = "C".repeat(MAX_SLACK_CHANNEL_LEN + 1);
+        let body = serde_json::json!({
+            "type": "event_callback",
+            "event": { "type": "message", "channel": long_channel }
+        });
+        assert_eq!(
+            extract_session_hint(
+                "slack",
+                Some("application/json"),
+                body.to_string().as_bytes(),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn slack_max_length_channel_is_accepted() {
+        let channel = "C".repeat(MAX_SLACK_CHANNEL_LEN);
+        let body = serde_json::json!({
+            "type": "event_callback",
+            "event": { "type": "message", "channel": channel }
+        });
+        assert_eq!(
+            extract_session_hint(
+                "slack",
+                Some("application/json"),
+                body.to_string().as_bytes(),
+            ),
+            Some(format!("slack:{channel}")),
         );
     }
 

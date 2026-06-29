@@ -196,9 +196,22 @@ impl HttpRouteTable {
     /// is dispatched. Provider ingress routes are synthesized identically across
     /// a deployment's revisions, so provider_type is revision-independent. Returns
     /// `None` for non-provider paths (caller then keeps weighted-random dispatch).
-    pub fn provider_type_for(&self, path: &str, method: &str) -> Option<&str> {
-        self.match_first(path, method, |route| route.provider_type.is_some())
-            .and_then(|m| m.descriptor.provider_type.as_deref())
+    /// The lookup is scoped to `deployment_id` so a provider route belonging to
+    /// one deployment cannot leak into another deployment's session hint.
+    pub fn provider_type_for(
+        &self,
+        path: &str,
+        method: &str,
+        deployment_id: DeploymentId,
+    ) -> Option<&str> {
+        self.match_first(path, method, |route| {
+            route.provider_type.is_some()
+                && route
+                    .scope
+                    .as_ref()
+                    .is_some_and(|s| s.deployment_id == deployment_id)
+        })
+        .and_then(|m| m.descriptor.provider_type.as_deref())
     }
 
     fn match_first(
@@ -1376,7 +1389,8 @@ pub(crate) mod tests {
 
     #[test]
     fn provider_type_for_returns_provider_type_for_provider_route() {
-        let scope = scope_for(DeploymentId::new(), RevisionId::new());
+        let dep_id = DeploymentId::new();
+        let scope = scope_for(dep_id, RevisionId::new());
         let provider_route =
             provider_descriptor_for_test("/bot/webhook/telegram", "messaging.telegram.bot", scope);
         let generic_route = descriptor_for_test(
@@ -1387,17 +1401,50 @@ pub(crate) mod tests {
         );
         let table = HttpRouteTable::from_descriptors(vec![provider_route, generic_route]);
 
-        // Provider path returns the provider_type.
+        // Provider path returns the provider_type when deployment matches.
         assert_eq!(
-            table.provider_type_for("/bot/webhook/telegram", "POST"),
+            table.provider_type_for("/bot/webhook/telegram", "POST", dep_id),
             Some("messaging.telegram.bot"),
         );
         // Generic/legacy path returns None.
         assert_eq!(
-            table.provider_type_for("/v1/messaging/webchat/demo/token", "GET"),
+            table.provider_type_for("/v1/messaging/webchat/demo/token", "GET", dep_id),
             None,
         );
         // Non-matching path returns None.
-        assert_eq!(table.provider_type_for("/healthz", "GET"), None);
+        assert_eq!(table.provider_type_for("/healthz", "GET", dep_id), None,);
+    }
+
+    #[test]
+    fn provider_type_for_scoped_to_deployment() {
+        let dep_a = DeploymentId::new();
+        let dep_b = DeploymentId::new();
+        let dep_unrelated = DeploymentId::new();
+
+        let route_a = provider_descriptor_for_test(
+            "/bot/webhook/telegram",
+            "messaging.telegram.bot",
+            scope_for(dep_a, RevisionId::new()),
+        );
+        let route_b = provider_descriptor_for_test(
+            "/bot/webhook/telegram",
+            "messaging.slack.client",
+            scope_for(dep_b, RevisionId::new()),
+        );
+        let table = HttpRouteTable::from_descriptors(vec![route_a, route_b]);
+
+        assert_eq!(
+            table.provider_type_for("/bot/webhook/telegram", "POST", dep_a),
+            Some("messaging.telegram.bot"),
+        );
+        assert_eq!(
+            table.provider_type_for("/bot/webhook/telegram", "POST", dep_b),
+            Some("messaging.slack.client"),
+        );
+        assert_eq!(
+            table.provider_type_for("/bot/webhook/telegram", "POST", dep_unrelated),
+            None,
+            "unrelated deployment must not match any provider route",
+        );
     }
 }

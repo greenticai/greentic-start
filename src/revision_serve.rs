@@ -870,10 +870,11 @@ async fn serve(
         if peer_is_loopback {
             return None;
         }
-        let provider_type = activation
-            .routing
-            .http_routes
-            .provider_type_for(&path, method.as_str())?;
+        let provider_type = activation.routing.http_routes.provider_type_for(
+            &path,
+            method.as_str(),
+            deployment_id,
+        )?;
         let provider = crate::http_routes::derive_provider_name(provider_type)?;
         crate::session_hint_extractor::extract_session_hint(
             &provider,
