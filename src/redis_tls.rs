@@ -12,7 +12,7 @@
 //! [`crate::notifier::redis::RedisNotifier::build`].
 
 /// True for a Redis URL whose scheme requires TLS (`rediss://`).
-pub(crate) fn is_tls_url(url: &str) -> bool {
+fn is_tls_url(url: &str) -> bool {
     url.split_once("://")
         .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("rediss"))
 }
@@ -50,13 +50,9 @@ mod tests {
 
     #[test]
     fn crypto_provider_install_lets_rustls_build_a_client_config() {
-        // Reproduces redis' TLS path — `rustls::ClientConfig::builder()`, which
-        // reads the process-global crypto provider — without any network I/O.
-        // With both ring and aws-lc-rs compiled in, that builder panics unless a
-        // default provider is installed; the guard installs ring for a rediss://
-        // URL, so reaching past `builder()` without panicking proves the
-        // connection path (notifier + pin store) can no longer panic. A plaintext
-        // URL first must NOT be what enables it.
+        // Without a default provider installed, `ClientConfig::builder()` panics
+        // when both ring and aws-lc-rs are compiled in. Verify the guard (rediss://,
+        // not the plaintext no-op) prevents that — reproduces redis' TLS path, no I/O.
         ensure_crypto_provider_for("redis://plaintext:6379"); // no-op
         ensure_crypto_provider_for("rediss://cache.example:6380"); // installs
         let _config = rustls::ClientConfig::builder()

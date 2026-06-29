@@ -52,11 +52,9 @@ rand = "0.10"
 redis = { version = "1", features = [
     "tokio-comp",
     "connection-manager",
-    # TLS for `rediss://` endpoints (managed cloud Redis on Azure/AWS/GCP
-    # mandates it). `tokio-rustls-comp` is the async rustls transport;
-    # `tls-rustls-webpki-roots` uses bundled Mozilla roots so the static
-    # distroless musl binary needs no system cert store. A process-default
-    # crypto provider is required — see revision_pin::ensure_rustls_crypto_provider.
+    # TLS (`rediss://`) via rustls + bundled Mozilla roots (no system cert
+    # store needed, so the distroless musl binary works). Requires a
+    # process-default crypto provider — see redis_tls::ensure_crypto_provider_for.
     "tokio-rustls-comp",
     "tls-rustls-webpki-roots",
 ] }

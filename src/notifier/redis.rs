@@ -106,9 +106,7 @@ impl RedisNotifier {
         let inner = Arc::new(InMemoryNotifier::new(capacity));
         let self_id = Uuid::new_v4();
 
-        // A `rediss://` notifier URL needs a process-default rustls crypto
-        // provider before redis builds its TLS config; no-op for `redis://`.
-        crate::redis_tls::ensure_crypto_provider_for(url);
+        crate::redis_tls::ensure_crypto_provider_for(url); // rustls provider for rediss://
         let client = Client::open(url).with_context(|| format!("invalid redis url: {url}"))?;
 
         // Open the PUB connection (ConnectionManager auto-reconnects on use).

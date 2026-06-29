@@ -442,9 +442,7 @@ impl RedisPinStore {
     /// that handles reconnection transparently.
     pub async fn from_url(url: impl AsRef<str>) -> Result<Self> {
         let url = url.as_ref();
-        // A `rediss://` endpoint needs a process-default rustls crypto provider
-        // in place before redis builds its TLS config; no-op for `redis://`.
-        crate::redis_tls::ensure_crypto_provider_for(url);
+        crate::redis_tls::ensure_crypto_provider_for(url); // rustls provider for rediss://
         let client = redis::Client::open(url)
             .with_context(|| format!("invalid redis url `{}`", redact_redis_url(url)))?;
         let manager = ConnectionManager::new(client)
