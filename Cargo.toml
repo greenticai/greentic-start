@@ -103,27 +103,29 @@ branch = "research"
 [dependencies.axum]
 version = "0.8"
 
-# Pinned to runner research rev e8ecbb4, which moves onto the greentic-types
-# 1.2.0-research line AND enables the multi-provider in-process LLM backend for
-# dw.agent (DeepSeek/Anthropic/… via greentic-llm) through the opt-in
-# `greentic-llm-backend` feature below. Requires greentic-setup, greentic-types,
-# secrets-lib, distributor-client + qa-spec all on the 1.2.0-research line (see
-# the greentic-setup migration, PR greenticai/greentic-setup#162).
+# Pinned to runner research rev 9d56b88 (merge of #503), which moves onto the
+# greentic-types 1.2.0-research line, enables the multi-provider in-process LLM
+# backend for dw.agent (DeepSeek/Anthropic/… via greentic-llm) through the opt-in
+# `greentic-llm-backend` feature below, AND pins greentic-ext-runtime c47a0738
+# (#94 OAuth broker host import + sdk 1.2.19) so OAuth-enabled design extensions
+# load and instantiate. Carries #502 (preflight-warn on tool load failure).
+# Requires greentic-setup, greentic-types, secrets-lib, distributor-client +
+# qa-spec all on the 1.2.0-research line (see greenticai/greentic-setup#162).
 [dependencies.greentic-runner-desktop]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "a110da7efebf49f485cd9159e91899a5621f3dcd"
+rev = "9d56b88598914c39b4837a01475a600cf893de92"
 default-features = false
 features = ["agentic-worker", "greentic-llm-backend", "desktop-agent-ephemeral"]
 
 [dependencies.greentic-runner-host]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "a110da7efebf49f485cd9159e91899a5621f3dcd"
+rev = "9d56b88598914c39b4837a01475a600cf893de92"
 default-features = false
 features = ["agentic-worker", "greentic-llm-backend"]
 
 [dependencies.greentic-aw-runtime]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "a110da7efebf49f485cd9159e91899a5621f3dcd"
+rev = "9d56b88598914c39b4837a01475a600cf893de92"
 default-features = false
 
 [dependencies.greentic-secrets-lib]
@@ -203,6 +205,16 @@ tempfile = "3"
 # here (we pin the published research build above) — a git patch would unify
 # greentic-types graph-wide and break greentic-setup's 0.5 line.
 [patch.crates-io]
-greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.2.15-research" }
+greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.2.19-research" }
 greentic-mcp-exec = { git = "https://github.com/greenticai/greentic-mcp.git", rev = "f0d2f02b002b49612ce25a6af1901a5280757605" }
+
+# NOTE: greentic-ext-runtime is NOT patched here. The runner revs pinned above
+# (9d56b88, runner `research`) already pin greentic-ext-runtime to rev c47a0738,
+# which carries #94 (the `greentic:oauth-broker/broker-v1` host import + the
+# `oauthProviders` describe field) plus the sdk 1.2.19 bump. That rev is what
+# lets OAuth-enabled design extensions (e.g. greentic.hubspot) load AND
+# instantiate — pre-#94 ext-runtime (rev 50ce911) understood neither, so the
+# extension's tools never reached the agent. Bumping the runner rev is the
+# coordinated, in-graph fix; a local ext-runtime [patch] cannot satisfy the
+# graph's exact sdk-contract pins.
 
