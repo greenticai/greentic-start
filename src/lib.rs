@@ -568,14 +568,34 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                         }
                         Err(err) => {
                             let var = revision_pin::PIN_REDIS_URL_ENV;
-                            operator_log::warn(
-                                module_path!(),
-                                format!(
-                                    "{var} set but the Redis pin store is unavailable ({err:#}); \
-                                     falling back to in-memory (pins will not survive a restart \
-                                     or share across pods)"
-                                ),
-                            );
+                            if revision_pin::is_tls_redis_url(&url)
+                                && !revision_pin::REDIS_TLS_SUPPORTED
+                            {
+                                // `rediss://` cannot connect without the redis TLS
+                                // features, and the bare `InvalidClientConfig` error
+                                // reads like a transient blip. Name the cause so the
+                                // operator does not think HA is working when it is not.
+                                operator_log::warn(
+                                    module_path!(),
+                                    format!(
+                                        "{var} points at a TLS endpoint ({}) but this build has \
+                                         no Redis TLS support; rebuild `redis` with the \
+                                         `tls-rustls` + `tokio-rustls-comp` features, or use a \
+                                         non-TLS `redis://` endpoint. Falling back to in-memory \
+                                         (pins will not survive a restart or share across pods)",
+                                        revision_pin::redact_redis_url(&url),
+                                    ),
+                                );
+                            } else {
+                                operator_log::warn(
+                                    module_path!(),
+                                    format!(
+                                        "{var} set but the Redis pin store is unavailable \
+                                         ({err:#}); falling back to in-memory (pins will not \
+                                         survive a restart or share across pods)"
+                                    ),
+                                );
+                            }
                             std::sync::Arc::new(revision_pin::InMemoryPinStore::new())
                         }
                     }

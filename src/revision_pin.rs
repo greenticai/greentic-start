@@ -340,24 +340,53 @@ pub(crate) fn redis_url_from_raw(raw: Option<String>) -> Option<String> {
     raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// Mask the `user:pass@` userinfo of a Redis URL so a credential in the
-/// connection string can never reach a log line or error context. A Redis
-/// URL embeds its password inline (`redis://:pass@host`), and `from_url`
-/// formats the URL into its error context on failure, so an operator log of
-/// that error would otherwise leak the password. Operates on the raw string:
-/// a value that lacks a `://` scheme (i.e. failed to parse as a URL) is
-/// returned fully masked rather than echoing possibly-secret bytes.
+/// Reduce a Redis URL to a safe-to-log `scheme://host[:port]`, dropping
+/// everything that can carry a credential: the `user:pass@` userinfo
+/// (`redis://:pass@host`), the path, AND the query string
+/// (`rediss://host/0?password=…`, `…?token=…`). A Redis URL embeds its
+/// password inline, and `from_url` formats the URL into its error context on
+/// failure, so logging that error would otherwise leak the secret — including
+/// a query credential, which an earlier userinfo-only mask left intact.
+///
+/// Operates on the raw string so an unparseable value is still scrubbed: no
+/// `://` scheme, or an empty authority (e.g. a `redis+unix:///sock` path),
+/// returns a fully-masked placeholder rather than echoing possibly-secret
+/// bytes.
 pub(crate) fn redact_redis_url(raw: &str) -> String {
     let Some((scheme, rest)) = raw.split_once("://") else {
         return "<redacted redis url>".to_string();
     };
-    // `rsplit_once` splits at the last `@`, so a literal `@` inside the
-    // password (which a well-formed URL percent-encodes anyway) still masks
-    // the whole userinfo rather than leaking its tail.
-    match rest.rsplit_once('@') {
-        Some((_userinfo, host_part)) => format!("{scheme}://****@{host_part}"),
-        None => format!("{scheme}://{rest}"),
+    // Authority = everything up to the first `/` (path) or `?` (query). Both
+    // can carry secrets, so neither is kept — this also means a `@` sitting in
+    // a query value can't be mistaken for the userinfo delimiter below.
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
+    // Drop `user:pass@` userinfo. The authority has no path/query left, so the
+    // last `@` (if any) is the userinfo delimiter; the host tail is safe.
+    let host = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => host,
+        None => authority,
+    };
+    if host.is_empty() {
+        "<redacted redis url>".to_string()
+    } else {
+        format!("{scheme}://{host}")
     }
+}
+
+/// Whether this build links `redis` with a TLS transport feature
+/// (`tls-rustls` + `tokio-rustls-comp`). Today it does NOT, so a `rediss://`
+/// URL cannot connect — `Client::open` rejects the scheme before any I/O. The
+/// boot path detects that and tells the operator exactly why instead of
+/// degrading to in-memory silently (which reads like a transient outage).
+/// Flip to `true` in lockstep with enabling the `redis` TLS features.
+pub(crate) const REDIS_TLS_SUPPORTED: bool = false;
+
+/// True for a Redis URL whose scheme requires TLS (`rediss://`). Paired with
+/// [`REDIS_TLS_SUPPORTED`] at boot to turn an otherwise-cryptic
+/// `InvalidClientConfig` into an actionable message.
+pub(crate) fn is_tls_redis_url(url: &str) -> bool {
+    url.split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("rediss"))
 }
 
 pub struct RedisPinStore {
@@ -644,22 +673,51 @@ mod tests {
 
     #[test]
     fn redact_redis_url_masks_inline_credentials() {
-        // Password-only and user:pass userinfo are both masked whole.
+        // Password-only and user:pass userinfo, plus path, are dropped.
         assert_eq!(
             redact_redis_url("redis://:s3cr3t@cache.internal:6379/0"),
-            "redis://****@cache.internal:6379/0",
+            "redis://cache.internal:6379",
         );
         assert_eq!(
             redact_redis_url("rediss://admin:p@ss@cache:6380"),
-            "rediss://****@cache:6380",
+            "rediss://cache:6380",
         );
-        // No userinfo: nothing secret to mask, returned intact.
+        // No userinfo: host+port kept, path dropped.
         assert_eq!(
             redact_redis_url("redis://127.0.0.1:6379/0"),
-            "redis://127.0.0.1:6379/0",
+            "redis://127.0.0.1:6379",
+        );
+        // Query-string credentials are dropped (the high-severity vector: no
+        // `@`, so an earlier userinfo-only mask left `?password=` intact).
+        assert_eq!(
+            redact_redis_url("rediss://cache:6380/0?password=s3cr3t"),
+            "rediss://cache:6380",
+        );
+        // A `@` inside a query value is not mistaken for userinfo.
+        assert_eq!(
+            redact_redis_url("redis://cache:6379/0?token=ab@cd"),
+            "redis://cache:6379",
+        );
+        // Bracketed IPv6 host is preserved while creds are stripped.
+        assert_eq!(
+            redact_redis_url("rediss://:pw@[::1]:6380/0"),
+            "rediss://[::1]:6380",
+        );
+        // Empty authority (unix-socket path) is fully masked, not echoed.
+        assert_eq!(
+            redact_redis_url("redis+unix:///var/run/redis.sock?pass=x"),
+            "<redacted redis url>",
         );
         // Unparseable (no scheme) is fully masked, never echoed.
         assert_eq!(redact_redis_url(":s3cr3t@host"), "<redacted redis url>");
+    }
+
+    #[test]
+    fn is_tls_redis_url_detects_rediss_scheme() {
+        assert!(is_tls_redis_url("rediss://cache:6380/0"));
+        assert!(is_tls_redis_url("REDISS://cache:6380")); // scheme is case-insensitive
+        assert!(!is_tls_redis_url("redis://cache:6379/0"));
+        assert!(!is_tls_redis_url("cache:6379")); // no scheme
     }
 
     #[tokio::test]
