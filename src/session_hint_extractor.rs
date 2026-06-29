@@ -150,16 +150,22 @@ fn slack_hint_json(body: &[u8]) -> Option<String> {
 fn slack_hint_form(body: &[u8]) -> Option<String> {
     let body_str = std::str::from_utf8(body).ok()?;
     for pair in body_str.split('&') {
-        let (key, value) = pair.split_once('=')?;
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
         match key {
             "channel_id" => {
-                let decoded = urlencoding::decode(value).ok()?;
+                let Ok(decoded) = urlencoding::decode(value) else {
+                    continue;
+                };
                 if !decoded.is_empty() {
                     return Some(format!("slack:{decoded}"));
                 }
             }
             "payload" => {
-                let decoded = urlencoding::decode(value).ok()?;
+                let Ok(decoded) = urlencoding::decode(value) else {
+                    continue;
+                };
                 let parsed: Value = serde_json::from_str(&decoded).ok()?;
                 if let Some(ch) = parsed
                     .get("channel")
