@@ -963,9 +963,11 @@ mod tests {
         assert!(candidates.contains(
             &"secrets://dev/acme/_/agentic-research-tavily-demo/llm_deepseek".to_string()
         ));
-        assert!(candidates.contains(
-            &"secrets://dev/acme/_/agentic-research-tavily-demo/deepseek".to_string()
-        ));
+        assert!(
+            candidates.contains(
+                &"secrets://dev/acme/_/agentic-research-tavily-demo/deepseek".to_string()
+            )
+        );
         // The already-tried exact path is never re-offered.
         assert!(!candidates.contains(&"secrets://default/acme/_/llm/deepseek".to_string()));
     }
@@ -1036,8 +1038,8 @@ mod tests {
 
         // Tool secret: `StoreToolSecretsBackend` hands the manager the canonical
         // `secrets://dev/demo/_/tavily/api_key` scope.
-        let tavily =
-            runtime.block_on(async { manager.read("secrets://dev/demo/_/tavily/api_key").await })?;
+        let tavily = runtime
+            .block_on(async { manager.read("secrets://dev/demo/_/tavily/api_key").await })?;
         assert_eq!(String::from_utf8(tavily)?, "tvly-test");
 
         Ok(())
