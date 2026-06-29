@@ -24,9 +24,10 @@
 //! [`RedisPinStore`] via
 //! [`RevisionDispatcher::with_pin_store`](crate::revision_dispatcher::RevisionDispatcher::with_pin_store).
 
-// `RedisPinStore` is scaffolded ahead of a Phase D producer; today only the
-// in-memory path has a live caller. Same shape as `revision_dispatcher`'s
-// pre-B3 `#![allow(dead_code)]`.
+// `RedisPinStore` has a live boot caller behind `PIN_REDIS_URL_ENV` (B2), but
+// its tuning setters (`with_op_timeout`, `with_cardinality_cap`) are exercised
+// only from tests. Same shape as `revision_dispatcher`'s pre-B3
+// `#![allow(dead_code)]`.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -322,6 +323,125 @@ return {0, ARGV[2]}
 static TRY_PIN_SCRIPT_HANDLE: LazyLock<redis::Script> =
     LazyLock::new(|| redis::Script::new(TRY_PIN_SCRIPT));
 
+/// Boot env var selecting the Redis-backed session-pin store (B2). Mirrors
+/// `GREENTIC_SECRETS_BACKEND`'s connection-string-via-env convention: set it
+/// to a Redis URL (`redis://[:pass@]host:port/db`) and the serve loop builds a
+/// shared [`RedisPinStore`] instead of the per-process [`InMemoryPinStore`], so
+/// session pins survive a pod restart and are shared across a horizontally
+/// scaled fleet. Unset/empty keeps the single-process in-memory store.
+pub(crate) const PIN_REDIS_URL_ENV: &str = "GREENTIC_REVISION_PIN_REDIS_URL";
+
+/// Normalize the raw [`PIN_REDIS_URL_ENV`] value into an actionable URL:
+/// `None` (unset) and a blank/whitespace-only string both mean "no Redis,
+/// use in-memory". Kept pure (takes the raw value rather than reading the
+/// process env) so the select decision is unit-testable without env mutation;
+/// the boot site supplies `std::env::var(PIN_REDIS_URL_ENV).ok()`.
+pub(crate) fn redis_url_from_raw(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Reduce a Redis URL to a safe-to-log `scheme://host[:port]`, dropping
+/// everything that can carry a credential: the `user:pass@` userinfo
+/// (`redis://:pass@host`), the path, AND the query string
+/// (`rediss://host/0?password=…`, `…?token=…`). A Redis URL embeds its
+/// password inline, and `from_url` formats the URL into its error context on
+/// failure, so logging that error would otherwise leak the secret — including
+/// a query credential, which an earlier userinfo-only mask left intact.
+///
+/// Operates on the raw string so an unparseable value is still scrubbed: no
+/// `://` scheme, or an empty authority (e.g. a `redis+unix:///sock` path),
+/// returns a fully-masked placeholder rather than echoing possibly-secret
+/// bytes.
+pub(crate) fn redact_redis_url(raw: &str) -> String {
+    const REDACTED: &str = "<redacted redis url>";
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return REDACTED.to_string();
+    };
+    // Authority = everything up to the first `/` (path) or `?` (query). Both
+    // can carry secrets, so neither is kept — this also means a `@` sitting in
+    // a query value can't be mistaken for the userinfo delimiter below.
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
+    // Drop `user:pass@` userinfo. The authority has no path/query left, so the
+    // last `@` (if any) is the userinfo delimiter; the host tail is safe.
+    let host = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => host,
+        None => authority,
+    };
+    if host.is_empty() {
+        REDACTED.to_string()
+    } else {
+        format!("{scheme}://{host}")
+    }
+}
+
+/// Whether this build links `redis` with a TLS transport feature
+/// (`tls-rustls` + `tokio-rustls-comp`). Today it does NOT, so a `rediss://`
+/// URL cannot connect — `Client::open` rejects the scheme before any I/O. The
+/// boot path detects that and tells the operator exactly why instead of
+/// degrading to in-memory silently (which reads like a transient outage).
+/// Flip to `true` in lockstep with enabling the `redis` TLS features.
+pub(crate) const REDIS_TLS_SUPPORTED: bool = false;
+
+/// True for a Redis URL whose scheme requires TLS (`rediss://`). Paired with
+/// [`REDIS_TLS_SUPPORTED`] at boot to turn an otherwise-cryptic
+/// `InvalidClientConfig` into an actionable message.
+pub(crate) fn is_tls_redis_url(url: &str) -> bool {
+    url.split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("rediss"))
+}
+
+/// Resolve the session-pin store backend for the serve loop (B2). Mirrors
+/// `secrets_gate::resolve_serve_secrets_manager`: reads its selecting env var
+/// ([`PIN_REDIS_URL_ENV`]) internally, connects or falls back, logs the
+/// outcome, and hands back a ready `Arc`. `rt` is the activation runtime the
+/// boot path already builds; the async [`RedisPinStore::from_url`] is driven on
+/// it.
+///
+/// Fail open: an invalid or unreachable Redis logs a warning and yields the
+/// in-memory store rather than aborting boot — pinning is best-effort (the
+/// stickiness cookie + weighted pick still route), so a transient Redis outage
+/// must not brick the worker.
+pub(crate) fn resolve_pin_store(
+    rt: &tokio::runtime::Runtime,
+) -> std::sync::Arc<dyn RevisionPinStore> {
+    use std::sync::Arc;
+    let Some(url) = redis_url_from_raw(std::env::var(PIN_REDIS_URL_ENV).ok()) else {
+        return Arc::new(InMemoryPinStore::new());
+    };
+    match rt.block_on(RedisPinStore::from_url(&url)) {
+        Ok(store) => {
+            crate::operator_log::info(
+                module_path!(),
+                "session-pin store: redis (multi-pod sticky routing)",
+            );
+            Arc::new(store)
+        }
+        Err(err) => {
+            // Fail open to in-memory; name the cause so a permanent misconfig
+            // is not mistaken for a transient blip.
+            let reason = if is_tls_redis_url(&url) && !REDIS_TLS_SUPPORTED {
+                // `rediss://` cannot connect without the redis TLS features.
+                format!(
+                    "{PIN_REDIS_URL_ENV} points at a TLS endpoint ({}) but this build has no \
+                     Redis TLS support; rebuild `redis` with the `tls-rustls` + \
+                     `tokio-rustls-comp` features, or use a non-TLS `redis://` endpoint",
+                    redact_redis_url(&url),
+                )
+            } else {
+                format!("{PIN_REDIS_URL_ENV} set but the Redis pin store is unavailable ({err:#})")
+            };
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "{reason}; falling back to in-memory (pins will not survive a restart or \
+                     share across pods)"
+                ),
+            );
+            Arc::new(InMemoryPinStore::new())
+        }
+    }
+}
+
 pub struct RedisPinStore {
     /// `ConnectionManager` is `Clone` and internally pipelines/multiplexes
     /// commands across a shared connection, so we hold it bare — no Mutex
@@ -346,7 +466,7 @@ impl RedisPinStore {
     /// build a [`ConnectionManager`] that handles reconnection transparently.
     pub async fn from_url(url: impl AsRef<str>) -> Result<Self> {
         let client = redis::Client::open(url.as_ref())
-            .with_context(|| format!("invalid redis url `{}`", url.as_ref()))?;
+            .with_context(|| format!("invalid redis url `{}`", redact_redis_url(url.as_ref())))?;
         let manager = ConnectionManager::new(client)
             .await
             .context("redis ConnectionManager init failed")?;
@@ -591,6 +711,66 @@ mod tests {
     }
     fn rev() -> RevisionId {
         RevisionId::new()
+    }
+
+    #[test]
+    fn redis_url_from_raw_treats_unset_and_blank_as_in_memory() {
+        assert_eq!(redis_url_from_raw(None), None);
+        assert_eq!(redis_url_from_raw(Some(String::new())), None);
+        assert_eq!(redis_url_from_raw(Some("   ".to_string())), None);
+        assert_eq!(
+            redis_url_from_raw(Some("  redis://127.0.0.1:6379/0  ".to_string())),
+            Some("redis://127.0.0.1:6379/0".to_string()),
+        );
+    }
+
+    #[test]
+    fn redact_redis_url_masks_inline_credentials() {
+        // Password-only and user:pass userinfo, plus path, are dropped.
+        assert_eq!(
+            redact_redis_url("redis://:s3cr3t@cache.internal:6379/0"),
+            "redis://cache.internal:6379",
+        );
+        assert_eq!(
+            redact_redis_url("rediss://admin:p@ss@cache:6380"),
+            "rediss://cache:6380",
+        );
+        // No userinfo: host+port kept, path dropped.
+        assert_eq!(
+            redact_redis_url("redis://127.0.0.1:6379/0"),
+            "redis://127.0.0.1:6379",
+        );
+        // Query-string credentials are dropped (the high-severity vector: no
+        // `@`, so an earlier userinfo-only mask left `?password=` intact).
+        assert_eq!(
+            redact_redis_url("rediss://cache:6380/0?password=s3cr3t"),
+            "rediss://cache:6380",
+        );
+        // A `@` inside a query value is not mistaken for userinfo.
+        assert_eq!(
+            redact_redis_url("redis://cache:6379/0?token=ab@cd"),
+            "redis://cache:6379",
+        );
+        // Bracketed IPv6 host is preserved while creds are stripped.
+        assert_eq!(
+            redact_redis_url("rediss://:pw@[::1]:6380/0"),
+            "rediss://[::1]:6380",
+        );
+        // Empty authority (unix-socket path) is fully masked, not echoed.
+        assert_eq!(
+            redact_redis_url("redis+unix:///var/run/redis.sock?pass=x"),
+            "<redacted redis url>",
+        );
+        // Unparseable (no scheme) is fully masked, never echoed.
+        assert_eq!(redact_redis_url(":s3cr3t@host"), "<redacted redis url>");
+    }
+
+    #[test]
+    fn is_tls_redis_url_detects_rediss_scheme() {
+        assert!(is_tls_redis_url("rediss://cache:6380/0"));
+        assert!(is_tls_redis_url("REDISS://cache:6380")); // scheme is case-insensitive
+        assert!(!is_tls_redis_url("redis://cache:6379/0"));
+        assert!(!is_tls_redis_url("cache:6379")); // no scheme
     }
 
     #[tokio::test]

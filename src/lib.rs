@@ -532,21 +532,22 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             std::sync::Arc::clone(&runtime_refs_store),
         ));
 
+        let activation_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("building runtime for revision activation")?;
+
         // B1a: one session-pin store for the env's whole lifetime. The SAME
         // `Arc` flows into BOTH the cold-start activation AND every
         // reload-rebuilt activation (via the watcher's `default_rebuild`), so a
         // traffic reweight — which rebuilds the dispatcher through reload — does
         // not discard live session pins. Without this, every reweight would
         // re-pick a fresh revision for in-flight conversations on connectors
-        // that hold no stickiness cookie (i.e. every messaging provider).
-        // In-memory today; the Redis-backed store swaps in here for multi-pod.
-        let pin_store: std::sync::Arc<dyn revision_pin::RevisionPinStore> =
-            std::sync::Arc::new(revision_pin::InMemoryPinStore::new());
-
-        let activation_rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("building runtime for revision activation")?;
+        // that hold no stickiness cookie (i.e. every messaging provider). B2:
+        // `resolve_pin_store` backs it with Redis when
+        // `GREENTIC_REVISION_PIN_REDIS_URL` is configured (fail-open to
+        // in-memory); see that fn for the rationale.
+        let pin_store = revision_pin::resolve_pin_store(&activation_rt);
         let activation = activation_rt.block_on(revision_boot::activate_runtime_config(
             &store_root,
             &rc,
