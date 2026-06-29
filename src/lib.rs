@@ -532,6 +532,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             std::sync::Arc::clone(&runtime_refs_store),
         ));
 
+        let activation_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("building runtime for revision activation")?;
+
         // B1a: one session-pin store for the env's whole lifetime. The SAME
         // `Arc` flows into BOTH the cold-start activation AND every
         // reload-rebuilt activation (via the watcher's `default_rebuild`), so a
@@ -539,14 +544,44 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // not discard live session pins. Without this, every reweight would
         // re-pick a fresh revision for in-flight conversations on connectors
         // that hold no stickiness cookie (i.e. every messaging provider).
-        // In-memory today; the Redis-backed store swaps in here for multi-pod.
+        //
+        // B2: when `GREENTIC_REVISION_PIN_REDIS_URL` is set, back the store with
+        // Redis so pins survive a pod restart and are shared across a
+        // horizontally scaled fleet — the in-memory store is per-process, lost
+        // on restart and invisible to sibling pods. Fail open: an invalid or
+        // unreachable Redis at boot logs a warning and falls back to in-memory
+        // rather than blocking the serve loop, because pinning is a best-effort
+        // optimization (the stickiness cookie + weighted pick still route), so a
+        // transient Redis outage must not brick the worker.
         let pin_store: std::sync::Arc<dyn revision_pin::RevisionPinStore> =
-            std::sync::Arc::new(revision_pin::InMemoryPinStore::new());
-
-        let activation_rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("building runtime for revision activation")?;
+            match revision_pin::redis_url_from_raw(
+                std::env::var(revision_pin::PIN_REDIS_URL_ENV).ok(),
+            ) {
+                Some(url) => {
+                    match activation_rt.block_on(revision_pin::RedisPinStore::from_url(&url)) {
+                        Ok(store) => {
+                            operator_log::info(
+                                module_path!(),
+                                "session-pin store: redis (multi-pod sticky routing)",
+                            );
+                            std::sync::Arc::new(store)
+                        }
+                        Err(err) => {
+                            let var = revision_pin::PIN_REDIS_URL_ENV;
+                            operator_log::warn(
+                                module_path!(),
+                                format!(
+                                    "{var} set but the Redis pin store is unavailable ({err:#}); \
+                                     falling back to in-memory (pins will not survive a restart \
+                                     or share across pods)"
+                                ),
+                            );
+                            std::sync::Arc::new(revision_pin::InMemoryPinStore::new())
+                        }
+                    }
+                }
+                None => std::sync::Arc::new(revision_pin::InMemoryPinStore::new()),
+            };
         let activation = activation_rt.block_on(revision_boot::activate_runtime_config(
             &store_root,
             &rc,

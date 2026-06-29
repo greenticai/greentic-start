@@ -24,9 +24,10 @@
 //! [`RedisPinStore`] via
 //! [`RevisionDispatcher::with_pin_store`](crate::revision_dispatcher::RevisionDispatcher::with_pin_store).
 
-// `RedisPinStore` is scaffolded ahead of a Phase D producer; today only the
-// in-memory path has a live caller. Same shape as `revision_dispatcher`'s
-// pre-B3 `#![allow(dead_code)]`.
+// `RedisPinStore` has a live boot caller behind `PIN_REDIS_URL_ENV` (B2), but
+// its tuning setters (`with_op_timeout`, `with_cardinality_cap`) are exercised
+// only from tests. Same shape as `revision_dispatcher`'s pre-B3
+// `#![allow(dead_code)]`.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -322,6 +323,23 @@ return {0, ARGV[2]}
 static TRY_PIN_SCRIPT_HANDLE: LazyLock<redis::Script> =
     LazyLock::new(|| redis::Script::new(TRY_PIN_SCRIPT));
 
+/// Boot env var selecting the Redis-backed session-pin store (B2). Mirrors
+/// `GREENTIC_SECRETS_BACKEND`'s connection-string-via-env convention: set it
+/// to a Redis URL (`redis://[:pass@]host:port/db`) and the serve loop builds a
+/// shared [`RedisPinStore`] instead of the per-process [`InMemoryPinStore`], so
+/// session pins survive a pod restart and are shared across a horizontally
+/// scaled fleet. Unset/empty keeps the single-process in-memory store.
+pub(crate) const PIN_REDIS_URL_ENV: &str = "GREENTIC_REVISION_PIN_REDIS_URL";
+
+/// Normalize the raw [`PIN_REDIS_URL_ENV`] value into an actionable URL:
+/// `None` (unset) and a blank/whitespace-only string both mean "no Redis,
+/// use in-memory". Kept pure (takes the raw value rather than reading the
+/// process env) so the select decision is unit-testable without env mutation;
+/// the boot site supplies `std::env::var(PIN_REDIS_URL_ENV).ok()`.
+pub(crate) fn redis_url_from_raw(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 pub struct RedisPinStore {
     /// `ConnectionManager` is `Clone` and internally pipelines/multiplexes
     /// commands across a shared connection, so we hold it bare — no Mutex
@@ -591,6 +609,17 @@ mod tests {
     }
     fn rev() -> RevisionId {
         RevisionId::new()
+    }
+
+    #[test]
+    fn redis_url_from_raw_treats_unset_and_blank_as_in_memory() {
+        assert_eq!(redis_url_from_raw(None), None);
+        assert_eq!(redis_url_from_raw(Some(String::new())), None);
+        assert_eq!(redis_url_from_raw(Some("   ".to_string())), None);
+        assert_eq!(
+            redis_url_from_raw(Some("  redis://127.0.0.1:6379/0  ".to_string())),
+            Some("redis://127.0.0.1:6379/0".to_string()),
+        );
     }
 
     #[tokio::test]
