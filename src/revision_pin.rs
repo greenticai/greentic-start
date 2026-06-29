@@ -374,22 +374,6 @@ pub(crate) fn redact_redis_url(raw: &str) -> String {
     }
 }
 
-/// Whether this build links `redis` with a TLS transport feature
-/// (`tls-rustls` + `tokio-rustls-comp`). Today it does NOT, so a `rediss://`
-/// URL cannot connect — `Client::open` rejects the scheme before any I/O. The
-/// boot path detects that and tells the operator exactly why instead of
-/// degrading to in-memory silently (which reads like a transient outage).
-/// Flip to `true` in lockstep with enabling the `redis` TLS features.
-pub(crate) const REDIS_TLS_SUPPORTED: bool = false;
-
-/// True for a Redis URL whose scheme requires TLS (`rediss://`). Paired with
-/// [`REDIS_TLS_SUPPORTED`] at boot to turn an otherwise-cryptic
-/// `InvalidClientConfig` into an actionable message.
-pub(crate) fn is_tls_redis_url(url: &str) -> bool {
-    url.split_once("://")
-        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("rediss"))
-}
-
 /// Resolve the session-pin store backend for the serve loop (B2). Mirrors
 /// `secrets_gate::resolve_serve_secrets_manager`: reads its selecting env var
 /// ([`PIN_REDIS_URL_ENV`]) internally, connects or falls back, logs the
@@ -417,24 +401,15 @@ pub(crate) fn resolve_pin_store(
             Arc::new(store)
         }
         Err(err) => {
-            // Fail open to in-memory; name the cause so a permanent misconfig
-            // is not mistaken for a transient blip.
-            let reason = if is_tls_redis_url(&url) && !REDIS_TLS_SUPPORTED {
-                // `rediss://` cannot connect without the redis TLS features.
-                format!(
-                    "{PIN_REDIS_URL_ENV} points at a TLS endpoint ({}) but this build has no \
-                     Redis TLS support; rebuild `redis` with the `tls-rustls` + \
-                     `tokio-rustls-comp` features, or use a non-TLS `redis://` endpoint",
-                    redact_redis_url(&url),
-                )
-            } else {
-                format!("{PIN_REDIS_URL_ENV} set but the Redis pin store is unavailable ({err:#})")
-            };
+            // Fail open to in-memory; name the cause (the redacted URL is
+            // preserved in the error context) so a permanent misconfig is not
+            // mistaken for a transient blip.
             crate::operator_log::warn(
                 module_path!(),
                 format!(
-                    "{reason}; falling back to in-memory (pins will not survive a restart or \
-                     share across pods)"
+                    "{PIN_REDIS_URL_ENV} set but the Redis pin store is unavailable ({err:#}); \
+                     falling back to in-memory (pins will not survive a restart or share across \
+                     pods)"
                 ),
             );
             Arc::new(InMemoryPinStore::new())
@@ -462,11 +437,14 @@ impl std::fmt::Debug for RedisPinStore {
 }
 
 impl RedisPinStore {
-    /// Open a Redis client from a URL (e.g. `redis://127.0.0.1:6379/0`) and
-    /// build a [`ConnectionManager`] that handles reconnection transparently.
+    /// Open a Redis client from a URL (`redis://…`, or `rediss://…` for TLS
+    /// endpoints such as managed cloud Redis) and build a [`ConnectionManager`]
+    /// that handles reconnection transparently.
     pub async fn from_url(url: impl AsRef<str>) -> Result<Self> {
-        let client = redis::Client::open(url.as_ref())
-            .with_context(|| format!("invalid redis url `{}`", redact_redis_url(url.as_ref())))?;
+        let url = url.as_ref();
+        crate::redis_tls::ensure_crypto_provider_for(url); // rustls provider for rediss://
+        let client = redis::Client::open(url)
+            .with_context(|| format!("invalid redis url `{}`", redact_redis_url(url)))?;
         let manager = ConnectionManager::new(client)
             .await
             .context("redis ConnectionManager init failed")?;
@@ -766,11 +744,15 @@ mod tests {
     }
 
     #[test]
-    fn is_tls_redis_url_detects_rediss_scheme() {
-        assert!(is_tls_redis_url("rediss://cache:6380/0"));
-        assert!(is_tls_redis_url("REDISS://cache:6380")); // scheme is case-insensitive
-        assert!(!is_tls_redis_url("redis://cache:6379/0"));
-        assert!(!is_tls_redis_url("cache:6379")); // no scheme
+    fn rediss_scheme_is_accepted_now_that_tls_is_compiled_in() {
+        // Regression guard for the redis TLS features: without a TLS transport
+        // linked, `Client::open` rejects the `rediss://` scheme up front. With
+        // `tokio-rustls-comp` enabled it parses. The connection itself is not
+        // attempted here (that needs a live TLS server) — this only proves the
+        // scheme is no longer refused, i.e. the features stay enabled.
+        assert!(redis::Client::open("rediss://127.0.0.1:6390/0").is_ok());
+        // Plaintext stays valid too.
+        assert!(redis::Client::open("redis://127.0.0.1:6379/0").is_ok());
     }
 
     #[tokio::test]

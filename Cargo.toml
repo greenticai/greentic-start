@@ -49,7 +49,15 @@ opentelemetry-appender-tracing = "0.32"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto"] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "logs"] }
 rand = "0.10"
-redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1", features = [
+    "tokio-comp",
+    "connection-manager",
+    # TLS (`rediss://`) via rustls + bundled Mozilla roots (no system cert
+    # store needed, so the distroless musl binary works). Requires a
+    # process-default crypto provider — see redis_tls::ensure_crypto_provider_for.
+    "tokio-rustls-comp",
+    "tls-rustls-webpki-roots",
+] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 rpassword = "7"
 rustls = "0.23"
