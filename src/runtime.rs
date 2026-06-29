@@ -824,6 +824,14 @@ pub fn demo_up_services(
         validate_messaging_app_route(config_dir, tenant, Some(team))
             .with_context(|| "messaging app route validation failed")?;
     }
+    // Pre-flight: fail closed BEFORE the HTTP ingress server binds when a flow
+    // references a `dw.agent` (agentic worker) that the assembled agent map does
+    // not provide. Without this the missing worker is only discovered at
+    // conversation time and silently swallowed into a generic error reply. The
+    // provided set is the assembled agent map keys (bundle DwApplication packs +
+    // GREENTIC_AW_AGENTS_FILE overlay), so an env-file agent is honoured.
+    crate::runner_host::check_bundle_dw_agents(config_dir, tenant, Some(team))
+        .with_context(|| "dw.agent pre-flight validation failed")?;
     let ingress_server = start_http_ingress_server(
         config,
         &ingress_domains,
