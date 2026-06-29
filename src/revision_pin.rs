@@ -374,30 +374,6 @@ pub(crate) fn redact_redis_url(raw: &str) -> String {
     }
 }
 
-/// True for a Redis URL whose scheme requires TLS (`rediss://`). Gates the
-/// one-time rustls crypto-provider install in [`resolve_pin_store`] so a
-/// plaintext `redis://` deployment pays no TLS setup.
-pub(crate) fn is_tls_redis_url(url: &str) -> bool {
-    url.split_once("://")
-        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("rediss"))
-}
-
-/// Install a process-default rustls crypto provider (ring) the first time a TLS
-/// Redis endpoint is configured. `redis` builds its TLS `ClientConfig` through
-/// `rustls::ClientConfig::builder()`, which reads the process-global default;
-/// with both `ring` and `aws-lc-rs` in the dependency tree rustls cannot pick a
-/// backend automatically and that builder *panics*. Installing ring up front —
-/// the same backend `admin_server` uses — keeps the panic from ever firing.
-/// Idempotent: if another component installed a provider first it wins and the
-/// returned error is ignored.
-fn ensure_rustls_crypto_provider() {
-    use std::sync::Once;
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
 /// Resolve the session-pin store backend for the serve loop (B2). Mirrors
 /// `secrets_gate::resolve_serve_secrets_manager`: reads its selecting env var
 /// ([`PIN_REDIS_URL_ENV`]) internally, connects or falls back, logs the
@@ -416,11 +392,6 @@ pub(crate) fn resolve_pin_store(
     let Some(url) = redis_url_from_raw(std::env::var(PIN_REDIS_URL_ENV).ok()) else {
         return Arc::new(InMemoryPinStore::new());
     };
-    // A `rediss://` endpoint needs a process-default rustls crypto provider in
-    // place before redis builds its TLS config; see `ensure_rustls_crypto_provider`.
-    if is_tls_redis_url(&url) {
-        ensure_rustls_crypto_provider();
-    }
     match rt.block_on(RedisPinStore::from_url(&url)) {
         Ok(store) => {
             crate::operator_log::info(
@@ -470,8 +441,12 @@ impl RedisPinStore {
     /// endpoints such as managed cloud Redis) and build a [`ConnectionManager`]
     /// that handles reconnection transparently.
     pub async fn from_url(url: impl AsRef<str>) -> Result<Self> {
-        let client = redis::Client::open(url.as_ref())
-            .with_context(|| format!("invalid redis url `{}`", redact_redis_url(url.as_ref())))?;
+        let url = url.as_ref();
+        // A `rediss://` endpoint needs a process-default rustls crypto provider
+        // in place before redis builds its TLS config; no-op for `redis://`.
+        crate::redis_tls::ensure_crypto_provider_for(url);
+        let client = redis::Client::open(url)
+            .with_context(|| format!("invalid redis url `{}`", redact_redis_url(url)))?;
         let manager = ConnectionManager::new(client)
             .await
             .context("redis ConnectionManager init failed")?;
@@ -768,14 +743,6 @@ mod tests {
         );
         // Unparseable (no scheme) is fully masked, never echoed.
         assert_eq!(redact_redis_url(":s3cr3t@host"), "<redacted redis url>");
-    }
-
-    #[test]
-    fn is_tls_redis_url_detects_rediss_scheme() {
-        assert!(is_tls_redis_url("rediss://cache:6380/0"));
-        assert!(is_tls_redis_url("REDISS://cache:6380")); // scheme is case-insensitive
-        assert!(!is_tls_redis_url("redis://cache:6379/0"));
-        assert!(!is_tls_redis_url("cache:6379")); // no scheme
     }
 
     #[test]

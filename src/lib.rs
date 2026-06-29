@@ -61,6 +61,7 @@ mod project;
 mod provider_auth;
 pub mod provider_config_envelope;
 mod qa_persist;
+mod redis_tls;
 mod revision_boot;
 mod revision_dispatcher;
 mod revision_drain;
