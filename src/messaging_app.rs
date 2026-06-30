@@ -22,6 +22,7 @@ use crate::runner_host::OperatorContext;
 pub struct AppPackInfo {
     pub pack_id: String,
     pub flows: Vec<AppFlowInfo>,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -174,7 +175,12 @@ pub fn load_app_pack_info(pack_path: &Path) -> Result<AppPackInfo> {
     let pack_id = extract_text_or_symbol(&value, "pack_id", "pack_ids")
         .ok_or_else(|| anyhow::anyhow!("pack manifest missing pack id in {pack_path:?}"))?;
     let flows = extract_flows(&value);
-    Ok(AppPackInfo { pack_id, flows })
+    let capabilities = extract_capabilities(&value);
+    Ok(AppPackInfo {
+        pack_id,
+        flows,
+        capabilities,
+    })
 }
 
 pub fn select_app_flow(info: &AppPackInfo) -> Result<&AppFlowInfo> {
@@ -251,22 +257,218 @@ pub fn run_app_flow(
     let target_node = envelope_for_flow
         .metadata
         .get("routeToCardId")
-        .or_else(|| envelope_for_flow.metadata.get("toCardId"));
+        .or_else(|| envelope_for_flow.metadata.get("toCardId"))
+        .or_else(|| envelope_for_flow.metadata.get("nextCardId"));
     operator_log::info(
         module_path!(),
         format!(
-            "[messaging_app] run_app_flow completed run_dir={} target_node={}",
+            "[messaging_app] run_app_flow completed run_dir={} target_node={} status={:?} failures={}",
             output.run_dir.display(),
-            target_node.map(String::as_str).unwrap_or("<none>")
+            target_node.map(String::as_str).unwrap_or("<none>"),
+            output.result.status,
+            output.result.failures.len(),
         ),
     );
-    let value = collect_transcript_outputs_with_retry(
+
+    // Flow-failure short-circuit: when a node failed, the transcript.jsonl
+    // contains only the last *successful* node's output (since failed nodes
+    // never write a transcript entry). Reading transcript here would return
+    // a stale envelope from an earlier node (e.g. the menu card), causing
+    // the chat to "loop" instead of surfacing the error. Build a metadata-only
+    // value from result.failures so parse_envelopes routes through the
+    // flow_error categorization branch instead.
+    //
+    // Skip the synthetic `_runtime` failure that the desktop runner injects
+    // when a Waiting status (e.g. "awaiting user submit at node ...") is
+    // converted into an Err. That isn't a real failure: the flow rendered
+    // the welcome card and is paused for the next inbound activity. Reading
+    // transcript in that case correctly returns the welcome card.
+    let real_failure = output
+        .result
+        .failures
+        .iter()
+        .find(|(node_id, _)| node_id.as_str() != "_runtime");
+    if !matches!(
+        output.result.status,
+        greentic_runner_desktop::RunStatus::Success
+    ) && let Some((failed_node_id, failure)) = real_failure
+    {
+        let error_value = json!({
+            "metadata": {
+                "error_kind": "flow_node_failed",
+                "error_message": failure.message,
+                "node_id": failed_node_id,
+            }
+        });
+        return parse_envelopes(&error_value, envelope);
+    }
+
+    let mut value = collect_transcript_outputs_with_retry(
         &output.run_dir,
         target_node.map(|s| s.as_str()),
         envelope,
     )?
     .ok_or_else(|| anyhow::anyhow!("app flow produced no outputs"))?;
+    // OAuth bake-in: the adapter's Connect card carries a `scheme|provider` state;
+    // mint a signed state token (host knows pack/tenant/team) so /oauth/callback
+    // can resolve pack-scoped creds + persist the token.
+    augment_oauth_connect_state(
+        &mut value,
+        pack_id,
+        &ctx.tenant,
+        ctx.team.as_deref().unwrap_or("default"),
+        (!envelope.session_id.is_empty()).then_some(envelope.session_id.as_str()),
+    );
     parse_envelopes(&value, envelope)
+}
+
+/// Replace the adapter's `state=scheme|provider` in a Connect card's authorize URL
+/// with a host-signed `crate::oauth_state` token carrying the full context.
+///
+/// `renderedCard` can be nested anywhere in the node output, so we walk the whole
+/// value and rewrite the `state` of any `oauth/authorize` URL we find.
+fn augment_oauth_connect_state(
+    value: &mut JsonValue,
+    pack_id: &str,
+    tenant: &str,
+    team: &str,
+    conv: Option<&str>,
+) {
+    match value {
+        JsonValue::Object(map) => {
+            if let Some(url) = map.get("url").and_then(|u| u.as_str()).map(String::from)
+                && let Some(new_url) = sign_authorize_url_state(&url, pack_id, tenant, team, conv)
+            {
+                map.insert("url".to_string(), JsonValue::String(new_url));
+            }
+            for (_, v) in map.iter_mut() {
+                augment_oauth_connect_state(v, pack_id, tenant, team, conv);
+            }
+        }
+        JsonValue::Array(arr) => {
+            for v in arr.iter_mut() {
+                augment_oauth_connect_state(v, pack_id, tenant, team, conv);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// If `url` is an OAuth `authorize` URL carrying a `state=scheme|provider`, return
+/// the same URL with `state` replaced by a signed `crate::oauth_state` token; else
+/// `None`.
+fn sign_authorize_url_state(
+    url: &str,
+    pack_id: &str,
+    tenant: &str,
+    team: &str,
+    conv: Option<&str>,
+) -> Option<String> {
+    // Trigger on the adapter's raw `state=<scheme>|<provider>` marker rather than a
+    // provider-specific authorize path: GitHub uses `.../oauth/authorize` but Google
+    // uses `.../oauth2/v2/auth`, so a path check skips Google entirely (no signed
+    // state, no PKCE, no redirect_uri). The `scheme|provider` split below is the real
+    // gate — only the adapter's OAuth card emits it, and an already-signed JWT state
+    // (no `|`) returns None here, so we never double-augment.
+    let raw_state = url_query_value(url, "state")?;
+    let (scheme, provider) = raw_state.split_once('|')?;
+    if scheme.is_empty() || provider.is_empty() {
+        return None;
+    }
+    let jti = uuid::Uuid::new_v4().to_string();
+    let signed = crate::oauth_state::mint(&crate::oauth_state::OAuthStateContext {
+        pack: pack_id.to_string(),
+        scheme: scheme.to_string(),
+        provider: provider.to_string(),
+        tenant: tenant.to_string(),
+        team: team.to_string(),
+        subject: "user".to_string(),
+        jti: jti.clone(),
+        // Carries the originating webchat conversation id so /oauth/callback can push
+        // a synthetic resume into it once the token is persisted (auto-advance).
+        conv: conv.map(str::to_string),
+        exp: chrono::Utc::now().timestamp() + 600,
+    });
+    let mut new_url = replace_query_value(url, "state", &signed);
+    // Layer on the provider profile: PKCE challenge (verifier stashed server-side,
+    // keyed by jti) + provider-specific authorize params (e.g. Google offline).
+    if let Some(profile) = crate::oauth_engine::provider_profile(provider) {
+        if profile.uses_pkce {
+            let pkce = crate::oauth_engine::pkce();
+            crate::oauth_engine::store_verifier(&jti, &pkce.verifier);
+            new_url.push_str(&format!(
+                "&code_challenge={}&code_challenge_method=S256",
+                crate::oauth_engine::enc(&pkce.challenge)
+            ));
+        }
+        for (k, v) in profile.authorize_extra {
+            new_url.push_str(&format!(
+                "&{}={}",
+                crate::oauth_engine::enc(k),
+                crate::oauth_engine::enc(v)
+            ));
+        }
+        if profile.redirect_uri_required {
+            new_url.push_str(&format!(
+                "&redirect_uri={}",
+                crate::oauth_engine::enc(&crate::oauth_engine::callback_redirect_uri(provider))
+            ));
+        }
+    }
+    Some(new_url)
+}
+
+/// Minimal `%XX`/`+` decode for a query value.
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                Ok(v) => {
+                    out.push(v);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn url_query_value(url: &str, key: &str) -> Option<String> {
+    let q = url.split_once('?')?.1;
+    q.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| pct_decode(v))
+    })
+}
+
+/// Replace `key=<old>` with `key=<new>` (new is URL-safe; written verbatim).
+fn replace_query_value(url: &str, key: &str, new: &str) -> String {
+    let Some((base, q)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let rebuilt: Vec<String> = q
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((k, _)) if k == key => format!("{key}={new}"),
+            _ => pair.to_string(),
+        })
+        .collect();
+    format!("{base}?{}", rebuilt.join("&"))
 }
 
 /// Merge top-level keys from `<bundle>/state/config/<pack_id>/setup-answers.json`
@@ -357,6 +559,59 @@ fn extract_flows(value: &CborValue) -> Vec<AppFlowInfo> {
         }
     }
     flows
+}
+
+/// Reads the pack manifest's `capabilities: Vec<ComponentCapability>` and
+/// returns each entry's `name`. The canonical encoder symbol-indexes the
+/// name as a `u32` into `symbols.capability_names`, so we resolve through
+/// that table when the inline value is an integer; an inline text name is
+/// also accepted for non-canonical encodings.
+fn extract_capabilities(value: &CborValue) -> Vec<String> {
+    let mut caps = Vec::new();
+    let CborValue::Map(map) = value else {
+        return caps;
+    };
+    let entries = match map.get(&CborValue::Text("capabilities".to_string())) {
+        Some(CborValue::Array(entries)) => entries,
+        _ => return caps,
+    };
+    let cap_names_table = symbol_table_array(map, "capability_names");
+    for entry in entries {
+        if let CborValue::Map(entry_map) = entry
+            && let Some(name) = resolve_capability_name(entry_map, cap_names_table)
+        {
+            caps.push(name);
+        }
+    }
+    caps
+}
+
+fn resolve_capability_name(
+    entry_map: &BTreeMap<CborValue, CborValue>,
+    cap_names_table: Option<&Vec<CborValue>>,
+) -> Option<String> {
+    match entry_map.get(&CborValue::Text("name".to_string()))? {
+        CborValue::Text(text) => Some(text.clone()),
+        CborValue::Integer(idx) => match cap_names_table?.get(*idx as usize)? {
+            CborValue::Text(resolved) => Some(resolved.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn symbol_table_array<'a>(
+    manifest_map: &'a BTreeMap<CborValue, CborValue>,
+    table: &str,
+) -> Option<&'a Vec<CborValue>> {
+    let symbols = manifest_map.get(&CborValue::Text("symbols".to_string()))?;
+    let CborValue::Map(sym_map) = symbols else {
+        return None;
+    };
+    match sym_map.get(&CborValue::Text(table.to_string())) {
+        Some(CborValue::Array(arr)) => Some(arr),
+        _ => None,
+    }
 }
 
 fn parse_flow_entry(value: &CborValue) -> Option<AppFlowInfo> {
@@ -771,8 +1026,9 @@ fn parse_envelopes(
                 summarize_output_shape(value)
             ),
         );
-        let envelope: ChannelMessageEnvelope = serde_json::from_value(envelope.clone())
+        let mut envelope: ChannelMessageEnvelope = serde_json::from_value(envelope.clone())
             .context("app flow message payload is not a ChannelMessageEnvelope")?;
+        preserve_ingress_reply_route(&mut envelope, ingress_envelope);
         return Ok(vec![envelope]);
     }
     if let Some(rendered_card) = value.get("renderedCard")
@@ -872,6 +1128,65 @@ fn parse_envelopes(
         );
         return Ok(vec![reply]);
     }
+    // Last-resort: runner lifts node failures onto metadata.error_kind/error_message
+    // when ending a user-facing flow at the failure point. Reply text is a generic
+    // categorized message; raw fields preserved on metadata for logs and TierA cards.
+    if let Some(metadata) = value.get("metadata").and_then(JsonValue::as_object) {
+        let error_kind = metadata
+            .get("error_kind")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let error_message = metadata
+            .get("error_message")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let (Some(kind), Some(message)) = (error_kind, error_message) {
+            let categorization = categorize_flow_error(kind, message);
+            let mut reply = base_reply_envelope(ingress_envelope);
+            reply.text = Some(categorization.user_message.clone());
+            reply
+                .metadata
+                .insert("error_kind".to_string(), kind.to_string());
+            reply
+                .metadata
+                .insert("error_message".to_string(), message.to_string());
+            reply.metadata.insert(
+                "error_category".to_string(),
+                categorization.category.to_string(),
+            );
+            reply.metadata.insert(
+                "error_user_message".to_string(),
+                categorization.user_message.clone(),
+            );
+            reply
+                .metadata
+                .insert("error_fault".to_string(), categorization.fault.to_string());
+            if let Some(node_id) = metadata
+                .get("node_id")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                reply
+                    .metadata
+                    .insert("error_node_id".to_string(), node_id.to_string());
+            }
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[messaging_app] parse_envelopes path=flow_error kind={} category={} fault={} shape={}",
+                    kind,
+                    categorization.category,
+                    categorization.fault,
+                    summarize_output_shape(value)
+                ),
+            );
+            return Ok(vec![reply]);
+        }
+    }
+
     operator_log::warn(
         module_path!(),
         format!(
@@ -882,6 +1197,125 @@ fn parse_envelopes(
     Err(anyhow::anyhow!(
         "app flow output did not produce envelope(s)"
     ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ErrorFault {
+    BundleProvider,
+    UpstreamService,
+    Greentic,
+}
+
+impl std::fmt::Display for ErrorFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            ErrorFault::BundleProvider => "bundle_provider",
+            ErrorFault::UpstreamService => "upstream_service",
+            ErrorFault::Greentic => "greentic",
+        };
+        f.write_str(label)
+    }
+}
+
+struct FlowErrorCategorization {
+    category: &'static str,
+    user_message: String,
+    fault: ErrorFault,
+}
+
+/// Map a raw `(error_kind, error_message)` from the engine onto a stable
+/// category and a generic, service-name-free user message. Pattern-matches on
+/// known shapes (MCP tool errors, HTTP status hints, timeout / auth keywords)
+/// and falls back to a generic message so the user never sees raw engine text.
+fn categorize_flow_error(error_kind: &str, error_message: &str) -> FlowErrorCategorization {
+    let lower = error_message.to_ascii_lowercase();
+    let status = extract_http_status(error_message);
+
+    let auth_signal = status == Some(401)
+        || status == Some(403)
+        || lower.contains("api key")
+        || lower.contains("apikey")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("authentication");
+    if auth_signal {
+        return FlowErrorCategorization {
+            category: "service_auth",
+            user_message: "There's an authentication problem with this service. Please contact your service provider so they can refresh the credentials.".to_string(),
+            fault: ErrorFault::BundleProvider,
+        };
+    }
+
+    let timeout_signal = lower.contains("timeout") || lower.contains("timed out");
+    if timeout_signal {
+        return FlowErrorCategorization {
+            category: "service_timeout",
+            user_message: "This service didn't respond in time. Please try again in a moment."
+                .to_string(),
+            fault: ErrorFault::UpstreamService,
+        };
+    }
+
+    if let Some(status) = status {
+        if (500..600).contains(&status) {
+            return FlowErrorCategorization {
+                category: "service_unavailable",
+                user_message:
+                    "This service is temporarily unavailable. Please try again in a few minutes."
+                        .to_string(),
+                fault: ErrorFault::UpstreamService,
+            };
+        }
+        if (400..500).contains(&status) {
+            return FlowErrorCategorization {
+                category: "service_bad_request",
+                user_message: "This service couldn't process the request. Please contact your service provider if this keeps happening.".to_string(),
+                fault: ErrorFault::BundleProvider,
+            };
+        }
+    }
+
+    if error_kind == "flow_execution_failed" {
+        return FlowErrorCategorization {
+            category: "flow_internal",
+            user_message: "Something went wrong while processing your request. Please try again."
+                .to_string(),
+            fault: ErrorFault::Greentic,
+        };
+    }
+
+    FlowErrorCategorization {
+        category: "service_error",
+        user_message: "Something went wrong with this service. Please try again, and contact your service provider if it persists.".to_string(),
+        fault: ErrorFault::BundleProvider,
+    }
+}
+
+/// Extract the first 3-digit HTTP status code mentioned in the error message.
+/// Recognises both bare numbers (" 401 ", " status 500 ") and JSON shapes
+/// (`"status":401`). Returns None when no plausible status is found.
+fn extract_http_status(message: &str) -> Option<u16> {
+    let bytes = message.as_bytes();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        if bytes[i].is_ascii_digit()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+        {
+            let preceded_by_digit = i > 0 && bytes[i - 1].is_ascii_digit();
+            let followed_by_digit = i + 3 < bytes.len() && bytes[i + 3].is_ascii_digit();
+            if !preceded_by_digit && !followed_by_digit {
+                let n: u16 = (bytes[i] - b'0') as u16 * 100
+                    + (bytes[i + 1] - b'0') as u16 * 10
+                    + (bytes[i + 2] - b'0') as u16;
+                if (100..600).contains(&n) {
+                    return Some(n);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn base_reply_envelope(ingress_envelope: &ChannelMessageEnvelope) -> ChannelMessageEnvelope {
@@ -919,14 +1353,14 @@ fn parse_envelope_array(
     let mut seen = BTreeSet::new();
     for element in array {
         if let Ok(envelope) = serde_json::from_value::<ChannelMessageEnvelope>(element.clone()) {
-            push_unique_envelope(&mut envelopes, &mut seen, envelope)?;
+            push_unique_envelope(&mut envelopes, &mut seen, envelope, ingress_envelope)?;
             continue;
         }
 
         let nested = parse_envelopes(element, ingress_envelope)
             .context("app flow output array contains invalid channel envelope")?;
         for envelope in nested {
-            push_unique_envelope(&mut envelopes, &mut seen, envelope)?;
+            push_unique_envelope(&mut envelopes, &mut seen, envelope, ingress_envelope)?;
         }
     }
     Ok(envelopes)
@@ -935,13 +1369,27 @@ fn parse_envelope_array(
 fn push_unique_envelope(
     envelopes: &mut Vec<ChannelMessageEnvelope>,
     seen: &mut BTreeSet<String>,
-    envelope: ChannelMessageEnvelope,
+    mut envelope: ChannelMessageEnvelope,
+    ingress_envelope: &ChannelMessageEnvelope,
 ) -> Result<()> {
+    preserve_ingress_reply_route(&mut envelope, ingress_envelope);
     let key = unique_envelope_key(&envelope)?;
     if seen.insert(key) {
         envelopes.push(envelope);
     }
     Ok(())
+}
+
+fn preserve_ingress_reply_route(
+    envelope: &mut ChannelMessageEnvelope,
+    ingress_envelope: &ChannelMessageEnvelope,
+) {
+    if envelope.to.is_empty() {
+        envelope.to = ingress_envelope.to.clone();
+    }
+    if envelope.session_id.trim().is_empty() {
+        envelope.session_id = ingress_envelope.session_id.clone();
+    }
 }
 
 fn unique_envelope_key(envelope: &ChannelMessageEnvelope) -> Result<String> {
@@ -977,6 +1425,10 @@ mod tests {
                 "id": "user-1",
                 "kind": "user"
             },
+            "to": [{
+                "id": "Y2lzY29zcGFyazovL3VzL1JPT00vcm9vbS0x",
+                "kind": "room"
+            }],
             "text": "hello",
             "metadata": {}
         }))
@@ -1057,6 +1509,7 @@ mod tests {
                     subscribes_to: vec![],
                 },
             ],
+            capabilities: Vec::new(),
         };
         assert_eq!(select_app_flow(&info).expect("default flow").id, "default");
 
@@ -1074,6 +1527,7 @@ mod tests {
                     subscribes_to: vec![],
                 },
             ],
+            capabilities: Vec::new(),
         };
         assert_eq!(
             select_app_flow(&single_messaging)
@@ -1099,6 +1553,7 @@ mod tests {
                     subscribes_to: vec![],
                 },
             ],
+            capabilities: Vec::new(),
         };
 
         let err = select_app_flow(&info).expect_err("ambiguous flow should fail");
@@ -1149,6 +1604,184 @@ mod tests {
                 .expect("default kind flow")
                 .kind,
             "messaging"
+        );
+    }
+
+    #[test]
+    fn extract_capabilities_reads_name_from_component_capability_entries() {
+        // Mirrors greentic_types::ComponentCapability { name, description } —
+        // the cbor for `capabilities` is Array<Map>, not Array<Text>.
+        let manifest = CborValue::Map(BTreeMap::from([(
+            CborValue::Text("capabilities".to_string()),
+            CborValue::Array(vec![
+                CborValue::Map(BTreeMap::from([
+                    cbor_text("name", "greentic.cap.fast2flow.v1"),
+                    cbor_text("description", "routable flows"),
+                ])),
+                CborValue::Map(BTreeMap::from([cbor_text("name", "greentic.cap.other.v1")])),
+            ]),
+        )]));
+        assert_eq!(
+            extract_capabilities(&manifest),
+            vec![
+                "greentic.cap.fast2flow.v1".to_string(),
+                "greentic.cap.other.v1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_capabilities_skips_entries_without_name_or_wrong_shape() {
+        // Bare strings and name-less maps must not surface as capabilities;
+        // returning silently keeps the gate fail-closed for malformed packs.
+        let manifest = CborValue::Map(BTreeMap::from([(
+            CborValue::Text("capabilities".to_string()),
+            CborValue::Array(vec![
+                CborValue::Map(BTreeMap::from([cbor_text("name", "greentic.cap.ok.v1")])),
+                CborValue::Map(BTreeMap::from([cbor_text("description", "no name")])),
+                CborValue::Text("legacy flat string".to_string()),
+            ]),
+        )]));
+        assert_eq!(
+            extract_capabilities(&manifest),
+            vec!["greentic.cap.ok.v1".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_capabilities_returns_empty_when_field_missing() {
+        let manifest = CborValue::Map(BTreeMap::from([cbor_text("pack_id", "demo-pack")]));
+        assert!(extract_capabilities(&manifest).is_empty());
+    }
+
+    #[test]
+    fn extract_capabilities_resolves_symbol_indexed_names() {
+        // Canonical EncodedCapability { name: u32, .. } references
+        // symbols.capability_names[idx] — what packc + greentic-types emit.
+        let manifest = CborValue::Map(BTreeMap::from([
+            (
+                CborValue::Text("symbols".to_string()),
+                CborValue::Map(BTreeMap::from([(
+                    CborValue::Text("capability_names".to_string()),
+                    CborValue::Array(vec![
+                        CborValue::Text("greentic.cap.fast2flow.v1".to_string()),
+                        CborValue::Text("greentic.cap.other.v1".to_string()),
+                    ]),
+                )])),
+            ),
+            (
+                CborValue::Text("capabilities".to_string()),
+                CborValue::Array(vec![
+                    CborValue::Map(BTreeMap::from([
+                        (CborValue::Text("name".to_string()), CborValue::Integer(0)),
+                        cbor_text("description", "fast2flow opt-in"),
+                    ])),
+                    CborValue::Map(BTreeMap::from([(
+                        CborValue::Text("name".to_string()),
+                        CborValue::Integer(1),
+                    )])),
+                ]),
+            ),
+        ]));
+        assert_eq!(
+            extract_capabilities(&manifest),
+            vec![
+                "greentic.cap.fast2flow.v1".to_string(),
+                "greentic.cap.other.v1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_capabilities_skips_out_of_range_symbol_indices() {
+        let manifest = CborValue::Map(BTreeMap::from([
+            (
+                CborValue::Text("symbols".to_string()),
+                CborValue::Map(BTreeMap::from([(
+                    CborValue::Text("capability_names".to_string()),
+                    CborValue::Array(vec![CborValue::Text("only-one".to_string())]),
+                )])),
+            ),
+            (
+                CborValue::Text("capabilities".to_string()),
+                CborValue::Array(vec![CborValue::Map(BTreeMap::from([(
+                    CborValue::Text("name".to_string()),
+                    CborValue::Integer(99),
+                )]))]),
+            ),
+        ]));
+        assert!(extract_capabilities(&manifest).is_empty());
+    }
+
+    /// End-to-end round-trip: build a real `PackManifest` with our
+    /// capability, encode via `greentic_types::encode_pack_manifest` (the
+    /// canonical encoder that symbol-indexes the name), zip into a
+    /// `.gtpack`, then `load_app_pack_info` and assert detection.
+    #[test]
+    fn load_app_pack_info_detects_fast2flow_capability_via_canonical_encoding() {
+        use greentic_types::pack_manifest::{
+            ComponentCapability, PackFlowEntry, PackKind, PackManifest, PackSignatures,
+        };
+        use greentic_types::{Flow, FlowId, FlowKind, PackId, encode_pack_manifest};
+        use semver::Version;
+        use tempfile::tempdir;
+        use zip::write::FileOptions;
+
+        let flow = Flow {
+            schema_version: "flow-v1".to_string(),
+            id: FlowId::new("main").expect("flow id"),
+            kind: FlowKind::Messaging,
+            entrypoints: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                serde_json::Value::Null,
+            )]),
+            nodes: Default::default(),
+            metadata: Default::default(),
+        };
+        let manifest = PackManifest {
+            schema_version: "pack-v1".into(),
+            pack_id: PackId::new("greentic.test.fast2flow").expect("pack id"),
+            name: Some("fast2flow-test".into()),
+            version: Version::parse("0.1.0").expect("version"),
+            kind: PackKind::Application,
+            publisher: "test".into(),
+            components: Vec::new(),
+            flows: vec![PackFlowEntry {
+                id: FlowId::new("main").expect("flow id"),
+                kind: FlowKind::Messaging,
+                flow,
+                tags: vec!["default".to_string()],
+                entrypoints: vec!["default".to_string()],
+            }],
+            dependencies: Vec::new(),
+            capabilities: vec![ComponentCapability {
+                name: "greentic.cap.fast2flow.v1".to_string(),
+                description: Some("test fixture".to_string()),
+            }],
+            secret_requirements: Vec::new(),
+            signatures: PackSignatures::default(),
+            bootstrap: None,
+            extensions: None,
+            agents: std::collections::BTreeMap::new(),
+        };
+        let cbor_bytes = encode_pack_manifest(&manifest).expect("encode manifest");
+
+        let dir = tempdir().expect("tempdir");
+        let pack_path = dir.path().join("test.gtpack");
+        let file = std::fs::File::create(&pack_path).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .expect("start file");
+        zip.write_all(&cbor_bytes).expect("write manifest");
+        zip.finish().expect("finish pack");
+
+        let info = load_app_pack_info(&pack_path).expect("load pack info");
+        assert_eq!(info.pack_id, "greentic.test.fast2flow");
+        assert!(
+            info.capabilities
+                .contains(&"greentic.cap.fast2flow.v1".to_string()),
+            "expected fast2flow capability via canonical encoding, got {:?}",
+            info.capabilities
         );
     }
 
@@ -1335,6 +1968,11 @@ mod tests {
         )
         .expect("message output");
         assert_eq!(message_output[0].text.as_deref(), Some("reply"));
+        assert_eq!(
+            message_output[0].to[0].id,
+            "Y2lzY29zcGFyazovL3VzL1JPT00vcm9vbS0x"
+        );
+        assert_eq!(message_output[0].to[0].kind.as_deref(), Some("room"));
 
         let events_output = parse_envelopes(
             &json!({
@@ -1492,6 +2130,141 @@ mod tests {
         let unknown = parse_envelopes(&json!({"payload": {"unknown": true}}), &ingress)
             .expect_err("unknown payload should fail");
         assert!(unknown.to_string().contains("did not produce envelope"));
+    }
+
+    #[test]
+    fn categorize_flow_error_detects_auth_signals() {
+        let cases = [
+            (
+                "flow_node_failed",
+                "component x failed: MCP_TOOL_ERROR: 401 API key required",
+            ),
+            ("flow_node_failed", "tool returned an error (status 403)"),
+            ("flow_node_failed", "Authentication denied"),
+            ("flow_node_failed", "apikey rejected"),
+        ];
+        for (kind, msg) in cases {
+            let cat = categorize_flow_error(kind, msg);
+            assert_eq!(cat.category, "service_auth", "msg={msg}");
+            assert_eq!(cat.fault, ErrorFault::BundleProvider, "msg={msg}");
+            assert!(
+                !cat.user_message.contains("MCP")
+                    && !cat.user_message.contains("401")
+                    && !cat.user_message.contains("API key"),
+                "user message must be generic: {}",
+                cat.user_message
+            );
+        }
+    }
+
+    #[test]
+    fn categorize_flow_error_detects_timeout() {
+        let cat = categorize_flow_error("flow_node_failed", "upstream request timed out");
+        assert_eq!(cat.category, "service_timeout");
+        assert_eq!(cat.fault, ErrorFault::UpstreamService);
+    }
+
+    #[test]
+    fn categorize_flow_error_detects_5xx_unavailable() {
+        let cat = categorize_flow_error(
+            "flow_node_failed",
+            "component x returned tool error: tool_error: upstream blew up (status 502)",
+        );
+        assert_eq!(cat.category, "service_unavailable");
+        assert_eq!(cat.fault, ErrorFault::UpstreamService);
+    }
+
+    #[test]
+    fn categorize_flow_error_detects_4xx_bad_request_non_auth() {
+        let cat = categorize_flow_error(
+            "flow_node_failed",
+            "component x returned tool error (status 422 unprocessable)",
+        );
+        assert_eq!(cat.category, "service_bad_request");
+        assert_eq!(cat.fault, ErrorFault::BundleProvider);
+    }
+
+    #[test]
+    fn categorize_flow_error_flow_execution_failed_maps_to_greentic() {
+        let cat = categorize_flow_error("flow_execution_failed", "panic in dispatch_node");
+        assert_eq!(cat.category, "flow_internal");
+        assert_eq!(cat.fault, ErrorFault::Greentic);
+    }
+
+    #[test]
+    fn categorize_flow_error_defaults_to_generic_bundle_provider() {
+        let cat = categorize_flow_error("flow_node_failed", "some unrecognized failure");
+        assert_eq!(cat.category, "service_error");
+        assert_eq!(cat.fault, ErrorFault::BundleProvider);
+    }
+
+    #[test]
+    fn extract_http_status_recognises_common_shapes() {
+        assert_eq!(extract_http_status("status 401 unauthorized"), Some(401));
+        assert_eq!(extract_http_status("(status 502)"), Some(502));
+        assert_eq!(extract_http_status("\"status\":401,"), Some(401));
+        assert_eq!(extract_http_status("HTTP 404 not found"), Some(404));
+        assert_eq!(extract_http_status("nothing here"), None);
+        assert_eq!(extract_http_status("1234"), None);
+        assert_eq!(extract_http_status("9999"), None);
+    }
+
+    #[test]
+    fn parse_envelopes_flow_error_branch_emits_generic_text_and_metadata() {
+        let ingress = envelope();
+        let output = json!({
+            "metadata": {
+                "error_kind": "flow_node_failed",
+                "error_message": "component weatherapi_current failed: MCP_TOOL_ERROR: 401 API key required",
+                "node_id": "call_weather",
+            }
+        });
+        let replies = parse_envelopes(&output, &ingress).expect("flow_error branch");
+        assert_eq!(replies.len(), 1);
+        let reply = &replies[0];
+        let text = reply.text.as_deref().expect("text fallback present");
+        assert!(
+            !text.contains("MCP")
+                && !text.contains("API key")
+                && !text.contains("weatherapi_current"),
+            "text must be generic: {text}"
+        );
+        assert_eq!(
+            reply.metadata.get("error_category").map(String::as_str),
+            Some("service_auth")
+        );
+        assert_eq!(
+            reply.metadata.get("error_fault").map(String::as_str),
+            Some("bundle_provider")
+        );
+        assert!(reply.metadata.contains_key("error_user_message"));
+        assert!(reply.metadata.contains_key("error_message"));
+        assert_eq!(
+            reply.metadata.get("error_node_id").map(String::as_str),
+            Some("call_weather")
+        );
+    }
+
+    #[test]
+    fn parse_envelopes_flow_error_branch_ignored_when_rendered_card_present() {
+        let ingress = envelope();
+        let output = json!({
+            "renderedCard": {
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [{"type": "TextBlock", "text": "hello"}]
+            },
+            "metadata": {
+                "error_kind": "flow_node_failed",
+                "error_message": "should not preempt rendered card",
+            }
+        });
+        let replies = parse_envelopes(&output, &ingress).expect("renderedCard branch");
+        assert_eq!(replies.len(), 1);
+        assert!(
+            !replies[0].metadata.contains_key("error_category"),
+            "error_category must not be set when a card branch already produced the reply"
+        );
     }
 
     #[test]

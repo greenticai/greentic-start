@@ -4,6 +4,7 @@ use std::{
     fs::{File, OpenOptions},
     io,
     io::Write,
+    panic::Location,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -33,13 +34,19 @@ fn logger_slot() -> &'static Mutex<Option<Logger>> {
 }
 
 pub fn init(log_dir: PathBuf, min_level: Level) -> anyhow::Result<PathBuf> {
-    let fallback = std::env::current_dir()
+    let cwd_fallback = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("logs");
+    let home_fallback = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".greentic/logs"));
 
     let mut candidates = vec![log_dir.clone()];
-    if fallback != log_dir {
-        candidates.push(fallback.clone());
+    if cwd_fallback != log_dir {
+        candidates.push(cwd_fallback);
+    }
+    if let Some(home) = home_fallback
+        && !candidates.contains(&home)
+    {
+        candidates.push(home);
     }
 
     let mut last_error: Option<(PathBuf, io::Error)> = None;
@@ -85,39 +92,96 @@ pub fn init(log_dir: PathBuf, min_level: Level) -> anyhow::Result<PathBuf> {
 
 fn try_open_operator_log(log_dir: &Path) -> io::Result<File> {
     std::fs::create_dir_all(log_dir)?;
-    let operator_path = log_dir.join("operator.log");
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&operator_path)
+    // Unified host log: operator_log + tracing-subscriber both append here.
+    let path = log_dir.join("system.log");
+    OpenOptions::new().create(true).append(true).open(&path)
 }
 
+/// Tracing target used to forward `operator_log` records into the tracing
+/// pipeline (and thus the OTLP/Loki exporter). The file `fmt` layer filters
+/// this target out (see `init_trace_log`) so the line `operator_log` already
+/// wrote to `system.log` is not duplicated there.
+pub(crate) const OTLP_BRIDGE_TARGET: &str = "greentic.operator";
+
+#[track_caller]
 pub fn log(level: Level, target: &str, message: String) {
-    let slot = match logger_slot().lock() {
-        Ok(slot) => slot,
-        Err(_) => return,
-    };
-    let logger = match slot.as_ref() {
-        Some(logger) => logger,
-        None => return,
-    };
-    if level < logger.min_level {
-        return;
+    log_at(Location::caller(), level, target, message);
+}
+
+fn log_at(location: &Location<'_>, level: Level, target: &str, message: String) {
+    let file = shorten_log_path(location.file());
+    let line = location.line();
+    {
+        let slot = match logger_slot().lock() {
+            Ok(slot) => slot,
+            Err(_) => return,
+        };
+        let logger = match slot.as_ref() {
+            Some(logger) => logger,
+            None => return,
+        };
+        if level < logger.min_level {
+            return;
+        }
+        let mut writer = match logger.writer.lock() {
+            Ok(writer) => writer,
+            Err(_) => return,
+        };
+        let timestamp = Utc::now().to_rfc3339();
+        let _ = writeln!(
+            *writer,
+            "{timestamp} [{level:?}] {target} {file}:{line} - {message}",
+            level = level,
+            target = target,
+            file = file,
+            line = line,
+            message = message
+        );
+        let _ = writer.flush();
     }
-    let mut writer = match logger.writer.lock() {
-        Ok(writer) => writer,
-        Err(_) => return,
-    };
-    let timestamp = Utc::now().to_rfc3339();
-    let _ = writeln!(
-        *writer,
-        "{timestamp} [{level:?}] {target} - {message}",
-        level = level,
-        target = target,
-        message = message
-    );
-    // Always flush to ensure logs are written immediately
-    let _ = writer.flush();
+    // Mirror the record into `tracing` so it reaches the OTLP exporter (Loki).
+    // Done after dropping the file locks; a no-op when no subscriber is installed
+    // (e.g. the `warmup` subprocess). The file `fmt` layer drops this target to
+    // avoid duplicating the line written above.
+    bridge_to_tracing(level, target, file, line, &message);
+}
+
+/// Re-emit an `operator_log` record as a `tracing` event on
+/// [`OTLP_BRIDGE_TARGET`]. The original module path, file, and line are carried
+/// as fields so they survive into Loki as structured metadata.
+fn bridge_to_tracing(level: Level, module: &str, file: &str, line: u32, message: &str) {
+    match level {
+        Level::Trace => tracing::trace!(
+            target: OTLP_BRIDGE_TARGET,
+            op_module = module, op_file = file, op_line = line, "{message}"
+        ),
+        Level::Debug => tracing::debug!(
+            target: OTLP_BRIDGE_TARGET,
+            op_module = module, op_file = file, op_line = line, "{message}"
+        ),
+        Level::Info => tracing::info!(
+            target: OTLP_BRIDGE_TARGET,
+            op_module = module, op_file = file, op_line = line, "{message}"
+        ),
+        Level::Warn => tracing::warn!(
+            target: OTLP_BRIDGE_TARGET,
+            op_module = module, op_file = file, op_line = line, "{message}"
+        ),
+        Level::Error => tracing::error!(
+            target: OTLP_BRIDGE_TARGET,
+            op_module = module, op_file = file, op_line = line, "{message}"
+        ),
+    }
+}
+
+/// Trim absolute paths emitted by `Location::caller()` down to a stable suffix
+/// (after `/src/`) so log entries stay portable across machines and CI runners.
+fn shorten_log_path(path: &str) -> &str {
+    if let Some(idx) = path.rfind("/src/") {
+        // Keep the `src/...` prefix so the path remains readable as a module reference.
+        return &path[idx + 1..];
+    }
+    path
 }
 
 #[cfg(test)]
@@ -144,22 +208,27 @@ pub fn reserve_service_log(log_dir: &Path, service: &str) -> anyhow::Result<Path
     Ok(path)
 }
 
+#[track_caller]
 pub fn trace(target: &str, message: impl AsRef<str>) {
     log(Level::Trace, target, message.as_ref().to_string());
 }
 
+#[track_caller]
 pub fn debug(target: &str, message: impl AsRef<str>) {
     log(Level::Debug, target, message.as_ref().to_string());
 }
 
+#[track_caller]
 pub fn info(target: &str, message: impl AsRef<str>) {
     log(Level::Info, target, message.as_ref().to_string());
 }
 
+#[track_caller]
 pub fn warn(target: &str, message: impl AsRef<str>) {
     log(Level::Warn, target, message.as_ref().to_string());
 }
 
+#[track_caller]
 pub fn error(target: &str, message: impl AsRef<str>) {
     log(Level::Error, target, message.as_ref().to_string());
 }
@@ -171,14 +240,28 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn writes_operator_log() -> anyhow::Result<()> {
+    fn writes_system_log_with_source_location() -> anyhow::Result<()> {
         reset_for_tests();
         let dir = tempdir()?;
         let _ = init(dir.path().to_path_buf(), Level::Info)?;
-        info("tests::writes_operator_log", "hello world");
-        let contents = fs::read_to_string(dir.path().join("operator.log"))?;
+        info("tests::writes_system_log", "hello world");
+        let contents = fs::read_to_string(dir.path().join("system.log"))?;
         assert!(contents.contains("hello world"));
+        assert!(
+            contents.contains("src/operator_log.rs:"),
+            "log entry must include file:line: {contents}"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn shorten_log_path_trims_to_src_suffix() {
+        assert_eq!(
+            shorten_log_path("/Users/whoever/project/crates/foo/src/bar/baz.rs"),
+            "src/bar/baz.rs"
+        );
+        assert_eq!(shorten_log_path("relative/path.rs"), "relative/path.rs");
+        assert_eq!(shorten_log_path("/no/src/marker.rs"), "src/marker.rs");
     }
 
     #[test]

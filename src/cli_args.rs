@@ -23,6 +23,8 @@ pub(crate) enum Command {
     Restart(StartArgs),
     Warmup(WarmupArgs),
     Doctor(DoctorArgs),
+    #[command(hide = true)]
+    ResolveSecret(ResolveSecretArgs),
 }
 
 #[derive(Parser, Clone)]
@@ -70,6 +72,20 @@ pub(crate) struct WarmupArgs {
     /// Fail on the first compile error instead of counting it as skipped.
     #[arg(long)]
     pub(crate) strict: bool,
+}
+
+#[derive(Parser, Clone)]
+pub(crate) struct ResolveSecretArgs {
+    /// Bundle root to resolve against.
+    #[arg(long)]
+    pub(crate) bundle: PathBuf,
+    #[arg(long, default_value = DEMO_DEFAULT_TENANT)]
+    pub(crate) tenant: String,
+    #[arg(long, default_value = DEMO_DEFAULT_TEAM)]
+    pub(crate) team: String,
+    /// Canonical secrets:// URI to read.
+    #[arg(long)]
+    pub(crate) uri: String,
 }
 
 #[derive(Parser, Clone)]
@@ -278,7 +294,15 @@ pub(crate) fn normalize_args(raw_tail: Vec<String>) -> Vec<String> {
         return out;
     }
 
-    let known = ["start", "up", "stop", "restart", "warmup", "doctor"];
+    let known = [
+        "start",
+        "up",
+        "stop",
+        "restart",
+        "warmup",
+        "doctor",
+        "resolve-secret",
+    ];
     let mut first_pos = None;
     let mut skip_next_value = false;
     for arg in out.iter().skip(1) {
@@ -354,6 +378,7 @@ fn arg_takes_value(arg: &str) -> bool {
             | "--admin-port"
             | "--admin-certs-dir"
             | "--admin-allowed-clients"
+            | "--uri"
     )
 }
 

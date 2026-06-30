@@ -419,26 +419,37 @@ fn handle_activities(
         Some(token) => token,
         None => return unauthorized("Unauthorized", "missing Authorization header"),
     };
-    let claims = match parse_token(&token, key) {
+    let mut claims = match parse_token(&token, key) {
         Ok(claims) => claims,
         Err(TokenError::BadSignature) => {
             return unauthorized("InvalidToken", "invalid token signature");
         }
         Err(TokenError::Malformed) => return unauthorized("InvalidToken", "malformed token"),
     };
-    if claims.conv.as_deref() != Some(conv_id) {
-        return forbidden(
-            "WrongConversation",
-            "token bound to a different conversation",
-        );
+    // Mirror `handle_reconnect`: accept a conv-LESS token (`conv = None`) as well as
+    // one already bound to this conversation. WebChat in `tokenUrl` mode periodically
+    // refreshes its bearer from `/token`, which mints a conv-less token; rejecting it
+    // here (while reconnect/polling accept it) is exactly what breaks "send" with a
+    // 403 after the first refresh. Only a token bound to a DIFFERENT conversation is
+    // a genuine mismatch.
+    match claims.conv.as_deref() {
+        None => {}
+        Some(bound) if bound == conv_id => {}
+        Some(_) => {
+            return forbidden(
+                "WrongConversation",
+                "token bound to a different conversation",
+            );
+        }
     }
     if is_expired(&claims) && !sessions.is_alive(conv_id) {
         return unauthorized("TokenExpired", "invalid token: Expired");
     }
-    // Accepted — extend the conversation's lifetime and re-mint a full-TTL
-    // bearer so the provider's strict `exp` check is satisfied even when the
-    // caller is still presenting an older (or just-expired) token.
+    // Accepted — extend the conversation's lifetime and re-mint a full-TTL,
+    // conv-bound bearer so the provider's strict `exp`+conversation checks pass and
+    // the client can adopt a properly-bound token (even if it sent a conv-less one).
     sessions.touch(conv_id);
+    claims.conv = Some(conv_id.to_string());
     let renewed = mint_token(&claims, key, sessions.ttl_secs());
     // POST = a user-typed message (low frequency) — always echo the renewed
     // token so the client can adopt it; GET polling (high frequency) only when

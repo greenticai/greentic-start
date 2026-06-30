@@ -123,97 +123,6 @@ fn load_form_spec_with_fallback(
     }
 }
 
-// ── Provider alias injection (Telegram + Slack secret dedup) ────────────────
-
-/// Static table of secret aliases per provider.
-///
-/// Each entry: `(setup.yaml field, WASM runtime key, is_secret)`.
-/// The wizard saves config under setup.yaml field names, but the WASM component
-/// reads secrets via its own constant (e.g. `SLACK_BOT_TOKEN` → `slack_bot_token`).
-/// This table bridges that gap by copying the value to the runtime key name.
-type ProviderSecretAlias = (&'static str, &'static str, bool);
-type ProviderSecretAliasEntry = (&'static str, &'static [ProviderSecretAlias]);
-
-const PROVIDER_SECRET_ALIASES: &[ProviderSecretAliasEntry] = &[
-    (
-        "messaging-telegram",
-        &[("bot_token", "telegram_bot_token", true)],
-    ),
-    ("messaging-slack", &[("bot_token", "slack_bot_token", true)]),
-    ("messaging-webex", &[("bot_token", "webex_bot_token", true)]),
-    (
-        "messaging-whatsapp",
-        &[("access_token", "whatsapp_token", true)],
-    ),
-];
-
-fn inject_provider_aliases(
-    provider_id: &str,
-    config: &mut Value,
-    form_spec: &mut qa_spec::FormSpec,
-    answers: &Value,
-) {
-    // Apply static alias table (setup.yaml field → WASM runtime key)
-    if let Some(&(_, aliases)) = PROVIDER_SECRET_ALIASES
-        .iter()
-        .find(|&&(id, _)| id == provider_id)
-    {
-        for &(src_key, dst_key, is_secret) in aliases {
-            if let Some(val) = config
-                .get(src_key)
-                .and_then(Value::as_str)
-                .map(String::from)
-                && !val.is_empty()
-            {
-                if let Some(map) = config.as_object_mut() {
-                    map.entry(dst_key.to_string())
-                        .or_insert_with(|| Value::String(val));
-                }
-                push_synthetic_question(form_spec, dst_key, is_secret);
-            }
-        }
-    }
-
-    // Slack-specific: forward extra fields from answers
-    if provider_id == "messaging-slack" {
-        for (key, is_secret) in [("slack_app_id", false), ("slack_configuration_token", true)] {
-            if let Some(val) = answers.get(key).and_then(Value::as_str).map(String::from)
-                && !val.is_empty()
-            {
-                if let Some(map) = config.as_object_mut() {
-                    map.entry(key.to_string())
-                        .or_insert_with(|| Value::String(val));
-                }
-                push_synthetic_question(form_spec, key, is_secret);
-            }
-        }
-    }
-}
-
-fn push_synthetic_question(form_spec: &mut qa_spec::FormSpec, key: &str, secret: bool) {
-    if form_spec.questions.iter().any(|q| q.id == key) {
-        return;
-    }
-    form_spec.questions.push(qa_spec::QuestionSpec {
-        id: key.to_string(),
-        kind: qa_spec::QuestionType::String,
-        title: key.to_string(),
-        title_i18n: None,
-        description: None,
-        description_i18n: None,
-        required: false,
-        choices: None,
-        default_value: None,
-        secret,
-        visible_if: None,
-        constraint: None,
-        list: None,
-        computed: None,
-        policy: Default::default(),
-        computed_overridable: false,
-    });
-}
-
 // ── Provider flow invocation (dedup setup_default + verify_webhooks) ────────
 
 fn run_provider_flow(
@@ -446,7 +355,7 @@ pub fn submit_answers(state: &OnboardState, body: &Value) -> OnboardResult {
     }
 
     // 2. Get FormSpec (for secret field identification — locale not needed here)
-    let mut form_spec = match get_form_spec_from_pack(
+    let form_spec = match get_form_spec_from_pack(
         bundle_root,
         params.domain,
         &pack,
@@ -460,14 +369,6 @@ pub fn submit_answers(state: &OnboardState, body: &Value) -> OnboardResult {
         None => setup_to_formspec::pack_to_form_spec(&pack.path, &params.provider_id)
             .unwrap_or_else(|| make_minimal_form_spec(&params.provider_id, &config)),
     };
-
-    // 3. Inject secret aliases into config + FormSpec (single batch to avoid DEK cache bug)
-    inject_provider_aliases(
-        &params.provider_id,
-        &mut config,
-        &mut form_spec,
-        &params.answers,
-    );
 
     // Persist secrets + config (single DevStore instance writes all secrets in one batch)
     let providers_root = bundle_root.join(".providers");
@@ -1119,6 +1020,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_request_top_level_scope_wins_over_answer_scope_and_mode_variants() {
+        let params = parse_request(&json!({
+            "provider_id": "events-calendar",
+            "domain": "events",
+            "tenant": "TenantTop",
+            "team": "TeamTop",
+            "mode": "remove",
+            "answers": {
+                "_scope_tenant": "TenantAnswer",
+                "_scope_team": "TeamAnswer",
+                "enabled": false
+            }
+        }))
+        .expect("request params");
+
+        assert_eq!(params.domain, Domain::Events);
+        assert_eq!(params.tenant(), "tenanttop");
+        assert_eq!(params.team(), Some("teamtop"));
+        assert_eq!(params.mode, QaMode::Remove);
+        assert_eq!(params.answers["enabled"], false);
+    }
+
+    #[test]
     fn parse_request_rejects_missing_provider_and_invalid_domain() {
         assert!(parse_request(&json!({"domain": "messaging"})).is_err());
         assert!(
@@ -1131,72 +1055,12 @@ mod tests {
     }
 
     #[test]
-    fn inject_provider_aliases_adds_runtime_secret_aliases_once() {
-        let mut config = json!({
-            "bot_token": "secret-value"
-        });
-        let mut form_spec = make_minimal_form_spec("messaging-slack", &config);
-        let original_question_count = form_spec.questions.len();
-
-        inject_provider_aliases(
-            "messaging-slack",
-            &mut config,
-            &mut form_spec,
-            &json!({
-                "bot_token": "secret-value",
-                "slack_app_id": "A123",
-                "slack_configuration_token": "cfg-secret"
-            }),
-        );
-        inject_provider_aliases(
-            "messaging-slack",
-            &mut config,
-            &mut form_spec,
-            &json!({
-                "bot_token": "secret-value",
-                "slack_app_id": "A123",
-                "slack_configuration_token": "cfg-secret"
-            }),
-        );
-
-        assert_eq!(config["slack_bot_token"], "secret-value");
-        assert_eq!(config["slack_app_id"], "A123");
-        assert_eq!(config["slack_configuration_token"], "cfg-secret");
-        assert!(
-            form_spec
-                .questions
-                .iter()
-                .any(|q| q.id == "slack_bot_token" && q.secret)
-        );
-        assert!(
-            form_spec
-                .questions
-                .iter()
-                .any(|q| q.id == "slack_configuration_token" && q.secret)
-        );
-        assert!(
-            form_spec
-                .questions
-                .iter()
-                .any(|q| q.id == "slack_app_id" && !q.secret)
-        );
-        assert!(form_spec.questions.len() >= original_question_count + 3);
-    }
-
-    #[test]
-    fn push_synthetic_question_deduplicates_existing_entries() {
-        let mut form_spec = make_minimal_form_spec("provider-a", &json!({"token": "x"}));
-        let initial = form_spec.questions.len();
-        push_synthetic_question(&mut form_spec, "token", true);
-        push_synthetic_question(&mut form_spec, "token", true);
-        assert_eq!(form_spec.questions.len(), initial);
-    }
-
-    #[test]
     fn helper_functions_cover_mode_gmap_and_setup_input_shapes() {
         assert_eq!(parse_mode(&json!({})), QaMode::Setup);
         assert_eq!(parse_mode(&json!({"mode": "upgrade"})), QaMode::Upgrade);
         assert_eq!(parse_mode(&json!({"mode": "remove"})), QaMode::Remove);
+        assert_eq!(parse_mode(&json!({"mode": "default"})), QaMode::Default);
+        assert_eq!(parse_mode(&json!({"mode": "unknown"})), QaMode::Setup);
 
         let spec = make_minimal_form_spec(
             "provider-a",
@@ -1221,6 +1085,11 @@ mod tests {
         assert_eq!(
             gmap,
             std::path::Path::new("/bundle/tenants/tenant-a/teams/team-b/team.gmap")
+        );
+        let tenant_gmap = resolve_gmap_path(std::path::Path::new("/bundle"), "tenant-a", None);
+        assert_eq!(
+            tenant_gmap,
+            std::path::Path::new("/bundle/tenants/tenant-a/tenant.gmap")
         );
 
         let payload = build_setup_flow_input(
@@ -1270,6 +1139,24 @@ mod tests {
         assert_eq!(merged["bot_token"], "stored-token");
         assert_eq!(merged["workspace"], "fresh-workspace");
         assert_eq!(merged["channel"], "alerts");
+    }
+
+    #[test]
+    fn merge_existing_config_returns_answers_when_no_valid_envelope_exists() {
+        let dir = tempdir().unwrap();
+        let answers = json!({"fresh": true});
+        assert_eq!(
+            merge_existing_config(dir.path(), "missing-provider", &answers),
+            answers
+        );
+
+        let providers_root = dir.path().join(".providers").join("broken-provider");
+        std::fs::create_dir_all(&providers_root).unwrap();
+        std::fs::write(providers_root.join("config.envelope.cbor"), b"not cbor").unwrap();
+        assert_eq!(
+            merge_existing_config(dir.path(), "broken-provider", &json!({"fallback": 1})),
+            json!({"fallback": 1})
+        );
     }
 
     #[test]

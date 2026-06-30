@@ -201,7 +201,7 @@ where
         ControlDirective::Continue => {}
         ControlDirective::Respond { reply } => apply_reply(body, reply, false)?,
         ControlDirective::Deny { reply } => apply_reply(body, reply, true)?,
-        ControlDirective::Dispatch { target } => {
+        ControlDirective::Dispatch { target, .. } => {
             dispatch_fn(bundle, domain, body, ctx, &target)?;
             body.response_status = 202;
             body.response_headers =
@@ -544,7 +544,7 @@ fn directive_action(directive: &ControlDirective) -> &'static str {
 
 fn directive_target_for_audit(directive: &ControlDirective) -> Option<JsonValue> {
     match directive {
-        ControlDirective::Dispatch { target } => Some(json!({
+        ControlDirective::Dispatch { target, .. } => Some(json!({
             "tenant": target.tenant,
             "team": target.team,
             "pack": target.pack,
@@ -696,7 +696,8 @@ mod tests {
                     pack: "hook-pack".to_string(),
                     flow: None,
                     node: None,
-                }
+                },
+                entities: Vec::new(),
             }),
             "dispatch"
         );
@@ -724,6 +725,7 @@ mod tests {
             },
             ControlDirective::Dispatch {
                 target: target.clone(),
+                entities: Vec::new(),
             },
             |_, _, _, _, dispatch_target| {
                 called = true;
@@ -735,8 +737,11 @@ mod tests {
         assert!(called);
         assert_eq!(dispatch_body.response_status, 202);
         assert!(dispatch_body.events.is_empty());
-        let target_json = directive_target_for_audit(&ControlDirective::Dispatch { target })
-            .expect("target json");
+        let target_json = directive_target_for_audit(&ControlDirective::Dispatch {
+            target,
+            entities: Vec::new(),
+        })
+        .expect("target json");
         assert_eq!(target_json["tenant"], "demo");
 
         let pack = offer_pack(

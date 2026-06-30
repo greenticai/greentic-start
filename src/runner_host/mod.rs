@@ -92,15 +92,14 @@ impl DemoRunnerHost {
     }
 
     /// Read a secret synchronously from the secrets manager.
-    /// The secret key is resolved using the canonical URI format:
-    /// `secrets://{env}/{tenant}/{team}/{provider}/{key}`
+    /// The secret key is resolved using the same order as WASM provider reads:
+    /// raw provider URI first, then canonicalized provider/key fallback.
     pub fn get_secret(
         &self,
         provider: &str,
         key: &str,
         ctx: &OperatorContext,
     ) -> anyhow::Result<Option<Vec<u8>>> {
-        use crate::secrets_gate::canonical_secret_uri;
         use crate::secrets_setup::resolve_env;
 
         if let Some(bytes) = load_setup_answer_secret(&self.bundle_root, provider, key) {
@@ -108,24 +107,24 @@ impl DemoRunnerHost {
         }
 
         let env = resolve_env(None);
-        let uri = canonical_secret_uri(&env, &ctx.tenant, ctx.team.as_deref(), provider, key);
+        let uris = secret_read_uris(&env, &ctx.tenant, ctx.team.as_deref(), provider, key);
 
         make_runtime_or_thread_scope(|rt| {
             rt.block_on(async {
-                match self.secrets_handle.manager().read(&uri).await {
-                    Ok(bytes) => Ok(Some(bytes)),
-                    Err(err) => {
-                        let err_str = err.to_string();
-                        if err_str.contains("not found")
-                            || err_str.contains("NotFound")
-                            || err_str.contains("not-found")
-                            || err_str.contains("not provisioned")
-                        {
-                            Ok(None)
-                        } else {
-                            Err(anyhow::anyhow!("secret read failed: {}", err))
+                let mut last_err = None;
+                for uri in uris {
+                    match self.secrets_handle.manager().read(&uri).await {
+                        Ok(bytes) => return Ok(Some(bytes)),
+                        Err(err) if is_secret_not_found(&err) => continue,
+                        Err(err) => {
+                            last_err = Some(err);
+                            break;
                         }
                     }
+                }
+                match last_err {
+                    Some(err) => Err(anyhow::anyhow!("secret read failed: {}", err)),
+                    None => Ok(None),
                 }
             })
         })
@@ -488,6 +487,36 @@ impl DemoRunnerHost {
     }
 }
 
+fn secret_read_uris(
+    env: &str,
+    tenant: &str,
+    team: Option<&str>,
+    provider: &str,
+    key: &str,
+) -> Vec<String> {
+    let team_segment = crate::secrets_manager::canonical_team(team);
+    let raw_provider = if provider.is_empty() {
+        "messaging"
+    } else {
+        provider
+    };
+    let raw_uri = format!("secrets://{env}/{tenant}/{team_segment}/{raw_provider}/{key}");
+    let canonical_uri = crate::secrets_gate::canonical_secret_uri(env, tenant, team, provider, key);
+    if raw_uri == canonical_uri {
+        vec![raw_uri]
+    } else {
+        vec![raw_uri, canonical_uri]
+    }
+}
+
+fn is_secret_not_found(err: &impl std::fmt::Display) -> bool {
+    let err_str = err.to_string();
+    err_str.contains("not found")
+        || err_str.contains("NotFound")
+        || err_str.contains("not-found")
+        || err_str.contains("not provisioned")
+}
+
 fn load_setup_answer_secret(bundle_root: &Path, provider: &str, key: &str) -> Option<Vec<u8>> {
     let path = bundle_root
         .join("state")
@@ -606,6 +635,44 @@ mod tests {
             .get_secret("messaging-webchat-gui", "jwt_signing_key", &ctx)
             .unwrap();
         assert_eq!(value, Some(b"from-setup-answers".to_vec()));
+    }
+
+    #[test]
+    fn get_secret_prefers_raw_provider_alias_before_canonical_alias() {
+        let dir = tempdir().unwrap();
+        let discovery = discovery::discover(dir.path()).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let manager = secrets_handle.manager();
+        runtime
+            .block_on(async {
+                manager
+                    .write(
+                        "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key",
+                        b"raw-provider-key",
+                    )
+                    .await?;
+                manager
+                    .write(
+                        "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key",
+                        b"canonical-provider-key",
+                    )
+                    .await
+            })
+            .unwrap();
+        let host =
+            DemoRunnerHost::new(dir.keep(), &discovery, None, secrets_handle, false).unwrap();
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            correlation_id: None,
+        };
+
+        let value = host
+            .get_secret("messaging-webchat-gui", "jwt_signing_key", &ctx)
+            .unwrap();
+        assert_eq!(value, Some(b"raw-provider-key".to_vec()));
     }
 
     #[test]

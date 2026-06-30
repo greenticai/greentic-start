@@ -25,12 +25,14 @@ use std::{
 use anyhow::{Result, anyhow};
 use greentic_secrets_lib::core::Error as SecretError;
 use greentic_secrets_lib::{
-    ApplyOptions, DevStore, SecretFormat, SecretsStore, SeedDoc, SeedEntry, SeedValue, apply_seed,
+    ApplyOptions, DevStore, GeneratedSecretRequirement, PackSecretRequirement, SecretFormat,
+    SecretsStore, SeedDoc, SeedEntry, SeedValue, apply_seed, generate_secret_value,
+    generated_scope_team,
 };
 use tracing::{debug, info};
 
 use crate::{
-    dev_store_path, secret_requirements::load_secret_keys_from_pack,
+    dev_store_path, secret_requirements::load_secret_requirements_from_pack,
     secrets_gate::canonical_secret_uri,
 };
 
@@ -76,35 +78,51 @@ impl SecretsSetup {
     }
 
     pub async fn ensure_pack_secrets(&self, pack_path: &Path, provider_id: &str) -> Result<()> {
-        let keys = load_secret_keys_from_pack(pack_path)?;
-        if keys.is_empty() {
+        let requirements = load_secret_requirements_from_pack(pack_path)?;
+        self.ensure_requirements(provider_id, requirements).await
+    }
+
+    pub async fn ensure_pack_generated_secrets(
+        &self,
+        pack_path: &Path,
+        provider_id: &str,
+    ) -> Result<()> {
+        let requirements = load_secret_requirements_from_pack(pack_path)?
+            .into_iter()
+            .filter(|requirement| requirement.generated.is_some())
+            .collect();
+        self.ensure_requirements(provider_id, requirements).await
+    }
+
+    async fn ensure_requirements(
+        &self,
+        provider_id: &str,
+        requirements: Vec<PackSecretRequirement>,
+    ) -> Result<()> {
+        if requirements.is_empty() {
             return Ok(());
         }
         let mut missing = Vec::new();
-        for key in keys {
-            let uri = canonical_secret_uri(
-                &self.env,
-                &self.tenant,
-                self.team.as_deref(),
+        for requirement in requirements {
+            let uri = self.requirement_uri(
                 provider_id,
-                &key,
+                &requirement.key,
+                requirement.generated.as_ref(),
             );
-            debug!(uri = %uri, provider = %provider_id, key = %key, "canonicalized secret requirement");
-            match self.store.get(&uri).await {
-                Ok(_) => continue,
-                Err(SecretError::NotFound { .. }) => {
-                    let source = if self.seeds.contains_key(&uri) {
+            debug!(uri = %uri, provider = %provider_id, key = %requirement.key, "canonicalized secret requirement");
+            match self.requirement_exists(provider_id, &requirement).await {
+                Ok(true) if !requirement_allows_regeneration(&requirement) => continue,
+                Ok(true) => continue,
+                Ok(false) => {
+                    let source = if requirement.generated.is_some() {
+                        "generated"
+                    } else if self.seeds.contains_key(&uri) {
                         "seeds.yaml"
                     } else {
                         "placeholder"
                     };
                     debug!(uri = %uri, source, "seeding missing secret");
-                    missing.push(
-                        self.seeds
-                            .get(&uri)
-                            .cloned()
-                            .unwrap_or_else(|| placeholder_entry(uri.clone())),
-                    );
+                    missing.push(self.seed_entry_for_requirement(uri.clone(), &requirement)?);
                 }
                 Err(err) => {
                     return Err(anyhow!("failed to read secret {}: {err}", uri));
@@ -125,6 +143,78 @@ impl SecretsSetup {
         }
         Ok(())
     }
+
+    async fn requirement_exists(
+        &self,
+        provider_id: &str,
+        requirement: &PackSecretRequirement,
+    ) -> Result<bool> {
+        let team = if let Some(generated) = requirement.generated.as_ref() {
+            generated_scope_team(generated, self.team.as_deref())
+        } else {
+            self.team.as_deref()
+        };
+        let canonical_team = crate::secrets_manager::canonical_team(team);
+        for key in std::iter::once(requirement.key.as_str())
+            .chain(requirement.aliases.iter().map(String::as_str))
+        {
+            // Reconcile differing provider string forms (raw `messaging-webchat-gui`
+            // vs canonical `messaging_webchat_gui`) via the canonicalization
+            // middleware, so a value persisted under one form is found here and we
+            // don't regenerate a duplicate under the other — which would make a
+            // minted token unverifiable (401). See `secrets_gate::secret_uri_candidates`.
+            for uri in crate::secrets_gate::secret_uri_candidates(
+                &self.env,
+                &self.tenant,
+                canonical_team.as_ref(),
+                key,
+                provider_id,
+            ) {
+                match self.store.get(&uri).await {
+                    Ok(_) => return Ok(true),
+                    Err(SecretError::NotFound { .. }) => continue,
+                    Err(err) => return Err(anyhow!("failed to read secret {}: {err}", uri)),
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn requirement_uri(
+        &self,
+        provider_id: &str,
+        key: &str,
+        generated: Option<&GeneratedSecretRequirement>,
+    ) -> String {
+        let team = if let Some(generated) = generated {
+            generated_scope_team(generated, self.team.as_deref())
+        } else {
+            self.team.as_deref()
+        };
+        canonical_secret_uri(&self.env, &self.tenant, team, provider_id, key)
+    }
+
+    fn seed_entry_for_requirement(
+        &self,
+        uri: String,
+        requirement: &PackSecretRequirement,
+    ) -> Result<SeedEntry> {
+        if let Some(generated) = &requirement.generated {
+            return generated_entry(uri, generated);
+        }
+        Ok(self
+            .seeds
+            .get(&uri)
+            .cloned()
+            .unwrap_or_else(|| placeholder_entry(uri.clone())))
+    }
+}
+
+fn requirement_allows_regeneration(requirement: &PackSecretRequirement) -> bool {
+    requirement
+        .generated
+        .as_ref()
+        .is_some_and(|generated| generated.regenerate_if_present)
 }
 
 fn load_seed_entries(bundle_root: &Path) -> Result<HashMap<String, SeedEntry>> {
@@ -159,6 +249,19 @@ fn placeholder_entry(uri: String) -> SeedEntry {
     }
 }
 
+fn generated_entry(uri: String, generated: &GeneratedSecretRequirement) -> Result<SeedEntry> {
+    let (bytes, format) = generate_secret_value(generated)
+        .map_err(|err| anyhow!("failed to generate secret for {uri}: {err}"))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|err| anyhow!("generated secret for {uri} was not valid UTF-8: {err}"))?;
+    Ok(SeedEntry {
+        uri,
+        format,
+        value: SeedValue::Text { text },
+        description: Some("auto-generated provider runtime secret".to_string()),
+    })
+}
+
 fn placeholder_text_for_uri(uri: &str) -> String {
     let lower = uri.to_ascii_lowercase();
     if matches!(lower.rsplit('/').next(), Some("api_key_secret")) {
@@ -191,6 +294,19 @@ mod tests {
         )
         .expect("requirements");
         zip.write_all(&requirements).expect("write");
+        zip.finish().expect("finish");
+    }
+
+    fn write_pack_with_requirements_json(path: &Path, requirements: serde_json::Value) {
+        let file = std::fs::File::create(path).expect("pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "assets/secret-requirements.json",
+            zip::write::FileOptions::<()>::default(),
+        )
+        .expect("start file");
+        zip.write_all(&serde_json::to_vec(&requirements).expect("requirements"))
+            .expect("write");
         zip.finish().expect("finish");
     }
 
@@ -290,6 +406,155 @@ mod tests {
                 .expect("utf8")
                 .contains("placeholder for")
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_pack_secrets_generates_declared_tenant_secret() {
+        let dir = tempdir().expect("tempdir");
+        let pack = dir.path().join("provider.gtpack");
+        write_pack_with_requirements_json(
+            &pack,
+            serde_json::json!([
+                {
+                    "key": "jwt_signing_key",
+                    "required": true,
+                    "generated": {
+                        "policy": "random",
+                        "length": 20,
+                        "encoding": "raw_text",
+                        "scope": {
+                            "level": "tenant",
+                            "team": "_"
+                        },
+                        "regenerate_if_present": false
+                    }
+                }
+            ]),
+        );
+
+        let setup = SecretsSetup::new(dir.path(), "dev", "demo", Some("default")).expect("setup");
+        setup
+            .ensure_pack_secrets(&pack, "messaging-webchat-gui")
+            .await
+            .expect("ensure secrets");
+
+        let tenant_uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            None,
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
+        let generated = setup.store.get(&tenant_uri).await.expect("generated");
+        let generated = String::from_utf8(generated).expect("utf8");
+        assert_eq!(generated.len(), 20);
+        assert!(!generated.contains("placeholder"));
+    }
+
+    #[tokio::test]
+    async fn ensure_pack_secrets_preserves_existing_generated_secret() {
+        let dir = tempdir().expect("tempdir");
+        let pack = dir.path().join("provider.gtpack");
+        write_pack_with_requirements_json(
+            &pack,
+            serde_json::json!([
+                {
+                    "key": "webex_webhook_secret",
+                    "required": true,
+                    "generated": {
+                        "policy": "random",
+                        "length": 20,
+                        "encoding": "raw_text",
+                        "scope": {
+                            "level": "tenant",
+                            "team": "_"
+                        },
+                        "regenerate_if_present": false
+                    }
+                }
+            ]),
+        );
+
+        let setup = SecretsSetup::new(dir.path(), "dev", "demo", Some("default")).expect("setup");
+        let uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            None,
+            "messaging-webex",
+            "webex_webhook_secret",
+        );
+        setup
+            .store
+            .put(&uri, SecretFormat::Text, b"existing-webhook-secret")
+            .await
+            .expect("seed existing");
+
+        setup
+            .ensure_pack_secrets(&pack, "messaging-webex")
+            .await
+            .expect("ensure secrets");
+
+        let value = setup.store.get(&uri).await.expect("existing");
+        assert_eq!(value, b"existing-webhook-secret".to_vec());
+    }
+
+    #[tokio::test]
+    async fn ensure_pack_secrets_considers_generated_aliases_existing() {
+        let dir = tempdir().expect("tempdir");
+        let pack = dir.path().join("provider.gtpack");
+        write_pack_with_requirements_json(
+            &pack,
+            serde_json::json!([
+                {
+                    "key": "jwt_signing_key",
+                    "aliases": ["legacy_jwt_key"],
+                    "required": true,
+                    "generated": {
+                        "policy": "random",
+                        "length": 20,
+                        "encoding": "raw_text",
+                        "scope": {
+                            "level": "tenant",
+                            "team": "_"
+                        },
+                        "regenerate_if_present": false
+                    }
+                }
+            ]),
+        );
+
+        let setup = SecretsSetup::new(dir.path(), "dev", "demo", Some("default")).expect("setup");
+        let alias_uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            None,
+            "messaging-webchat-gui",
+            "legacy_jwt_key",
+        );
+        setup
+            .store
+            .put(&alias_uri, SecretFormat::Text, b"existing-alias-secret")
+            .await
+            .expect("seed alias");
+
+        setup
+            .ensure_pack_secrets(&pack, "messaging-webchat-gui")
+            .await
+            .expect("ensure secrets");
+
+        let alias_value = setup.store.get(&alias_uri).await.expect("alias");
+        assert_eq!(alias_value, b"existing-alias-secret".to_vec());
+        let canonical_uri = canonical_secret_uri(
+            "dev",
+            "demo",
+            None,
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
+        assert!(matches!(
+            setup.store.get(&canonical_uri).await,
+            Err(SecretError::NotFound { .. })
+        ));
     }
 
     #[test]

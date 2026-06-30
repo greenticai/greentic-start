@@ -5,6 +5,7 @@ use greentic_types::ChannelMessageEnvelope;
 use serde_json::json;
 
 use crate::domains::Domain;
+use crate::ingress_dispatch::build_injected_config;
 use crate::messaging_app as app;
 use crate::messaging_dto::ProviderPayloadV1;
 use crate::messaging_egress as egress;
@@ -24,7 +25,7 @@ pub(super) fn route_messaging_envelopes(
     let pack_info = app::load_app_pack_info(&app_pack_path).context("load app pack manifest")?;
     let flow = app::select_app_flow(&pack_info).context("select app default flow")?;
 
-    operator_log::info(
+    operator_log::debug(
         module_path!(),
         format!(
             "[demo messaging] routing {} envelope(s) through app flow={} pack={}",
@@ -34,8 +35,57 @@ pub(super) fn route_messaging_envelopes(
         ),
     );
 
-    for envelope in &envelopes {
-        let outputs = if let Some(route_to_card) = envelope.metadata.get("routeToCardId") {
+    for original in &envelopes {
+        // Per-envelope Fast2Flow probe. On Dispatch with a node target, we
+        // synthesize the same metadata an Adaptive Card button click would
+        // produce — `routeToCardId` — so the existing card path renders the
+        // chosen card. Continue / Respond / Deny still fall through to the
+        // default flow path; per-directive handling lands incrementally.
+        let mut owned;
+        let envelope: &ChannelMessageEnvelope = match crate::fast2flow::try_for_request(
+            crate::fast2flow::Fast2FlowConfig::global(),
+            ctx,
+            &pack_info,
+            &app_pack_path,
+            original,
+            provider,
+        ) {
+            Some(crate::ingress::control_directive::ControlDirective::Dispatch {
+                target,
+                entities,
+            }) if target.node.is_some() => {
+                let node = target.node.as_ref().expect("checked some").clone();
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "[fast2flow] dispatch -> routeToCardId={node} entities={} \
+                         (pack={} flow={:?})",
+                        entities.len(),
+                        target.pack,
+                        target.flow
+                    ),
+                );
+                owned = original.clone();
+                owned.metadata.insert("routeToCardId".to_string(), node);
+                inject_prefill_metadata(&mut owned, &entities);
+                &owned
+            }
+            // No deterministic node dispatch. Try the embedded LLM fallback
+            // (greentic-start's own greentic-llm capability) before giving up.
+            _ => match try_llm_fallback(ctx, &pack_info, &app_pack_path, original) {
+                Some(synth) => {
+                    owned = synth;
+                    &owned
+                }
+                None => original,
+            },
+        };
+        let outputs = if let Some(route_to_card) = envelope
+            .metadata
+            .get("routeToCardId")
+            .or_else(|| envelope.metadata.get("toCardId"))
+            .or_else(|| envelope.metadata.get("nextCardId"))
+        {
             match read_card_from_pack(&app_pack_path, route_to_card) {
                 Some(mut card_json) => {
                     operator_log::info(
@@ -60,11 +110,12 @@ pub(super) fn route_messaging_envelopes(
                         .map(String::as_str)
                         .unwrap_or("en");
                     resolve_i18n_tokens(&mut card_json, &app_pack_path, locale);
-                    // Replace ${key} placeholders and carry form data forward
-                    // through Action.Submit buttons so subsequent cards can
-                    // also access the original form values.
-                    resolve_placeholders(&mut card_json, &envelope.metadata);
-                    carry_form_data_to_actions(&mut card_json, &envelope.metadata);
+                    // Empty-string defaults for unmatched `${prefill_*}`
+                    // — keeps the literal text out of the rendered card.
+                    let mut effective_metadata = envelope.metadata.clone();
+                    ensure_prefill_defaults(&card_json, &mut effective_metadata);
+                    resolve_placeholders(&mut card_json, &effective_metadata);
+                    carry_form_data_to_actions(&mut card_json, &effective_metadata);
                     let mut reply = envelope.clone();
                     reply.metadata.insert(
                         "adaptive_card".to_string(),
@@ -84,6 +135,34 @@ pub(super) fn route_messaging_envelopes(
                     run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
                 }
             }
+        } else if pack_info
+            .capabilities
+            .iter()
+            .any(|c| c == crate::fast2flow::FAST2FLOW_CAPABILITY)
+            && envelope
+                .text
+                .as_deref()
+                .is_some_and(|t| !t.trim().is_empty())
+        {
+            // The pack opted into Fast2Flow routing, the user sent free text,
+            // and no dispatch resolved (Fast2Flow returned Continue and
+            // didn't set routeToCardId). Surface a short error so we don't
+            // re-echo the welcome menu and confuse the user.
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[fast2flow] no dispatch for free text — emitting error reply pack={} text_len={}",
+                    pack_info.pack_id,
+                    envelope.text.as_deref().map(str::len).unwrap_or(0)
+                ),
+            );
+            let mut reply = envelope.clone();
+            reply.metadata.remove("adaptive_card");
+            reply.text = Some(
+                "I'm not sure what you meant. Tap one of the menu options or rephrase your request."
+                    .to_string(),
+            );
+            vec![reply]
         } else {
             run_app_flow_safe(bundle, ctx, &app_pack_path, &pack_info, flow, envelope)
         };
@@ -115,7 +194,7 @@ pub(super) fn route_messaging_envelopes(
                 .and_then(|v| v.as_str())
                 .map(|s| !s.is_empty())
                 .unwrap_or(false);
-            operator_log::info(
+            operator_log::debug(
                 module_path!(),
                 format!(
                     "[demo messaging] pre-encode adaptive_card={} text_present={} session_id={} route={} tenant={} metadata_keys={}",
@@ -183,8 +262,15 @@ pub(super) fn route_messaging_envelopes(
             };
 
             let provider_type = runner_host.canonical_provider_type(Domain::Messaging, provider);
-            let send_input =
-                egress::build_send_payload(payload, &provider_type, &ctx.tenant, ctx.team.clone());
+            let config = build_injected_config(runner_host, Domain::Messaging, provider, ctx)
+                .map(decode_injected_config_for_provider);
+            let send_input = egress::build_send_payload(
+                payload,
+                &provider_type,
+                &ctx.tenant,
+                ctx.team.clone(),
+                config,
+            );
             let send_bytes = serde_json::to_vec(&send_input)?;
             let outcome = runner_host.invoke_provider_op(
                 Domain::Messaging,
@@ -202,7 +288,7 @@ pub(super) fn route_messaging_envelopes(
                 .unwrap_or(false);
 
             if outcome.success && provider_ok {
-                operator_log::info(
+                operator_log::debug(
                     module_path!(),
                     format!(
                         "[demo messaging] send succeeded provider={} envelope_id={}",
@@ -231,6 +317,170 @@ pub(super) fn route_messaging_envelopes(
         }
     }
     Ok(())
+}
+
+fn decode_injected_config_for_provider(config: serde_json::Value) -> serde_json::Value {
+    let Some(obj) = config.as_object() else {
+        return config;
+    };
+    let mut decoded = serde_json::Map::new();
+    for (key, value) in obj {
+        if let Some(raw_key) = key.strip_suffix("_b64")
+            && let Some(text) = value.as_str()
+            && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(text)
+            && let Ok(decoded_text) = String::from_utf8(bytes)
+        {
+            decoded.insert(raw_key.to_string(), serde_json::Value::String(decoded_text));
+            continue;
+        }
+        decoded.insert(key.clone(), value.clone());
+    }
+    serde_json::Value::Object(decoded)
+}
+
+/// Drop intent-extracted entities into `envelope.metadata` so the
+/// existing `${placeholder}` substitution step can wire them into card
+/// fields. The shape is intentionally generic — no per-kind code lives
+/// here. Each entity contributes:
+///
+/// * `prefill_<kind>` — the canonical `normalized` value.
+/// * `prefill_<kind>_<role>` — when the entity carries a role tag
+///   (e.g. `prefill_location_from`, `prefill_location_to`).
+/// * `prefill_<kind>_<format>` — for every entry in the entity's
+///   `formats` map (e.g. an `iso` variant of a `YYYYMMDD` date, set
+///   by the routing host so this layer stays kind-agnostic).
+///
+/// Card authors opt in per field via `value: "${prefill_<key>}"`. The
+/// runtime never assumes which fields exist or which entities will
+/// arrive — every entity surfaces under the same naming convention.
+fn inject_prefill_metadata(
+    envelope: &mut ChannelMessageEnvelope,
+    entities: &[crate::ingress::control_directive::PrefillEntity],
+) {
+    for entity in entities {
+        envelope.metadata.insert(
+            format!("prefill_{}", entity.kind),
+            entity.normalized.clone(),
+        );
+        if let Some(role) = entity.role.as_deref() {
+            envelope.metadata.insert(
+                format!("prefill_{}_{}", entity.kind, role),
+                entity.normalized.clone(),
+            );
+        }
+        for (format_name, value) in &entity.formats {
+            envelope.metadata.insert(
+                format!("prefill_{}_{}", entity.kind, format_name),
+                value.clone(),
+            );
+        }
+    }
+}
+
+/// Embedded LLM routing fallback: when the deterministic tier yields no node
+/// dispatch for a Fast2Flow-capable pack and the bundle declared an `llm:`
+/// instance (with `fast2flow` enabled), ask [`crate::llm`] to pick a card and
+/// synthesize the same `routeToCardId` + prefill the host path produces. Needs
+/// no external binary, so it works embedded. `None` ⇒ fall through.
+fn try_llm_fallback(
+    ctx: &OperatorContext,
+    pack_info: &app::AppPackInfo,
+    app_pack_path: &Path,
+    original: &ChannelMessageEnvelope,
+) -> Option<ChannelMessageEnvelope> {
+    // The bundle's shared `llm:` instance, with the Fast2Flow consumer enabled.
+    let cfg = crate::llm::config()?;
+    if !cfg.fast2flow {
+        return None;
+    }
+    if !pack_info
+        .capabilities
+        .iter()
+        .any(|c| c == crate::fast2flow::FAST2FLOW_CAPABILITY)
+    {
+        return None;
+    }
+    let text = original
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())?;
+    let index_path = crate::fast2flow::resolve_index_path(
+        crate::fast2flow::Fast2FlowConfig::global(),
+        ctx,
+        app_pack_path,
+    )?;
+    match crate::fast2flow::try_llm_route(cfg, ctx, &index_path, text)? {
+        crate::ingress::control_directive::ControlDirective::Dispatch { target, entities }
+            if target.node.is_some() =>
+        {
+            let node = target.node.as_ref().expect("checked some").clone();
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[fast2flow:llm] dispatch -> routeToCardId={node} entities={} \
+                     (pack={} flow={:?})",
+                    entities.len(),
+                    target.pack,
+                    target.flow
+                ),
+            );
+            let mut owned = original.clone();
+            owned.metadata.insert("routeToCardId".to_string(), node);
+            inject_prefill_metadata(&mut owned, &entities);
+            Some(owned)
+        }
+        _ => None,
+    }
+}
+
+/// Insert empty-string defaults for any unmatched `${prefill_*}`
+/// placeholder the card references. Non-prefill keys keep the existing
+/// "unresolved → keep literal" behaviour so two-pass flows aren't broken.
+fn ensure_prefill_defaults(
+    card: &serde_json::Value,
+    metadata: &mut std::collections::BTreeMap<String, String>,
+) {
+    let mut keys = std::collections::HashSet::<String>::new();
+    collect_placeholder_keys(card, &mut keys);
+    for key in keys {
+        if key.starts_with("prefill_") {
+            metadata.entry(key).or_default();
+        }
+    }
+}
+
+fn collect_placeholder_keys(
+    value: &serde_json::Value,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match value {
+        serde_json::Value::String(s) => {
+            let mut rest = s.as_str();
+            while let Some(start) = rest.find("${") {
+                let after = &rest[start + 2..];
+                let Some(end) = after.find('}') else {
+                    break;
+                };
+                let key = after[..end].trim();
+                if !key.is_empty() {
+                    out.insert(key.to_string());
+                }
+                rest = &after[end + 1..];
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_placeholder_keys(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values() {
+                collect_placeholder_keys(v, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn read_card_from_pack(pack_path: &Path, card_key: &str) -> Option<serde_json::Value> {
@@ -277,6 +527,7 @@ use anyhow::Context;
 const ROUTING_META_KEYS: &[&str] = &[
     "routeToCardId",
     "toCardId",
+    "nextCardId",
     "action_id",
     "adaptive_card",
     "locale",
@@ -569,6 +820,58 @@ mod tests {
     use tempfile::tempdir;
     use zip::write::FileOptions;
 
+    #[test]
+    fn ensure_prefill_defaults_inserts_empty_for_unmatched_prefill_keys() {
+        let card = json!({"value": "${prefill_date_iso}"});
+        let mut metadata = std::collections::BTreeMap::<String, String>::new();
+        ensure_prefill_defaults(&card, &mut metadata);
+        assert_eq!(
+            metadata.get("prefill_date_iso").map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn ensure_prefill_defaults_preserves_existing_extracted_values() {
+        let card = json!({"value": "${prefill_date_iso}"});
+        let mut metadata = std::collections::BTreeMap::<String, String>::new();
+        metadata.insert("prefill_date_iso".into(), "2026-05-30".into());
+        ensure_prefill_defaults(&card, &mut metadata);
+        assert_eq!(
+            metadata.get("prefill_date_iso").map(String::as_str),
+            Some("2026-05-30")
+        );
+    }
+
+    #[test]
+    fn ensure_prefill_defaults_leaves_non_prefill_placeholders_alone() {
+        let card = json!({"value": "${other_token}", "subtitle": "${i18n:foo}"});
+        let mut metadata = std::collections::BTreeMap::<String, String>::new();
+        ensure_prefill_defaults(&card, &mut metadata);
+        assert!(!metadata.contains_key("other_token"));
+        assert!(!metadata.contains_key("i18n:foo"));
+    }
+
+    #[test]
+    fn end_to_end_unresolved_prefill_renders_empty_not_literal() {
+        let mut card = json!({"value": "${prefill_date_iso}"});
+        let mut metadata = std::collections::BTreeMap::<String, String>::new();
+        ensure_prefill_defaults(&card, &mut metadata);
+        resolve_placeholders(&mut card, &metadata);
+        assert_eq!(card["value"], json!(""));
+    }
+
+    #[test]
+    fn collect_placeholder_keys_handles_multiple_per_string() {
+        let v = json!("from ${a} to ${b}, on ${c}, missing}${d}");
+        let mut keys = std::collections::HashSet::<String>::new();
+        collect_placeholder_keys(&v, &mut keys);
+        assert!(keys.contains("a"));
+        assert!(keys.contains("b"));
+        assert!(keys.contains("c"));
+        assert!(keys.contains("d"));
+    }
+
     fn envelope() -> ChannelMessageEnvelope {
         serde_json::from_value(json!({
             "id": "msg-1",
@@ -677,6 +980,7 @@ mod tests {
             &AppPackInfo {
                 pack_id: "app-pack".to_string(),
                 flows: vec![],
+                capabilities: Vec::new(),
             },
             &AppFlowInfo {
                 id: "default".to_string(),
@@ -784,6 +1088,74 @@ mod tests {
             result.is_err(),
             "expected error because no messaging provider pack is available"
         );
+    }
+
+    #[test]
+    fn route_messaging_envelopes_card_routing_accepts_next_card_id_alias() {
+        // The designer emits card navigation under `nextCardId`; the demo host
+        // must treat it as an alias for `routeToCardId` and take the same
+        // card-routing fast-path. Without a provider pack, egress fails — which
+        // confirms the fast-path (read_card_from_pack) was entered rather than
+        // falling through to the app flow.
+        let dir = tempdir().expect("tempdir");
+        let packs_dir = dir.path().join("packs");
+        std::fs::create_dir_all(&packs_dir).expect("packs dir");
+        let app_pack = packs_dir.join("default.gtpack");
+        write_test_app_pack(&app_pack);
+
+        let discovery = crate::discovery::discover(dir.path()).expect("discovery");
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
+                .expect("secrets");
+        let runner_host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )
+        .expect("runner host");
+
+        let mut card_routed = envelope();
+        card_routed
+            .metadata
+            .insert("nextCardId".to_string(), "welcome".to_string());
+
+        let result = route_messaging_envelopes(
+            dir.path(),
+            &runner_host,
+            "messaging-webchat",
+            &OperatorContext {
+                tenant: "demo".to_string(),
+                team: Some("default".to_string()),
+                correlation_id: None,
+            },
+            vec![card_routed],
+        );
+        assert!(
+            result.is_err(),
+            "expected egress error, proving the nextCardId alias took the card-routing fast-path"
+        );
+    }
+
+    #[test]
+    fn next_card_id_is_a_routing_key_and_not_carried_as_form_data() {
+        assert!(ROUTING_META_KEYS.contains(&"nextCardId"));
+
+        let mut card = json!({
+            "actions": [
+                { "type": "Action.Submit", "data": { "nextCardId": "second" } }
+            ]
+        });
+        let mut meta = std::collections::BTreeMap::new();
+        meta.insert("full_name".to_string(), "Alice".to_string());
+        meta.insert("nextCardId".to_string(), "second".to_string());
+
+        carry_form_data_to_actions(&mut card, &meta);
+
+        let data = &card["actions"][0]["data"];
+        assert_eq!(data["full_name"], "Alice", "form data is carried forward");
+        assert_eq!(data["nextCardId"], "second");
     }
 
     use std::io::Write;

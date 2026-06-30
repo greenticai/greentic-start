@@ -45,6 +45,7 @@ fn make_pack_with_timer_subscriber() -> AppPackInfo {
                 subscribes_to: vec!["timer.*".to_string()],
             },
         ],
+        capabilities: vec![],
     }
 }
 
@@ -88,6 +89,7 @@ fn timer_fired_does_not_match_unrelated_subscriber() {
             kind: "events".to_string(),
             subscribes_to: vec!["orders.*".to_string()],
         }],
+        capabilities: vec![],
     };
 
     let matched = select_target_flows(&pack, "timer.fired");
@@ -115,6 +117,7 @@ fn multiple_flows_can_subscribe_to_same_timer_pattern() {
                 subscribes_to: vec!["timer.fired".to_string()],
             },
         ],
+        capabilities: vec![],
     };
 
     let matched = select_target_flows(&pack, "timer.fired");

@@ -130,6 +130,7 @@ mod tests {
                     subscribes_to: vec!["orders.*".to_string()],
                 },
             ],
+            capabilities: vec![],
         }
     }
 
@@ -172,6 +173,7 @@ mod tests {
                     subscribes_to: vec!["payments.*".to_string()],
                 },
             ],
+            capabilities: vec![],
         };
         let matched = select_target_flows(&info, "orders.shipped");
         let ids: Vec<&str> = matched.iter().map(|f| f.id.as_str()).collect();
@@ -187,6 +189,7 @@ mod tests {
                 kind: "messaging".to_string(),
                 subscribes_to: vec!["billing.*".to_string()],
             }],
+            capabilities: vec![],
         };
         // "subscription.created" must NOT match "billing.*"
         let matched = select_target_flows(&info, "subscription.created");

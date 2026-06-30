@@ -26,6 +26,7 @@ use crate::secret_value::SecretValue;
 use crate::secrets_backend::SecretsBackendKind;
 use crate::secrets_client::SecretsClient;
 use crate::secrets_manager;
+use crate::secrets_provider_binding::SecretsProviderBinding;
 
 type CborMap = BTreeMap<CborValue, CborValue>;
 
@@ -183,21 +184,34 @@ impl SecretsManager for LoggingSecretsManager {
                 Ok(value)
             }
             Err(err) => {
-                // Fallback: if team-specific secret not found, try team="_" (wildcard).
-                // Secrets saved at tenant-level (no team) live under "_" but runtime
-                // may read with a specific team from the routing context.
+                // Fallback candidates. The dev store canonicalizes the provider/key
+                // segments at write time (setup uses canonical_secret_name), but the
+                // WASM provider-invoke path in the external runner-host crate requests
+                // the raw pack-stem provider (e.g. `messaging-webchat-gui`), so a
+                // verbatim lookup misses the stored `messaging_webchat_gui`. Try the
+                // canonicalized URI, plus the team="_" wildcard variants (secrets saved
+                // at tenant-level live under "_" but the runtime may read with a
+                // specific team from the routing context).
+                let mut candidates: Vec<String> = Vec::new();
+                if let Some(canon) = canonicalize_provider_segment(path) {
+                    candidates.push(canon);
+                }
                 if let Some(fallback_path) = team_wildcard_fallback(path) {
+                    if let Some(canon_fb) = canonicalize_provider_segment(&fallback_path) {
+                        candidates.push(canon_fb);
+                    }
+                    candidates.push(fallback_path);
+                }
+                for candidate in candidates {
                     operator_log::info(
                         module_path!(),
-                        format!(
-                            "WASM secrets read fallback: team-specific not found, trying uri={fallback_path}",
-                        ),
+                        format!("WASM secrets read fallback: trying uri={candidate}"),
                     );
-                    if let Ok(value) = self.inner.read(&fallback_path).await {
+                    if let Ok(value) = self.inner.read(&candidate).await {
                         operator_log::debug(
                             module_path!(),
                             format!(
-                                "WASM secrets read fallback resolved uri={fallback_path}; value={}",
+                                "WASM secrets read fallback resolved uri={candidate}; value={}",
                                 SecretValue::new(value.as_slice()),
                             ),
                         );
@@ -259,6 +273,29 @@ fn team_wildcard_fallback(path: &str) -> Option<String> {
     Some(format!(
         "secrets://{}/{}/{}/{}/{}",
         segments[0], segments[1], "_", segments[3], segments[4]
+    ))
+}
+
+/// If `path` is `secrets://env/tenant/team/provider/key`, return the same URI with the
+/// provider and key segments canonicalized (lowercase, `-`/`.`/`/`/space -> `_`) to match
+/// how setup/store keys are normalized at write time. Returns None if it is already
+/// canonical or not a 5-segment `secrets://` URI. This bridges the external runner-host
+/// requesting a raw pack-stem provider (e.g. `messaging-webchat-gui`) against a store
+/// keyed by the canonical `messaging_webchat_gui`.
+fn canonicalize_provider_segment(path: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("secrets://")?;
+    let segments: Vec<&str> = trimmed.split('/').collect();
+    if segments.len() != 5 {
+        return None;
+    }
+    let canonical_provider = secret_name::canonical_secret_name(segments[3]);
+    let canonical_key = secret_name::canonical_secret_name(segments[4]);
+    if canonical_provider == segments[3] && canonical_key == segments[4] {
+        return None;
+    }
+    Some(format!(
+        "secrets://{}/{}/{}/{}/{}",
+        segments[0], segments[1], segments[2], canonical_provider, canonical_key
     ))
 }
 
@@ -335,11 +372,13 @@ fn store_scope_candidates(path: &str, pack_id: Option<&str>, setup_env: &str) ->
 }
 
 const ENV_ALLOW_ENV_SECRETS: &str = "GREENTIC_ALLOW_ENV_SECRETS";
+const ENV_REQUIRE_PROVIDER_BINDING: &str = "GREENTIC_REQUIRE_SECRETS_PROVIDER_BINDING";
 
 #[derive(Clone)]
 pub struct SecretsManagerHandle {
     manager: DynSecretsManager,
     pub selection: secrets_manager::SecretsManagerSelection,
+    pub provider_binding: Option<SecretsProviderBinding>,
     pub dev_store_path: Option<PathBuf>,
     pub canonical_team: String,
     pub using_env_fallback: bool,
@@ -368,8 +407,45 @@ pub fn resolve_secrets_manager(
 ) -> AnyhowResult<SecretsManagerHandle> {
     let canonical_team = secrets_manager::canonical_team(team);
     let team_owned = canonical_team.into_owned();
-    let selection = secrets_manager::select_secrets_manager(bundle_root, tenant, &team_owned)?;
     let allow_env = matches!(env::var(ENV_ALLOW_ENV_SECRETS).as_deref(), Ok("1"));
+    if let Some((binding_path, binding)) = SecretsProviderBinding::load_from_bundle(bundle_root)? {
+        return resolve_bound_secrets_manager(bundle_root, team, allow_env, binding_path, binding);
+    }
+    if matches!(
+        env::var(ENV_REQUIRE_PROVIDER_BINDING).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    ) {
+        return Err(anyhow!(
+            "cloud secrets mode requires a secrets provider binding at .providers/platform/secrets-provider.json"
+        ));
+    }
+    let selection = match secrets_manager::select_secrets_manager(bundle_root, tenant, &team_owned)
+    {
+        Ok(selection) => selection,
+        Err(err) => {
+            let (manager, store_path, using_env_fallback) =
+                fallback_to_env(allow_env, "<selection>".to_string(), "<none>", err)?;
+            let manager = CachingSecretsManager::wrap(manager);
+            let manager = crate::oauth_secret_bridge::OAuthBridgingSecretsManager::wrap(
+                manager,
+                Some(Arc::new(
+                    crate::oauth_secret_bridge::NoopProviderTokenResolver,
+                )),
+            );
+            return Ok(SecretsManagerHandle {
+                manager,
+                selection: secrets_manager::SecretsManagerSelection {
+                    scope: secrets_manager::SelectedKind::None,
+                    pack_path: None,
+                    reason: "secrets manager selection failed; using env fallback".to_string(),
+                },
+                provider_binding: None,
+                dev_store_path: store_path,
+                canonical_team: team_owned,
+                using_env_fallback,
+            });
+        }
+    };
     let pack_desc = selection
         .pack_path
         .as_ref()
@@ -439,11 +515,135 @@ pub fn resolve_secrets_manager(
         );
     }
     let manager = CachingSecretsManager::wrap(manager);
+    // OAuth bake-in: refresh-on-read. `/oauth/callback` persists the token at the
+    // pack-scoped key the adapter reads; this resolver serves it and silently
+    // refreshes via the native OAuth engine when it's near expiry (using the sibling
+    // refresh_token/client_id/secret). Non-OAuth keys and tokens without an
+    // `expires_at` fall through unchanged.
+    let resolver: std::sync::Arc<dyn crate::oauth_secret_bridge::ProviderTokenResolver> =
+        std::sync::Arc::new(crate::oauth_secret_bridge::RefreshingResolver::new(
+            manager.clone(),
+        ));
+    let manager =
+        crate::oauth_secret_bridge::OAuthBridgingSecretsManager::wrap(manager, Some(resolver));
     Ok(SecretsManagerHandle {
         manager,
         selection,
+        provider_binding: None,
         dev_store_path: store_path,
         canonical_team: team_owned,
+        using_env_fallback,
+    })
+}
+
+fn resolve_bound_secrets_manager(
+    bundle_root: &Path,
+    team: Option<&str>,
+    allow_env: bool,
+    binding_path: PathBuf,
+    binding: SecretsProviderBinding,
+) -> AnyhowResult<SecretsManagerHandle> {
+    let canonical_team = secrets_manager::canonical_team(team).into_owned();
+    let pack_path = binding.resolved_pack_path(bundle_root);
+    let selection = secrets_manager::SecretsManagerSelection {
+        scope: secrets_manager::SelectedKind::Binding,
+        pack_path: pack_path.clone(),
+        reason: format!(
+            "secrets provider binding {} selected provider {}",
+            binding_path.display(),
+            binding.provider_id
+        ),
+    };
+    let pack_desc = pack_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<none>".to_string());
+    operator_log::info(
+        module_path!(),
+        format!(
+            "secrets provider binding selected: path={} provider_id={} pack_path={}",
+            binding_path.display(),
+            binding.provider_id,
+            pack_desc,
+        ),
+    );
+
+    let backend_kind = binding.backend_kind(bundle_root);
+    let backend_label = backend_kind
+        .as_ref()
+        .map(|kind| match kind {
+            Some(kind) => kind.to_string(),
+            None => format!("binding:{}", binding.provider_id),
+        })
+        .unwrap_or_else(|err| format!("ERR({err})"));
+    let (manager, store_path, using_env_fallback) = match backend_kind {
+        Ok(Some(kind)) => match instantiate_manager_for_backend(bundle_root, &selection, kind) {
+            Ok((manager, path)) => Ok((manager, path, false)),
+            Err(err) => fallback_to_env(allow_env, kind.to_string(), &pack_desc, err),
+        },
+        Ok(None) => {
+            let err = anyhow!(
+                "secrets provider binding {} does not declare a supported runtime backend; provider_id={} requires a linked greentic-secrets provider adapter",
+                binding_path.display(),
+                binding.provider_id
+            );
+            fallback_to_env(
+                allow_env,
+                format!("binding:{}", binding.provider_id),
+                &pack_desc,
+                err,
+            )
+        }
+        Err(err) => fallback_to_env(
+            allow_env,
+            format!("binding:{}", binding.provider_id),
+            &pack_desc,
+            err,
+        ),
+    }?;
+
+    operator_log::info(
+        module_path!(),
+        format!(
+            "secrets runtime backend chosen from binding: provider_id={} backend={} dev_store_path={} using_env_fallback={}",
+            binding.provider_id,
+            backend_label,
+            store_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+            using_env_fallback
+        ),
+    );
+    eprintln!(
+        "secrets: binding_provider={} backend={} using_env_fallback={} dev_store_path={} selection_pack={}",
+        binding.provider_id,
+        backend_label,
+        using_env_fallback,
+        store_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        pack_desc,
+    );
+
+    let manager = CachingSecretsManager::wrap(manager);
+    // OAuth bake-in (host resolver): intercept `auth.oauth2.*.access_token` reads
+    // and resolve a valid token via greentic-oauth (mint/refresh). With the no-op
+    // resolver these fall through to the store unchanged; the greentic-oauth-backed
+    // resolver is wired in separately.
+    let manager = crate::oauth_secret_bridge::OAuthBridgingSecretsManager::wrap(
+        manager,
+        Some(Arc::new(
+            crate::oauth_secret_bridge::NoopProviderTokenResolver,
+        )),
+    );
+    Ok(SecretsManagerHandle {
+        manager,
+        selection,
+        provider_binding: Some(binding),
+        dev_store_path: store_path,
+        canonical_team,
         using_env_fallback,
     })
 }
@@ -513,10 +713,14 @@ pub fn canonical_secret_uri(
     key: &str,
 ) -> String {
     let team_segment = secrets_manager::canonical_team(team);
+    // Normalize the provider segment the same way as the key (and as the cloud
+    // secret name / env-bridge key already do), so a value written under a
+    // provider id like `messaging-webchat-gui` resolves when a component fetches
+    // it under `messaging.webchat-gui` — both collapse to `messaging_webchat_gui`.
     let provider_segment = if provider.is_empty() {
         "messaging".to_string()
     } else {
-        provider.to_string()
+        secret_name::canonical_secret_name(provider)
     };
     let normalized_key = secret_name::canonical_secret_name(key);
     format!(
@@ -525,36 +729,25 @@ pub fn canonical_secret_uri(
     )
 }
 
+/// Derive the env-var lookup key for a 5-segment `secrets://` store URI.
+///
+/// Delegates to `greentic-secrets`
+/// ([`greentic_secrets_lib::canonical_secret_store_key`]) — the single shared
+/// definition the runtime reader and the deployer's resolver both use, so a
+/// secret exported as an env var is found under exactly the key it was written
+/// as.
 pub fn canonical_secret_store_key(uri: &str) -> Option<String> {
-    let trimmed = uri.strip_prefix("secrets://")?;
-    let segments: Vec<&str> = trimmed.split('/').collect();
-    if segments.len() != 5 {
-        return None;
-    }
-    let normalized = segments
-        .into_iter()
-        .map(normalize_store_segment)
-        .collect::<Vec<_>>();
-    let mut parts = vec!["GREENTIC_SECRET".to_string()];
-    parts.extend(normalized);
-    Some(parts.join("__"))
+    greentic_secrets_lib::canonical_secret_store_key(uri)
 }
 
-fn normalize_store_segment(segment: &str) -> String {
-    let mut normalized = String::with_capacity(segment.len());
-    for ch in segment.chars() {
-        let replacement = match ch {
-            'A'..='Z' | '0'..='9' => ch,
-            'a'..='z' => ch.to_ascii_uppercase(),
-            '_' => '_',
-            _ => '_',
-        };
-        normalized.push(replacement);
-    }
-    normalized
-}
-
-fn secret_uri_candidates(
+/// Store-key candidates for a secret, reconciling differing provider string forms
+/// (raw `messaging-webchat-gui` vs canonical `messaging_webchat_gui`). The raw
+/// provider form is first; the canonical (underscored) form is added when it
+/// differs. This is the canonicalization middleware for read/existence CRITICAL
+/// PATHS — without it a writer and reader that disagree on the provider segment
+/// resolve different keys (e.g. a regenerated `jwt_signing_key` → a minted token
+/// that fails to verify → 401).
+pub fn secret_uri_candidates(
     env: &str,
     tenant: &str,
     canonical_team: &str,
@@ -563,7 +756,15 @@ fn secret_uri_candidates(
 ) -> Vec<String> {
     let normalized_key = secret_name::canonical_secret_name(key);
     let prefix = format!("secrets://{}/{}/{}/", env, tenant, canonical_team);
-    vec![format!("{prefix}{provider_id}/{normalized_key}")]
+    let mut out = vec![format!("{prefix}{provider_id}/{normalized_key}")];
+    let canonical_provider = secret_name::canonical_secret_name(provider_id);
+    if canonical_provider != provider_id {
+        let canon = format!("{prefix}{canonical_provider}/{normalized_key}");
+        if !out.contains(&canon) {
+            out.push(canon);
+        }
+    }
+    out
 }
 
 fn display_secret_candidates(
@@ -950,6 +1151,68 @@ mod tests {
     }
 
     #[test]
+    fn canonical_uri_normalizes_provider_segment() {
+        // A secret stored under the pack provider id `messaging-webchat-gui`
+        // must resolve when a component fetches it under its dotted manifest id
+        // `messaging.webchat-gui` — both collapse to `messaging_webchat_gui`.
+        let stored = canonical_secret_uri(
+            "dev",
+            "demo",
+            None,
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
+        let fetched = canonical_secret_uri(
+            "dev",
+            "demo",
+            None,
+            "messaging.webchat-gui",
+            "jwt_signing_key",
+        );
+        assert_eq!(stored, fetched);
+        assert_eq!(
+            stored,
+            "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key"
+        );
+    }
+
+    #[test]
+    fn canonicalize_provider_segment_normalizes_provider_and_key() {
+        // The external runner-host requests the raw pack-stem provider; the read
+        // chokepoint must canonicalize it to match the stored key.
+        assert_eq!(
+            canonicalize_provider_segment(
+                "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key"
+            ),
+            Some("secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key".to_string())
+        );
+        // Dotted manifest id collapses the same way.
+        assert_eq!(
+            canonicalize_provider_segment(
+                "secrets://dev/demo/team-a/messaging.webchat-gui/JWT-Signing-Key"
+            ),
+            Some("secrets://dev/demo/team-a/messaging_webchat_gui/jwt_signing_key".to_string())
+        );
+    }
+
+    #[test]
+    fn canonicalize_provider_segment_skips_already_canonical_and_malformed() {
+        // Already canonical -> None (no redundant retry).
+        assert_eq!(
+            canonicalize_provider_segment(
+                "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key"
+            ),
+            None
+        );
+        // Not a 5-segment secrets URI -> None.
+        assert_eq!(
+            canonicalize_provider_segment("secrets://dev/demo/_/key"),
+            None
+        );
+        assert_eq!(canonicalize_provider_segment("not-a-secret-uri"), None);
+    }
+
+    #[test]
     fn store_scope_candidates_bridge_llm_credential_to_setup_scope() {
         // Runtime reads the canonical LLM credential scope; `gtc setup` wrote it
         // under the app-pack provider at the `dev` setup env.
@@ -1247,6 +1510,210 @@ mod tests {
     }
 
     #[test]
+    fn local_runtime_ignores_cloud_provider_packs_and_defaults_to_devstore() -> anyhow::Result<()> {
+        let bundle_root = tempdir()?;
+        let providers_secrets = bundle_root.path().join("providers").join("secrets");
+        write_cloud_provider_pack(&providers_secrets, "aws-sm.gtpack")?;
+        write_cloud_provider_pack(&providers_secrets, "azure-kv.gtpack")?;
+        write_cloud_provider_pack(&providers_secrets, "gcp-sm.gtpack")?;
+
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+            env::remove_var(ENV_REQUIRE_PROVIDER_BINDING);
+        }
+        let handle = resolve_secrets_manager(bundle_root.path(), "demo", Some("default"))?;
+        drop(env_guard);
+
+        assert_eq!(handle.selection.scope, secrets_manager::SelectedKind::None);
+        assert!(handle.selection.pack_path.is_none());
+        assert!(handle.provider_binding.is_none());
+        assert!(handle.dev_store_path.is_some());
+        assert!(!handle.using_env_fallback);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_binding_env_backend_accepts_arbitrary_provider_id() -> anyhow::Result<()> {
+        let bundle_root = tempdir()?;
+        write_provider_binding(
+            bundle_root.path(),
+            "greentic.secrets.custom-vendor",
+            r#""backend":"env""#,
+            None,
+        )?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+        }
+        let handle = resolve_secrets_manager(bundle_root.path(), "demo", Some("default"))?;
+        drop(env_guard);
+
+        assert_eq!(
+            handle.selection.scope,
+            secrets_manager::SelectedKind::Binding
+        );
+        assert_eq!(
+            handle
+                .provider_binding
+                .as_ref()
+                .map(|binding| binding.provider_id.as_str()),
+            Some("greentic.secrets.custom-vendor")
+        );
+        assert!(handle.dev_store_path.is_none());
+        assert!(!handle.using_env_fallback);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_binding_wins_over_scoped_pack_discovery() -> anyhow::Result<()> {
+        let bundle_root = tempdir()?;
+        write_provider_binding(
+            bundle_root.path(),
+            "greentic.secrets.custom-vendor",
+            r#""backend":"env""#,
+            None,
+        )?;
+        let pack_dir = secrets_pack_dir(bundle_root.path(), "demo", "default");
+        let _ = write_secrets_pack(
+            &pack_dir,
+            "dev-backend.gtpack",
+            r#"{"backend":"dev-store"}"#,
+        )?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+        }
+        let handle = resolve_secrets_manager(bundle_root.path(), "demo", Some("default"))?;
+        drop(env_guard);
+
+        assert_eq!(
+            handle.selection.scope,
+            secrets_manager::SelectedKind::Binding
+        );
+        assert!(handle.dev_store_path.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_provider_binding_wins_over_cloud_provider_packs() -> anyhow::Result<()> {
+        let bundle_root = tempdir()?;
+        let providers_secrets = bundle_root.path().join("providers").join("secrets");
+        write_cloud_provider_pack(&providers_secrets, "aws-sm.gtpack")?;
+        write_cloud_provider_pack(&providers_secrets, "azure-kv.gtpack")?;
+        write_cloud_provider_pack(&providers_secrets, "gcp-sm.gtpack")?;
+        write_provider_binding(
+            bundle_root.path(),
+            "greentic.secrets.aws-sm",
+            r#""backend":"env""#,
+            Some("providers/secrets/aws-sm.gtpack"),
+        )?;
+
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+            env::remove_var(ENV_REQUIRE_PROVIDER_BINDING);
+        }
+        let handle = resolve_secrets_manager(bundle_root.path(), "demo", Some("default"))?;
+        drop(env_guard);
+
+        assert_eq!(
+            handle.selection.scope,
+            secrets_manager::SelectedKind::Binding
+        );
+        assert_eq!(
+            handle
+                .provider_binding
+                .as_ref()
+                .map(|binding| binding.provider_id.as_str()),
+            Some("greentic.secrets.aws-sm")
+        );
+        assert!(handle.dev_store_path.is_none());
+        assert!(!handle.using_env_fallback);
+        Ok(())
+    }
+
+    #[test]
+    fn cloud_mode_requires_provider_binding_when_flagged() -> anyhow::Result<()> {
+        let bundle_root = tempdir()?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+            env::set_var(ENV_REQUIRE_PROVIDER_BINDING, "1");
+        }
+        let err = match resolve_secrets_manager(bundle_root.path(), "demo", Some("default")) {
+            Ok(_) => anyhow!("expected provider binding requirement to fail"),
+            Err(err) => err,
+        };
+        unsafe {
+            env::remove_var(ENV_REQUIRE_PROVIDER_BINDING);
+        }
+        drop(env_guard);
+
+        assert!(
+            err.to_string()
+                .contains("requires a secrets provider binding")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cloud_mode_requires_provider_binding_even_with_cloud_provider_packs() -> anyhow::Result<()> {
+        let bundle_root = tempdir()?;
+        let providers_secrets = bundle_root.path().join("providers").join("secrets");
+        write_cloud_provider_pack(&providers_secrets, "aws-sm.gtpack")?;
+        write_cloud_provider_pack(&providers_secrets, "azure-kv.gtpack")?;
+        write_cloud_provider_pack(&providers_secrets, "gcp-sm.gtpack")?;
+
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+            env::set_var(ENV_REQUIRE_PROVIDER_BINDING, "1");
+        }
+        let err = match resolve_secrets_manager(bundle_root.path(), "demo", Some("default")) {
+            Ok(_) => anyhow!("expected provider binding requirement to fail"),
+            Err(err) => err,
+        };
+        unsafe {
+            env::remove_var(ENV_REQUIRE_PROVIDER_BINDING);
+        }
+        drop(env_guard);
+
+        assert!(
+            err.to_string()
+                .contains("requires a secrets provider binding")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_binding_without_supported_backend_fails_clearly() -> anyhow::Result<()> {
+        let bundle_root = tempdir()?;
+        write_provider_binding(
+            bundle_root.path(),
+            "greentic.secrets.aws-sm",
+            r#""region":"eu-north-1""#,
+            None,
+        )?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var("GREENTIC_SECRETS_MANAGER_PACK");
+            env::remove_var(ENV_ALLOW_ENV_SECRETS);
+        }
+        let err = match resolve_secrets_manager(bundle_root.path(), "demo", Some("default")) {
+            Ok(_) => anyhow!("expected unsupported provider binding to fail"),
+            Err(err) => err,
+        };
+        drop(env_guard);
+
+        assert!(
+            err.to_string()
+                .contains("requires a linked greentic-secrets provider adapter")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn env_selection_pack_uses_env_manager() -> anyhow::Result<()> {
         let bundle_root = tempdir()?;
         let tenant = "demo";
@@ -1338,6 +1805,44 @@ mod tests {
         zip.write_all(backend_config.as_bytes())?;
         zip.finish()?;
         Ok(pack_path)
+    }
+
+    fn write_cloud_provider_pack(dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
+        fs::create_dir_all(dir)?;
+        let pack_path = dir.join(name);
+        let file = File::create(&pack_path)?;
+        let mut zip = ZipWriter::new(file);
+        let options: FileOptions<'_, ()> = FileOptions::default();
+        zip.start_file("pack.json", options)?;
+        zip.write_all(br#"{"pack_id":"greentic.secrets.adapter"}"#)?;
+        zip.finish()?;
+        Ok(pack_path)
+    }
+
+    fn write_provider_binding(
+        bundle_root: &Path,
+        provider_id: &str,
+        config_fields: &str,
+        pack: Option<&str>,
+    ) -> anyhow::Result<PathBuf> {
+        let binding_dir = bundle_root.join("state/config/platform");
+        fs::create_dir_all(&binding_dir)?;
+        let binding_path = binding_dir.join("secrets-provider.json");
+        let pack_field = pack
+            .map(|pack| format!(r#","pack":"{}""#, pack))
+            .unwrap_or_default();
+        fs::write(
+            &binding_path,
+            format!(
+                r#"{{
+                  "schema_version":"greentic.secrets.binding.v1",
+                  "provider_id":"{}"{},
+                  "config":{{{}}}
+                }}"#,
+                provider_id, pack_field, config_fields
+            ),
+        )?;
+        Ok(binding_path)
     }
 
     fn secrets_pack_dir(bundle_root: &Path, tenant: &str, team: &str) -> PathBuf {
