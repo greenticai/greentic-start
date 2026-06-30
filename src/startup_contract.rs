@@ -381,6 +381,7 @@ mod tests {
             dependencies: Vec::new(),
             capabilities: Vec::new(),
             secret_requirements: Vec::new(),
+            agents: Default::default(),
             signatures: PackSignatures::default(),
             bootstrap: None,
             extensions: if extensions.is_empty() {

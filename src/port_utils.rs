@@ -56,4 +56,26 @@ mod tests {
         let result = find_available_port("127.0.0.1", base, 1);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn range_zero_refuses_fallback_when_port_busy() {
+        // range=0 is the strict-bind contract: only the preferred port is
+        // considered, no neighbour-scan. The HTTP ingress relies on this
+        // to refuse silent fallback to a different port — silent fallback
+        // leaves the displayed Public/Routes URLs pointing at whatever
+        // else owns the requested port (e.g. an orphan greentic-start),
+        // which produces stale-state symptoms that look like runtime bugs.
+        let preferred = 19890u16;
+        let _hold = TcpListener::bind(format!("127.0.0.1:{preferred}")).expect("bind preferred");
+        let result = find_available_port("127.0.0.1", preferred, 0);
+        assert!(result.is_err(), "range=0 must error when preferred is busy");
+    }
+
+    #[test]
+    fn range_zero_returns_preferred_when_free() {
+        // High ephemeral port — extremely likely to be free.
+        let preferred = 19891u16;
+        let port = find_available_port("127.0.0.1", preferred, 0).expect("should bind");
+        assert_eq!(port, preferred);
+    }
 }

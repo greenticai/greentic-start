@@ -17,6 +17,7 @@ pub struct OperatorContext {
 pub enum RunnerExecutionMode {
     Exec,
     Integration,
+    RemoteSor,
 }
 
 #[derive(Clone)]
