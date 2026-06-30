@@ -1,10 +1,8 @@
-bench = [
-    { name = "perf", harness = false },
-]
+bench = [{ name = "perf", harness = false }]
 
 [package]
 name = "greentic-start"
-version = "1.1.0-dev.1"
+version = "1.1.0-dev.2"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -12,16 +10,8 @@ license = "MIT"
 repository = "https://github.com/greenticai/greentic-start"
 homepage = "https://github.com/greenticai/greentic-start"
 readme = "README.md"
-keywords = [
-    "greentic",
-    "cli",
-    "lifecycle",
-    "orchestration",
-]
-categories = [
-    "command-line-utilities",
-    "development-tools",
-]
+keywords = ["greentic", "cli", "lifecycle", "orchestration"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0"
@@ -65,14 +55,14 @@ rustls-pemfile = "2"
 semver = "1"
 serde_cbor = "0.11"
 serde_json = "1.0"
-sys-locale = "0.3"
-sysinfo = "0.39"
 sha2 = "0.11"
 subtle = "2"
-tokio-rustls = "0.26"
-tokio-tungstenite = "0.29"
+sys-locale = "0.3"
+sysinfo = "0.39"
 tar = "0.4"
 thiserror = "2"
+tokio-rustls = "0.26"
+tokio-tungstenite = "0.29"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-opentelemetry = "0.33"
@@ -86,23 +76,19 @@ zstd = "0.13"
 
 [dependencies.clap]
 version = "4.5"
-features = [
-    "derive",
-]
+features = ["derive"]
 
-# Lower bound pinned to the first dev build exposing the `signing` module
-# (verify_artifact_dsse / TrustRoot); earlier 1.1.0-dev builds lack it. Floor
-# bumped to the publish that adds
-# `DefaultRegistryClient::with_insecure_registries` (distributor-client#168) —
-# `bundle_ref::fetch_remote_bundle` calls it when
-# GREENTIC_OCI_INSECURE_REGISTRIES is set so listed registries are pulled over
-# plain HTTP; earlier publishes lack that constructor.
-[dependencies.greentic-distributor-client]
-version = ">=1.1.0-dev.27832309681, <1.2.0-0"
-default-features = false
-features = [
-    "pack-fetch",
-]
+# Matches the deploy-spec the pinned deployer was built against; `Environment`
+# / `Revision` cross the deployer boundary, so resolution must not pick an
+# older deploy-spec. Floor bumped to the publish that adds
+# `EnvironmentHostConfig.gui_enabled` + `resolved_gui_enabled()` (deployer#322);
+# greentic-start reads the resolver at boot to gate the built-in webchat
+# console, and earlier publishes lack both the field and the method. Floor
+# bumped again to the M2 PR1 publish (deployer#335) — `revision_pull` reads
+# `Revision.bundle_source_uri` at boot to decide which bundles to pull, and
+# earlier publishes lack that field.
+[dependencies.greentic-deploy-spec]
+version = ">=0.1.27745539530, <0.2"
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
 # (per-env trust root + operator key, deployer #226). Floor bumped to the
@@ -117,24 +103,17 @@ features = [
 version = ">=1.1.0-dev.27745539530, <1.2.0-0"
 default-features = false
 
-# Matches the deploy-spec the pinned deployer was built against; `Environment`
-# / `Revision` cross the deployer boundary, so resolution must not pick an
-# older deploy-spec. Floor bumped to the publish that adds
-# `EnvironmentHostConfig.gui_enabled` + `resolved_gui_enabled()` (deployer#322);
-# greentic-start reads the resolver at boot to gate the built-in webchat
-# console, and earlier publishes lack both the field and the method. Floor
-# bumped again to the M2 PR1 publish (deployer#335) — `revision_pull` reads
-# `Revision.bundle_source_uri` at boot to decide which bundles to pull, and
-# earlier publishes lack that field.
-[dependencies.greentic-deploy-spec]
-version = ">=0.1.27745539530, <0.2"
-
-# Lower bound pinned to the publish that updates the bootstrap call site for
-# the deployer's 2-arg `ensure_local_environment` (greentic-setup#134).
-# Earlier publishes have the 1-arg call against the new deployer floor and
-# would fail to compile in the resolved graph.
-[dependencies.greentic-setup]
-version = ">=1.1.0-dev.27093775683, <1.2.0-0"
+# Lower bound pinned to the first dev build exposing the `signing` module
+# (verify_artifact_dsse / TrustRoot); earlier 1.1.0-dev builds lack it. Floor
+# bumped to the publish that adds
+# `DefaultRegistryClient::with_insecure_registries` (distributor-client#168) —
+# `bundle_ref::fetch_remote_bundle` calls it when
+# GREENTIC_OCI_INSECURE_REGISTRIES is set so listed registries are pulled over
+# plain HTTP; earlier publishes lack that constructor.
+[dependencies.greentic-distributor-client]
+version = ">=1.1.0-dev.27832309681, <1.2.0-0"
+default-features = false
+features = ["pack-fetch"]
 
 [dependencies.greentic-runner-desktop]
 version = ">=1.1.0-dev, <1.2.0-0"
@@ -158,10 +137,14 @@ version = ">=1.1.0-dev.27823510319, <1.2.0-0"
 # 1.1.0-dev.28218485692 (the floor below) — older publishes resolve a vault
 # provider that only supports a static VAULT_TOKEN, not the pod-identity login.
 version = ">=1.1.0-dev.28218485692, <1.2.0-0"
-features = [
-    "providers-dev",
-    "providers-vault",
-]
+features = ["providers-dev", "providers-vault"]
+
+# Lower bound pinned to the publish that updates the bootstrap call site for
+# the deployer's 2-arg `ensure_local_environment` (greentic-setup#134).
+# Earlier publishes have the 1-arg call against the new deployer floor and
+# would fail to compile in the resolved graph.
+[dependencies.greentic-setup]
+version = ">=1.1.0-dev.27093775683, <1.2.0-0"
 
 [dependencies.greentic-telemetry]
 # Floor pinned to the first dev publish that exposes `RolloutEvent` +
@@ -171,24 +154,18 @@ version = ">=1.1.0-dev.26432434860, <1.2.0-0"
 
 [dependencies.greentic-types]
 version = ">=1.1.0-dev, <1.2.0-0"
-features = [
-    "serde",
-]
+features = ["serde"]
 
 [dependencies.hyper]
 version = "1"
-features = [
-    "full",
-]
+features = ["full"]
 
 [dependencies.qa-spec]
 version = ">=1.1.0-dev, <1.2.0-0"
 
 [dependencies.serde]
 version = "1.0"
-features = [
-    "derive",
-]
+features = ["derive"]
 
 [dependencies.serde_yaml_bw]
 package = "serde_yaml_gtc"
@@ -196,38 +173,25 @@ version = "2.5.2"
 
 [dependencies.tokio]
 version = "1"
-features = [
-    "rt-multi-thread",
-    "signal",
-    "sync",
-    "net",
-    "macros",
-]
+features = ["rt-multi-thread", "signal", "sync", "net", "macros"]
 
 [dependencies.tokio-stream]
 version = "0.1"
-features = [
-    "sync",
-]
+features = ["sync"]
 
 [dependencies.ureq]
 version = "3"
-features = [
-    "json",
-]
+features = ["json"]
 
 [dependencies.uuid]
 version = "1"
-features = [
-    "v4",
-    "serde",
-]
+features = ["v4", "serde"]
 
 [dev-dependencies]
 criterion = "0.8"
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 # Enable greentic-llm's scriptable test double (TestLlmProvider) for unit tests
 # only — `test-mock` stays out of release builds.
 greentic-llm = { version = "1", features = ["test-mock"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
-ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }

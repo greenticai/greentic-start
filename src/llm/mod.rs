@@ -103,6 +103,8 @@ pub fn build_backend(
         api_key,
         base_url,
         expires_at: None,
+        api_version: None,
+        aws_profile: None,
     };
     RigBackend::new(kind, model, &cred)
         .map_err(|e| anyhow!("build {provider} llm backend (model={model}): {e}"))
@@ -123,12 +125,16 @@ pub async fn chat_json<T: DeserializeOwned>(
             role: MessageRole::System,
             content: system.to_string(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         });
     }
     messages.push(ChatMessage {
         role: MessageRole::User,
         content: user.to_string(),
         images: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
     });
 
     let req = ChatRequest {
