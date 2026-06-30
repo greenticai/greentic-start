@@ -305,6 +305,14 @@ pub(super) async fn handle_oauth_callback(
     // write matches the key the adapter reads.
     let env = crate::secrets_setup::resolve_env(None);
     let team_seg = crate::oauth_state::team_segment(&ctx.team);
+    // Secrets are stored under the canonicalized provider/pack segment (see the
+    // secrets-gate `canonicalize_provider_segment`, #271). The MCP adapter reads
+    // through that gate so it resolves a hyphenated pack id like
+    // `github-review-pack` against the stored `github_review_pack`. This callback
+    // reads the dev store directly (no gate), so canonicalize the pack segment
+    // here too — otherwise the raw hyphenated id misses the stored key and we
+    // wrongly report "client_id not configured".
+    let pack_seg = crate::oauth_state::canonical_secret_name(&ctx.pack);
     // Pack-scoped secret URI for `auth.oauth2.<scheme>.<suffix>`.
     let key_uri = |suffix: &str| -> String {
         let canon = crate::oauth_state::canonical_secret_name(&format!(
@@ -313,7 +321,7 @@ pub(super) async fn handle_oauth_callback(
         ));
         format!(
             "secrets://{}/{}/{}/{}/{}",
-            env, ctx.tenant, team_seg, ctx.pack, canon
+            env, ctx.tenant, team_seg, pack_seg, canon
         )
     };
     let read = |uri: String| {
