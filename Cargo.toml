@@ -1,6 +1,8 @@
+bench = [{ name = "perf", harness = false }]
+
 [package]
 name = "greentic-start"
-version = "0.5.49"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -8,6 +10,23 @@ license = "MIT"
 repository = "https://github.com/greenticai/greentic-start"
 homepage = "https://github.com/greenticai/greentic-start"
 readme = "README.md"
+
+# cargo-binstall pulls the pre-built binary from the GitHub release tagged
+# `v{version}`. The research-branch binary is built from git deps (full runner
+# with agentic-worker + greentic-llm-backend), so it carries multi-provider
+# dw.agent — unlike any crates.io-source build (aw-runtime is publish=false).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tgz"
+pkg-fmt = "tgz"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
 keywords = ["greentic", "cli", "lifecycle", "orchestration"]
 categories = ["command-line-utilities", "development-tools"]
 
@@ -16,20 +35,17 @@ anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
 chrono = "0.4"
-clap = { version = "4.5", features = ["derive"] }
 dashmap = "6"
 flate2 = "1"
 futures-util = "0.3"
-greentic-distributor-client = { version = "0.5", default-features = false, features = ["pack-fetch"] }
+# main-lane features carried into the AW (research) dependency world:
+#   greentic-llm        -> src/llm + src/fast2flow/llm_router
+#   opentelemetry stack -> src/metrics + src/otlp_telemetry
+#   reqwest             -> src/lib.rs + src/runner_host/dispatch.rs
+#   tracing-*           -> src/otlp_telemetry + src/lib.rs
 greentic-llm = { version = "1" }
-greentic-runner-desktop = { version = "0.5" }
-greentic-runner-host = { version = "0.5" }
-greentic-secrets-lib = { version = ">=0.5.2, <0.6.0", features = ["providers-dev"] }
-greentic-setup = { version = "0.5" }
-greentic-types = { version = "0.5", features = ["serde"] }
 hmac = "0.13"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["full"] }
 hyper-tungstenite = "0.20"
 hyper-util = "0.1"
 include_dir = "0.7"
@@ -41,7 +57,6 @@ opentelemetry = { version = "0.32", features = ["logs"] }
 opentelemetry-appender-tracing = "0.32"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto"] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "logs"] }
-qa-spec = { version = ">=0.5.0, <0.6.0" }
 rand = "0.10"
 redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
@@ -49,30 +64,118 @@ rpassword = "7"
 rustls = "0.23"
 rustls-pemfile = "2"
 semver = "1"
-serde = { version = "1.0", features = ["derive"] }
 serde_cbor = "0.11"
 serde_json = "1.0"
-serde_yaml_bw = { package = "serde_yaml_gtc", version = "2.5.2" }
 sha2 = "0.11"
 sys-locale = "0.3"
 sysinfo = "0.39"
 tar = "0.4"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "signal", "sync", "net"] }
 tokio-rustls = "0.26"
-tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = "0.29"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 unic-langid = "0.9"
-ureq = { version = "3", features = ["json"] }
 urlencoding = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
 wasmtime = { version = "45", default-features = false, features = ["component-model", "cranelift", "runtime"] }
 zip = "8"
 zstd = "0.13"
+
+[dependencies.axum]
+version = "0.8"
+
+[dependencies.clap]
+version = "4.5"
+features = ["derive"]
+
+[dependencies.greentic-aw-runtime]
+git = "https://github.com/greenticai/greentic-runner.git"
+rev = "f97c58771d96f27f57e8fe021dfc3c8e0f468370"
+default-features = false
+
+[dependencies.greentic-distributor-client]
+version = "=1.2.0-research.0"
+default-features = false
+features = ["pack-fetch"]
+
+# Pinned to runner rev f97c587 (greentic-runner#507, based on the #503 merge
+# 9d56b88), which moves onto the greentic-types 1.2.0-research line, enables the
+# multi-provider in-process LLM backend for dw.agent (DeepSeek/Anthropic/… via
+# greentic-llm) through the opt-in `greentic-llm-backend` feature below, pins
+# greentic-ext-runtime c47a0738 (#94 OAuth broker host import + sdk 1.2.19) so
+# OAuth-enabled design extensions load and instantiate, carries #502
+# (preflight-warn on tool load failure), AND makes the desktop ephemeral AW
+# state store process-global so dw.agent keeps multi-turn memory with no Redis.
+# Based on 9d56b88 (NOT research HEAD) to stay before the knowledge-chronicle
+# merge, which pulls a private dep that breaks the workspace resolve.
+# Requires greentic-setup, greentic-types, secrets-lib, distributor-client +
+# qa-spec all on the 1.2.0-research line (see greenticai/greentic-setup#162).
+[dependencies.greentic-runner-desktop]
+git = "https://github.com/greenticai/greentic-runner.git"
+rev = "f97c58771d96f27f57e8fe021dfc3c8e0f468370"
+default-features = false
+features = ["agentic-worker", "greentic-llm-backend", "desktop-agent-ephemeral"]
+
+[dependencies.greentic-runner-host]
+git = "https://github.com/greenticai/greentic-runner.git"
+rev = "f97c58771d96f27f57e8fe021dfc3c8e0f468370"
+default-features = false
+features = ["agentic-worker", "greentic-llm-backend"]
+
+[dependencies.greentic-secrets-lib]
+version = "=1.2.0-research.0"
+features = ["providers-dev"]
+
+# Consumed as a git dep on the research branch (like greentic-runner) so it
+# tracks the types 1.2.0-research migration directly, independent of the -dev
+# crates.io publish-stamp version. greentic-setup's deps are on the research
+# line; its own crate version follows its -dev publish channel.
+[dependencies.greentic-setup]
+git = "https://github.com/greenticai/greentic-setup.git"
+branch = "research"
+
+# Exact-pinned to the research-content build (carries ComponentDescribe.outcomes,
+# PackManifest.agents, and runtime_dispatch types the runner rev needs). A loose
+# `>=1.1.0-dev, <1.2.0-0` would resolve to a higher-numbered develop/main build
+# that LACKS those, breaking the runner graph; consuming the published research
+# build directly avoids the old git [patch] that force-unified greentic-types and
+# broke greentic-setup. Bump this when a newer research build is published.
+[dependencies.greentic-types]
+version = "=1.2.0-research.1"
+features = ["serde"]
+
+[dependencies.hyper]
+version = "1"
+features = ["full"]
+
+[dependencies.qa-spec]
+version = "=1.2.0-research.0"
+
+[dependencies.serde]
+version = "1.0"
+features = ["derive"]
+
+[dependencies.serde_yaml_bw]
+package = "serde_yaml_gtc"
+version = "2.5.2"
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "signal", "sync", "net"]
+
+[dependencies.tokio-stream]
+version = "0.1"
+features = ["sync"]
+
+[dependencies.ureq]
+version = "3"
+features = ["json"]
+
+[dependencies.uuid]
+version = "1"
+features = ["v4", "serde"]
 
 [dev-dependencies]
 criterion = "0.8"
@@ -81,8 +184,24 @@ criterion = "0.8"
 greentic-llm = { version = "1", features = ["test-mock"] }
 tempfile = "3"
 
-[[bench]]
-name = "perf"
-harness = false
+# greentic-runner (rev ad08c976) pulls greentic-extension-sdk-contract
+# =1.2.11-research and greentic-mcp-exec (list_tools), both git-tag/branch-only
+# (not republished to crates.io). Cargo [patch] does NOT propagate through git
+# dependencies, so greentic-start must declare the same redirects to resolve the
+# agentic-worker graph. NOTE: unlike the runner, we do NOT patch greentic-types
+# here (we pin the published research build above) — a git patch would unify
+# greentic-types graph-wide and break greentic-setup's 0.5 line.
+[patch.crates-io]
+greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.2.19-research" }
+greentic-mcp-exec = { git = "https://github.com/greenticai/greentic-mcp.git", rev = "f0d2f02b002b49612ce25a6af1901a5280757605" }
 
+# NOTE: greentic-ext-runtime is NOT patched here. The runner revs pinned above
+# (f97c587, runner `research`) already pin greentic-ext-runtime to rev c47a0738,
+# which carries #94 (the `greentic:oauth-broker/broker-v1` host import + the
+# `oauthProviders` describe field) plus the sdk 1.2.19 bump. That rev is what
+# lets OAuth-enabled design extensions (e.g. greentic.hubspot) load AND
+# instantiate — pre-#94 ext-runtime (rev 50ce911) understood neither, so the
+# extension's tools never reached the agent. Bumping the runner rev is the
+# coordinated, in-graph fix; a local ext-runtime [patch] cannot satisfy the
+# graph's exact sdk-contract pins.
 

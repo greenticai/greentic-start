@@ -581,6 +581,7 @@ mod tests {
             signatures: PackSignatures::default(),
             bootstrap: None,
             extensions: Some(extensions),
+            agents: std::collections::BTreeMap::new(),
         };
         write_pack(
             &pack,

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,7 +10,7 @@ use zip::ZipArchive;
 
 use crate::discovery;
 use crate::domains::Domain;
-use crate::event_router::route_events_to_default_flow;
+use crate::event_router::route_events;
 use crate::ingress_types::EventEnvelopeV1;
 use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
@@ -198,14 +196,18 @@ fn run_timer_handler(
     let output = outcome.output.unwrap_or_else(|| json!({}));
     let events = parse_events(&output)?;
     if !events.is_empty() {
-        route_events_to_default_flow(scheduler.runner_host.bundle_root(), &context, &events)?;
+        route_events(scheduler.runner_host.bundle_root(), &context, &events)?;
     }
     timer.last_run_rfc3339 = Some(occurred_at);
     Ok(())
 }
 
 fn parse_events(output: &JsonValue) -> anyhow::Result<Vec<EventEnvelopeV1>> {
-    let Some(array) = output.get("events").and_then(JsonValue::as_array) else {
+    let Some(array) = output
+        .get("events")
+        .or_else(|| output.get("emitted_events"))
+        .and_then(JsonValue::as_array)
+    else {
         return Ok(Vec::new());
     };
     let mut events = Vec::with_capacity(array.len());
@@ -580,5 +582,36 @@ mod tests {
         assert_eq!(alias_handler.op_id, "timer_sync");
         assert_eq!(alias_handler.handler_id, "default");
         assert_eq!(alias_handler.interval_seconds, 5);
+    }
+
+    #[test]
+    fn parse_events_accepts_emitted_events_key() {
+        let event = json!({
+            "event_id": "evt-2",
+            "event_type": "timer.fired",
+            "occurred_at": "2026-04-01T00:00:00Z",
+            "source": {
+                "domain": "events",
+                "provider": "events-email",
+                "handler_id": "digest"
+            },
+            "scope": {
+                "tenant": "demo",
+                "team": "default"
+            },
+            "payload": {"ok": true}
+        });
+        // "emitted_events" key must be treated as a fallback for "events"
+        let parsed =
+            parse_events(&json!({"emitted_events": [event.clone()]})).expect("emitted_events key");
+        assert_eq!(parsed.len(), 1, "emitted_events not picked up as fallback");
+        // "events" takes precedence when both are present
+        let parsed2 = parse_events(&json!({"events": [event.clone()], "emitted_events": [event]}))
+            .expect("both keys");
+        assert_eq!(
+            parsed2.len(),
+            1,
+            "should read events key, not emitted_events"
+        );
     }
 }
