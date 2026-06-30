@@ -12,7 +12,6 @@ use std::{
 
 use anyhow::{Context, Error as AnyhowError, Result as AnyhowResult, anyhow};
 use async_trait::async_trait;
-use greentic_secrets_lib::env::EnvSecretsManager;
 use greentic_secrets_lib::{Result as SecretResult, SecretError, SecretsManager};
 use serde::Deserialize;
 use serde_cbor::value::Value as CborValue;
@@ -679,9 +678,89 @@ fn fallback_to_env(
                 pack = pack_desc,
             ),
         );
-        Ok((Arc::new(EnvSecretsManager) as DynSecretsManager, None, true))
+        Ok((
+            Arc::new(CanonicalEnvSecretsManager) as DynSecretsManager,
+            None,
+            true,
+        ))
     } else {
         Err(err)
+    }
+}
+
+/// FIXME(PR-31 / env bridge): bridge-only. `greentic_secrets_lib::EnvSecretsManager`
+/// reads `std::env::var(<raw secrets:// URI>)` — a URI is not a valid env-var
+/// name, so the cloud env bridge (deployer-injected `GTSEC_*` vars) never
+/// resolves. `CanonicalEnvSecretsManager` maps
+/// `secrets://{env}/{tenant}/{team}/{cat}/{name}` to the canonical
+/// `GTSEC_{ENV}_{TENANT}_{TEAM}_{CAT}_{NAME}` name the deployer injects before
+/// `std::env::var`. Compat path until the runtime consumes provider bindings.
+struct CanonicalEnvSecretsManager;
+
+/// Map a `secrets://…` URI to the canonical env-var name; `None` if not a 5-segment URI.
+fn canonical_secret_env_var_name(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("secrets://")?;
+    let segs: Vec<&str> = rest.split('/').collect();
+    if segs.len() != 5 {
+        return None;
+    }
+    fn sani(s: &str) -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+    Some(format!(
+        "GTSEC_{}_{}_{}_{}_{}",
+        sani(segs[0]),
+        sani(segs[1]),
+        sani(segs[2]),
+        sani(segs[3]),
+        sani(segs[4]),
+    ))
+}
+
+#[async_trait]
+impl SecretsManager for CanonicalEnvSecretsManager {
+    async fn read(&self, path: &str) -> SecretResult<Vec<u8>> {
+        let var = canonical_secret_env_var_name(path).unwrap_or_else(|| path.to_string());
+        // PR-31 env-bridge debug trace: log the URI -> env-var-name mapping + hit/miss
+        // so a cloud secret-resolution failure is easy to diagnose. Never logs the value.
+        match std::env::var(&var) {
+            Ok(value) => {
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "env-bridge secret read: uri={path} -> env_var={var} FOUND ({} bytes)",
+                        value.len()
+                    ),
+                );
+                Ok(value.into_bytes())
+            }
+            Err(_) => {
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "env-bridge secret read: uri={path} -> env_var={var} NOT_FOUND \
+                         (inject via deployer secrets_map / GREENTIC_OPERATOR_SECRETS_JSON keyed by {var})"
+                    ),
+                );
+                Err(SecretError::NotFound(path.to_string()))
+            }
+        }
+    }
+
+    async fn write(&self, _path: &str, _value: &[u8]) -> SecretResult<()> {
+        Err(SecretError::Permission("env is read-only".into()))
+    }
+
+    async fn delete(&self, _path: &str) -> SecretResult<()> {
+        Err(SecretError::Permission("env is read-only".into()))
     }
 }
 
@@ -692,7 +771,10 @@ fn instantiate_manager_for_backend(
 ) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>)> {
     match backend_kind {
         SecretsBackendKind::DevStore => open_dev_store_manager(bundle_root),
-        SecretsBackendKind::Env => Ok((Arc::new(EnvSecretsManager) as DynSecretsManager, None)),
+        SecretsBackendKind::Env => Ok((
+            Arc::new(CanonicalEnvSecretsManager) as DynSecretsManager,
+            None,
+        )),
     }
 }
 
