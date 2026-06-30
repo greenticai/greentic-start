@@ -108,41 +108,65 @@ pub fn log(level: Level, target: &str, message: String) {
     log_at(Location::caller(), level, target, message);
 }
 
+/// Whether operator records should also be mirrored to stderr. True when
+/// stderr is NOT a terminal — i.e. a container (`kubectl logs`/`docker logs`
+/// read stdout/stderr, not the on-disk `system.log`), a pipe, or CI. False for
+/// an interactive terminal, so local sessions keep stderr quiet and rely on the
+/// file as today. Evaluated once (the stderr fd is fixed for the process life).
+fn mirror_to_stderr() -> bool {
+    use std::io::IsTerminal;
+    static IS_TTY: OnceLock<bool> = OnceLock::new();
+    !*IS_TTY.get_or_init(|| std::io::stderr().is_terminal())
+}
+
 fn log_at(location: &Location<'_>, level: Level, target: &str, message: String) {
     let file = shorten_log_path(location.file());
     let line = location.line();
+    let timestamp = Utc::now().to_rfc3339();
+    let formatted = format!("{timestamp} [{level:?}] {target} {file}:{line} - {message}");
+
     {
         let slot = match logger_slot().lock() {
             Ok(slot) => slot,
-            Err(_) => return,
+            Err(_) => {
+                // Poisoned slot: surface Info+ to stderr (container logs) rather
+                // than drop the record entirely.
+                if level >= Level::Info && mirror_to_stderr() {
+                    eprintln!("{formatted}");
+                }
+                return;
+            }
         };
-        let logger = match slot.as_ref() {
-            Some(logger) => logger,
-            None => return,
-        };
-        if level < logger.min_level {
-            return;
+        match slot.as_ref() {
+            Some(logger) => {
+                if level < logger.min_level {
+                    return;
+                }
+                if let Ok(mut writer) = logger.writer.lock() {
+                    let _ = writeln!(*writer, "{formatted}");
+                    let _ = writer.flush();
+                }
+            }
+            None => {
+                // Logger not yet initialized: no file sink. Surface Info+ records
+                // to stderr (container logs) so early-boot diagnostics are
+                // visible; matches the prior no-tracing-bridge behavior here.
+                if level >= Level::Info && mirror_to_stderr() {
+                    eprintln!("{formatted}");
+                }
+                return;
+            }
         }
-        let mut writer = match logger.writer.lock() {
-            Ok(writer) => writer,
-            Err(_) => return,
-        };
-        let timestamp = Utc::now().to_rfc3339();
-        let _ = writeln!(
-            *writer,
-            "{timestamp} [{level:?}] {target} {file}:{line} - {message}",
-            level = level,
-            target = target,
-            file = file,
-            line = line,
-            message = message
-        );
-        let _ = writer.flush();
     }
-    // Mirror the record into `tracing` so it reaches the OTLP exporter (Loki).
-    // Done after dropping the file locks; a no-op when no subscriber is installed
-    // (e.g. the `warmup` subprocess). The file `fmt` layer drops this target to
-    // avoid duplicating the line written above.
+    // Mirror operator-facing records to stderr so container runtimes
+    // (`kubectl logs`/`docker logs`) surface them — the file the logger writes
+    // is invisible there. Done after dropping the file locks.
+    if mirror_to_stderr() {
+        eprintln!("{formatted}");
+    }
+    // Then re-emit into `tracing` so it reaches the OTLP exporter (Loki). A
+    // no-op when no subscriber is installed (e.g. the `warmup` subprocess). The
+    // file `fmt` layer drops this target to avoid duplicating the line above.
     bridge_to_tracing(level, target, file, line, &message);
 }
 

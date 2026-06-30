@@ -305,7 +305,8 @@ enum ResolvedSecretToken {
 }
 
 /// Resolve a plan's [`SecretTokenSource`] into the actual on-wire value at
-/// invocation time. `WebhookSecretRef` reads the dev-store backend; a read
+/// invocation time. `WebhookSecretRef` reads the active secrets backend (the
+/// one the serve path selected — dev-store, Vault, or env); a read
 /// failure returns [`ResolvedSecretToken::Unresolved`] so the caller skips
 /// registration rather than mutating the provider to a URL-only posture that
 /// the auth gate will reject. We never fall back to the legacy `provider_id`
