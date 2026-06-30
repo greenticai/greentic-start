@@ -36,4 +36,23 @@ if [ -n "${STAGED_RS}" ] || git diff --cached --name-only | grep -qE 'Cargo\.(to
   green "[pre-commit] clippy clean"
 fi
 
+# --- 3. cargo-sort on the workspace -----------------------------------------
+# Keeps every Cargo.toml's dependency lists alphabetized. CI does not run
+# this yet — the hook is the canonical gate. Auto-sorts and re-stages so
+# the developer doesn't have to run a second pass by hand.
+if git diff --cached --name-only | grep -qE 'Cargo\.toml$'; then
+  if ! command -v cargo-sort >/dev/null 2>&1; then
+    blue "[pre-commit] cargo-sort not found, installing (one-time)…"
+    cargo install cargo-sort --locked
+  fi
+  blue "[pre-commit] cargo sort --workspace"
+  cargo sort --workspace >/dev/null
+  if ! git diff --quiet -- '*Cargo.toml'; then
+    git add $(git diff --name-only -- '*Cargo.toml')
+    green "[pre-commit] cargo-sort rewrote + re-staged Cargo.toml files"
+  else
+    green "[pre-commit] cargo-sort clean"
+  fi
+fi
+
 green "[pre-commit] ok"

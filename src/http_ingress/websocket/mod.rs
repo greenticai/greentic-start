@@ -14,6 +14,7 @@ pub use upgrade::{UpgradeContext, UpgradeError, refusal_response, validate_reque
 
 use crate::domains::Domain;
 use crate::notifier::ActivityNotifier;
+use crate::operator_log;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -186,6 +187,19 @@ impl pump::ActivitySource for RunnerHostActivitySource {
     }
 }
 
+/// Decrements `greentic.conversations.active` when dropped. Created after a
+/// successful WS handshake so the gauge mirrors live connections regardless
+/// of how the session ends.
+struct SessionMetricGuard {
+    tenant: String,
+}
+
+impl Drop for SessionMetricGuard {
+    fn drop(&mut self) {
+        crate::metrics::record_session_end(&self.tenant, "webchat");
+    }
+}
+
 /// Serve a single WebSocket session: complete the upgrade, then bridge the
 /// `Pump` output frames into the WS sink and watch the WS stream for client
 /// disconnects.
@@ -203,22 +217,35 @@ pub async fn serve_session(
     limits: WsLimits,
     _guard: SessionGuard,
 ) {
-    eprintln!(
-        "[ws serve_session] entered tenant={} conv={} initial_watermark={}",
-        tenant_id, conversation_id, initial_watermark,
+    operator_log::debug(
+        module_path!(),
+        format!(
+            "[ws serve_session] entered tenant={} conv={} initial_watermark={}",
+            tenant_id, conversation_id, initial_watermark,
+        ),
     );
+    crate::metrics::record_session_start(&tenant_id, "webchat");
+    let _session_metric = SessionMetricGuard {
+        tenant: tenant_id.clone(),
+    };
     let mut ws = match websocket.await {
         Ok(stream) => {
-            eprintln!(
-                "[ws serve_session] handshake completed tenant={} conv={}",
-                tenant_id, conversation_id,
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[ws serve_session] handshake completed tenant={} conv={}",
+                    tenant_id, conversation_id,
+                ),
             );
             stream
         }
         Err(err) => {
-            eprintln!(
-                "[ws serve_session] handshake FAILED tenant={} conv={} err={}",
-                tenant_id, conversation_id, err,
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "[ws serve_session] handshake FAILED tenant={} conv={} err={}",
+                    tenant_id, conversation_id, err,
+                ),
             );
             return;
         }
@@ -234,14 +261,20 @@ pub async fn serve_session(
             .run(tenant_id, conversation_id, initial_watermark, frame_tx)
             .await;
         if let Err(ref err) = result {
-            eprintln!(
-                "[ws pump] run errored tenant={} conv={} err={:?}",
-                pump_tenant, pump_conv, err,
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "[ws pump] run errored tenant={} conv={} err={:?}",
+                    pump_tenant, pump_conv, err,
+                ),
             );
         } else {
-            eprintln!(
-                "[ws pump] run ended Ok tenant={} conv={}",
-                pump_tenant, pump_conv,
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[ws pump] run ended Ok tenant={} conv={}",
+                    pump_tenant, pump_conv,
+                ),
             );
         }
         result

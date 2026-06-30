@@ -1,10 +1,8 @@
-bench = [
-    { name = "perf", harness = false },
-]
+bench = [{ name = "perf", harness = false }]
 
 [package]
 name = "greentic-start"
-version = "1.2.0-research.5"
+version = "1.2.0-research.6"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -22,23 +20,15 @@ pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ targe
 pkg-fmt = "tgz"
 bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
 targets = [
-  "x86_64-unknown-linux-gnu",
-  "aarch64-unknown-linux-gnu",
-  "x86_64-apple-darwin",
-  "aarch64-apple-darwin",
-  "x86_64-pc-windows-msvc",
-  "aarch64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
 ]
-keywords = [
-    "greentic",
-    "cli",
-    "lifecycle",
-    "orchestration",
-]
-categories = [
-    "command-line-utilities",
-    "development-tools",
-]
+keywords = ["greentic", "cli", "lifecycle", "orchestration"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0"
@@ -48,6 +38,12 @@ chrono = "0.4"
 dashmap = "6"
 flate2 = "1"
 futures-util = "0.3"
+# main-lane features carried into the AW (research) dependency world:
+#   greentic-llm        -> src/llm + src/fast2flow/llm_router
+#   opentelemetry stack -> src/metrics + src/otlp_telemetry
+#   reqwest             -> src/lib.rs + src/runner_host/dispatch.rs
+#   tracing-*           -> src/otlp_telemetry + src/lib.rs
+greentic-llm = { version = "1" }
 hmac = "0.13"
 http-body-util = "0.1"
 hyper-tungstenite = "0.20"
@@ -57,51 +53,52 @@ jsonschema = "0.46"
 libc = "0.2"
 once_cell = "1.21"
 open = "5"
+opentelemetry = { version = "0.32", features = ["logs"] }
+opentelemetry-appender-tracing = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "logs"] }
 rand = "0.10"
-rpassword = "7"
 redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+rpassword = "7"
 rustls = "0.23"
 rustls-pemfile = "2"
 semver = "1"
 serde_cbor = "0.11"
 serde_json = "1.0"
+sha2 = "0.11"
 sys-locale = "0.3"
 sysinfo = "0.39"
-sha2 = "0.11"
-tokio-rustls = "0.26"
-tokio-tungstenite = "0.29"
 tar = "0.4"
 thiserror = "2"
+tokio-rustls = "0.26"
+tokio-tungstenite = "0.29"
 tracing = "0.1"
+tracing-appender = "0.2"
+tracing-opentelemetry = "0.33"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 unic-langid = "0.9"
 urlencoding = "2"
 wasmtime = { version = "45", default-features = false, features = ["component-model", "cranelift", "runtime"] }
 zip = "8"
 zstd = "0.13"
 
+[dependencies.axum]
+version = "0.8"
+
 [dependencies.clap]
 version = "4.5"
-features = [
-    "derive",
-]
+features = ["derive"]
+
+[dependencies.greentic-aw-runtime]
+git = "https://github.com/greenticai/greentic-runner.git"
+rev = "f97c58771d96f27f57e8fe021dfc3c8e0f468370"
+default-features = false
 
 [dependencies.greentic-distributor-client]
 version = "=1.2.0-research.0"
 default-features = false
-features = [
-    "pack-fetch",
-]
-
-# Consumed as a git dep on the research branch (like greentic-runner) so it
-# tracks the types 1.2.0-research migration directly, independent of the -dev
-# crates.io publish-stamp version. greentic-setup's deps are on the research
-# line; its own crate version follows its -dev publish channel.
-[dependencies.greentic-setup]
-git = "https://github.com/greenticai/greentic-setup.git"
-branch = "research"
-
-[dependencies.axum]
-version = "0.8"
+features = ["pack-fetch"]
 
 # Pinned to runner rev f97c587 (greentic-runner#507, based on the #503 merge
 # 9d56b88), which moves onto the greentic-types 1.2.0-research line, enables the
@@ -127,16 +124,17 @@ rev = "f97c58771d96f27f57e8fe021dfc3c8e0f468370"
 default-features = false
 features = ["agentic-worker", "greentic-llm-backend"]
 
-[dependencies.greentic-aw-runtime]
-git = "https://github.com/greenticai/greentic-runner.git"
-rev = "f97c58771d96f27f57e8fe021dfc3c8e0f468370"
-default-features = false
-
 [dependencies.greentic-secrets-lib]
 version = "=1.2.0-research.0"
-features = [
-    "providers-dev",
-]
+features = ["providers-dev"]
+
+# Consumed as a git dep on the research branch (like greentic-runner) so it
+# tracks the types 1.2.0-research migration directly, independent of the -dev
+# crates.io publish-stamp version. greentic-setup's deps are on the research
+# line; its own crate version follows its -dev publish channel.
+[dependencies.greentic-setup]
+git = "https://github.com/greenticai/greentic-setup.git"
+branch = "research"
 
 # Exact-pinned to the research-content build (carries ComponentDescribe.outcomes,
 # PackManifest.agents, and runtime_dispatch types the runner rev needs). A loose
@@ -146,24 +144,18 @@ features = [
 # broke greentic-setup. Bump this when a newer research build is published.
 [dependencies.greentic-types]
 version = "=1.2.0-research.1"
-features = [
-    "serde",
-]
+features = ["serde"]
 
 [dependencies.hyper]
 version = "1"
-features = [
-    "full",
-]
+features = ["full"]
 
 [dependencies.qa-spec]
 version = "=1.2.0-research.0"
 
 [dependencies.serde]
 version = "1.0"
-features = [
-    "derive",
-]
+features = ["derive"]
 
 [dependencies.serde_yaml_bw]
 package = "serde_yaml_gtc"
@@ -171,34 +163,25 @@ version = "2.5.2"
 
 [dependencies.tokio]
 version = "1"
-features = [
-    "rt-multi-thread",
-    "signal",
-    "sync",
-    "net",
-]
+features = ["rt-multi-thread", "signal", "sync", "net"]
 
 [dependencies.tokio-stream]
 version = "0.1"
-features = [
-    "sync",
-]
+features = ["sync"]
 
 [dependencies.ureq]
 version = "3"
-features = [
-    "json",
-]
+features = ["json"]
 
 [dependencies.uuid]
 version = "1"
-features = [
-    "v4",
-    "serde",
-]
+features = ["v4", "serde"]
 
 [dev-dependencies]
 criterion = "0.8"
+# Enable greentic-llm's scriptable test double (TestLlmProvider) for unit tests
+# only — `test-mock` stays out of release builds.
+greentic-llm = { version = "1", features = ["test-mock"] }
 tempfile = "3"
 
 # greentic-runner (rev ad08c976) pulls greentic-extension-sdk-contract

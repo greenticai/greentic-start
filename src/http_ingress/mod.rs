@@ -43,8 +43,8 @@ use admin_relay::{
 use conv_dedup::{ConversationDedupCache, DedupKey, extract_user_id};
 use helpers::{
     build_http_response, collect_headers, collect_queries, cors_preflight_response, domain_name,
-    error_response, handle_builtin_health_request, handle_oauth_token_exchange, parse_domain,
-    parse_route_segments, with_cors,
+    error_response, handle_builtin_health_request, handle_oauth_callback,
+    handle_oauth_token_exchange, parse_domain, parse_route_segments, with_cors,
 };
 use messaging::route_messaging_envelopes;
 use static_handler::serve_static_route;
@@ -421,10 +421,15 @@ where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
 {
+    let started = std::time::Instant::now();
+    let method = req.method().as_str().to_string();
+    let route = crate::metrics::normalise_route(req.uri().path());
     let response = match handle_request_inner(req, state).await {
         Ok(response) => with_cors(response),
         Err(response) => with_cors(response),
     };
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    crate::metrics::record_http_request(&method, &route, response.status().as_u16(), elapsed_ms);
     Ok(response)
 }
 
@@ -466,6 +471,19 @@ where
         return crate::onboard::api::handle_onboard_request(req, &path, &state.runner_host)
             .await
             .map_err(|err| *err);
+    }
+
+    // Our own OAuth callback: GET /oauth/callback/<provider> — exchanges the code
+    // and persists the token at oauth/<provider>/access_token (read by the MCP
+    // bake-in resolver). This is the bake-in card flow's redirect target.
+    if path.starts_with("/oauth/callback/") && req.method() == Method::GET {
+        let provider = path
+            .trim_start_matches("/oauth/callback/")
+            .trim_end_matches('/')
+            .to_string();
+        let query = req.uri().query().unwrap_or("").to_string();
+        let manager = state.runner_host.secrets_manager();
+        return Ok(handle_oauth_callback(&query, &provider, manager, &state).await);
     }
 
     // OAuth token exchange proxy: /v1/messaging/webchat/{tenant}/oauth/token-exchange
@@ -763,13 +781,52 @@ where
         remote_addr: None,
     };
 
+    operator_log::debug(
+        module_path!(),
+        format!(
+            "[demo ingress] received method={} path={} domain={} provider={} tenant={} team={} payload_len={}",
+            method,
+            path,
+            domain_name(domain),
+            parsed.provider,
+            parsed.tenant,
+            parsed.team,
+            ingress_request.body.len()
+        ),
+    );
+
     let result = dispatch_http_ingress(
         state.runner_host.as_ref(),
         domain,
         &ingress_request,
         &context,
     )
-    .map_err(|err| error_response(StatusCode::BAD_GATEWAY, err.to_string()))?;
+    .map_err(|err| {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "[demo ingress] provider dispatch failed domain={} provider={} tenant={} team={} err={err}",
+                domain_name(domain),
+                parsed.provider,
+                parsed.tenant,
+                parsed.team
+            ),
+        );
+        error_response(StatusCode::BAD_GATEWAY, err.to_string())
+    })?;
+    operator_log::debug(
+        module_path!(),
+        format!(
+            "[demo ingress] provider parsed domain={} provider={} tenant={} team={} messages={} events={} status={}",
+            domain_name(domain),
+            parsed.provider,
+            parsed.tenant,
+            parsed.team,
+            result.messaging_envelopes.len(),
+            result.events.len(),
+            result.response.status
+        ),
+    );
     if !result.events.is_empty() {
         operator_log::info(
             module_path!(),
@@ -964,6 +1021,99 @@ where
         StatusCode::NOT_FOUND,
         "provider does not implement directline_http or ingest_http",
     ))
+}
+
+/// Auto-resume the webchat conversation that surfaced an OAuth Connect card, once
+/// `/oauth/callback` has persisted the token. Re-runs the app flow against a
+/// synthetic inbound envelope (bound to the conversation via `session_id`) through
+/// the SAME pipeline an inbound message uses — `route_messaging_envelopes` runs the
+/// flow (token now present) and egresses the next card to the conversation's store,
+/// which the client's open stream/poll picks up. No user re-type.
+/// Best-effort: logs and returns on any miss (no conversation, no provider).
+async fn trigger_oauth_resume(
+    state: &Arc<HttpIngressState>,
+    ctx: &crate::oauth_state::OAuthStateContext,
+) {
+    let Some(conv) = ctx.conv.as_deref().filter(|c| !c.is_empty()) else {
+        operator_log::info(
+            module_path!(),
+            "[oauth-resume] no conversation id in state; skipping auto-advance",
+        );
+        return;
+    };
+    let Some(provider) = ["messaging-webchat", "messaging-webchat-gui"]
+        .into_iter()
+        .find(|p| {
+            state
+                .runner_host
+                .get_provider_pack_path(Domain::Messaging, p)
+                .is_some()
+        })
+    else {
+        operator_log::warn(
+            module_path!(),
+            "[oauth-resume] no webchat provider found; skipping auto-advance",
+        );
+        return;
+    };
+    let team_str = if ctx.team.is_empty() || ctx.team == "_" {
+        "default"
+    } else {
+        ctx.team.as_str()
+    };
+    let op_ctx = OperatorContext {
+        tenant: ctx.tenant.clone(),
+        team: Some(team_str.to_string()),
+        correlation_id: None,
+    };
+    let env = crate::secrets_setup::resolve_env(None);
+    // Synthetic inbound envelope bound to the conversation via `session_id`; empty
+    // text re-triggers the flow's gate node (which now resolves the persisted token).
+    let envelope: greentic_types::ChannelMessageEnvelope = match serde_json::from_value(
+        serde_json::json!({
+            "id": format!("oauth-resume-{conv}"),
+            "tenant": { "env": env, "tenant": ctx.tenant, "tenant_id": ctx.tenant, "team": team_str, "attempt": 0 },
+            "channel": conv,
+            "session_id": conv,
+            "from": { "id": "oauth-resume", "kind": "user" },
+            "text": "",
+            "metadata": { "tenant": ctx.tenant, "team": team_str, "oauth_resume": "true" }
+        }),
+    ) {
+        Ok(e) => e,
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!("[oauth-resume] could not build resume envelope for {conv}: {err}"),
+            );
+            return;
+        }
+    };
+    operator_log::info(
+        module_path!(),
+        format!(
+            "[oauth-resume] token persisted for {} — re-running flow to auto-advance conversation {conv} (provider={provider}, tenant={}, team={team_str})",
+            ctx.provider, ctx.tenant
+        ),
+    );
+    let bundle = state.runner_host.bundle_root().to_path_buf();
+    let runner_host = state.runner_host.clone();
+    let provider = provider.to_string();
+    let conv_id = conv.to_string();
+    // Run off the callback's request thread so the "Signed in" page returns promptly;
+    // the flow + egress (list + render the next card) take ~1s.
+    std::thread::spawn(move || {
+        match route_messaging_envelopes(&bundle, &runner_host, &provider, &op_ctx, vec![envelope]) {
+            Ok(()) => operator_log::info(
+                module_path!(),
+                format!("[oauth-resume] auto-advance delivered to conversation {conv_id}"),
+            ),
+            Err(err) => operator_log::warn(
+                module_path!(),
+                format!("[oauth-resume] auto-advance flow/delivery failed for {conv_id}: {err}"),
+            ),
+        }
+    });
 }
 
 async fn handle_websocket_upgrade<B>(
@@ -1498,17 +1648,34 @@ where
             .insert(key, result.response.clone());
     }
 
-    if request.path == "/token" && (200..300).contains(&result.response.status) {
+    if request.path == "/token" {
         let body = result.response.body.as_deref().unwrap_or_default();
-        let token_ok = serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("token")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
-            .is_some_and(|token| !token.trim().is_empty());
+        if !(200..300).contains(&result.response.status) {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "[webchat directline] token request failed provider={} tenant={} team={} status={} body={}",
+                    request.provider,
+                    request.tenant,
+                    request.team,
+                    result.response.status,
+                    String::from_utf8_lossy(body)
+                        .chars()
+                        .take(500)
+                        .collect::<String>()
+                ),
+            );
+        }
+        let token_ok = (200..300).contains(&result.response.status)
+            && serde_json::from_slice::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("token")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .is_some_and(|token| !token.trim().is_empty());
         if !token_ok {
             return Err(error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1816,24 +1983,33 @@ fn register_webchat_post_op_notifier(state: &Arc<HttpIngressState>) {
                 return;
             }
             if op_name != "directline_http" && op_name != "send_payload" {
-                eprintln!(
-                    "[ws post-op-notifier] op={} provider={} skipped (not directline_http or send_payload)",
-                    op_name, provider,
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "[ws post-op-notifier] op={} provider={} skipped (not directline_http or send_payload)",
+                        op_name, provider,
+                    ),
                 );
                 return;
             }
             let Some((tenant_id, conversation_id, new_watermark)) =
                 extract_greentic_metadata(output)
             else {
-                eprintln!(
-                    "[ws post-op-notifier] op={} provider={} skipped (no _greentic metadata)",
-                    op_name, provider,
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "[ws post-op-notifier] op={} provider={} skipped (no _greentic metadata)",
+                        op_name, provider,
+                    ),
                 );
                 return;
             };
-            eprintln!(
-                "[ws post-op-notifier] publishing event tenant={} conv={} watermark={}",
-                tenant_id, conversation_id, new_watermark,
+            operator_log::debug(
+                module_path!(),
+                format!(
+                    "[ws post-op-notifier] publishing event tenant={} conv={} watermark={}",
+                    tenant_id, conversation_id, new_watermark,
+                ),
             );
             let notifier = notifier.clone();
             // The callback is invoked from a synchronous code path that

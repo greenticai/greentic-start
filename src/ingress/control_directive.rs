@@ -19,12 +19,28 @@ pub struct IngressReply {
     pub reason_code: Option<String>,
 }
 
+/// Intent-extracted entity surfaced on a Dispatch.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct PrefillEntity {
+    pub kind: String,
+    pub normalized: String,
+    pub role: Option<String>,
+    pub formats: std::collections::BTreeMap<String, String>,
+}
+
 #[derive(Clone, Debug)]
 pub enum ControlDirective {
     Continue,
-    Dispatch { target: DispatchTarget },
-    Respond { reply: IngressReply },
-    Deny { reply: IngressReply },
+    Dispatch {
+        target: DispatchTarget,
+        entities: Vec<PrefillEntity>,
+    },
+    Respond {
+        reply: IngressReply,
+    },
+    Deny {
+        reply: IngressReply,
+    },
 }
 
 pub fn try_parse_control_directive(output: &JsonValue) -> Option<ControlDirective> {
@@ -35,8 +51,12 @@ pub fn try_parse_control_directive(output: &JsonValue) -> Option<ControlDirectiv
         .map(|value| value.trim().to_ascii_lowercase())?;
     match action.as_str() {
         "continue" => Some(ControlDirective::Continue),
-        "dispatch" => parse_dispatch(decoded.get("target"))
-            .map(|target| ControlDirective::Dispatch { target }),
+        "dispatch" => {
+            parse_dispatch(decoded.get("target")).map(|target| ControlDirective::Dispatch {
+                target,
+                entities: Vec::new(),
+            })
+        }
         "respond" => Some(ControlDirective::Respond {
             reply: parse_reply(&decoded, false),
         }),
@@ -183,7 +203,7 @@ mod tests {
             "target": "acme/default/pack-a/flow-x/node-y"
         }))
         .expect("directive");
-        let ControlDirective::Dispatch { target } = directive else {
+        let ControlDirective::Dispatch { target, .. } = directive else {
             panic!("expected dispatch");
         };
         assert_eq!(target.tenant, "acme");

@@ -1,4 +1,6 @@
 use anyhow::Context;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value as JsonValue, json};
 
 use crate::domains::Domain;
@@ -20,11 +22,15 @@ pub fn build_encode_input(message: JsonValue, plan: JsonValue) -> EncodeInV1 {
 }
 
 pub fn build_send_payload(
-    payload: ProviderPayloadV1,
+    mut payload: ProviderPayloadV1,
     provider_type: impl Into<String>,
     tenant: impl Into<String>,
     team: Option<String>,
+    config: Option<JsonValue>,
 ) -> SendPayloadInV1 {
+    if let Some(config) = config.as_ref() {
+        inject_config_into_envelope_payload(&mut payload, config);
+    }
     SendPayloadInV1 {
         v: 1,
         provider_type: provider_type.into(),
@@ -36,6 +42,35 @@ pub fn build_send_payload(
             correlation_id: None,
         },
         reply_scope: None,
+        config,
+    }
+}
+
+fn inject_config_into_envelope_payload(payload: &mut ProviderPayloadV1, config: &JsonValue) {
+    if config.as_object().is_none_or(serde_json::Map::is_empty) {
+        return;
+    }
+    if !payload.content_type.contains("json") {
+        return;
+    }
+    let Ok(bytes) = STANDARD.decode(&payload.body_b64) else {
+        return;
+    };
+    let Ok(mut body) = serde_json::from_slice::<JsonValue>(&bytes) else {
+        return;
+    };
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    // Only augment Greentic envelope-shaped payloads. Provider-native JSON bodies
+    // may be sent directly to third-party APIs and must not receive config.
+    if !(obj.contains_key("tenant") && obj.contains_key("session_id")) {
+        return;
+    }
+    obj.entry("config".to_string())
+        .or_insert_with(|| config.clone());
+    if let Ok(bytes) = serde_json::to_vec(&body) {
+        payload.body_b64 = STANDARD.encode(bytes);
     }
 }
 
@@ -132,12 +167,65 @@ mod tests {
             "messaging-slack",
             "demo",
             Some("ops".to_string()),
+            Some(json!({"tenant_id": "tenant-1"})),
         );
         assert_eq!(send.v, 1);
         assert_eq!(send.provider_type, "messaging-slack");
         assert_eq!(send.tenant.tenant, "demo");
         assert_eq!(send.tenant.team.as_deref(), Some("ops"));
         assert!(send.reply_scope.is_none());
+        assert_eq!(send.config, Some(json!({"tenant_id": "tenant-1"})));
+    }
+
+    #[test]
+    fn build_send_payload_injects_config_into_envelope_body() {
+        let envelope = json!({
+            "tenant": {"tenant": "demo"},
+            "session_id": "session-1",
+            "text": "hello"
+        });
+        let send = build_send_payload(
+            ProviderPayloadV1 {
+                content_type: "application/json".to_string(),
+                body_b64: STANDARD.encode(serde_json::to_vec(&envelope).unwrap()),
+                metadata_json: None,
+                metadata: None,
+            },
+            "messaging-teams",
+            "demo",
+            None,
+            Some(json!({"tenant_id": "tenant-1", "client_id": "client-1"})),
+        );
+        let body = STANDARD.decode(send.payload.body_b64).unwrap();
+        let body: JsonValue = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["config"]["tenant_id"], "tenant-1");
+        assert_eq!(
+            send.config,
+            Some(json!({"tenant_id": "tenant-1", "client_id": "client-1"}))
+        );
+    }
+
+    #[test]
+    fn build_send_payload_does_not_inject_config_into_provider_native_body() {
+        let native = json!({
+            "channel": "C123",
+            "text": "hello"
+        });
+        let send = build_send_payload(
+            ProviderPayloadV1 {
+                content_type: "application/json".to_string(),
+                body_b64: STANDARD.encode(serde_json::to_vec(&native).unwrap()),
+                metadata_json: None,
+                metadata: None,
+            },
+            "messaging-slack",
+            "demo",
+            None,
+            Some(json!({"token": "secret"})),
+        );
+        let body = STANDARD.decode(send.payload.body_b64).unwrap();
+        let body: JsonValue = serde_json::from_slice(&body).unwrap();
+        assert!(body.get("config").is_none());
     }
 
     #[test]
