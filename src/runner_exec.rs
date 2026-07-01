@@ -107,37 +107,17 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
         .unwrap_or_else(|| "default".to_string());
     // Derive a stable session_id from the inbound envelope so the desktop
     // runner can persist/restore the engine's `FlowSnapshot` between
-    // activities AND so the agentic worker (dw.agent) keeps multi-turn
-    // conversation memory keyed by this id. Conversational messaging flows
-    // rely on this to resume at the card the user paused on — and to let an
-    // agent propose an action, then act on the user's follow-up "yes".
-    //
-    // `request.input` is the RAW rendered event payload, whose conversation
-    // id lives at the ROOT (`/session_id`), set by the messaging provider
-    // ingest. (The `/input/...`-nested shape only appears AFTER the engine
-    // wraps this payload under `in.input`, which is not what we see here.)
-    // We probe the known-good locations in priority order and fall back to
-    // the channel/route id so a missing field never silently degrades to a
-    // fresh per-message session (which would erase all conversation memory).
+    // activities. Conversational messaging flows rely on this to resume
+    // at the card the user paused on instead of restarting at the entry.
     //
     // We compose `{pack}:{flow}:{envelope.session_id}` so two flows or
     // packs sharing the same conversation id stay isolated.
-    let envelope_session_id = [
-        "/session_id",
-        "/input/session_id",
-        "/channel",
-        "/metadata/route",
-        "/input/metadata/route",
-    ]
-    .iter()
-    .find_map(|pointer| {
-        request
-            .input
-            .pointer(pointer)
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-    });
+    let envelope_session_id = request
+        .input
+        .pointer("/input/session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let session_id = envelope_session_id.as_deref().map(|conv| {
         format!(
             "{pack}:{flow}:{conv}",

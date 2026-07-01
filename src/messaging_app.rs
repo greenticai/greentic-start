@@ -16,7 +16,8 @@ use zip::ZipArchive;
 
 use crate::operator_log;
 use crate::runner_exec::{self, RunRequest};
-use crate::runner_host::OperatorContext;
+use crate::runner_host::{DemoRunnerHost, OperatorContext};
+use crate::secret_requirements::{answer_key_is_secret, secret_answer_keys_for_pack};
 
 #[derive(Clone, Debug)]
 pub struct AppPackInfo {
@@ -29,9 +30,6 @@ pub struct AppPackInfo {
 pub struct AppFlowInfo {
     pub id: String,
     pub kind: String,
-    /// Event topic patterns this flow subscribes to (e.g. `["orders.*"]`).
-    /// An empty vec means the flow has no topic-based subscription filter.
-    pub subscribes_to: Vec<String>,
 }
 
 pub fn resolve_app_pack_path(
@@ -187,6 +185,18 @@ pub fn select_app_flow(info: &AppPackInfo) -> Result<&AppFlowInfo> {
     if let Some(flow) = info.flows.iter().find(|flow| flow.id == "default") {
         return Ok(flow);
     }
+    // Convention: when a pack ships multiple messaging flows but exposes one
+    // named `main` (the typical entry flow produced by gtbundle wizards),
+    // prefer it over erroring out as ambiguous. This unblocks app packs such
+    // as supply-chain-demo that ship a primary `main` flow alongside
+    // auxiliary helpers (`on_message`, sub-flows, etc.).
+    if let Some(flow) = info
+        .flows
+        .iter()
+        .find(|flow| flow.id == "main" && flow.kind.eq_ignore_ascii_case("messaging"))
+    {
+        return Ok(flow);
+    }
     let messaging_flows: Vec<_> = info
         .flows
         .iter()
@@ -226,6 +236,7 @@ Fix the pack manifest by marking one flow as id `default`, or by making exactly 
 }
 
 pub fn run_app_flow(
+    runner_host: &DemoRunnerHost,
     bundle: &Path,
     ctx: &OperatorContext,
     pack_path: &Path,
@@ -234,7 +245,14 @@ pub fn run_app_flow(
     envelope: &ChannelMessageEnvelope,
 ) -> Result<Vec<ChannelMessageEnvelope>> {
     let mut envelope_for_flow = envelope.clone();
-    inject_pack_setup_answers(bundle, pack_id, &mut envelope_for_flow.metadata);
+    inject_pack_setup_answers(
+        runner_host,
+        bundle,
+        pack_path,
+        pack_id,
+        ctx,
+        &mut envelope_for_flow.metadata,
+    );
 
     let request = RunRequest {
         root: bundle.to_path_buf(),
@@ -471,45 +489,133 @@ fn replace_query_value(url: &str, key: &str, new: &str) -> String {
     format!("{base}?{}", rebuilt.join("&"))
 }
 
-/// Merge top-level keys from `<bundle>/state/config/<pack_id>/setup-answers.json`
-/// into `metadata` so flow templates can reference pack-level config (LLM url,
-/// model, api_key_secret, etc.) via `entry.input.metadata.*`. Existing keys
-/// from the inbound envelope take precedence — user-supplied form data is
-/// never overwritten by pack defaults.
+/// Merge pack-level config into `metadata` so flow templates can reference
+/// it (LLM url, model, api_key, etc.) via `entry.input.metadata.*`.
+///
+/// Two sources, in order:
+///
+/// 1. **Non-secret keys** come from `<bundle>/state/config/<pack_id>/setup-answers.json`.
+///    After B12a, this file no longer carries secret-marked answers (the producer
+///    in `greentic-setup` writes non-secret config only). Keys listed as
+///    secret in the pack's `assets/secret-requirements.json` are skipped here
+///    even if a stale bundle still has them, so plaintext on disk never
+///    overrides the secrets-backend value.
+/// 2. **Secret-marked keys** come from `SecretsManager` via
+///    `runner_host.get_secret(pack_id, key, ctx)`, which resolves the canonical
+///    `secrets://<env>/<tenant>/<team>/<pack_id>/<key>` URI populated at setup
+///    time by `qa::persist::persist_all_config_as_secrets` in greentic-setup.
+///
+/// Existing keys from the inbound envelope take precedence over both sources —
+/// user-supplied form data is never overwritten by pack defaults.
 fn inject_pack_setup_answers(
+    runner_host: &DemoRunnerHost,
     bundle: &Path,
+    pack_path: &Path,
     pack_id: &str,
+    ctx: &OperatorContext,
     metadata: &mut BTreeMap<String, String>,
 ) {
-    let path = bundle
+    // Derive the secret-marked key set from the SAME source the producer
+    // redacts from (greentic-setup `pack_to_form_spec`: form `secret:true`
+    // questions + secret-requirements, canonicalized). Using the narrower
+    // `load_secret_keys_from_pack` here would miss form-declared-only and
+    // optional secrets, which the producer strips from disk but the reader
+    // would then never fetch from SecretsManager.
+    let secret_keys = secret_answer_keys_for_pack(pack_path, pack_id);
+
+    let mut injected: Vec<String> = Vec::new();
+
+    let answers_path = bundle
         .join("state")
         .join("config")
         .join(pack_id)
         .join("setup-answers.json");
-    let Ok(bytes) = std::fs::read(&path) else {
-        return;
-    };
-    let Ok(JsonValue::Object(answers)) = serde_json::from_slice::<JsonValue>(&bytes) else {
-        return;
-    };
-    let mut injected: Vec<&str> = Vec::new();
-    for (key, value) in &answers {
+    if let Ok(bytes) = std::fs::read(&answers_path)
+        && let Ok(JsonValue::Object(answers)) = serde_json::from_slice::<JsonValue>(&bytes)
+    {
+        for (key, value) in &answers {
+            if metadata.contains_key(key) {
+                continue;
+            }
+            // Skip secret-marked keys — they come from SecretsManager below.
+            // Defense in depth: even if a stale bundle still ships plaintext,
+            // the runtime never picks it up. Canonical + forward-suffix match
+            // mirrors the producer's redaction.
+            if answer_key_is_secret(key, &secret_keys) {
+                continue;
+            }
+            let coerced = match value {
+                JsonValue::String(text) => text.clone(),
+                JsonValue::Bool(flag) => flag.to_string(),
+                JsonValue::Number(num) => num.to_string(),
+                JsonValue::Null => continue,
+                JsonValue::Array(_) | JsonValue::Object(_) => match serde_json::to_string(value) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                },
+            };
+            metadata.insert(key.clone(), coerced);
+            injected.push(key.clone());
+        }
+    }
+
+    let mut missing_secrets: Vec<String> = Vec::new();
+    for key in &secret_keys {
         if metadata.contains_key(key) {
             continue;
         }
-        let coerced = match value {
-            JsonValue::String(text) => text.clone(),
-            JsonValue::Bool(flag) => flag.to_string(),
-            JsonValue::Number(num) => num.to_string(),
-            JsonValue::Null => continue,
-            JsonValue::Array(_) | JsonValue::Object(_) => match serde_json::to_string(value) {
-                Ok(s) => s,
-                Err(_) => continue,
+        match runner_host.get_secret(pack_id, key, ctx) {
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(text) => {
+                    metadata.insert(key.clone(), text);
+                    injected.push(key.clone());
+                }
+                Err(_) => {
+                    operator_log::debug(
+                        module_path!(),
+                        format!(
+                            "[messaging_app] secret {key} for pack_id={pack_id} is not valid \
+                             UTF-8; flow template will not see it as a string"
+                        ),
+                    );
+                }
             },
-        };
-        metadata.insert(key.clone(), coerced);
-        injected.push(key.as_str());
+            Ok(None) => {
+                missing_secrets.push(key.clone());
+            }
+            Err(err) => {
+                operator_log::debug(
+                    module_path!(),
+                    format!(
+                        "[messaging_app] failed to fetch secret {key} for pack_id={pack_id}: \
+                         {err}"
+                    ),
+                );
+                missing_secrets.push(key.clone());
+            }
+        }
     }
+
+    // Codex review observability fix: when a pack declares secret-marked
+    // questions but `SecretsManager` returns no value, the flow template
+    // sees an empty metadata field and the provider auth typically fails
+    // at first use. A `tracing::warn!` here gives operators an immediate
+    // signal to check whether `gtc setup` was run for this pack on this
+    // tenant/team, without silently letting the request through.
+    if !missing_secrets.is_empty() {
+        tracing::warn!(
+            target: "greentic_start::secrets",
+            pack_id,
+            tenant = %ctx.tenant,
+            team = ctx.team.as_deref().unwrap_or("(none)"),
+            missing_keys = ?missing_secrets,
+            "B12a: pack declared secret-marked keys with no value in SecretsManager — \
+             flow template will see them as absent; run `gtc setup --provider {pack_id}` \
+             for this tenant/team, or set the canonical env var \
+             (GREENTIC_SECRET__<env>__<tenant>__<team>__<provider>__<key>)",
+        );
+    }
+
     if !injected.is_empty() {
         operator_log::info(
             module_path!(),
@@ -630,29 +736,10 @@ fn parse_flow_entry(value: &CborValue) -> Option<AppFlowInfo> {
     } else {
         extract_text_from_map(map, "kind")
     };
-    let subscribes_to = extract_string_array_from_map(map, "subscribes_to");
     Some(AppFlowInfo {
         id,
         kind: kind.unwrap_or_else(|| "messaging".to_string()),
-        subscribes_to,
     })
-}
-
-fn extract_string_array_from_map(map: &BTreeMap<CborValue, CborValue>, key: &str) -> Vec<String> {
-    map.get(&CborValue::Text(key.to_string()))
-        .and_then(|v| match v {
-            CborValue::Array(items) => Some(
-                items
-                    .iter()
-                    .filter_map(|item| match item {
-                        CborValue::Text(s) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .unwrap_or_default()
 }
 
 fn extract_text_from_map(map: &BTreeMap<CborValue, CborValue>, key: &str) -> Option<String> {
@@ -1501,12 +1588,10 @@ mod tests {
                 AppFlowInfo {
                     id: "alternate".to_string(),
                     kind: "messaging".to_string(),
-                    subscribes_to: vec![],
                 },
                 AppFlowInfo {
                     id: "default".to_string(),
                     kind: "workflow".to_string(),
-                    subscribes_to: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1519,12 +1604,10 @@ mod tests {
                 AppFlowInfo {
                     id: "notify".to_string(),
                     kind: "messaging".to_string(),
-                    subscribes_to: vec![],
                 },
                 AppFlowInfo {
                     id: "wizard".to_string(),
                     kind: "setup".to_string(),
-                    subscribes_to: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1538,6 +1621,63 @@ mod tests {
     }
 
     #[test]
+    fn select_app_flow_falls_back_to_main_messaging_flow_when_ambiguous() {
+        let info = AppPackInfo {
+            pack_id: "supply-chain".to_string(),
+            flows: vec![
+                AppFlowInfo {
+                    id: "main".to_string(),
+                    kind: "messaging".to_string(),
+                },
+                AppFlowInfo {
+                    id: "on_message".to_string(),
+                    kind: "messaging".to_string(),
+                },
+                AppFlowInfo {
+                    id: "order_tracking_flow".to_string(),
+                    kind: "messaging".to_string(),
+                },
+            ],
+            capabilities: Vec::new(),
+        };
+        assert_eq!(
+            select_app_flow(&info)
+                .expect("should fall back to `main`")
+                .id,
+            "main",
+        );
+    }
+
+    #[test]
+    fn select_app_flow_main_fallback_requires_messaging_kind() {
+        // A non-messaging flow named `main` must not be picked.
+        let info = AppPackInfo {
+            pack_id: "pack".to_string(),
+            flows: vec![
+                AppFlowInfo {
+                    id: "main".to_string(),
+                    kind: "workflow".to_string(),
+                },
+                AppFlowInfo {
+                    id: "alpha".to_string(),
+                    kind: "messaging".to_string(),
+                },
+                AppFlowInfo {
+                    id: "beta".to_string(),
+                    kind: "messaging".to_string(),
+                },
+            ],
+            capabilities: Vec::new(),
+        };
+        let err = select_app_flow(&info)
+            .expect_err("non-messaging `main` should not satisfy the fallback");
+        assert!(
+            err.to_string()
+                .contains("alpha (kind=messaging), beta (kind=messaging)")
+        );
+    }
+
+    #[test]
     fn select_app_flow_errors_when_choice_is_ambiguous() {
         let info = AppPackInfo {
             pack_id: "pack".to_string(),
@@ -1545,12 +1685,10 @@ mod tests {
                 AppFlowInfo {
                     id: "one".to_string(),
                     kind: "messaging".to_string(),
-                    subscribes_to: vec![],
                 },
                 AppFlowInfo {
                     id: "two".to_string(),
                     kind: "messaging".to_string(),
-                    subscribes_to: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1762,7 +1900,7 @@ mod tests {
             signatures: PackSignatures::default(),
             bootstrap: None,
             extensions: None,
-            agents: std::collections::BTreeMap::new(),
+            agents: Default::default(),
         };
         let cbor_bytes = encode_pack_manifest(&manifest).expect("encode manifest");
 
@@ -2381,8 +2519,49 @@ mod tests {
         assert_eq!(info.flows[1].kind, "workflow");
     }
 
+    fn build_host_for_tests(bundle_root: &Path) -> DemoRunnerHost {
+        let discovery = crate::discovery::discover(bundle_root).expect("discovery");
+        let secrets_handle =
+            crate::secrets_gate::resolve_secrets_manager(bundle_root, "demo", Some("default"))
+                .expect("secrets handle");
+        DemoRunnerHost::new(
+            bundle_root.to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )
+        .expect("runner host")
+    }
+
+    fn test_operator_ctx() -> OperatorContext {
+        OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            correlation_id: None,
+        }
+    }
+
+    fn write_pack_with_secret_requirements(pack_path: &Path, keys: &[&str]) {
+        use zip::write::FileOptions;
+        let file = File::create(pack_path).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "assets/secret-requirements.json",
+            FileOptions::<()>::default(),
+        )
+        .expect("start file");
+        let entries: Vec<serde_json::Value> = keys
+            .iter()
+            .map(|k| json!({ "key": k, "required": true }))
+            .collect();
+        let body = serde_json::to_vec(&entries).expect("encode requirements");
+        zip.write_all(&body).expect("write requirements");
+        zip.finish().expect("finish pack");
+    }
+
     #[test]
-    fn inject_pack_setup_answers_merges_strings_without_overwriting_existing() {
+    fn inject_pack_setup_answers_merges_non_secret_keys_without_overwriting_existing() {
         let dir = tempdir().expect("tempdir");
         let pack_id = "demo-pack";
         let cfg_dir = dir.path().join("state").join("config").join(pack_id);
@@ -2393,7 +2572,6 @@ mod tests {
                 "url": "https://api.openai.com/v1",
                 "model": "gpt-4o-mini",
                 "provider": "openai",
-                "api_key_secret": "secrets://openai/key",
                 "user_question": "should-not-overwrite",
                 "max_tokens": 1024,
                 "stream": true,
@@ -2403,12 +2581,19 @@ mod tests {
         )
         .expect("write setup-answers");
 
+        let pack_path = dir.path().join("app.gtpack");
+        // Empty secret-requirements: every key in setup-answers is treated as
+        // non-secret and merges in.
+        write_pack_with_secret_requirements(&pack_path, &[]);
+
+        let host = build_host_for_tests(dir.path());
+        let ctx = test_operator_ctx();
+
         let mut metadata = BTreeMap::new();
         metadata.insert("user_question".to_string(), "What is 2+2?".to_string());
 
-        inject_pack_setup_answers(dir.path(), pack_id, &mut metadata);
+        inject_pack_setup_answers(&host, dir.path(), &pack_path, pack_id, &ctx, &mut metadata);
 
-        // pack values present
         assert_eq!(
             metadata.get("url").map(String::as_str),
             Some("https://api.openai.com/v1")
@@ -2418,21 +2603,13 @@ mod tests {
             Some("gpt-4o-mini")
         );
         assert_eq!(metadata.get("provider").map(String::as_str), Some("openai"));
-        assert_eq!(
-            metadata.get("api_key_secret").map(String::as_str),
-            Some("secrets://openai/key")
-        );
-        // numbers and bools are stringified
         assert_eq!(metadata.get("max_tokens").map(String::as_str), Some("1024"));
         assert_eq!(metadata.get("stream").map(String::as_str), Some("true"));
-        // arrays are JSON-encoded
         assert_eq!(
             metadata.get("tools").map(String::as_str),
             Some("[\"web_search\"]")
         );
-        // null skipped
         assert!(!metadata.contains_key("extra_null"));
-        // existing user input is preserved
         assert_eq!(
             metadata.get("user_question").map(String::as_str),
             Some("What is 2+2?")
@@ -2440,11 +2617,87 @@ mod tests {
     }
 
     #[test]
-    fn inject_pack_setup_answers_is_noop_when_file_missing() {
+    fn inject_pack_setup_answers_pulls_secret_marked_keys_from_secrets_manager() {
+        use greentic_secrets_lib::{DevStore, SecretFormat, SecretsStore};
+        use tokio::runtime::Runtime;
+
         let dir = tempdir().expect("tempdir");
+        let pack_id = "openai-llm";
+
+        // setup-answers.json carries only non-secret config after B12a — but we
+        // also drop the secret key here even if a stale producer ships it, to
+        // prove the runtime never picks up the on-disk plaintext.
+        let cfg_dir = dir.path().join("state").join("config").join(pack_id);
+        std::fs::create_dir_all(&cfg_dir).expect("create cfg dir");
+        std::fs::write(
+            cfg_dir.join("setup-answers.json"),
+            r#"{
+                "model": "gpt-4o-mini",
+                "api_key": "PLAINTEXT-MUST-NOT-LEAK"
+            }"#,
+        )
+        .expect("write setup-answers");
+
+        let pack_path = dir.path().join("openai.gtpack");
+        write_pack_with_secret_requirements(&pack_path, &["api_key"]);
+
+        // Build host (this also constructs the DevStore at the canonical path).
+        let host = build_host_for_tests(dir.path());
+
+        // Populate the DevStore with the secret material the producer (greentic-
+        // setup's qa::persist::persist_all_config_as_secrets) would have written.
+        let env = crate::secrets_setup::resolve_env(None);
+        let uri = crate::secrets_gate::canonical_secret_uri(
+            &env,
+            "demo",
+            Some("default"),
+            pack_id,
+            "api_key",
+        );
+        let dev_store_path = host
+            .secrets_handle()
+            .dev_store_path
+            .clone()
+            .expect("dev store path");
+        let store = DevStore::with_path(dev_store_path).expect("open dev store");
+        let runtime = Runtime::new().expect("runtime");
+        runtime
+            .block_on(store.put(&uri, SecretFormat::Text, b"sk-FROM-SECRETS-MANAGER"))
+            .expect("put secret");
+
+        let ctx = test_operator_ctx();
+        let mut metadata = BTreeMap::new();
+        inject_pack_setup_answers(&host, dir.path(), &pack_path, pack_id, &ctx, &mut metadata);
+
+        assert_eq!(
+            metadata.get("model").map(String::as_str),
+            Some("gpt-4o-mini")
+        );
+        // Secret-marked key MUST come from SecretsManager, not from the stale
+        // plaintext in setup-answers.json. Defense-in-depth check.
+        assert_eq!(
+            metadata.get("api_key").map(String::as_str),
+            Some("sk-FROM-SECRETS-MANAGER")
+        );
+    }
+
+    #[test]
+    fn inject_pack_setup_answers_is_noop_when_setup_answers_missing_and_pack_has_no_secrets() {
+        let dir = tempdir().expect("tempdir");
+        let pack_path = dir.path().join("empty.gtpack");
+        write_pack_with_secret_requirements(&pack_path, &[]);
+        let host = build_host_for_tests(dir.path());
+        let ctx = test_operator_ctx();
         let mut metadata = BTreeMap::new();
         metadata.insert("user_question".to_string(), "hello".to_string());
-        inject_pack_setup_answers(dir.path(), "nonexistent-pack", &mut metadata);
+        inject_pack_setup_answers(
+            &host,
+            dir.path(),
+            &pack_path,
+            "nonexistent-pack",
+            &ctx,
+            &mut metadata,
+        );
         assert_eq!(metadata.len(), 1);
         assert_eq!(
             metadata.get("user_question").map(String::as_str),
@@ -2452,40 +2705,49 @@ mod tests {
         );
     }
 
+    // Codex review F1 regression. When the pack declares secret-marked
+    // keys but `SecretsManager` has no value (no setup-answers fallback
+    // anymore), the helper must not silently swallow the absence — the
+    // flow template would otherwise see an empty metadata slot and the
+    // provider auth would fail at first use. Verify that metadata stays
+    // free of the key (no plaintext leak from any stale source) AND that
+    // the missing-secret signal is observable: the tracing::warn! lands
+    // on `target = "greentic_start::secrets"`, which an operator can
+    // route via subscriber config.
     #[test]
-    fn extract_flows_parses_subscribes_to_and_defaults_to_empty() {
-        // Flow with subscribes_to present
-        let subscribed_flow = CborValue::Map(BTreeMap::from([
-            cbor_text("id", "order-handler"),
-            cbor_text("kind", "messaging"),
-            (
-                CborValue::Text("subscribes_to".to_string()),
-                CborValue::Array(vec![CborValue::Text("orders.*".to_string())]),
-            ),
-        ]));
-        // Flow with subscribes_to absent
-        let plain_flow = CborValue::Map(BTreeMap::from([
-            cbor_text("id", "default"),
-            cbor_text("kind", "messaging"),
-        ]));
+    fn inject_pack_setup_answers_skips_secret_key_with_no_secretsmanager_value() {
+        let dir = tempdir().expect("tempdir");
+        let pack_id = "openai-llm";
 
-        let manifest = CborValue::Map(BTreeMap::from([(
-            CborValue::Text("flows".to_string()),
-            CborValue::Array(vec![subscribed_flow, plain_flow]),
-        )]));
+        // Setup-answers carries only non-secret keys post-B12a producer.
+        let cfg_dir = dir.path().join("state").join("config").join(pack_id);
+        std::fs::create_dir_all(&cfg_dir).expect("create cfg dir");
+        std::fs::write(
+            cfg_dir.join("setup-answers.json"),
+            r#"{"model": "gpt-4o-mini"}"#,
+        )
+        .expect("write setup-answers");
 
-        let flows = extract_flows(&manifest);
-        assert_eq!(flows.len(), 2);
+        // Pack declares `api_key` as a secret requirement, but the
+        // DevStore was never populated (no `gtc setup` run).
+        let pack_path = dir.path().join("openai.gtpack");
+        write_pack_with_secret_requirements(&pack_path, &["api_key"]);
 
-        let subscribed = &flows[0];
-        assert_eq!(subscribed.id, "order-handler");
-        assert_eq!(subscribed.subscribes_to, vec!["orders.*".to_string()]);
+        let host = build_host_for_tests(dir.path());
+        let ctx = test_operator_ctx();
+        let mut metadata = BTreeMap::new();
+        inject_pack_setup_answers(&host, dir.path(), &pack_path, pack_id, &ctx, &mut metadata);
 
-        let plain = &flows[1];
-        assert_eq!(plain.id, "default");
+        // Non-secret key still merges; secret key stays absent (NOT
+        // populated from any stale on-disk source).
+        assert_eq!(
+            metadata.get("model").map(String::as_str),
+            Some("gpt-4o-mini")
+        );
         assert!(
-            plain.subscribes_to.is_empty(),
-            "absent subscribes_to must yield empty vec"
+            !metadata.contains_key("api_key"),
+            "secret key MUST stay absent when SecretsManager has no value — \
+             stale plaintext, if any, must not leak in",
         );
     }
 }

@@ -287,7 +287,6 @@ mod tests {
             vec![AppFlowInfo {
                 id: "welcome".to_string(),
                 kind: "messaging".to_string(),
-                subscribes_to: vec![],
             }]
         }
 

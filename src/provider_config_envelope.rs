@@ -1,3 +1,12 @@
+//! Provider configuration envelope reader/writer for greentic-start.
+//!
+//! After B12a, `config.envelope.cbor` carries **non-secret** provider config
+//! only. Secret material is fetched from `SecretsBackend` keyed by the
+//! canonical `secrets://<env>/<tenant>/<team>/<provider>/<key>` URI; the
+//! envelope's `config` JSON no longer ships plaintext secret values.
+//! The envelope itself remains a transitional sink for non-secret runtime
+//! config until `pack-config.v1` ships.
+
 #![allow(dead_code)]
 
 use std::fs::File;
@@ -240,10 +249,11 @@ fn read_pack_provenance(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
-        // Synthetic setup-side envelope declares no routing outcomes; the
-        // real set is carried by the component's own describe at runtime.
-        outcomes: Vec::new(),
         config_schema: SchemaIr::Null,
+        // Additive 0.6.x field: a pack manifest carries no outcomes vocabulary,
+        // so the provenance describe mirrors the empty default older descriptors
+        // decode to.
+        outcomes: Vec::new(),
     };
     let describe_hash = hash_canonical(&describe)?;
 

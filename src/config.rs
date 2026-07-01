@@ -5,9 +5,6 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-// SQL gateway config is now provided by the published crate type.
-// See greentic_runner_host::sql::config::SqlConfig.
-
 #[derive(Clone, Debug, Deserialize, Default)]
 pub struct OperatorConfig {
     #[serde(default)]
@@ -100,10 +97,6 @@ pub struct DemoConfig {
     pub services: DemoServicesConfig,
     #[serde(default)]
     pub providers: Option<std::collections::BTreeMap<String, DemoProviderConfig>>,
-    /// SQL gateway configuration. When present, `gtc start` spawns a dedicated
-    /// localhost axum server serving `/sql/<conn>/schema` and `/sql/<conn>/query`.
-    #[serde(default)]
-    pub sql: Option<greentic_runner_host::sql::config::SqlConfig>,
 }
 
 impl Default for DemoConfig {
@@ -113,7 +106,6 @@ impl Default for DemoConfig {
             team: default_demo_team(),
             services: DemoServicesConfig::default(),
             providers: None,
-            sql: None,
         }
     }
 }

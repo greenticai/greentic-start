@@ -1547,6 +1547,7 @@ mod tests {
             },
         );
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "1".to_string(),
             pack_id: "messaging-teams".parse()?,
             name: None,
@@ -1561,7 +1562,6 @@ mod tests {
             signatures: PackSignatures::default(),
             bootstrap: None,
             extensions: Some(extensions),
-            agents: std::collections::BTreeMap::new(),
         };
         let mut zip = ZipWriter::new(std::fs::File::create(&pack_path)?);
         zip.start_file("manifest.cbor", FileOptions::<()>::default())?;
@@ -1610,6 +1610,7 @@ mod tests {
             },
         );
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "1".to_string(),
             pack_id: "messaging-teams".parse()?,
             name: None,
@@ -1624,7 +1625,6 @@ mod tests {
             signatures: PackSignatures::default(),
             bootstrap: None,
             extensions: Some(extensions),
-            agents: std::collections::BTreeMap::new(),
         };
         let mut zip = ZipWriter::new(std::fs::File::create(&pack_path)?);
         zip.start_file("manifest.cbor", FileOptions::<()>::default())?;

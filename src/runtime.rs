@@ -22,7 +22,6 @@ use crate::startup_contract::{
     StartupContract, StartupContractInput,
 };
 use crate::supervisor;
-use crate::timer_scheduler::{TimerScheduler, TimerSchedulerConfig, discover_timer_handlers};
 use anyhow::Context;
 
 use crate::cloudflared::{self, CloudflaredConfig};
@@ -37,16 +36,12 @@ use crate::subscriptions_universal::{
 #[derive(Default)]
 pub struct ForegroundRuntimeHandles {
     pub ingress_server: Option<HttpIngressServer>,
-    pub timer_scheduler: Option<TimerScheduler>,
 }
 
 impl ForegroundRuntimeHandles {
     pub fn stop(mut self) -> anyhow::Result<()> {
         if let Some(server) = self.ingress_server.take() {
             server.stop()?;
-        }
-        if let Some(scheduler) = self.timer_scheduler.take() {
-            scheduler.stop()?;
         }
         Ok(())
     }
@@ -457,7 +452,7 @@ fn looks_like_path(value: &str) -> bool {
     value.contains('/') || value.contains('\\') || Path::new(value).is_absolute()
 }
 
-fn should_restart(restart: &BTreeSet<String>, service: &str) -> bool {
+pub(crate) fn should_restart(restart: &BTreeSet<String>, service: &str) -> bool {
     restart.contains("all") || restart.contains(service)
 }
 
@@ -757,6 +752,7 @@ pub fn demo_up_services(
     config: &DemoConfig,
     static_routes: &BundleStaticRoutesInspection,
     configured_public_base_url: Option<String>,
+    env_store_public_base_url: Option<String>,
     cloudflared: Option<CloudflaredConfig>,
     ngrok: Option<NgrokConfig>,
     restart: &BTreeSet<String>,
@@ -835,14 +831,6 @@ pub fn demo_up_services(
         validate_messaging_app_route(config_dir, tenant, Some(team))
             .with_context(|| "messaging app route validation failed")?;
     }
-    // Pre-flight: fail closed BEFORE the HTTP ingress server binds when a flow
-    // references a `dw.agent` (agentic worker) that the assembled agent map does
-    // not provide. Without this the missing worker is only discovered at
-    // conversation time and silently swallowed into a generic error reply. The
-    // provided set is the assembled agent map keys (bundle DwApplication packs +
-    // GREENTIC_AW_AGENTS_FILE overlay), so an env-file agent is honoured.
-    crate::runner_host::check_bundle_dw_agents(config_dir, tenant, Some(team))
-        .with_context(|| "dw.agent pre-flight validation failed")?;
     let ingress_server = start_http_ingress_server(
         config,
         &ingress_domains,
@@ -852,161 +840,6 @@ pub fn demo_up_services(
         notifier_config,
     )
     .with_context(|| "failed to start local HTTP ingress server")?;
-
-    // ── Timer scheduler (optional) ─────────────────────────────────────────
-    // Discover any event-domain providers that declare timer handlers and start
-    // the background scheduler thread. If no timer providers are present the
-    // scheduler is not started, leaving the startup path unaffected. Discovery
-    // or start failures are non-fatal: they warn and leave the scheduler absent
-    // so HTTP ingress (webchat/messaging) is not affected.
-    const DEFAULT_TIMER_INTERVAL_SECONDS: u64 = 60;
-    let timer_scheduler = match discover_timer_handlers(&discovery, DEFAULT_TIMER_INTERVAL_SECONDS)
-    {
-        Err(err) => {
-            operator_log::warn(module_path!(), format!("timer scheduler disabled: {err:#}"));
-            None
-        }
-        Ok(timer_handlers) if timer_handlers.is_empty() => None,
-        Ok(timer_handlers) => {
-            match TimerScheduler::start(TimerSchedulerConfig {
-                runner_host: Arc::clone(&runner_host),
-                tenant: tenant.to_string(),
-                team: if team.is_empty() {
-                    None
-                } else {
-                    Some(team.to_string())
-                },
-                handlers: timer_handlers,
-                debug_enabled,
-            }) {
-                Ok(scheduler) => Some(scheduler),
-                Err(err) => {
-                    operator_log::warn(
-                        module_path!(),
-                        format!("timer scheduler disabled: {err:#}"),
-                    );
-                    None
-                }
-            }
-        }
-    };
-
-    // ── SQL gateway (optional) ─────────────────────────────────────────────
-    // When `demo_config.sql` is set, resolve secrets and spawn a dedicated
-    // localhost axum server serving `/sql/<conn>/schema` + `/sql/<conn>/query`.
-    // The default port is 8765 (not yet in SqlConfig v1 — hardcoded here).
-    const SQL_GATEWAY_DEFAULT_PORT: u16 = 8765;
-    if let Some(sql_cfg) = config.sql.as_ref() {
-        let sql_secrets_manager = secrets_handle.manager();
-        let sql_cfg_owned = sql_cfg.clone();
-        let sql_future = async move {
-            // Resolve the bearer token secret.
-            let token_bytes = sql_secrets_manager
-                .read(&sql_cfg_owned.auth_token_secret)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "sql.auth_token_secret ({}): {e}",
-                        sql_cfg_owned.auth_token_secret
-                    )
-                })?;
-            let token = String::from_utf8(token_bytes).map_err(|e| {
-                anyhow::anyhow!("sql.auth_token_secret value is not valid UTF-8: {e}")
-            })?;
-            if token.is_empty() && !sql_cfg_owned.connections.is_empty() {
-                anyhow::bail!(
-                    "sql.auth_token_secret resolved to an empty string — \
-                     refusing to start SQL gateway (set the secret or remove the sql: block)"
-                );
-            }
-
-            // Build a pool for each configured connection.
-            let mut connections: std::collections::HashMap<
-                String,
-                greentic_runner_host::sql::SqlConnection,
-            > = std::collections::HashMap::new();
-            for (connection_name, connection_cfg) in &sql_cfg_owned.connections {
-                let dsn_bytes = sql_secrets_manager
-                    .read(&connection_cfg.dsn_secret)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "sql connection {connection_name} dsn_secret ({}): {e}",
-                            connection_cfg.dsn_secret
-                        )
-                    })?;
-                let dsn = String::from_utf8(dsn_bytes).map_err(|e| {
-                    anyhow::anyhow!(
-                        "sql connection {connection_name} dsn value is not valid UTF-8: {e}"
-                    )
-                })?;
-                match greentic_runner_host::sql::pool::build(
-                    connection_cfg.engine,
-                    &dsn,
-                    connection_cfg.read_only,
-                )
-                .await
-                {
-                    Ok(pool) => {
-                        connections.insert(
-                            connection_name.clone(),
-                            greentic_runner_host::sql::SqlConnection {
-                                engine: connection_cfg.engine,
-                                pool,
-                            },
-                        );
-                    }
-                    Err(pool_error) => {
-                        tracing::warn!(
-                            "sql gateway: skipping connection {connection_name}: {pool_error}"
-                        );
-                    }
-                }
-            }
-
-            Ok::<_, anyhow::Error>((
-                greentic_runner_host::sql::SqlGateway::new(connections, token),
-                SQL_GATEWAY_DEFAULT_PORT,
-            ))
-        };
-
-        let sql_gateway_result = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(sql_future)),
-            Err(_) => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("failed to build temporary tokio runtime for sql gateway")?
-                .block_on(sql_future),
-        };
-
-        match sql_gateway_result {
-            Ok((gateway, port)) => {
-                let gateway_app = greentic_runner_host::sql::routes::router(gateway);
-                tokio::spawn(async move {
-                    match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                        Ok(listener) => {
-                            tracing::info!("sql gateway listening on 127.0.0.1:{port}");
-                            if let Err(serve_error) = axum::serve(listener, gateway_app).await {
-                                tracing::error!("sql gateway server error: {serve_error}");
-                            }
-                        }
-                        Err(bind_error) => {
-                            tracing::error!("sql gateway bind 127.0.0.1:{port}: {bind_error}");
-                        }
-                    }
-                });
-                operator_log::info(
-                    module_path!(),
-                    format!("sql gateway started on 127.0.0.1:{SQL_GATEWAY_DEFAULT_PORT}"),
-                );
-            }
-            Err(gateway_error) => {
-                anyhow::bail!("sql gateway startup failed: {gateway_error:#}");
-            }
-        }
-    }
-    // ── end SQL gateway ────────────────────────────────────────────────────
-
     let run_gsm_services = config.services.nats.enabled;
     operator_log::info(
         module_path!(),
@@ -1173,23 +1006,39 @@ pub fn demo_up_services(
     let previous_public_url =
         crate::webhook_updater::read_previous_public_url(&paths.runtime_root());
 
-    // Resolve public_base_url with fallback to local HTTP listener for local dev
-    let public_base_url = tunnel_public_base_url
+    // Resolve public_base_url with fallback to local HTTP listener for local dev.
+    // Precedence: tunnel > env-store > env var > local-listener derived.
+    // env-store wins over env var: it's the persisted operator intent set via
+    // `gtc op env set-public-url`, while the env var is a process-level override.
+    //
+    // Source attribution is computed in the same pass so the URL value and its
+    // `RuntimePublicBaseUrlSource` tag can't drift — adding a fifth source is
+    // one new `.or_else` arm instead of two parallel chains.
+    let derived_local_url = if ingress_server.is_some() && enable_static_routes {
+        let host = &config.services.gateway.listen_addr;
+        let port = ingress_server
+            .as_ref()
+            .map(|server| server.actual_port)
+            .unwrap_or(config.services.gateway.port);
+        Some(format!("http://{}:{}", host, port))
+    } else {
+        None
+    };
+    let url_with_source: Option<(String, RuntimePublicBaseUrlSource)> = tunnel_public_base_url
         .clone()
-        .or(configured_public_base_url.clone())
+        .map(|u| (u, RuntimePublicBaseUrlSource::Tunnel))
         .or_else(|| {
-            // Fallback: derive from local HTTP listener if static routes are enabled
-            if ingress_server.is_some() && enable_static_routes {
-                let host = &config.services.gateway.listen_addr;
-                let port = ingress_server
-                    .as_ref()
-                    .map(|server| server.actual_port)
-                    .unwrap_or(config.services.gateway.port);
-                Some(format!("http://{}:{}", host, port))
-            } else {
-                None
-            }
-        });
+            env_store_public_base_url
+                .clone()
+                .map(|u| (u, RuntimePublicBaseUrlSource::EnvStore))
+        })
+        .or_else(|| {
+            configured_public_base_url
+                .clone()
+                .map(|u| (u, RuntimePublicBaseUrlSource::Configured))
+        })
+        .or_else(|| derived_local_url.map(|u| (u, RuntimePublicBaseUrlSource::Derived)));
+    let public_base_url = url_with_source.as_ref().map(|(u, _)| u.clone());
 
     // Auto-update webhooks if public URL changed
     let webhook_summary = if let Some(ref new_url) = public_base_url {
@@ -1242,28 +1091,9 @@ pub fn demo_up_services(
     // asset_serving_enabled: true if bundle declares static routes we're enabling
     let http_listener_enabled = ingress_server.is_some();
     let asset_serving_enabled = enable_static_routes;
-    let runtime_config = if let Some(url) = tunnel_public_base_url {
-        Some(RuntimeConfig {
-            public_base_url: Some(RuntimePublicBaseUrl {
-                value: url,
-                source: RuntimePublicBaseUrlSource::Tunnel,
-            }),
-        })
-    } else if let Some(url) = configured_public_base_url {
-        Some(RuntimeConfig {
-            public_base_url: Some(RuntimePublicBaseUrl {
-                value: url,
-                source: RuntimePublicBaseUrlSource::Configured,
-            }),
-        })
-    } else {
-        public_base_url.clone().map(|url| RuntimeConfig {
-            public_base_url: Some(RuntimePublicBaseUrl {
-                value: url,
-                source: RuntimePublicBaseUrlSource::Derived,
-            }),
-        })
-    };
+    let runtime_config = url_with_source.map(|(value, source)| RuntimeConfig {
+        public_base_url: Some(RuntimePublicBaseUrl { value, source }),
+    });
 
     let startup_contract = resolve_startup_contract(
         static_routes,
@@ -1473,10 +1303,7 @@ pub fn demo_up_services(
         operator_log::warn(module_path!(), format!("failed to open browser: {err}"));
     }
 
-    Ok(ForegroundRuntimeHandles {
-        ingress_server,
-        timer_scheduler,
-    })
+    Ok(ForegroundRuntimeHandles { ingress_server })
 }
 
 fn validate_messaging_app_route(
@@ -1627,6 +1454,9 @@ fn start_http_ingress_server(
         tenant: config.tenant.clone(),
         public_base_url,
         notifier_config,
+        // Legacy single-bundle boot path: no materialized runtime-config, so
+        // revision routing is inert here.
+        revision_routing: None,
     })?;
     operator_log::info(
         module_path!(),
@@ -1962,6 +1792,44 @@ fn nats_started_marker(paths: &RuntimePaths) -> PathBuf {
     paths.runtime_root().join("nats.started")
 }
 
+// Hardened distroless host images ship no shell or interpreters. A script
+// helper (one with a `#!` shebang) cannot exec if its interpreter is absent,
+// and the kernel reports the missing *interpreter* as a "No such file" error
+// against the script itself — opaque to operators. Preflight the shebang and
+// fail with the ELF-only contract spelled out. No-op for ELF helpers and on
+// hosts that do have the interpreter, so normal dev runs are unaffected.
+fn preflight_interpreter(binary: &Path) -> anyhow::Result<()> {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(binary) else {
+        return Ok(());
+    };
+    let mut magic = [0u8; 2];
+    if file.read(&mut magic).unwrap_or(0) < 2 || &magic != b"#!" {
+        return Ok(());
+    }
+    let mut rest = Vec::new();
+    let mut byte = [0u8; 1];
+    while rest.len() < 256 {
+        match file.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => rest.push(byte[0]),
+            Err(_) => return Ok(()),
+        }
+    }
+    let line = String::from_utf8_lossy(&rest);
+    let interpreter = line.split_whitespace().next().unwrap_or("");
+    if interpreter.is_empty() || Path::new(interpreter).exists() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "service helper {} needs interpreter `{interpreter}`, which is not present. \
+         The hardened distroless runtime image ships no shell or interpreters — supply a \
+         statically-linked ELF helper, or run a runtime variant that includes `{interpreter}`.",
+        binary.display()
+    )
+}
+
 fn build_service_spec(
     config_dir: &Path,
     service_id: &str,
@@ -1986,6 +1854,7 @@ fn build_service_spec(
             explicit_path: explicit,
         },
     )?;
+    preflight_interpreter(&path)?;
     let mut argv = vec![path.to_string_lossy().to_string()];
     argv.extend(args.iter().cloned());
     Ok(supervisor::ServiceSpec {
@@ -2130,10 +1999,10 @@ mod tests {
             dependencies: Vec::new(),
             capabilities: Vec::new(),
             secret_requirements: Vec::new(),
-            agents: std::collections::BTreeMap::new(),
             signatures: PackSignatures::default(),
             bootstrap: None,
             extensions: Some(extensions),
+            agents: Default::default(),
         };
         write_pack_with_manifest(&pack_path, manifest, &[])?;
 
@@ -2155,8 +2024,9 @@ mod tests {
 
         let store = DevStore::with_path(dir.path().join(".greentic/dev/.dev.secrets.env"))?;
         let runtime = tokio::runtime::Runtime::new()?;
+        let env = crate::secrets_setup::resolve_env(None);
         let uri = crate::secrets_gate::canonical_secret_uri(
-            "dev",
+            &env,
             "demo",
             None,
             "messaging-webchat-gui",
@@ -2276,6 +2146,21 @@ mod tests {
         )?;
         assert_eq!(absolute.argv[0], binary.display().to_string());
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_service_spec_rejects_script_with_missing_interpreter() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().expect("tempdir");
+        let helper = dir.path().join("runner.sh");
+        fs::write(&helper, "#!/nonexistent/xyz-interp\necho hi\n").expect("write helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let err = build_service_spec(dir.path(), "runner", "./runner.sh", &[], &BTreeMap::new())
+            .expect_err("missing interpreter must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("interpreter"), "got: {msg}");
+        assert!(msg.contains("distroless"), "got: {msg}");
     }
 
     #[test]
@@ -2459,7 +2344,6 @@ mod tests {
                 ..Default::default()
             },
             providers: None,
-            sql: None,
         };
         let static_routes = BundleStaticRoutesInspection::default();
         let restart = BTreeSet::new();
@@ -2468,6 +2352,7 @@ mod tests {
             &config_path,
             &config,
             &static_routes,
+            None,
             None,
             None,
             None,
@@ -2495,6 +2380,83 @@ mod tests {
         assert_eq!(endpoints["team"], "default");
         assert!(endpoints["public_base_url"].is_null());
         assert!(endpoints["nats_url"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn demo_up_services_derives_local_public_base_url_from_actual_ingress_port()
+    -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let bundle_root = dir.path().join("bundle");
+        let config_path = bundle_root.join("greentic-demo.yaml");
+        let log_dir = bundle_root.join("logs");
+        fs::create_dir_all(&bundle_root)?;
+        fs::create_dir_all(&log_dir)?;
+        fs::write(&config_path, "tenant: demo\nteam: default\n")?;
+        write_default_app_pack(&bundle_root.join("packs/default.gtpack"))?;
+        let static_pack_path = bundle_root.join("providers/messaging/messaging-webchat-gui.gtpack");
+        write_static_route_provider_pack(&static_pack_path)?;
+
+        let port_holder = bind_available_nonterminal_port()?;
+        let requested_port = port_holder.local_addr()?.port();
+        let static_routes = BundleStaticRoutesInspection {
+            pack_paths: vec![static_pack_path],
+        };
+        let mut config = DemoConfig {
+            tenant: "demo".to_string(),
+            team: "default".to_string(),
+            services: crate::config::DemoServicesConfig {
+                nats: crate::config::DemoNatsConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            providers: None,
+        };
+        config.services.gateway.listen_addr = "127.0.0.1".to_string();
+        config.services.gateway.port = requested_port;
+        let restart = BTreeSet::new();
+
+        let handles = demo_up_services(
+            &config_path,
+            &config,
+            &static_routes,
+            None,
+            None,
+            None,
+            None,
+            &restart,
+            None,
+            &log_dir,
+            false,
+            true,
+        )?;
+        let actual_port = handles
+            .ingress_server
+            .as_ref()
+            .expect("ingress server")
+            .actual_port;
+        assert_ne!(actual_port, requested_port);
+
+        let runtime_root =
+            RuntimePaths::new(bundle_root.join("state"), "demo", "default").runtime_root();
+        let expected_public_base_url = format!("http://127.0.0.1:{actual_port}");
+        let startup_contract: StartupContract =
+            serde_json::from_slice(&fs::read(runtime_root.join("startup_contract.json"))?)?;
+        assert_eq!(
+            startup_contract.public_base_url.as_deref(),
+            Some(expected_public_base_url.as_str())
+        );
+
+        let endpoints: serde_json::Value =
+            serde_json::from_slice(&fs::read(runtime_root.join("endpoints.json"))?)?;
+        assert_eq!(endpoints["public_base_url"], expected_public_base_url);
+        assert_eq!(endpoints["gateway_port"], actual_port);
+        assert_ne!(endpoints["gateway_port"], requested_port);
+
+        drop(port_holder);
+        handles.stop()?;
         Ok(())
     }
 
@@ -2591,6 +2553,7 @@ mod tests {
             },
         );
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::new("messaging-webchat-gui")?,
             name: Some("messaging-webchat-gui".to_string()),
@@ -2602,7 +2565,6 @@ mod tests {
             dependencies: Vec::new(),
             capabilities: Vec::new(),
             secret_requirements: Vec::new(),
-            agents: Default::default(),
             signatures: PackSignatures::default(),
             bootstrap: None,
             extensions: Some(extensions),
@@ -2623,6 +2585,7 @@ mod tests {
             metadata: Default::default(),
         };
         let manifest = PackManifest {
+            agents: Default::default(),
             schema_version: "pack-v1".to_string(),
             pack_id: PackId::new("demo-app")?,
             name: Some("demo-app".to_string()),
@@ -2640,7 +2603,6 @@ mod tests {
             dependencies: Vec::new(),
             capabilities: Vec::new(),
             secret_requirements: Vec::new(),
-            agents: Default::default(),
             signatures: PackSignatures::default(),
             bootstrap: None,
             extensions: None,

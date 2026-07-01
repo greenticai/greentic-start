@@ -80,7 +80,6 @@ mod tests {
             flows: vec![AppFlowInfo {
                 id: "default".into(),
                 kind: "messaging".into(),
-                subscribes_to: vec![],
             }],
             capabilities: caps.iter().map(|s| s.to_string()).collect(),
         }

@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::fs;
-use std::io::{ErrorKind, Read};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
+use backhand::{FilesystemReader, InnerNode};
 use flate2::read::GzDecoder;
 use greentic_distributor_client::{
     OciPackFetcher, PackFetchOptions, oci_packs::DefaultRegistryClient,
@@ -71,8 +73,44 @@ pub fn resolve_bundle_ref(reference: &str) -> anyhow::Result<ResolvedBundle> {
         );
     }
 
-    let fetched = fetch_remote_bundle(trimmed)?;
+    // Non-boot resolution: the extracted bytes are served directly with no
+    // downstream digest gate, so insecure transport is never allowed here.
+    let fetched = fetch_remote_bundle(trimmed, false)?;
     extract_bundle_archive(&fetched, trimmed)
+}
+
+/// Fetch a bundle reference to a local `.gtbundle` archive **file** (not an
+/// extracted directory).
+///
+/// [`resolve_bundle_ref`] extracts the archive and hands back a directory, but
+/// the M2 worker-boot path ([`crate::revision_pull`]) feeds the raw archive to
+/// the deployer's `materialize_revision_from_bundle`, which does its own
+/// copy + content-hash + unbundle and integrity-gates the staged digest against
+/// the revision's pinned `bundle_digest`. So this returns the raw file and does
+/// **no** digest check of its own: an `oci://…@sha256:…` resolved digest is the
+/// manifest digest, not the `.gtbundle` byte digest, so checking it here would
+/// false-negative — the deployer's content-hash gate is the authority.
+///
+/// A local directory reference is rejected: materialization needs an archive
+/// file, and the worker's `bundle_source_uri` is always a remote ref.
+pub fn fetch_bundle_to_file(reference: &str) -> anyhow::Result<PathBuf> {
+    let trimmed = reference.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("bundle reference cannot be empty");
+    }
+    if let Some(path) = parse_local_bundle_ref(trimmed) {
+        if path.is_dir() {
+            anyhow::bail!(
+                "bundle reference {trimmed} is a directory; a .gtbundle archive file is \
+                 required for worker materialization"
+            );
+        }
+        return Ok(path);
+    }
+    // Boot-pull: the deployer re-hashes the returned archive against the
+    // revision's pinned `bundle_digest`, so insecure-registry transport is
+    // safe here (a forged bundle fails the digest gate).
+    Ok(fetch_remote_bundle(trimmed, true)?.path)
 }
 
 pub fn parse_local_bundle_ref(reference: &str) -> Option<PathBuf> {
@@ -118,7 +156,7 @@ pub fn map_remote_bundle_ref(reference: &str) -> anyhow::Result<(String, BundleS
     );
 }
 
-fn fetch_remote_bundle(reference: &str) -> anyhow::Result<FetchedBundle> {
+fn fetch_remote_bundle(reference: &str, allow_insecure: bool) -> anyhow::Result<FetchedBundle> {
     let (mapped_ref, kind) = map_remote_bundle_ref(reference)?;
     if kind == BundleSourceKind::Http {
         return fetch_http_bundle(reference);
@@ -127,11 +165,24 @@ fn fetch_remote_bundle(reference: &str) -> anyhow::Result<FetchedBundle> {
         .enable_all()
         .build()
         .context("build tokio runtime for bundle resolution")?;
-    let fetcher: OciPackFetcher<DefaultRegistryClient> = OciPackFetcher::new(PackFetchOptions {
+    let opts = PackFetchOptions {
         allow_tags: true,
         offline: false,
         ..PackFetchOptions::default()
-    });
+    };
+    // Registries listed in GREENTIC_OCI_INSECURE_REGISTRIES are pulled over
+    // plain HTTP (for in-cluster / air-gapped registries that terminate HTTP);
+    // every other registry stays HTTPS. Honored only when `allow_insecure` is
+    // set — i.e. the digest-gated boot-pull. Unset/empty => HTTPS everywhere.
+    let insecure_registries = insecure_registries_for_fetch(allow_insecure);
+    let fetcher: OciPackFetcher<DefaultRegistryClient> = if insecure_registries.is_empty() {
+        OciPackFetcher::new(opts)
+    } else {
+        OciPackFetcher::with_client(
+            DefaultRegistryClient::with_insecure_registries(insecure_registries),
+            opts,
+        )
+    };
     let fetched = rt
         .block_on(fetcher.fetch_pack_to_cache(&mapped_ref))
         .with_context(|| format!("fetch bundle reference {reference}"))?;
@@ -142,6 +193,41 @@ fn fetch_remote_bundle(reference: &str) -> anyhow::Result<FetchedBundle> {
         path: fetched.path,
         kind,
     })
+}
+
+/// Read the `GREENTIC_OCI_INSECURE_REGISTRIES` allow-list. Unset or empty
+/// yields an empty list (HTTPS for every registry, the default).
+fn insecure_oci_registries_from_env() -> Vec<String> {
+    std::env::var("GREENTIC_OCI_INSECURE_REGISTRIES")
+        .ok()
+        .map(|raw| parse_insecure_registries(&raw))
+        .unwrap_or_default()
+}
+
+/// The insecure-registry allow-list is honored only for fetches that are
+/// followed by a byte-level integrity gate: the worker boot-pull, whose pulled
+/// `.gtbundle` is re-hashed against `revision.bundle_digest` by the deployer
+/// (`materialize_revision_from_bundle`, fail-closed). Non-boot resolution
+/// (`start --bundle`, doctor, `bundle_config`) extracts and serves the fetched
+/// bytes with no such gate — over plain HTTP a network attacker could forge an
+/// unverified bundle — so it never downgrades transport. When `allow_insecure`
+/// is false this returns empty (HTTPS everywhere) regardless of the env var.
+fn insecure_registries_for_fetch(allow_insecure: bool) -> Vec<String> {
+    if allow_insecure {
+        insecure_oci_registries_from_env()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Parse the comma-separated insecure-registry allow-list into `host[:port]`
+/// entries. Blank entries (and surrounding whitespace) are dropped.
+fn parse_insecure_registries(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn fetch_http_bundle(reference: &str) -> anyhow::Result<FetchedBundle> {
@@ -314,28 +400,59 @@ fn extract_zip(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
         fs::File::open(path).with_context(|| format!("open zip bundle {}", path.display()))?;
     let mut archive = zip::ZipArchive::new(file)
         .with_context(|| format!("read zip bundle {}", path.display()))?;
-    archive
-        .extract(out_dir)
-        .with_context(|| format!("extract zip bundle into {}", out_dir.display()))
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("create zip output dir {}", out_dir.display()))?;
+    let mut seen_paths: HashSet<String> = HashSet::new();
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .with_context(|| format!("read zip entry {index} in {}", path.display()))?;
+        let raw_name = entry.name().to_string();
+        let normalized = normalize_archive_inner_path(&raw_name)?;
+        if normalized.is_none() {
+            continue;
+        }
+        let normalized = normalized.unwrap();
+        if !seen_paths.insert(normalized.clone()) {
+            bail!("duplicate zip entry rejected: {normalized}");
+        }
+        let destination = safe_output_path(out_dir, &normalized)?;
+        if entry.is_dir() || raw_name.ends_with('/') {
+            safe_create_dir_all(out_dir, &destination)
+                .with_context(|| format!("create directory {}", destination.display()))?;
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            safe_create_dir_all(out_dir, parent)
+                .with_context(|| format!("create parent directory {}", parent.display()))?;
+        }
+        assert_no_existing_symlink(&destination)
+            .with_context(|| format!("validate destination for {normalized}"))?;
+        let executable = entry
+            .unix_mode()
+            .map(|mode| mode & 0o111 != 0)
+            .unwrap_or(false);
+        let mut target = File::create(&destination)
+            .with_context(|| format!("create file {}", destination.display()))?;
+        std::io::copy(&mut entry, &mut target)
+            .with_context(|| format!("extract zip entry {normalized}"))?;
+        mark_executable_if(&destination, executable)
+            .with_context(|| format!("set mode for {normalized}"))?;
+    }
+    Ok(())
 }
 
 fn extract_tar(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
     let file =
         fs::File::open(path).with_context(|| format!("open tar bundle {}", path.display()))?;
-    let mut archive = tar::Archive::new(file);
-    archive
-        .unpack(out_dir)
-        .with_context(|| format!("extract tar bundle into {}", out_dir.display()))
+    extract_tar_reader(tar::Archive::new(file), path, out_dir)
 }
 
 fn extract_tar_gz(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
     let file =
         fs::File::open(path).with_context(|| format!("open tar.gz bundle {}", path.display()))?;
     let decoder = GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
-    archive
-        .unpack(out_dir)
-        .with_context(|| format!("extract tar.gz bundle into {}", out_dir.display()))
+    extract_tar_reader(tar::Archive::new(decoder), path, out_dir)
 }
 
 fn extract_tar_zstd(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
@@ -343,40 +460,324 @@ fn extract_tar_zstd(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
         fs::File::open(path).with_context(|| format!("open tar.zst bundle {}", path.display()))?;
     let decoder = ZstdDecoder::new(file)
         .with_context(|| format!("decode tar.zst bundle {}", path.display()))?;
-    let mut archive = tar::Archive::new(decoder);
-    archive
-        .unpack(out_dir)
-        .with_context(|| format!("extract tar.zst bundle into {}", out_dir.display()))
+    extract_tar_reader(tar::Archive::new(decoder), path, out_dir)
 }
 
+fn extract_tar_reader<R: Read>(
+    mut archive: tar::Archive<R>,
+    source: &Path,
+    out_dir: &Path,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("create tar output dir {}", out_dir.display()))?;
+    let mut seen_paths: HashSet<String> = HashSet::new();
+    let entries = archive
+        .entries()
+        .with_context(|| format!("read tar entries in {}", source.display()))?;
+    for entry in entries {
+        let mut entry = entry.with_context(|| format!("read tar entry in {}", source.display()))?;
+        let entry_path = entry
+            .path()
+            .with_context(|| format!("read tar entry path in {}", source.display()))?
+            .into_owned();
+        let normalized = normalize_archive_inner_path(&entry_path.to_string_lossy())?;
+        let Some(normalized) = normalized else {
+            continue;
+        };
+        if !seen_paths.insert(normalized.clone()) {
+            bail!("duplicate tar entry rejected: {normalized}");
+        }
+        let destination = safe_output_path(out_dir, &normalized)?;
+        let header = entry.header();
+        let entry_type = header.entry_type();
+        // Capture the archived mode before the body mutably borrows `entry`.
+        let executable = header.mode().map(|mode| mode & 0o111 != 0).unwrap_or(false);
+        match entry_type {
+            tar::EntryType::Directory => {
+                safe_create_dir_all(out_dir, &destination)
+                    .with_context(|| format!("create directory {}", destination.display()))?;
+            }
+            tar::EntryType::Regular | tar::EntryType::Continuous => {
+                if let Some(parent) = destination.parent() {
+                    safe_create_dir_all(out_dir, parent)
+                        .with_context(|| format!("create parent directory {}", parent.display()))?;
+                }
+                assert_no_existing_symlink(&destination)
+                    .with_context(|| format!("validate destination for {normalized}"))?;
+                let mut target = File::create(&destination)
+                    .with_context(|| format!("create file {}", destination.display()))?;
+                std::io::copy(&mut entry, &mut target)
+                    .with_context(|| format!("extract tar entry {normalized}"))?;
+                mark_executable_if(&destination, executable)
+                    .with_context(|| format!("set mode for {normalized}"))?;
+            }
+            tar::EntryType::Symlink => {
+                let link = entry
+                    .link_name()
+                    .with_context(|| format!("read symlink target for {normalized}"))?
+                    .ok_or_else(|| anyhow!("symlink entry {normalized} missing target"))?;
+                if let Some(parent) = destination.parent() {
+                    safe_create_dir_all(out_dir, parent)
+                        .with_context(|| format!("create parent directory {}", parent.display()))?;
+                }
+                assert_no_existing_symlink(&destination)
+                    .with_context(|| format!("validate destination for {normalized}"))?;
+                assert_symlink_target_within_root(&normalized, link.as_ref())
+                    .with_context(|| format!("validate symlink target for {normalized}"))?;
+                create_symlink(link.as_ref(), &destination)
+                    .with_context(|| format!("extract symlink {normalized}"))?;
+            }
+            tar::EntryType::Link => {
+                // Hardlinks could land outside the extract root if the link
+                // target wasn't validated. Refuse them; bundles in this
+                // codebase do not produce hardlinks.
+                bail!("refusing to extract tar hardlink entry: {normalized}");
+            }
+            other => {
+                bail!(
+                    "unsupported tar entry type {:?} for {normalized}",
+                    other.as_byte() as char
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+// Phase 0 P0.4: replace the previous `unsquashfs` shell-out with an in-process
+// extractor built on `backhand`. The shell-out had no per-entry safety
+// control: if the host `unsquashfs` followed a symlink, an attacker could
+// land writes outside `out_dir`. The in-process loop applies the same
+// no-follow ancestor walk, symlink-target validation, and duplicate-path
+// rejection used by `greentic-bundle`'s reader.
 fn extract_squashfs(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
+    let file =
+        File::open(path).with_context(|| format!("open squashfs bundle {}", path.display()))?;
+    let filesystem = FilesystemReader::from_reader(BufReader::new(file))
+        .with_context(|| format!("read squashfs bundle {}", path.display()))?;
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create squashfs output dir {}", out_dir.display()))?;
-    let output = Command::new("unsquashfs")
-        .args([
-            "-no-progress",
-            "-quiet",
-            "-dest",
-            out_dir.to_str().unwrap_or_default(),
-            path.to_str().unwrap_or_default(),
-        ])
-        .output()
-        .map_err(|error| match error.kind() {
-            ErrorKind::NotFound => anyhow!(
-                "required tool `unsquashfs` was not found on PATH; install SquashFS tools to read `.gtbundle` artifacts"
-            ),
-            _ => anyhow::Error::new(error).context("spawn unsquashfs"),
-        })?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "unsquashfs failed while extracting {} into {}: {}",
-            path.display(),
-            out_dir.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    let mut seen_paths: HashSet<String> = HashSet::new();
+    for node in filesystem.files() {
+        let full = node.fullpath.to_string_lossy();
+        let Some(normalized) = normalize_archive_inner_path(full.as_ref())? else {
+            continue;
+        };
+        if !seen_paths.insert(normalized.clone()) {
+            bail!("duplicate squashfs entry rejected: {normalized}");
+        }
+        let destination = safe_output_path(out_dir, &normalized)?;
+        match &node.inner {
+            InnerNode::Dir(_) => {
+                safe_create_dir_all(out_dir, &destination)
+                    .with_context(|| format!("create directory {}", destination.display()))?;
+            }
+            InnerNode::File(file) => {
+                if let Some(parent) = destination.parent() {
+                    safe_create_dir_all(out_dir, parent)
+                        .with_context(|| format!("create parent directory {}", parent.display()))?;
+                }
+                assert_no_existing_symlink(&destination)
+                    .with_context(|| format!("validate destination for {normalized}"))?;
+                let mut source = filesystem.file(file).reader();
+                let mut target = File::create(&destination)
+                    .with_context(|| format!("create file {}", destination.display()))?;
+                std::io::copy(&mut source, &mut target)
+                    .with_context(|| format!("extract squashfs entry {normalized}"))?;
+                mark_executable_if(&destination, node.header.permissions & 0o111 != 0)
+                    .with_context(|| format!("set mode for {normalized}"))?;
+            }
+            InnerNode::Symlink(symlink) => {
+                if let Some(parent) = destination.parent() {
+                    safe_create_dir_all(out_dir, parent)
+                        .with_context(|| format!("create parent directory {}", parent.display()))?;
+                }
+                assert_no_existing_symlink(&destination)
+                    .with_context(|| format!("validate destination for {normalized}"))?;
+                assert_symlink_target_within_root(&normalized, &symlink.link)
+                    .with_context(|| format!("validate symlink target for {normalized}"))?;
+                create_symlink(&symlink.link, &destination)
+                    .with_context(|| format!("extract symlink {normalized}"))?;
+            }
+            InnerNode::CharacterDevice(_)
+            | InnerNode::BlockDevice(_)
+            | InnerNode::NamedPipe
+            | InnerNode::Socket => {
+                bail!("unsupported squashfs entry type for {normalized}");
+            }
+        }
     }
     normalize_extracted_permissions(out_dir)?;
     Ok(())
+}
+
+// Phase 0 P0.4 — shared safety helpers for archive extraction. These mirror
+// the hardened reader in greentic-bundle/src/bundle_fs/backhand_writer.rs;
+// inlined here per feedback_refactoring_scope.md (no new helper crate for a
+// hotfix). See plans/next-gen-deployment.md P0.4.
+
+fn normalize_archive_inner_path(raw: &str) -> anyhow::Result<Option<String>> {
+    let trimmed = raw.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for component in Path::new(trimmed).components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or_else(|| anyhow!("archive path must be valid UTF-8: {raw}"))?;
+                if part.is_empty() {
+                    bail!("archive path has empty component: {raw}");
+                }
+                parts.push(part.to_string());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                bail!("refusing archive path with parent dir component: {raw}");
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("refusing absolute archive path: {raw}");
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(parts.join("/")))
+}
+
+fn safe_output_path(out_dir: &Path, inner_path: &str) -> anyhow::Result<PathBuf> {
+    let mut out = out_dir.to_path_buf();
+    for component in Path::new(inner_path).components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("refusing to extract unsafe archive path: {inner_path}");
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn safe_create_dir_all(extract_root: &Path, target: &Path) -> anyhow::Result<()> {
+    if !target.starts_with(extract_root) {
+        bail!(
+            "refusing to descend outside extract root: {} not under {}",
+            target.display(),
+            extract_root.display()
+        );
+    }
+    let relative = target.strip_prefix(extract_root).map_err(|err| {
+        anyhow!(
+            "make {} relative to extract root {}: {err}",
+            target.display(),
+            extract_root.display()
+        )
+    })?;
+    let mut current = extract_root.to_path_buf();
+    for component in relative.components() {
+        let part = match component {
+            Component::Normal(part) => part,
+            Component::CurDir => continue,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!(
+                    "refusing to traverse unsafe component during mkdir: {}",
+                    target.display()
+                );
+            }
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    bail!(
+                        "refusing to descend through symlink at {}",
+                        current.display()
+                    );
+                }
+                if !meta.file_type().is_dir() {
+                    bail!(
+                        "refusing to descend through non-directory at {}",
+                        current.display()
+                    );
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)
+                    .with_context(|| format!("create directory {}", current.display()))?;
+            }
+            Err(err) => {
+                return Err(anyhow::Error::new(err)
+                    .context(format!("stat {} during safe mkdir", current.display())));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn assert_no_existing_symlink(destination: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(destination) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!(
+                "refusing to write through existing symlink at {}",
+                destination.display()
+            );
+        }
+        Ok(_) | Err(_) => Ok(()),
+    }
+}
+
+fn assert_symlink_target_within_root(
+    symlink_inner_path: &str,
+    target: &Path,
+) -> anyhow::Result<()> {
+    let parent_depth = Path::new(symlink_inner_path)
+        .parent()
+        .map(|parent| {
+            parent
+                .components()
+                .filter(|component| matches!(component, Component::Normal(_)))
+                .count()
+        })
+        .unwrap_or(0);
+    let mut depth: i64 = parent_depth as i64;
+    for component in target.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    bail!(
+                        "refusing symlink target {} from {}: escapes extract root",
+                        target.display(),
+                        symlink_inner_path
+                    );
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!(
+                    "refusing absolute symlink target {} from {}",
+                    target.display(),
+                    symlink_inner_path
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, destination: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, destination)
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, destination: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, destination)
 }
 
 #[cfg(unix)]
@@ -400,7 +801,14 @@ fn normalize_extracted_permissions(root: &Path) -> anyhow::Result<()> {
                 apply(&entry.path())?;
             }
         } else if file_type.is_file() {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+            // Preserve the executable bit so bundle helpers stay spawnable;
+            // collapse everything else to a readable, owner-independent mode.
+            let target_mode = if metadata.permissions().mode() & 0o111 != 0 {
+                0o755
+            } else {
+                0o644
+            };
+            fs::set_permissions(path, fs::Permissions::from_mode(target_mode))
                 .with_context(|| format!("chmod file {}", path.display()))?;
         }
         Ok(())
@@ -411,6 +819,25 @@ fn normalize_extracted_permissions(root: &Path) -> anyhow::Result<()> {
 
 #[cfg(not(unix))]
 fn normalize_extracted_permissions(_root: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+// `File::create` drops the archive's executable bit; restore it for entries
+// the archive marked executable so `bin/*` helpers stay spawnable. This is
+// the behavior `tar::Archive::unpack` gave before the hardened per-entry
+// extractors replaced it.
+#[cfg(unix)]
+fn mark_executable_if(dest: &Path, executable: bool) -> anyhow::Result<()> {
+    if executable {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dest, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("set executable mode on {}", dest.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn mark_executable_if(_dest: &Path, _executable: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -561,6 +988,46 @@ mod tests {
     }
 
     #[test]
+    fn insecure_registry_list_is_empty_for_blank_input() {
+        assert!(parse_insecure_registries("").is_empty());
+        assert!(parse_insecure_registries("   ").is_empty());
+        assert!(parse_insecure_registries(", ,").is_empty());
+    }
+
+    #[test]
+    fn insecure_registry_list_trims_and_drops_blanks() {
+        assert_eq!(
+            parse_insecure_registries(
+                " localhost:5000 , ,gtc-oci-registry.gtc-local.svc.cluster.local:5000"
+            ),
+            vec![
+                "localhost:5000".to_string(),
+                "gtc-oci-registry.gtc-local.svc.cluster.local:5000".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn insecure_registries_honored_only_for_digest_gated_boot_fetch() {
+        // Single owner of this env var across the test module, so mutating it
+        // here is not racy with other tests.
+        unsafe {
+            std::env::set_var("GREENTIC_OCI_INSECURE_REGISTRIES", "localhost:5000");
+        }
+        // Boot-pull (digest-gated downstream) honors the allow-list.
+        assert_eq!(
+            insecure_registries_for_fetch(true),
+            vec!["localhost:5000".to_string()]
+        );
+        // Non-boot resolution has no integrity gate, so transport never
+        // downgrades even when the env var is set.
+        assert!(insecure_registries_for_fetch(false).is_empty());
+        unsafe {
+            std::env::remove_var("GREENTIC_OCI_INSECURE_REGISTRIES");
+        }
+    }
+
+    #[test]
     fn remote_repo_and_store_refs_require_mapping() {
         unsafe {
             std::env::set_var("GREENTIC_REPO_REGISTRY_BASE", "ghcr.io/acme/repo");
@@ -670,6 +1137,28 @@ mod tests {
     fn empty_and_unsupported_bundle_references_error() {
         assert!(resolve_bundle_ref("   ").is_err());
         assert!(map_remote_bundle_ref("ftp://example.com/demo").is_err());
+    }
+
+    #[test]
+    fn fetch_bundle_to_file_returns_local_archive_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = dir.path().join("demo.gtbundle");
+        fs::write(&bundle, b"PK\x03\x04local-bytes").expect("write bundle");
+        let resolved = fetch_bundle_to_file(bundle.to_string_lossy().as_ref()).expect("fetch");
+        assert_eq!(resolved, bundle);
+    }
+
+    #[test]
+    fn fetch_bundle_to_file_rejects_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = fetch_bundle_to_file(dir.path().to_string_lossy().as_ref())
+            .expect_err("a directory is not a bundle archive");
+        assert!(format!("{err:#}").contains("directory"));
+    }
+
+    #[test]
+    fn fetch_bundle_to_file_rejects_empty_reference() {
+        assert!(fetch_bundle_to_file("   ").is_err());
     }
 
     #[test]
@@ -841,5 +1330,240 @@ mod tests {
         );
         let _ = fs::remove_file(marker);
         let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    // Phase 0 P0.4 — extraction-path hardening regression tests.
+
+    #[test]
+    fn extract_zip_rejects_parent_dir_entry() {
+        let dir = tempdir().expect("tempdir");
+        let zip_path = dir.path().join("evil.zip");
+        {
+            let file = fs::File::create(&zip_path).expect("zip");
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("../escape.txt", FileOptions::<()>::default())
+                .expect("start");
+            zip.write_all(b"pwned").expect("write");
+            zip.finish().expect("finish");
+        }
+        let out = dir.path().join("out");
+        let err = extract_zip(&zip_path, &out).expect_err("must reject parent-dir");
+        assert!(format!("{err:#}").contains("parent dir"));
+        assert!(!dir.path().join("escape.txt").exists());
+    }
+
+    // Note: the `zip` crate 8.x writer rejects duplicate filenames at write
+    // time, so we can't construct a duplicate-zip fixture via that API. The
+    // reader-side `seen_paths` check is still present for defense-in-depth
+    // against malformed bytes; we exercise the same code path via tar below.
+
+    #[test]
+    fn extract_tar_rejects_duplicate_entries() {
+        let dir = tempdir().expect("tempdir");
+        let tar_path = dir.path().join("dup.tar");
+        {
+            let file = fs::File::create(&tar_path).expect("tar");
+            let mut tar = TarBuilder::new(file);
+            let mut header = tar::Header::new_gnu();
+            let bytes = b"benign";
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, "a/b.txt", &bytes[..])
+                .expect("append benign");
+            let mut header2 = tar::Header::new_gnu();
+            let overwrite = b"overwrite";
+            header2.set_size(overwrite.len() as u64);
+            header2.set_mode(0o644);
+            header2.set_cksum();
+            tar.append_data(&mut header2, "a/b.txt", &overwrite[..])
+                .expect("append overwrite");
+            tar.finish().expect("finish");
+        }
+        let out = dir.path().join("out");
+        let err = extract_tar(&tar_path, &out).expect_err("must reject duplicate");
+        assert!(format!("{err:#}").contains("duplicate tar entry"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_tar_preserves_executable_bit_for_helpers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().expect("tempdir");
+        let tar_path = dir.path().join("helpers.tar");
+        {
+            let file = fs::File::create(&tar_path).expect("tar");
+            let mut tar = TarBuilder::new(file);
+            let exe = b"#!/bin/sh\necho hi\n";
+            let mut h = tar::Header::new_gnu();
+            h.set_size(exe.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            tar.append_data(&mut h, "bin/helper", &exe[..])
+                .expect("append exe");
+            let data = b"data";
+            let mut h2 = tar::Header::new_gnu();
+            h2.set_size(data.len() as u64);
+            h2.set_mode(0o644);
+            h2.set_cksum();
+            tar.append_data(&mut h2, "data/value.txt", &data[..])
+                .expect("append data");
+            tar.finish().expect("finish");
+        }
+        let out = dir.path().join("out");
+        extract_tar(&tar_path, &out).expect("extract");
+        let helper_mode = fs::metadata(out.join("bin/helper"))
+            .expect("meta helper")
+            .permissions()
+            .mode();
+        assert!(
+            helper_mode & 0o111 != 0,
+            "helper must stay executable, got {helper_mode:o}"
+        );
+        let data_mode = fs::metadata(out.join("data/value.txt"))
+            .expect("meta data")
+            .permissions()
+            .mode();
+        assert_eq!(
+            data_mode & 0o111,
+            0,
+            "data file must not be executable, got {data_mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_zip_preserves_executable_bit_for_helpers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().expect("tempdir");
+        let zip_path = dir.path().join("helpers.zip");
+        {
+            let file = fs::File::create(&zip_path).expect("zip");
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file(
+                "bin/helper",
+                FileOptions::<()>::default().unix_permissions(0o755),
+            )
+            .expect("start exe");
+            zip.write_all(b"#!/bin/sh\necho hi\n").expect("write exe");
+            zip.start_file(
+                "data/value.txt",
+                FileOptions::<()>::default().unix_permissions(0o644),
+            )
+            .expect("start data");
+            zip.write_all(b"data").expect("write data");
+            zip.finish().expect("finish");
+        }
+        let out = dir.path().join("out");
+        extract_zip(&zip_path, &out).expect("extract");
+        let helper_mode = fs::metadata(out.join("bin/helper"))
+            .expect("meta helper")
+            .permissions()
+            .mode();
+        assert!(
+            helper_mode & 0o111 != 0,
+            "helper must stay executable, got {helper_mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_tar_rejects_escaping_symlink_target() {
+        let dir = tempdir().expect("tempdir");
+        let tar_path = dir.path().join("evil.tar");
+        {
+            let file = fs::File::create(&tar_path).expect("tar");
+            let mut tar = TarBuilder::new(file);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            // Symlink at depth 0 with target `../../outside` — depth -1, escape.
+            header
+                .set_link_name("../../outside")
+                .expect("set link name");
+            header.set_cksum();
+            tar.append_data(&mut header, "evil-link", std::io::empty())
+                .expect("append symlink");
+            tar.finish().expect("finish tar");
+        }
+        let out = dir.path().join("out");
+        let err = extract_tar(&tar_path, &out).expect_err("must reject escaping symlink");
+        assert!(format!("{err:#}").contains("escapes extract root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_tar_rejects_absolute_symlink_target() {
+        let dir = tempdir().expect("tempdir");
+        let tar_path = dir.path().join("absolute.tar");
+        {
+            let file = fs::File::create(&tar_path).expect("tar");
+            let mut tar = TarBuilder::new(file);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_link_name("/etc/passwd").expect("set link name");
+            header.set_cksum();
+            tar.append_data(&mut header, "absolute-link", std::io::empty())
+                .expect("append symlink");
+            tar.finish().expect("finish tar");
+        }
+        let out = dir.path().join("out");
+        let err = extract_tar(&tar_path, &out).expect_err("must reject absolute symlink target");
+        assert!(format!("{err:#}").contains("absolute symlink target"));
+    }
+
+    #[test]
+    fn extract_tar_rejects_hardlink_entries() {
+        let dir = tempdir().expect("tempdir");
+        let tar_path = dir.path().join("hardlink.tar");
+        {
+            let file = fs::File::create(&tar_path).expect("tar");
+            let mut tar = TarBuilder::new(file);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Link);
+            header.set_size(0);
+            header.set_mode(0o644);
+            header
+                .set_link_name("../outside-target")
+                .expect("set link name");
+            header.set_cksum();
+            tar.append_data(&mut header, "hardlink", std::io::empty())
+                .expect("append");
+            tar.finish().expect("finish");
+        }
+        let out = dir.path().join("out");
+        let err = extract_tar(&tar_path, &out).expect_err("must refuse hardlink");
+        assert!(format!("{err:#}").contains("hardlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_create_dir_all_rejects_symlink_ancestor() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        fs::create_dir(&root).expect("root");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, root.join("escape")).expect("symlink");
+        let err = safe_create_dir_all(&root, &root.join("escape/inner"))
+            .expect_err("must reject symlink ancestor");
+        assert!(format!("{err:#}").contains("descend through symlink"));
+        assert!(!outside.join("inner").exists());
+    }
+
+    #[test]
+    fn symlink_target_within_root_accepts_sibling() {
+        assert_symlink_target_within_root("packs/a/link", Path::new("../b/file"))
+            .expect("sibling resolves under root");
+    }
+
+    #[test]
+    fn symlink_target_within_root_rejects_escape() {
+        let err = assert_symlink_target_within_root("packs/link", Path::new("../../etc"))
+            .expect_err("must reject escape");
+        assert!(format!("{err:#}").contains("escapes extract root"));
     }
 }

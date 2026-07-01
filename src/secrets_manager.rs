@@ -338,12 +338,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let base = dir.path().join(DEFAULT_SECRETS_DIR);
         fs::create_dir_all(&base).unwrap();
-        write_backend_pack(&base.join("bad.gtpack"), "vault");
+        // `vault` is now a supported backend (Phase E), so use a genuinely
+        // unknown backend to exercise the rejection. `select_secrets_manager`
+        // validates the backend while scanning packs (find_best_pack →
+        // backend_kind_from_pack), so an unknown backend errors at selection.
+        write_backend_pack(&base.join("bad.gtpack"), "bogus");
 
         let err = select_secrets_manager(dir.path(), "tenant", "team").unwrap_err();
 
         let message = format!("{err:#}");
-        assert!(message.contains("unsupported secrets backend 'vault'"));
+        assert!(message.contains("unsupported secrets backend 'bogus'"));
     }
 
     fn write_backend_pack(path: &Path, backend: &str) {
