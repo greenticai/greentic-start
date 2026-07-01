@@ -2,7 +2,7 @@ bench = [{ name = "perf", harness = false }]
 
 [package]
 name = "greentic-start"
-version = "1.1.1-dev.0"
+version = "1.1.2-dev.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -100,7 +100,7 @@ version = ">=0.1.27745539530, <0.2"
 # `cli::bundle_stage::materialize_revision_from_bundle` to stage a worker's
 # pulled bundle at boot; earlier publishes lack that function.
 [dependencies.greentic-deployer]
-version = ">=1.1.0-dev.27745539530, <1.2.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 default-features = false
 
 # Lower bound pinned to the first dev build exposing the `signing` module
@@ -111,7 +111,7 @@ default-features = false
 # GREENTIC_OCI_INSECURE_REGISTRIES is set so listed registries are pulled over
 # plain HTTP; earlier publishes lack that constructor.
 [dependencies.greentic-distributor-client]
-version = ">=1.1.0-dev.27832309681, <1.2.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 default-features = false
 features = ["pack-fetch"]
 
@@ -128,7 +128,7 @@ version = ">=1.1.0-dev, <1.2.0-0"
 # with "component '…' not found in pack". This floor supersedes (and still
 # satisfies) the C5 `runtime_refs` floor (#424).
 [dependencies.greentic-runner-host]
-version = ">=1.1.0-dev.27823510319, <1.2.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [dependencies.greentic-secrets-lib]
 # `providers-vault` brings in the HashiCorp Vault KV backend used for runtime
@@ -136,7 +136,7 @@ version = ">=1.1.0-dev.27823510319, <1.2.0-0"
 # token exchange it relies on landed in greentic-secrets#94, first published in
 # 1.1.0-dev.28218485692 (the floor below) — older publishes resolve a vault
 # provider that only supports a static VAULT_TOKEN, not the pod-identity login.
-version = ">=1.1.0-dev.28218485692, <1.2.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 features = ["providers-dev", "providers-vault"]
 
 # Lower bound pinned to the publish that updates the bootstrap call site for
@@ -144,13 +144,13 @@ features = ["providers-dev", "providers-vault"]
 # Earlier publishes have the 1-arg call against the new deployer floor and
 # would fail to compile in the resolved graph.
 [dependencies.greentic-setup]
-version = ">=1.1.0-dev.27093775683, <1.2.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [dependencies.greentic-telemetry]
 # Floor pinned to the first dev publish that exposes `RolloutEvent` +
 # `emit_rollout_event` (C5.1); lower versions in the same range satisfy
 # `>=1.1.0-dev` but lack the rollout module.
-version = ">=1.1.0-dev.26432434860, <1.2.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [dependencies.greentic-types]
 version = ">=1.1.0-dev, <1.2.0-0"
