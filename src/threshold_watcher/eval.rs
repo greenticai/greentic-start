@@ -6,11 +6,6 @@
 //! exhaustively unit tested without a runtime, HTTP client, or durable
 //! state.
 
-// These enums and functions are the pure evaluation core; the config
-// loader, durable state, and poll loop that consume them land in later
-// tasks of this module. Until then they are unreferenced from the crate.
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 /// How a sampled value is compared against the configured threshold.

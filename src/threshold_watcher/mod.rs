@@ -3,14 +3,16 @@
 //!
 //! This module mirrors the shape of `crate::timer_scheduler` (background
 //! poll loop, `route_events` delivery, discover -> start -> stop wiring on
-//! `runtime.rs`). Task 1 lands only the pure evaluation logic (`eval`);
-//! config, durable state, HTTP fetch, and the loop + wiring land in later
-//! tasks.
-// Items are wired up incrementally across the slice's tasks; the loop + the
-// `runtime.rs` registration (final task) consume everything. Remove once wired.
-#![allow(dead_code)]
+//! `crate::runtime`). [`eval`] holds the pure evaluation logic (`side`,
+//! `crossing`), [`config`] the bundle-declared watch list, [`state`] the
+//! durable per-watch edge state, [`fetch`] the metric HTTP fetch, and
+//! [`watcher`] the poll loop + `ThresholdWatcher` handle that ties them all
+//! together and is wired into `crate::runtime`.
 
 pub mod config;
 pub mod eval;
 pub mod fetch;
 pub mod state;
+pub mod watcher;
+
+pub use watcher::{ThresholdWatcher, ThresholdWatcherConfig};

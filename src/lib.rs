@@ -77,7 +77,11 @@ mod static_routes;
 mod subscription_updater;
 mod subscriptions_universal;
 pub mod supervisor;
-mod threshold_watcher;
+// `pub` (doc-hidden) so `tests/threshold_watcher.rs` can drive `poll_once`
+// and the config/state/eval types directly, the same way `ws_test_support`
+// and `perf_harness` are exposed for their own integration tests.
+#[doc(hidden)]
+pub mod threshold_watcher;
 mod timer_scheduler;
 pub(crate) mod topic_match;
 mod tunnel_prompt;

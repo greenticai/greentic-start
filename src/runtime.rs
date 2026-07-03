@@ -22,6 +22,8 @@ use crate::startup_contract::{
     StartupContract, StartupContractInput,
 };
 use crate::supervisor;
+use crate::threshold_watcher::config::load_watches;
+use crate::threshold_watcher::{ThresholdWatcher, ThresholdWatcherConfig};
 use crate::timer_scheduler::{TimerScheduler, TimerSchedulerConfig, discover_timer_handlers};
 use anyhow::Context;
 
@@ -38,6 +40,7 @@ use crate::subscriptions_universal::{
 pub struct ForegroundRuntimeHandles {
     pub ingress_server: Option<HttpIngressServer>,
     pub timer_scheduler: Option<TimerScheduler>,
+    pub threshold_watcher: Option<ThresholdWatcher>,
 }
 
 impl ForegroundRuntimeHandles {
@@ -47,6 +50,9 @@ impl ForegroundRuntimeHandles {
         }
         if let Some(scheduler) = self.timer_scheduler.take() {
             scheduler.stop()?;
+        }
+        if let Some(watcher) = self.threshold_watcher.take() {
+            watcher.stop();
         }
         Ok(())
     }
@@ -891,6 +897,29 @@ pub fn demo_up_services(
         }
     };
 
+    // ── Threshold watcher (optional) ────────────────────────────────────────
+    // Bundles may declare `threshold-watchers.yaml` at the bundle root to
+    // poll a metric endpoint and fire a flow on a threshold crossing. If no
+    // watches are declared (the common case) the watcher is not started,
+    // leaving the default startup path unaffected — mirrors the timer
+    // scheduler's discover -> start -> store -> stop wiring above.
+    let watches = load_watches(config_dir);
+    let threshold_watcher = if watches.is_empty() {
+        None
+    } else {
+        Some(ThresholdWatcher::start(ThresholdWatcherConfig {
+            bundle_root: config_dir.to_path_buf(),
+            state_dir: state_dir.clone(),
+            tenant: tenant.to_string(),
+            team: if team.is_empty() {
+                None
+            } else {
+                Some(team.to_string())
+            },
+            watches,
+        }))
+    };
+
     // ── SQL gateway (optional) ─────────────────────────────────────────────
     // When `demo_config.sql` is set, resolve secrets and spawn a dedicated
     // localhost axum server serving `/sql/<conn>/schema` + `/sql/<conn>/query`.
@@ -1476,6 +1505,7 @@ pub fn demo_up_services(
     Ok(ForegroundRuntimeHandles {
         ingress_server,
         timer_scheduler,
+        threshold_watcher,
     })
 }
 
