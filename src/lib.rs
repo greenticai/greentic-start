@@ -77,6 +77,7 @@ mod static_routes;
 mod subscription_updater;
 mod subscriptions_universal;
 pub mod supervisor;
+mod threshold_watcher;
 mod timer_scheduler;
 pub(crate) mod topic_match;
 mod tunnel_prompt;
