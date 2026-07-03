@@ -10,4 +10,5 @@
 // `runtime.rs` registration (final task) consume everything. Remove once wired.
 #![allow(dead_code)]
 
+pub mod config;
 pub mod eval;
