@@ -35,6 +35,9 @@ pub struct ThresholdWatchConfig {
     pub threshold: f64,
     pub direction: EdgeDirection,
     pub interval_seconds: u64,
+    /// The emitted event's `event_type`. This is the user contract: a flow fires
+    /// on a crossing iff its pack-manifest `subscribes_to` matches this string
+    /// (exact or glob, e.g. `metric.inventory_low.crossed` / `metric.*`).
     pub topic: String,
 }
 
@@ -48,14 +51,23 @@ impl ThresholdWatchConfig {
     /// Validate the watch's static configuration.
     ///
     /// Checks: `name`/`tenant`/`source.url`/`source.json_path`/`topic` are
-    /// non-empty, `interval_seconds >= 1`, and `threshold` is finite (not
-    /// NaN/infinite).
+    /// non-empty, `name`/`tenant` are free of path separators/traversal (they
+    /// compose the state-file path), `interval_seconds >= 1`, and `threshold`
+    /// is finite (not NaN/infinite).
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
             return Err("name must not be empty".to_string());
         }
         if self.tenant.trim().is_empty() {
             return Err("tenant must not be empty".to_string());
+        }
+        // `tenant` and `name` compose the durable state path
+        // (`{state_dir}/threshold/{tenant}/{name}.json`); reject path separators
+        // and traversal so a watch cannot escape the state directory.
+        for (field, value) in [("name", &self.name), ("tenant", &self.tenant)] {
+            if value.contains('/') || value.contains('\\') || value.contains("..") {
+                return Err(format!("{field} must not contain '/', '\\', or '..'"));
+            }
         }
         if self.source.url.trim().is_empty() {
             return Err("source.url must not be empty".to_string());
@@ -262,6 +274,18 @@ mod tests {
         let mut watch = base_watch();
         watch.threshold = f64::INFINITY;
         assert!(watch.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_path_traversal_in_name_or_tenant() {
+        for bad in ["../etc", "a/b", "a\\b", ".."] {
+            let mut watch = base_watch();
+            watch.name = bad.to_string();
+            assert!(watch.validate().is_err(), "name {bad:?} must be rejected");
+            let mut watch = base_watch();
+            watch.tenant = bad.to_string();
+            assert!(watch.validate().is_err(), "tenant {bad:?} must be rejected");
+        }
     }
 
     #[test]
