@@ -67,7 +67,7 @@ if [[ ! -f "$BIN_ARCHIVE_PATH" ]]; then
   exit 1
 fi
 
-PKG_BASENAME="${BIN_NAME}-${VERSION}-${TARGET}"
+PKG_BASENAME="${BIN_NAME}-v${VERSION}-${TARGET}"
 STAGE_DIR="$(mktemp -d)"
 cp "$BIN_ARCHIVE_PATH" "$STAGE_DIR/"
 
@@ -88,7 +88,7 @@ if [[ "$TARGET" == *windows* ]]; then
     fi
   )
 else
-  ARCHIVE="$OUT_DIR/$PKG_BASENAME.tar.gz"
+  ARCHIVE="$OUT_DIR/$PKG_BASENAME.tgz"
   (
     cd "$STAGE_DIR"
     tar -czf "$ARCHIVE" "$(basename "$BIN_ARCHIVE_PATH")"
