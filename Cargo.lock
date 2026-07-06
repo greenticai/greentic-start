@@ -2844,6 +2844,7 @@ dependencies = [
  "greentic-setup",
  "greentic-telemetry",
  "greentic-types",
+ "greentic-update",
  "hmac 0.13.0",
  "http-body-util",
  "hyper",

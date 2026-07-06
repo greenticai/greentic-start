@@ -64,8 +64,9 @@ use greentic_deploy_spec::{
 };
 use greentic_deployer::cli::updates::{self, UpdatesGetPayload};
 use greentic_deployer::cli::{OpError, OpFlags};
-use greentic_deployer::environment::LocalFsStore;
+use greentic_deployer::environment::{LocalFsStore, load_trust_root};
 use greentic_types::EnvId;
+use greentic_update::plan::verify_update_plan;
 
 use crate::deployment_routes::RevisionIngressRouting;
 use crate::endpoint_resolver;
@@ -826,14 +827,24 @@ async fn serve(
     // signature verification against the env trust root (inside `updates::get`)
     // plus the per-env update-channel `enabled` gate (deny-by-default) — the same
     // posture as signature-verified provider webhooks, not caller-asserted trust.
+    // Only reserve this path on envs that actually have an update channel
+    // configured (an `update-channel.json` sidecar). On every other env the
+    // request falls through to normal deployment routing, so adding this platform
+    // path never shadows an existing app route (e.g. a broad `/`-prefix binding)
+    // on an env that never opted into the updater.
     if path == "/v1/updates/notify" {
-        if method != hyper::Method::POST {
-            return Err(error_response(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "update notify requires POST",
-            ));
+        let intercept = LocalFsStore::default_root().is_some_and(|root| {
+            update_channel_present(&root, state.current().routing.dispatcher.env_id())
+        });
+        if intercept {
+            if method != hyper::Method::POST {
+                return Err(error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "update notify requires POST",
+                ));
+            }
+            return handle_update_notify(req, Arc::clone(&state)).await;
         }
-        return handle_update_notify(req, Arc::clone(&state)).await;
     }
 
     // Snapshot the activation ONCE per request so dispatch and execute see a
@@ -1357,6 +1368,51 @@ fn notify_action(cfg: &UpdateChannelConfig) -> NotifyAction {
     }
 }
 
+/// Whether `env_id` has an update channel configured — i.e. an
+/// `update-channel.json` sidecar exists under its env dir. Only such envs
+/// reserve `/v1/updates/notify`; every other env lets the path fall through to
+/// normal deployment routing (see the route gate in [`serve`]).
+fn update_channel_present(store_root: &std::path::Path, env_id: &str) -> bool {
+    match crate::runtime_config::env_dir_in(store_root, env_id) {
+        Ok(env_dir) => env_dir.join("update-channel.json").exists(),
+        Err(_) => false,
+    }
+}
+
+/// Verify a posted plan the way the stage path does — trusted-key DSSE signature
+/// plus target-env match — but WITHOUT staging it. Used by the record-only path
+/// so an enabled record-only channel records a *verified* notification. Reuses
+/// the shared [`verify_update_plan`] primitive (verification is not forked); a
+/// missing/empty trust root fails closed. Failures surface as the same
+/// [`OpError`] categories `map_op_error` maps for the stage path — verification
+/// or trust-root problems → 409, target-env mismatch → 400.
+fn verify_signed_plan(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    plan: &[u8],
+    sig: &[u8],
+) -> Result<(), NotifyError> {
+    let env_dir = crate::runtime_config::env_dir_in(store.root(), env_id.as_str())
+        .map_err(|err| NotifyError::Internal(format!("resolve env dir: {err}")))?;
+    let trust = load_trust_root(&env_dir).map_err(|err| {
+        NotifyError::Op(OpError::Conflict(format!(
+            "record-only verify: trust root unavailable: {err}"
+        )))
+    })?;
+    let verified = verify_update_plan(plan, sig, &trust).map_err(|err| {
+        NotifyError::Op(OpError::Conflict(format!(
+            "record-only verify: plan verification failed: {err}"
+        )))
+    })?;
+    if verified.plan.env_id.as_str() != env_id.as_str() {
+        return Err(NotifyError::Op(OpError::InvalidArgument(format!(
+            "record-only verify: plan targets env `{}`, not this environment",
+            verified.plan.env_id
+        ))));
+    }
+    Ok(())
+}
+
 /// Core of the receiver: load the env's update-channel policy and act on a
 /// notification — ignore (disabled), record (log only), or stage
 /// (download + DSSE-verify + stage the plan via the deployer `updates::get`).
@@ -1391,9 +1447,16 @@ fn run_update_notify(
             ))
         }
         NotifyAction::Record => {
+            // Record-only still VERIFIES the plan (trusted-key DSSE signature +
+            // target env) before recording: `on_notify` is the action on a
+            // *verified* notification, and the endpoint is not loopback-gated, so
+            // recording an unverified plan would let any caller forge the signal.
+            // Verify without staging — the Stage arm below verifies via
+            // `updates::get`.
+            verify_signed_plan(store, &env_typed, plan, sig)?;
             operator_log::info(
                 module_path!(),
-                format!("update-notify: plan available for env `{env_id}` (record-only)"),
+                format!("update-notify: verified plan available for env `{env_id}` (record-only)"),
             );
             Ok((
                 StatusCode::ACCEPTED,
@@ -1459,7 +1522,7 @@ fn map_op_error(err: &OpError) -> Response<Full<Bytes>> {
     };
     operator_log::warn(
         module_path!(),
-        format!("update-notify: staging rejected ({status}): {err}"),
+        format!("update-notify: rejected ({status}): {err}"),
     );
     let message = match status {
         StatusCode::CONFLICT => {
@@ -5281,10 +5344,11 @@ mod update_notify_tests {
     }
 
     #[test]
-    fn record_only_channel_does_not_stage() {
-        // Enabled + record-only resolves to `Record`, so `run_update_notify`
-        // returns 202 WITHOUT ever calling `updates::get` — the garbage plan/sig
-        // below would error if it reached staging.
+    fn record_only_rejects_unverified_plan() {
+        // Enabled + record-only still VERIFIES before recording. The env has no
+        // trust root and the bytes carry no valid DSSE signature, so verification
+        // fails closed and the request is REJECTED (409) — never `202 recorded`.
+        // (An unverified record would let any caller forge the notification.)
         let root = tempfile::TempDir::new().expect("tempdir");
         std::fs::create_dir_all(root.path().join("local")).expect("env dir");
         let mut cfg = UpdateChannelConfig::disabled(env("local"));
@@ -5297,9 +5361,27 @@ mod update_notify_tests {
         .expect("write channel");
         let store = LocalFsStore::new(root.path().to_path_buf());
 
-        let (status, body) =
-            run_update_notify(&store, "local", b"not-a-plan", b"not-a-sig").expect("record is Ok");
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(body["status"], "recorded");
+        match run_update_notify(&store, "local", b"not-a-plan", b"not-a-sig") {
+            Err(NotifyError::Op(op)) => {
+                assert_eq!(map_op_error(&op).status(), StatusCode::CONFLICT);
+            }
+            other => panic!("expected verification rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_channel_present_reflects_the_sidecar() {
+        // The route only reserves `/v1/updates/notify` on envs that have run
+        // `op updates config-set` (an `update-channel.json` sidecar); every other
+        // env falls through to deployment routing.
+        let root = tempfile::TempDir::new().expect("tempdir");
+        assert!(!update_channel_present(root.path(), "local"));
+
+        std::fs::create_dir_all(root.path().join("local")).expect("env dir");
+        std::fs::write(root.path().join("local").join("update-channel.json"), b"{}")
+            .expect("write sidecar");
+        assert!(update_channel_present(root.path(), "local"));
+        // A different env is unaffected.
+        assert!(!update_channel_present(root.path(), "other"));
     }
 }
