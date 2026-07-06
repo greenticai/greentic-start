@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::business_event_listener::{BusinessEventListener, BusinessEventListenerConfig};
 use crate::domains::Domain;
 use crate::http_ingress::{HttpIngressConfig, HttpIngressServer};
 use crate::operator_log;
@@ -41,6 +42,7 @@ pub struct ForegroundRuntimeHandles {
     pub ingress_server: Option<HttpIngressServer>,
     pub timer_scheduler: Option<TimerScheduler>,
     pub threshold_watcher: Option<ThresholdWatcher>,
+    pub business_event_listener: Option<BusinessEventListener>,
 }
 
 impl ForegroundRuntimeHandles {
@@ -53,6 +55,9 @@ impl ForegroundRuntimeHandles {
         }
         if let Some(watcher) = self.threshold_watcher.take() {
             watcher.stop();
+        }
+        if let Some(listener) = self.business_event_listener.take() {
+            listener.stop();
         }
         Ok(())
     }
@@ -920,6 +925,47 @@ pub fn demo_up_services(
         }))
     };
 
+    // ── Business event listener (optional) ──────────────────────────────────
+    // When `GREENTIC_EVENTS_NATS_URL` is set, subscribe to the SoRX
+    // business-event bus (NATS `greentic.events.>`) and route matching
+    // events to flows via `event_router::route_events` — the same gate
+    // `greentic-runner` uses for `NatsDispatcher`. Off by default: no env
+    // var means the listener is never started, leaving the default startup
+    // path unaffected. A connect failure warns and leaves the listener
+    // absent rather than failing boot (mirrors the runner's
+    // `GREENTIC_EVENTS_NATS_URL` connect-failure handling in
+    // `greentic-runner-host/src/runtime.rs`).
+    let business_event_listener = match std::env::var("GREENTIC_EVENTS_NATS_URL") {
+        Ok(nats_url) if !nats_url.is_empty() => {
+            let connect_future = async_nats::connect(nats_url.clone());
+            let connect_result = match tokio::runtime::Handle::try_current() {
+                Ok(handle) => tokio::task::block_in_place(|| handle.block_on(connect_future)),
+                Err(_) => tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to build temporary tokio runtime for business event listener")?
+                    .block_on(connect_future),
+            };
+            match connect_result {
+                Ok(client) => Some(BusinessEventListener::start(BusinessEventListenerConfig {
+                    client,
+                    bundle_root: config_dir.to_path_buf(),
+                })),
+                Err(err) => {
+                    operator_log::warn(
+                        module_path!(),
+                        format!(
+                            "GREENTIC_EVENTS_NATS_URL set but NATS connect failed; \
+                             business event listener disabled: {err}"
+                        ),
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     // ── SQL gateway (optional) ─────────────────────────────────────────────
     // When `demo_config.sql` is set, resolve secrets and spawn a dedicated
     // localhost axum server serving `/sql/<conn>/schema` + `/sql/<conn>/query`.
@@ -1506,6 +1552,7 @@ pub fn demo_up_services(
         ingress_server,
         timer_scheduler,
         threshold_watcher,
+        business_event_listener,
     })
 }
 

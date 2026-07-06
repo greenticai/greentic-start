@@ -3147,6 +3147,7 @@ name = "greentic-start"
 version = "1.2.0-research.6"
 dependencies = [
  "anyhow",
+ "async-nats",
  "async-trait",
  "axum",
  "base64 0.22.1",
