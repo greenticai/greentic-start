@@ -5,10 +5,12 @@
 //! `.gtpack` artifacts) that this module teaches `greentic-start` to read at
 //! boot, instead of relying solely on ad-hoc bundle refs. See the sub-project
 //! spec/plan docs under `.superpowers/sdd/` for the full slice-1a design.
+mod loader;
 mod route;
 mod spec;
 mod verify;
 
+pub use loader::load_env_home;
 pub use route::select_routed_revisions;
 pub use spec::{
     LockedPack, PACK_LIST_LOCK_SCHEMA, PackListLock, RUNTIME_CONFIG_SCHEMA, RevisionRuntimeBlock,

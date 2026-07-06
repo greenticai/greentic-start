@@ -7,8 +7,14 @@ use crate::StartRequest;
 use crate::bundle_ref;
 use crate::config;
 
+// `DemoPaths`/`DemoConfigSource` are `pub` (not `pub(crate)`) purely so that
+// `env_home::load_env_home` — a fully `pub fn` re-exported from this crate's
+// public API — can name them in its return type without tripping rustc's
+// `private_interfaces` lint (denied via `-D warnings`). Their fields stay
+// `pub(crate)`: external crates can hold/pass the opaque value but cannot
+// construct one or read/write a field.
 #[derive(Clone, Debug)]
-pub(crate) struct DemoPaths {
+pub struct DemoPaths {
     pub(crate) config_path: PathBuf,
     pub(crate) root_dir: PathBuf,
     pub(crate) state_dir: PathBuf,
@@ -16,7 +22,7 @@ pub(crate) struct DemoPaths {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DemoConfigSource {
+pub enum DemoConfigSource {
     LegacyFile,
     NormalizedBundle,
 }
@@ -37,14 +43,7 @@ pub(crate) fn resolve_demo_paths(
     }
     if let Some(bundle_ref) = bundle {
         let resolved = bundle_ref::resolve_bundle_ref(bundle_ref)?;
-        let root_dir = resolved.bundle_dir;
-        let (config_path, config_source) = resolve_bundle_config_path(&root_dir)?;
-        return Ok(DemoPaths {
-            state_dir: root_dir.join("state"),
-            root_dir,
-            config_path,
-            config_source,
-        });
+        return resolve_bundle_dir_paths(&resolved.bundle_dir);
     }
     let cwd = std::env::current_dir()?;
     let demo_path = cwd.join("demo").join("demo.yaml");
@@ -69,6 +68,22 @@ pub(crate) fn resolve_demo_paths(
     Err(anyhow!(
         "no demo config found; pass --config, --bundle, or create ./demo/demo.yaml"
     ))
+}
+
+/// Resolve a bundle directory (a local bundle ref target, or a
+/// greentic-deployer env-home revision's `<rev>/bundle/`) into [`DemoPaths`].
+///
+/// Shared by [`resolve_demo_paths`]'s `--bundle` branch and
+/// `env_home::load_env_home`, which points this at a routed revision's
+/// extracted bundle directory after verifying its pinned packs.
+pub(crate) fn resolve_bundle_dir_paths(root_dir: &Path) -> anyhow::Result<DemoPaths> {
+    let (config_path, config_source) = resolve_bundle_config_path(root_dir)?;
+    Ok(DemoPaths {
+        state_dir: root_dir.join("state"),
+        root_dir: root_dir.to_path_buf(),
+        config_path,
+        config_source,
+    })
 }
 
 fn resolve_bundle_config_path(root_dir: &Path) -> anyhow::Result<(PathBuf, DemoConfigSource)> {
