@@ -1426,12 +1426,17 @@ fn run_update_notify(
                 schema_only: false,
                 answers: None,
             };
-            let outcome = updates::get(store, &flags, Some(payload)).map_err(NotifyError::Op)?;
+            // Run for its staging side effect and discard the outcome: the
+            // deployer's `OpOutcome.result` carries the staging directory path and
+            // the trust-root key IDs that verified the plan, which must not leak to
+            // the off-host caller. Return only a category signal, matching the
+            // `disabled` / `recorded` arms above.
+            let _ = updates::get(store, &flags, Some(payload)).map_err(NotifyError::Op)?;
             operator_log::info(
                 module_path!(),
                 format!("update-notify: staged update plan for env `{env_id}`"),
             );
-            Ok((StatusCode::OK, outcome.result))
+            Ok((StatusCode::OK, serde_json::json!({ "status": "staged" })))
         }
     }
 }
@@ -5273,5 +5278,28 @@ mod update_notify_tests {
             .expect("disabled is Ok");
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["status"], "disabled");
+    }
+
+    #[test]
+    fn record_only_channel_does_not_stage() {
+        // Enabled + record-only resolves to `Record`, so `run_update_notify`
+        // returns 202 WITHOUT ever calling `updates::get` — the garbage plan/sig
+        // below would error if it reached staging.
+        let root = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("local")).expect("env dir");
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.on_notify = Some(OnNotifyAction::RecordOnly);
+        std::fs::write(
+            root.path().join("local").join("update-channel.json"),
+            serde_json::to_vec(&cfg).expect("serialize channel"),
+        )
+        .expect("write channel");
+        let store = LocalFsStore::new(root.path().to_path_buf());
+
+        let (status, body) =
+            run_update_notify(&store, "local", b"not-a-plan", b"not-a-sig").expect("record is Ok");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["status"], "recorded");
     }
 }
