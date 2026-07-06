@@ -7,12 +7,14 @@
 //! spec/plan docs under `.superpowers/sdd/` for the full slice-1a design.
 mod route;
 mod spec;
+mod verify;
 
 pub use route::select_routed_revisions;
 pub use spec::{
     LockedPack, PACK_LIST_LOCK_SCHEMA, PackListLock, RUNTIME_CONFIG_SCHEMA, RevisionRuntimeBlock,
     RuntimeConfig, parse_runtime_config,
 };
+pub use verify::verify_pack_list;
 
 use std::path::PathBuf;
 
