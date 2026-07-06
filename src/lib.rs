@@ -946,6 +946,8 @@ mod tests {
         let mut config = config::DemoConfig::default();
         let args = StartRequest {
             bundle: None,
+            store_root: None,
+            env: "local".to_string(),
             tenant: None,
             team: None,
             no_nats: false,
@@ -978,6 +980,8 @@ mod tests {
         let mut config = config::DemoConfig::default();
         let args = StartRequest {
             bundle: None,
+            store_root: None,
+            env: "local".to_string(),
             tenant: None,
             team: None,
             no_nats: false,
@@ -1049,6 +1053,8 @@ mod tests {
     fn make_start_request(bundle: &Path) -> StartRequest {
         StartRequest {
             bundle: Some(bundle.display().to_string()),
+            store_root: None,
+            env: "local".to_string(),
             tenant: None,
             team: None,
             no_nats: false,

@@ -78,6 +78,8 @@ mod tests {
     fn make_request() -> StartRequest {
         StartRequest {
             bundle: None,
+            store_root: None,
+            env: "local".to_string(),
             tenant: None,
             team: None,
             no_nats: false,

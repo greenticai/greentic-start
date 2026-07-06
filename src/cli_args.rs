@@ -92,6 +92,12 @@ pub(crate) struct ResolveSecretArgs {
 pub(crate) struct StartArgs {
     #[arg(long)]
     bundle: Option<String>,
+    /// Boot from a greentic-deployer environment home instead of a bundle.
+    #[arg(long)]
+    store_root: Option<PathBuf>,
+    /// Environment id within the store root (deployer env, not GREENTIC_ENV).
+    #[arg(long, default_value = "local")]
+    env: String,
     #[arg(long)]
     tenant: Option<String>,
     #[arg(long)]
@@ -197,6 +203,8 @@ pub enum RestartTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartRequest {
     pub bundle: Option<String>,
+    pub store_root: Option<PathBuf>,
+    pub env: String,
     pub tenant: Option<String>,
     pub team: Option<String>,
     pub no_nats: bool,
@@ -233,6 +241,8 @@ pub struct StopRequest {
 pub(crate) fn start_request_from_args(args: StartArgs, tunnel_explicit: bool) -> StartRequest {
     StartRequest {
         bundle: args.bundle,
+        store_root: args.store_root,
+        env: args.env,
         tenant: args.tenant,
         team: args.team,
         no_nats: args.no_nats,
@@ -361,6 +371,8 @@ fn arg_takes_value(arg: &str) -> bool {
         arg,
         "--locale"
             | "--bundle"
+            | "--store-root"
+            | "--env"
             | "--tenant"
             | "--team"
             | "--nats"
@@ -494,5 +506,30 @@ mod tests {
                 "--version".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn store_root_and_env_flow_into_start_request() {
+        let args = StartArgs::parse_from([
+            "greentic-start",
+            "--store-root",
+            "/tmp/envs",
+            "--env",
+            "local",
+        ]);
+        let request = start_request_from_args(args, false);
+        assert_eq!(
+            request.store_root,
+            Some(std::path::PathBuf::from("/tmp/envs"))
+        );
+        assert_eq!(request.env, "local");
+    }
+
+    #[test]
+    fn env_defaults_to_local_when_absent() {
+        let args = StartArgs::parse_from(["greentic-start", "--bundle", "x.gtbundle"]);
+        let request = start_request_from_args(args, false);
+        assert_eq!(request.store_root, None);
+        assert_eq!(request.env, "local");
     }
 }
