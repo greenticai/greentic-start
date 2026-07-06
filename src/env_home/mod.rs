@@ -26,16 +26,30 @@ use std::time::SystemTime;
 /// trigger a clean restart when greentic-deployer writes a new revision.
 ///
 /// Returns `true` when `path`'s mtime is strictly newer than `baseline`, or
-/// when the file can no longer be read (e.g. deleted because traffic was
-/// cleared from the env). Slice-1a semantics: deletion is treated the same as
-/// a change — the supervisor is expected to restart into whatever state
-/// (redeployed or torn down) is now on disk, rather than have this process
-/// keep running against a stale/removed config.
+/// when the file has been deleted (e.g. because traffic was cleared from the
+/// env). Slice-1a semantics: deletion is treated the same as a change — the
+/// supervisor is expected to restart into whatever state (redeployed or torn
+/// down) is now on disk, rather than have this process keep running against a
+/// stale/removed config.
+///
+/// Only a `NotFound` stat error is treated as "changed". Any other stat error
+/// (e.g. `PermissionDenied`, transient I/O) returns `false` instead: treating
+/// every stat failure as a deletion would restart-loop the process forever if
+/// such an error persisted across restarts. The error is logged so the
+/// degradation is diagnosable.
 pub fn runtime_config_changed(path: &std::path::Path, baseline: SystemTime) -> bool {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map(|modified| modified > baseline)
-        .unwrap_or(true)
+    match std::fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(modified) => modified > baseline,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "runtime-config.json stat failed; not treating as change"
+            );
+            false
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

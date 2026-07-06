@@ -905,10 +905,16 @@ fn wait_for_shutdown(
     // Baseline captured once, before the loop starts, so the very first tick
     // compares against the config's state at process start rather than
     // against itself.
-    let baseline = watched_runtime_config
-        .as_deref()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .and_then(|m| m.modified().ok());
+    let baseline = watched_runtime_config.as_deref().and_then(|p| {
+        let modified = std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
+        if modified.is_none() {
+            tracing::warn!(
+                path = %p.display(),
+                "failed to capture baseline mtime for runtime-config.json; config-change watch disabled for this process"
+            );
+        }
+        modified
+    });
     runtime.block_on(async move {
         loop {
             tokio::select! {
@@ -969,7 +975,11 @@ mod tests {
         let baseline = std::fs::metadata(&p).unwrap().modified().unwrap();
         std::fs::remove_file(&p).unwrap();
         // Slice-1a semantics: a deleted runtime-config.json (traffic cleared)
-        // must also trigger a restart, same as a redeploy would.
+        // must also trigger a restart, same as a redeploy would. This is
+        // specifically a `NotFound` stat error — the only error kind treated
+        // as "changed"; any other stat error (e.g. permission denied) must
+        // return `false` instead, to avoid a restart-loop on a persistent,
+        // non-deletion stat failure.
         assert!(runtime_config_changed(&p, baseline));
     }
 
