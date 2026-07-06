@@ -53,3 +53,11 @@ A new tiny process that subscribes to `greentic.events.>` and POSTs to start's `
 **Should greentic-start take on a NATS client + subscribe to the business-event bus (Option A)?** Yes → the §5 slice is ready to build (no other blocker; it reuses `route_events` + `subscribes_to`, off by default). No → fall back to Option B (runner bridge) and confirm start's `/v1/events/ingress` contract for runner-forwarded events.
 
 This doc is the decision artifact; no code is written until the answer is given.
+
+## 7. Queue group & SoRX subject contract (implemented — Option A shipped in #345)
+
+**Subject contract.** SoRX publishes business events on `greentic.events.<tenant>.<topic>`, where `<topic>` (e.g. `sorla.<pack>.<entity>.created`) is the routing key. The listener sets `EventEnvelopeV1.event_type` to that subject-derived `<topic>`, which `route_events`/`select_target_flows` match against each flow's `subscribes_to` patterns (so `subscribes_to: ["sorla.*"]` fires on `sorla.pack.order.created`). The decoded envelope's `tenant` is authoritative; the subject's `<tenant>` segment is only cross-checked (mismatch → warn, envelope wins).
+
+**Queue group.** The listener uses `queue_subscribe` under a queue group (not a fan-out `subscribe`), so multiple `greentic-start` instances form a NATS queue group and each event is delivered to exactly one instance — same-bundle HA replicas dedup instead of every replica double-firing the flow.
+
+The group defaults to `greentic-start-be-listener` and is overridable via the **`GREENTIC_BE_QUEUE_GROUP`** environment variable (`resolve_queue_group`; an empty/whitespace value falls back to the default). **Set it per deployment when two *distinct* greentic-start deployments share one NATS server** — otherwise they share the default group and NATS may deliver one deployment's event to the other (which can't route it against its own bundle), silently losing it. Leave it at the default for HA replicas of the *same* bundle. The code cannot know the operator's topology, so this is a deployment-time choice.

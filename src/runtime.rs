@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::business_event_listener::{BusinessEventListener, BusinessEventListenerConfig};
+use crate::business_event_listener::{
+    BusinessEventListener, BusinessEventListenerConfig, resolve_queue_group,
+};
 use crate::domains::Domain;
 use crate::http_ingress::{HttpIngressConfig, HttpIngressServer};
 use crate::operator_log;
@@ -948,6 +950,7 @@ pub fn demo_up_services(
             Some(BusinessEventListener::start(BusinessEventListenerConfig {
                 nats_url,
                 bundle_root: config_dir.to_path_buf(),
+                queue_group: resolve_queue_group(std::env::var("GREENTIC_BE_QUEUE_GROUP").ok()),
             }))
         }
         _ => None,
