@@ -367,7 +367,6 @@ mod tests {
                 content: r#"{"target":"sales-crm/pipeline_flow/pipeline_card","confidence":0.82,"reason":"deals"}"#.into(),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
-                usage: None,
             })
             .build();
         let d = decide(&provider, &candidates(), "show my deals").expect("decision");
@@ -446,7 +445,6 @@ mod tests {
                 content: "I would route to sales".into(),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
-                usage: None,
             })
             .build();
 

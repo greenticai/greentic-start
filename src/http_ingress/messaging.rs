@@ -1016,6 +1016,7 @@ mod tests {
             &AppFlowInfo {
                 id: "default".to_string(),
                 kind: "messaging".to_string(),
+                subscribes_to: vec![],
             },
             &original,
         );
