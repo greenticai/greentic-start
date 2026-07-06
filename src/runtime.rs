@@ -931,37 +931,24 @@ pub fn demo_up_services(
     // events to flows via `event_router::route_events` — the same gate
     // `greentic-runner` uses for `NatsDispatcher`. Off by default: no env
     // var means the listener is never started, leaving the default startup
-    // path unaffected. A connect failure warns and leaves the listener
-    // absent rather than failing boot (mirrors the runner's
+    // path unaffected.
+    //
+    // FIX C1: this call site is on the fully synchronous `gtc start` path
+    // (`run_start_request -> run_start -> demo_up_services`) — there is no
+    // ambient Tokio runtime here. `BusinessEventListener::start` therefore
+    // does the actual `async_nats::connect` (and everything else) itself,
+    // inside a dedicated `std::thread` that owns its own runtime — this
+    // call site just hands over the URL/bundle root and returns
+    // immediately. A connect failure inside that thread warns and the
+    // thread exits cleanly rather than failing boot (mirrors the runner's
     // `GREENTIC_EVENTS_NATS_URL` connect-failure handling in
     // `greentic-runner-host/src/runtime.rs`).
     let business_event_listener = match std::env::var("GREENTIC_EVENTS_NATS_URL") {
         Ok(nats_url) if !nats_url.is_empty() => {
-            let connect_future = async_nats::connect(nats_url.clone());
-            let connect_result = match tokio::runtime::Handle::try_current() {
-                Ok(handle) => tokio::task::block_in_place(|| handle.block_on(connect_future)),
-                Err(_) => tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("failed to build temporary tokio runtime for business event listener")?
-                    .block_on(connect_future),
-            };
-            match connect_result {
-                Ok(client) => Some(BusinessEventListener::start(BusinessEventListenerConfig {
-                    client,
-                    bundle_root: config_dir.to_path_buf(),
-                })),
-                Err(err) => {
-                    operator_log::warn(
-                        module_path!(),
-                        format!(
-                            "GREENTIC_EVENTS_NATS_URL set but NATS connect failed; \
-                             business event listener disabled: {err}"
-                        ),
-                    );
-                    None
-                }
-            }
+            Some(BusinessEventListener::start(BusinessEventListenerConfig {
+                nats_url,
+                bundle_root: config_dir.to_path_buf(),
+            }))
         }
         _ => None,
     };

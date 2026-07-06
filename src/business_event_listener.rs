@@ -3,13 +3,25 @@
 //! Subscribes to `greentic.events.>`, converts each raw NATS message
 //! (`subject`, `body`) into an `(OperatorContext, EventEnvelopeV1)` pair, and
 //! routes it to flows via `crate::event_router::route_events`. Mirrors
-//! `crate::threshold_watcher`'s shape: a background task (here, over NATS
-//! rather than a poll interval) that is off by default and never panics or
-//! blocks the server on a decode/route failure. See `crate::runtime` (the
-//! `business_event_listener` wiring block) for the discover -> start ->
-//! store -> stop pattern this module's caller follows — gated on
-//! `GREENTIC_EVENTS_NATS_URL`, mirroring `greentic-runner`'s
-//! `NatsDispatcher` gate.
+//! `crate::threshold_watcher`'s shape: a background thread (owning a
+//! dedicated single-thread Tokio runtime, exactly like
+//! `crate::threshold_watcher::watcher` owns its polling thread) that is off
+//! by default and never panics or blocks the server on a connect/decode/
+//! route failure. See `crate::runtime` (the `business_event_listener` wiring
+//! block) for the discover -> start -> store -> stop pattern this module's
+//! caller follows — gated on `GREENTIC_EVENTS_NATS_URL`, mirroring
+//! `greentic-runner`'s `NatsDispatcher` gate.
+//!
+//! The `gtc start` path (`run_start_request -> run_start ->
+//! demo_up_services`) is synchronous — there is no ambient Tokio runtime.
+//! [`BusinessEventListener::start`] therefore owns its own runtime on a
+//! dedicated `std::thread` (mirroring
+//! `crate::threshold_watcher::ThresholdWatcher::start`'s thread ownership),
+//! rather than borrowing/creating a temporary one in the caller: connecting
+//! to NATS and subscribing both happen *inside* that thread's
+//! `rt.block_on(...)`, so a connect failure only ever warns-and-exits the
+//! background thread — it can never panic (`tokio::spawn`/`.await` with "no
+//! reactor running") or crash boot.
 //!
 //! [`handle_message`] is generic over the `route` call purely for
 //! testability: production code (the loop below, and `crate::runtime`)
@@ -18,8 +30,10 @@
 //! NATS server or flow.
 
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use futures_util::StreamExt;
+use tokio::sync::oneshot;
 
 use crate::ingress_types::{EventEnvelopeV1, EventScopeV1, EventSourceV1};
 use crate::operator_log;
@@ -28,6 +42,11 @@ use crate::runner_host::OperatorContext;
 /// NATS subject wildcard business events are published on
 /// (`greentic.events.<tenant>.<topic...>`; see [`topic_from_subject`]).
 const BUSINESS_EVENTS_SUBJECT: &str = "greentic.events.>";
+
+/// NATS queue group all `greentic-start` instances subscribe under so a
+/// business event is delivered to exactly one instance rather than every
+/// instance in a multi-instance deployment (FIX I1).
+const BUSINESS_EVENTS_QUEUE_GROUP: &str = "greentic-start-be-listener";
 
 const SUBJECT_PREFIX: &str = "greentic.events.";
 
@@ -111,6 +130,18 @@ pub fn convert(subject: &str, body: &[u8]) -> Option<(OperatorContext, EventEnve
         correlation_id: envelope.correlation_id.clone(),
     };
 
+    // FIX M1: derive `source.domain` from the topic's first segment (e.g.
+    // `sorla.pack.order.created` -> `sorla`) rather than hard-coding
+    // `"sorla"` — a non-SoRX producer publishing on `greentic.events.>`
+    // would otherwise be mislabeled. Falls back to `"events"` if the topic
+    // has no non-empty first segment.
+    let domain = event_type
+        .split('.')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or("events")
+        .to_string();
+
     // Mirrors `threshold_watcher::watcher::build_crossing_event`'s
     // `EventEnvelopeV1` construction: `event_type` carries routing (there is
     // no dedicated `topic` field), and `source.provider` is the closest
@@ -120,7 +151,7 @@ pub fn convert(subject: &str, body: &[u8]) -> Option<(OperatorContext, EventEnve
         event_type,
         occurred_at: envelope.time.to_rfc3339(),
         source: EventSourceV1 {
-            domain: "sorla".to_string(),
+            domain,
             provider: envelope.source.clone(),
             handler_id: None,
         },
@@ -170,53 +201,143 @@ where
     }
 }
 
-/// Configuration for one running [`BusinessEventListener`]: an already
-/// connected NATS client and the bundle root `route_events` dispatches
-/// against.
+/// Configuration for one running [`BusinessEventListener`]: the NATS URL to
+/// connect to (connecting happens *inside* the listener's own thread/
+/// runtime — see the module docs) and the bundle root `route_events`
+/// dispatches against.
+#[derive(Clone)]
 pub struct BusinessEventListenerConfig {
-    pub client: async_nats::Client,
+    pub nats_url: String,
     pub bundle_root: PathBuf,
 }
 
-/// Handle to the background subscribe-loop task. `start`/`stop` mirror
-/// `crate::threshold_watcher::ThresholdWatcher`.
+/// Handle to the background subscribe-loop thread. `start`/`stop` mirror
+/// `crate::threshold_watcher::ThresholdWatcher` exactly: a dedicated
+/// `std::thread` owns a Tokio runtime it builds itself, so the listener
+/// never depends on (or corrupts) an ambient runtime the caller may or may
+/// not have.
 pub struct BusinessEventListener {
-    handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
 impl BusinessEventListener {
-    /// Spawn the background subscribe-loop task on the current Tokio
-    /// runtime. Never fails: a subscribe error surfaces as a warning inside
-    /// the task rather than here (mirrors the best-effort philosophy of
-    /// `crate::threshold_watcher::ThresholdWatcher::start`).
+    /// Spawn the background thread that owns the listener's Tokio runtime.
+    ///
+    /// FIX C1: this thread builds its *own* `current_thread` runtime and
+    /// does the `async_nats::connect` + `queue_subscribe` + subscribe loop
+    /// entirely inside `rt.block_on(...)`. Nothing here runs on — or
+    /// assumes — an ambient runtime, so calling this from the fully
+    /// synchronous `gtc start` path (`run_start_request -> run_start ->
+    /// demo_up_services`) is safe: a connect failure warns and the thread
+    /// exits cleanly instead of panicking ("there is no reactor running")
+    /// and crashing boot.
+    ///
+    /// If the thread itself fails to spawn (an exceptional OS-level
+    /// condition), the failure is logged and a no-op handle is returned
+    /// rather than panicking the caller — mirrors
+    /// `ThresholdWatcher::start`.
     pub fn start(config: BusinessEventListenerConfig) -> Self {
-        let handle = tokio::spawn(run_listener_loop(config));
-        Self {
-            handle: Some(handle),
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        match thread::Builder::new()
+            .name("business-event-listener".to_string())
+            .spawn(move || run_listener_thread(config, shutdown_rx))
+        {
+            Ok(handle) => Self {
+                shutdown: Some(shutdown_tx),
+                handle: Some(handle),
+            },
+            Err(err) => {
+                operator_log::error(
+                    module_path!(),
+                    format!("failed to spawn business event listener thread: {err}"),
+                );
+                Self {
+                    shutdown: None,
+                    handle: None,
+                }
+            }
         }
     }
 
-    /// Signal the loop to stop by aborting the background task. There is no
-    /// graceful in-flight-message drain: `subscriber.next()` is the only
-    /// await point, and dropping the client on abort simply ends the
-    /// subscription mirrors `ThresholdWatcher::stop`'s intent (stop
-    /// promptly, never block shutdown).
+    /// Signal the loop to stop and wait for the thread to exit. Mirrors
+    /// `ThresholdWatcher::stop`: send the shutdown signal (a no-op if the
+    /// thread already exited on its own, e.g. after a connect failure or a
+    /// NATS disconnect), then join the thread so callers never race a
+    /// still-running listener past `stop()` returning.
     pub fn stop(mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.handle.take()
+            && let Err(err) = handle.join()
+        {
+            operator_log::error(
+                module_path!(),
+                format!("business event listener thread panicked: {err:?}"),
+            );
         }
     }
 }
 
-/// Subscribe to `greentic.events.>` and route every message via
-/// [`handle_message`] until the subscription ends (NATS disconnect) or the
-/// task is aborted by [`BusinessEventListener::stop`].
+/// Thread entry point: build a dedicated single-thread Tokio runtime and run
+/// the async subscribe loop on it via `block_on`. A runtime-build failure
+/// (exceptional — e.g. OS resource exhaustion) warns and the thread exits;
+/// it never propagates a panic to the caller.
+fn run_listener_thread(config: BusinessEventListenerConfig, shutdown_rx: oneshot::Receiver<()>) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            operator_log::error(
+                module_path!(),
+                format!("failed to build tokio runtime for business event listener: {err}"),
+            );
+            return;
+        }
+    };
+    runtime.block_on(run_listener_loop(config, shutdown_rx));
+}
+
+/// Connect to NATS, queue-subscribe to `greentic.events.>`, and route every
+/// message via [`handle_message`] until the subscription ends (NATS
+/// disconnect) or `shutdown_rx` fires ([`BusinessEventListener::stop`]).
 ///
-/// Best-effort: a subscribe failure warns and returns without ever
-/// panicking the task (and, since this always runs on a spawned task, never
-/// affects the rest of the server).
-async fn run_listener_loop(config: BusinessEventListenerConfig) {
-    let mut subscriber = match config.client.subscribe(BUSINESS_EVENTS_SUBJECT).await {
+/// Best-effort throughout: a connect or subscribe failure warns and returns
+/// without ever panicking the thread.
+///
+/// FIX I1: uses `queue_subscribe` under [`BUSINESS_EVENTS_QUEUE_GROUP`]
+/// rather than a plain fan-out `subscribe`, so multiple `greentic-start`
+/// instances sharing the same NATS server form a queue group — each event
+/// is delivered to exactly one instance instead of every instance
+/// double-firing the same flow.
+async fn run_listener_loop(
+    config: BusinessEventListenerConfig,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    let client = match async_nats::connect(&config.nats_url).await {
+        Ok(client) => client,
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "business event listener failed to connect to {}: {err}",
+                    config.nats_url
+                ),
+            );
+            return;
+        }
+    };
+
+    let mut subscriber = match client
+        .queue_subscribe(
+            BUSINESS_EVENTS_SUBJECT,
+            BUSINESS_EVENTS_QUEUE_GROUP.to_string(),
+        )
+        .await
+    {
         Ok(subscriber) => subscriber,
         Err(err) => {
             operator_log::warn(
@@ -231,22 +352,71 @@ async fn run_listener_loop(config: BusinessEventListenerConfig) {
 
     operator_log::info(
         module_path!(),
-        format!("business event listener subscribed subject={BUSINESS_EVENTS_SUBJECT}"),
+        format!(
+            "business event listener subscribed subject={BUSINESS_EVENTS_SUBJECT} queue_group={BUSINESS_EVENTS_QUEUE_GROUP}"
+        ),
     );
 
-    while let Some(message) = subscriber.next().await {
+    loop {
+        tokio::select! {
+            maybe_message = subscriber.next() => {
+                match maybe_message {
+                    Some(message) => dispatch_message(message, &config.bundle_root),
+                    None => {
+                        operator_log::warn(
+                            module_path!(),
+                            "business event listener subscription ended (NATS connection closed)",
+                        );
+                        break;
+                    }
+                }
+            }
+            _ = &mut shutdown_rx => {
+                operator_log::info(
+                    module_path!(),
+                    "business event listener stopping (shutdown signal)",
+                );
+                break;
+            }
+        }
+    }
+}
+
+/// FIX I2: offloads one message's decode-and-route work
+/// ([`handle_message`], which calls the synchronous, flow-executing
+/// `event_router::route_events`) onto the blocking thread pool via
+/// `tokio::task::spawn_blocking`, so a slow flow never stalls this loop's
+/// `subscriber.next().await` (head-of-line blocking across the whole
+/// subscription).
+///
+/// Fire-and-forget from the caller's perspective: a separate task awaits
+/// the `spawn_blocking` join handle purely to log a join failure (e.g. a
+/// panic inside `route_events`) — it is never propagated or re-panicked.
+fn dispatch_message(message: async_nats::Message, bundle_root: &Path) {
+    let subject = message.subject.to_string();
+    let payload = message.payload.to_vec();
+    let bundle_root = bundle_root.to_path_buf();
+    let log_subject = subject.clone();
+
+    let blocking = tokio::task::spawn_blocking(move || {
         handle_message(
-            message.subject.as_str(),
-            &message.payload,
-            &config.bundle_root,
+            &subject,
+            &payload,
+            &bundle_root,
             crate::event_router::route_events,
         );
-    }
+    });
 
-    operator_log::warn(
-        module_path!(),
-        "business event listener subscription ended (NATS connection closed)",
-    );
+    tokio::spawn(async move {
+        if let Err(err) = blocking.await {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "business event listener spawn_blocking task failed subject={log_subject}: {err}"
+                ),
+            );
+        }
+    });
 }
 
 #[cfg(test)]
@@ -416,6 +586,67 @@ mod tests {
             &body,
             Path::new("/nonexistent-bundle"),
             |_bundle, _ctx, _events| anyhow::bail!("simulated routing failure"),
+        );
+    }
+
+    #[test]
+    fn convert_derives_domain_from_topic_first_segment() {
+        // FIX M1: `source.domain` must come from the routed topic's first
+        // segment, not a hard-coded "sorla" — a non-SoRX producer
+        // publishing on `greentic.events.>` would otherwise be mislabeled.
+        let mut env = sample_envelope();
+        env.topic = "billing.invoice.paid".to_string();
+        let body = serde_json::to_vec(&env).expect("serialize envelope");
+
+        let (_, ev) = convert("greentic.events.t1.billing.invoice.paid", &body)
+            .expect("convert should succeed");
+        assert_eq!(ev.event_type, "billing.invoice.paid");
+        assert_eq!(ev.source.domain, "billing");
+    }
+
+    #[test]
+    fn convert_falls_back_to_events_domain_when_topic_has_no_first_segment() {
+        // A topic with an empty first segment (e.g. a leading dot) has no
+        // usable domain — fall back to "events" rather than an empty string.
+        let mut env = sample_envelope();
+        env.topic = ".weird.topic".to_string();
+        let body = serde_json::to_vec(&env).expect("serialize envelope");
+
+        // Subject is deliberately unparseable so `convert` falls back to the
+        // envelope's own (malformed) `topic` for `event_type`.
+        let (_, ev) = convert("not.a.greentic.subject", &body).expect("convert should succeed");
+        assert_eq!(ev.event_type, ".weird.topic");
+        assert_eq!(ev.source.domain, "events");
+    }
+
+    #[test]
+    fn start_and_stop_do_not_panic_in_a_synchronous_no_runtime_context() {
+        // Regression test for FIX C1. The real `gtc start` boot path
+        // (`run_start_request -> run_start -> demo_up_services`) is fully
+        // synchronous — there is no ambient Tokio runtime. Before FIX C1,
+        // `BusinessEventListener::start` called `tokio::spawn` directly,
+        // which panics immediately ("there is no reactor running") when
+        // there's no ambient runtime, crashing boot whenever
+        // `GREENTIC_EVENTS_NATS_URL` was set. This is a plain `#[test]`
+        // (deliberately NOT `#[tokio::test]`) so it reproduces that exact
+        // no-ambient-runtime context; `catch_unwind` turns "did calling
+        // start()/stop() panic" into a concrete assertion instead of just
+        // "did the test process crash".
+        let result = std::panic::catch_unwind(|| {
+            let listener = BusinessEventListener::start(BusinessEventListenerConfig {
+                // Deliberately unreachable: nothing listens here, so the
+                // background thread's own `async_nats::connect` fails fast
+                // and the thread warns + exits cleanly instead of blocking.
+                nats_url: "nats://127.0.0.1:59999".to_string(),
+                bundle_root: PathBuf::from("/nonexistent-bundle"),
+            });
+            listener.stop();
+        });
+
+        assert!(
+            result.is_ok(),
+            "start()/stop() must not panic when called from a synchronous, \
+             no-ambient-runtime context — this is exactly gtc start's real boot path"
         );
     }
 }

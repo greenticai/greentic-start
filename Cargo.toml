@@ -164,7 +164,7 @@ version = "2.5.2"
 
 [dependencies.tokio]
 version = "1"
-features = ["rt-multi-thread", "signal", "sync", "net"]
+features = ["rt-multi-thread", "signal", "sync", "net", "macros"]
 
 [dependencies.tokio-stream]
 version = "0.1"
