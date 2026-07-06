@@ -7,14 +7,8 @@ use crate::StartRequest;
 use crate::bundle_ref;
 use crate::config;
 
-// `DemoPaths`/`DemoConfigSource` are `pub` (not `pub(crate)`) purely so that
-// `env_home::load_env_home` — a fully `pub fn` re-exported from this crate's
-// public API — can name them in its return type without tripping rustc's
-// `private_interfaces` lint (denied via `-D warnings`). Their fields stay
-// `pub(crate)`: external crates can hold/pass the opaque value but cannot
-// construct one or read/write a field.
 #[derive(Clone, Debug)]
-pub struct DemoPaths {
+pub(crate) struct DemoPaths {
     pub(crate) config_path: PathBuf,
     pub(crate) root_dir: PathBuf,
     pub(crate) state_dir: PathBuf,
@@ -22,7 +16,7 @@ pub struct DemoPaths {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DemoConfigSource {
+pub(crate) enum DemoConfigSource {
     LegacyFile,
     NormalizedBundle,
 }

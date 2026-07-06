@@ -31,7 +31,9 @@ use crate::config::DemoConfig;
 ///
 /// Never falls back to another boot mode: any parse, schema, traffic-split,
 /// missing-artifact, or digest-mismatch error aborts the boot.
-pub fn load_env_home(
+// Consumed by run_start in Task 6; not yet wired in-crate.
+#[allow(dead_code)]
+pub(crate) fn load_env_home(
     store_root: &Path,
     env: &str,
     request: &StartRequest,
@@ -52,7 +54,9 @@ pub fn load_env_home(
     let block = routed
         .first()
         .copied()
-        .ok_or_else(|| anyhow::anyhow!("no routed revision in {}", rc_path.display()))?;
+        .ok_or_else(|| EnvHomeError::NoRoutedRevision {
+            env: env.to_string(),
+        })?;
 
     for lock_ref in &block.pack_list_refs {
         let lock_path = env_home.join(lock_ref);

@@ -10,7 +10,8 @@ mod route;
 mod spec;
 mod verify;
 
-pub use loader::load_env_home;
+#[allow(unused_imports)]
+pub(crate) use loader::load_env_home;
 pub use route::select_routed_revisions;
 pub use spec::{
     LockedPack, PACK_LIST_LOCK_SCHEMA, PackListLock, RUNTIME_CONFIG_SCHEMA, RevisionRuntimeBlock,
@@ -40,6 +41,8 @@ pub enum EnvHomeError {
     },
     #[error("missing artifact at {0}")]
     MissingArtifact(PathBuf),
+    #[error("no routed revision in runtime-config.json for env `{env}`")]
+    NoRoutedRevision { env: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("malformed json in {path}: {source}")]
