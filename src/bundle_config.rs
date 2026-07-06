@@ -37,14 +37,7 @@ pub(crate) fn resolve_demo_paths(
     }
     if let Some(bundle_ref) = bundle {
         let resolved = bundle_ref::resolve_bundle_ref(bundle_ref)?;
-        let root_dir = resolved.bundle_dir;
-        let (config_path, config_source) = resolve_bundle_config_path(&root_dir)?;
-        return Ok(DemoPaths {
-            state_dir: root_dir.join("state"),
-            root_dir,
-            config_path,
-            config_source,
-        });
+        return resolve_bundle_dir_paths(&resolved.bundle_dir);
     }
     let cwd = std::env::current_dir()?;
     let demo_path = cwd.join("demo").join("demo.yaml");
@@ -69,6 +62,22 @@ pub(crate) fn resolve_demo_paths(
     Err(anyhow!(
         "no demo config found; pass --config, --bundle, or create ./demo/demo.yaml"
     ))
+}
+
+/// Resolve a bundle directory (a local bundle ref target, or a
+/// greentic-deployer env-home revision's `<rev>/bundle/`) into [`DemoPaths`].
+///
+/// Shared by [`resolve_demo_paths`]'s `--bundle` branch and
+/// `env_home::load_env_home`, which points this at a routed revision's
+/// extracted bundle directory after verifying its pinned packs.
+pub(crate) fn resolve_bundle_dir_paths(root_dir: &Path) -> anyhow::Result<DemoPaths> {
+    let (config_path, config_source) = resolve_bundle_config_path(root_dir)?;
+    Ok(DemoPaths {
+        state_dir: root_dir.join("state"),
+        root_dir: root_dir.to_path_buf(),
+        config_path,
+        config_source,
+    })
 }
 
 fn resolve_bundle_config_path(root_dir: &Path) -> anyhow::Result<(PathBuf, DemoConfigSource)> {
@@ -500,6 +509,8 @@ mod tests {
     fn make_test_request(bundle: Option<&str>) -> StartRequest {
         StartRequest {
             bundle: bundle.map(|s| s.to_string()),
+            store_root: None,
+            env: "local".to_string(),
             tenant: None,
             team: None,
             no_nats: false,

@@ -79,6 +79,34 @@ These are the supported `start` and `restart` flags from [src/cli_args.rs](/proj
 
 Bundle/config resolution is handled through [src/bundle_config.rs](/projects/ai/greentic-ng/greentic-start/src/bundle_config.rs:20).
 
+### Environment-home mode
+
+- `--store-root <dir>`
+  Boots from a greentic-deployer environment home instead of a bundle — the directory
+  produced by `greentic-deployer op env init` + `op deploy`.
+- `--env <id>`
+  Environment id within the store root to route (default `local`). This is the
+  **deployer env-home id**, not the `GREENTIC_ENV` secrets tier — do not conflate the two.
+
+```bash
+greentic-start --store-root /path/to/env-home --env local
+```
+
+Behavior:
+
+- `--store-root` is **mutually exclusive** with `--bundle` / `--config`; passing both is
+  a startup error (`src/lib.rs:221`).
+- The loader parses `runtime-config.json`, selects the routed revision, sha256-verifies
+  packs against `pack-list.lock`, then reuses the same bundle-dir loading path as a
+  regular bundle start.
+- Gateway bind is unaffected: it still comes from `GREENTIC_GATEWAY_PORT` /
+  `GREENTIC_GATEWAY_LISTEN_ADDR`.
+- A background watcher observes `runtime-config.json`; on change or delete, the process
+  exits cleanly (`ShutdownReason::ConfigChanged`) so a supervisor can restart it against
+  the new routed revision.
+
+Implementation lives in [src/env_home/](/projects/ai/greentic-ng/greentic-start/src/env_home/mod.rs).
+
 ### NATS
 
 - `--nats off`

@@ -24,6 +24,11 @@ mod dev_store_path;
 mod discovery;
 mod doctor;
 mod domains;
+// `pub` (doc-hidden) so integration tests in later env-home tasks can drive
+// the loader directly, the same way `ws_test_support` and `perf_harness` are
+// exposed for their own integration tests.
+#[doc(hidden)]
+pub mod env_home;
 pub mod event_router;
 mod fast2flow;
 pub(crate) mod flow_log;
@@ -213,6 +218,10 @@ fn redis_endpoint_reachable(url: &str) -> bool {
 }
 
 fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
+    if request.store_root.is_some() && (request.bundle.is_some() || request.config.is_some()) {
+        anyhow::bail!("--store-root is mutually exclusive with --bundle/--config");
+    }
+
     // Disable provider-core-only mode in demo so WASM components can access secrets directly.
     // Without this, the runner-host blocks secrets_store.get() calls from WASM.
     // SAFETY: This is called early in single-threaded startup before spawning workers.
@@ -306,18 +315,30 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     // subscriber. Absent → file-only, today's behaviour.
     let _trace_guard = init_trace_log(&log_dir, peeked_telemetry.as_ref(), &peeked_service_name);
 
-    let demo_paths = match bundle_config::resolve_demo_paths(
-        request.config.clone(),
-        request.bundle.as_deref(),
-    ) {
-        Ok(paths) => paths,
-        Err(err) => {
-            operator_log::error(
-                module_path!(),
-                format!("resolve_demo_paths failed: {err:#}"),
-            );
-            return Err(err);
+    let (demo_paths, mut demo_config) = if let Some(store_root) = request.store_root.clone() {
+        match crate::env_home::load_env_home(&store_root, &request.env, &request) {
+            Ok(pair) => pair,
+            Err(err) => {
+                operator_log::error(module_path!(), format!("load_env_home failed: {err:#}"));
+                return Err(err);
+            }
         }
+    } else {
+        let demo_paths = match bundle_config::resolve_demo_paths(
+            request.config.clone(),
+            request.bundle.as_deref(),
+        ) {
+            Ok(paths) => paths,
+            Err(err) => {
+                operator_log::error(
+                    module_path!(),
+                    format!("resolve_demo_paths failed: {err:#}"),
+                );
+                return Err(err);
+            }
+        };
+        let demo_config = bundle_config::load_runtime_demo_config(&demo_paths, &request)?;
+        (demo_paths, demo_config)
     };
     let config_path = demo_paths.config_path.clone();
     let config_dir = demo_paths.root_dir.clone();
@@ -350,7 +371,6 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         }
     }
 
-    let mut demo_config = bundle_config::load_runtime_demo_config(&demo_paths, &request)?;
     apply_nats_overrides(&mut demo_config, &request);
 
     // Make the bundle's `llm:` instance available to every LLM consumer (the
@@ -551,7 +571,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         ),
     );
     println!("\nReady. Press Ctrl+C to stop.");
-    let shutdown_reason = wait_for_shutdown(&runtime_paths)?;
+    let watched_runtime_config = request
+        .store_root
+        .as_deref()
+        .map(|store_root| store_root.join(&request.env).join("runtime-config.json"));
+    let shutdown_reason = wait_for_shutdown(&runtime_paths, watched_runtime_config)?;
     operator_log::info(
         module_path!(),
         format!(
@@ -603,10 +627,27 @@ const NOISY_TRACE_TARGETS: &[&str] = &[
 fn peek_startup_telemetry(
     request: &StartRequest,
 ) -> (Option<bundle_config::BundleTelemetryConfig>, String) {
-    let Ok(demo_paths) =
-        bundle_config::resolve_demo_paths(request.config.clone(), request.bundle.as_deref())
-    else {
-        return (None, "greentic".to_string());
+    let demo_paths = if let Some(store_root) = request.store_root.as_deref() {
+        // Env-home mode: resolve the routed revision's bundle dir cheaply
+        // (no pack-digest verification — that happens for real in
+        // `env_home::load_env_home` once logging is up). Best-effort, same
+        // as the `--bundle`/`--config` branch below: any failure here just
+        // means default telemetry/service-name until the real boot runs.
+        let Ok(bundle_dir) = crate::env_home::resolve_routed_bundle_dir(store_root, &request.env)
+        else {
+            return (None, "greentic".to_string());
+        };
+        let Ok(paths) = bundle_config::resolve_bundle_dir_paths(&bundle_dir) else {
+            return (None, "greentic".to_string());
+        };
+        paths
+    } else {
+        let Ok(paths) =
+            bundle_config::resolve_demo_paths(request.config.clone(), request.bundle.as_deref())
+        else {
+            return (None, "greentic".to_string());
+        };
+        paths
     };
     let bundle_yaml = demo_paths.root_dir.join("bundle.yaml");
     let telemetry = bundle_config::peek_bundle_telemetry(&bundle_yaml)
@@ -829,6 +870,12 @@ fn load_tunnel_config(bundle_root: &std::path::Path) -> Option<TunnelConfig> {
 enum ShutdownReason {
     CtrlC,
     AdminStop,
+    /// The watched env-home `runtime-config.json` changed (redeploy) or was
+    /// deleted (traffic cleared). Slice-1a scope: this only detects the
+    /// change and asks the process to exit cleanly so an external supervisor
+    /// restarts it onto the new revision — no in-process hot-swap or graceful
+    /// drain here.
+    ConfigChanged,
 }
 
 impl ShutdownReason {
@@ -836,14 +883,38 @@ impl ShutdownReason {
         match self {
             Self::CtrlC => "ctrl_c",
             Self::AdminStop => "admin_stop",
+            Self::ConfigChanged => "config_changed",
         }
     }
 }
 
-fn wait_for_shutdown(paths: &runtime_state::RuntimePaths) -> anyhow::Result<ShutdownReason> {
+/// Blocks until Ctrl+C, an admin stop request, or (in env-home mode) a change
+/// to the watched `runtime-config.json` is observed.
+///
+/// `watched_runtime_config` is `Some(<env-home>/runtime-config.json)` when
+/// this process was started via `--store-root`/`--env`; `None` in bundle mode
+/// (`--bundle`/`--config`), which preserves today's behavior exactly — no
+/// third condition is ever checked.
+fn wait_for_shutdown(
+    paths: &runtime_state::RuntimePaths,
+    watched_runtime_config: Option<PathBuf>,
+) -> anyhow::Result<ShutdownReason> {
     let runtime =
         tokio::runtime::Runtime::new().context("failed to spawn runtime for Ctrl+C listener")?;
     let paths = paths.clone();
+    // Baseline captured once, before the loop starts, so the very first tick
+    // compares against the config's state at process start rather than
+    // against itself.
+    let baseline = watched_runtime_config.as_deref().and_then(|p| {
+        let modified = std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
+        if modified.is_none() {
+            tracing::warn!(
+                path = %p.display(),
+                "failed to capture baseline mtime for runtime-config.json; config-change watch disabled for this process"
+            );
+        }
+        modified
+    });
     runtime.block_on(async move {
         loop {
             tokio::select! {
@@ -854,6 +925,12 @@ fn wait_for_shutdown(paths: &runtime_state::RuntimePaths) -> anyhow::Result<Shut
                 _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                     if runtime_state::read_stop_request(&paths)?.is_some() {
                         return Ok(ShutdownReason::AdminStop);
+                    }
+                    if let (Some(watched), Some(baseline)) =
+                        (watched_runtime_config.as_deref(), baseline)
+                        && crate::env_home::runtime_config_changed(watched, baseline)
+                    {
+                        return Ok(ShutdownReason::ConfigChanged);
                     }
                 }
             }
@@ -873,6 +950,38 @@ mod tests {
     use std::path::Path;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn detects_runtime_config_change_by_mtime() {
+        use crate::env_home::runtime_config_changed;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("runtime-config.json");
+        std::fs::write(&p, b"{}").unwrap();
+        let baseline = std::fs::metadata(&p).unwrap().modified().unwrap();
+        // no change yet
+        assert!(!runtime_config_changed(&p, baseline));
+        // touch with a newer mtime
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&p, b"{ }").unwrap();
+        assert!(runtime_config_changed(&p, baseline));
+    }
+
+    #[test]
+    fn runtime_config_changed_treats_deletion_as_a_change() {
+        use crate::env_home::runtime_config_changed;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("runtime-config.json");
+        std::fs::write(&p, b"{}").unwrap();
+        let baseline = std::fs::metadata(&p).unwrap().modified().unwrap();
+        std::fs::remove_file(&p).unwrap();
+        // Slice-1a semantics: a deleted runtime-config.json (traffic cleared)
+        // must also trigger a restart, same as a redeploy would. This is
+        // specifically a `NotFound` stat error — the only error kind treated
+        // as "changed"; any other stat error (e.g. permission denied) must
+        // return `false` instead, to avoid a restart-loop on a persistent,
+        // non-deletion stat failure.
+        assert!(runtime_config_changed(&p, baseline));
+    }
 
     #[test]
     fn build_trace_filter_clamps_noisy_targets_even_when_rust_log_unset() {
@@ -946,6 +1055,8 @@ mod tests {
         let mut config = config::DemoConfig::default();
         let args = StartRequest {
             bundle: None,
+            store_root: None,
+            env: "local".to_string(),
             tenant: None,
             team: None,
             no_nats: false,
@@ -978,6 +1089,8 @@ mod tests {
         let mut config = config::DemoConfig::default();
         let args = StartRequest {
             bundle: None,
+            store_root: None,
+            env: "local".to_string(),
             tenant: None,
             team: None,
             no_nats: false,
@@ -1049,6 +1162,8 @@ mod tests {
     fn make_start_request(bundle: &Path) -> StartRequest {
         StartRequest {
             bundle: Some(bundle.display().to_string()),
+            store_root: None,
+            env: "local".to_string(),
             tenant: None,
             team: None,
             no_nats: false,

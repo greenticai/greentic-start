@@ -448,6 +448,8 @@ fn check_runtime_config(
 fn default_start_request(bundle: Option<String>) -> StartRequest {
     StartRequest {
         bundle,
+        store_root: None,
+        env: "local".to_string(),
         tenant: None,
         team: None,
         no_nats: false,

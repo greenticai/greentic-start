@@ -125,6 +125,19 @@ greentic-start start --bundle /tmp/my-bundle --admin --admin-port 8443
 
 This enables a protected admin endpoint intended for operational control.
 
+### Start from a greentic-deployer environment (operators)
+
+If you are running an operator-managed deployment instead of a plain bundle, `greentic-start`
+can also boot straight from the environment home that `greentic-deployer` produces:
+
+```bash
+greentic-start --store-root /path/to/env-home --env local
+```
+
+This mode is mutually exclusive with `--bundle`/`--config` — use one or the other, not both.
+See [docs/coding-agents.md](docs/coding-agents.md) for the full behavior (routing, pack
+verification, and restart-on-change semantics).
+
 ## What You Need Before Starting
 
 Usually you need:
