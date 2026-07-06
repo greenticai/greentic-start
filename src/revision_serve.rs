@@ -59,7 +59,14 @@ use tokio::sync::oneshot;
 
 use greentic_runner_host::{Activity, RunnerHost, WelcomeFlowHint};
 
-use greentic_deploy_spec::{DEFAULT_LISTEN_ADDR, EnvironmentHostConfig};
+use greentic_deploy_spec::{
+    DEFAULT_LISTEN_ADDR, EnvironmentHostConfig, OnNotifyAction, UpdateChannelConfig,
+};
+use greentic_deployer::cli::updates::{self, UpdatesGetPayload};
+use greentic_deployer::cli::{OpError, OpFlags};
+use greentic_deployer::environment::{LocalFsStore, load_trust_root};
+use greentic_types::EnvId;
+use greentic_update::plan::verify_update_plan;
 
 use crate::deployment_routes::RevisionIngressRouting;
 use crate::endpoint_resolver;
@@ -809,6 +816,37 @@ async fn serve(
         return handle_worker_invoke(req, Arc::clone(&state), peer_is_loopback).await;
     }
 
+    // Phase-4 signed update-plan receiver: a plan server POSTs a DSSE-signed
+    // update plan here and the receiver verifies + (optionally) stages it via the
+    // deployer `updates::get` library call. Short-circuited before deployment-route
+    // resolution for the same reason as `/workers/invoke` — a broad `/`-prefix
+    // route binding would otherwise run it as a generic entry-flow activity.
+    //
+    // NOT loopback-gated (unlike `/chat` and `/workers/invoke`): the notification
+    // originates off-host from the plan server. The auth boundary is the DSSE
+    // signature verification against the env trust root (inside `updates::get`)
+    // plus the per-env update-channel `enabled` gate (deny-by-default) — the same
+    // posture as signature-verified provider webhooks, not caller-asserted trust.
+    // Only reserve this path on envs that actually have an update channel
+    // configured (an `update-channel.json` sidecar). On every other env the
+    // request falls through to normal deployment routing, so adding this platform
+    // path never shadows an existing app route (e.g. a broad `/`-prefix binding)
+    // on an env that never opted into the updater.
+    if path == "/v1/updates/notify" {
+        let intercept = LocalFsStore::default_root().is_some_and(|root| {
+            update_channel_present(&root, state.current().routing.dispatcher.env_id())
+        });
+        if intercept {
+            if method != hyper::Method::POST {
+                return Err(error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "update notify requires POST",
+                ));
+            }
+            return handle_update_notify(req, Arc::clone(&state)).await;
+        }
+    }
+
     // Snapshot the activation ONCE per request so dispatch and execute see a
     // coherent (host, routing) pair. A concurrent [`RevisionServer::reload`]
     // swap is observed by the *next* request; this one keeps running against
@@ -1247,6 +1285,320 @@ async fn handle_worker_invoke(
     let body = serde_json::to_vec(&response)
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     Ok(json_response(StatusCode::OK, body))
+}
+
+/// Wire contract `greentic.update-notify.v1`: a signed update plan pushed to a
+/// running environment by a plan server. `plan_b64` / `sig_b64` carry the EXACT
+/// plan document and DSSE-envelope bytes, base64-encoded. They are base64 (not a
+/// nested JSON plan) on purpose: DSSE verification pins `sha256(plan_bytes)` as
+/// the subject digest, so the bytes must survive transport unaltered — nesting
+/// the plan as JSON would re-serialize it and break the digest.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateNotifyV1 {
+    schema: String,
+    plan_b64: String,
+    sig_b64: String,
+}
+
+/// The wire `schema` discriminator the receiver accepts.
+const UPDATE_NOTIFY_SCHEMA_V1: &str = "greentic.update-notify.v1";
+
+/// What the receiver does with a transport-accepted notification, resolved from
+/// the env's update-channel policy. Deny-by-default: an absent or disabled
+/// channel is [`NotifyAction::Ignore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifyAction {
+    Ignore,
+    Record,
+    Stage,
+}
+
+/// A staging failure. `Op` is a deployer [`OpError`] from `updates::get` (mapped
+/// to an HTTP status by [`map_op_error`], with a category-only body so trust /
+/// path details never leak to the caller). `Internal` is a server-side failure
+/// (store, tempfile, env-id) reported as an opaque 500.
+#[derive(Debug)]
+enum NotifyError {
+    Op(OpError),
+    Internal(String),
+}
+
+/// Parse + validate a `greentic.update-notify.v1` body into the raw plan and
+/// signature bytes. `Err((status, message))` is a ready 4xx (all client faults:
+/// malformed JSON, unknown schema, non-base64 payloads).
+fn decode_update_notify(body: &[u8]) -> Result<(Vec<u8>, Vec<u8>), (StatusCode, String)> {
+    let notify: UpdateNotifyV1 = serde_json::from_slice(body).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid update-notify body: {err}"),
+        )
+    })?;
+    if notify.schema != UPDATE_NOTIFY_SCHEMA_V1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unsupported update-notify schema `{}`", notify.schema),
+        ));
+    }
+    let plan = BASE64.decode(notify.plan_b64.as_bytes()).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("plan_b64 is not valid base64: {err}"),
+        )
+    })?;
+    let sig = BASE64.decode(notify.sig_b64.as_bytes()).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("sig_b64 is not valid base64: {err}"),
+        )
+    })?;
+    Ok((plan, sig))
+}
+
+/// Resolve the update-channel policy into the action to take. Deny-by-default:
+/// `resolved_enabled()` is `false` for an absent (`None`) or `enabled: None/false`
+/// channel, so an operator must explicitly opt the environment in.
+fn notify_action(cfg: &UpdateChannelConfig) -> NotifyAction {
+    if !cfg.resolved_enabled() {
+        return NotifyAction::Ignore;
+    }
+    match cfg.resolved_on_notify() {
+        OnNotifyAction::RecordOnly => NotifyAction::Record,
+        OnNotifyAction::Stage => NotifyAction::Stage,
+    }
+}
+
+/// Whether `env_id` has an update channel configured — i.e. an
+/// `update-channel.json` sidecar exists under its env dir. Only such envs
+/// reserve `/v1/updates/notify`; every other env lets the path fall through to
+/// normal deployment routing (see the route gate in [`serve`]).
+fn update_channel_present(store_root: &std::path::Path, env_id: &str) -> bool {
+    match crate::runtime_config::env_dir_in(store_root, env_id) {
+        Ok(env_dir) => env_dir.join("update-channel.json").exists(),
+        Err(_) => false,
+    }
+}
+
+/// Verify a posted plan the way the stage path does — trusted-key DSSE signature
+/// plus target-env match — but WITHOUT staging it. Used by the record-only path
+/// so an enabled record-only channel records a *verified* notification. Reuses
+/// the shared [`verify_update_plan`] primitive (verification is not forked); a
+/// missing/empty trust root fails closed. Failures surface as the same
+/// [`OpError`] categories `map_op_error` maps for the stage path — verification
+/// or trust-root problems → 409, target-env mismatch → 400.
+fn verify_signed_plan(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    plan: &[u8],
+    sig: &[u8],
+) -> Result<(), NotifyError> {
+    let env_dir = crate::runtime_config::env_dir_in(store.root(), env_id.as_str())
+        .map_err(|err| NotifyError::Internal(format!("resolve env dir: {err}")))?;
+    let trust = load_trust_root(&env_dir).map_err(|err| {
+        NotifyError::Op(OpError::Conflict(format!(
+            "record-only verify: trust root unavailable: {err}"
+        )))
+    })?;
+    let verified = verify_update_plan(plan, sig, &trust).map_err(|err| {
+        NotifyError::Op(OpError::Conflict(format!(
+            "record-only verify: plan verification failed: {err}"
+        )))
+    })?;
+    if verified.plan.env_id.as_str() != env_id.as_str() {
+        return Err(NotifyError::Op(OpError::InvalidArgument(format!(
+            "record-only verify: plan targets env `{}`, not this environment",
+            verified.plan.env_id
+        ))));
+    }
+    Ok(())
+}
+
+/// Core of the receiver: load the env's update-channel policy and act on a
+/// notification — ignore (disabled), record (log only), or stage
+/// (download + DSSE-verify + stage the plan via the deployer `updates::get`).
+///
+/// Sync and internally blocking: `updates::get` downloads + verifies artifacts on
+/// a blocking runtime. The async handler runs this on a blocking thread so the
+/// request worker is never parked. Returns the HTTP status + JSON body on a
+/// resolved outcome, or a [`NotifyError`] the handler maps to a status.
+fn run_update_notify(
+    store: &LocalFsStore,
+    env_id: &str,
+    plan: &[u8],
+    sig: &[u8],
+) -> Result<(StatusCode, Value), NotifyError> {
+    let env_typed = EnvId::new(env_id).map_err(|err| {
+        NotifyError::Internal(format!("invalid environment id `{env_id}`: {err}"))
+    })?;
+    let cfg = store
+        .load_update_channel(&env_typed)
+        .map_err(|err| NotifyError::Internal(format!("failed to read update channel: {err}")))?
+        .unwrap_or_else(|| UpdateChannelConfig::disabled(env_typed.clone()));
+
+    match notify_action(&cfg) {
+        NotifyAction::Ignore => {
+            operator_log::info(
+                module_path!(),
+                format!("update-notify: channel disabled for env `{env_id}`, ignoring"),
+            );
+            Ok((
+                StatusCode::FORBIDDEN,
+                serde_json::json!({ "status": "disabled" }),
+            ))
+        }
+        NotifyAction::Record => {
+            // Record-only still VERIFIES the plan (trusted-key DSSE signature +
+            // target env) before recording: `on_notify` is the action on a
+            // *verified* notification, and the endpoint is not loopback-gated, so
+            // recording an unverified plan would let any caller forge the signal.
+            // Verify without staging — the Stage arm below verifies via
+            // `updates::get`.
+            verify_signed_plan(store, &env_typed, plan, sig)?;
+            operator_log::info(
+                module_path!(),
+                format!("update-notify: verified plan available for env `{env_id}` (record-only)"),
+            );
+            Ok((
+                StatusCode::ACCEPTED,
+                serde_json::json!({ "status": "recorded" }),
+            ))
+        }
+        NotifyAction::Stage => {
+            // Stage the posted bytes into a TempDir so the deployer's file-import
+            // path can read them. `dir` stays in scope until after `get()` returns
+            // (it reads the files synchronously) and is removed on drop.
+            let dir = tempfile::TempDir::new().map_err(|err| {
+                NotifyError::Internal(format!("failed to create temp dir: {err}"))
+            })?;
+            let plan_path = dir.path().join("plan.json");
+            let sig_path = dir.path().join("plan.json.sig");
+            std::fs::write(&plan_path, plan).map_err(|err| {
+                NotifyError::Internal(format!("failed to stage plan bytes: {err}"))
+            })?;
+            std::fs::write(&sig_path, sig).map_err(|err| {
+                NotifyError::Internal(format!("failed to stage signature bytes: {err}"))
+            })?;
+
+            let payload = UpdatesGetPayload {
+                environment_id: env_id.to_string(),
+                plan_url: None,
+                plan_file: Some(plan_path),
+                plan_sig_file: Some(sig_path),
+            };
+            let flags = OpFlags {
+                schema_only: false,
+                answers: None,
+            };
+            // Run for its staging side effect and discard the outcome: the
+            // deployer's `OpOutcome.result` carries the staging directory path and
+            // the trust-root key IDs that verified the plan, which must not leak to
+            // the off-host caller. Return only a category signal, matching the
+            // `disabled` / `recorded` arms above.
+            let _ = updates::get(store, &flags, Some(payload)).map_err(NotifyError::Op)?;
+            operator_log::info(
+                module_path!(),
+                format!("update-notify: staged update plan for env `{env_id}`"),
+            );
+            Ok((StatusCode::OK, serde_json::json!({ "status": "staged" })))
+        }
+    }
+}
+
+/// Map a deployer [`OpError`] from `updates::get` to an HTTP status with a
+/// category-only body. The full error is logged; the response body is a fixed
+/// per-status string so untrusted-signer, path, or trust-root details are never
+/// echoed back to the (unauthenticated) caller.
+fn map_op_error(err: &OpError) -> Response<Full<Bytes>> {
+    let status = match err {
+        // Untrusted signer, downgrade, or target-env mismatch, and trust-root
+        // failures are all "the plan is not acceptable here" → 409.
+        OpError::TrustRoot(_) | OpError::Conflict(_) => StatusCode::CONFLICT,
+        OpError::Unauthorized { .. } => StatusCode::FORBIDDEN,
+        OpError::NotFound(_) => StatusCode::NOT_FOUND,
+        OpError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+        // Artifact download failed against the plan/distributor endpoint.
+        OpError::Fetch(_) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    operator_log::warn(
+        module_path!(),
+        format!("update-notify: rejected ({status}): {err}"),
+    );
+    let message = match status {
+        StatusCode::CONFLICT => {
+            "update plan rejected (untrusted signer, downgrade, or env mismatch)"
+        }
+        StatusCode::FORBIDDEN => "update plan rejected by policy",
+        StatusCode::NOT_FOUND => "update plan or a referenced artifact was not found",
+        StatusCode::BAD_REQUEST => "update plan is malformed",
+        StatusCode::BAD_GATEWAY => "failed to fetch update artifacts",
+        _ => "internal error staging update plan",
+    };
+    text_response(status, message)
+}
+
+/// Handle `POST /v1/updates/notify`: read the posted signed plan, resolve the
+/// env's update-channel policy, and ignore / record / stage it. The heavy path
+/// (`updates::get` — download + DSSE-verify + stage) is sync and internally
+/// blocking, so it runs on a blocking thread and the request worker is never
+/// parked. NOT loopback-gated — see the route comment in [`serve`].
+async fn handle_update_notify(
+    req: Request<Incoming>,
+    state: Arc<ServeState>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let body = read_body_limited(req).await.map_err(|_| {
+        error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds the size limit",
+        )
+    })?;
+    let (plan, sig) =
+        decode_update_notify(&body).map_err(|(status, message)| error_response(status, message))?;
+
+    let env_id = state.current().routing.dispatcher.env_id().to_string();
+
+    let store_root = LocalFsStore::default_root().ok_or_else(|| {
+        operator_log::error(
+            module_path!(),
+            "update-notify: no environment store root (HOME unset)",
+        );
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "environment store unavailable",
+        )
+    })?;
+    let store = LocalFsStore::new(store_root);
+
+    let result =
+        tokio::task::spawn_blocking(move || run_update_notify(&store, &env_id, &plan, &sig))
+            .await
+            .map_err(|err| {
+                operator_log::error(
+                    module_path!(),
+                    format!("update-notify: worker task failed: {err}"),
+                );
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "update notify failed")
+            })?;
+
+    match result {
+        Ok((status, body)) => {
+            let bytes = serde_json::to_vec(&body).map_err(|err| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+            })?;
+            Ok(json_response(status, bytes))
+        }
+        Err(NotifyError::Op(err)) => Err(map_op_error(&err)),
+        Err(NotifyError::Internal(message)) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-notify: internal failure: {message}"),
+            );
+            Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error staging update plan",
+            ))
+        }
+    }
 }
 
 /// Map a runner reply [`Activity`] into a worker message. A rendered Adaptive
@@ -4846,5 +5198,190 @@ mod tests {
             !probe.is_live_elsewhere(dep_id, rev_removed),
             "a genuinely removed revision must NOT read as live elsewhere"
         );
+    }
+}
+
+#[cfg(test)]
+mod update_notify_tests {
+    use super::*;
+
+    fn env(id: &str) -> EnvId {
+        EnvId::new(id).expect("valid env id")
+    }
+
+    fn notify_body(schema: &str, plan: &[u8], sig: &[u8]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema": schema,
+            "plan_b64": BASE64.encode(plan),
+            "sig_b64": BASE64.encode(sig),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn decode_accepts_valid_body() {
+        let body = notify_body(UPDATE_NOTIFY_SCHEMA_V1, b"plan-bytes", b"sig-bytes");
+        let (plan, sig) = decode_update_notify(&body).expect("valid body decodes");
+        assert_eq!(plan, b"plan-bytes");
+        assert_eq!(sig, b"sig-bytes");
+    }
+
+    #[test]
+    fn decode_rejects_unknown_schema() {
+        let body = notify_body("greentic.update-notify.v99", b"p", b"s");
+        let (status, _) = decode_update_notify(&body).expect_err("unknown schema is rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decode_rejects_non_base64_payload() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schema": UPDATE_NOTIFY_SCHEMA_V1,
+            "plan_b64": "not valid base64!!",
+            "sig_b64": BASE64.encode(b"s"),
+        }))
+        .unwrap();
+        let (status, _) = decode_update_notify(&body).expect_err("bad base64 is rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decode_rejects_unknown_fields() {
+        // `deny_unknown_fields` guards against a plan server smuggling extra keys.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schema": UPDATE_NOTIFY_SCHEMA_V1,
+            "plan_b64": BASE64.encode(b"p"),
+            "sig_b64": BASE64.encode(b"s"),
+            "extra": "surprise",
+        }))
+        .unwrap();
+        let (status, _) = decode_update_notify(&body).expect_err("unknown field is rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decode_rejects_malformed_json() {
+        let (status, _) =
+            decode_update_notify(b"{not json").expect_err("malformed json is rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn notify_action_denies_by_default() {
+        // Absent operator opt-in must never stage: disabled(), enabled: None, and
+        // enabled: Some(false) all resolve to Ignore.
+        assert_eq!(
+            notify_action(&UpdateChannelConfig::disabled(env("local"))),
+            NotifyAction::Ignore
+        );
+
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = None;
+        cfg.on_notify = Some(OnNotifyAction::Stage);
+        assert_eq!(notify_action(&cfg), NotifyAction::Ignore);
+
+        cfg.enabled = Some(false);
+        assert_eq!(notify_action(&cfg), NotifyAction::Ignore);
+    }
+
+    #[test]
+    fn notify_action_enabled_branches() {
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+
+        cfg.on_notify = Some(OnNotifyAction::RecordOnly);
+        assert_eq!(notify_action(&cfg), NotifyAction::Record);
+
+        cfg.on_notify = Some(OnNotifyAction::Stage);
+        assert_eq!(notify_action(&cfg), NotifyAction::Stage);
+
+        // Unset on_notify resolves to Stage (the deploy-spec default).
+        cfg.on_notify = None;
+        assert_eq!(notify_action(&cfg), NotifyAction::Stage);
+    }
+
+    #[test]
+    fn map_op_error_status_mapping() {
+        assert_eq!(
+            map_op_error(&OpError::Conflict("downgrade".into())).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            map_op_error(&OpError::Unauthorized {
+                policy: "p".into(),
+                reason: "r".into()
+            })
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            map_op_error(&OpError::NotFound("plan".into())).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            map_op_error(&OpError::InvalidArgument("bad".into())).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            map_op_error(&OpError::Fetch("timeout".into())).status(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[test]
+    fn disabled_channel_does_not_stage() {
+        // End-to-end deny-by-default: a store with no update-channel policy resolves
+        // to disabled, so `run_update_notify` returns 403 WITHOUT ever calling
+        // `updates::get` — the garbage plan/sig below would error if it were staged.
+        let root = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("local")).expect("env dir");
+        let store = LocalFsStore::new(root.path().to_path_buf());
+
+        let (status, body) = run_update_notify(&store, "local", b"not-a-plan", b"not-a-sig")
+            .expect("disabled is Ok");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["status"], "disabled");
+    }
+
+    #[test]
+    fn record_only_rejects_unverified_plan() {
+        // Enabled + record-only still VERIFIES before recording. The env has no
+        // trust root and the bytes carry no valid DSSE signature, so verification
+        // fails closed and the request is REJECTED (409) — never `202 recorded`.
+        // (An unverified record would let any caller forge the notification.)
+        let root = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("local")).expect("env dir");
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.on_notify = Some(OnNotifyAction::RecordOnly);
+        std::fs::write(
+            root.path().join("local").join("update-channel.json"),
+            serde_json::to_vec(&cfg).expect("serialize channel"),
+        )
+        .expect("write channel");
+        let store = LocalFsStore::new(root.path().to_path_buf());
+
+        match run_update_notify(&store, "local", b"not-a-plan", b"not-a-sig") {
+            Err(NotifyError::Op(op)) => {
+                assert_eq!(map_op_error(&op).status(), StatusCode::CONFLICT);
+            }
+            other => panic!("expected verification rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_channel_present_reflects_the_sidecar() {
+        // The route only reserves `/v1/updates/notify` on envs that have run
+        // `op updates config-set` (an `update-channel.json` sidecar); every other
+        // env falls through to deployment routing.
+        let root = tempfile::TempDir::new().expect("tempdir");
+        assert!(!update_channel_present(root.path(), "local"));
+
+        std::fs::create_dir_all(root.path().join("local")).expect("env dir");
+        std::fs::write(root.path().join("local").join("update-channel.json"), b"{}")
+            .expect("write sidecar");
+        assert!(update_channel_present(root.path(), "local"));
+        // A different env is unaffected.
+        assert!(!update_channel_present(root.path(), "other"));
     }
 }
