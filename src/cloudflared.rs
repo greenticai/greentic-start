@@ -1,12 +1,33 @@
+//! Cloudflare quick-tunnel lifecycle against the machine-wide shared record
+//! (see [`crate::tunnel_state`]).
+//!
+//! One tunnel per (machine, port): every boot first consults the shared
+//! pidfile + URL cache under `~/.greentic/tunnel`, verifies the recorded
+//! tunnel still serves, and only spawns when nothing healthy exists. Kills
+//! are strictly pidfile-scoped — a cloudflared this code did not record is
+//! never touched (no `pgrep`/`pkill`), so setup-owned tunnels and other
+//! tenants' tunnels survive concurrent boots.
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::runtime_state::{RuntimePaths, atomic_write};
 use crate::supervisor::{self, ServiceId, ServiceSpec};
+use crate::tunnel_state;
 
 const SERVICE_ID: &str = "cloudflared";
 const URL_SUFFIX: &str = ".trycloudflare.com";
+
+/// How long a boot waits for another process racing through the
+/// check-then-spawn critical section. Spawn + URL discovery hold the lock for
+/// ~20s worst case.
+const LOCK_WAIT: Duration = Duration::from_secs(45);
+
+/// Probe budget when deciding whether a recorded tunnel still serves. Short
+/// on purpose: a dead edge fails fast, and a false negative only costs a
+/// restart (fresh URL), which is what pre-shared-record boots always did.
+const REUSE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct CloudflaredConfig {
@@ -22,47 +43,62 @@ pub struct CloudflaredHandle {
     pub log_path: PathBuf,
 }
 
+/// Acquire the shared quick tunnel for `config.local_port`: reuse the
+/// recorded one when it is alive and reachable, otherwise spawn a fresh
+/// cloudflared under the shared record. The caller's tenant-scoped
+/// `public_base_url.txt` (under `paths`) is updated either way, so existing
+/// readers (`startup_contract`, webhook updater) are unaffected.
 pub fn start_quick_tunnel(
     paths: &RuntimePaths,
     config: &CloudflaredConfig,
-    log_path: &Path,
 ) -> anyhow::Result<CloudflaredHandle> {
-    let pid_path = paths.pid_path(SERVICE_ID);
-    let url_path = public_url_path(paths);
+    let shared = tunnel_state::shared_runtime_paths(SERVICE_ID, config.local_port);
+    let shared_pid_path = shared.pid_path(SERVICE_ID);
+    let shared_url_path = public_url_path(&shared);
+    let shared_log_path = shared.log_path(SERVICE_ID);
+    let _lock = tunnel_state::TunnelLock::acquire(
+        &tunnel_state::lock_path(SERVICE_ID, config.local_port),
+        LOCK_WAIT,
+    )?;
+
+    adopt_legacy_record(paths, &shared_pid_path, &shared_url_path)?;
+
     if config.restart {
-        let _ = supervisor::stop_pidfile(&pid_path, 2_000);
+        let _ = supervisor::stop_pidfile(&shared_pid_path, 2_000);
+        let _ = std::fs::remove_file(&shared_url_path);
     }
 
-    // Reuse a still-running cloudflared that we own (valid PID file).
-    // This avoids DNS propagation delays on quick restarts.
-    if let Ok(Some(pid)) = read_pid(&pid_path)
+    // Reuse the recorded tunnel only when its process is alive AND its URL
+    // still serves. A recorded-but-dead tunnel is ours (pidfile-owned), so
+    // replacing it is safe.
+    if let Ok(Some(pid)) = read_pid(&shared_pid_path)
         && supervisor::is_running(pid)
     {
-        let log_path_buf = log_path.to_path_buf();
-        if let Some(url) = read_public_url(&url_path)? {
+        let recorded_url = match read_public_url(&shared_url_path)? {
+            Some(url) => Some(url),
+            None => discover_public_url(&shared_log_path, Duration::from_secs(10)).ok(),
+        };
+        if let Some(url) = recorded_url
+            && probe_tunnel_alive(&url, REUSE_PROBE_TIMEOUT)
+        {
+            write_public_url(&shared_url_path, &url)?;
+            mirror_public_url(paths, &url)?;
             return Ok(CloudflaredHandle {
                 url,
                 pid,
-                log_path: log_path_buf,
+                log_path: shared_log_path,
             });
         }
-        let url = discover_public_url(&log_path_buf, Duration::from_secs(10))?;
-        write_public_url(&url_path, &url)?;
-        return Ok(CloudflaredHandle {
-            url,
-            pid,
-            log_path: log_path_buf,
-        });
+        let _ = supervisor::stop_pidfile(&shared_pid_path, 2_000);
     }
 
-    // No valid owned process — kill any orphaned cloudflared from a
-    // previous session and start fresh.
-    if is_cloudflared_running() {
-        stop_cloudflared();
+    let _ = std::fs::remove_file(&shared_url_path);
+    let _ = std::fs::remove_file(&shared_pid_path);
+    if let Some(parent) = shared_log_path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    let _ = std::fs::remove_file(&url_path);
-    let _ = std::fs::remove_file(&pid_path);
-    let _ = std::fs::File::create(log_path);
+    // Truncate: URL discovery must not read a previous tunnel's URL.
+    let _ = std::fs::File::create(&shared_log_path);
 
     let mut argv = vec![
         config.binary.to_string_lossy().to_string(),
@@ -79,10 +115,10 @@ pub fn start_quick_tunnel(
         cwd: None,
         env: BTreeMap::new(),
     };
-    let log_path_buf = log_path.to_path_buf();
-    let handle = supervisor::spawn_service(paths, spec, Some(log_path_buf.clone()))?;
+    let handle = supervisor::spawn_service(&shared, spec, Some(shared_log_path.clone()))?;
     let url = discover_public_url(&handle.log_path, Duration::from_secs(10))?;
-    write_public_url(&url_path, &url)?;
+    write_public_url(&shared_url_path, &url)?;
+    mirror_public_url(paths, &url)?;
     Ok(CloudflaredHandle {
         url,
         pid: handle.pid,
@@ -90,30 +126,106 @@ pub fn start_quick_tunnel(
     })
 }
 
+/// Migrate a live tunnel recorded under the caller's pre-shared-record
+/// namespace (`pids/<tenant>.<team>/cloudflared.pid`) into the shared record
+/// instead of abandoning (or worse, racing) it. No-op when the shared record
+/// already points at a live process or no legacy record exists.
+fn adopt_legacy_record(
+    paths: &RuntimePaths,
+    shared_pid_path: &Path,
+    shared_url_path: &Path,
+) -> anyhow::Result<()> {
+    if let Ok(Some(pid)) = read_pid(shared_pid_path)
+        && supervisor::is_running(pid)
+    {
+        return Ok(());
+    }
+    let legacy_pid_path = paths.pid_path(SERVICE_ID);
+    let Some(pid) = read_pid(&legacy_pid_path).unwrap_or(None) else {
+        return Ok(());
+    };
+    if !supervisor::is_running(pid) {
+        let _ = std::fs::remove_file(&legacy_pid_path);
+        return Ok(());
+    }
+    if let Some(parent) = shared_pid_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write(shared_pid_path, pid.to_string().as_bytes())?;
+    if read_public_url(shared_url_path)?.is_none()
+        && let Some(url) = read_public_url(&public_url_path(paths))?
+    {
+        write_public_url(shared_url_path, &url)?;
+    }
+    let _ = std::fs::remove_file(&legacy_pid_path);
+    Ok(())
+}
+
+/// Copy the shared tunnel URL into the caller's tenant-scoped
+/// `public_base_url.txt` so per-boot readers keep working.
+fn mirror_public_url(paths: &RuntimePaths, url: &str) -> anyhow::Result<()> {
+    let path = public_url_path(paths);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_public_url(&path, url)
+}
+
+/// Stop every shared cloudflared record (all ports) via its pidfile and clear
+/// the cached URLs. Pidfile-scoped: processes this code did not record are
+/// never touched. Returns the record keys that were consumed.
+pub fn stop_shared_tunnels() -> Vec<String> {
+    let mut stopped = Vec::new();
+    for shared in tunnel_state::existing_shared_paths(SERVICE_ID) {
+        let pid_path = shared.pid_path(SERVICE_ID);
+        if pid_path.exists() && supervisor::stop_pidfile(&pid_path, 2_000).is_ok() {
+            stopped.push(shared.key());
+        }
+        let _ = std::fs::remove_file(public_url_path(&shared));
+    }
+    stopped
+}
+
+/// One HEAD probe. `Ok(true)` = the edge routed to a live origin (2xx/3xx, or
+/// any error status other than Cloudflare's 530 tunnel-down page — a 404 from
+/// the origin still proves the tunnel works). `Ok(false)` = the edge answered
+/// that the tunnel is down. `Err` = transport-level failure (DNS, TLS, ...).
+fn head_probe(url: &str) -> Result<bool, Box<ureq::Error>> {
+    match ureq::head(url).call() {
+        Ok(_) => Ok(true),
+        Err(ureq::Error::StatusCode(code)) => Ok(code != 530),
+        Err(err) => Err(Box::new(err)),
+    }
+}
+
+fn probe_tunnel_alive(url: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut attempt = 0u32;
+    loop {
+        if head_probe(url).unwrap_or(false) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        attempt += 1;
+        let delay = Duration::from_millis(200 * 2u64.pow(attempt.min(3)));
+        std::thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
 /// Verify the tunnel is reachable by making HTTP requests until one succeeds
 /// or the timeout elapses.  Returns `Ok(())` on success, or an error if the
 /// tunnel never became reachable within the deadline.
 pub fn wait_tunnel_ready(url: &str, timeout: Duration) -> anyhow::Result<()> {
-    let deadline = Instant::now() + timeout;
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        match ureq::head(url).call() {
-            Ok(_) => return Ok(()),
-            Err(_) if Instant::now() < deadline => {
-                // Exponential backoff: 200ms, 400ms, 800ms, capped at 2s
-                let delay = Duration::from_millis(200 * 2u64.pow(attempt.min(3)));
-                std::thread::sleep(delay.min(deadline - Instant::now()));
-            }
-            Err(err) => {
-                return Err(anyhow::anyhow!(
-                    "tunnel at {} not reachable after {:.0}s: {err}",
-                    url,
-                    timeout.as_secs_f64()
-                ));
-            }
-        }
+    if probe_tunnel_alive(url, timeout) {
+        return Ok(());
     }
+    Err(anyhow::anyhow!(
+        "tunnel at {} not reachable after {:.0}s",
+        url,
+        timeout.as_secs_f64()
+    ))
 }
 
 pub fn public_url_path(paths: &RuntimePaths) -> PathBuf {
@@ -209,41 +321,6 @@ pub fn cleanup_url_file(paths: &RuntimePaths) {
     let _ = std::fs::remove_file(&url_path);
 }
 
-/// Check whether a cloudflared process is running on this machine.
-fn is_cloudflared_running() -> bool {
-    #[cfg(unix)]
-    {
-        std::process::Command::new("pgrep")
-            .arg("cloudflared")
-            .stdout(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
-}
-
-/// Stop any orphaned cloudflared processes not tracked by pidfile.
-pub fn stop_cloudflared() {
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("pkill")
-            .args(["-9", "cloudflared"])
-            .status();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/IM", "cloudflared.exe", "/F"])
-            .status();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +387,7 @@ mod tests {
                 .join("public_base_url.txt")
         );
 
+        std::fs::create_dir_all(url_path.parent().expect("runtime dir")).expect("mkdir runtime");
         write_public_url(&url_path, "https://demo.trycloudflare.com").expect("write url");
         assert_eq!(
             read_public_url(&url_path).expect("read url"),
@@ -336,5 +414,80 @@ mod tests {
         let err = wait_tunnel_ready("https://127.0.0.1:1", Duration::from_millis(200))
             .expect_err("unreachable URL should fail");
         assert!(err.to_string().contains("not reachable"));
+    }
+
+    #[test]
+    fn adopt_legacy_record_moves_live_pid_and_url_into_shared_record() {
+        let dir = tempdir().expect("tempdir");
+        let legacy = RuntimePaths::new(dir.path().join("bundle-state"), "demo", "default");
+        let shared = RuntimePaths::new(
+            dir.path().join("tunnel").join("state"),
+            "shared",
+            "cloudflared-8080",
+        );
+        let shared_pid_path = shared.pid_path(SERVICE_ID);
+        let shared_url_path = public_url_path(&shared);
+        std::fs::create_dir_all(shared_url_path.parent().expect("runtime dir")).expect("mkdir");
+
+        // A pid that is definitely alive: our own.
+        let live_pid = std::process::id();
+        let legacy_pid_path = legacy.pid_path(SERVICE_ID);
+        std::fs::create_dir_all(legacy_pid_path.parent().expect("pids dir")).expect("mkdir");
+        std::fs::write(&legacy_pid_path, live_pid.to_string()).expect("write legacy pid");
+        let legacy_url_path = public_url_path(&legacy);
+        std::fs::create_dir_all(legacy_url_path.parent().expect("runtime dir")).expect("mkdir");
+        std::fs::write(&legacy_url_path, "https://demo.trycloudflare.com").expect("write url");
+
+        adopt_legacy_record(&legacy, &shared_pid_path, &shared_url_path).expect("adopt");
+
+        assert_eq!(
+            read_pid(&shared_pid_path).expect("shared pid"),
+            Some(live_pid)
+        );
+        assert_eq!(
+            read_public_url(&shared_url_path).expect("shared url"),
+            Some("https://demo.trycloudflare.com".to_string())
+        );
+        assert!(
+            !legacy_pid_path.exists(),
+            "legacy pidfile must be consumed on adoption"
+        );
+    }
+
+    #[test]
+    fn adopt_legacy_record_discards_dead_legacy_pid() {
+        let dir = tempdir().expect("tempdir");
+        let legacy = RuntimePaths::new(dir.path().join("bundle-state"), "demo", "default");
+        let shared = RuntimePaths::new(
+            dir.path().join("tunnel").join("state"),
+            "shared",
+            "cloudflared-8080",
+        );
+        let shared_pid_path = shared.pid_path(SERVICE_ID);
+        let shared_url_path = public_url_path(&shared);
+
+        let legacy_pid_path = legacy.pid_path(SERVICE_ID);
+        std::fs::create_dir_all(legacy_pid_path.parent().expect("pids dir")).expect("mkdir");
+        // u32::MAX is above every real pid_max — guaranteed not running.
+        std::fs::write(&legacy_pid_path, u32::MAX.to_string()).expect("write legacy pid");
+
+        adopt_legacy_record(&legacy, &shared_pid_path, &shared_url_path).expect("adopt");
+
+        assert_eq!(read_pid(&shared_pid_path).expect("shared pid"), None);
+        assert!(
+            !legacy_pid_path.exists(),
+            "dead legacy pidfile must be removed"
+        );
+    }
+
+    #[test]
+    fn mirror_public_url_creates_parent_dirs() {
+        let dir = tempdir().expect("tempdir");
+        let paths = RuntimePaths::new(dir.path().join("state"), "demo", "default");
+        mirror_public_url(&paths, "https://demo.trycloudflare.com").expect("mirror");
+        assert_eq!(
+            read_public_url(&public_url_path(&paths)).expect("read"),
+            Some("https://demo.trycloudflare.com".to_string())
+        );
     }
 }

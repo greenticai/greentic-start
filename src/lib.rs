@@ -102,6 +102,7 @@ pub mod supervisor;
 mod test_fixtures;
 mod timer_scheduler;
 mod tunnel_prompt;
+mod tunnel_state;
 mod warmup;
 mod webhook_secret_resolver;
 mod webhook_updater;
