@@ -19,6 +19,24 @@ pub use spec::{
 pub use verify::verify_pack_list;
 
 use std::path::PathBuf;
+use std::time::SystemTime;
+
+/// Poll-based change detection for `<env-home>/runtime-config.json`, used by
+/// the foreground shutdown loop (see `wait_for_shutdown` in `lib.rs`) to
+/// trigger a clean restart when greentic-deployer writes a new revision.
+///
+/// Returns `true` when `path`'s mtime is strictly newer than `baseline`, or
+/// when the file can no longer be read (e.g. deleted because traffic was
+/// cleared from the env). Slice-1a semantics: deletion is treated the same as
+/// a change — the supervisor is expected to restart into whatever state
+/// (redeployed or torn down) is now on disk, rather than have this process
+/// keep running against a stale/removed config.
+pub fn runtime_config_changed(path: &std::path::Path, baseline: SystemTime) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|modified| modified > baseline)
+        .unwrap_or(true)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum EnvHomeError {

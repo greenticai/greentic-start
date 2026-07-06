@@ -571,7 +571,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         ),
     );
     println!("\nReady. Press Ctrl+C to stop.");
-    let shutdown_reason = wait_for_shutdown(&runtime_paths)?;
+    let watched_runtime_config = request
+        .store_root
+        .as_deref()
+        .map(|store_root| store_root.join(&request.env).join("runtime-config.json"));
+    let shutdown_reason = wait_for_shutdown(&runtime_paths, watched_runtime_config)?;
     operator_log::info(
         module_path!(),
         format!(
@@ -866,6 +870,12 @@ fn load_tunnel_config(bundle_root: &std::path::Path) -> Option<TunnelConfig> {
 enum ShutdownReason {
     CtrlC,
     AdminStop,
+    /// The watched env-home `runtime-config.json` changed (redeploy) or was
+    /// deleted (traffic cleared). Slice-1a scope: this only detects the
+    /// change and asks the process to exit cleanly so an external supervisor
+    /// restarts it onto the new revision — no in-process hot-swap or graceful
+    /// drain here.
+    ConfigChanged,
 }
 
 impl ShutdownReason {
@@ -873,14 +883,32 @@ impl ShutdownReason {
         match self {
             Self::CtrlC => "ctrl_c",
             Self::AdminStop => "admin_stop",
+            Self::ConfigChanged => "config_changed",
         }
     }
 }
 
-fn wait_for_shutdown(paths: &runtime_state::RuntimePaths) -> anyhow::Result<ShutdownReason> {
+/// Blocks until Ctrl+C, an admin stop request, or (in env-home mode) a change
+/// to the watched `runtime-config.json` is observed.
+///
+/// `watched_runtime_config` is `Some(<env-home>/runtime-config.json)` when
+/// this process was started via `--store-root`/`--env`; `None` in bundle mode
+/// (`--bundle`/`--config`), which preserves today's behavior exactly — no
+/// third condition is ever checked.
+fn wait_for_shutdown(
+    paths: &runtime_state::RuntimePaths,
+    watched_runtime_config: Option<PathBuf>,
+) -> anyhow::Result<ShutdownReason> {
     let runtime =
         tokio::runtime::Runtime::new().context("failed to spawn runtime for Ctrl+C listener")?;
     let paths = paths.clone();
+    // Baseline captured once, before the loop starts, so the very first tick
+    // compares against the config's state at process start rather than
+    // against itself.
+    let baseline = watched_runtime_config
+        .as_deref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
     runtime.block_on(async move {
         loop {
             tokio::select! {
@@ -891,6 +919,12 @@ fn wait_for_shutdown(paths: &runtime_state::RuntimePaths) -> anyhow::Result<Shut
                 _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                     if runtime_state::read_stop_request(&paths)?.is_some() {
                         return Ok(ShutdownReason::AdminStop);
+                    }
+                    if let (Some(watched), Some(baseline)) =
+                        (watched_runtime_config.as_deref(), baseline)
+                        && crate::env_home::runtime_config_changed(watched, baseline)
+                    {
+                        return Ok(ShutdownReason::ConfigChanged);
                     }
                 }
             }
@@ -910,6 +944,34 @@ mod tests {
     use std::path::Path;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn detects_runtime_config_change_by_mtime() {
+        use crate::env_home::runtime_config_changed;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("runtime-config.json");
+        std::fs::write(&p, b"{}").unwrap();
+        let baseline = std::fs::metadata(&p).unwrap().modified().unwrap();
+        // no change yet
+        assert!(!runtime_config_changed(&p, baseline));
+        // touch with a newer mtime
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&p, b"{ }").unwrap();
+        assert!(runtime_config_changed(&p, baseline));
+    }
+
+    #[test]
+    fn runtime_config_changed_treats_deletion_as_a_change() {
+        use crate::env_home::runtime_config_changed;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("runtime-config.json");
+        std::fs::write(&p, b"{}").unwrap();
+        let baseline = std::fs::metadata(&p).unwrap().modified().unwrap();
+        std::fs::remove_file(&p).unwrap();
+        // Slice-1a semantics: a deleted runtime-config.json (traffic cleared)
+        // must also trigger a restart, same as a redeploy would.
+        assert!(runtime_config_changed(&p, baseline));
+    }
 
     #[test]
     fn build_trace_filter_clamps_noisy_targets_even_when_rust_log_unset() {
