@@ -7,7 +7,7 @@
 //! digest and compare against the pinned value, refusing to start on any
 //! mismatch or missing artifact.
 
-use super::{EnvHomeError, LockedPack, PackListLock};
+use super::{EnvHomeError, LockedPack, PackListLock, safe_join};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::io::Read;
@@ -17,9 +17,18 @@ use std::path::{Path, PathBuf};
 ///
 /// Reads in fixed-size chunks rather than loading the whole file into memory,
 /// since `.gtpack` artifacts may be large.
+///
+/// Only a `NotFound` open error is mapped to [`EnvHomeError::MissingArtifact`];
+/// any other I/O failure (permissions, etc.) is surfaced as
+/// [`EnvHomeError::Io`] instead of being misreported as "missing".
 fn sha256_hex(path: &Path) -> Result<String, EnvHomeError> {
-    let mut file =
-        std::fs::File::open(path).map_err(|_| EnvHomeError::MissingArtifact(path.to_path_buf()))?;
+    let mut file = std::fs::File::open(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            EnvHomeError::MissingArtifact(path.to_path_buf())
+        } else {
+            EnvHomeError::Io(err)
+        }
+    })?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -56,10 +65,7 @@ pub fn verify_pack_list(
         digest,
     } in &lock.packs
     {
-        let abs = env_home.join(path);
-        if !abs.exists() {
-            return Err(EnvHomeError::MissingArtifact(abs));
-        }
+        let abs = safe_join(env_home, path)?;
         let actual = sha256_hex(&abs)?;
         if &actual != digest {
             return Err(EnvHomeError::DigestMismatch {
@@ -144,6 +150,20 @@ mod tests {
         assert!(matches!(
             verify_pack_list(dir.path(), &lock).unwrap_err(),
             EnvHomeError::MissingArtifact(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_path_traversal_in_locked_pack_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_with(vec![LockedPack {
+            pack_id: "a".into(),
+            path: "../escape/a.gtpack".into(),
+            digest: "sha256:00".into(),
+        }]);
+        assert!(matches!(
+            verify_pack_list(dir.path(), &lock).unwrap_err(),
+            EnvHomeError::UnsafePath(_)
         ));
     }
 }

@@ -3,8 +3,10 @@
 //! `greentic-deployer` writes an "environment home" directory tree
 //! (`runtime-config.json`, per-revision `pack-list.lock` files, extracted
 //! `.gtpack` artifacts) that this module teaches `greentic-start` to read at
-//! boot, instead of relying solely on ad-hoc bundle refs. See the sub-project
-//! spec/plan docs under `.superpowers/sdd/` for the full slice-1a design.
+//! boot, instead of relying solely on ad-hoc bundle refs. See
+//! `docs/superpowers/specs/2026-07-06-env-home-loader-design.md` and
+//! `docs/superpowers/plans/2026-07-06-env-home-loader.md` for the full
+//! slice-1a design.
 mod loader;
 mod route;
 mod spec;
@@ -18,8 +20,29 @@ pub use spec::{
 };
 pub use verify::verify_pack_list;
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
+
+/// Join `rel` onto `base`, rejecting any component that is absolute
+/// (`Component::RootDir`/`Component::Prefix`) or a parent-directory (`..`)
+/// traversal.
+///
+/// Slice-1a trust assumption: the env-home tree is local and populated
+/// solely by the operator's own `greentic-deployer`, so this guard is not
+/// load-bearing today. It is defense-in-depth for a future remote/SP2 pack
+/// store, where `pack_list_refs` and `LockedPack::path` could originate from
+/// a less-trusted source.
+pub(crate) fn safe_join(base: &Path, rel: &Path) -> Result<PathBuf, EnvHomeError> {
+    for component in rel.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(EnvHomeError::UnsafePath(rel.to_path_buf()));
+            }
+        }
+    }
+    Ok(base.join(rel))
+}
 
 /// Poll-based change detection for `<env-home>/runtime-config.json`, used by
 /// the foreground shutdown loop (see `wait_for_shutdown` in `lib.rs`) to
@@ -58,6 +81,16 @@ pub enum EnvHomeError {
     NotDeployed { env: String, path: PathBuf },
     #[error("unexpected runtime-config schema: got `{got}`, expected `{RUNTIME_CONFIG_SCHEMA}`")]
     SchemaMismatch { got: String },
+    #[error("unexpected pack-list.lock schema: got `{got}`, expected `{PACK_LIST_LOCK_SCHEMA}`")]
+    PackListSchemaMismatch { got: String },
+    #[error(
+        "runtime-config.json env_id `{found}` does not match requested environment `{expected}`"
+    )]
+    EnvIdMismatch { expected: String, found: String },
+    #[error("pack-list.lock revision_id `{found}` does not match routed revision `{expected}`")]
+    RevisionMismatch { expected: String, found: String },
+    #[error("unsafe path reference (absolute or parent-dir traversal): {0}")]
+    UnsafePath(PathBuf),
     #[error(
         "invalid traffic split for deployment `{deployment_id}`: weights sum to {sum} bps, expected 10000"
     )]

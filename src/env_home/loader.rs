@@ -14,8 +14,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    EnvHomeError, PackListLock, RevisionRuntimeBlock, parse_runtime_config,
-    select_routed_revisions, verify_pack_list,
+    EnvHomeError, PACK_LIST_LOCK_SCHEMA, PackListLock, RevisionRuntimeBlock, parse_runtime_config,
+    safe_join, select_routed_revisions, verify_pack_list,
 };
 use crate::StartRequest;
 use crate::bundle_config::{self, DemoPaths};
@@ -37,6 +37,13 @@ fn routed_revision_block(env_home: &Path, env: &str) -> anyhow::Result<RevisionR
 
     let rc_bytes = std::fs::read(&rc_path).map_err(EnvHomeError::from)?;
     let rc = parse_runtime_config(&rc_bytes)?;
+    if rc.env_id != env {
+        return Err(EnvHomeError::EnvIdMismatch {
+            expected: env.to_string(),
+            found: rc.env_id,
+        }
+        .into());
+    }
     let routed = select_routed_revisions(&rc)?;
     let block = routed
         .first()
@@ -85,7 +92,7 @@ pub(crate) fn load_env_home(
     let block = routed_revision_block(&env_home, env)?;
 
     for lock_ref in &block.pack_list_refs {
-        let lock_path = env_home.join(lock_ref);
+        let lock_path = safe_join(&env_home, lock_ref)?;
         let lock_bytes = std::fs::read(&lock_path)
             .map_err(|_| EnvHomeError::MissingArtifact(lock_path.clone()))?;
         let lock: PackListLock =
@@ -93,6 +100,16 @@ pub(crate) fn load_env_home(
                 path: lock_path.clone(),
                 source,
             })?;
+        if lock.schema != PACK_LIST_LOCK_SCHEMA {
+            return Err(EnvHomeError::PackListSchemaMismatch { got: lock.schema }.into());
+        }
+        if lock.revision_id != block.revision_id {
+            return Err(EnvHomeError::RevisionMismatch {
+                expected: block.revision_id.clone(),
+                found: lock.revision_id,
+            }
+            .into());
+        }
         verify_pack_list(&env_home, &lock)?;
     }
 
@@ -235,6 +252,81 @@ mod tests {
         assert!(
             err.downcast_ref::<EnvHomeError>()
                 .map(|e| matches!(e, EnvHomeError::DigestMismatch { .. }))
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn pack_list_wrong_schema_is_rejected() {
+        let dir = fixture_env_home();
+        // Tamper with the lockfile's schema after the fixture pinned it.
+        std::fs::write(
+            dir.path().join("local/revisions/r1/pack-list.lock"),
+            r#"{"schema":"greentic.pack-list-lock.v2","revision_id":"r1","packs":[]}"#,
+        )
+        .unwrap();
+        let req = test_request();
+        let err = load_env_home(dir.path(), "local", &req).unwrap_err();
+        assert!(
+            err.downcast_ref::<EnvHomeError>()
+                .map(|e| matches!(e, EnvHomeError::PackListSchemaMismatch { .. }))
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn pack_list_wrong_revision_id_is_rejected() {
+        let dir = fixture_env_home();
+        // Lockfile claims a different revision than the one it's routed
+        // under (e.g. leftover/misplaced from another revision).
+        std::fs::write(
+            dir.path().join("local/revisions/r1/pack-list.lock"),
+            r#"{"schema":"greentic.pack-list-lock.v1","revision_id":"other-rev","packs":[]}"#,
+        )
+        .unwrap();
+        let req = test_request();
+        let err = load_env_home(dir.path(), "local", &req).unwrap_err();
+        assert!(
+            err.downcast_ref::<EnvHomeError>()
+                .map(|e| matches!(e, EnvHomeError::RevisionMismatch { .. }))
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn env_id_mismatch_is_rejected() {
+        let dir = fixture_env_home();
+        // The physical directory is `local`, but the runtime-config claims a
+        // different `env_id` — must not boot silently under the wrong name.
+        std::fs::write(
+            dir.path().join("local/runtime-config.json"),
+            r#"{"schema":"greentic.runtime-config.v1","env_id":"prod","revisions":[{"deployment_id":"d1","revision_id":"r1","bundle_id":"app","pack_list_refs":["revisions/r1/pack-list.lock"],"pack_config_refs":[],"weight_bps":10000}]}"#,
+        )
+        .unwrap();
+        let req = test_request();
+        let err = load_env_home(dir.path(), "local", &req).unwrap_err();
+        assert!(
+            err.downcast_ref::<EnvHomeError>()
+                .map(|e| matches!(e, EnvHomeError::EnvIdMismatch { .. }))
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn pack_list_ref_path_traversal_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join("local");
+        std::fs::create_dir_all(&env).unwrap();
+        std::fs::write(
+            env.join("runtime-config.json"),
+            r#"{"schema":"greentic.runtime-config.v1","env_id":"local","revisions":[{"deployment_id":"d1","revision_id":"r1","bundle_id":"app","pack_list_refs":["../escape.lock"],"pack_config_refs":[],"weight_bps":10000}]}"#,
+        )
+        .unwrap();
+        let req = test_request();
+        let err = load_env_home(dir.path(), "local", &req).unwrap_err();
+        assert!(
+            err.downcast_ref::<EnvHomeError>()
+                .map(|e| matches!(e, EnvHomeError::UnsafePath(_)))
                 .unwrap_or(false)
         );
     }

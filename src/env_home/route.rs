@@ -103,6 +103,17 @@ mod tests {
     }
 
     #[test]
+    fn selects_full_weight_block_ignoring_zero_weight_block() {
+        let cfg = rc(vec![
+            block("dep-1", "rev-zero", 0),
+            block("dep-1", "rev-full", 10000),
+        ]);
+        let sel = select_routed_revisions(&cfg).expect("select");
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].revision_id, "rev-full");
+    }
+
+    #[test]
     fn selects_one_revision_per_deployment_across_multiple_deployments() {
         let cfg = rc(vec![
             block("dep-1", "rev-1", 10000),
