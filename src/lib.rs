@@ -10,6 +10,7 @@ mod admin_server;
 mod bin_resolver;
 mod bundle_config;
 mod bundle_ref;
+mod business_event_listener;
 mod capabilities;
 mod cards;
 mod cli_args;
@@ -27,7 +28,10 @@ mod domains;
 mod endpoint_admit;
 mod endpoint_resolver;
 mod env_tunnel;
-mod event_router;
+// `pub` (doc-hidden) so `tests/threshold_watcher.rs` can drive
+// `select_target_flows` and the event-routing types directly.
+#[doc(hidden)]
+pub mod event_router;
 mod extension_resolver;
 mod fast2flow;
 pub(crate) mod flow_log;
@@ -37,9 +41,11 @@ mod http_routes;
 mod identify_payload;
 mod ingress;
 mod ingress_dispatch;
-mod ingress_types;
+#[doc(hidden)]
+pub mod ingress_types;
 mod llm;
-mod messaging_app;
+#[doc(hidden)]
+pub mod messaging_app;
 mod messaging_dto;
 mod messaging_egress;
 mod metrics;
@@ -100,7 +106,13 @@ mod subscriptions_universal;
 pub mod supervisor;
 #[cfg(test)]
 mod test_fixtures;
+// `pub` (doc-hidden) so `tests/threshold_watcher.rs` can drive `poll_once`
+// and the config/state/eval types directly, the same way `ws_test_support`
+// and `perf_harness` are exposed for their own integration tests.
+#[doc(hidden)]
+pub mod threshold_watcher;
 mod timer_scheduler;
+mod topic_match;
 mod tunnel_prompt;
 mod tunnel_state;
 mod warmup;

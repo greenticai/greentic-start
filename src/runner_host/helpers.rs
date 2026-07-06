@@ -262,6 +262,8 @@ pub(super) fn build_demo_host_config(tenant: &str) -> HostConfig {
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
         fast2flow: Fast2FlowRoutingConfig::default(),
+        agents: Default::default(),
+        graphs: Default::default(),
     }
 }
 
