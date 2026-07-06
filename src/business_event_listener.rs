@@ -43,10 +43,32 @@ use crate::runner_host::OperatorContext;
 /// (`greentic.events.<tenant>.<topic...>`; see [`topic_from_subject`]).
 const BUSINESS_EVENTS_SUBJECT: &str = "greentic.events.>";
 
-/// NATS queue group all `greentic-start` instances subscribe under so a
+/// Default NATS queue group `greentic-start` instances subscribe under so a
 /// business event is delivered to exactly one instance rather than every
 /// instance in a multi-instance deployment (FIX I1).
-const BUSINESS_EVENTS_QUEUE_GROUP: &str = "greentic-start-be-listener";
+///
+/// Overridable per deployment via `GREENTIC_BE_QUEUE_GROUP` (see
+/// [`resolve_queue_group`]) — distinct `greentic-start` deployments sharing
+/// one NATS server must use different queue groups, or NATS may deliver one
+/// deployment's event to the other (which can't route it), silently losing
+/// it. Same-bundle HA replicas should keep this default so they still form a
+/// single queue group.
+pub const DEFAULT_BUSINESS_EVENTS_QUEUE_GROUP: &str = "greentic-start-be-listener";
+
+/// Resolves the effective NATS queue group from an optional env value
+/// (`GREENTIC_BE_QUEUE_GROUP`), falling back to
+/// [`DEFAULT_BUSINESS_EVENTS_QUEUE_GROUP`] when the value is absent, empty,
+/// or whitespace-only.
+///
+/// Takes the env value as a parameter (rather than reading
+/// `std::env::var` itself) so it is deterministically testable; callers
+/// (`crate::runtime`) pass `std::env::var("GREENTIC_BE_QUEUE_GROUP").ok()`.
+pub fn resolve_queue_group(env_value: Option<String>) -> String {
+    match env_value.as_deref().map(str::trim) {
+        Some(trimmed) if !trimmed.is_empty() => trimmed.to_string(),
+        _ => DEFAULT_BUSINESS_EVENTS_QUEUE_GROUP.to_string(),
+    }
+}
 
 const SUBJECT_PREFIX: &str = "greentic.events.";
 
@@ -209,6 +231,10 @@ where
 pub struct BusinessEventListenerConfig {
     pub nats_url: String,
     pub bundle_root: PathBuf,
+    /// NATS queue group to `queue_subscribe` under (see
+    /// [`resolve_queue_group`]). Callers resolve this from
+    /// `GREENTIC_BE_QUEUE_GROUP` before constructing the config.
+    pub queue_group: String,
 }
 
 /// Handle to the background subscribe-loop thread. `start`/`stop` mirror
@@ -308,11 +334,13 @@ fn run_listener_thread(config: BusinessEventListenerConfig, shutdown_rx: oneshot
 /// Best-effort throughout: a connect or subscribe failure warns and returns
 /// without ever panicking the thread.
 ///
-/// FIX I1: uses `queue_subscribe` under [`BUSINESS_EVENTS_QUEUE_GROUP`]
-/// rather than a plain fan-out `subscribe`, so multiple `greentic-start`
-/// instances sharing the same NATS server form a queue group — each event
-/// is delivered to exactly one instance instead of every instance
-/// double-firing the same flow.
+/// FIX I1: uses `queue_subscribe` under `config.queue_group` (defaults to
+/// [`DEFAULT_BUSINESS_EVENTS_QUEUE_GROUP`], overridable via
+/// `GREENTIC_BE_QUEUE_GROUP` — see [`resolve_queue_group`]) rather than a
+/// plain fan-out `subscribe`, so multiple `greentic-start` instances sharing
+/// the same NATS server form a queue group — each event is delivered to
+/// exactly one instance instead of every instance double-firing the same
+/// flow.
 async fn run_listener_loop(
     config: BusinessEventListenerConfig,
     mut shutdown_rx: oneshot::Receiver<()>,
@@ -331,11 +359,9 @@ async fn run_listener_loop(
         }
     };
 
+    let queue_group = config.queue_group.clone();
     let mut subscriber = match client
-        .queue_subscribe(
-            BUSINESS_EVENTS_SUBJECT,
-            BUSINESS_EVENTS_QUEUE_GROUP.to_string(),
-        )
+        .queue_subscribe(BUSINESS_EVENTS_SUBJECT, queue_group.clone())
         .await
     {
         Ok(subscriber) => subscriber,
@@ -353,7 +379,7 @@ async fn run_listener_loop(
     operator_log::info(
         module_path!(),
         format!(
-            "business event listener subscribed subject={BUSINESS_EVENTS_SUBJECT} queue_group={BUSINESS_EVENTS_QUEUE_GROUP}"
+            "business event listener subscribed subject={BUSINESS_EVENTS_SUBJECT} queue_group={queue_group}"
         ),
     );
 
@@ -423,6 +449,30 @@ fn dispatch_message(message: async_nats::Message, bundle_root: &Path) {
 mod tests {
     use super::*;
     use greentic_types::{EnvId, EventEnvelope, EventId, TeamId, TenantCtx, TenantId};
+
+    #[test]
+    fn resolve_queue_group_uses_env_value_when_set() {
+        assert_eq!(
+            resolve_queue_group(Some("acme-prod".to_string())),
+            "acme-prod"
+        );
+    }
+
+    #[test]
+    fn resolve_queue_group_trims_and_defaults_on_unset_or_blank() {
+        assert_eq!(
+            resolve_queue_group(None),
+            DEFAULT_BUSINESS_EVENTS_QUEUE_GROUP
+        );
+        assert_eq!(
+            resolve_queue_group(Some("   ".to_string())),
+            DEFAULT_BUSINESS_EVENTS_QUEUE_GROUP
+        );
+        assert_eq!(
+            resolve_queue_group(Some("  acme-prod  ".to_string())),
+            "acme-prod"
+        );
+    }
 
     fn sample_tenant_ctx() -> TenantCtx {
         TenantCtx::new(
@@ -639,6 +689,7 @@ mod tests {
                 // and the thread warns + exits cleanly instead of blocking.
                 nats_url: "nats://127.0.0.1:59999".to_string(),
                 bundle_root: PathBuf::from("/nonexistent-bundle"),
+                queue_group: DEFAULT_BUSINESS_EVENTS_QUEUE_GROUP.to_string(),
             });
             listener.stop();
         });
