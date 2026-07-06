@@ -495,17 +495,14 @@ pub fn demo_up(
         );
     }
     if let Some(config) = cloudflared {
-        let cloudflared_log = operator_log::reserve_service_log(log_dir, "cloudflared")
-            .with_context(|| "unable to open cloudflared.log")?;
         operator_log::info(
             module_path!(),
             format!(
-                "starting cloudflared log={} bundle={}",
-                cloudflared_log.display(),
+                "starting cloudflared (shared machine-wide tunnel record) bundle={}",
                 bundle_root.display()
             ),
         );
-        let handle = cloudflared::start_quick_tunnel(&paths, &config, &cloudflared_log)?;
+        let handle = cloudflared::start_quick_tunnel(&paths, &config)?;
         operator_log::info(
             module_path!(),
             format!(
@@ -883,13 +880,11 @@ pub fn demo_up_services(
             if let Some(ref server) = ingress_server {
                 cfg.local_port = server.actual_port;
             }
-            let cloudflared_log = operator_log::reserve_service_log(log_dir, "cloudflared")
-                .with_context(|| "unable to open cloudflared.log")?;
             operator_log::info(
                 module_path!(),
-                format!("starting cloudflared log={}", cloudflared_log.display()),
+                "starting cloudflared (shared machine-wide tunnel record)",
             );
-            let handle = cloudflared::start_quick_tunnel(&paths, &cfg, &cloudflared_log)?;
+            let handle = cloudflared::start_quick_tunnel(&paths, &cfg)?;
             // Wait for the tunnel to become reachable before declaring it ready.
             match cloudflared::wait_tunnel_ready(&handle.url, std::time::Duration::from_secs(30)) {
                 Ok(()) => {
@@ -1574,9 +1569,11 @@ pub fn demo_down_runtime(
     let timeout_ms = 2_000;
     let paths = RuntimePaths::new(state_dir, tenant, team);
     stop_started_nats(&paths, state_dir)?;
-    // Kill any orphaned ngrok/cloudflared processes not tracked by pidfile
+    // ngrok teardown is still name-based (shared-record treatment is
+    // cloudflared-only for now); cloudflared stops strictly via the shared
+    // pidfile records — tunnels we did not record are never touched.
     ngrok::stop_ngrok();
-    cloudflared::stop_cloudflared();
+    let _ = cloudflared::stop_shared_tunnels();
     // Remove cached tunnel URL so a fresh URL is discovered on next start.
     cloudflared::cleanup_url_file(&paths);
     if all {

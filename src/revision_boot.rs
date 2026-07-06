@@ -689,7 +689,7 @@ mod tests {
 
         let refs = read_revision_pack_refs(env_dir, &rev, &[lock_path]).unwrap();
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].path, pack_abs);
+        assert_eq!(refs[0].path, pack_abs.canonicalize().unwrap());
         assert_eq!(refs[0].digest, "sha256:deadbeef");
     }
 

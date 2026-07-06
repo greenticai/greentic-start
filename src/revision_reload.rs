@@ -146,6 +146,8 @@ where
     P: FnMut(&Activation) + Send + 'static,
     S: FnMut() + Send + 'static,
 {
+    let env_dir = env_dir.canonicalize().unwrap_or(env_dir);
+
     // Activation triggers: paths whose mutations must invalidate the
     // RevisionServer's current activation. `runtime-config.json` is the
     // original trigger; `environment.json` is the M1.4c-ii fix so messaging

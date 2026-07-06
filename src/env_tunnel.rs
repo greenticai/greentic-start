@@ -12,8 +12,10 @@
 //! - logs:      `<env_dir>/logs/<service>.log`
 //!
 //! It reuses the same [`cloudflared`] / [`ngrok`] service modules as the
-//! legacy arm, so reuse-running-tunnel semantics (stable URL across quick
-//! restarts) and orphan cleanup behave identically. The tunnel deliberately
+//! legacy arm. Cloudflared tunnels live in the machine-wide shared record
+//! (see [`crate::tunnel_state`]) — the env pidfile namespace above only
+//! applies to ngrok and to pre-shared-record leftovers, which get adopted
+//! into the shared record on the next start. The tunnel deliberately
 //! OUTLIVES Ctrl+C — the next boot reuses it; `greentic-start stop` tears it
 //! down via the pidfile (see [`stop_env_tunnels`]).
 
@@ -99,11 +101,12 @@ pub(crate) fn start_env_tunnel(
             explicit_path: explicit_binary,
         },
     )?;
-    let log_path = operator_log::reserve_service_log(log_dir, service)?;
     let restart_service = crate::runtime::should_restart(&restart, service);
     let url = match choice {
         TunnelChoice::Off => unreachable!("Off returned above"),
         TunnelChoice::Cloudflared => {
+            // Logs live under the shared tunnel record, not this env's log
+            // dir — the tunnel is machine-wide and may outlive this boot.
             cloudflared::start_quick_tunnel(
                 &paths,
                 &cloudflared::CloudflaredConfig {
@@ -112,11 +115,11 @@ pub(crate) fn start_env_tunnel(
                     extra_args: Vec::new(),
                     restart: restart_service,
                 },
-                &log_path,
             )?
             .url
         }
         TunnelChoice::Ngrok => {
+            let log_path = operator_log::reserve_service_log(log_dir, service)?;
             ngrok::start_tunnel(
                 &paths,
                 &ngrok::NgrokConfig {
@@ -177,6 +180,11 @@ pub(crate) fn stop_env_tunnels(paths: &RuntimePaths) -> Vec<&'static str> {
             ),
         }
     }
+    // Cloudflared normally lives in the machine-wide shared record, not the
+    // env namespace swept above. Also pidfile-scoped — never a name-based kill.
+    if !cloudflared::stop_shared_tunnels().is_empty() && !stopped.contains(&"cloudflared") {
+        stopped.push("cloudflared");
+    }
     cloudflared::cleanup_url_file(paths);
     stopped
 }
@@ -218,9 +226,44 @@ mod tests {
         );
     }
 
+    /// Points the shared tunnel record at a tempdir for the duration of a
+    /// test, so stop paths never touch the developer's real ~/.greentic.
+    struct TunnelStateOverride {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TunnelStateOverride {
+        fn set(dir: &Path) -> Self {
+            let guard = crate::test_env_lock()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let previous = std::env::var_os("GREENTIC_TUNNEL_STATE_DIR");
+            // SAFETY: process-global env mutation serialized by test_env_lock.
+            unsafe { std::env::set_var("GREENTIC_TUNNEL_STATE_DIR", dir) };
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for TunnelStateOverride {
+        fn drop(&mut self) {
+            // SAFETY: still serialized by the held test_env_lock guard.
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var("GREENTIC_TUNNEL_STATE_DIR", value),
+                    None => std::env::remove_var("GREENTIC_TUNNEL_STATE_DIR"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn stop_env_tunnels_consumes_stale_pidfile_and_url_cache() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _tunnel_state = TunnelStateOverride::set(&dir.path().join("tunnel"));
         let paths = env_runtime_paths(dir.path(), "local");
         let pid_path = paths.pid_path("cloudflared");
         std::fs::create_dir_all(pid_path.parent().expect("pids dir")).expect("mkdir pids");
@@ -240,7 +283,33 @@ mod tests {
     #[test]
     fn stop_env_tunnels_is_a_no_op_without_pidfiles() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let _tunnel_state = TunnelStateOverride::set(&dir.path().join("tunnel"));
         let paths = env_runtime_paths(dir.path(), "local");
         assert!(stop_env_tunnels(&paths).is_empty());
+    }
+
+    #[test]
+    fn stop_env_tunnels_consumes_shared_record_pidfile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tunnel_root = dir.path().join("tunnel");
+        let _tunnel_state = TunnelStateOverride::set(&tunnel_root);
+        let paths = env_runtime_paths(dir.path(), "local");
+
+        let shared_pid_path = tunnel_root
+            .join("state")
+            .join("pids")
+            .join("shared.cloudflared-8080")
+            .join("cloudflared.pid");
+        std::fs::create_dir_all(shared_pid_path.parent().expect("pids dir")).expect("mkdir");
+        // u32::MAX is above every real pid_max — guaranteed not running.
+        std::fs::write(&shared_pid_path, u32::MAX.to_string()).expect("write pidfile");
+
+        let stopped = stop_env_tunnels(&paths);
+
+        assert_eq!(stopped, vec!["cloudflared"]);
+        assert!(
+            !shared_pid_path.exists(),
+            "stale shared pidfile must be removed"
+        );
     }
 }
