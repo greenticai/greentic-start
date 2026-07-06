@@ -32,6 +32,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0"
+async-nats = "0.46"
 async-trait = "0.1"
 base64 = "0.22"
 chrono = "0.4"
@@ -163,7 +164,7 @@ version = "2.5.2"
 
 [dependencies.tokio]
 version = "1"
-features = ["rt-multi-thread", "signal", "sync", "net"]
+features = ["rt-multi-thread", "signal", "sync", "net", "macros"]
 
 [dependencies.tokio-stream]
 version = "0.1"

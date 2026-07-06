@@ -10,6 +10,7 @@ mod admin_server;
 mod bin_resolver;
 mod bundle_config;
 mod bundle_ref;
+mod business_event_listener;
 mod capabilities;
 pub mod capability_discovery;
 mod cards;
