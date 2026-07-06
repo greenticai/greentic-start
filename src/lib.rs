@@ -24,6 +24,11 @@ mod dev_store_path;
 mod discovery;
 mod doctor;
 mod domains;
+// `pub` (doc-hidden) so integration tests in later env-home tasks can drive
+// the loader directly, the same way `ws_test_support` and `perf_harness` are
+// exposed for their own integration tests.
+#[doc(hidden)]
+pub mod env_home;
 pub mod event_router;
 mod fast2flow;
 pub(crate) mod flow_log;
