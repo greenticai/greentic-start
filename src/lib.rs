@@ -218,6 +218,10 @@ fn redis_endpoint_reachable(url: &str) -> bool {
 }
 
 fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
+    if request.store_root.is_some() && (request.bundle.is_some() || request.config.is_some()) {
+        anyhow::bail!("--store-root is mutually exclusive with --bundle/--config");
+    }
+
     // Disable provider-core-only mode in demo so WASM components can access secrets directly.
     // Without this, the runner-host blocks secrets_store.get() calls from WASM.
     // SAFETY: This is called early in single-threaded startup before spawning workers.
@@ -311,18 +315,30 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     // subscriber. Absent → file-only, today's behaviour.
     let _trace_guard = init_trace_log(&log_dir, peeked_telemetry.as_ref(), &peeked_service_name);
 
-    let demo_paths = match bundle_config::resolve_demo_paths(
-        request.config.clone(),
-        request.bundle.as_deref(),
-    ) {
-        Ok(paths) => paths,
-        Err(err) => {
-            operator_log::error(
-                module_path!(),
-                format!("resolve_demo_paths failed: {err:#}"),
-            );
-            return Err(err);
+    let (demo_paths, mut demo_config) = if let Some(store_root) = request.store_root.clone() {
+        match crate::env_home::load_env_home(&store_root, &request.env, &request) {
+            Ok(pair) => pair,
+            Err(err) => {
+                operator_log::error(module_path!(), format!("load_env_home failed: {err:#}"));
+                return Err(err);
+            }
         }
+    } else {
+        let demo_paths = match bundle_config::resolve_demo_paths(
+            request.config.clone(),
+            request.bundle.as_deref(),
+        ) {
+            Ok(paths) => paths,
+            Err(err) => {
+                operator_log::error(
+                    module_path!(),
+                    format!("resolve_demo_paths failed: {err:#}"),
+                );
+                return Err(err);
+            }
+        };
+        let demo_config = bundle_config::load_runtime_demo_config(&demo_paths, &request)?;
+        (demo_paths, demo_config)
     };
     let config_path = demo_paths.config_path.clone();
     let config_dir = demo_paths.root_dir.clone();
@@ -355,7 +371,6 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         }
     }
 
-    let mut demo_config = bundle_config::load_runtime_demo_config(&demo_paths, &request)?;
     apply_nats_overrides(&mut demo_config, &request);
 
     // Make the bundle's `llm:` instance available to every LLM consumer (the
@@ -608,10 +623,27 @@ const NOISY_TRACE_TARGETS: &[&str] = &[
 fn peek_startup_telemetry(
     request: &StartRequest,
 ) -> (Option<bundle_config::BundleTelemetryConfig>, String) {
-    let Ok(demo_paths) =
-        bundle_config::resolve_demo_paths(request.config.clone(), request.bundle.as_deref())
-    else {
-        return (None, "greentic".to_string());
+    let demo_paths = if let Some(store_root) = request.store_root.as_deref() {
+        // Env-home mode: resolve the routed revision's bundle dir cheaply
+        // (no pack-digest verification — that happens for real in
+        // `env_home::load_env_home` once logging is up). Best-effort, same
+        // as the `--bundle`/`--config` branch below: any failure here just
+        // means default telemetry/service-name until the real boot runs.
+        let Ok(bundle_dir) = crate::env_home::resolve_routed_bundle_dir(store_root, &request.env)
+        else {
+            return (None, "greentic".to_string());
+        };
+        let Ok(paths) = bundle_config::resolve_bundle_dir_paths(&bundle_dir) else {
+            return (None, "greentic".to_string());
+        };
+        paths
+    } else {
+        let Ok(paths) =
+            bundle_config::resolve_demo_paths(request.config.clone(), request.bundle.as_deref())
+        else {
+            return (None, "greentic".to_string());
+        };
+        paths
     };
     let bundle_yaml = demo_paths.root_dir.join("bundle.yaml");
     let telemetry = bundle_config::peek_bundle_telemetry(&bundle_yaml)

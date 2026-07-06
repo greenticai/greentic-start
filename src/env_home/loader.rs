@@ -14,31 +14,18 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    EnvHomeError, PackListLock, parse_runtime_config, select_routed_revisions, verify_pack_list,
+    EnvHomeError, PackListLock, RevisionRuntimeBlock, parse_runtime_config,
+    select_routed_revisions, verify_pack_list,
 };
 use crate::StartRequest;
 use crate::bundle_config::{self, DemoPaths};
 use crate::config::DemoConfig;
 
-/// Boot from `<store_root>/<env>`.
-///
-/// Reads `runtime-config.json`, selects the routed revision (slice 1a: a
-/// single fully-weighted revision per deployment), verifies every pack
-/// pinned by that revision's `pack_list_refs` lockfiles against their
-/// on-disk digest, then resolves and loads the routed revision's
-/// `<rev>/bundle/` directory exactly as the existing `--bundle` boot path
-/// does.
-///
-/// Never falls back to another boot mode: any parse, schema, traffic-split,
-/// missing-artifact, or digest-mismatch error aborts the boot.
-// Consumed by run_start in Task 6; not yet wired in-crate.
-#[allow(dead_code)]
-pub(crate) fn load_env_home(
-    store_root: &Path,
-    env: &str,
-    request: &StartRequest,
-) -> anyhow::Result<(DemoPaths, DemoConfig)> {
-    let env_home = store_root.join(env);
+/// Read `<env_home>/runtime-config.json` and select the single routed
+/// revision block for `env` (slice 1a: one fully-weighted revision per
+/// deployment). Shared by [`load_env_home`] (full boot, including pack
+/// verification) and [`resolve_routed_bundle_dir`] (cheap telemetry peek).
+fn routed_revision_block(env_home: &Path, env: &str) -> anyhow::Result<RevisionRuntimeBlock> {
     let rc_path = env_home.join("runtime-config.json");
     if !rc_path.exists() {
         return Err(EnvHomeError::NotDeployed {
@@ -54,9 +41,48 @@ pub(crate) fn load_env_home(
     let block = routed
         .first()
         .copied()
+        .cloned()
         .ok_or_else(|| EnvHomeError::NoRoutedRevision {
             env: env.to_string(),
         })?;
+    Ok(block)
+}
+
+/// Resolve the on-disk bundle directory (`<env_home>/revisions/<rev>/bundle`)
+/// for `<store_root>/<env>`'s routed revision, without verifying any pinned
+/// pack digests.
+///
+/// This exists solely for the pre-log-init startup-telemetry peek
+/// (`peek_startup_telemetry` in `lib.rs`), which is best-effort and must not
+/// hash every pinned pack before `operator.log` even exists. The real boot
+/// path is [`load_env_home`], which still performs full pack verification.
+pub(crate) fn resolve_routed_bundle_dir(store_root: &Path, env: &str) -> anyhow::Result<PathBuf> {
+    let env_home = store_root.join(env);
+    let block = routed_revision_block(&env_home, env)?;
+    Ok(env_home
+        .join("revisions")
+        .join(&block.revision_id)
+        .join("bundle"))
+}
+
+/// Boot from `<store_root>/<env>`.
+///
+/// Reads `runtime-config.json`, selects the routed revision (slice 1a: a
+/// single fully-weighted revision per deployment), verifies every pack
+/// pinned by that revision's `pack_list_refs` lockfiles against their
+/// on-disk digest, then resolves and loads the routed revision's
+/// `<rev>/bundle/` directory exactly as the existing `--bundle` boot path
+/// does.
+///
+/// Never falls back to another boot mode: any parse, schema, traffic-split,
+/// missing-artifact, or digest-mismatch error aborts the boot.
+pub(crate) fn load_env_home(
+    store_root: &Path,
+    env: &str,
+    request: &StartRequest,
+) -> anyhow::Result<(DemoPaths, DemoConfig)> {
+    let env_home = store_root.join(env);
+    let block = routed_revision_block(&env_home, env)?;
 
     for lock_ref in &block.pack_list_refs {
         let lock_path = env_home.join(lock_ref);

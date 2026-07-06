@@ -10,8 +10,7 @@ mod route;
 mod spec;
 mod verify;
 
-#[allow(unused_imports)]
-pub(crate) use loader::load_env_home;
+pub(crate) use loader::{load_env_home, resolve_routed_bundle_dir};
 pub use route::select_routed_revisions;
 pub use spec::{
     LockedPack, PACK_LIST_LOCK_SCHEMA, PackListLock, RUNTIME_CONFIG_SCHEMA, RevisionRuntimeBlock,
