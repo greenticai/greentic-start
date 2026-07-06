@@ -70,6 +70,10 @@ subtle = "2"
 sys-locale = "0.3"
 sysinfo = "0.39"
 tar = "0.4"
+# Runtime dep (not just dev): the update-notify receiver stages the posted plan
+# + DSSE sidecar into a TempDir so the deployer `updates::get` file-import path
+# can read them, then drops it after the staging call returns.
+tempfile = "3"
 thiserror = "2"
 tokio-rustls = "0.26"
 tokio-tungstenite = "0.29"
@@ -96,9 +100,12 @@ features = ["derive"]
 # console, and earlier publishes lack both the field and the method. Floor
 # bumped again to the M2 PR1 publish (deployer#335) — `revision_pull` reads
 # `Revision.bundle_source_uri` at boot to decide which bundles to pull, and
-# earlier publishes lack that field.
+# earlier publishes lack that field. Floor bumped again to the Phase-4 config
+# publish (deployer#424) — the update-notify receiver reads `UpdateChannelConfig`
+# / `OnNotifyAction` (per-env update-channel gate); earlier publishes lack those
+# types.
 [dependencies.greentic-deploy-spec]
-version = ">=0.1.27745539530, <0.2"
+version = ">=0.1.28777598365, <0.2"
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
 # (per-env trust root + operator key, deployer #226). Floor bumped to the
@@ -108,10 +115,25 @@ version = ">=0.1.27745539530, <0.2"
 # publishes lack both surfaces. Floor bumped again to the M2 PR2a publish
 # (deployer#337) — `revision_pull` calls
 # `cli::bundle_stage::materialize_revision_from_bundle` to stage a worker's
-# pulled bundle at boot; earlier publishes lack that function.
+# pulled bundle at boot; earlier publishes lack that function. Floor bumped to
+# the stable 1.1.3 release that carries the updater on the main lane — the
+# update-notify receiver calls `cli::updates::{get, UpdatesGetPayload}` +
+# `environment::LocalFsStore::load_update_channel`; earlier publishes lack the
+# `updates` module. A plain `>=1.1.3` (no `-dev` suffix) intentionally requires
+# the stable release, not the develop `1.1.3-dev.*` prereleases (updater ships
+# on main, so there is no pre-release matching to satisfy).
 [dependencies.greentic-deployer]
-version = ">=1.1.0-0, <1.2.0-0"
+version = ">=1.1.3, <1.2.0-0"
 default-features = false
+
+# The record-only update-notify path VERIFIES the posted plan (trusted-key DSSE
+# signature + target env) without staging it — reusing the same
+# `plan::verify_update_plan` primitive the deployer's `updates::get` uses for the
+# stage path, so verification lives in one shared crate rather than being forked.
+# Default features only (no `enroll`/`mtls`, which pull reqwest/rcgen). Floor at
+# the publish carrying `verify_update_plan` + `VerifiedUpdatePlan.plan.env_id`.
+[dependencies.greentic-update]
+version = ">=0.1.28607531727, <0.2"
 
 # Lower bound pinned to the first dev build exposing the `signing` module
 # (verify_artifact_dsse / TrustRoot); earlier 1.1.0-dev builds lack it. Floor
@@ -203,5 +225,4 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 # Enable greentic-llm's scriptable test double (TestLlmProvider) for unit tests
 # only — `test-mock` stays out of release builds.
 greentic-llm = { version = "1", features = ["test-mock"] }
-tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
