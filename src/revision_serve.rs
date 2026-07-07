@@ -496,6 +496,14 @@ impl RevisionServer {
                     loop {
                         tokio::select! {
                             _ = &mut shutdown => {
+                                // Stop the poll loop. The abort is prompt when the
+                                // task is sleeping between cycles (the common case).
+                                // A cycle already inside its `spawn_blocking`
+                                // (mid fetch/stage) runs to completion before the
+                                // runtime tears down — the same property the push
+                                // receiver's `spawn_blocking(run_update_notify)` has;
+                                // `updates::get`'s staging FSM is resumable, so no
+                                // half-staged state results, only a bounded delay.
                                 if let Some(task) = &update_poll_task {
                                     task.abort();
                                 }
@@ -1823,9 +1831,18 @@ fn poll_update_cycle(
                     body.get("status").and_then(|s| s.as_str()).unwrap_or("ok"),
                 ),
             );
-            // Advance only on a clean outcome so a transient failure re-attempts
-            // the same sequence next cycle.
-            (Some(meta.sequence), interval)
+            // Advance the remembered sequence ONLY when the plan was actually
+            // acted on (2xx = staged or recorded). A non-2xx `Ok` means the
+            // channel was disabled between this cycle's config read and the
+            // receiver's own re-read (a TOCTOU that yields 403 `disabled`);
+            // leaving the sequence unadvanced lets a re-enabled channel pick the
+            // plan up next cycle instead of skipping it until the server
+            // publishes a newer one.
+            if status.is_success() {
+                (Some(meta.sequence), interval)
+            } else {
+                (last_sequence, interval)
+            }
         }
         Err(NotifyError::Op(err)) => {
             operator_log::warn(
