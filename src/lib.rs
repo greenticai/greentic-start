@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 use clap::Parser;
@@ -893,6 +893,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
 
     let mut demo_config = bundle_config::load_runtime_demo_config(&demo_paths, &request)?;
     apply_nats_overrides(&mut demo_config, &request);
+    apply_setup_tunnel_handoff(&mut demo_config, &config_dir);
 
     // Make the bundle's `llm:` instance available to every LLM consumer (the
     // Fast2Flow routing fallback today; other features later). Peeked once at
@@ -1355,6 +1356,35 @@ fn apply_nats_overrides(config: &mut config::DemoConfig, args: &StartRequest) {
     }
 }
 
+/// Binds the gateway to the same local port `greentic-setup` already
+/// speculatively tunneled, when a handoff record exists (see
+/// `startup_contract::configured_gateway_port_from_handoff`). This makes the
+/// boot sequence's shared tunnel record recognise and adopt setup's tunnel
+/// instead of minting a disconnected second one on the configured/default
+/// port. A missing or unreadable handoff is not fatal — the gateway just
+/// keeps whatever port the bundle config (or its default) already specified.
+fn apply_setup_tunnel_handoff(config: &mut config::DemoConfig, config_dir: &Path) {
+    match crate::startup_contract::configured_gateway_port_from_handoff(config_dir) {
+        Ok(Some(port)) if port != config.services.gateway.port => {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "adopting setup tunnel handoff: binding gateway to port {port} (was {}) to reuse its tunnel",
+                    config.services.gateway.port
+                ),
+            );
+            config.services.gateway.port = port;
+        }
+        Ok(_) => {}
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!("failed to read setup tunnel handoff, ignoring: {err:#}"),
+            );
+        }
+    }
+}
+
 fn resolve_state_dir(state_dir: Option<PathBuf>, bundle: Option<&str>) -> anyhow::Result<PathBuf> {
     if let Some(state_dir) = state_dir {
         return Ok(state_dir);
@@ -1587,6 +1617,36 @@ mod tests {
         assert!(config.services.nats.enabled);
         assert!(!config.services.nats.spawn.enabled);
         assert_eq!(config.services.nats.url, "nats://127.0.0.1:5555");
+    }
+
+    #[test]
+    fn apply_setup_tunnel_handoff_binds_gateway_to_recorded_port() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let platform_dir = temp.path().join("state").join("config").join("platform");
+        std::fs::create_dir_all(&platform_dir).unwrap();
+        std::fs::write(
+            platform_dir.join("tunnel-handoff.json"),
+            r#"{"service":"cloudflared","local_port":54213,"public_base_url":"https://example.trycloudflare.com"}"#,
+        )
+        .unwrap();
+
+        let mut config = config::DemoConfig::default();
+        let original_port = config.services.gateway.port;
+        apply_setup_tunnel_handoff(&mut config, temp.path());
+
+        assert_eq!(config.services.gateway.port, 54213);
+        assert_ne!(config.services.gateway.port, original_port);
+    }
+
+    #[test]
+    fn apply_setup_tunnel_handoff_keeps_configured_port_without_a_handoff_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = config::DemoConfig::default();
+        let original_port = config.services.gateway.port;
+
+        apply_setup_tunnel_handoff(&mut config, temp.path());
+
+        assert_eq!(config.services.gateway.port, original_port);
     }
 
     #[test]

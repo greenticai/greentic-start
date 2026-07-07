@@ -1224,13 +1224,26 @@ pub fn demo_up_services(
         crate::webhook_updater::read_previous_public_url(&paths.runtime_root());
 
     // Resolve public_base_url with fallback to local HTTP listener for local dev.
-    // Precedence: tunnel > env-store > env var > local-listener derived.
+    // Precedence: tunnel > env-store > env var > setup static-routes > derived.
     // env-store wins over env var: it's the persisted operator intent set via
     // `gtc op env set-public-url`, while the env var is a process-level override.
+    // The setup-provided static-routes URL sits BELOW the env var on purpose, so
+    // `PUBLIC_BASE_URL` can always override a value baked in at setup time.
     //
     // Source attribution is computed in the same pass so the URL value and its
-    // `RuntimePublicBaseUrlSource` tag can't drift — adding a fifth source is
-    // one new `.or_else` arm instead of two parallel chains.
+    // `RuntimePublicBaseUrlSource` tag can't drift — adding a source is one new
+    // `.or_else` arm instead of two parallel chains.
+    let static_routes_public_base_url =
+        match crate::startup_contract::configured_public_base_url_from_static_routes(config_dir) {
+            Ok(value) => value,
+            Err(err) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!("failed to read static-routes public_base_url, falling back: {err:#}"),
+                );
+                None
+            }
+        };
     let derived_local_url = if ingress_server.is_some() && enable_static_routes {
         let host = &config.services.gateway.listen_addr;
         let port = ingress_server
@@ -1253,6 +1266,11 @@ pub fn demo_up_services(
             configured_public_base_url
                 .clone()
                 .map(|u| (u, RuntimePublicBaseUrlSource::Configured))
+        })
+        .or_else(|| {
+            static_routes_public_base_url
+                .clone()
+                .map(|u| (u, RuntimePublicBaseUrlSource::StaticRoutes))
         })
         .or_else(|| derived_local_url.map(|u| (u, RuntimePublicBaseUrlSource::Derived)));
     let public_base_url = url_with_source.as_ref().map(|(u, _)| u.clone());
