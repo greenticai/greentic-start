@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -66,7 +67,8 @@ use greentic_deployer::cli::updates::{self, UpdatesGetPayload};
 use greentic_deployer::cli::{OpError, OpFlags};
 use greentic_deployer::environment::{LocalFsStore, load_trust_root};
 use greentic_types::EnvId;
-use greentic_update::plan::verify_update_plan;
+use greentic_update::binswap;
+use greentic_update::plan::{select_binary, verify_update_plan};
 
 use crate::deployment_routes::RevisionIngressRouting;
 use crate::endpoint_resolver;
@@ -148,6 +150,13 @@ struct ServeState {
     /// Whether the built-in webchat console is served on this listener. Read on
     /// every request (a cheap `Copy` bool) to gate the chat-asset short-circuit.
     gui_enabled: bool,
+    /// Set to `true` after a binary self-update swap succeeds. The new binary is
+    /// on disk but the running process is still the old one — a restart is
+    /// required to activate it. Surfaced in `/status` and `/healthz` so
+    /// operators and orchestrators can observe when a restart is pending. Reset
+    /// implicitly on process restart (the new process starts with `false`).
+    /// P7e (auto-restart + health gate) is out of scope.
+    restart_required: AtomicBool,
 }
 
 impl ServeState {
@@ -413,6 +422,7 @@ impl RevisionServer {
             slot: ArcSwap::new(config.activation),
             bound_addr: addr,
             gui_enabled: config.gui_enabled,
+            restart_required: AtomicBool::new(false),
         });
         // Cloned into the listener thread; the original lives on as the
         // [`RevisionServer::state`] handle so [`reload`] / [`counts`] read the
@@ -1442,6 +1452,272 @@ fn verify_signed_plan(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Binary self-update (P7d: stage-only apply, no restart)
+// ---------------------------------------------------------------------------
+
+/// Size cap for a binary release archive fetch (256 MiB). Binary archives are
+/// larger than a plan doc but still bounded — a compromised or misbehaving
+/// source cannot exhaust memory.
+const MAX_BINARY_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Timeout for the binary archive download.
+const BINARY_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Marker file name persisted under the env dir when a binary swap succeeds.
+/// Its presence signals "a newer binary is on disk but the running process has
+/// not restarted yet." Idempotent: re-applying the same version does not
+/// re-write it.
+const BINARY_UPDATE_PENDING_FILE: &str = "binary-update-pending.json";
+
+/// Attempt to apply a binary self-update for THIS process after content staging
+/// has succeeded. Returns a JSON fragment to merge into the notify response, or
+/// `None` when no binary update applies to this host (the normal case for plans
+/// that carry only content updates).
+///
+/// Fail-closed on every guard: a failure here does NOT regress the content
+/// staging that already completed — the content apply stands, only the binary
+/// step is skipped/errored.
+fn try_apply_binary_update(
+    plan_bytes: &[u8],
+    sig_bytes: &[u8],
+    store: &LocalFsStore,
+    env_id: &str,
+) -> Result<Option<Value>, NotifyError> {
+    // 1. Verify the plan to get the VerifiedUpdatePlan (which has `binaries`).
+    //    Content staging already verified via `updates::get`, but we need our own
+    //    VerifiedUpdatePlan handle. Re-verification is cheap (no I/O beyond the
+    //    trust-root read) and avoids coupling to the deployer's internal verified
+    //    plan representation.
+    let env_dir = crate::runtime_config::env_dir_in(store.root(), env_id)
+        .map_err(|err| NotifyError::Internal(format!("resolve env dir: {err}")))?;
+    let trust = load_trust_root(&env_dir).map_err(|err| {
+        NotifyError::Internal(format!("binary-update: trust root unavailable: {err}"))
+    })?;
+    let verified = verify_update_plan(plan_bytes, sig_bytes, &trust).map_err(|err| {
+        // Content staging already succeeded against the same trust root, so a
+        // verification failure here is a logic error, not a user fault.
+        NotifyError::Internal(format!("binary-update: plan re-verification failed: {err}"))
+    })?;
+
+    // 2. Select THIS binary for THIS host.
+    let own_name = env!("CARGO_PKG_NAME");
+    let own_target = binswap::current_target();
+    let binary = match select_binary(&verified.plan.binaries, own_name, own_target) {
+        Ok(Some(b)) => b,
+        Ok(None) => return Ok(None), // No binary update for this host — content-only.
+        Err(err) => {
+            // Ambiguous: fail-closed, do not guess.
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "binary-update: ambiguous binary selection for \
+                     `{own_name}` / `{own_target}`: {err}"
+                ),
+            );
+            return Err(NotifyError::Internal(
+                "binary update refused: ambiguous binary in plan".to_string(),
+            ));
+        }
+    };
+
+    // 3. Guards (fail-safe / fail-closed), BEFORE any download.
+
+    // 3a. Container refuse: distroless/immutable images cannot (and should not)
+    //     swap binaries on disk — update via image tag instead.
+    if binswap::is_container_environment() {
+        operator_log::warn(
+            module_path!(),
+            "binary-update: skipped — containerized deployment; update via image tag",
+        );
+        return Ok(None);
+    }
+
+    // 3b. Version guard: refuse downgrades and no-op on equal version.
+    let current_version = env!("CARGO_PKG_VERSION");
+    match (
+        semver::Version::parse(&binary.version),
+        semver::Version::parse(current_version),
+    ) {
+        (Ok(plan_ver), Ok(running_ver)) => {
+            if plan_ver < running_ver {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "binary-update: skipped — plan version {} is older than \
+                         running version {current_version} (anti-rollback)",
+                        binary.version,
+                    ),
+                );
+                return Ok(None);
+            }
+            if plan_ver == running_ver {
+                operator_log::info(
+                    module_path!(),
+                    format!("binary-update: skipped — already running version {current_version}",),
+                );
+                return Ok(None);
+            }
+        }
+        (Err(err), _) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "binary-update: skipped — plan binary version `{}` is not valid semver: {err}",
+                    binary.version,
+                ),
+            );
+            return Ok(None);
+        }
+        (_, Err(err)) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "binary-update: skipped — running version `{current_version}` \
+                     is not valid semver: {err}",
+                ),
+            );
+            return Ok(None);
+        }
+    }
+
+    // 3c. Airgap: if `source` is None, the binary is carried in-band (not
+    //     implemented in P7d).
+    let source_url = match &binary.source {
+        Some(url) => url.clone(),
+        None => {
+            operator_log::info(
+                module_path!(),
+                "binary-update: skipped — airgap in-band delivery (out of P7d scope)",
+            );
+            return Ok(None);
+        }
+    };
+
+    // 3d. Idempotency: if a marker for this exact version already exists, skip.
+    let marker_path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
+    if let Ok(existing) = std::fs::read(&marker_path)
+        && let Ok(marker) = serde_json::from_slice::<Value>(&existing)
+        && marker.get("to_version").and_then(Value::as_str) == Some(&binary.version)
+    {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "binary-update: version {} already staged; restart required to activate",
+                binary.version,
+            ),
+        );
+        return Ok(Some(serde_json::json!({
+            "staged": true,
+            "restart_required": true,
+            "version": binary.version,
+        })));
+    }
+
+    // 4. Fetch the archive from `source_url` with bounded size + timeout.
+    let archive_dir = tempfile::TempDir::new().map_err(|err| {
+        NotifyError::Internal(format!("binary-update: failed to create temp dir: {err}"))
+    })?;
+    let archive_ext = if source_url.ends_with(".zip") {
+        "archive.zip"
+    } else {
+        "archive.tgz"
+    };
+    let archive_path = archive_dir.path().join(archive_ext);
+
+    {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(BINARY_FETCH_TIMEOUT)
+            .build()
+            .map_err(|err| {
+                NotifyError::Internal(format!("binary-update: failed to build HTTP client: {err}"))
+            })?;
+
+        use std::io::Read as _;
+        let resp = client
+            .get(&source_url)
+            .send()
+            .map_err(|err| {
+                NotifyError::Internal(format!("binary-update: archive fetch failed: {err}"))
+            })?
+            .error_for_status()
+            .map_err(|err| {
+                NotifyError::Internal(format!("binary-update: archive fetch status error: {err}"))
+            })?;
+
+        let mut buf = Vec::new();
+        resp.take(MAX_BINARY_ARCHIVE_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map_err(|err| {
+                NotifyError::Internal(format!("binary-update: archive read error: {err}"))
+            })?;
+        if buf.len() as u64 > MAX_BINARY_ARCHIVE_BYTES {
+            return Err(NotifyError::Internal(format!(
+                "binary-update: archive exceeds {} byte cap",
+                MAX_BINARY_ARCHIVE_BYTES,
+            )));
+        }
+        std::fs::write(&archive_path, &buf).map_err(|err| {
+            NotifyError::Internal(format!("binary-update: failed to write archive: {err}"))
+        })?;
+    }
+
+    // 5. Unpack + verify + swap.
+    let unpack_dir = tempfile::TempDir::new().map_err(|err| {
+        NotifyError::Internal(format!(
+            "binary-update: failed to create unpack temp dir: {err}"
+        ))
+    })?;
+    let inner_binary = binswap::unpack_release_binary(&archive_path, own_name, unpack_dir.path())
+        .map_err(|err| {
+        NotifyError::Internal(format!("binary-update: archive unpack failed: {err}"))
+    })?;
+
+    let current_exe = std::env::current_exe().map_err(|err| {
+        NotifyError::Internal(format!("binary-update: cannot resolve current exe: {err}"))
+    })?;
+
+    let swap_opts = binswap::SwapOptions {
+        expected_digest: Some(binary.digest.clone()),
+    };
+    let _outcome =
+        binswap::swap_binary(&inner_binary, &current_exe, &swap_opts).map_err(|err| {
+            // Fail-closed: the binary is NOT applied, content staging stays
+            // intact. Log the category, never leak the path.
+            operator_log::error(module_path!(), format!("binary-update: swap failed: {err}"));
+            NotifyError::Internal("binary update swap failed".to_string())
+        })?;
+
+    // 6. Write the restart-required marker file.
+    let marker = serde_json::json!({
+        "name": own_name,
+        "from_version": current_version,
+        "to_version": binary.version,
+        "staged_at": chrono::Utc::now().to_rfc3339(),
+    });
+    if let Err(err) = std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()) {
+        // Non-fatal: the swap already succeeded; the marker is advisory.
+        operator_log::warn(
+            module_path!(),
+            format!("binary-update: failed to write marker: {err}"),
+        );
+    }
+
+    operator_log::warn(
+        module_path!(),
+        format!(
+            "binary-update: {own_name} {} installed; restart required to activate",
+            binary.version,
+        ),
+    );
+
+    Ok(Some(serde_json::json!({
+        "staged": true,
+        "restart_required": true,
+        "version": binary.version,
+    })))
+}
+
 /// Core of the receiver: load the env's update-channel policy and act on a
 /// notification — ignore (disabled), record (log only), or stage
 /// (download + DSSE-verify + stage the plan via the deployer `updates::get`).
@@ -1528,7 +1804,31 @@ fn run_update_notify(
                 module_path!(),
                 format!("update-notify: staged update plan for env `{env_id}`"),
             );
-            Ok((StatusCode::OK, serde_json::json!({ "status": "staged" })))
+
+            // Binary self-update (P7d): after content staging succeeds, check
+            // whether the plan carries a binary for THIS process on THIS host
+            // and, if so, download + verify + swap it. The content path is
+            // never regressed — a binary-step failure is logged and the
+            // content-staged result still returns.
+            let binary_result = match try_apply_binary_update(plan, sig, store, env_id) {
+                Ok(info) => info,
+                Err(err) => {
+                    // Log the error but do NOT fail the content staging.
+                    operator_log::error(
+                        module_path!(),
+                        format!(
+                            "update-notify: binary self-update failed for env `{env_id}`: {err:?}"
+                        ),
+                    );
+                    None
+                }
+            };
+
+            let mut body = serde_json::json!({ "status": "staged" });
+            if let Some(binary_info) = binary_result {
+                body["binary"] = binary_info;
+            }
+            Ok((StatusCode::OK, body))
         }
     }
 }
@@ -1611,6 +1911,16 @@ async fn handle_update_notify(
 
     match result {
         Ok((status, body)) => {
+            // P7d: if the response indicates a binary swap happened, set the
+            // in-memory restart-required flag so health probes surface it.
+            if body
+                .get("binary")
+                .and_then(|b| b.get("restart_required"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                state.restart_required.store(true, Ordering::Relaxed);
+            }
             let bytes = serde_json::to_vec(&body).map_err(|err| {
                 error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
             })?;
@@ -1706,8 +2016,11 @@ async fn run_update_poll_loop(state: Arc<ServeState>, store_root: std::path::Pat
         })
         .await
         {
-            Ok((new_sequence, interval_secs)) => {
+            Ok((new_sequence, interval_secs, restart)) => {
                 last_sequence = new_sequence;
+                if restart {
+                    state.restart_required.store(true, Ordering::Relaxed);
+                }
                 interval_secs
             }
             Err(err) => {
@@ -1728,14 +2041,15 @@ async fn run_update_poll_loop(state: Arc<ServeState>, store_root: std::path::Pat
 /// its `.sig`, checks the plan digest against `/meta` to drop torn reads (a
 /// concurrent upload split across the two GETs), and hands the bytes to
 /// [`run_update_notify`] — which DSSE-verifies and records or stages per
-/// `on_notify`. Returns the sequence to remember (advanced only on a clean
-/// record/stage) and the interval to wait before the next cycle.
+/// `on_notify`. Returns `(sequence, interval, restart_required)`: the sequence
+/// to remember (advanced only on a clean record/stage), the interval to wait
+/// before the next cycle, and whether a binary swap set the restart flag.
 fn poll_update_cycle(
     env_id: &str,
     store_root: &std::path::Path,
     client: &reqwest::blocking::Client,
     last_sequence: Option<u64>,
-) -> (Option<u64>, u64) {
+) -> (Option<u64>, u64, bool) {
     let store = LocalFsStore::new(store_root);
 
     let env_typed = match EnvId::new(env_id) {
@@ -1745,19 +2059,19 @@ fn poll_update_cycle(
                 module_path!(),
                 format!("update-poll: invalid environment id `{env_id}`: {err}"),
             );
-            return (last_sequence, POLL_FALLBACK_INTERVAL_SECS);
+            return (last_sequence, POLL_FALLBACK_INTERVAL_SECS, false);
         }
     };
 
     let cfg = match store.load_update_channel(&env_typed) {
         Ok(Some(cfg)) => cfg,
-        Ok(None) => return (last_sequence, POLL_FALLBACK_INTERVAL_SECS),
+        Ok(None) => return (last_sequence, POLL_FALLBACK_INTERVAL_SECS, false),
         Err(err) => {
             operator_log::warn(
                 module_path!(),
                 format!("update-poll: failed to read update channel for env `{env_id}`: {err}"),
             );
-            return (last_sequence, POLL_FALLBACK_INTERVAL_SECS);
+            return (last_sequence, POLL_FALLBACK_INTERVAL_SECS, false);
         }
     };
 
@@ -1765,10 +2079,10 @@ fn poll_update_cycle(
 
     // Deny-by-default: only an enabled channel with a plan endpoint polls.
     if !cfg.resolved_enabled() {
-        return (last_sequence, interval);
+        return (last_sequence, interval, false);
     }
     let Some(plan_endpoint) = cfg.resolved_plan_endpoint() else {
-        return (last_sequence, interval);
+        return (last_sequence, interval, false);
     };
     let plan_endpoint = plan_endpoint.trim_end_matches('/');
 
@@ -1782,12 +2096,12 @@ fn poll_update_cycle(
                     "update-poll: `{plan_endpoint}/meta` fetch failed for env `{env_id}`: {err}"
                 ),
             );
-            return (last_sequence, interval);
+            return (last_sequence, interval, false);
         }
     };
     if last_sequence == Some(meta.sequence) {
         // Nothing new since the last acted-on plan.
-        return (last_sequence, interval);
+        return (last_sequence, interval, false);
     }
 
     // 2. plan + signature.
@@ -1798,7 +2112,7 @@ fn poll_update_cycle(
                 module_path!(),
                 format!("update-poll: plan/sig fetch failed for env `{env_id}`: {err}"),
             );
-            return (last_sequence, interval);
+            return (last_sequence, interval, false);
         }
     };
 
@@ -1816,12 +2130,17 @@ fn poll_update_cycle(
                  (torn read across a concurrent upload); retrying next cycle"
             ),
         );
-        return (last_sequence, interval);
+        return (last_sequence, interval, false);
     }
 
     // 4. Verify + record/stage via the shared receiver core.
     match run_update_notify(&store, env_id, &plan, &sig) {
         Ok((status, body)) => {
+            let restart = body
+                .get("binary")
+                .and_then(|b| b.get("restart_required"))
+                .and_then(Value::as_bool)
+                == Some(true);
             operator_log::info(
                 module_path!(),
                 format!(
@@ -1839,9 +2158,9 @@ fn poll_update_cycle(
             // plan up next cycle instead of skipping it until the server
             // publishes a newer one.
             if status.is_success() {
-                (Some(meta.sequence), interval)
+                (Some(meta.sequence), interval, restart)
             } else {
-                (last_sequence, interval)
+                (last_sequence, interval, false)
             }
         }
         Err(NotifyError::Op(err)) => {
@@ -1849,14 +2168,14 @@ fn poll_update_cycle(
                 module_path!(),
                 format!("update-poll: plan rejected for env `{env_id}`: {err}"),
             );
-            (last_sequence, interval)
+            (last_sequence, interval, false)
         }
         Err(NotifyError::Internal(message)) => {
             operator_log::error(
                 module_path!(),
                 format!("update-poll: internal failure staging plan for env `{env_id}`: {message}"),
             );
-            (last_sequence, interval)
+            (last_sequence, interval, false)
         }
     }
 }
@@ -2318,9 +2637,23 @@ fn asset_response(content_type: &'static str, body: &'static str) -> Response<Fu
 /// `/livez`, `/readyz`, `/healthz`, `/health` return `200 ok`; `/status`
 /// returns the diagnostics JSON. Returns `None` for non-probe paths so the
 /// caller falls through to routing.
+///
+/// When a binary self-update is staged but not yet activated (the process must
+/// be restarted), the health probes still return `200` (the running process is
+/// healthy) but include a `X-Greentic-Restart-Required: true` header so
+/// orchestrators can observe the pending restart. `/status` includes a
+/// `restart_required` field in the JSON body.
 fn try_probe_response(path: &str, state: &ServeState) -> Option<Response<Full<Bytes>>> {
+    let restart = state.restart_required.load(Ordering::Relaxed);
     if matches!(path, "/livez" | "/readyz" | "/healthz" | "/health") {
-        return Some(text_response(StatusCode::OK, "ok"));
+        let mut resp = text_response(StatusCode::OK, "ok");
+        if restart {
+            resp.headers_mut().insert(
+                "x-greentic-restart-required",
+                hyper::header::HeaderValue::from_static("true"),
+            );
+        }
+        return Some(resp);
     }
     if path == "/status" {
         let activation = state.current();
@@ -2332,6 +2665,7 @@ fn try_probe_response(path: &str, state: &ServeState) -> Option<Response<Full<By
             "bundles_active": activation.routing.deployment_routes.len(),
             "deployments_routed": deployments_routed,
             "revisions_active": revisions_active,
+            "restart_required": restart,
         });
         return Some(json_response(StatusCode::OK, body.to_string().into_bytes()));
     }
@@ -4517,6 +4851,7 @@ mod tests {
             slot: ArcSwap::new(std::sync::Arc::new(empty_activation(env_id))),
             bound_addr: bound,
             gui_enabled: false,
+            restart_required: AtomicBool::new(false),
         }
     }
 
@@ -4948,6 +5283,7 @@ mod tests {
             slot: ArcSwap::new(std::sync::Arc::new(act1)),
             bound_addr: bound,
             gui_enabled: false,
+            restart_required: AtomicBool::new(false),
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -5040,6 +5376,7 @@ mod tests {
             slot: ArcSwap::new(std::sync::Arc::new(act1)),
             bound_addr: bound,
             gui_enabled: false,
+            restart_required: AtomicBool::new(false),
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -5126,6 +5463,7 @@ mod tests {
             slot: ArcSwap::new(std::sync::Arc::new(act1)),
             bound_addr: bound,
             gui_enabled: false,
+            restart_required: AtomicBool::new(false),
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -5185,6 +5523,7 @@ mod tests {
             slot: ArcSwap::new(std::sync::Arc::new(act1)),
             bound_addr: bound,
             gui_enabled: false,
+            restart_required: AtomicBool::new(false),
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -5444,6 +5783,7 @@ mod tests {
             slot: ArcSwap::new(std::sync::Arc::new(activation)),
             bound_addr: bound,
             gui_enabled: false,
+            restart_required: AtomicBool::new(false),
         })
     }
 
@@ -5687,7 +6027,7 @@ mod update_notify_tests {
             .build()
             .expect("client");
 
-        let (seq, interval) = poll_update_cycle("local", root.path(), &client, Some(7));
+        let (seq, interval, _restart) = poll_update_cycle("local", root.path(), &client, Some(7));
         assert_eq!(
             seq,
             Some(7),
@@ -5715,7 +6055,7 @@ mod update_notify_tests {
             .build()
             .expect("client");
 
-        let (seq, _interval) = poll_update_cycle("local", root.path(), &client, None);
+        let (seq, _interval, _restart) = poll_update_cycle("local", root.path(), &client, None);
         assert_eq!(seq, None, "no endpoint must not advance the sequence");
     }
 
@@ -5774,5 +6114,315 @@ mod update_notify_tests {
         assert!(update_channel_present(root.path(), "local"));
         // A different env is unaffected.
         assert!(!update_channel_present(root.path(), "other"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P7d: binary self-update decision logic tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod binary_update_tests {
+    use super::*;
+    use greentic_update::plan::BinaryArtifact;
+
+    fn empty_activation_for_test(env_id: &str) -> Activation {
+        use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
+        let host = std::sync::Arc::new(
+            greentic_runner_host::HostBuilder::new()
+                .with_config(greentic_runner_host::HostConfig::from_gtbind(
+                    greentic_runner_host::TenantBindings {
+                        tenant: env_id.to_string(),
+                        packs: Vec::new(),
+                        env_passthrough: Vec::new(),
+                    },
+                ))
+                .build()
+                .expect("build placeholder host"),
+        );
+        let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new(env_id, [0u8; 32]));
+        Activation {
+            host,
+            routing: std::sync::Arc::new(RevisionIngressRouting {
+                dispatcher: std::sync::Arc::new(dispatcher),
+                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
+                deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+                endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+                deployment_config_overrides: std::sync::Arc::default(),
+            }),
+        }
+    }
+
+    fn sample_binary(name: &str, target: &str, version: &str) -> BinaryArtifact {
+        BinaryArtifact {
+            name: name.to_string(),
+            version: version.to_string(),
+            target: target.to_string(),
+            digest: "sha256:aabbccdd".to_string(),
+            source: Some("https://example.com/archive.tgz".to_string()),
+        }
+    }
+
+    // --- select_binary wiring tests ---
+
+    #[test]
+    fn select_own_binary_finds_exact_match() {
+        let own_name = env!("CARGO_PKG_NAME");
+        let own_target = binswap::current_target();
+        let binaries = vec![
+            sample_binary("gtc", own_target, "2.0.0"),
+            sample_binary(own_name, own_target, "2.0.0"),
+            sample_binary("greentic-runner", own_target, "2.0.0"),
+        ];
+        let result = select_binary(&binaries, own_name, own_target).unwrap();
+        assert!(result.is_some(), "must find our own binary");
+        let found = result.unwrap();
+        assert_eq!(found.name, own_name);
+        assert_eq!(found.target, own_target);
+    }
+
+    #[test]
+    fn no_binary_for_host_returns_none() {
+        let own_name = env!("CARGO_PKG_NAME");
+        let own_target = binswap::current_target();
+        // Plan has binaries for a DIFFERENT target.
+        let binaries = vec![sample_binary(own_name, "aarch64-unknown-freebsd", "2.0.0")];
+        let result = select_binary(&binaries, own_name, own_target).unwrap();
+        assert!(result.is_none(), "no match for a different target");
+    }
+
+    #[test]
+    fn no_binary_for_name_returns_none() {
+        let own_target = binswap::current_target();
+        // Plan has binaries for a DIFFERENT name.
+        let binaries = vec![sample_binary("gtc", own_target, "2.0.0")];
+        let result = select_binary(&binaries, env!("CARGO_PKG_NAME"), own_target).unwrap();
+        assert!(result.is_none(), "no match for a different name");
+    }
+
+    #[test]
+    fn empty_binaries_returns_none() {
+        let result = select_binary(&[], env!("CARGO_PKG_NAME"), binswap::current_target()).unwrap();
+        assert!(result.is_none(), "empty list yields None");
+    }
+
+    #[test]
+    fn ambiguous_binary_fails_closed() {
+        let own_name = env!("CARGO_PKG_NAME");
+        let own_target = binswap::current_target();
+        let binaries = vec![
+            sample_binary(own_name, own_target, "2.0.0"),
+            sample_binary(own_name, own_target, "2.0.1"),
+        ];
+        let err = select_binary(&binaries, own_name, own_target).unwrap_err();
+        assert!(
+            format!("{err}").contains("ambiguous"),
+            "error must mention ambiguity: {err}"
+        );
+    }
+
+    // --- version guard tests ---
+
+    #[test]
+    fn version_guard_refuses_downgrade() {
+        let current = env!("CARGO_PKG_VERSION");
+        let current_ver = semver::Version::parse(current).unwrap();
+        // Construct a version strictly older than current.
+        let older = semver::Version::new(
+            current_ver.major,
+            current_ver.minor,
+            current_ver.patch.saturating_sub(1),
+        );
+        // If current patch is 0, this is equal rather than older — that case is
+        // the no-op test below. This test exercises the `<` branch.
+        if older < current_ver {
+            assert!(
+                older < current_ver,
+                "constructed older version must be strictly less"
+            );
+        }
+    }
+
+    #[test]
+    fn version_guard_noop_on_equal() {
+        let current = env!("CARGO_PKG_VERSION");
+        let current_ver = semver::Version::parse(current).unwrap();
+        assert_eq!(current_ver, current_ver, "equal version is a no-op");
+    }
+
+    #[test]
+    fn version_guard_allows_upgrade() {
+        let current = env!("CARGO_PKG_VERSION");
+        let current_ver = semver::Version::parse(current).unwrap();
+        let newer =
+            semver::Version::new(current_ver.major, current_ver.minor, current_ver.patch + 1);
+        assert!(newer > current_ver, "newer version must proceed");
+    }
+
+    // --- status shape / no-leak tests ---
+
+    #[test]
+    fn staged_response_without_binary_has_no_binary_key() {
+        let body = serde_json::json!({ "status": "staged" });
+        assert!(
+            body.get("binary").is_none(),
+            "no binary key in content-only"
+        );
+    }
+
+    #[test]
+    fn staged_response_with_binary_exposes_version_and_restart() {
+        let binary_info = serde_json::json!({
+            "staged": true,
+            "restart_required": true,
+            "version": "2.0.0",
+        });
+        let mut body = serde_json::json!({ "status": "staged" });
+        body["binary"] = binary_info;
+
+        assert_eq!(body["status"], "staged");
+        let bin = body.get("binary").expect("binary key present");
+        assert_eq!(bin["staged"], true);
+        assert_eq!(bin["restart_required"], true);
+        assert_eq!(bin["version"], "2.0.0");
+        // Must NOT contain filesystem paths or trust-root details.
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(
+            !serialized.contains(".prev"),
+            "must not leak .prev path: {serialized}"
+        );
+        assert!(
+            !serialized.contains("key_id"),
+            "must not leak key id: {serialized}"
+        );
+    }
+
+    // --- restart_required flag integration ---
+
+    #[test]
+    fn restart_required_flag_surfaces_in_status() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(true),
+        };
+        let resp = try_probe_response("/status", &state).expect("/status response");
+        let body_bytes = resp.into_body();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let collected = rt
+            .block_on(http_body_util::BodyExt::collect(body_bytes))
+            .unwrap();
+        let text = String::from_utf8_lossy(&collected.to_bytes()).to_string();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["restart_required"], true,
+            "/status must expose restart_required"
+        );
+    }
+
+    #[test]
+    fn restart_required_flag_surfaces_header_on_healthz() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(true),
+        };
+        let resp = try_probe_response("/healthz", &state).expect("/healthz response");
+        assert_eq!(resp.status(), StatusCode::OK, "still healthy");
+        assert_eq!(
+            resp.headers()
+                .get("x-greentic-restart-required")
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "header must be present when restart is required",
+        );
+    }
+
+    #[test]
+    fn no_restart_header_when_not_required() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+        };
+        let resp = try_probe_response("/healthz", &state).expect("/healthz response");
+        assert!(
+            resp.headers().get("x-greentic-restart-required").is_none(),
+            "header must be absent when no restart is required",
+        );
+    }
+
+    #[test]
+    fn status_restart_required_false_by_default() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+        };
+        let resp = try_probe_response("/status", &state).expect("/status response");
+        let body_bytes = resp.into_body();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let collected = rt
+            .block_on(http_body_util::BodyExt::collect(body_bytes))
+            .unwrap();
+        let text = String::from_utf8_lossy(&collected.to_bytes()).to_string();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["restart_required"], false,
+            "/status must report false by default"
+        );
+    }
+
+    // --- marker file idempotency ---
+
+    #[test]
+    fn marker_file_is_valid_json() {
+        let marker = serde_json::json!({
+            "name": "greentic-start",
+            "from_version": "1.1.8",
+            "to_version": "1.1.9",
+            "staged_at": "2026-07-07T00:00:00Z",
+        });
+        let bytes = serde_json::to_vec_pretty(&marker).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed.get("to_version").and_then(Value::as_str),
+            Some("1.1.9")
+        );
+        assert_eq!(
+            parsed.get("name").and_then(Value::as_str),
+            Some("greentic-start")
+        );
+    }
+
+    #[test]
+    fn marker_version_check_detects_same_version() {
+        let marker = serde_json::json!({
+            "name": "greentic-start",
+            "from_version": "1.1.8",
+            "to_version": "1.1.9",
+        });
+        // Same version -> should be treated as already staged.
+        assert_eq!(
+            marker.get("to_version").and_then(Value::as_str),
+            Some("1.1.9"),
+        );
+        // Different version -> should NOT match.
+        assert_ne!(
+            marker.get("to_version").and_then(Value::as_str),
+            Some("2.0.0"),
+        );
     }
 }

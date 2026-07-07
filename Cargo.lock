@@ -3489,23 +3489,27 @@ dependencies = [
 
 [[package]]
 name = "greentic-update"
-version = "0.1.28607531727"
+version = "0.1.28859386871"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd32a91765c9ec536cdbdd98274a70f08f521fff2518c41bf2e32a3611c0c4b7"
+checksum = "a47eb7b004ef9ad38b5d11acd9561c4b0cf28f9126c9cfe1d86fcf8ae66c6691"
 dependencies = [
  "chrono",
+ "flate2",
  "fs4",
  "greentic-distributor-client",
  "hex",
  "rcgen",
  "reqwest 0.13.4",
+ "self-replace",
  "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "x509-parser",
+ "zip 2.4.2",
 ]
 
 [[package]]
@@ -6625,6 +6629,17 @@ checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "self-replace"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03ec815b5eab420ab893f63393878d89c90fdd94c0bcc44c07abb8ad95552fb7"
+dependencies = [
+ "fastrand",
+ "tempfile",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
