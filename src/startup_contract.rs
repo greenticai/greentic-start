@@ -186,6 +186,40 @@ pub fn configured_public_base_url_from_static_routes(
     Ok(normalize_public_base_url(raw_url).ok())
 }
 
+/// Reads the local port `greentic-setup` recorded when it started a
+/// speculative tunnel during setup (`tunnel-handoff.json`, written by
+/// `greentic-setup::platform_setup::persist_tunnel_handoff_artifact`).
+///
+/// Binding the gateway to this same port lets the boot sequence's shared
+/// tunnel record (`tunnel_state.rs`, protocol-compatible with `greentic-setup`'s
+/// own copy) recognise and adopt the tunnel setup already established,
+/// instead of picking its own default/fallback port and minting a second,
+/// disconnected tunnel — which would leave whatever URL was registered with
+/// providers like Slack (Event Subscriptions, etc.) pointing at a tunnel
+/// nothing is listening behind anymore.
+///
+/// Returns `Ok(None)` when the file is absent or carries no usable port — a
+/// missing or malformed handoff must never block startup; the gateway just
+/// falls back to its configured/default port as before.
+pub fn configured_gateway_port_from_handoff(config_dir: &Path) -> anyhow::Result<Option<u16>> {
+    let path = config_dir
+        .join("state")
+        .join("config")
+        .join("platform")
+        .join("tunnel-handoff.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(doc
+        .get("local_port")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok()))
+}
+
 /// Reads the persisted `public_base_url` from the deployer-managed env store.
 ///
 /// Returns `Ok(None)` when the env directory is missing (cold start before
@@ -334,6 +368,36 @@ mod tests {
         let inspection = inspect_bundle(dir.path())?;
         assert!(inspection.bundle_has_static_routes());
         assert_eq!(inspection.pack_paths, vec![pack_path]);
+        Ok(())
+    }
+
+    #[test]
+    fn configured_gateway_port_from_handoff_reads_setup_written_port() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        assert_eq!(configured_gateway_port_from_handoff(dir.path())?, None);
+
+        let platform_dir = dir.path().join("state").join("config").join("platform");
+        std::fs::create_dir_all(&platform_dir)?;
+        std::fs::write(
+            platform_dir.join("tunnel-handoff.json"),
+            r#"{"service":"cloudflared","local_port":8080,"public_base_url":"https://example.trycloudflare.com"}"#,
+        )?;
+
+        assert_eq!(
+            configured_gateway_port_from_handoff(dir.path())?,
+            Some(8080)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn configured_gateway_port_from_handoff_ignores_malformed_file() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let platform_dir = dir.path().join("state").join("config").join("platform");
+        std::fs::create_dir_all(&platform_dir)?;
+        std::fs::write(platform_dir.join("tunnel-handoff.json"), "not json")?;
+
+        assert!(configured_gateway_port_from_handoff(dir.path()).is_err());
         Ok(())
     }
 
