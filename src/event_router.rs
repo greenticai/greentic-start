@@ -6,9 +6,9 @@ use serde_json::{Value as JsonValue, json};
 use crate::domains::Domain;
 use crate::ingress_types::EventEnvelopeV1;
 use crate::messaging_app as app;
+use crate::messaging_app::{AppFlowInfo, AppPackInfo};
 use crate::operator_log;
 use crate::runner_exec::{self, RunRequest};
-use crate::messaging_app::{AppFlowInfo, AppPackInfo};
 use crate::runner_host::OperatorContext;
 
 /// Return the flows whose `subscribes_to` patterns match `event_type`.

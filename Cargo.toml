@@ -116,9 +116,15 @@ features = ["derive"]
 # earlier publishes lack that field. Floor bumped again to the Phase-4 config
 # publish (deployer#424) — the update-notify receiver reads `UpdateChannelConfig`
 # / `OnNotifyAction` (per-env update-channel gate); earlier publishes lack those
-# types.
+# types. Floor bumped to the 0.2.x line (deployer#430 `plan_endpoint` +
+# deployer#434 forward-compat catch-all) — the P6.4 poll loop calls
+# `UpdateChannelConfig::resolved_plan_endpoint()` (0.2.0) and relies on the
+# unknown-field preservation (0.2.1); earlier publishes lack both. A `>=0.2.1`
+# floor also keeps a SINGLE deploy-spec copy in the tree: `greentic-deployer`
+# (below) pulls deploy-spec transitively, so both must land on `^0.2` or the
+# build resolves two copies and the deploy-spec types stop unifying (E0308).
 [dependencies.greentic-deploy-spec]
-version = ">=0.1.28777598365, <0.2"
+version = ">=0.2.1, <0.3"
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
 # (per-env trust root + operator key, deployer #226). Floor bumped to the
@@ -134,16 +140,20 @@ version = ">=0.1.28777598365, <0.2"
 # `environment::LocalFsStore::load_update_channel`; earlier publishes lack the
 # `updates` module. A plain `>=1.1.3` (no `-dev` suffix) intentionally requires
 # the stable release, not the develop `1.1.3-dev.*` prereleases (updater ships
-# on main, so there is no pre-release matching to satisfy).
+# on main, so there is no pre-release matching to satisfy). Floor bumped to
+# 1.1.7 to unify deploy-spec at `^0.2`: 1.1.7 depends on deploy-spec 0.2.x
+# (same line this crate pins directly above), so a single deploy-spec copy
+# resolves. A lower deployer (1.1.3–1.1.6) would drag in deploy-spec `^0.1`
+# transitively and collide with the `^0.2` direct pin (two copies → E0308).
 [dependencies.greentic-deployer]
-version = ">=1.1.3, <1.2.0-0"
+version = ">=1.1.7, <1.2.0-0"
 default-features = false
 
 # Agentic Worker (dw.agent) serve runtime, from the research (agentic) lineage.
 # Version pin kept from research for now; re-pin once the merged runner is
 # republished.
 [dependencies.greentic-aw-runtime]
-version = "=1.1.4"
+version = "=1.1.5"
 default-features = false
 
 # Lower bound pinned to the first dev build exposing the `signing` module
@@ -164,12 +174,12 @@ features = ["pack-fetch"]
 # main's greentic-runner#466 flow-node component-id resolution floor, which must
 # be re-asserted after the merged runner build.
 [dependencies.greentic-runner-desktop]
-version = "=1.1.4"
+version = "=1.1.5"
 default-features = false
 features = ["agentic-worker", "greentic-llm-backend", "desktop-agent-ephemeral"]
 
 [dependencies.greentic-runner-host]
-version = "=1.1.4"
+version = "=1.1.5"
 default-features = false
 features = ["agentic-worker", "greentic-llm-backend"]
 
