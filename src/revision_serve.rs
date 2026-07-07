@@ -423,6 +423,16 @@ impl RevisionServer {
         // `ServeState`. AND-ed into the per-connection loopback decision below.
         let trust_loopback_peers = config.trust_loopback_peers;
 
+        // Updater pull path: if this env has an `update-channel.json` sidecar,
+        // the ingress runtime runs a poll loop against its configured plan
+        // endpoint (see `run_update_poll_loop`). Resolved here so the gate reads
+        // the same env id the listener serves; `None` (no store root or no
+        // sidecar) → no poll task is ever spawned (deny-by-default).
+        let update_poll_root = LocalFsStore::default_root().filter(|root| {
+            update_channel_present(root, state.current().routing.dispatcher.env_id())
+        });
+        let poll_state = Arc::clone(&state);
+
         let (tx, rx) = oneshot::channel();
         // The startup channel ships the Tokio runtime handle alongside the
         // bind result so [`reload`] can schedule the overlap-window drop of
@@ -476,10 +486,29 @@ impl RevisionServer {
                             format!("revision ingress admin/console listening on http://{a}"),
                         );
                     }
+                    // Spawn the updater poll loop on this runtime when the env
+                    // opted in (sidecar present). It re-reads config each cycle,
+                    // so a disabled or endpoint-less channel simply no-ops.
+                    // Aborted on shutdown below.
+                    let update_poll_task = update_poll_root
+                        .map(|root| tokio::spawn(run_update_poll_loop(poll_state, root)));
                     let mut shutdown = rx;
                     loop {
                         tokio::select! {
-                            _ = &mut shutdown => break,
+                            _ = &mut shutdown => {
+                                // Stop the poll loop. The abort is prompt when the
+                                // task is sleeping between cycles (the common case).
+                                // A cycle already inside its `spawn_blocking`
+                                // (mid fetch/stage) runs to completion before the
+                                // runtime tears down — the same property the push
+                                // receiver's `spawn_blocking(run_update_notify)` has;
+                                // `updates::get`'s staging FSM is resumable, so no
+                                // half-staged state results, only a bounded delay.
+                                if let Some(task) = &update_poll_task {
+                                    task.abort();
+                                }
+                                break;
+                            }
                             // Main listener: the loopback gate + caller-asserted
                             // identity (see `serve`) honour `trust_loopback_peers`,
                             // which is false when a tunnel fronts this port.
@@ -1599,6 +1628,302 @@ async fn handle_update_notify(
             ))
         }
     }
+}
+
+/// Server plan-metadata (`GET {plan_endpoint}/meta`) — only the fields the poll
+/// loop needs; any others the server adds are ignored. Mirrors the plan server's
+/// `PlanMetaResponse` without depending on the (private, Docker-only) server
+/// crate.
+#[derive(serde::Deserialize)]
+struct PlanMeta {
+    sequence: u64,
+    plan_sha256: String,
+}
+
+/// Interval used when a cycle can't resolve one from config (invalid env id,
+/// unreadable channel, or a worker-task failure). Matches deploy-spec's default
+/// so behavior is the same whether the interval comes from config or here.
+const POLL_FALLBACK_INTERVAL_SECS: u64 = 3600;
+
+/// Size caps for the poll fetch, so a compromised or misbehaving plan server
+/// can't exhaust memory (`updates::get`'s own artifact download is separately
+/// bounded). A plan doc + DSSE envelope are small; these are generous ceilings.
+const MAX_PLAN_META_BYTES: u64 = 64 * 1024;
+const MAX_PLAN_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PLAN_SIG_BYTES: u64 = 64 * 1024;
+
+/// Updater pull path: periodically fetch the latest signed plan from the env's
+/// configured `plan_endpoint` and hand it to the same receiver core the push
+/// path uses ([`run_update_notify`]). Spawned by [`RevisionServer::start`] only
+/// when the env has an `update-channel.json` sidecar; the per-cycle config read
+/// enforces deny-by-default (a disabled or endpoint-less channel no-ops) and
+/// lets `op updates config-set` changes take effect without a restart.
+///
+/// Cancelled (via the returned task's `abort`) when the ingress shuts down; it
+/// is otherwise sleeping between cycles, so cancellation is prompt.
+async fn run_update_poll_loop(state: Arc<ServeState>, store_root: std::path::PathBuf) {
+    // Build the blocking HTTP client off the runtime (the blocking client must
+    // not be constructed or used on an async runtime thread).
+    let client = match tokio::task::spawn_blocking(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+    })
+    .await
+    {
+        Ok(Ok(client)) => client,
+        Ok(Err(err)) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-poll: failed to build HTTP client, poll loop disabled: {err}"),
+            );
+            return;
+        }
+        Err(err) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-poll: client-build task failed, poll loop disabled: {err}"),
+            );
+            return;
+        }
+    };
+
+    // Last plan sequence acted on, so an unchanged `/meta` short-circuits the
+    // plan + signature GETs. Advisory: the authoritative anti-rollback is the
+    // signed manifest version checked inside `updates::get`.
+    let mut last_sequence: Option<u64> = None;
+    loop {
+        // Read the served env id fresh each cycle (a cheap ArcSwap load) so a
+        // reload that changes it is picked up.
+        let env_id = state.current().routing.dispatcher.env_id().to_string();
+        let root = store_root.clone();
+        let client_for_cycle = client.clone();
+        let seq_in = last_sequence;
+        // The cycle downloads + DSSE-verifies + records/stages synchronously
+        // (`updates::get` is internally blocking), so it runs off the runtime.
+        let interval = match tokio::task::spawn_blocking(move || {
+            poll_update_cycle(&env_id, &root, &client_for_cycle, seq_in)
+        })
+        .await
+        {
+            Ok((new_sequence, interval_secs)) => {
+                last_sequence = new_sequence;
+                interval_secs
+            }
+            Err(err) => {
+                operator_log::error(
+                    module_path!(),
+                    format!("update-poll: worker task failed: {err}"),
+                );
+                POLL_FALLBACK_INTERVAL_SECS
+            }
+        };
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+    }
+}
+
+/// One poll cycle, run on a blocking thread. Re-reads the env's update-channel
+/// policy (deny-by-default), and when enabled with a plan endpoint: GETs
+/// `/meta`, short-circuits if the sequence is unchanged, else GETs the plan and
+/// its `.sig`, checks the plan digest against `/meta` to drop torn reads (a
+/// concurrent upload split across the two GETs), and hands the bytes to
+/// [`run_update_notify`] — which DSSE-verifies and records or stages per
+/// `on_notify`. Returns the sequence to remember (advanced only on a clean
+/// record/stage) and the interval to wait before the next cycle.
+fn poll_update_cycle(
+    env_id: &str,
+    store_root: &std::path::Path,
+    client: &reqwest::blocking::Client,
+    last_sequence: Option<u64>,
+) -> (Option<u64>, u64) {
+    let store = LocalFsStore::new(store_root);
+
+    let env_typed = match EnvId::new(env_id) {
+        Ok(env) => env,
+        Err(err) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-poll: invalid environment id `{env_id}`: {err}"),
+            );
+            return (last_sequence, POLL_FALLBACK_INTERVAL_SECS);
+        }
+    };
+
+    let cfg = match store.load_update_channel(&env_typed) {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => return (last_sequence, POLL_FALLBACK_INTERVAL_SECS),
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!("update-poll: failed to read update channel for env `{env_id}`: {err}"),
+            );
+            return (last_sequence, POLL_FALLBACK_INTERVAL_SECS);
+        }
+    };
+
+    let interval = cfg.resolved_poll_interval_secs();
+
+    // Deny-by-default: only an enabled channel with a plan endpoint polls.
+    if !cfg.resolved_enabled() {
+        return (last_sequence, interval);
+    }
+    let Some(plan_endpoint) = cfg.resolved_plan_endpoint() else {
+        return (last_sequence, interval);
+    };
+    let plan_endpoint = plan_endpoint.trim_end_matches('/');
+
+    // 1. `/meta` — advisory sequence gate.
+    let meta = match fetch_plan_meta(client, plan_endpoint) {
+        Ok(meta) => meta,
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "update-poll: `{plan_endpoint}/meta` fetch failed for env `{env_id}`: {err}"
+                ),
+            );
+            return (last_sequence, interval);
+        }
+    };
+    if last_sequence == Some(meta.sequence) {
+        // Nothing new since the last acted-on plan.
+        return (last_sequence, interval);
+    }
+
+    // 2. plan + signature.
+    let (plan, sig) = match fetch_plan_and_sig(client, plan_endpoint) {
+        Ok(pair) => pair,
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!("update-poll: plan/sig fetch failed for env `{env_id}`: {err}"),
+            );
+            return (last_sequence, interval);
+        }
+    };
+
+    // 3. Torn-read guard: the server resolves `/meta`, `/plan`, `/plan.sig`
+    //    independently, so a concurrent upload between the GETs can split the
+    //    plan and signature across sequences. `/meta` carries the authoritative
+    //    digest for its sequence; a mismatch means the plan we fetched is not the
+    //    one `/meta` described — skip and retry next cycle rather than fail DSSE
+    //    verification noisily.
+    if sha256_hex(&plan) != meta.plan_sha256 {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "update-poll: plan digest does not match `/meta` for env `{env_id}` \
+                 (torn read across a concurrent upload); retrying next cycle"
+            ),
+        );
+        return (last_sequence, interval);
+    }
+
+    // 4. Verify + record/stage via the shared receiver core.
+    match run_update_notify(&store, env_id, &plan, &sig) {
+        Ok((status, body)) => {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "update-poll: env `{env_id}` plan sequence {} -> {} ({})",
+                    meta.sequence,
+                    status.as_u16(),
+                    body.get("status").and_then(|s| s.as_str()).unwrap_or("ok"),
+                ),
+            );
+            // Advance the remembered sequence ONLY when the plan was actually
+            // acted on (2xx = staged or recorded). A non-2xx `Ok` means the
+            // channel was disabled between this cycle's config read and the
+            // receiver's own re-read (a TOCTOU that yields 403 `disabled`);
+            // leaving the sequence unadvanced lets a re-enabled channel pick the
+            // plan up next cycle instead of skipping it until the server
+            // publishes a newer one.
+            if status.is_success() {
+                (Some(meta.sequence), interval)
+            } else {
+                (last_sequence, interval)
+            }
+        }
+        Err(NotifyError::Op(err)) => {
+            operator_log::warn(
+                module_path!(),
+                format!("update-poll: plan rejected for env `{env_id}`: {err}"),
+            );
+            (last_sequence, interval)
+        }
+        Err(NotifyError::Internal(message)) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-poll: internal failure staging plan for env `{env_id}`: {message}"),
+            );
+            (last_sequence, interval)
+        }
+    }
+}
+
+/// GET `{plan_endpoint}/meta` and parse the plan metadata (size-capped).
+fn fetch_plan_meta(
+    client: &reqwest::blocking::Client,
+    plan_endpoint: &str,
+) -> Result<PlanMeta, String> {
+    let bytes = fetch_bytes(
+        client,
+        &format!("{plan_endpoint}/meta"),
+        MAX_PLAN_META_BYTES,
+    )?;
+    serde_json::from_slice(&bytes).map_err(|err| format!("decode error: {err}"))
+}
+
+/// GET the plan (`{plan_endpoint}`) and its DSSE envelope (`{plan_endpoint}.sig`),
+/// each size-capped.
+fn fetch_plan_and_sig(
+    client: &reqwest::blocking::Client,
+    plan_endpoint: &str,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let plan = fetch_bytes(client, plan_endpoint, MAX_PLAN_BYTES)?;
+    let sig = fetch_bytes(client, &format!("{plan_endpoint}.sig"), MAX_PLAN_SIG_BYTES)?;
+    Ok((plan, sig))
+}
+
+/// GET `url` into memory, reading at most `max_bytes` so a lying/oversized
+/// response can't exhaust memory (the body is streamed through a bounded reader
+/// rather than trusting `Content-Length`).
+fn fetch_bytes(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let resp = client
+        .get(url)
+        .send()
+        .map_err(|err| format!("request error: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("status error: {err}"))?;
+    let mut buf = Vec::new();
+    // Read one byte past the cap so an over-limit body is detected, not silently
+    // truncated (a truncated plan would just fail verification anyway, but an
+    // explicit error is clearer).
+    resp.take(max_bytes + 1)
+        .read_to_end(&mut buf)
+        .map_err(|err| format!("read error: {err}"))?;
+    if buf.len() as u64 > max_bytes {
+        return Err(format!("response exceeds {max_bytes} bytes"));
+    }
+    Ok(buf)
+}
+
+/// Lowercase hex of the SHA-256 of `bytes` — matches the server's `plan_sha256`
+/// (`hex::encode(Sha256::digest(...))`).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Map a runner reply [`Activity`] into a worker message. A rendered Adaptive
@@ -5326,6 +5651,72 @@ mod update_notify_tests {
             map_op_error(&OpError::Fetch("timeout".into())).status(),
             StatusCode::BAD_GATEWAY
         );
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vectors() {
+        // The torn-read guard compares this against the server's `plan_sha256`
+        // (`hex::encode(Sha256::digest(...))`), so it must be lowercase hex.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn poll_cycle_disabled_channel_does_not_fetch() {
+        // Deny-by-default: a disabled channel returns before any HTTP. The
+        // endpoint points at an unroutable port, so a fetch attempt would error;
+        // the sequence stays put and the resolved interval is returned.
+        let root = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("local")).expect("env dir");
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(false);
+        cfg.plan_endpoint = Some("http://127.0.0.1:1/plan".into());
+        std::fs::write(
+            root.path().join("local").join("update-channel.json"),
+            serde_json::to_vec(&cfg).expect("serialize channel"),
+        )
+        .expect("write channel");
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .expect("client");
+
+        let (seq, interval) = poll_update_cycle("local", root.path(), &client, Some(7));
+        assert_eq!(
+            seq,
+            Some(7),
+            "disabled channel must not advance the sequence"
+        );
+        assert!(interval >= 60, "resolved interval is floored");
+    }
+
+    #[test]
+    fn poll_cycle_enabled_without_endpoint_does_not_fetch() {
+        // Enabled but no plan endpoint → the poll loop has no source and returns
+        // without fetching (again, an unroutable endpoint is never set).
+        let root = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("local")).expect("env dir");
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.plan_endpoint = None;
+        std::fs::write(
+            root.path().join("local").join("update-channel.json"),
+            serde_json::to_vec(&cfg).expect("serialize channel"),
+        )
+        .expect("write channel");
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .expect("client");
+
+        let (seq, _interval) = poll_update_cycle("local", root.path(), &client, None);
+        assert_eq!(seq, None, "no endpoint must not advance the sequence");
     }
 
     #[test]
