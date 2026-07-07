@@ -264,4 +264,9 @@ tokio = { version = "1", features = ["test-util"] }
 # greentic-types graph-wide and break greentic-setup's 0.5 line.
 
 [dependencies.greentic-update]
-version = ">=0.1.28607531727, <0.2"
+# Floor bumped to 0.1.28859386871 (2026-07-07): first publish carrying the
+# `binswap` feature (P7a) + the `binaries` / `select_binary` schema (P7b) that
+# the P7d stage-only binary self-update path consumes. `binswap` pulls the
+# archive-unpack + atomic-swap primitive.
+version = ">=0.1.28859386871, <0.2"
+features = ["binswap"]
