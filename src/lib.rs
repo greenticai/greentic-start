@@ -616,6 +616,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             gui_enabled,
             trust_loopback_peers: !will_tunnel,
             admin_bind_addr,
+            updates_enabled: !request.no_updates,
         })
         .context("starting the revision ingress server")?;
         let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
@@ -1574,6 +1575,7 @@ mod tests {
             verbose: false,
             quiet: false,
             no_browser: false,
+            no_updates: false,
             admin: false,
             admin_port: 9443,
             admin_certs_dir: None,
@@ -1607,6 +1609,7 @@ mod tests {
             verbose: false,
             quiet: false,
             no_browser: false,
+            no_updates: false,
             admin: false,
             admin_port: 9443,
             admin_certs_dir: None,
@@ -1709,6 +1712,7 @@ mod tests {
             verbose: false,
             quiet: false,
             no_browser: false,
+            no_updates: false,
             admin: false,
             admin_port: 9443,
             admin_certs_dir: None,

@@ -2,7 +2,7 @@ bench = [{ name = "perf", harness = false }]
 
 [package]
 name = "greentic-start"
-version = "1.1.8"
+version = "1.1.9"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -123,8 +123,13 @@ features = ["derive"]
 # floor also keeps a SINGLE deploy-spec copy in the tree: `greentic-deployer`
 # (below) pulls deploy-spec transitively, so both must land on `^0.2` or the
 # build resolves two copies and the deploy-spec types stop unifying (E0308).
+# Floor bumped to 0.2.2 (deployer#443) — `notify_action` reads
+# `UpdateChannelConfig::resolved_action()` / `UpdateAction`, the additive
+# supersession of `on_notify`; earlier publishes lack both. Additive on purpose:
+# `greentic-runner-host` pins `<0.3.0-0`, so a 0.3 here would fork the copy it
+# shares with us (E0308) and drag the runner into the release train.
 [dependencies.greentic-deploy-spec]
-version = ">=0.2.1, <0.3"
+version = ">=0.2.2, <0.3"
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
 # (per-env trust root + operator key, deployer #226). Floor bumped to the
@@ -145,8 +150,11 @@ version = ">=0.2.1, <0.3"
 # (same line this crate pins directly above), so a single deploy-spec copy
 # resolves. A lower deployer (1.1.3–1.1.6) would drag in deploy-spec `^0.1`
 # transitively and collide with the `^0.2` direct pin (two copies → E0308).
+# Floor bumped to 1.1.10 (deployer#443) — the `NotifyAction::Apply` arm calls
+# `cli::updates::{apply_updates, ApplyUpdatesPayload}` and needs the 0.2.2
+# deploy-spec that 1.1.10 pulls; earlier publishes drag in 0.2.1 and fork the copy.
 [dependencies.greentic-deployer]
-version = ">=1.1.7, <1.2.0-0"
+version = ">=1.1.10, <1.2.0-0"
 default-features = false
 
 # Agentic Worker (dw.agent) serve runtime, from the research (agentic) lineage.

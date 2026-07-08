@@ -147,6 +147,11 @@ pub(crate) struct StartArgs {
     quiet: bool,
     #[arg(long, help = "Do not open the first web UI URL in the default browser")]
     no_browser: bool,
+    #[arg(
+        long,
+        help = "Do not subscribe this runtime to its environment's update channel"
+    )]
+    no_updates: bool,
     #[arg(long, help = "Enable mTLS admin API endpoint")]
     admin: bool,
     #[arg(long, default_value = "8443", help = "Port for the admin API endpoint")]
@@ -244,6 +249,11 @@ pub struct StartRequest {
     pub verbose: bool,
     pub quiet: bool,
     pub no_browser: bool,
+    /// Kill switch for the updater, not a policy knob: skip the update poll
+    /// loop and refuse `/v1/updates/notify` on this box. The environment's
+    /// `update-channel.json` policy (`on_update` / `enabled`) is untouched, so
+    /// a restart without the flag resumes whatever the operator declared.
+    pub no_updates: bool,
     pub admin: bool,
     pub admin_port: u16,
     pub admin_certs_dir: Option<PathBuf>,
@@ -284,6 +294,7 @@ pub(crate) fn start_request_from_args(args: StartArgs, tunnel_explicit: bool) ->
         verbose: args.verbose,
         quiet: args.quiet,
         no_browser: args.no_browser,
+        no_updates: args.no_updates,
         admin: args.admin,
         admin_port: args.admin_port,
         admin_certs_dir: args.admin_certs_dir,

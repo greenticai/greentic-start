@@ -491,6 +491,7 @@ mod tests {
                 gui_enabled: false,
                 trust_loopback_peers: true,
                 admin_bind_addr: None,
+                updates_enabled: false,
             })
             .expect("placeholder server"),
         )
