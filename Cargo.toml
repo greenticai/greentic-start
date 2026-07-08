@@ -2,7 +2,7 @@ bench = [{ name = "perf", harness = false }]
 
 [package]
 name = "greentic-start"
-version = "1.1.9"
+version = "1.1.10"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -26,7 +26,14 @@ pkg-fmt = "zip"
 [dependencies]
 anyhow = "1.0"
 arc-swap = "1"
-async-nats = "0.46"
+# 0.49, not 0.46: every async-nats 0.46.x pins `rustls-webpki = "0.102"`, whose
+# newest release (0.102.8) carries GHSA-82j2-j2ch-gfr8 (high) and
+# GHSA-pwjx-qhcg-rvj4. No fixed 0.102.x exists; 0.47 moved to the patched 0.103
+# line. Must match the version `greentic-runner-host` resolves or the lock keeps
+# both webpki copies. Neither advisory is reachable here (both are CRL-parsing
+# bugs and async-nats configures no CRLs), but dependency review gates on the
+# lock, not on reachability.
+async-nats = "0.49"
 async-trait = "0.1"
 backhand = "0.25"
 base64 = "0.22"
@@ -159,9 +166,10 @@ default-features = false
 
 # Agentic Worker (dw.agent) serve runtime, from the research (agentic) lineage.
 # Version pin kept from research for now; re-pin once the merged runner is
-# republished.
+# republished. 1.1.6 is the first publish on async-nats 0.49 (see the async-nats
+# note above) — 1.1.5 forces `rustls-webpki` 0.102.8 into the lock.
 [dependencies.greentic-aw-runtime]
-version = "=1.1.5"
+version = "=1.1.6"
 default-features = false
 
 # Lower bound pinned to the first dev build exposing the `signing` module
@@ -182,12 +190,12 @@ features = ["pack-fetch"]
 # main's greentic-runner#466 flow-node component-id resolution floor, which must
 # be re-asserted after the merged runner build.
 [dependencies.greentic-runner-desktop]
-version = "=1.1.5"
+version = "=1.1.6"
 default-features = false
 features = ["agentic-worker", "greentic-llm-backend", "desktop-agent-ephemeral"]
 
 [dependencies.greentic-runner-host]
-version = "=1.1.5"
+version = "=1.1.6"
 default-features = false
 features = ["agentic-worker", "greentic-llm-backend"]
 
