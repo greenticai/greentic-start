@@ -61,10 +61,10 @@ use tokio::sync::oneshot;
 use greentic_runner_host::{Activity, RunnerHost, WelcomeFlowHint};
 
 use greentic_deploy_spec::{
-    DEFAULT_LISTEN_ADDR, EnvironmentHostConfig, OnNotifyAction, UpdateChannelConfig,
+    DEFAULT_LISTEN_ADDR, EnvironmentHostConfig, UpdateAction, UpdateChannelConfig,
 };
-use greentic_deployer::cli::updates::{self, UpdatesGetPayload};
-use greentic_deployer::cli::{OpError, OpFlags};
+use greentic_deployer::cli::updates::{self, ApplyUpdatesPayload, UpdatesGetPayload};
+use greentic_deployer::cli::{OpError, OpFlags, OpOutcome};
 use greentic_deployer::environment::{LocalFsStore, load_trust_root};
 use greentic_types::EnvId;
 use greentic_update::binswap;
@@ -133,6 +133,13 @@ pub(crate) struct RevisionServeConfig {
     /// `/workers/invoke` to a genuine local caller while the public face
     /// refuses them. `None` = single listener (the non-tunnel default).
     pub admin_bind_addr: Option<SocketAddr>,
+    /// Whether this process participates in the update channel at all: run the
+    /// poll loop and reserve `/v1/updates/notify`. `false` is the `--no-updates`
+    /// kill switch — a host-local override, not a policy change. Policy (whether
+    /// the channel is enabled, and what a notification does) still lives in the
+    /// env's `update-channel.json`; with `true` the poll loop reads it every
+    /// cycle and no-ops while it is absent or disabled.
+    pub updates_enabled: bool,
 }
 
 /// Per-connection shared state. Holds the live activation behind an
@@ -157,6 +164,10 @@ struct ServeState {
     /// implicitly on process restart (the new process starts with `false`).
     /// P7e (auto-restart + health gate) is out of scope.
     restart_required: AtomicBool,
+    /// `--no-updates` inverted: when `false`, `/v1/updates/notify` is never
+    /// reserved (the path falls through to deployment routing) and no poll loop
+    /// runs. See [`RevisionServeConfig::updates_enabled`].
+    updates_enabled: bool,
 }
 
 impl ServeState {
@@ -423,6 +434,7 @@ impl RevisionServer {
             bound_addr: addr,
             gui_enabled: config.gui_enabled,
             restart_required: AtomicBool::new(false),
+            updates_enabled: config.updates_enabled,
         });
         // Cloned into the listener thread; the original lives on as the
         // [`RevisionServer::state`] handle so [`reload`] / [`counts`] read the
@@ -433,14 +445,17 @@ impl RevisionServer {
         // `ServeState`. AND-ed into the per-connection loopback decision below.
         let trust_loopback_peers = config.trust_loopback_peers;
 
-        // Updater pull path: if this env has an `update-channel.json` sidecar,
-        // the ingress runtime runs a poll loop against its configured plan
-        // endpoint (see `run_update_poll_loop`). Resolved here so the gate reads
-        // the same env id the listener serves; `None` (no store root or no
-        // sidecar) → no poll task is ever spawned (deny-by-default).
-        let update_poll_root = LocalFsStore::default_root().filter(|root| {
-            update_channel_present(root, state.current().routing.dispatcher.env_id())
-        });
+        // Updater pull path: the ingress runtime runs a poll loop against the
+        // env's configured plan endpoint (see `run_update_poll_loop`). The loop
+        // re-reads `update-channel.json` every cycle and no-ops while the channel
+        // is absent, disabled, or endpoint-less, so deny-by-default lives there —
+        // not in a boot-time sidecar probe, which would strand an env that
+        // subscribes *after* boot until the next restart. `--no-updates` (and a
+        // missing store root) is the only thing that keeps the task from spawning.
+        let update_poll_root = config
+            .updates_enabled
+            .then(LocalFsStore::default_root)
+            .flatten();
         let poll_state = Arc::clone(&state);
 
         let (tx, rx) = oneshot::channel();
@@ -871,10 +886,13 @@ async fn serve(
     // request falls through to normal deployment routing, so adding this platform
     // path never shadows an existing app route (e.g. a broad `/`-prefix binding)
     // on an env that never opted into the updater.
+    // `--no-updates` also closes this door: the kill switch is "not on this box",
+    // so neither the pull nor the push half of the updater may run.
     if path == "/v1/updates/notify" {
-        let intercept = LocalFsStore::default_root().is_some_and(|root| {
-            update_channel_present(&root, state.current().routing.dispatcher.env_id())
-        });
+        let intercept = state.updates_enabled
+            && LocalFsStore::default_root().is_some_and(|root| {
+                update_channel_present(&root, state.current().routing.dispatcher.env_id())
+            });
         if intercept {
             if method != hyper::Method::POST {
                 return Err(error_response(
@@ -1351,6 +1369,8 @@ enum NotifyAction {
     Ignore,
     Record,
     Stage,
+    /// Stage, then converge this environment onto the plan's target manifest.
+    Apply,
 }
 
 /// A staging failure. `Op` is a deployer [`OpError`] from `updates::get` (mapped
@@ -1397,13 +1417,21 @@ fn decode_update_notify(body: &[u8]) -> Result<(Vec<u8>, Vec<u8>), (StatusCode, 
 /// Resolve the update-channel policy into the action to take. Deny-by-default:
 /// `resolved_enabled()` is `false` for an absent (`None`) or `enabled: None/false`
 /// channel, so an operator must explicitly opt the environment in.
+///
+/// Reads `resolved_action()`, which prefers the `on_update` field and falls back
+/// to the legacy `on_notify` when it is absent — a channel written by an older
+/// deployer keeps its meaning. `UpdateAction` is `#[non_exhaustive]`; an action
+/// this binary does not know is treated as `Stage`, the conservative floor:
+/// content lands on disk, traffic does not move.
 fn notify_action(cfg: &UpdateChannelConfig) -> NotifyAction {
     if !cfg.resolved_enabled() {
         return NotifyAction::Ignore;
     }
-    match cfg.resolved_on_notify() {
-        OnNotifyAction::RecordOnly => NotifyAction::Record,
-        OnNotifyAction::Stage => NotifyAction::Stage,
+    match cfg.resolved_action() {
+        UpdateAction::RecordOnly => NotifyAction::Record,
+        UpdateAction::Stage => NotifyAction::Stage,
+        UpdateAction::Apply => NotifyAction::Apply,
+        _ => NotifyAction::Stage,
     }
 }
 
@@ -1768,7 +1796,7 @@ fn run_update_notify(
                 serde_json::json!({ "status": "recorded" }),
             ))
         }
-        NotifyAction::Stage => {
+        action @ (NotifyAction::Stage | NotifyAction::Apply) => {
             // Stage the posted bytes into a TempDir so the deployer's file-import
             // path can read them. `dir` stays in scope until after `get()` returns
             // (it reads the files synchronously) and is removed on drop.
@@ -1794,12 +1822,14 @@ fn run_update_notify(
                 schema_only: false,
                 answers: None,
             };
-            // Run for its staging side effect and discard the outcome: the
-            // deployer's `OpOutcome.result` carries the staging directory path and
-            // the trust-root key IDs that verified the plan, which must not leak to
-            // the off-host caller. Return only a category signal, matching the
-            // `disabled` / `recorded` arms above.
-            let _ = updates::get(store, &flags, Some(payload)).map_err(NotifyError::Op)?;
+            // The deployer's `OpOutcome.result` carries the staging directory path
+            // and the trust-root key IDs that verified the plan, which must not
+            // leak to the off-host caller — the response below is a category
+            // signal only, matching the `disabled` / `recorded` arms above. The
+            // `plan_id` is read back out here for the apply arm, which needs to
+            // name the plan `get` just staged and verified; re-deriving it from
+            // the posted bytes would trust unverified input.
+            let staged = updates::get(store, &flags, Some(payload)).map_err(NotifyError::Op)?;
             operator_log::info(
                 module_path!(),
                 format!("update-notify: staged update plan for env `{env_id}`"),
@@ -1824,13 +1854,63 @@ fn run_update_notify(
                 }
             };
 
-            let mut body = serde_json::json!({ "status": "staged" });
+            // `Apply` converges on top of the staged content: snapshot → apply →
+            // verify → rollback on failure, all inside the deployer's
+            // single-flight `begin_apply_checked`. The apply rewrites
+            // `runtime-config.json`, which this process's own `revision_reload`
+            // watcher picks up and hot-swaps — no explicit reload, no restart.
+            // Unlike the binary step, a failure here is NOT swallowed: the
+            // operator asked for convergence, and reporting "staged" after a
+            // failed rollback would hide it.
+            let status = if action == NotifyAction::Apply {
+                apply_staged_plan(store, env_id, plan_id_of(&staged)?)?;
+                "applied"
+            } else {
+                "staged"
+            };
+
+            let mut body = serde_json::json!({ "status": status });
             if let Some(binary_info) = binary_result {
                 body["binary"] = binary_info;
             }
             Ok((StatusCode::OK, body))
         }
     }
+}
+
+/// The `plan_id` of the plan `updates::get` just staged and verified. Read back
+/// off the deployer's outcome rather than re-parsed from the posted bytes: those
+/// are attacker-supplied until `get` has checked the DSSE signature and the
+/// target env, and the id names *what was staged*.
+fn plan_id_of(staged: &OpOutcome) -> Result<&str, NotifyError> {
+    staged
+        .result
+        .get("plan_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| NotifyError::Internal("staged update plan carries no plan id".to_string()))
+}
+
+/// Converge the environment onto a staged plan's signed target manifest.
+/// Delegates to the deployer's `updates::apply` — the same code path
+/// `op updates apply` runs — so snapshot / verify / rollback and the applied-set
+/// bookkeeping are not forked here. The outcome is discarded for the same reason
+/// the stage path discards it: it names host paths the off-host caller must not
+/// see.
+fn apply_staged_plan(store: &LocalFsStore, env_id: &str, plan_id: &str) -> Result<(), NotifyError> {
+    let flags = OpFlags {
+        schema_only: false,
+        answers: None,
+    };
+    let payload = ApplyUpdatesPayload {
+        environment_id: env_id.to_string(),
+        plan_id: plan_id.to_string(),
+    };
+    updates::apply_updates(store, &flags, Some(payload)).map_err(NotifyError::Op)?;
+    operator_log::info(
+        module_path!(),
+        format!("update-notify: applied update plan `{plan_id}` to env `{env_id}`"),
+    );
+    Ok(())
 }
 
 /// Map a deployer [`OpError`] from `updates::get` to an HTTP status with a
@@ -1964,10 +2044,11 @@ const MAX_PLAN_SIG_BYTES: u64 = 64 * 1024;
 
 /// Updater pull path: periodically fetch the latest signed plan from the env's
 /// configured `plan_endpoint` and hand it to the same receiver core the push
-/// path uses ([`run_update_notify`]). Spawned by [`RevisionServer::start`] only
-/// when the env has an `update-channel.json` sidecar; the per-cycle config read
-/// enforces deny-by-default (a disabled or endpoint-less channel no-ops) and
-/// lets `op updates config-set` changes take effect without a restart.
+/// path uses ([`run_update_notify`]) — so `on_update: apply` converges on the
+/// pull path too. Spawned by [`RevisionServer::start`] unless `--no-updates`; the
+/// per-cycle config read enforces deny-by-default (an absent, disabled, or
+/// endpoint-less channel no-ops) and lets a channel written *after* boot — by
+/// `op env apply` or `op updates config-set` — take effect without a restart.
 ///
 /// Cancelled (via the returned task's `abort`) when the ingress shuts down; it
 /// is otherwise sleeping between cycles, so cancellation is prompt.
@@ -3881,6 +3962,7 @@ mod tests {
             gui_enabled: true,
             trust_loopback_peers: false,
             admin_bind_addr: Some("127.0.0.1:17900".parse::<SocketAddr>().unwrap()),
+            updates_enabled: false,
         })
         .expect("start split server");
 
@@ -3927,6 +4009,7 @@ mod tests {
             // Admin requested at base+1 — exactly where the main listener
             // will land after bumping past the held base port.
             admin_bind_addr: Some(format!("127.0.0.1:{}", base + 1).parse().unwrap()),
+            updates_enabled: false,
         })
         .expect("start must succeed even when main bumps into admin range");
 
@@ -4852,6 +4935,7 @@ mod tests {
             bound_addr: bound,
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
+            updates_enabled: false,
         }
     }
 
@@ -5284,6 +5368,7 @@ mod tests {
             bound_addr: bound,
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
+            updates_enabled: false,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -5377,6 +5462,7 @@ mod tests {
             bound_addr: bound,
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
+            updates_enabled: false,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -5464,6 +5550,7 @@ mod tests {
             bound_addr: bound,
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
+            updates_enabled: false,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -5524,6 +5611,7 @@ mod tests {
             bound_addr: bound,
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
+            updates_enabled: false,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -5784,6 +5872,7 @@ mod tests {
             bound_addr: bound,
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
+            updates_enabled: false,
         })
     }
 
@@ -5869,6 +5958,9 @@ mod tests {
 #[cfg(test)]
 mod update_notify_tests {
     use super::*;
+    // The legacy field these tests still exercise, to prove `resolved_action()`
+    // keeps honoring a channel written before `on_update` existed.
+    use greentic_deploy_spec::OnNotifyAction;
 
     fn env(id: &str) -> EnvId {
         EnvId::new(id).expect("valid env id")
@@ -5963,6 +6055,49 @@ mod update_notify_tests {
         // Unset on_notify resolves to Stage (the deploy-spec default).
         cfg.on_notify = None;
         assert_eq!(notify_action(&cfg), NotifyAction::Stage);
+    }
+
+    #[test]
+    fn notify_action_reads_on_update_over_legacy_on_notify() {
+        // `set_action` writes both fields: `on_update: apply` for a binary that
+        // understands it, `on_notify: stage` as the conservative floor an older
+        // binary reads. This binary must pick the former.
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.set_action(UpdateAction::Apply);
+        assert_eq!(cfg.on_notify, Some(OnNotifyAction::Stage));
+        assert_eq!(notify_action(&cfg), NotifyAction::Apply);
+    }
+
+    #[test]
+    fn notify_action_falls_back_to_legacy_when_on_update_absent() {
+        // A channel written before `on_update` existed keeps its meaning.
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.on_update = None;
+        cfg.on_notify = Some(OnNotifyAction::RecordOnly);
+        assert_eq!(notify_action(&cfg), NotifyAction::Record);
+    }
+
+    #[test]
+    fn notify_action_never_applies_a_disabled_channel() {
+        // `apply` is policy, `enabled` is the gate. The gate wins.
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.set_action(UpdateAction::Apply);
+        cfg.enabled = Some(false);
+        assert_eq!(notify_action(&cfg), NotifyAction::Ignore);
+    }
+
+    #[test]
+    fn plan_id_of_reads_the_staged_outcome_and_rejects_a_missing_id() {
+        let ok = OpOutcome::new("updates", "get", serde_json::json!({ "plan_id": "plan-7" }));
+        assert_eq!(plan_id_of(&ok).expect("plan id"), "plan-7");
+
+        let bad = OpOutcome::new("updates", "get", serde_json::json!({ "sequence": 3 }));
+        assert!(matches!(
+            plan_id_of(&bad),
+            Err(NotifyError::Internal(msg)) if msg.contains("no plan id")
+        ));
     }
 
     #[test]
@@ -6307,6 +6442,7 @@ mod binary_update_tests {
             bound_addr: bound,
             gui_enabled: false,
             restart_required: AtomicBool::new(true),
+            updates_enabled: false,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -6332,6 +6468,7 @@ mod binary_update_tests {
             bound_addr: bound,
             gui_enabled: false,
             restart_required: AtomicBool::new(true),
+            updates_enabled: false,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
         assert_eq!(resp.status(), StatusCode::OK, "still healthy");
@@ -6352,6 +6489,7 @@ mod binary_update_tests {
             bound_addr: bound,
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
+            updates_enabled: false,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
         assert!(
@@ -6368,6 +6506,7 @@ mod binary_update_tests {
             bound_addr: bound,
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
+            updates_enabled: false,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
