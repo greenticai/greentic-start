@@ -9,9 +9,11 @@
 //! tenants' tunnels survive concurrent boots.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::operator_log;
 use crate::runtime_state::{RuntimePaths, atomic_write};
 use crate::supervisor::{self, ServiceId, ServiceSpec};
 use crate::tunnel_state;
@@ -23,11 +25,6 @@ const URL_SUFFIX: &str = ".trycloudflare.com";
 /// check-then-spawn critical section. Spawn + URL discovery hold the lock for
 /// ~20s worst case.
 const LOCK_WAIT: Duration = Duration::from_secs(45);
-
-/// Probe budget when deciding whether a recorded tunnel still serves. Short
-/// on purpose: a dead edge fails fast, and a false negative only costs a
-/// restart (fresh URL), which is what pre-shared-record boots always did.
-const REUSE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct CloudflaredConfig {
@@ -68,9 +65,14 @@ pub fn start_quick_tunnel(
         let _ = std::fs::remove_file(&shared_url_path);
     }
 
-    // Reuse the recorded tunnel only when its process is alive AND its URL
-    // still serves. A recorded-but-dead tunnel is ours (pidfile-owned), so
-    // replacing it is safe.
+    // Reuse the recorded tunnel when its process is alive AND still usable. A
+    // recorded-but-dead tunnel is ours (pidfile-owned), so replacing it is
+    // safe — but "this host cannot reach the URL right now" does NOT mean dead:
+    // a freshly-minted `*.trycloudflare.com` hostname sits in the OS
+    // negative-DNS cache and lags public-DNS propagation by minutes, so a
+    // healthy tunnel probes as unreachable locally for a while. Tearing it down
+    // on that signal only mints a new URL and strands webhooks already pointed
+    // at it. `classify_recorded_tunnel` only reports `Down` on positive proof.
     if let Ok(Some(pid)) = read_pid(&shared_pid_path)
         && supervisor::is_running(pid)
     {
@@ -78,16 +80,24 @@ pub fn start_quick_tunnel(
             Some(url) => Some(url),
             None => discover_public_url(&shared_log_path, Duration::from_secs(10)).ok(),
         };
-        if let Some(url) = recorded_url
-            && probe_tunnel_alive(&url, REUSE_PROBE_TIMEOUT)
-        {
-            write_public_url(&shared_url_path, &url)?;
-            mirror_public_url(paths, &url)?;
-            return Ok(CloudflaredHandle {
-                url,
-                pid,
-                log_path: shared_log_path,
-            });
+        if let Some(url) = recorded_url {
+            match classify_recorded_tunnel(&url, &shared_log_path) {
+                RecordedTunnelState::Serving | RecordedTunnelState::WarmingUp => {
+                    write_public_url(&shared_url_path, &url)?;
+                    mirror_public_url(paths, &url)?;
+                    return Ok(CloudflaredHandle {
+                        url,
+                        pid,
+                        log_path: shared_log_path,
+                    });
+                }
+                RecordedTunnelState::Down => {
+                    operator_log::info(
+                        module_path!(),
+                        format!("[tunnel] recorded tunnel {url} is down; replacing it"),
+                    );
+                }
+            }
         }
         let _ = supervisor::stop_pidfile(&shared_pid_path, 2_000);
     }
@@ -196,6 +206,129 @@ fn head_probe(url: &str) -> Result<bool, Box<ureq::Error>> {
         Err(ureq::Error::StatusCode(code)) => Ok(code != 530),
         Err(err) => Err(Box::new(err)),
     }
+}
+
+/// Whether a recorded, process-alive tunnel should be reused or replaced.
+#[derive(Debug)]
+enum RecordedTunnelState {
+    /// Reachable now — directly, or published in public DNS. Reuse it.
+    Serving,
+    /// Alive and registered with the edge, but the hostname has not propagated
+    /// into public DNS yet. Reuse and wait: a fresh quick tunnel can take
+    /// minutes to appear in DNS, and respawning would only reset that clock and
+    /// orphan the URL already registered with providers.
+    WarmingUp,
+    /// The edge reports the binding is gone (530), or it never registered.
+    /// Replace it.
+    Down,
+}
+
+/// Decide whether the recorded tunnel at `url` (whose cloudflared process the
+/// caller has already confirmed is alive) is still usable.
+///
+/// The decision must not hinge on a plain HTTP probe from this host: fresh
+/// `*.trycloudflare.com` hostnames land in the OS resolver's negative-DNS cache
+/// (30-min TTL) and lag public-DNS propagation by minutes, so a healthy tunnel
+/// probes as "dead" locally for a while. Killing it on that signal is exactly
+/// what made every boot mint a new URL and strand provider webhooks. So we
+/// escalate through more authoritative signals and only return `Down` on proof.
+fn classify_recorded_tunnel(url: &str, log_path: &Path) -> RecordedTunnelState {
+    // 1. Direct probe: routed response = serving; 530 = edge binding gone.
+    match head_probe(url) {
+        Ok(true) => {
+            operator_log::debug(
+                module_path!(),
+                format!("[tunnel] {url} reachable directly — reusing (Serving)"),
+            );
+            return RecordedTunnelState::Serving;
+        }
+        Ok(false) => {
+            operator_log::info(
+                module_path!(),
+                format!("[tunnel] {url} edge returned 530 (binding lost) — replacing (Down)"),
+            );
+            return RecordedTunnelState::Down;
+        }
+        Err(_) => {}
+    }
+
+    // 2. The local resolver may just be blind. If public DNS resolves the host,
+    //    remote providers reach it even though we cannot → serving for them.
+    if let Some(host) = url_host(url)
+        && let Some(ip) = resolve_via_public_doh(&host)
+    {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[tunnel] {url} unreachable locally but published in public DNS ({ip}) — the OS \
+                 resolver has a stale negative cache; remote providers resolve it — reusing (Serving)"
+            ),
+        );
+        return RecordedTunnelState::Serving;
+    }
+
+    // 3. Not reachable from anywhere yet. The process is alive (caller-checked);
+    //    if it registered an edge connection it is mid-propagation — reuse and
+    //    wait rather than churn the URL.
+    if log_shows_registered_connection(log_path) {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[tunnel] {url} alive and edge-registered but still propagating into public DNS — \
+                 reusing rather than minting a new URL (WarmingUp)"
+            ),
+        );
+        RecordedTunnelState::WarmingUp
+    } else {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[tunnel] {url} not reachable and no edge registration in log — replacing (Down)"
+            ),
+        );
+        RecordedTunnelState::Down
+    }
+}
+
+/// Resolve `host`'s first A record via Cloudflare's DNS-over-HTTPS JSON API,
+/// addressed by IP literal so it works even when this host's resolver is blind
+/// to the zone. `Some(ip)` means the hostname is published in public DNS — i.e.
+/// every remote party (Slack, Teams, the Bot Framework, ...) can resolve it.
+fn resolve_via_public_doh(host: &str) -> Option<IpAddr> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(3)))
+        .build()
+        .new_agent();
+    let query = format!("https://1.1.1.1/dns-query?name={host}&type=A");
+    let mut response = agent
+        .get(&query)
+        .header("accept", "application/dns-json")
+        .call()
+        .ok()?;
+    let body: serde_json::Value = response.body_mut().read_json().ok()?;
+    body.get("Answer")?
+        .as_array()?
+        .iter()
+        // type 1 = A record; CNAME chain entries (type 5) also appear here.
+        .filter(|answer| answer.get("type").and_then(serde_json::Value::as_u64) == Some(1))
+        .find_map(|answer| answer.get("data")?.as_str()?.parse().ok())
+}
+
+/// Whether the tunnel log shows cloudflared registered an edge connection —
+/// proof the tunnel came up at Cloudflare's edge even before DNS propagates.
+fn log_shows_registered_connection(log_path: &Path) -> bool {
+    std::fs::read_to_string(log_path)
+        .is_ok_and(|contents| contents.contains("Registered tunnel connection"))
+}
+
+/// Host component of an `http(s)://` URL, for a DNS lookup. Avoids a `url`
+/// crate dependency for this single use.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host = rest.split(['/', ':', '?', '#']).next()?;
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 fn probe_tunnel_alive(url: &str, timeout: Duration) -> bool {
@@ -414,6 +547,40 @@ mod tests {
         let err = wait_tunnel_ready("https://127.0.0.1:1", Duration::from_millis(200))
             .expect_err("unreachable URL should fail");
         assert!(err.to_string().contains("not reachable"));
+    }
+
+    #[test]
+    fn url_host_extracts_hostname() {
+        assert_eq!(
+            url_host("https://foo-bar.trycloudflare.com/x?y=1").as_deref(),
+            Some("foo-bar.trycloudflare.com")
+        );
+        assert_eq!(
+            url_host("http://127.0.0.1:8080/hooks").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(url_host("not a url"), None);
+    }
+
+    #[test]
+    fn registration_detected_only_when_logged() {
+        let dir = tempdir().expect("tempdir");
+        let log = dir.path().join("cloudflared.log");
+        assert!(
+            !log_shows_registered_connection(&log),
+            "missing file → false"
+        );
+        std::fs::write(&log, "INF Starting metrics server\n").expect("write");
+        assert!(
+            !log_shows_registered_connection(&log),
+            "no registration line → false"
+        );
+        std::fs::write(
+            &log,
+            "INF Registered tunnel connection connIndex=0 protocol=quic\n",
+        )
+        .expect("write");
+        assert!(log_shows_registered_connection(&log));
     }
 
     #[test]
