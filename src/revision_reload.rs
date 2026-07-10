@@ -397,6 +397,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc as std_mpsc;
+    use std::time::Instant;
 
     /// A counting rebuild closure suitable for unit tests. Returns
     /// `Ok(None)` always (no real activation is built) but increments a
@@ -586,11 +587,16 @@ mod tests {
 
     #[test]
     fn watcher_coalesces_burst_writes_into_one_rebuild() {
+        // Wide enough that a loaded CI runner still lands the whole burst in
+        // one window; the burst is timed below so a runner slow enough to
+        // break that premise says so instead of failing as "did not coalesce".
+        const DEBOUNCE: Duration = Duration::from_secs(3);
+
         let env = fresh_env_dir();
         let counter = Arc::new(AtomicUsize::new(0));
         let _handle = spawn_runtime_config_watcher(
             env.path().to_path_buf(),
-            Duration::from_millis(200),
+            DEBOUNCE,
             Duration::ZERO,
             placeholder_server(),
             counting_rebuild(Arc::clone(&counter)),
@@ -599,13 +605,17 @@ mod tests {
         )
         .expect("spawn watcher");
 
-        // Five back-to-back writes well within the 200ms debounce window.
+        let burst_started = Instant::now();
         for i in 0..5 {
             write_runtime_config(env.path(), &format!(r#"{{"i":{i}}}"#));
         }
+        let burst = burst_started.elapsed();
+        assert!(
+            burst < DEBOUNCE,
+            "burst of 5 writes took {burst:?}, exceeding the {DEBOUNCE:?} debounce — coalescing was never exercised"
+        );
 
-        // Wait past the debounce window plus a safety margin.
-        std::thread::sleep(Duration::from_millis(800));
+        std::thread::sleep(DEBOUNCE + Duration::from_millis(600));
         let observed = counter.load(Ordering::SeqCst);
         assert!(
             (1..=2).contains(&observed),
