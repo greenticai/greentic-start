@@ -15,15 +15,16 @@ use serde_json::json;
 
 use crate::ingress_types::IngressHttpResponse;
 
+const CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
+const CORS_ALLOW_HEADERS: &str =
+    "Content-Type, Authorization, X-Requested-With, x-ms-bot-agent, X-Greentic-Locale";
+
 pub(crate) fn cors_preflight_response() -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .header("Access-Control-Allow-Origin", "*")
-        .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        .header(
-            "Access-Control-Allow-Headers",
-            "Content-Type, Authorization, X-Requested-With, x-ms-bot-agent",
-        )
+        .header("Access-Control-Allow-Methods", CORS_ALLOW_METHODS)
+        .header("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS)
         .header("Access-Control-Max-Age", "86400")
         .body(Full::from(Bytes::new()))
         .unwrap()
@@ -34,11 +35,11 @@ pub(crate) fn with_cors(mut response: Response<Full<Bytes>>) -> Response<Full<By
     headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
     headers.insert(
         "Access-Control-Allow-Methods",
-        HeaderValue::from_static("GET, POST, OPTIONS"),
+        HeaderValue::from_static(CORS_ALLOW_METHODS),
     );
     headers.insert(
         "Access-Control-Allow-Headers",
-        HeaderValue::from_static("Content-Type, Authorization, X-Requested-With, x-ms-bot-agent"),
+        HeaderValue::from_static(CORS_ALLOW_HEADERS),
     );
     response
 }

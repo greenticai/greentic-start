@@ -72,6 +72,7 @@ use greentic_update::plan::{select_binary, verify_update_plan};
 
 use crate::deployment_routes::RevisionIngressRouting;
 use crate::endpoint_resolver;
+use crate::http_helpers::{cors_preflight_response, with_cors};
 use crate::http_routes::{HttpRouteTable, RevisionScope};
 use crate::identify_payload;
 use crate::ingress_dispatch::parse_dispatch_result;
@@ -850,10 +851,32 @@ async fn handle_connection(
     state: Arc<ServeState>,
     peer_is_loopback: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    Ok(match serve(req, state, peer_is_loopback).await {
-        Ok(response) => response,
-        Err(response) => response,
-    })
+    let cors = path_allows_cors(req.uri().path());
+    let (Ok(response) | Err(response)) = serve(req, state, peer_is_loopback).await;
+    Ok(if cors { with_cors(response) } else { response })
+}
+
+/// Paths that are never legitimately called cross-origin, and so must not
+/// receive `Access-Control-Allow-Origin`.
+///
+/// `/workers/invoke` executes a flow under the deployment's own tenant and
+/// returns its output. It is gated on `peer_is_loopback` — but that gate checks
+/// the *TCP peer*, and a page served from any origin, running in a browser on
+/// this machine, connects from `127.0.0.1` and passes it. The endpoint does not
+/// check `Content-Type` (it just parses the body as JSON), so a blind
+/// cross-origin POST is already possible; granting a wildcard
+/// `Access-Control-Allow-Origin` would additionally let that page *read the
+/// response*, turning a blind write into a full read/write channel. The
+/// `X-Frame-Options` header on `/chat` exists to stop exactly this
+/// (a cross-site page auto-driving the worker endpoint) — blanket CORS would
+/// reopen it by another door.
+///
+/// Nothing legitimate needs CORS here: the built-in `/chat` console fetches it
+/// **same-origin** (a relative `fetch('/workers/invoke')`, see `assets/chat.html`)
+/// and `greentic-gui` reaches it **server-side** via `HttpWorkerBackend`, where
+/// CORS does not apply.
+fn path_allows_cors(path: &str) -> bool {
+    path != "/workers/invoke"
 }
 
 /// Resolve → dispatch → execute for a single request. `Err` carries a ready HTTP
@@ -865,6 +888,22 @@ async fn serve(
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+
+    // CORS preflight: browsers send OPTIONS with no auth and no body before
+    // any cross-origin POST. Short-circuited here — before probes, chat
+    // assets, worker-invoke, and admission gates — because every one of
+    // those either ignores non-GET/POST or hard-rejects the method,
+    // turning the preflight into a 405 the browser treats as an opaque
+    // CORS failure. Mirrors the legacy `http_ingress` short-circuit.
+    if method == hyper::Method::OPTIONS {
+        if !path_allows_cors(&path) {
+            return Ok(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "cross-origin requests are not permitted on this path",
+            ));
+        }
+        return Ok(cors_preflight_response());
+    }
 
     if let Some(response) = try_probe_response(&path, &state) {
         return Ok(response);
@@ -5294,6 +5333,188 @@ mod tests {
         // Non-asset paths fall through so deployment routing still handles them.
         assert!(try_chat_asset_response("/", &hyper::Method::GET).is_none());
         assert!(try_chat_asset_response("/workers/invoke", &hyper::Method::POST).is_none());
+    }
+
+    // --- A.2: CORS + OPTIONS preflight on the revision path ----------------
+
+    fn cors_roundtrip(port: u16, gui_enabled: bool, raw_request: &str) -> String {
+        use std::io::{Read, Write};
+        use std::net::SocketAddr;
+
+        let server = RevisionServer::start(RevisionServeConfig {
+            bind_addr: format!("127.0.0.1:{port}").parse::<SocketAddr>().unwrap(),
+            activation: std::sync::Arc::new(empty_activation("cors")),
+            gui_enabled,
+            trust_loopback_peers: true,
+            admin_bind_addr: None,
+            updates_enabled: false,
+            auto_restart_enabled: false,
+            exe_path: None,
+        })
+        .expect("start server");
+        let port = server.actual_port();
+
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.write_all(raw_request.as_bytes()).expect("write");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).expect("read");
+        server.stop().expect("stop");
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[test]
+    fn cors_preflight_returns_204_for_realistic_browser_preflight() {
+        let resp = cors_roundtrip(
+            17950,
+            true,
+            concat!(
+                "OPTIONS /any/path HTTP/1.1\r\n",
+                "Host: localhost\r\n",
+                "Origin: https://example.com\r\n",
+                "Access-Control-Request-Method: POST\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+            ),
+        );
+
+        assert!(
+            resp.starts_with("HTTP/1.1 204"),
+            "preflight must return 204, got: {}",
+            resp.lines().next().unwrap_or("")
+        );
+
+        let methods_header = resp
+            .lines()
+            .find(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with("access-control-allow-methods:")
+            })
+            .expect("Access-Control-Allow-Methods header missing");
+        assert!(
+            methods_header.contains("POST"),
+            "Allow-Methods must include POST: {methods_header}"
+        );
+    }
+
+    #[test]
+    fn cors_allow_headers_covers_webchat_gui_custom_headers() {
+        let preflight = cors_preflight_response();
+        let allow = preflight.headers()["access-control-allow-headers"]
+            .to_str()
+            .expect("valid UTF-8");
+        let allowed: Vec<&str> = allow.split(',').map(str::trim).collect();
+
+        for required in ["Content-Type", "X-Greentic-Locale"] {
+            assert!(
+                allowed.iter().any(|h| h.eq_ignore_ascii_case(required)),
+                "Allow-Headers must include {required} (sent by the webchat GUI), got: {allow}"
+            );
+        }
+    }
+
+    #[test]
+    fn cors_options_to_chat_path_returns_204_not_405() {
+        let resp = cors_roundtrip(
+            17960,
+            true,
+            concat!(
+                "OPTIONS /chat HTTP/1.1\r\n",
+                "Host: localhost\r\n",
+                "Origin: https://example.com\r\n",
+                "Access-Control-Request-Method: GET\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+            ),
+        );
+
+        assert!(
+            resp.starts_with("HTTP/1.1 204"),
+            "OPTIONS /chat must return 204 (not 405), got: {}",
+            resp.lines().next().unwrap_or("")
+        );
+    }
+
+    #[test]
+    fn post_response_carries_cors_origin_header() {
+        let body = r#"{"text":"hello"}"#;
+        let resp = cors_roundtrip(
+            17970,
+            false,
+            &format!(
+                "POST /some/path HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {}",
+                body.len(),
+                body
+            ),
+        );
+
+        assert!(
+            resp.lines().any(|l| l
+                .to_ascii_lowercase()
+                .starts_with("access-control-allow-origin:")),
+            "POST response must carry Access-Control-Allow-Origin header, got:\n{resp}"
+        );
+    }
+
+    /// `/workers/invoke` executes a flow and returns its output. It is gated on
+    /// the TCP peer being loopback — which a page from *any* origin, running in
+    /// a browser on this machine, satisfies. It also ignores `Content-Type`, so
+    /// a blind cross-origin POST already reaches it. Granting a wildcard
+    /// `Access-Control-Allow-Origin` would additionally let that page read the
+    /// response. Nothing legitimate needs it: `/chat` calls it same-origin and
+    /// `greentic-gui` calls it server-side.
+    #[test]
+    fn worker_invoke_is_not_exposed_cross_origin() {
+        let preflight = cors_roundtrip(
+            17980,
+            false,
+            "OPTIONS /workers/invoke HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Origin: https://evil.example\r\n\
+             Access-Control-Request-Method: POST\r\n\
+             Access-Control-Request-Headers: content-type\r\n\
+             Connection: close\r\n\
+             \r\n",
+        );
+        assert!(
+            !preflight.to_ascii_lowercase().contains("204"),
+            "a cross-origin preflight for /workers/invoke must NOT be granted, got:\n{preflight}"
+        );
+        assert!(
+            !preflight
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "/workers/invoke preflight must not carry Access-Control-Allow-Origin, got:\n{preflight}"
+        );
+
+        let body = r#"{"text":"hello"}"#;
+        let posted = cors_roundtrip(
+            17981,
+            false,
+            &format!(
+                "POST /workers/invoke HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 Origin: https://evil.example\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(
+            !posted
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "/workers/invoke response must not be readable cross-origin, got:\n{posted}"
+        );
     }
 
     // --- N1.2: listen-address resolution ----------------------------------
