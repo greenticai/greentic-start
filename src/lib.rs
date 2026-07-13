@@ -439,6 +439,19 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             .context("cannot determine the default environment store root (no home directory)")?;
         let env_dir = runtime_config::env_dir_in(&store_root, &env_id)?;
 
+        // P7e: capture the exe path ONCE, before any binary swap can
+        // invalidate `/proc/self/exe` (deleted-inode hazard on Linux).
+        let own_exe = std::env::current_exe()
+            .and_then(|p| p.canonicalize())
+            .context("resolving own executable path for auto-restart")?;
+
+        // P7e: resolve auto-restart. CLI flag or env var disables it.
+        let auto_restart = cfg!(unix)
+            && !request.no_auto_restart
+            && std::env::var("GREENTIC_NO_AUTO_RESTART")
+                .map(|v| !matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(true);
+
         // Initialize operator.log under the env directory before any
         // `operator_log::*` call on this path; otherwise every banner,
         // listener log, and warning is silently dropped (the logger
@@ -460,6 +473,55 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // request aimed at this process.
         let shutdown_paths = env_tunnel::env_runtime_paths(&env_dir, &env_id);
         runtime_state::clear_stop_request(&shutdown_paths)?;
+
+        // P7e: boot-time marker processing. Determines whether this process
+        // is the NEW binary after a successful exec, the OLD binary after a
+        // rollback, or a fresh/stale start. On unix, arms a rollback guard
+        // when we are the new binary (to_version == own).
+        #[cfg(unix)]
+        let mut _boot_rollback_guard = {
+            let own_version = env!("CARGO_PKG_VERSION");
+            if let Some(marker) = revision_serve::read_binary_update_marker(&env_dir) {
+                match marker.phase {
+                    revision_serve::MarkerPhase::Pending if marker.to_version == own_version => {
+                        // We ARE the new binary. Arm a rollback guard; it fires
+                        // if we fail before reaching "boot succeeded".
+                        Some(BootRollbackGuard {
+                            env_dir: env_dir.clone(),
+                            exe_path: own_exe.clone(),
+                            marker,
+                            disarmed: false,
+                        })
+                    }
+                    revision_serve::MarkerPhase::Pending if marker.from_version == own_version => {
+                        // Old binary, swap happened but exec didn't run (or
+                        // auto-restart disabled). Leave marker for idempotency.
+                        None
+                    }
+                    revision_serve::MarkerPhase::RolledBack
+                        if marker.from_version == own_version =>
+                    {
+                        // We are the rolled-back old binary. Tombstone stays.
+                        operator_log::info(
+                            module_path!(),
+                            format!(
+                                "binary-update: running as rolled-back version {own_version}; \
+                                 version {} will not be retried until tombstone is cleared",
+                                marker.to_version,
+                            ),
+                        );
+                        None
+                    }
+                    _ => {
+                        // Stale marker from a different version lineage.
+                        revision_serve::clear_binary_update_marker(&env_dir);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
 
         // Load the Environment so the bind address can layer on top of the
         // persisted `host_config.listen_addr`. The same `Environment` is
@@ -617,6 +679,8 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             trust_loopback_peers: !will_tunnel,
             admin_bind_addr,
             updates_enabled: !request.no_updates,
+            auto_restart_enabled: auto_restart,
+            exe_path: Some(own_exe.clone()),
         })
         .context("starting the revision ingress server")?;
         let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
@@ -765,7 +829,25 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // `greentic-start stop` — the same select loop the legacy bundle arm
         // uses, run on the activation runtime this arm already owns. A
         // corrupt stop file fails the wait loudly on both arms.
-        let reason = activation_rt.block_on(wait_for_shutdown_inner(&shutdown_paths))?;
+        // P7e: disarm the boot rollback guard — boot succeeded.
+        #[cfg(unix)]
+        if let Some(guard) = &mut _boot_rollback_guard {
+            // We ARE the new binary and boot succeeded. Clear the marker.
+            let own_version = env!("CARGO_PKG_VERSION");
+            if guard.marker.to_version == own_version {
+                operator_log::info(
+                    module_path!(),
+                    format!("binary-update: activated {own_version}"),
+                );
+                revision_serve::clear_binary_update_marker(&env_dir);
+            }
+            guard.disarmed = true;
+        }
+
+        let reason = activation_rt.block_on(wait_for_shutdown_inner(
+            &shutdown_paths,
+            if auto_restart { Some(&server) } else { None },
+        ))?;
         if matches!(reason, ShutdownReason::AdminStop) {
             runtime_state::clear_stop_request(&shutdown_paths)?;
             let line = operator_i18n::tr(
@@ -801,6 +883,22 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 );
             }
         }
+
+        #[cfg(unix)]
+        if matches!(reason, ShutdownReason::BinaryUpdateRestart) {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "binary-update: auto-restarting into new binary at {}",
+                    own_exe.display(),
+                ),
+            );
+            // Drop the trace guard to flush logs before exec.
+            drop(_trace_guard);
+            exec_into_self(&own_exe)?;
+            // exec_into_self does not return on success.
+        }
+
         return Ok(());
     }
 
@@ -1432,9 +1530,64 @@ fn load_tunnel_config(bundle_root: &std::path::Path) -> Option<TunnelConfig> {
     serde_json::from_str(&raw).ok()
 }
 
+/// Guard that fires boot-fail rollback on drop if the new binary fails to
+/// boot. Armed when the marker says `to_version == own_version` (we are the
+/// NEW binary). Disarmed at the "boot succeeded" point (just before entering
+/// the shutdown select loop).
+#[cfg(unix)]
+struct BootRollbackGuard {
+    env_dir: PathBuf,
+    exe_path: PathBuf,
+    marker: revision_serve::BinaryUpdateMarker,
+    disarmed: bool,
+}
+
+#[cfg(unix)]
+impl Drop for BootRollbackGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        operator_log::error(
+            module_path!(),
+            format!(
+                "binary-update: new version {} failed to boot; rolling back to {}",
+                self.marker.to_version, self.marker.from_version,
+            ),
+        );
+        revision_serve::write_rollback_tombstone(&self.env_dir, &self.marker);
+        if let Err(err) = greentic_update::binswap::restore_prev(&self.exe_path) {
+            operator_log::error(
+                module_path!(),
+                format!("binary-update: restore_prev failed: {err}; manual recovery required"),
+            );
+            return;
+        }
+        if let Err(err) = exec_into_self(&self.exe_path) {
+            operator_log::error(
+                module_path!(),
+                format!("binary-update: re-exec into old binary failed: {err}"),
+            );
+        }
+    }
+}
+
+/// Replace this process with a fresh copy of the binary at `exe`.
+/// Uses `execv` so the PID is preserved and tunnel children (reparented
+/// to PID 1) survive. Does not return on success.
+#[cfg(unix)]
+fn exec_into_self(exe: &Path) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let args: Vec<String> = std::env::args().collect();
+    let err = std::process::Command::new(exe).args(&args[1..]).exec();
+    // exec() only returns on error.
+    Err(anyhow::anyhow!("exec failed: {err}"))
+}
+
 enum ShutdownReason {
     CtrlC,
     AdminStop,
+    BinaryUpdateRestart,
 }
 
 impl ShutdownReason {
@@ -1442,6 +1595,7 @@ impl ShutdownReason {
         match self {
             Self::CtrlC => "ctrl_c",
             Self::AdminStop => "admin_stop",
+            Self::BinaryUpdateRestart => "binary_update_restart",
         }
     }
 }
@@ -1449,14 +1603,19 @@ impl ShutdownReason {
 fn wait_for_shutdown(paths: &runtime_state::RuntimePaths) -> anyhow::Result<ShutdownReason> {
     let runtime =
         tokio::runtime::Runtime::new().context("failed to spawn runtime for Ctrl+C listener")?;
-    runtime.block_on(wait_for_shutdown_inner(paths))
+    runtime.block_on(wait_for_shutdown_inner(paths, None))
 }
 
 /// Core Ctrl+C / stop-request select loop, shared by the legacy bundle arm
 /// (via [`wait_for_shutdown`], on its own throwaway runtime) and the
 /// bundle-less env-serving arm (on the activation runtime it already owns).
+///
+/// When `auto_restart_check` is `Some`, the 250ms poll also checks the
+/// auto-restart-pending flag and returns `BinaryUpdateRestart` when set.
+/// The legacy bundle arm passes `None` (auto-restart is env-serve only).
 async fn wait_for_shutdown_inner(
     paths: &runtime_state::RuntimePaths,
+    auto_restart_check: Option<&std::sync::Arc<revision_serve::RevisionServer>>,
 ) -> anyhow::Result<ShutdownReason> {
     loop {
         tokio::select! {
@@ -1467,6 +1626,11 @@ async fn wait_for_shutdown_inner(
             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                 if runtime_state::read_stop_request(paths)?.is_some() {
                     return Ok(ShutdownReason::AdminStop);
+                }
+                if let Some(server) = auto_restart_check
+                    && server.auto_restart_pending()
+                {
+                    return Ok(ShutdownReason::BinaryUpdateRestart);
                 }
             }
         }
@@ -1576,6 +1740,7 @@ mod tests {
             quiet: false,
             no_browser: false,
             no_updates: false,
+            no_auto_restart: false,
             admin: false,
             admin_port: 9443,
             admin_certs_dir: None,
@@ -1610,6 +1775,7 @@ mod tests {
             quiet: false,
             no_browser: false,
             no_updates: false,
+            no_auto_restart: false,
             admin: false,
             admin_port: 9443,
             admin_certs_dir: None,
@@ -1713,6 +1879,7 @@ mod tests {
             quiet: false,
             no_browser: false,
             no_updates: false,
+            no_auto_restart: false,
             admin: false,
             admin_port: 9443,
             admin_certs_dir: None,
@@ -2054,5 +2221,80 @@ mod tests {
         assert_eq!(resolve_env(Some("local")), "local");
         assert_eq!(resolve_env(Some("staging")), "staging");
         assert_eq!(resolve_env(None), "local");
+    }
+
+    // --- P7e: ShutdownReason + auto-restart tests ---
+
+    #[test]
+    fn shutdown_reason_binary_update_restart_as_str() {
+        assert_eq!(
+            ShutdownReason::BinaryUpdateRestart.as_str(),
+            "binary_update_restart"
+        );
+    }
+
+    /// Shared helper: mirrors the auto-restart resolution in `run_start`.
+    fn resolve_auto_restart(no_auto_restart_flag: bool) -> bool {
+        cfg!(unix)
+            && !no_auto_restart_flag
+            && std::env::var("GREENTIC_NO_AUTO_RESTART")
+                .map(|v| !matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(true)
+    }
+
+    #[test]
+    fn auto_restart_env_var_disables() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("GREENTIC_NO_AUTO_RESTART", "1") };
+        let result = resolve_auto_restart(false);
+        assert!(
+            !result,
+            "env var GREENTIC_NO_AUTO_RESTART=1 must disable auto-restart"
+        );
+        unsafe { std::env::remove_var("GREENTIC_NO_AUTO_RESTART") };
+    }
+
+    #[test]
+    fn auto_restart_enabled_when_env_var_unset_and_flag_false() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("GREENTIC_NO_AUTO_RESTART") };
+        let result = resolve_auto_restart(false);
+        if cfg!(unix) {
+            assert!(
+                result,
+                "auto-restart should be enabled when nothing disables it"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_restart_disabled_by_cli_flag() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("GREENTIC_NO_AUTO_RESTART") };
+        let result = resolve_auto_restart(true);
+        assert!(!result, "CLI flag must disable auto-restart");
+    }
+
+    #[test]
+    fn no_auto_restart_flag_parses() {
+        use clap::Parser;
+        let cli = cli_args::Cli::try_parse_from(["greentic-start", "start", "--no-auto-restart"])
+            .unwrap();
+        let cli_args::Command::Start(args) = cli.command else {
+            panic!("expected start");
+        };
+        let req = cli_args::start_request_from_args(args, false);
+        assert!(req.no_auto_restart);
+    }
+
+    #[test]
+    fn no_auto_restart_defaults_false() {
+        use clap::Parser;
+        let cli = cli_args::Cli::try_parse_from(["greentic-start", "start"]).unwrap();
+        let cli_args::Command::Start(args) = cli.command else {
+            panic!("expected start");
+        };
+        let req = cli_args::start_request_from_args(args, false);
+        assert!(!req.no_auto_restart);
     }
 }
