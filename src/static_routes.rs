@@ -1008,18 +1008,39 @@ mod tests {
 
     // ── Revision-scoped discovery + matching ──────────────────────────────
 
-    /// Path to the real `.gtpack` built from the `messaging-webchat-gui`
-    /// pack. Anchors tests to on-disk reality rather than hand-authored
-    /// fixtures.
-    fn real_webchat_gui_gtpack() -> PathBuf {
-        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.pop(); // up from greentic-start
-        p.push("greentic-messaging-providers/dist/packs/messaging-webchat-gui.gtpack");
-        p
+    /// Verbatim copy of the `greentic.static-routes.v1` inline payload declared
+    /// by the real `messaging-webchat-gui` pack
+    /// (`greentic-messaging-providers/packs/messaging-webchat-gui/pack.yaml`).
+    ///
+    /// Vendored, not read from the sibling repo: greentic-start's CI does not
+    /// check that repo out. Driving these tests straight off the sibling
+    /// artifact made every one of them `return` early and report green while
+    /// covering nothing — the misparse they exist to catch would have shipped.
+    /// `vendored_fixture_still_matches_real_pack` guards this copy against drift.
+    const WEBCHAT_GUI_STATIC_ROUTES: &str = r#"
+version: 1
+routes:
+- id: webchat-gui
+  index_file: index.html
+  public_path: /v1/web/webchat/{tenant}
+  scope:
+    team: false
+    tenant: true
+  source_root: assets/webchat-gui
+  spa_fallback: index.html
+"#;
+
+    fn webchat_gui_payload() -> serde_json::Value {
+        serde_yaml_bw::from_str(WEBCHAT_GUI_STATIC_ROUTES).expect("parse webchat-gui fixture")
     }
 
-    /// Read the expected field values from the real pack.yaml so assertions
-    /// are anchored to the artifact, not to the test author's understanding.
+    /// A `.gtpack` carrying the real webchat-gui static-routes declaration.
+    fn webchat_gui_gtpack(dir: &Path) -> PathBuf {
+        build_gtpack_with_payload(dir, "messaging-webchat-gui", webchat_gui_payload())
+    }
+
+    /// Expected field values, read from the declaration itself rather than
+    /// restated by the test author.
     fn expected_webchat_gui_values() -> (
         String,
         String,
@@ -1029,12 +1050,8 @@ mod tests {
         bool,
         bool,
     ) {
-        let mut yaml_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        yaml_path.pop();
-        yaml_path.push("greentic-messaging-providers/packs/messaging-webchat-gui/pack.yaml");
-        let content = fs::read_to_string(&yaml_path).expect("read pack.yaml");
-        let doc: serde_json::Value = serde_yaml_bw::from_str(&content).expect("parse pack.yaml");
-        let ext = &doc["extensions"]["greentic.static-routes.v1"]["inline"]["routes"][0];
+        let doc = webchat_gui_payload();
+        let ext = &doc["routes"][0];
         let route_id = ext["id"].as_str().expect("id").to_string();
         let public_path = ext["public_path"]
             .as_str()
@@ -1059,16 +1076,37 @@ mod tests {
         )
     }
 
+    /// Drift guard. Where the sibling repo IS checked out (local dev, the
+    /// monorepo), the vendored fixture above must still match what the real
+    /// pack declares. Skipping is correct here — this checks the fixture, not
+    /// the parser, and the parser is covered unconditionally either way.
     #[test]
-    fn discover_revision_static_routes_from_real_pack() {
-        let pack_path = real_webchat_gui_gtpack();
-        if !pack_path.exists() {
+    fn vendored_fixture_still_matches_real_pack() {
+        let mut yaml_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        yaml_path.pop();
+        yaml_path.push("greentic-messaging-providers/packs/messaging-webchat-gui/pack.yaml");
+        if !yaml_path.is_file() {
             eprintln!(
-                "skipping: real .gtpack not found at {}",
-                pack_path.display()
+                "skipping drift check: sibling repo not checked out at {}",
+                yaml_path.display()
             );
             return;
         }
+        let content = fs::read_to_string(&yaml_path).expect("read pack.yaml");
+        let doc: serde_json::Value = serde_yaml_bw::from_str(&content).expect("parse pack.yaml");
+        let real = &doc["extensions"]["greentic.static-routes.v1"]["inline"]["routes"][0];
+        let fixture = &webchat_gui_payload()["routes"][0];
+        assert_eq!(
+            real, fixture,
+            "the vendored WEBCHAT_GUI_STATIC_ROUTES fixture has drifted from the real \
+             messaging-webchat-gui pack.yaml — update it"
+        );
+    }
+
+    #[test]
+    fn discover_revision_static_routes_parses_webchat_gui_declaration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack_path = webchat_gui_gtpack(dir.path());
         let (
             expected_id,
             expected_public_path,
@@ -1135,14 +1173,8 @@ mod tests {
 
     #[test]
     fn revision_scoped_route_not_matched_by_legacy_matcher() {
-        let pack_path = real_webchat_gui_gtpack();
-        if !pack_path.exists() {
-            eprintln!(
-                "skipping: real .gtpack not found at {}",
-                pack_path.display()
-            );
-            return;
-        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack_path = webchat_gui_gtpack(dir.path());
         let scope = crate::http_routes::RevisionScope {
             deployment_id: greentic_deploy_spec::DeploymentId::new(),
             bundle_id: greentic_deploy_spec::BundleId::new("acme"),
@@ -1165,14 +1197,8 @@ mod tests {
 
     #[test]
     fn match_request_for_revision_isolates_scopes() {
-        let pack_path = real_webchat_gui_gtpack();
-        if !pack_path.exists() {
-            eprintln!(
-                "skipping: real .gtpack not found at {}",
-                pack_path.display()
-            );
-            return;
-        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack_path = webchat_gui_gtpack(dir.path());
         let reserved = ReservedRouteSet::operator_defaults();
         let deployment = greentic_deploy_spec::DeploymentId::new();
         let scope_a = crate::http_routes::RevisionScope {
@@ -1225,14 +1251,8 @@ mod tests {
 
     #[test]
     fn path_outside_public_path_does_not_match() {
-        let pack_path = real_webchat_gui_gtpack();
-        if !pack_path.exists() {
-            eprintln!(
-                "skipping: real .gtpack not found at {}",
-                pack_path.display()
-            );
-            return;
-        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack_path = webchat_gui_gtpack(dir.path());
         let scope = crate::http_routes::RevisionScope {
             deployment_id: greentic_deploy_spec::DeploymentId::new(),
             bundle_id: greentic_deploy_spec::BundleId::new("acme"),
@@ -1259,6 +1279,27 @@ mod tests {
     /// `public_path`. Used to drive the REAL discovery pipeline from the
     /// test rather than asserting helper internals.
     fn build_test_gtpack(dir: &Path, name: &str, public_path: &str) -> PathBuf {
+        build_gtpack_with_payload(
+            dir,
+            name,
+            serde_json::json!({
+                "schema_version": 1,
+                "routes": [{
+                    "id": name,
+                    "public_path": public_path,
+                    "source_root": "assets",
+                }]
+            }),
+        )
+    }
+
+    /// Build a `.gtpack` ZIP whose `manifest.cbor` carries the given
+    /// `greentic.static-routes.v1` payload verbatim.
+    fn build_gtpack_with_payload(
+        dir: &Path,
+        name: &str,
+        route_payload: serde_json::Value,
+    ) -> PathBuf {
         use greentic_types::{
             ExtensionInline, ExtensionRef, PackId, PackKind, PackManifest, PackSignatures,
             encode_pack_manifest,
@@ -1266,14 +1307,6 @@ mod tests {
         use semver::Version;
         use std::io::Write;
 
-        let route_payload = serde_json::json!({
-            "schema_version": 1,
-            "routes": [{
-                "id": name,
-                "public_path": public_path,
-                "source_root": "assets",
-            }]
-        });
         let mut extensions = std::collections::BTreeMap::new();
         extensions.insert(
             EXT_STATIC_ROUTES_V1.to_string(),
