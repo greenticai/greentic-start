@@ -3300,7 +3300,7 @@ async fn dispatch_provider_route(
     // path normalization, query augmentation, session-token preflight,
     // conversation dedup, streamUrl rewrite, POST /token validation.
     let is_directline = provider_type.starts_with("messaging.webchat");
-    let (dl_method, dl_path, dl_query, mut dl_headers, dl_forward_plan, dl_dedup_key);
+    let (dl_method, dl_path, dl_query_pairs, mut dl_headers, dl_forward_plan, dl_dedup_key);
     if is_directline {
         // Extract the provider-relative path from the full request path.
         // The http-routes.v1 routes carry the full URL pattern
@@ -3358,13 +3358,13 @@ async fn dispatch_provider_route(
 
         dl_method = norm_method;
         dl_path = norm_path;
-        dl_query = encode_directline_query_string(&augmented);
+        dl_query_pairs = augmented;
         dl_forward_plan = Some(forward_plan);
         dl_dedup_key = dedup_key;
     } else {
         dl_method = method.to_string();
         dl_path = path.to_string();
-        dl_query = query.map(str::to_string);
+        dl_query_pairs = parse_query_pairs(query);
         dl_headers = request_headers.to_vec();
         dl_forward_plan = None;
         dl_dedup_key = None;
@@ -3453,7 +3453,7 @@ async fn dispatch_provider_route(
         tenant,
         &dl_method,
         &dl_path,
-        dl_query.as_deref(),
+        &dl_query_pairs,
         &dl_headers,
         body,
     );
@@ -3567,6 +3567,22 @@ async fn dispatch_provider_route(
             && (dl_path == "/v3/directline/conversations" || dl_path.ends_with("/conversations"))
             && (200..300).contains(&response.status)
         {
+            // Pin the newly created conversation to the revision that
+            // created it. POST /conversations has no conversation_id in
+            // the URL yet, so the pre-dispatch session_hint was None
+            // and no pin was written. Extract the id from the response
+            // and commit the pin now so subsequent activities on this
+            // conversation stick to the same revision.
+            if let Some(conv) = crate::directline_session::conversation_id_from_response(&response)
+            {
+                let hint = format!("webchat:{conv}");
+                activation
+                    .routing
+                    .dispatcher
+                    .commit_pin(tenant, deployment_id, &hint, revision_id)
+                    .await;
+            }
+
             rewrite_stream_url(&dl_headers, &mut response, &state);
 
             // Cache the post-rewrite response for conversation dedup.
@@ -3900,7 +3916,7 @@ fn build_provider_http_in(
     tenant: &str,
     method: &str,
     path: &str,
-    query: Option<&str>,
+    query: &[(String, String)],
     headers: &[(String, String)],
     body: &[u8],
 ) -> HttpInV1 {
@@ -3913,7 +3929,7 @@ fn build_provider_http_in(
         team_hint: None,
         method: method.to_string(),
         path: path.to_string(),
-        query: parse_query_pairs(query),
+        query: query.to_vec(),
         headers: headers.to_vec(),
         body_b64: BASE64.encode(body),
         config: None,
@@ -4059,7 +4075,8 @@ fn extract_directline_provider_path(path: &str) -> String {
     if let Some(idx) = path.find("/v3/directline") {
         return path[idx..].to_string();
     }
-    // Legacy `/token` shorthand: the path ends with `/token`.
+    // Legacy shorthand paths: the last segment(s) map to a known
+    // provider-relative path.
     let segments: Vec<&str> = path
         .trim_start_matches('/')
         .split('/')
@@ -4067,6 +4084,13 @@ fn extract_directline_provider_path(path: &str) -> String {
         .collect();
     if segments.last() == Some(&"token") {
         return "/token".to_string();
+    }
+    // /auth/config — OAuth configuration endpoint used by webchat-gui.
+    if segments.len() >= 2
+        && segments[segments.len() - 2] == "auth"
+        && segments[segments.len() - 1] == "config"
+    {
+        return "/auth/config".to_string();
     }
     // Fallback: return the path as-is (should not happen for well-formed
     // webchat routes, but avoids a panic).
@@ -4111,6 +4135,7 @@ fn augment_directline_queries(
 }
 
 /// Percent-encode a query-string key or value per RFC 3986 unreserved set.
+#[cfg(test)]
 fn percent_encode_query_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -4127,6 +4152,7 @@ fn percent_encode_query_component(value: &str) -> String {
 
 /// Serialize query pairs into a percent-encoded query string.
 /// Returns `None` for an empty list (no `?` suffix needed).
+#[cfg(test)]
 fn encode_directline_query_string(queries: &[(String, String)]) -> Option<String> {
     if queries.is_empty() {
         return None;
@@ -5046,12 +5072,13 @@ mod tests {
     #[test]
     fn build_provider_http_in_wires_fields_and_b64_body() {
         let headers = vec![("content-type".to_string(), "application/json".to_string())];
+        let query = parse_query_pairs(Some("token=abc&n=1"));
         let http_in = build_provider_http_in(
             "messaging.telegram.bot",
             "acme",
             "POST",
             "/webhook/telegram",
-            Some("token=abc&n=1"),
+            &query,
             &headers,
             br#"{"update_id":42}"#,
         );
@@ -5062,6 +5089,32 @@ mod tests {
         assert_eq!(http_in.headers, headers);
         assert_eq!(http_in.query.len(), 2);
         assert_eq!(http_in.body_b64, BASE64.encode(br#"{"update_id":42}"#));
+    }
+
+    #[test]
+    fn build_provider_http_in_preserves_percent_encoded_query() {
+        // Regression: the old path encoded pairs into a query string then
+        // re-parsed them, double-encoding any `%` already in the raw
+        // query (e.g. `%20` became `%2520`). The fix passes pairs
+        // directly so percent-encoded characters survive unchanged.
+        let pairs = parse_query_pairs(Some("user=John%20Doe&tag=%E2%9C%93"));
+        let http_in = build_provider_http_in(
+            "messaging.webchat.standard",
+            "acme",
+            "POST",
+            "/v3/directline/conversations",
+            &pairs,
+            &[],
+            b"{}",
+        );
+        assert_eq!(
+            http_in.query,
+            vec![
+                ("user".to_string(), "John%20Doe".to_string()),
+                ("tag".to_string(), "%E2%9C%93".to_string()),
+            ],
+            "percent-encoded characters must survive without double-encoding"
+        );
     }
 
     #[test]
@@ -5940,6 +5993,14 @@ mod tests {
         assert_eq!(
             extract_directline_provider_path("/v1/messaging/webchat/demo/unknown"),
             "/v1/messaging/webchat/demo/unknown"
+        );
+    }
+
+    #[test]
+    fn extract_directline_provider_path_auth_config() {
+        assert_eq!(
+            extract_directline_provider_path("/v1/messaging/webchat/demo/auth/config"),
+            "/auth/config"
         );
     }
 
