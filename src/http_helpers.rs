@@ -22,7 +22,7 @@ pub(crate) fn cors_preflight_response() -> Response<Full<Bytes>> {
         .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         .header(
             "Access-Control-Allow-Headers",
-            "Content-Type, Authorization, X-Requested-With, x-ms-bot-agent",
+            "Content-Type, Authorization, X-Requested-With, x-ms-bot-agent, X-Greentic-Locale",
         )
         .header("Access-Control-Max-Age", "86400")
         .body(Full::from(Bytes::new()))
@@ -38,7 +38,9 @@ pub(crate) fn with_cors(mut response: Response<Full<Bytes>>) -> Response<Full<By
     );
     headers.insert(
         "Access-Control-Allow-Headers",
-        HeaderValue::from_static("Content-Type, Authorization, X-Requested-With, x-ms-bot-agent"),
+        HeaderValue::from_static(
+            "Content-Type, Authorization, X-Requested-With, x-ms-bot-agent, X-Greentic-Locale",
+        ),
     );
     response
 }
