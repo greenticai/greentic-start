@@ -199,6 +199,13 @@ struct ServeState {
     /// new activities. Shared across all revisions so a REST POST that writes
     /// an activity on one revision wakes the WS pump watching that conversation.
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
+    /// Test-only: override the activity source used by the WS pump. When
+    /// `Some`, `handle_websocket_upgrade` substitutes this source instead of
+    /// constructing a `RevisionActivitySource` that calls
+    /// `invoke_provider_for_revision`. This lets integration tests exercise the
+    /// full WS upgrade + pump pipeline without loading a real WASM pack.
+    #[cfg(test)]
+    activity_source_override: Option<Arc<dyn crate::websocket::pump::ActivitySource>>,
 }
 
 impl ServeState {
@@ -492,6 +499,8 @@ impl RevisionServer {
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
             session_manager,
             notifier,
+            #[cfg(test)]
+            activity_source_override: None,
         });
         // Cloned into the listener thread; the original lives on as the
         // [`RevisionServer::state`] handle so [`reload`] / [`counts`] read the
@@ -4638,6 +4647,22 @@ async fn handle_websocket_upgrade(
     // Build the revision-specific activity source. This calls
     // `invoke_provider_for_revision` directly (async) — no sync/async bridge
     // needed because the pump runs entirely in an async context.
+    #[cfg(test)]
+    let source: Arc<dyn crate::websocket::pump::ActivitySource> =
+        if let Some(ref override_source) = state.activity_source_override {
+            Arc::clone(override_source)
+        } else {
+            Arc::new(RevisionActivitySource {
+                host: Arc::clone(&activation.host),
+                deployment_id,
+                bundle_id,
+                revision_id,
+                provider_type,
+                team: team.to_string(),
+                auth_token,
+            })
+        };
+    #[cfg(not(test))]
     let source: Arc<dyn crate::websocket::pump::ActivitySource> =
         Arc::new(RevisionActivitySource {
             host: Arc::clone(&activation.host),
@@ -6074,6 +6099,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         }
     }
 
@@ -7017,6 +7043,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -7122,6 +7149,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -7221,6 +7249,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -7293,6 +7322,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -7566,6 +7596,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         })
     }
 
@@ -8308,6 +8339,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -8345,6 +8377,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
         assert_eq!(resp.status(), StatusCode::OK, "still healthy");
@@ -8377,6 +8410,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
         assert!(
@@ -8405,6 +8439,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -8622,6 +8657,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -8662,6 +8698,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         state.mark_restart_required();
         assert!(
@@ -8697,6 +8734,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         state.mark_restart_required();
         assert!(
@@ -8879,5 +8917,365 @@ mod binary_update_tests {
             !prev_path.exists(),
             "restore_prev consumes the .prev copy it restores from"
         );
+    }
+
+    // ── Category 12: A5 — end-to-end WS upgrade through revision-serve ─────
+
+    /// In-memory `SecretsManager` for tests: returns a pre-loaded signing key
+    /// and rejects everything else.
+    struct TestSecretsManager {
+        entries: std::sync::Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl TestSecretsManager {
+        fn with_entry(key: &str, value: Vec<u8>) -> Self {
+            let mut map = HashMap::new();
+            map.insert(key.to_string(), value);
+            Self {
+                entries: std::sync::Mutex::new(map),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl greentic_secrets_lib::SecretsManager for TestSecretsManager {
+        async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+            self.entries
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+        }
+
+        async fn write(&self, _path: &str, _bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+
+        async fn delete(&self, _path: &str) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// In-memory activity source for the WS pump that bypasses the WASM
+    /// provider. Shared between the test driver and the pump via `Arc`.
+    struct TestActivitySource {
+        entries: std::sync::Mutex<Vec<serde_json::Value>>,
+        next_watermark: std::sync::Mutex<u64>,
+    }
+
+    impl TestActivitySource {
+        fn new() -> Self {
+            Self {
+                entries: std::sync::Mutex::new(Vec::new()),
+                next_watermark: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn append(&self, text: &str) -> u64 {
+            let mut wm = self.next_watermark.lock().unwrap();
+            let watermark = *wm;
+            *wm += 1;
+            self.entries.lock().unwrap().push(serde_json::json!({
+                "type": "message",
+                "text": text,
+                "channelData": {"watermark": watermark},
+            }));
+            watermark
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::websocket::pump::ActivitySource for TestActivitySource {
+        async fn fetch_since(
+            &self,
+            _tenant_id: &str,
+            _conversation_id: &str,
+            since_watermark: u64,
+        ) -> Result<(Vec<serde_json::Value>, u64), String> {
+            let entries = self.entries.lock().unwrap();
+            let next = *self.next_watermark.lock().unwrap();
+            let filtered: Vec<serde_json::Value> = entries
+                .iter()
+                .filter(|a| {
+                    a.get("channelData")
+                        .and_then(|cd| cd.get("watermark"))
+                        .and_then(|w| w.as_u64())
+                        .map(|w| w >= since_watermark)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            Ok((filtered, next))
+        }
+    }
+
+    /// Issue a HS256 JWT for the test WebSocket handshake.
+    fn issue_test_token(conversation_id: &str, tenant: &str, signing_key: &[u8]) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+
+        let exp = chrono::Utc::now().timestamp() + 60;
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let claims = format!(
+            r#"{{"sub":"test-user","exp":{exp},"ctx":{{"env":"test","tenant":"{tenant}"}},"conv":"{conversation_id}"}}"#
+        );
+        let payload = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let signing_input = format!("{header}.{payload}");
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(signing_key).expect("hmac key");
+        mac.update(signing_input.as_bytes());
+        let sig = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("{signing_input}.{sig}")
+    }
+
+    /// Build an [`Activation`] wired for the A5 end-to-end WS test: routes
+    /// resolve, the dispatcher holds one revision, and the secrets manager
+    /// returns the signing key.
+    fn ws_test_activation(
+        env_id: &str,
+        tenant: &str,
+        deployment_id: greentic_deploy_spec::ids::DeploymentId,
+        revision_id: greentic_deploy_spec::ids::RevisionId,
+        bundle_id: greentic_deploy_spec::ids::BundleId,
+        signing_key: &[u8],
+        pin_store: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore>,
+    ) -> Activation {
+        use crate::deployment_routes::DeploymentRouteTable;
+        use crate::http_routes::{HttpRouteTable, provider_descriptor_for_test};
+        use crate::revision_dispatcher::{
+            RevisionDispatcher, RevisionDispatcherConfig, RevisionEntry,
+        };
+
+        let scope = crate::http_routes::RevisionScope {
+            deployment_id,
+            bundle_id: bundle_id.clone(),
+            revision_id,
+        };
+
+        let mut provider_route = provider_descriptor_for_test(
+            "/v1/messaging/webchat/{tenant}/{path*}",
+            "messaging.webchat.gui",
+            scope,
+        );
+        provider_route.methods = Vec::new();
+        let http_routes = HttpRouteTable::from_descriptors(vec![provider_route]);
+
+        let deployment_routes = DeploymentRouteTable::from_parts(vec![(
+            deployment_id,
+            tenant.to_string(),
+            Vec::new(),
+            Vec::new(),
+        )]);
+
+        let dispatcher = RevisionDispatcher::with_pin_store(
+            RevisionDispatcherConfig::new(env_id, [0u8; 32]),
+            pin_store,
+        );
+        dispatcher
+            .apply_traffic_split(
+                deployment_id,
+                vec![RevisionEntry {
+                    revision_id,
+                    bundle_id: bundle_id.clone(),
+                    weight_bps: 10_000,
+                }],
+                bundle_id,
+                0,
+            )
+            .expect("apply_traffic_split");
+
+        let provider_hyphen = "messaging-webchat-gui";
+        let env = crate::resolve_env(None);
+        let team_segment = crate::secrets_manager::canonical_team(Some("default"));
+        let raw_uri =
+            format!("secrets://{env}/{tenant}/{team_segment}/{provider_hyphen}/jwt_signing_key");
+        let secrets: greentic_runner_host::secrets::DynSecretsManager = std::sync::Arc::new(
+            TestSecretsManager::with_entry(&raw_uri, signing_key.to_vec()),
+        );
+
+        let host = std::sync::Arc::new(
+            greentic_runner_host::HostBuilder::new()
+                .with_config(greentic_runner_host::HostConfig::from_gtbind(
+                    greentic_runner_host::TenantBindings {
+                        tenant: tenant.to_string(),
+                        packs: Vec::new(),
+                        env_passthrough: Vec::new(),
+                    },
+                ))
+                .with_secrets_manager(secrets)
+                .build()
+                .expect("build test host"),
+        );
+
+        Activation {
+            host,
+            routing: std::sync::Arc::new(RevisionIngressRouting {
+                dispatcher: std::sync::Arc::new(dispatcher),
+                http_routes,
+                deployment_routes,
+                endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+                deployment_config_overrides: std::sync::Arc::default(),
+                static_routes: crate::static_routes::ActiveRouteTable::default(),
+            }),
+        }
+    }
+
+    /// A5 end-to-end: a WebSocket client connects through the REAL
+    /// `spawn_revision_connection` → `handle_connection` →
+    /// `handle_websocket_upgrade` pipeline, completes the handshake,
+    /// receives a pre-populated replay activity, then receives a
+    /// live-pushed activity via the notifier.
+    ///
+    /// Mutation proof:
+    /// (a) Removing `.with_upgrades()` from `spawn_revision_connection`
+    ///     makes the handshake fail ("Handshake not finished").
+    /// (b) Removing `try_notify_webchat_activity` removes the only
+    ///     `notifier.publish` on the revision path; the pump never
+    ///     wakes for live activities and the second frame never arrives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revision_ws_upgrade_end_to_end() {
+        let env_id = "local";
+        let tenant = "test-tenant";
+        let signing_key = b"revision-ws-test-key";
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let rev_id = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("test.webchat");
+        let conv_id = "conv-ws-e2e";
+        let pin_store: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore> =
+            std::sync::Arc::new(crate::revision_pin::InMemoryPinStore::new());
+
+        let activation = ws_test_activation(
+            env_id,
+            tenant,
+            dep_id,
+            rev_id,
+            bundle_id.clone(),
+            signing_key,
+            std::sync::Arc::clone(&pin_store),
+        );
+
+        let test_source = std::sync::Arc::new(TestActivitySource::new());
+        test_source.append("hello from replay");
+
+        let notifier: Arc<dyn crate::notifier::ActivityNotifier> =
+            Arc::new(crate::notifier::InMemoryNotifier::new(64));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let state = Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(activation)),
+            bound_addr: addr,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::clone(&notifier),
+            activity_source_override: Some(
+                test_source.clone() as Arc<dyn crate::websocket::pump::ActivitySource>
+            ),
+        });
+
+        // Pre-seed a revision pin for this conversation so the WS upgrade
+        // finds it (A5: the WS endpoint requires a prior REST POST
+        // /conversations that pins the session).
+        let session_hint = format!("webchat:{conv_id}");
+        state
+            .current()
+            .routing
+            .dispatcher
+            .commit_pin(tenant, dep_id, &session_hint, rev_id)
+            .await;
+
+        // Spawn the accept loop.
+        let accept_state = Arc::clone(&state);
+        let accept_handle = tokio::spawn(async move {
+            while let Ok(accept) = listener.accept().await {
+                spawn_revision_connection(Ok(accept), &accept_state, true);
+            }
+        });
+
+        // Build the WS URL with a valid token.
+        let token = issue_test_token(conv_id, tenant, signing_key);
+        let url = format!(
+            "ws://{addr}/v1/messaging/webchat/{tenant}/v3/directline/conversations/{conv_id}/stream?t={token}&watermark=0"
+        );
+
+        // Connect and complete the WebSocket handshake.
+        let (mut ws, response) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("ws connect must succeed (handshake)");
+        assert_eq!(
+            response.status(),
+            tokio_tungstenite::tungstenite::http::StatusCode::SWITCHING_PROTOCOLS,
+            "handshake must complete with 101"
+        );
+
+        // First frame: the replay activity pre-populated in the source.
+        use futures_util::StreamExt;
+        let replay = tokio::time::timeout(std::time::Duration::from_millis(3000), ws.next())
+            .await
+            .expect("replay timeout")
+            .expect("ws closed before replay")
+            .expect("ws error");
+        let replay_text = match replay {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let payload: serde_json::Value = serde_json::from_str(&replay_text).expect("replay json");
+        let activities = payload["activities"].as_array().expect("activities array");
+        assert_eq!(activities.len(), 1, "replay should contain one activity");
+        assert_eq!(
+            activities[0]["text"], "hello from replay",
+            "replay activity text"
+        );
+
+        // Simulate a provider-op writing a new activity: append to source,
+        // then publish a notify event (the production code path calls
+        // `try_notify_webchat_activity` after `invoke_provider_for_revision`).
+        let new_wm = test_source.append("live bot reply");
+        notifier
+            .publish(crate::notifier::NotifyEvent {
+                tenant_id: tenant.to_string(),
+                conversation_id: conv_id.to_string(),
+                new_watermark: new_wm + 1,
+            })
+            .await;
+
+        // Second frame: the live-pushed activity.
+        let live = tokio::time::timeout(std::time::Duration::from_millis(3000), ws.next())
+            .await
+            .expect("live timeout — pump never woke (notifier publish missing?)")
+            .expect("ws closed before live frame")
+            .expect("ws error");
+        let live_text = match live {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("expected text frame for live push, got {other:?}"),
+        };
+        let live_payload: serde_json::Value = serde_json::from_str(&live_text).expect("live json");
+        let live_activities = live_payload["activities"]
+            .as_array()
+            .expect("live activities array");
+        assert!(
+            live_activities
+                .iter()
+                .any(|a| a["text"] == "live bot reply"),
+            "expected live bot reply in {live_activities:?}",
+        );
+
+        let _ = ws.close(None).await;
+        accept_handle.abort();
     }
 }
