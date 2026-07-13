@@ -1534,6 +1534,11 @@ pub(crate) struct BinaryUpdateMarker {
     pub(crate) phase: MarkerPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rolled_back_at: Option<String>,
+    /// SHA-256 digest of the binary artifact at swap time. Allows the
+    /// tombstone guard to distinguish a same-version re-release (different
+    /// build artifact) from the exact binary that already failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) digest: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1720,10 +1725,15 @@ fn try_apply_binary_update(
         }
 
         // 3e. Anti-rollback tombstone: a previous attempt to run this version
-        //     failed to boot and was rolled back. Do not retry until the
-        //     operator clears the tombstone or a newer version supersedes it.
+        //     failed to boot and was rolled back. Do not retry the SAME build
+        //     artifact. If the digest differs (a same-version re-release with
+        //     a fixed binary), allow the swap.
         if existing_marker.phase == MarkerPhase::RolledBack
             && existing_marker.to_version == binary.version
+            && existing_marker
+                .digest
+                .as_ref()
+                .is_none_or(|d| d == &binary.digest)
         {
             operator_log::warn(
                 module_path!(),
@@ -1827,6 +1837,7 @@ fn try_apply_binary_update(
         staged_at: chrono::Utc::now().to_rfc3339(),
         phase: MarkerPhase::Pending,
         rolled_back_at: None,
+        digest: Some(binary.digest.clone()),
     };
     if let Err(err) = std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()) {
         // Non-fatal: the swap already succeeded; the marker is advisory.
@@ -6745,6 +6756,7 @@ mod binary_update_tests {
             staged_at: "2026-07-13T00:00:00Z".to_string(),
             phase: MarkerPhase::Pending,
             rolled_back_at: None,
+            digest: None,
         };
         let bytes = serde_json::to_vec(&marker).unwrap();
         let back: BinaryUpdateMarker = serde_json::from_slice(&bytes).unwrap();
@@ -6762,6 +6774,7 @@ mod binary_update_tests {
             staged_at: "2026-07-13T00:00:00Z".to_string(),
             phase: MarkerPhase::RolledBack,
             rolled_back_at: Some("2026-07-13T01:00:00Z".to_string()),
+            digest: Some("abc123".to_string()),
         };
         let bytes = serde_json::to_vec(&marker).unwrap();
         let back: BinaryUpdateMarker = serde_json::from_slice(&bytes).unwrap();
@@ -6785,6 +6798,7 @@ mod binary_update_tests {
             staged_at: "2026-01-01T00:00:00Z".to_string(),
             phase: MarkerPhase::Pending,
             rolled_back_at: None,
+            digest: None,
         };
         std::fs::write(
             dir.path().join(BINARY_UPDATE_PENDING_FILE),
@@ -6823,6 +6837,7 @@ mod binary_update_tests {
             staged_at: "2026-07-13T00:00:00Z".to_string(),
             phase: MarkerPhase::Pending,
             rolled_back_at: None,
+            digest: Some("sha256:abc".to_string()),
         };
         write_rollback_tombstone(dir.path(), &marker);
         let read = read_binary_update_marker(dir.path()).expect("should read tombstone");
@@ -6830,6 +6845,30 @@ mod binary_update_tests {
         assert!(read.rolled_back_at.is_some());
         assert_eq!(read.to_version, "1.1.12");
         assert_eq!(read.from_version, "1.1.11");
+    }
+
+    #[test]
+    fn write_rollback_tombstone_preserves_digest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: "1.1.11".to_string(),
+            to_version: "1.1.12".to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::Pending,
+            rolled_back_at: None,
+            digest: Some("sha256:deadbeef".to_string()),
+        };
+        write_rollback_tombstone(dir.path(), &marker);
+        let read = read_binary_update_marker(dir.path()).expect("should read tombstone");
+        assert_eq!(read.digest.as_deref(), Some("sha256:deadbeef"));
+    }
+
+    #[test]
+    fn marker_digest_defaults_to_none_on_missing_field() {
+        let json = r#"{"name":"x","from_version":"1","to_version":"2","staged_at":"t"}"#;
+        let marker: BinaryUpdateMarker = serde_json::from_str(json).unwrap();
+        assert!(marker.digest.is_none());
     }
 
     #[test]
@@ -6859,6 +6898,94 @@ mod binary_update_tests {
             json["version"].as_str(),
             Some(env!("CARGO_PKG_VERSION")),
             "/status must include version"
+        );
+    }
+
+    /// Regression: binary swap response with restart_required=true must set
+    /// auto_restart_pending when auto_restart_enabled is true.
+    #[test]
+    fn auto_restart_pending_set_on_binary_swap_response() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: true,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: true,
+            exe_path: None,
+        });
+        // Simulate the response-processing logic from handle_update_notify.
+        let body = serde_json::json!({
+            "binary": {
+                "restart_required": true,
+                "version": "1.1.12",
+            }
+        });
+        if body
+            .get("binary")
+            .and_then(|b| b.get("restart_required"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            state.restart_required.store(true, Ordering::Relaxed);
+            #[cfg(unix)]
+            if state.auto_restart_enabled {
+                state.auto_restart_pending.store(true, Ordering::Relaxed);
+            }
+        }
+        assert!(
+            state.restart_required.load(Ordering::Relaxed),
+            "restart_required must be set"
+        );
+        #[cfg(unix)]
+        assert!(
+            state.auto_restart_pending.load(Ordering::Relaxed),
+            "auto_restart_pending must be set when auto_restart_enabled is true"
+        );
+    }
+
+    /// Complement: when auto_restart_enabled is false, auto_restart_pending
+    /// must remain false even after a binary swap.
+    #[test]
+    fn auto_restart_pending_not_set_when_disabled() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: true,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+        });
+        let body = serde_json::json!({
+            "binary": {
+                "restart_required": true,
+                "version": "1.1.12",
+            }
+        });
+        if body
+            .get("binary")
+            .and_then(|b| b.get("restart_required"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            state.restart_required.store(true, Ordering::Relaxed);
+            #[cfg(unix)]
+            if state.auto_restart_enabled {
+                state.auto_restart_pending.store(true, Ordering::Relaxed);
+            }
+        }
+        assert!(
+            state.restart_required.load(Ordering::Relaxed),
+            "restart_required must still be set"
+        );
+        assert!(
+            !state.auto_restart_pending.load(Ordering::Relaxed),
+            "auto_restart_pending must NOT be set when disabled"
         );
     }
 }

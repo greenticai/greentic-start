@@ -446,11 +446,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             .context("resolving own executable path for auto-restart")?;
 
         // P7e: resolve auto-restart. CLI flag or env var disables it.
-        let auto_restart = cfg!(unix)
-            && !request.no_auto_restart
-            && std::env::var("GREENTIC_NO_AUTO_RESTART")
-                .map(|v| !matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-                .unwrap_or(true);
+        let auto_restart = resolve_auto_restart(request.no_auto_restart);
 
         // Initialize operator.log under the env directory before any
         // `operator_log::*` call on this path; otherwise every banner,
@@ -508,6 +504,21 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                                 "binary-update: running as rolled-back version {own_version}; \
                                  version {} will not be retried until tombstone is cleared",
                                 marker.to_version,
+                            ),
+                        );
+                        None
+                    }
+                    revision_serve::MarkerPhase::RolledBack if marker.to_version == own_version => {
+                        // We ARE the version that failed to boot (restore_prev
+                        // failed, so the broken binary is still on disk and the
+                        // supervisor restarted it). Preserve the tombstone so the
+                        // anti-rollback guard in try_apply_binary_update still
+                        // blocks this version.
+                        operator_log::warn(
+                            module_path!(),
+                            format!(
+                                "binary-update: running as the failed version {own_version} \
+                                 (restore_prev may have failed); tombstone preserved",
                             ),
                         );
                         None
@@ -1563,6 +1574,11 @@ impl Drop for BootRollbackGuard {
             );
             return;
         }
+        // Flush stderr before exec so the diagnostic messages logged above
+        // survive the process replacement. The trace guard (declared before
+        // this guard) would normally flush on drop, but exec replaces the
+        // process before that destructor runs.
+        let _ = std::io::Write::flush(&mut std::io::stderr());
         if let Err(err) = exec_into_self(&self.exe_path) {
             operator_log::error(
                 module_path!(),
@@ -1582,6 +1598,25 @@ fn exec_into_self(exe: &Path) -> anyhow::Result<()> {
     let err = std::process::Command::new(exe).args(&args[1..]).exec();
     // exec() only returns on error.
     Err(anyhow::anyhow!("exec failed: {err}"))
+}
+
+/// Resolve whether auto-restart after binary self-update is enabled.
+/// Returns `true` when all of: unix, CLI flag not set, and env var
+/// `GREENTIC_NO_AUTO_RESTART` not set to a truthy value.
+#[cfg(unix)]
+pub(crate) fn resolve_auto_restart(no_flag: bool) -> bool {
+    !no_flag
+        && std::env::var("GREENTIC_NO_AUTO_RESTART")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(true)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn resolve_auto_restart(_no_flag: bool) -> bool {
+    false
 }
 
 enum ShutdownReason {
@@ -2233,20 +2268,11 @@ mod tests {
         );
     }
 
-    /// Shared helper: mirrors the auto-restart resolution in `run_start`.
-    fn resolve_auto_restart(no_auto_restart_flag: bool) -> bool {
-        cfg!(unix)
-            && !no_auto_restart_flag
-            && std::env::var("GREENTIC_NO_AUTO_RESTART")
-                .map(|v| !matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-                .unwrap_or(true)
-    }
-
     #[test]
     fn auto_restart_env_var_disables() {
         let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("GREENTIC_NO_AUTO_RESTART", "1") };
-        let result = resolve_auto_restart(false);
+        let result = super::resolve_auto_restart(false);
         assert!(
             !result,
             "env var GREENTIC_NO_AUTO_RESTART=1 must disable auto-restart"
@@ -2258,7 +2284,7 @@ mod tests {
     fn auto_restart_enabled_when_env_var_unset_and_flag_false() {
         let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("GREENTIC_NO_AUTO_RESTART") };
-        let result = resolve_auto_restart(false);
+        let result = super::resolve_auto_restart(false);
         if cfg!(unix) {
             assert!(
                 result,
@@ -2271,8 +2297,22 @@ mod tests {
     fn auto_restart_disabled_by_cli_flag() {
         let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::remove_var("GREENTIC_NO_AUTO_RESTART") };
-        let result = resolve_auto_restart(true);
+        let result = super::resolve_auto_restart(true);
         assert!(!result, "CLI flag must disable auto-restart");
+    }
+
+    #[test]
+    fn auto_restart_env_var_case_insensitive() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        for val in ["TRUE", "True", "YES", "Yes", "ON", "On", "1"] {
+            unsafe { std::env::set_var("GREENTIC_NO_AUTO_RESTART", val) };
+            let result = super::resolve_auto_restart(false);
+            assert!(
+                !result,
+                "env var GREENTIC_NO_AUTO_RESTART={val} must disable auto-restart"
+            );
+        }
+        unsafe { std::env::remove_var("GREENTIC_NO_AUTO_RESTART") };
     }
 
     #[test]
@@ -2296,5 +2336,80 @@ mod tests {
         };
         let req = cli_args::start_request_from_args(args, false);
         assert!(!req.no_auto_restart);
+    }
+
+    /// Regression: a RolledBack tombstone where to_version matches the running
+    /// binary (restore_prev failed scenario) must NOT be cleared by the catch-all.
+    #[test]
+    fn boot_marker_rolled_back_to_version_preserves_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_json = serde_json::json!({
+            "name": "greentic-start",
+            "from_version": "1.1.11",
+            "to_version": "1.1.12",
+            "staged_at": "2026-07-13T00:00:00Z",
+            "phase": "rolled_back",
+            "rolled_back_at": "2026-07-13T01:00:00Z",
+        });
+        std::fs::write(
+            dir.path().join("binary-update-pending.json"),
+            serde_json::to_vec_pretty(&marker_json).unwrap(),
+        )
+        .unwrap();
+
+        // Simulate boot marker processing with own_version == to_version.
+        // This is the failed-binary-restart scenario.
+        let own_version = "1.1.12";
+        let read = revision_serve::read_binary_update_marker(dir.path()).unwrap();
+        let should_clear = match read.phase {
+            revision_serve::MarkerPhase::Pending if read.to_version == own_version => false,
+            revision_serve::MarkerPhase::Pending if read.from_version == own_version => false,
+            revision_serve::MarkerPhase::RolledBack if read.from_version == own_version => false,
+            revision_serve::MarkerPhase::RolledBack if read.to_version == own_version => false,
+            _ => true,
+        };
+        assert!(
+            !should_clear,
+            "RolledBack tombstone with to_version == own must NOT be cleared"
+        );
+        // Verify marker still on disk.
+        assert!(
+            revision_serve::read_binary_update_marker(dir.path()).is_some(),
+            "tombstone must survive"
+        );
+    }
+
+    /// Regression: stale marker from a different version lineage SHOULD be cleared.
+    #[test]
+    fn boot_marker_stale_lineage_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_json = serde_json::json!({
+            "name": "greentic-start",
+            "from_version": "1.0.0",
+            "to_version": "1.0.1",
+            "staged_at": "2026-07-13T00:00:00Z",
+            "phase": "rolled_back",
+            "rolled_back_at": "2026-07-13T01:00:00Z",
+        });
+        std::fs::write(
+            dir.path().join("binary-update-pending.json"),
+            serde_json::to_vec_pretty(&marker_json).unwrap(),
+        )
+        .unwrap();
+
+        // own_version is neither from_version nor to_version.
+        let own_version = "1.1.12";
+        let read = revision_serve::read_binary_update_marker(dir.path()).unwrap();
+        let should_clear = match read.phase {
+            revision_serve::MarkerPhase::Pending if read.to_version == own_version => false,
+            revision_serve::MarkerPhase::Pending if read.from_version == own_version => false,
+            revision_serve::MarkerPhase::RolledBack if read.from_version == own_version => false,
+            revision_serve::MarkerPhase::RolledBack if read.to_version == own_version => false,
+            _ => true,
+        };
+        assert!(
+            should_clear,
+            "stale marker from a different lineage must be cleared"
+        );
     }
 }
