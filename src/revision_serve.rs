@@ -3525,6 +3525,13 @@ async fn dispatch_provider_route(
             error_response(StatusCode::BAD_GATEWAY, "provider invocation failed")
         })?;
 
+    // A5: notify the WS pump when the provider op itself writes an activity
+    // (e.g. `directline_http` bumps the watermark on POST /activities). The
+    // legacy path solves this via `register_webchat_post_op_notifier`; the
+    // revision path has no callback mechanism on `invoke_provider_for_revision`,
+    // so we extract the `_greentic` metadata inline.
+    try_notify_webchat_activity(state.notifier.as_ref(), &output).await;
+
     let result = parse_dispatch_result(&output).map_err(|err| {
         operator_log::warn(
             module_path!(),
@@ -3571,6 +3578,7 @@ async fn dispatch_provider_route(
         let pipeline_tenant = tenant.to_string();
         let pipeline_provider = provider_type.clone();
         let pipeline_bundle = bundle_id.clone();
+        let pipeline_notifier = Arc::clone(&state.notifier);
         tokio::spawn(async move {
             run_provider_inbound_pipeline(
                 pipeline_activation,
@@ -3583,6 +3591,7 @@ async fn dispatch_provider_route(
                 ingress_envelopes,
                 endpoint_id,
                 welcome_hint,
+                pipeline_notifier,
             )
             .await;
         });
@@ -3657,6 +3666,7 @@ async fn run_provider_inbound_pipeline(
     envelopes: Vec<ChannelMessageEnvelope>,
     endpoint_id: Option<String>,
     welcome_hint: Option<WelcomeFlowHint>,
+    notifier: Arc<dyn crate::notifier::ActivityNotifier>,
 ) {
     for ingress in &envelopes {
         let activity = envelope_to_activity(
@@ -3691,7 +3701,7 @@ async fn run_provider_inbound_pipeline(
 
         for reply in replies {
             let reply_envelope = build_reply_envelope(ingress, &reply);
-            if let Err(err) = run_reply_egress(
+            match run_reply_egress(
                 &activation,
                 &tenant,
                 deployment_id,
@@ -3703,14 +3713,19 @@ async fn run_provider_inbound_pipeline(
             )
             .await
             {
-                operator_log::error(
-                    module_path!(),
-                    format!(
-                        "provider {provider_type} egress failed for deployment \
-                         {deployment_id} revision {revision_id} (reply id={}): {err:#}",
-                        reply_envelope.id
-                    ),
-                );
+                Ok(send_outcome) => {
+                    try_notify_webchat_activity(notifier.as_ref(), &send_outcome).await;
+                }
+                Err(err) => {
+                    operator_log::error(
+                        module_path!(),
+                        format!(
+                            "provider {provider_type} egress failed for deployment \
+                             {deployment_id} revision {revision_id} (reply id={}): {err:#}",
+                            reply_envelope.id
+                        ),
+                    );
+                }
             }
         }
     }
@@ -3737,7 +3752,7 @@ async fn run_reply_egress(
     pack_id: &str,
     provider_type: &str,
     envelope: &ChannelMessageEnvelope,
-) -> Result<()> {
+) -> Result<Value> {
     use crate::messaging_dto::{EncodeInV1, ProviderPayloadV1, RenderPlanInV1};
 
     let message_value = serde_json::to_value(envelope).context("serialize reply envelope")?;
@@ -3824,7 +3839,61 @@ async fn run_reply_egress(
             .unwrap_or("send_payload reported ok=false");
         anyhow::bail!("{error_msg}");
     }
-    Ok(())
+    Ok(send_outcome)
+}
+
+/// Extract `_greentic` metadata from a provider-op output and publish a
+/// [`NotifyEvent`] so the WS pump wakes up. Mirrors the legacy
+/// `register_webchat_post_op_notifier` callback in [`crate::http_ingress`]
+/// which fires on `directline_http` and `send_payload` outputs.
+///
+/// The metadata may appear at the top level (`send_payload`) or inside a
+/// base64-encoded `body_b64` field (`directline_http`). When absent the call
+/// is a no-op — non-webchat providers simply don't carry `_greentic`.
+async fn try_notify_webchat_activity(
+    notifier: &dyn crate::notifier::ActivityNotifier,
+    output: &Value,
+) {
+    let metadata = if let Some(body_b64) = output.get("body_b64").and_then(|v| v.as_str()) {
+        let Ok(decoded) = BASE64.decode(body_b64.as_bytes()) else {
+            return;
+        };
+        let Ok(body) = serde_json::from_slice::<Value>(&decoded) else {
+            return;
+        };
+        match body.get("_greentic").cloned() {
+            Some(m) => m,
+            None => return,
+        }
+    } else {
+        match output.get("_greentic").cloned() {
+            Some(m) => m,
+            None => return,
+        }
+    };
+    let Some(tenant_id) = metadata.get("tenant").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Some(conversation_id) = metadata.get("conversation_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Some(new_watermark) = metadata.get("watermark_bumped").and_then(|v| v.as_u64()) else {
+        return;
+    };
+    operator_log::debug(
+        module_path!(),
+        format!(
+            "[revision ws notifier] publishing event tenant={tenant_id} \
+             conv={conversation_id} watermark={new_watermark}",
+        ),
+    );
+    notifier
+        .publish(crate::notifier::NotifyEvent {
+            tenant_id: tenant_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            new_watermark,
+        })
+        .await;
 }
 
 /// Build a reply [`ChannelMessageEnvelope`] from an inbound `ingress`
@@ -4604,6 +4673,7 @@ async fn handle_websocket_upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifier::ActivityNotifier;
     // `BundleId` is used only in tests (prod refers to it via the `RevisionKey`
     // alias), so it lives here rather than in the library import set.
     use greentic_deploy_spec::WelcomeFlowRef;
@@ -7635,12 +7705,109 @@ mod tests {
     }
 
     #[test]
-    fn stream_path_gets_cors() {
-        // The stream URL originates from the browser's DirectLineJS, which
-        // connects cross-origin to the deployment's ingress.
+    fn stream_path_matches_cors_allowlist() {
+        // `path_allows_cors` classifies stream paths as CORS-eligible.
+        // In practice `handle_connection` intercepts stream paths for the WS
+        // upgrade BEFORE reaching the CORS wrapper, so the header is never
+        // applied — browsers don't enforce CORS on WebSocket connections
+        // anyway. This test validates the classifier's output, not the
+        // end-to-end CORS behaviour on stream responses.
         assert!(path_allows_cors(
             "/v1/messaging/webchat/tenant1/v3/directline/conversations/c1/stream"
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Category 11: A5 — WS notifier integration (try_notify_webchat_activity)
+    // -----------------------------------------------------------------------
+
+    /// Verify that `try_notify_webchat_activity` publishes a `NotifyEvent`
+    /// when the provider output carries top-level `_greentic` metadata
+    /// (the shape returned by `send_payload`).
+    #[tokio::test]
+    async fn notify_publishes_on_top_level_greentic_metadata() {
+        let notifier = crate::notifier::InMemoryNotifier::new(16);
+        let mut events = notifier.subscribe("t1", "conv-1").await.expect("subscribe");
+
+        let output = serde_json::json!({
+            "ok": true,
+            "_greentic": {
+                "tenant": "t1",
+                "conversation_id": "conv-1",
+                "watermark_bumped": 42u64,
+            }
+        });
+        try_notify_webchat_activity(&notifier, &output).await;
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            futures_util::StreamExt::next(&mut events),
+        )
+        .await
+        .expect("timeout waiting for notify event")
+        .expect("stream ended");
+        assert_eq!(event.tenant_id, "t1");
+        assert_eq!(event.conversation_id, "conv-1");
+        assert_eq!(event.new_watermark, 42);
+    }
+
+    /// Verify that `try_notify_webchat_activity` publishes when `_greentic`
+    /// is embedded inside a base64-encoded `body_b64` field (the shape
+    /// returned by `directline_http`).
+    #[tokio::test]
+    async fn notify_publishes_on_body_b64_greentic_metadata() {
+        let notifier = crate::notifier::InMemoryNotifier::new(16);
+        let mut events = notifier
+            .subscribe("t2", "conv-99")
+            .await
+            .expect("subscribe");
+
+        let inner = serde_json::json!({
+            "_greentic": {
+                "tenant": "t2",
+                "conversation_id": "conv-99",
+                "watermark_bumped": 7u64,
+            },
+            "id": "a1"
+        });
+        let body_b64 = BASE64.encode(serde_json::to_vec(&inner).unwrap());
+        let output = serde_json::json!({
+            "status": 200,
+            "body_b64": body_b64,
+        });
+        try_notify_webchat_activity(&notifier, &output).await;
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            futures_util::StreamExt::next(&mut events),
+        )
+        .await
+        .expect("timeout waiting for notify event")
+        .expect("stream ended");
+        assert_eq!(event.tenant_id, "t2");
+        assert_eq!(event.conversation_id, "conv-99");
+        assert_eq!(event.new_watermark, 7);
+    }
+
+    /// Non-webchat provider outputs (no `_greentic`) must not trigger a
+    /// publish. The notifier stream must stay empty.
+    #[tokio::test]
+    async fn notify_is_noop_without_greentic_metadata() {
+        let notifier = crate::notifier::InMemoryNotifier::new(16);
+        let mut events = notifier.subscribe("t1", "conv-1").await.expect("subscribe");
+
+        let output = serde_json::json!({"ok": true});
+        try_notify_webchat_activity(&notifier, &output).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            futures_util::StreamExt::next(&mut events),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "no event should be published for non-webchat output"
+        );
     }
 }
 
