@@ -851,10 +851,32 @@ async fn handle_connection(
     state: Arc<ServeState>,
     peer_is_loopback: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    Ok(match serve(req, state, peer_is_loopback).await {
-        Ok(response) => with_cors(response),
-        Err(response) => with_cors(response),
-    })
+    let cors = path_allows_cors(req.uri().path());
+    let (Ok(response) | Err(response)) = serve(req, state, peer_is_loopback).await;
+    Ok(if cors { with_cors(response) } else { response })
+}
+
+/// Paths that are never legitimately called cross-origin, and so must not
+/// receive `Access-Control-Allow-Origin`.
+///
+/// `/workers/invoke` executes a flow under the deployment's own tenant and
+/// returns its output. It is gated on `peer_is_loopback` — but that gate checks
+/// the *TCP peer*, and a page served from any origin, running in a browser on
+/// this machine, connects from `127.0.0.1` and passes it. The endpoint does not
+/// check `Content-Type` (it just parses the body as JSON), so a blind
+/// cross-origin POST is already possible; granting a wildcard
+/// `Access-Control-Allow-Origin` would additionally let that page *read the
+/// response*, turning a blind write into a full read/write channel. The
+/// `X-Frame-Options` header on `/chat` exists to stop exactly this
+/// (a cross-site page auto-driving the worker endpoint) — blanket CORS would
+/// reopen it by another door.
+///
+/// Nothing legitimate needs CORS here: the built-in `/chat` console fetches it
+/// **same-origin** (a relative `fetch('/workers/invoke')`, see `assets/chat.html`)
+/// and `greentic-gui` reaches it **server-side** via `HttpWorkerBackend`, where
+/// CORS does not apply.
+fn path_allows_cors(path: &str) -> bool {
+    path != "/workers/invoke"
 }
 
 /// Resolve → dispatch → execute for a single request. `Err` carries a ready HTTP
@@ -874,6 +896,12 @@ async fn serve(
     // turning the preflight into a 405 the browser treats as an opaque
     // CORS failure. Mirrors the legacy `http_ingress` short-circuit.
     if method == hyper::Method::OPTIONS {
+        if !path_allows_cors(&path) {
+            return Ok(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "cross-origin requests are not permitted on this path",
+            ));
+        }
         return Ok(cors_preflight_response());
     }
 
@@ -5430,6 +5458,62 @@ mod tests {
                 .to_ascii_lowercase()
                 .starts_with("access-control-allow-origin:")),
             "POST response must carry Access-Control-Allow-Origin header, got:\n{resp}"
+        );
+    }
+
+    /// `/workers/invoke` executes a flow and returns its output. It is gated on
+    /// the TCP peer being loopback — which a page from *any* origin, running in
+    /// a browser on this machine, satisfies. It also ignores `Content-Type`, so
+    /// a blind cross-origin POST already reaches it. Granting a wildcard
+    /// `Access-Control-Allow-Origin` would additionally let that page read the
+    /// response. Nothing legitimate needs it: `/chat` calls it same-origin and
+    /// `greentic-gui` calls it server-side.
+    #[test]
+    fn worker_invoke_is_not_exposed_cross_origin() {
+        let preflight = cors_roundtrip(
+            17980,
+            false,
+            "OPTIONS /workers/invoke HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Origin: https://evil.example\r\n\
+             Access-Control-Request-Method: POST\r\n\
+             Access-Control-Request-Headers: content-type\r\n\
+             Connection: close\r\n\
+             \r\n",
+        );
+        assert!(
+            !preflight.to_ascii_lowercase().contains("204"),
+            "a cross-origin preflight for /workers/invoke must NOT be granted, got:\n{preflight}"
+        );
+        assert!(
+            !preflight
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "/workers/invoke preflight must not carry Access-Control-Allow-Origin, got:\n{preflight}"
+        );
+
+        let body = r#"{"text":"hello"}"#;
+        let posted = cors_roundtrip(
+            17981,
+            false,
+            &format!(
+                "POST /workers/invoke HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 Origin: https://evil.example\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(
+            !posted
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "/workers/invoke response must not be readable cross-origin, got:\n{posted}"
         );
     }
 
