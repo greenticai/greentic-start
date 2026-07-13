@@ -825,6 +825,27 @@ impl RevisionDispatcher {
             .await;
     }
 
+    /// Read an existing pin without side-effects (no write, no cookie, no
+    /// weighted fallback). Returns the `(bundle_id, revision_id)` pair if the
+    /// pin exists, belongs to the current generation, and the revision is
+    /// still routable (not evicted). Used by the WebSocket upgrade path to
+    /// recover the revision a REST conversation was pinned to — A.5 invariant.
+    pub async fn lookup_pin(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        hint: &str,
+    ) -> Option<(BundleId, RevisionId)> {
+        let snap = self.snapshot.load();
+        let entry = snap.deployments.get(&deployment_id)?;
+        let key = self.pin_key_raw(self.env_id.as_str(), deployment_id, tenant, hint);
+        let revision_id = self.pin_store.lookup(key, entry.generation).await?;
+        if !has_revision(entry, revision_id) {
+            return None;
+        }
+        Some((entry.bundle_id.clone(), revision_id))
+    }
+
     /// Single [`PinKey`] construction site so the lookup, try_pin, and
     /// commit_pin call sites can't drift on field order or selection.
     fn pin_key_raw<'a>(
@@ -2506,5 +2527,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("non-draining"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn lookup_pin_returns_pinned_revision() {
+        let dep_id = dep();
+        let rev_id = rev();
+        let d = dispatcher_with(dep_id, vec![entry(rev_id, 10_000)]);
+        // Pin via commit_pin so the store has an entry.
+        d.commit_pin("t1", dep_id, "webchat:conv-1", rev_id).await;
+        let result = d.lookup_pin("t1", dep_id, "webchat:conv-1").await;
+        assert_eq!(
+            result.map(|(_bid, rid)| rid),
+            Some(rev_id),
+            "lookup_pin must return the revision that was pinned"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_pin_returns_none_when_no_pin() {
+        let dep_id = dep();
+        let rev_id = rev();
+        let d = dispatcher_with(dep_id, vec![entry(rev_id, 10_000)]);
+        let result = d.lookup_pin("t1", dep_id, "webchat:no-such-conv").await;
+        assert_eq!(
+            result, None,
+            "lookup_pin must return None when no pin exists"
+        );
     }
 }
