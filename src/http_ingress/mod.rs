@@ -3,7 +3,7 @@ mod conv_dedup;
 mod directline_session;
 mod helpers;
 mod messaging;
-mod static_handler;
+pub(crate) mod static_handler;
 pub mod websocket;
 
 use std::{
@@ -2533,6 +2533,7 @@ mod tests {
             http_routes: HttpRouteTable::default(),
             deployment_routes,
             deployment_config_overrides: Arc::default(),
+            static_routes: ActiveRouteTable::default(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
@@ -2575,6 +2576,7 @@ mod tests {
             http_routes: HttpRouteTable::default(),
             deployment_routes,
             deployment_config_overrides: Arc::default(),
+            static_routes: ActiveRouteTable::default(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
@@ -2876,6 +2878,7 @@ mod tests {
             team_scoped: false,
             cache_strategy: CacheStrategy::None,
             route_segments: vec![RouteScopeSegment::Literal("web".to_string())],
+            scope: None,
         };
         let notifier = runtime
             .block_on(crate::notifier::build_notifier(
@@ -2967,6 +2970,7 @@ mod tests {
                 RouteScopeSegment::Literal("webchat".to_string()),
                 RouteScopeSegment::Tenant,
             ],
+            scope: None,
         };
         let notifier = runtime
             .block_on(crate::notifier::build_notifier(
@@ -3050,6 +3054,7 @@ mod tests {
                 RouteScopeSegment::Tenant,
                 RouteScopeSegment::Team,
             ],
+            scope: None,
         };
         let route_match = StaticRouteMatch {
             descriptor: &descriptor,
@@ -3088,6 +3093,7 @@ mod tests {
                 RouteScopeSegment::Tenant,
                 RouteScopeSegment::Team,
             ],
+            scope: None,
         };
         let route_match = StaticRouteMatch {
             descriptor: &descriptor,

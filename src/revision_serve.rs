@@ -1140,6 +1140,24 @@ async fn serve(
         revision_id: outcome.revision_id,
     };
 
+    // A3: revision-scoped static routes. Checked AFTER reserved operator
+    // paths (probes, /chat, /workers/invoke, /v1/updates/notify) which all
+    // short-circuited above, and AFTER deployment-route resolution, but
+    // BEFORE the provider-route admission gate and generic-flow branch.
+    // Only GET — a POST to a path that happens to overlap a static route's
+    // public_path prefix must fall through to the provider/generic flow so
+    // webhooks keep working.
+    if method == hyper::Method::GET
+        && let Some(route_match) = activation
+            .routing
+            .static_routes
+            .match_request_for_revision(&path, &scope)
+    {
+        let response =
+            crate::http_ingress::static_handler::serve_static_route_from_pack(&route_match, &path);
+        return Ok(with_cors(response));
+    }
+
     // Phase D.3: branch out to the provider-route handler BEFORE the
     // generic-JSON path runs the endpoint resolver / strict JSON parse /
     // entry-flow build_activity. Provider webhooks send raw bodies
@@ -5198,6 +5216,7 @@ mod tests {
                 deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
+                static_routes: crate::static_routes::ActiveRouteTable::default(),
             }),
         }
     }
@@ -6217,6 +6236,7 @@ mod tests {
             )]),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: std::sync::Arc::default(),
+            static_routes: crate::static_routes::ActiveRouteTable::default(),
         });
         let activation = Activation {
             host: base.host,
@@ -6777,6 +6797,7 @@ mod binary_update_tests {
                 deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
+                static_routes: crate::static_routes::ActiveRouteTable::default(),
             }),
         }
     }
