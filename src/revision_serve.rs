@@ -191,6 +191,14 @@ struct ServeState {
     /// Prevents racy double-calls from clients from minting two independent
     /// conversations for the same browser session.
     conversation_dedup: Arc<crate::conv_dedup::ConversationDedupCache>,
+    /// WebSocket session concurrency limits + per-tenant/conversation gauges.
+    /// Shared with the WS upgrade handler so every revision listener shares one
+    /// session accounting pool.
+    session_manager: Arc<crate::websocket::SessionManager>,
+    /// Activity push notifier — informs WS sessions when a conversation has
+    /// new activities. Shared across all revisions so a REST POST that writes
+    /// an activity on one revision wakes the WS pump watching that conversation.
+    notifier: Arc<dyn crate::notifier::ActivityNotifier>,
 }
 
 impl ServeState {
@@ -463,6 +471,14 @@ impl RevisionServer {
         };
         let admin_port = admin_addr.map(|a| a.port());
 
+        let session_manager = Arc::new(crate::websocket::SessionManager::new(
+            crate::websocket::WsLimits::default(),
+        ));
+        // In-memory notifier is sufficient for single-process revision hosts.
+        // A Redis-backed notifier (for horizontally scaled deployments) plugs
+        // in via the same `build_notifier` machinery as the legacy path.
+        let notifier: Arc<dyn crate::notifier::ActivityNotifier> =
+            Arc::new(crate::notifier::InMemoryNotifier::new(64));
         let state = Arc::new(ServeState {
             slot: ArcSwap::new(config.activation),
             bound_addr: addr,
@@ -474,6 +490,8 @@ impl RevisionServer {
             exe_path: config.exe_path,
             directline_sessions: Arc::new(crate::directline_session::DirectLineSessions::from_env()),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager,
+            notifier,
         });
         // Cloned into the listener thread; the original lives on as the
         // [`RevisionServer::state`] handle so [`reload`] / [`counts`] read the
@@ -839,7 +857,15 @@ fn spawn_revision_connection(
                     handle_connection(req, connection_state.clone(), peer_is_loopback)
                 });
                 let io = TokioIo::new(stream);
-                if let Err(err) = Http1Builder::new().serve_connection(io, service).await {
+                // `with_upgrades` is required so the WebSocket handshake
+                // completes — without it hyper closes the TCP connection right
+                // after the 101 response and hyper-tungstenite's
+                // `websocket.await` errors out with "Handshake not finished".
+                if let Err(err) = Http1Builder::new()
+                    .serve_connection(io, service)
+                    .with_upgrades()
+                    .await
+                {
                     operator_log::error(
                         module_path!(),
                         format!("revision ingress connection error: {err}"),
@@ -857,11 +883,21 @@ fn spawn_revision_connection(
 /// `service_fn` adapter: collapse the `Ok`/`Err` response halves into the single
 /// infallible response hyper wants.
 async fn handle_connection(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     state: Arc<ServeState>,
     peer_is_loopback: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let cors = path_allows_cors(req.uri().path());
+    // A5: intercept WebSocket stream paths BEFORE `serve` so the upgrade
+    // handshake can borrow the request mutably. The stream path is the WS
+    // endpoint browsers open after creating a conversation over REST.
+    let path = req.uri().path().to_string();
+    if is_directline_stream_path(&path) {
+        let (Ok(response) | Err(response)) =
+            handle_websocket_upgrade(&mut req, &path, Arc::clone(&state)).await;
+        return Ok(response);
+    }
+
+    let cors = path_allows_cors(&path);
     let (Ok(response) | Err(response)) = serve(req, state, peer_is_loopback).await;
     Ok(if cors { with_cors(response) } else { response })
 }
@@ -4268,6 +4304,302 @@ fn validate_token_response(response: &IngressHttpResponse) -> Result<(), Respons
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// A5: WebSocket upgrade on the revision path
+// ---------------------------------------------------------------------------
+
+/// True when the full request path is a DirectLine stream endpoint:
+/// `.../v3/directline/conversations/{id}/stream`.
+fn is_directline_stream_path(path: &str) -> bool {
+    let dl = extract_directline_provider_path(path);
+    let segments: Vec<&str> = dl.trim_start_matches('/').split('/').collect();
+    matches!(
+        segments.as_slice(),
+        ["v3", "directline", "conversations", _, "stream"]
+    )
+}
+
+/// Extract the conversation id from a DirectLine stream path.
+fn extract_stream_conversation_id(path: &str) -> Option<String> {
+    let dl = extract_directline_provider_path(path);
+    let segments: Vec<&str> = dl.trim_start_matches('/').split('/').collect();
+    match segments.as_slice() {
+        ["v3", "directline", "conversations", conv_id, "stream"] => Some((*conv_id).to_string()),
+        _ => None,
+    }
+}
+
+/// `ActivitySource` that calls `RunnerHost::invoke_provider_for_revision`
+/// to read activities from the conversation state. Unlike the legacy
+/// `RunnerHostActivitySource` (which wraps a sync `RunnerHostHandle` in
+/// `spawn_blocking`), this source calls the async revision-path API
+/// directly — no sync/async bridge required.
+struct RevisionActivitySource {
+    host: Arc<RunnerHost>,
+    deployment_id: DeploymentId,
+    bundle_id: BundleId,
+    revision_id: RevisionId,
+    provider_type: String,
+    team: String,
+    /// Bearer token captured at WS upgrade time.
+    auth_token: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl crate::websocket::pump::ActivitySource for RevisionActivitySource {
+    async fn fetch_since(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        since_watermark: u64,
+    ) -> Result<(Vec<Value>, u64), String> {
+        let headers: Vec<Value> = match &self.auth_token {
+            Some(token) if !token.is_empty() => {
+                vec![serde_json::json!([
+                    "Authorization",
+                    format!("Bearer {token}")
+                ])]
+            }
+            _ => Vec::new(),
+        };
+        let payload = serde_json::json!({
+            "v": 1,
+            "provider": self.provider_type,
+            "route": Value::Null,
+            "binding_id": Value::Null,
+            "tenant_hint": tenant_id,
+            "team_hint": self.team,
+            "method": "GET",
+            "path": format!("/v3/directline/conversations/{conversation_id}/activities"),
+            "query": format!("watermark={since_watermark}&tenant={tenant_id}&team={}", self.team),
+            "headers": headers,
+            "body_b64": "",
+            "config": Value::Null,
+        });
+        let input_json = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
+
+        // Try canonical `ingest-http` op, then fall back to the underscore
+        // alias used by older pack builds — same pattern as the legacy
+        // `DemoRunnerHost` impl.
+        let output = match self
+            .host
+            .invoke_provider_for_revision(
+                tenant_id,
+                self.deployment_id,
+                self.bundle_id.clone(),
+                self.revision_id,
+                &self.provider_type,
+                "ingest-http",
+                input_json.clone(),
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => self
+                .host
+                .invoke_provider_for_revision(
+                    tenant_id,
+                    self.deployment_id,
+                    self.bundle_id.clone(),
+                    self.revision_id,
+                    &self.provider_type,
+                    "ingest_http",
+                    input_json,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|err| err.to_string())?,
+        };
+
+        // Decode the provider response envelope.
+        let body_b64 = output
+            .get("body_b64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing body_b64 in provider response".to_string())?;
+        let body_bytes = BASE64
+            .decode(body_b64.as_bytes())
+            .map_err(|err| format!("invalid base64 body_b64: {err}"))?;
+        if body_bytes.is_empty() {
+            return Ok((Vec::new(), since_watermark));
+        }
+        let value: Value = serde_json::from_slice(&body_bytes)
+            .map_err(|err| format!("invalid body json: {err}"))?;
+        let activities = value
+            .get("activities")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let next_watermark = value
+            .get("watermark")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(since_watermark);
+        Ok((activities, next_watermark))
+    }
+}
+
+/// Handle a WebSocket upgrade on the revision path.
+///
+/// The conversation must already exist (created via REST `POST /conversations`)
+/// and be pinned to a revision. The WS pump reads activities from the SAME
+/// revision the REST conversation was pinned to — never re-dispatching — so
+/// the socket and the REST endpoint always see the same conversation state.
+async fn handle_websocket_upgrade(
+    req: &mut Request<Incoming>,
+    path: &str,
+    state: Arc<ServeState>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let conv_id = match extract_stream_conversation_id(path) {
+        Some(c) => c,
+        None => return Err(error_response(StatusCode::NOT_FOUND, "invalid stream path")),
+    };
+
+    let activation = state.current();
+    let host_header = header_str(req.headers(), header::HOST.as_str());
+
+    // Resolve deployment + tenant from the path so we know which env's
+    // secrets to read the signing key from.
+    let (deployment_id, tenant) = activation
+        .routing
+        .deployment_routes
+        .resolve(host_header.as_deref(), path)
+        .map(|(deployment_id, tenant)| (deployment_id, tenant.to_string()))
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "no deployment is bound to this host and path",
+            )
+        })?;
+
+    // Resolve the provider_type for this path so we can read its signing key.
+    let provider_type = activation
+        .routing
+        .http_routes
+        .provider_type_for(path, "GET", deployment_id)
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "no provider route matches this stream path",
+            )
+        })?
+        .to_string();
+
+    // Look up the revision pin for this conversation. A5 critical invariant:
+    // the WS pump MUST read from the same revision the REST POST pinned to.
+    // The session hint format is `webchat:{conversation_id}`.
+    let session_hint = format!("webchat:{conv_id}");
+    let pinned = activation
+        .routing
+        .dispatcher
+        .lookup_pin(&tenant, deployment_id, &session_hint)
+        .await;
+
+    let (bundle_id, revision_id) = match pinned {
+        Some((bid, rid)) => (bid, rid),
+        None => {
+            // No pin means the conversation was never created via REST, or the
+            // pin expired. Either way, we cannot safely pick a revision.
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "no revision pin for this conversation; create it via REST first",
+            ));
+        }
+    };
+
+    // Read the JWT signing key from the pinned revision's secrets.
+    let team = "default";
+    let signing_key =
+        read_provider_signing_key(&activation, &tenant, Some(team), &provider_type).await;
+    let signing_key = match signing_key {
+        Some(key) => key,
+        None => {
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "missing jwt_signing_key for the webchat provider",
+            ));
+        }
+    };
+
+    // Validate the ?t= token.
+    let ctx = match crate::websocket::validate_request_parts(
+        req.uri(),
+        req.headers(),
+        &conv_id,
+        &tenant,
+        &signing_key,
+    ) {
+        Ok(c) => c,
+        Err(err) => return Ok(crate::websocket::refusal_response(&err)),
+    };
+
+    // Acquire a session slot.
+    let guard = match state.session_manager.acquire(&tenant, &conv_id) {
+        Ok(g) => g,
+        Err(err) => {
+            return Ok(crate::websocket::refusal_response(
+                &crate::websocket::UpgradeError::LimitExceeded(err.to_string()),
+            ));
+        }
+    };
+
+    // Extract the bearer token from ?t= BEFORE the upgrade call consumes
+    // the request reference. The token authenticates the pump's internal
+    // GET /activities calls against the WASM provider's JWT guard.
+    let auth_token = req.uri().query().and_then(|q| {
+        q.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            if k == "t" { Some(v.to_string()) } else { None }
+        })
+    });
+
+    // Perform the HTTP -> WS upgrade.
+    let (response, websocket) = match hyper_tungstenite::upgrade(req, None) {
+        Ok(pair) => pair,
+        Err(err) => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("websocket upgrade failed: {err}"),
+            ));
+        }
+    };
+
+    // Build the revision-specific activity source. This calls
+    // `invoke_provider_for_revision` directly (async) — no sync/async bridge
+    // needed because the pump runs entirely in an async context.
+    let source: Arc<dyn crate::websocket::pump::ActivitySource> =
+        Arc::new(RevisionActivitySource {
+            host: Arc::clone(&activation.host),
+            deployment_id,
+            bundle_id,
+            revision_id,
+            provider_type,
+            team: team.to_string(),
+            auth_token,
+        });
+
+    let notifier = state.notifier.clone();
+    let limits = state.session_manager.limits().clone();
+
+    tokio::spawn(crate::websocket::serve_session(
+        websocket,
+        notifier,
+        source,
+        tenant,
+        conv_id,
+        ctx.initial_watermark,
+        limits,
+        guard,
+    ));
+
+    // Repackage the upgrade response into `Full<Bytes>` (the 101 body is
+    // empty; only the status + headers matter for the handshake).
+    let (parts, _body) = response.into_parts();
+    Ok(Response::from_parts(parts, Full::new(Bytes::new())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5668,6 +6000,10 @@ mod tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         }
     }
 
@@ -6607,6 +6943,10 @@ mod tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -6708,6 +7048,10 @@ mod tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -6803,6 +7147,10 @@ mod tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -6871,6 +7219,10 @@ mod tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -7140,6 +7492,10 @@ mod tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         })
     }
 
@@ -7219,6 +7575,67 @@ mod tests {
             !probe.is_live_elsewhere(dep_id, rev_removed),
             "a genuinely removed revision must NOT read as live elsewhere"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Category 10: A5 — WebSocket stream path helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_directline_stream_path_accepts_full_path() {
+        assert!(is_directline_stream_path(
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations/conv-42/stream"
+        ));
+    }
+
+    #[test]
+    fn is_directline_stream_path_rejects_activities() {
+        assert!(!is_directline_stream_path(
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations/conv-42/activities"
+        ));
+    }
+
+    #[test]
+    fn is_directline_stream_path_rejects_bare_conversations() {
+        assert!(!is_directline_stream_path(
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations"
+        ));
+    }
+
+    #[test]
+    fn is_directline_stream_path_rejects_non_directline() {
+        assert!(!is_directline_stream_path(
+            "/v1/messaging/telegram/tenant1/webhook"
+        ));
+    }
+
+    #[test]
+    fn extract_stream_conversation_id_returns_id() {
+        assert_eq!(
+            extract_stream_conversation_id(
+                "/v1/messaging/webchat/tenant1/v3/directline/conversations/abc-123/stream"
+            ),
+            Some("abc-123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_stream_conversation_id_returns_none_for_non_stream() {
+        assert_eq!(
+            extract_stream_conversation_id(
+                "/v1/messaging/webchat/tenant1/v3/directline/conversations/abc/activities"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn stream_path_gets_cors() {
+        // The stream URL originates from the browser's DirectLineJS, which
+        // connects cross-origin to the deployment's ingress.
+        assert!(path_allows_cors(
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations/c1/stream"
+        ));
     }
 }
 
@@ -7720,6 +8137,10 @@ mod binary_update_tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -7753,6 +8174,10 @@ mod binary_update_tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
         assert_eq!(resp.status(), StatusCode::OK, "still healthy");
@@ -7781,6 +8206,10 @@ mod binary_update_tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
         assert!(
@@ -7805,6 +8234,10 @@ mod binary_update_tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -8018,6 +8451,10 @@ mod binary_update_tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -8054,6 +8491,10 @@ mod binary_update_tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         });
         state.mark_restart_required();
         assert!(
@@ -8085,6 +8526,10 @@ mod binary_update_tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         });
         state.mark_restart_required();
         assert!(
