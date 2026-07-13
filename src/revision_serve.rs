@@ -140,6 +140,10 @@ pub(crate) struct RevisionServeConfig {
     /// env's `update-channel.json`; with `true` the poll loop reads it every
     /// cycle and no-ops while it is absent or disabled.
     pub updates_enabled: bool,
+    /// Whether auto-restart after a binary self-update is enabled.
+    pub auto_restart_enabled: bool,
+    /// Executable path captured at boot, before any swap.
+    pub exe_path: Option<std::path::PathBuf>,
 }
 
 /// Per-connection shared state. Holds the live activation behind an
@@ -162,12 +166,22 @@ struct ServeState {
     /// required to activate it. Surfaced in `/status` and `/healthz` so
     /// operators and orchestrators can observe when a restart is pending. Reset
     /// implicitly on process restart (the new process starts with `false`).
-    /// P7e (auto-restart + health gate) is out of scope.
     restart_required: AtomicBool,
     /// `--no-updates` inverted: when `false`, `/v1/updates/notify` is never
     /// reserved (the path falls through to deployment routing) and no poll loop
     /// runs. See [`RevisionServeConfig::updates_enabled`].
     updates_enabled: bool,
+    /// Set to `true` when a binary swap succeeded AND auto-restart is enabled
+    /// AND we are on unix. The main thread's shutdown loop returns
+    /// `BinaryUpdateRestart` when this is set.
+    auto_restart_pending: AtomicBool,
+    /// Whether auto-restart after a binary self-update is enabled for this
+    /// process. Derived from `--no-auto-restart` / `GREENTIC_NO_AUTO_RESTART`.
+    auto_restart_enabled: bool,
+    /// Executable path captured once at boot (before any swap can invalidate
+    /// `/proc/self/exe`). Used by `try_apply_binary_update` as a fallback
+    /// and by the exec-into-self logic after shutdown.
+    exe_path: Option<std::path::PathBuf>,
 }
 
 impl ServeState {
@@ -177,6 +191,17 @@ impl ServeState {
     /// activation outlives every in-flight request that pinned it.
     fn current(&self) -> Arc<Activation> {
         self.slot.load_full()
+    }
+
+    /// Record that a restart is required (binary swap succeeded) and, when
+    /// auto-restart is enabled on this platform, arm the auto-restart flag
+    /// so the shutdown loop returns `BinaryUpdateRestart`.
+    fn mark_restart_required(&self) {
+        self.restart_required.store(true, Ordering::Relaxed);
+        #[cfg(unix)]
+        if self.auto_restart_enabled {
+            self.auto_restart_pending.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -435,6 +460,9 @@ impl RevisionServer {
             gui_enabled: config.gui_enabled,
             restart_required: AtomicBool::new(false),
             updates_enabled: config.updates_enabled,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: config.auto_restart_enabled,
+            exe_path: config.exe_path,
         });
         // Cloned into the listener thread; the original lives on as the
         // [`RevisionServer::state`] handle so [`reload`] / [`counts`] read the
@@ -744,6 +772,12 @@ impl RevisionServer {
             new_deployments,
             new_revisions,
         }
+    }
+
+    /// Whether a binary swap succeeded and auto-restart was requested. Polled
+    /// by the main thread's shutdown loop to return `BinaryUpdateRestart`.
+    pub(crate) fn auto_restart_pending(&self) -> bool {
+        self.state.auto_restart_pending.load(Ordering::Relaxed)
     }
 
     /// Signal shutdown and join the serving thread.
@@ -1498,6 +1532,174 @@ const BINARY_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 /// re-write it.
 const BINARY_UPDATE_PENDING_FILE: &str = "binary-update-pending.json";
 
+/// Typed marker written to [`BINARY_UPDATE_PENDING_FILE`] after a binary swap.
+/// Old markers (pre-P7e) that lack `phase` deserialize as [`MarkerPhase::Pending`]
+/// via the serde default.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BinaryUpdateMarker {
+    name: String,
+    pub(crate) from_version: String,
+    pub(crate) to_version: String,
+    staged_at: String,
+    #[serde(default = "default_marker_phase")]
+    pub(crate) phase: MarkerPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rolled_back_at: Option<String>,
+    /// SHA-256 digest of the binary artifact at swap time. Allows the
+    /// tombstone guard to distinguish a same-version re-release (different
+    /// build artifact) from the exact binary that already failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) digest: Option<String>,
+    /// Number of times this pending marker has been booted. Incremented and
+    /// persisted (fsync) before boot proceeds; when it exceeds
+    /// [`MAX_BOOT_ATTEMPTS`] the boot-time logic rolls back immediately
+    /// instead of arming the RAII guard, breaking hard-kill crash loops.
+    #[serde(default)]
+    pub(crate) boot_attempts: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MarkerPhase {
+    Pending,
+    RolledBack,
+}
+
+fn default_marker_phase() -> MarkerPhase {
+    MarkerPhase::Pending
+}
+
+/// Read and parse the binary-update marker for the given env dir.
+/// Returns `None` if the file is absent or unparseable.
+pub(crate) fn read_binary_update_marker(env_dir: &std::path::Path) -> Option<BinaryUpdateMarker> {
+    let path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Delete the binary-update marker.
+pub(crate) fn clear_binary_update_marker(env_dir: &std::path::Path) {
+    let path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Maximum number of boot attempts before the boot-time logic rolls back
+/// immediately instead of arming the RAII guard. A hard-killed process
+/// (OOM-kill, SIGKILL, SIGSEGV) runs no destructors, so the guard never
+/// fires; the counter breaks the infinite crash-loop.
+pub(crate) const MAX_BOOT_ATTEMPTS: u32 = 3;
+
+/// Decision the boot-time marker processing should execute. Extracted as a
+/// pure function so the logic is unit-testable without standing up the full
+/// `run_start` environment.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BootAction {
+    /// No marker on disk — proceed with a normal boot.
+    Proceed,
+    /// Pending marker, `to_version == own`: arm the rollback guard with the
+    /// (already-incremented) marker.
+    ArmGuard(BinaryUpdateMarker),
+    /// Pending marker, `to_version == own`, but `boot_attempts >= MAX`:
+    /// roll back immediately (tombstone + restore_prev + exec).
+    RollbackNow(BinaryUpdateMarker),
+    /// Marker is stale or matches a different version lineage — delete it.
+    ClearMarker,
+    /// Rolled-back tombstone where `to_version == own` (restore_prev failed,
+    /// supervisor restarted the broken binary): keep the tombstone so the
+    /// anti-retry guard still blocks re-swap.
+    PreserveTombstone,
+}
+
+/// Decide what the boot should do given an optional on-disk marker and the
+/// version of the running binary.
+pub(crate) fn decide_boot_action(
+    marker: Option<BinaryUpdateMarker>,
+    own_version: &str,
+) -> BootAction {
+    let marker = match marker {
+        Some(m) => m,
+        None => return BootAction::Proceed,
+    };
+    match marker.phase {
+        MarkerPhase::Pending if marker.to_version == own_version => {
+            if marker.boot_attempts >= MAX_BOOT_ATTEMPTS {
+                BootAction::RollbackNow(marker)
+            } else {
+                BootAction::ArmGuard(marker)
+            }
+        }
+        MarkerPhase::Pending if marker.from_version == own_version => BootAction::Proceed,
+        MarkerPhase::RolledBack if marker.from_version == own_version => BootAction::Proceed,
+        MarkerPhase::RolledBack if marker.to_version == own_version => {
+            BootAction::PreserveTombstone
+        }
+        _ => BootAction::ClearMarker,
+    }
+}
+
+/// Durably write the marker to disk: create, write_all, fsync. Returns an
+/// error if any step fails — the caller must treat a failure as "rollback
+/// state not persisted."
+/// Persist the rollback marker, undoing the binary swap if it cannot be written.
+///
+/// The marker is the rollback state: without it on disk the boot-fail guard
+/// cannot arm, so a new binary that fails to boot would never be rolled back.
+/// Rather than exec into a binary with no rollback coverage, restore the
+/// previous one and fail the binary step (content staging is unaffected).
+fn persist_marker_or_undo_swap(
+    env_dir: &std::path::Path,
+    marker: &BinaryUpdateMarker,
+    exe_path: &std::path::Path,
+) -> Result<(), NotifyError> {
+    let Err(err) = write_marker_durable(env_dir, marker) else {
+        return Ok(());
+    };
+    operator_log::error(
+        module_path!(),
+        format!("binary-update: failed to persist rollback marker: {err}; undoing swap"),
+    );
+    if let Err(restore_err) = binswap::restore_prev(exe_path) {
+        operator_log::error(
+            module_path!(),
+            format!(
+                "binary-update: restore_prev ALSO failed after marker write failure: \
+                 {restore_err}; manual recovery required"
+            ),
+        );
+    }
+    Err(NotifyError::Internal(format!(
+        "binary update aborted: rollback marker not persisted: {err}"
+    )))
+}
+
+pub(crate) fn write_marker_durable(
+    env_dir: &std::path::Path,
+    marker: &BinaryUpdateMarker,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
+    let bytes = serde_json::to_vec_pretty(marker).map_err(std::io::Error::other)?;
+    let file = std::fs::File::create(&path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    writer.write_all(&bytes)?;
+    let file = writer.into_inner()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Write a rolled-back tombstone marker.
+pub(crate) fn write_rollback_tombstone(env_dir: &std::path::Path, marker: &BinaryUpdateMarker) {
+    let tombstone = BinaryUpdateMarker {
+        phase: MarkerPhase::RolledBack,
+        rolled_back_at: Some(chrono::Utc::now().to_rfc3339()),
+        ..marker.clone()
+    };
+    let path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
+    if let Ok(bytes) = serde_json::to_vec_pretty(&tombstone) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
 /// Attempt to apply a binary self-update for THIS process after content staging
 /// has succeeded. Returns a JSON fragment to merge into the notify response, or
 /// `None` when no binary update applies to this host (the normal case for plans
@@ -1511,6 +1713,7 @@ fn try_apply_binary_update(
     sig_bytes: &[u8],
     store: &LocalFsStore,
     env_id: &str,
+    exe_path: Option<&std::path::Path>,
 ) -> Result<Option<Value>, NotifyError> {
     // 1. Verify the plan to get the VerifiedUpdatePlan (which has `binaries`).
     //    Content staging already verified via `updates::get`, but we need our own
@@ -1622,24 +1825,52 @@ fn try_apply_binary_update(
         }
     };
 
-    // 3d. Idempotency: if a marker for this exact version already exists, skip.
+    // 3d. Idempotency: if a pending marker for this exact version already exists, skip.
     let marker_path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
-    if let Ok(existing) = std::fs::read(&marker_path)
-        && let Ok(marker) = serde_json::from_slice::<Value>(&existing)
-        && marker.get("to_version").and_then(Value::as_str) == Some(&binary.version)
-    {
-        operator_log::info(
-            module_path!(),
-            format!(
-                "binary-update: version {} already staged; restart required to activate",
-                binary.version,
-            ),
-        );
-        return Ok(Some(serde_json::json!({
-            "staged": true,
-            "restart_required": true,
-            "version": binary.version,
-        })));
+    if let Some(existing_marker) = read_binary_update_marker(&env_dir) {
+        if existing_marker.phase == MarkerPhase::Pending
+            && existing_marker.to_version == binary.version
+        {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "binary-update: version {} already staged; restart required to activate",
+                    binary.version,
+                ),
+            );
+            return Ok(Some(serde_json::json!({
+                "staged": true,
+                "restart_required": true,
+                "version": binary.version,
+            })));
+        }
+
+        // 3e. Anti-rollback tombstone: a previous attempt to run this version
+        //     failed to boot and was rolled back. Do not retry the SAME build
+        //     artifact. If the digest differs (a same-version re-release with
+        //     a fixed binary), allow the swap.
+        if existing_marker.phase == MarkerPhase::RolledBack
+            && existing_marker.to_version == binary.version
+            && existing_marker
+                .digest
+                .as_ref()
+                .is_none_or(|d| d == &binary.digest)
+        {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "binary-update: version {} previously rolled back after boot failure \
+                     at {}; refusing auto-retry. Clear `{}` to override.",
+                    binary.version,
+                    existing_marker
+                        .rolled_back_at
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    marker_path.display(),
+                ),
+            );
+            return Ok(None);
+        }
     }
 
     // 4. Fetch the archive from `source_url` with bounded size + timeout.
@@ -1701,9 +1932,12 @@ fn try_apply_binary_update(
         NotifyError::Internal(format!("binary-update: archive unpack failed: {err}"))
     })?;
 
-    let current_exe = std::env::current_exe().map_err(|err| {
-        NotifyError::Internal(format!("binary-update: cannot resolve current exe: {err}"))
-    })?;
+    let current_exe = match exe_path {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_exe().map_err(|err| {
+            NotifyError::Internal(format!("binary-update: cannot resolve current exe: {err}"))
+        })?,
+    };
 
     let swap_opts = binswap::SwapOptions {
         expected_digest: Some(binary.digest.clone()),
@@ -1716,20 +1950,22 @@ fn try_apply_binary_update(
             NotifyError::Internal("binary update swap failed".to_string())
         })?;
 
-    // 6. Write the restart-required marker file.
-    let marker = serde_json::json!({
-        "name": own_name,
-        "from_version": current_version,
-        "to_version": binary.version,
-        "staged_at": chrono::Utc::now().to_rfc3339(),
-    });
-    if let Err(err) = std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()) {
-        // Non-fatal: the swap already succeeded; the marker is advisory.
-        operator_log::warn(
-            module_path!(),
-            format!("binary-update: failed to write marker: {err}"),
-        );
-    }
+    // 6. Durably persist the rollback marker BEFORE reporting success. The
+    //    marker is the rollback state — without it the boot-fail guard cannot
+    //    arm, and a crash-looping new binary is never rolled back. If the
+    //    write fails, undo the swap so we never exec into a binary that has
+    //    no rollback coverage.
+    let marker = BinaryUpdateMarker {
+        name: own_name.to_string(),
+        from_version: current_version.to_string(),
+        to_version: binary.version.clone(),
+        staged_at: chrono::Utc::now().to_rfc3339(),
+        phase: MarkerPhase::Pending,
+        rolled_back_at: None,
+        digest: Some(binary.digest.clone()),
+        boot_attempts: 0,
+    };
+    persist_marker_or_undo_swap(&env_dir, &marker, &current_exe)?;
 
     operator_log::warn(
         module_path!(),
@@ -1759,6 +1995,7 @@ fn run_update_notify(
     env_id: &str,
     plan: &[u8],
     sig: &[u8],
+    exe_path: Option<&std::path::Path>,
 ) -> Result<(StatusCode, Value), NotifyError> {
     let env_typed = EnvId::new(env_id).map_err(|err| {
         NotifyError::Internal(format!("invalid environment id `{env_id}`: {err}"))
@@ -1840,7 +2077,7 @@ fn run_update_notify(
             // and, if so, download + verify + swap it. The content path is
             // never regressed — a binary-step failure is logged and the
             // content-staged result still returns.
-            let binary_result = match try_apply_binary_update(plan, sig, store, env_id) {
+            let binary_result = match try_apply_binary_update(plan, sig, store, env_id, exe_path) {
                 Ok(info) => info,
                 Err(err) => {
                     // Log the error but do NOT fail the content staging.
@@ -1977,17 +2214,19 @@ async fn handle_update_notify(
         )
     })?;
     let store = LocalFsStore::new(store_root);
+    let captured_exe = state.exe_path.clone();
 
-    let result =
-        tokio::task::spawn_blocking(move || run_update_notify(&store, &env_id, &plan, &sig))
-            .await
-            .map_err(|err| {
-                operator_log::error(
-                    module_path!(),
-                    format!("update-notify: worker task failed: {err}"),
-                );
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, "update notify failed")
-            })?;
+    let result = tokio::task::spawn_blocking(move || {
+        run_update_notify(&store, &env_id, &plan, &sig, captured_exe.as_deref())
+    })
+    .await
+    .map_err(|err| {
+        operator_log::error(
+            module_path!(),
+            format!("update-notify: worker task failed: {err}"),
+        );
+        error_response(StatusCode::INTERNAL_SERVER_ERROR, "update notify failed")
+    })?;
 
     match result {
         Ok((status, body)) => {
@@ -1999,7 +2238,7 @@ async fn handle_update_notify(
                 .and_then(Value::as_bool)
                 == Some(true)
             {
-                state.restart_required.store(true, Ordering::Relaxed);
+                state.mark_restart_required();
             }
             let bytes = serde_json::to_vec(&body).map_err(|err| {
                 error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
@@ -2090,17 +2329,24 @@ async fn run_update_poll_loop(state: Arc<ServeState>, store_root: std::path::Pat
         let root = store_root.clone();
         let client_for_cycle = client.clone();
         let seq_in = last_sequence;
+        let captured_exe = state.exe_path.clone();
         // The cycle downloads + DSSE-verifies + records/stages synchronously
         // (`updates::get` is internally blocking), so it runs off the runtime.
         let interval = match tokio::task::spawn_blocking(move || {
-            poll_update_cycle(&env_id, &root, &client_for_cycle, seq_in)
+            poll_update_cycle(
+                &env_id,
+                &root,
+                &client_for_cycle,
+                seq_in,
+                captured_exe.as_deref(),
+            )
         })
         .await
         {
             Ok((new_sequence, interval_secs, restart)) => {
                 last_sequence = new_sequence;
                 if restart {
-                    state.restart_required.store(true, Ordering::Relaxed);
+                    state.mark_restart_required();
                 }
                 interval_secs
             }
@@ -2130,6 +2376,7 @@ fn poll_update_cycle(
     store_root: &std::path::Path,
     client: &reqwest::blocking::Client,
     last_sequence: Option<u64>,
+    exe_path: Option<&std::path::Path>,
 ) -> (Option<u64>, u64, bool) {
     let store = LocalFsStore::new(store_root);
 
@@ -2215,7 +2462,7 @@ fn poll_update_cycle(
     }
 
     // 4. Verify + record/stage via the shared receiver core.
-    match run_update_notify(&store, env_id, &plan, &sig) {
+    match run_update_notify(&store, env_id, &plan, &sig, exe_path) {
         Ok((status, body)) => {
             let restart = body
                 .get("binary")
@@ -2743,6 +2990,7 @@ fn try_probe_response(path: &str, state: &ServeState) -> Option<Response<Full<By
             "schema": "greentic.status.v1",
             "env_id": activation.routing.dispatcher.env_id(),
             "listen_addr": state.bound_addr.to_string(),
+            "version": env!("CARGO_PKG_VERSION"),
             "bundles_active": activation.routing.deployment_routes.len(),
             "deployments_routed": deployments_routed,
             "revisions_active": revisions_active,
@@ -3963,6 +4211,8 @@ mod tests {
             trust_loopback_peers: false,
             admin_bind_addr: Some("127.0.0.1:17900".parse::<SocketAddr>().unwrap()),
             updates_enabled: false,
+            auto_restart_enabled: false,
+            exe_path: None,
         })
         .expect("start split server");
 
@@ -4010,6 +4260,8 @@ mod tests {
             // will land after bumping past the held base port.
             admin_bind_addr: Some(format!("127.0.0.1:{}", base + 1).parse().unwrap()),
             updates_enabled: false,
+            auto_restart_enabled: false,
+            exe_path: None,
         })
         .expect("start must succeed even when main bumps into admin range");
 
@@ -4936,6 +5188,9 @@ mod tests {
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
             updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
         }
     }
 
@@ -5369,6 +5624,9 @@ mod tests {
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
             updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -5463,6 +5721,9 @@ mod tests {
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
             updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -5551,6 +5812,9 @@ mod tests {
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
             updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -5612,6 +5876,9 @@ mod tests {
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
             updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -5873,6 +6140,9 @@ mod tests {
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
             updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
         })
     }
 
@@ -6162,7 +6432,8 @@ mod update_notify_tests {
             .build()
             .expect("client");
 
-        let (seq, interval, _restart) = poll_update_cycle("local", root.path(), &client, Some(7));
+        let (seq, interval, _restart) =
+            poll_update_cycle("local", root.path(), &client, Some(7), None);
         assert_eq!(
             seq,
             Some(7),
@@ -6190,7 +6461,8 @@ mod update_notify_tests {
             .build()
             .expect("client");
 
-        let (seq, _interval, _restart) = poll_update_cycle("local", root.path(), &client, None);
+        let (seq, _interval, _restart) =
+            poll_update_cycle("local", root.path(), &client, None, None);
         assert_eq!(seq, None, "no endpoint must not advance the sequence");
     }
 
@@ -6203,7 +6475,7 @@ mod update_notify_tests {
         std::fs::create_dir_all(root.path().join("local")).expect("env dir");
         let store = LocalFsStore::new(root.path().to_path_buf());
 
-        let (status, body) = run_update_notify(&store, "local", b"not-a-plan", b"not-a-sig")
+        let (status, body) = run_update_notify(&store, "local", b"not-a-plan", b"not-a-sig", None)
             .expect("disabled is Ok");
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["status"], "disabled");
@@ -6227,7 +6499,7 @@ mod update_notify_tests {
         .expect("write channel");
         let store = LocalFsStore::new(root.path().to_path_buf());
 
-        match run_update_notify(&store, "local", b"not-a-plan", b"not-a-sig") {
+        match run_update_notify(&store, "local", b"not-a-plan", b"not-a-sig", None) {
             Err(NotifyError::Op(op)) => {
                 assert_eq!(map_op_error(&op).status(), StatusCode::CONFLICT);
             }
@@ -6443,6 +6715,9 @@ mod binary_update_tests {
             gui_enabled: false,
             restart_required: AtomicBool::new(true),
             updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -6469,6 +6744,9 @@ mod binary_update_tests {
             gui_enabled: false,
             restart_required: AtomicBool::new(true),
             updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
         assert_eq!(resp.status(), StatusCode::OK, "still healthy");
@@ -6490,6 +6768,9 @@ mod binary_update_tests {
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
             updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
         assert!(
@@ -6507,6 +6788,9 @@ mod binary_update_tests {
             gui_enabled: false,
             restart_required: AtomicBool::new(false),
             updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -6562,6 +6846,400 @@ mod binary_update_tests {
         assert_ne!(
             marker.get("to_version").and_then(Value::as_str),
             Some("2.0.0"),
+        );
+    }
+
+    // --- P7e: BinaryUpdateMarker typed tests ---
+
+    #[test]
+    fn marker_phase_defaults_to_pending_on_missing_field() {
+        let json = r#"{"name":"x","from_version":"1","to_version":"2","staged_at":"t"}"#;
+        let marker: BinaryUpdateMarker = serde_json::from_str(json).unwrap();
+        assert_eq!(marker.phase, MarkerPhase::Pending);
+        assert!(marker.rolled_back_at.is_none());
+    }
+
+    #[test]
+    fn marker_roundtrip_pending() {
+        let marker = BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: "1.1.11".to_string(),
+            to_version: "1.1.12".to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::Pending,
+            rolled_back_at: None,
+            digest: None,
+            boot_attempts: 0,
+        };
+        let bytes = serde_json::to_vec(&marker).unwrap();
+        let back: BinaryUpdateMarker = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.phase, MarkerPhase::Pending);
+        assert_eq!(back.to_version, "1.1.12");
+        assert!(back.rolled_back_at.is_none());
+    }
+
+    #[test]
+    fn marker_roundtrip_rolled_back() {
+        let marker = BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: "1.1.11".to_string(),
+            to_version: "1.1.12".to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::RolledBack,
+            rolled_back_at: Some("2026-07-13T01:00:00Z".to_string()),
+            digest: Some("abc123".to_string()),
+            boot_attempts: 0,
+        };
+        let bytes = serde_json::to_vec(&marker).unwrap();
+        let back: BinaryUpdateMarker = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.phase, MarkerPhase::RolledBack);
+        assert_eq!(back.rolled_back_at.as_deref(), Some("2026-07-13T01:00:00Z"));
+    }
+
+    #[test]
+    fn read_binary_update_marker_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(read_binary_update_marker(dir.path()).is_none());
+    }
+
+    #[test]
+    fn read_binary_update_marker_valid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: "1.0.0".to_string(),
+            to_version: "1.1.0".to_string(),
+            staged_at: "2026-01-01T00:00:00Z".to_string(),
+            phase: MarkerPhase::Pending,
+            rolled_back_at: None,
+            digest: None,
+            boot_attempts: 0,
+        };
+        std::fs::write(
+            dir.path().join(BINARY_UPDATE_PENDING_FILE),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        let read = read_binary_update_marker(dir.path()).expect("should parse");
+        assert_eq!(read.to_version, "1.1.0");
+        assert_eq!(read.phase, MarkerPhase::Pending);
+    }
+
+    #[test]
+    fn read_binary_update_marker_corrupt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(BINARY_UPDATE_PENDING_FILE), b"not json").unwrap();
+        assert!(read_binary_update_marker(dir.path()).is_none());
+    }
+
+    #[test]
+    fn clear_binary_update_marker_removes_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(BINARY_UPDATE_PENDING_FILE);
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(path.exists());
+        clear_binary_update_marker(dir.path());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn write_rollback_tombstone_sets_phase_and_timestamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: "1.1.11".to_string(),
+            to_version: "1.1.12".to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::Pending,
+            rolled_back_at: None,
+            digest: Some("sha256:abc".to_string()),
+            boot_attempts: 0,
+        };
+        write_rollback_tombstone(dir.path(), &marker);
+        let read = read_binary_update_marker(dir.path()).expect("should read tombstone");
+        assert_eq!(read.phase, MarkerPhase::RolledBack);
+        assert!(read.rolled_back_at.is_some());
+        assert_eq!(read.to_version, "1.1.12");
+        assert_eq!(read.from_version, "1.1.11");
+    }
+
+    #[test]
+    fn write_rollback_tombstone_preserves_digest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: "1.1.11".to_string(),
+            to_version: "1.1.12".to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::Pending,
+            rolled_back_at: None,
+            digest: Some("sha256:deadbeef".to_string()),
+            boot_attempts: 0,
+        };
+        write_rollback_tombstone(dir.path(), &marker);
+        let read = read_binary_update_marker(dir.path()).expect("should read tombstone");
+        assert_eq!(read.digest.as_deref(), Some("sha256:deadbeef"));
+    }
+
+    #[test]
+    fn marker_digest_defaults_to_none_on_missing_field() {
+        let json = r#"{"name":"x","from_version":"1","to_version":"2","staged_at":"t"}"#;
+        let marker: BinaryUpdateMarker = serde_json::from_str(json).unwrap();
+        assert!(marker.digest.is_none());
+    }
+
+    #[test]
+    fn status_includes_version_field() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+        };
+        let resp = try_probe_response("/status", &state).expect("/status response");
+        let body_bytes = resp.into_body();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let collected = rt
+            .block_on(http_body_util::BodyExt::collect(body_bytes))
+            .unwrap();
+        let text = String::from_utf8_lossy(&collected.to_bytes()).to_string();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "/status must include version"
+        );
+    }
+
+    /// Regression: binary swap response with restart_required=true must set
+    /// auto_restart_pending when auto_restart_enabled is true.
+    #[test]
+    fn auto_restart_pending_set_on_binary_swap_response() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: true,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: true,
+            exe_path: None,
+        });
+        state.mark_restart_required();
+        assert!(
+            state.restart_required.load(Ordering::Relaxed),
+            "restart_required must be set"
+        );
+        #[cfg(unix)]
+        assert!(
+            state.auto_restart_pending.load(Ordering::Relaxed),
+            "auto_restart_pending must be set when auto_restart_enabled is true"
+        );
+    }
+
+    /// Complement: when auto_restart_enabled is false, auto_restart_pending
+    /// must remain false even after a binary swap.
+    #[test]
+    fn auto_restart_pending_not_set_when_disabled() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: true,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+        });
+        state.mark_restart_required();
+        assert!(
+            state.restart_required.load(Ordering::Relaxed),
+            "restart_required must still be set"
+        );
+        assert!(
+            !state.auto_restart_pending.load(Ordering::Relaxed),
+            "auto_restart_pending must NOT be set when disabled"
+        );
+    }
+
+    // --- boot_attempts field and decide_boot_action tests ---
+
+    fn make_pending_marker(from: &str, to: &str, attempts: u32) -> BinaryUpdateMarker {
+        BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: from.to_string(),
+            to_version: to.to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::Pending,
+            rolled_back_at: None,
+            digest: Some("sha256:abc".to_string()),
+            boot_attempts: attempts,
+        }
+    }
+
+    fn make_rolled_back_marker(from: &str, to: &str) -> BinaryUpdateMarker {
+        BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: from.to_string(),
+            to_version: to.to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::RolledBack,
+            rolled_back_at: Some("2026-07-13T01:00:00Z".to_string()),
+            digest: Some("sha256:abc".to_string()),
+            boot_attempts: 0,
+        }
+    }
+
+    #[test]
+    fn boot_attempts_defaults_to_zero_on_missing_field() {
+        let json = r#"{"name":"x","from_version":"1","to_version":"2","staged_at":"t"}"#;
+        let marker: BinaryUpdateMarker = serde_json::from_str(json).unwrap();
+        assert_eq!(marker.boot_attempts, 0);
+    }
+
+    #[test]
+    fn marker_roundtrip_with_boot_attempts() {
+        let marker = make_pending_marker("1.1.11", "1.1.12", 2);
+        let bytes = serde_json::to_vec(&marker).unwrap();
+        let back: BinaryUpdateMarker = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.boot_attempts, 2);
+        assert_eq!(back.phase, MarkerPhase::Pending);
+        assert_eq!(back.to_version, "1.1.12");
+    }
+
+    #[test]
+    fn decide_boot_action_no_marker() {
+        assert_eq!(decide_boot_action(None, "1.1.12"), BootAction::Proceed);
+    }
+
+    #[test]
+    fn decide_boot_action_pending_to_eq_own_below_max() {
+        let marker = make_pending_marker("1.1.11", "1.1.12", 0);
+        let action = decide_boot_action(Some(marker.clone()), "1.1.12");
+        assert_eq!(action, BootAction::ArmGuard(marker));
+    }
+
+    #[test]
+    fn decide_boot_action_pending_to_eq_own_at_max() {
+        let marker = make_pending_marker("1.1.11", "1.1.12", MAX_BOOT_ATTEMPTS);
+        let action = decide_boot_action(Some(marker.clone()), "1.1.12");
+        assert_eq!(action, BootAction::RollbackNow(marker));
+    }
+
+    #[test]
+    fn decide_boot_action_pending_to_eq_own_above_max() {
+        let marker = make_pending_marker("1.1.11", "1.1.12", MAX_BOOT_ATTEMPTS + 5);
+        let action = decide_boot_action(Some(marker.clone()), "1.1.12");
+        assert_eq!(action, BootAction::RollbackNow(marker));
+    }
+
+    #[test]
+    fn decide_boot_action_pending_from_eq_own() {
+        let marker = make_pending_marker("1.1.12", "1.1.13", 0);
+        assert_eq!(
+            decide_boot_action(Some(marker), "1.1.12"),
+            BootAction::Proceed
+        );
+    }
+
+    #[test]
+    fn decide_boot_action_rolled_back_from_eq_own() {
+        let marker = make_rolled_back_marker("1.1.12", "1.1.13");
+        assert_eq!(
+            decide_boot_action(Some(marker), "1.1.12"),
+            BootAction::Proceed
+        );
+    }
+
+    #[test]
+    fn decide_boot_action_rolled_back_to_eq_own() {
+        let marker = make_rolled_back_marker("1.1.11", "1.1.12");
+        assert_eq!(
+            decide_boot_action(Some(marker), "1.1.12"),
+            BootAction::PreserveTombstone
+        );
+    }
+
+    #[test]
+    fn decide_boot_action_stale_marker() {
+        let marker = make_pending_marker("1.0.0", "1.0.1", 0);
+        assert_eq!(
+            decide_boot_action(Some(marker), "1.1.12"),
+            BootAction::ClearMarker
+        );
+    }
+
+    #[test]
+    fn write_marker_durable_persists_and_survives_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = make_pending_marker("1.1.11", "1.1.12", 2);
+        write_marker_durable(dir.path(), &marker).expect("durable write should succeed");
+        let read = read_binary_update_marker(dir.path()).expect("should parse");
+        assert_eq!(read.boot_attempts, 2);
+        assert_eq!(read.to_version, "1.1.12");
+        assert_eq!(read.phase, MarkerPhase::Pending);
+    }
+
+    #[test]
+    fn boot_attempt_counter_persisted_before_boot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut marker = make_pending_marker("1.1.11", "1.1.12", 0);
+        marker.boot_attempts += 1;
+        write_marker_durable(dir.path(), &marker).expect("write");
+        let on_disk = read_binary_update_marker(dir.path()).expect("read");
+        assert_eq!(
+            on_disk.boot_attempts, 1,
+            "incremented counter must be visible on disk before boot proceeds"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_write_failure_returns_err_and_restores_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let exe_path = dir.path().join("greentic-start");
+        let prev_path = dir.path().join("greentic-start.prev");
+        let old_binary = b"old-binary-content";
+        let new_binary = b"new-binary-content";
+
+        std::fs::write(&prev_path, old_binary).unwrap();
+        std::fs::write(&exe_path, new_binary).unwrap();
+
+        let env_dir = dir.path().join("env");
+        std::fs::create_dir_all(&env_dir).unwrap();
+        let perms = std::fs::Permissions::from_mode(0o500);
+        std::fs::set_permissions(&env_dir, perms).unwrap();
+
+        let marker = make_pending_marker("1.1.11", "1.1.12", 0);
+        let result = persist_marker_or_undo_swap(&env_dir, &marker, &exe_path);
+
+        std::fs::set_permissions(&env_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "an unpersistable marker must fail the binary step"
+        );
+        // The swap must be undone: exec'ing into a binary with no rollback
+        // state on disk is exactly the case the marker exists to prevent.
+        assert_eq!(
+            std::fs::read(&exe_path).unwrap(),
+            old_binary,
+            "the previous binary must be restored when the marker cannot be persisted"
+        );
+        assert!(
+            !prev_path.exists(),
+            "restore_prev consumes the .prev copy it restores from"
         );
     }
 }

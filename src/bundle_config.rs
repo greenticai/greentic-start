@@ -518,6 +518,7 @@ mod tests {
             quiet: false,
             no_browser: false,
             no_updates: false,
+            no_auto_restart: false,
             admin: false,
             admin_port: 9443,
             admin_certs_dir: None,

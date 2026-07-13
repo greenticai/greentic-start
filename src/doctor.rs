@@ -544,6 +544,7 @@ fn default_start_request(bundle: Option<String>) -> StartRequest {
         quiet: true,
         no_browser: true,
         no_updates: true,
+        no_auto_restart: false,
         admin: false,
         admin_port: 8443,
         admin_certs_dir: None,
