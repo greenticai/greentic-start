@@ -285,12 +285,11 @@ pub(crate) async fn activate_runtime_config(
             &scope,
             &meta.path_prefixes,
         ));
-        let rev_static = discover_revision_static_routes(&pack_paths, &scope, &reserved_routes);
-        static_plan.routes.extend(rev_static.routes);
-        static_plan.warnings.extend(rev_static.warnings);
-        static_plan
-            .blocking_failures
-            .extend(rev_static.blocking_failures);
+        static_plan.merge(discover_revision_static_routes(
+            &pack_paths,
+            &scope,
+            &reserved_routes,
+        ));
 
         // Session isolation: give each revision its OWN session and state store
         // rather than sharing the host's. The session/resume/state backend keys

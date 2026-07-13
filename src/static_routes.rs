@@ -56,6 +56,14 @@ pub struct StaticRoutePlan {
     pub blocking_failures: Vec<String>,
 }
 
+impl StaticRoutePlan {
+    pub fn merge(&mut self, other: Self) {
+        self.routes.extend(other.routes);
+        self.warnings.extend(other.warnings);
+        self.blocking_failures.extend(other.blocking_failures);
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReservedRouteSet {
     exact_paths: BTreeSet<String>,
