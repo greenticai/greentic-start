@@ -5309,15 +5309,14 @@ mod tests {
 
     // --- A.2: CORS + OPTIONS preflight on the revision path ----------------
 
-    #[test]
-    fn cors_preflight_returns_204_for_realistic_browser_preflight() {
+    fn cors_roundtrip(port: u16, gui_enabled: bool, raw_request: &str) -> String {
         use std::io::{Read, Write};
         use std::net::SocketAddr;
 
         let server = RevisionServer::start(RevisionServeConfig {
-            bind_addr: "127.0.0.1:17950".parse::<SocketAddr>().unwrap(),
-            activation: std::sync::Arc::new(empty_activation("cors-test")),
-            gui_enabled: true,
+            bind_addr: format!("127.0.0.1:{port}").parse::<SocketAddr>().unwrap(),
+            activation: std::sync::Arc::new(empty_activation("cors")),
+            gui_enabled,
             trust_loopback_peers: true,
             admin_bind_addr: None,
             updates_enabled: false,
@@ -5327,11 +5326,19 @@ mod tests {
         .expect("start server");
         let port = server.actual_port();
 
-        // A realistic browser CORS preflight: OPTIONS with Origin and
-        // Access-Control-Request-Method headers. Without the short-circuit
-        // this would reach admit_request and become a 405.
         let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        s.write_all(
+        s.write_all(raw_request.as_bytes()).expect("write");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).expect("read");
+        server.stop().expect("stop");
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[test]
+    fn cors_preflight_returns_204_for_realistic_browser_preflight() {
+        let resp = cors_roundtrip(
+            17950,
+            true,
             concat!(
                 "OPTIONS /any/path HTTP/1.1\r\n",
                 "Host: localhost\r\n",
@@ -5339,22 +5346,15 @@ mod tests {
                 "Access-Control-Request-Method: POST\r\n",
                 "Connection: close\r\n",
                 "\r\n",
-            )
-            .as_bytes(),
-        )
-        .expect("write");
-        let mut buf = Vec::new();
-        s.read_to_end(&mut buf).expect("read");
-        let resp = String::from_utf8_lossy(&buf);
+            ),
+        );
 
-        // Must be 204 No Content (not 405).
         assert!(
             resp.starts_with("HTTP/1.1 204"),
             "preflight must return 204, got: {}",
             resp.lines().next().unwrap_or("")
         );
 
-        // The response must permit POST (the requested method).
         let methods_header = resp
             .lines()
             .find(|l| {
@@ -5366,28 +5366,16 @@ mod tests {
             methods_header.contains("POST"),
             "Allow-Methods must include POST: {methods_header}"
         );
-
-        server.stop().expect("stop");
     }
 
     #[test]
     fn cors_allow_headers_covers_webchat_gui_custom_headers() {
-        // The real webchat GUI (runtime-bootstrap.js) sends
-        // X-Greentic-Locale via setRequestHeader and fetch init.headers.
-        // If Allow-Headers omits it, the browser blocks the request after
-        // a successful preflight — a silent failure with no server log.
         let preflight = cors_preflight_response();
         let allow = preflight.headers()["access-control-allow-headers"]
             .to_str()
             .expect("valid UTF-8");
-        // Split into individual header names for superset checking.
         let allowed: Vec<&str> = allow.split(',').map(str::trim).collect();
 
-        // Headers the webchat GUI actually sends (derived from reading
-        // the JS sources, not inferred):
-        //   Content-Type          — every POST (application/json, application/x-www-form-urlencoded)
-        //   X-Greentic-Locale     — setRequestHeader + fetch headers on Direct Line calls
-        // (Accept is CORS-safelisted and does not require listing.)
         for required in ["Content-Type", "X-Greentic-Locale"] {
             assert!(
                 allowed.iter().any(|h| h.eq_ignore_ascii_case(required)),
@@ -5398,26 +5386,9 @@ mod tests {
 
     #[test]
     fn cors_options_to_chat_path_returns_204_not_405() {
-        use std::io::{Read, Write};
-        use std::net::SocketAddr;
-
-        // The /chat path returns 405 for non-GET via try_chat_asset_response.
-        // The OPTIONS short-circuit must fire BEFORE that check.
-        let server = RevisionServer::start(RevisionServeConfig {
-            bind_addr: "127.0.0.1:17960".parse::<SocketAddr>().unwrap(),
-            activation: std::sync::Arc::new(empty_activation("cors-chat")),
-            gui_enabled: true,
-            trust_loopback_peers: true,
-            admin_bind_addr: None,
-            updates_enabled: false,
-            auto_restart_enabled: false,
-            exe_path: None,
-        })
-        .expect("start server");
-        let port = server.actual_port();
-
-        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        s.write_all(
+        let resp = cors_roundtrip(
+            17960,
+            true,
             concat!(
                 "OPTIONS /chat HTTP/1.1\r\n",
                 "Host: localhost\r\n",
@@ -5425,50 +5396,23 @@ mod tests {
                 "Access-Control-Request-Method: GET\r\n",
                 "Connection: close\r\n",
                 "\r\n",
-            )
-            .as_bytes(),
-        )
-        .expect("write");
-        let mut buf = Vec::new();
-        s.read_to_end(&mut buf).expect("read");
-        let resp = String::from_utf8_lossy(&buf);
+            ),
+        );
 
         assert!(
             resp.starts_with("HTTP/1.1 204"),
             "OPTIONS /chat must return 204 (not 405), got: {}",
             resp.lines().next().unwrap_or("")
         );
-
-        server.stop().expect("stop");
     }
 
     #[test]
     fn post_response_carries_cors_origin_header() {
-        use std::io::{Read, Write};
-        use std::net::SocketAddr;
-
-        // Before this change, a POST to the revision path carried zero CORS
-        // headers. This test ensures the with_cors wrapper in
-        // handle_connection attaches them.
-        let server = RevisionServer::start(RevisionServeConfig {
-            bind_addr: "127.0.0.1:17970".parse::<SocketAddr>().unwrap(),
-            activation: std::sync::Arc::new(empty_activation("cors-post")),
-            gui_enabled: false,
-            trust_loopback_peers: true,
-            admin_bind_addr: None,
-            updates_enabled: false,
-            auto_restart_enabled: false,
-            exe_path: None,
-        })
-        .expect("start server");
-        let port = server.actual_port();
-
-        // POST to an arbitrary path — no deployment is bound so the server
-        // returns 404, but the response must still carry CORS headers.
         let body = r#"{"text":"hello"}"#;
-        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        s.write_all(
-            format!(
+        let resp = cors_roundtrip(
+            17970,
+            false,
+            &format!(
                 "POST /some/path HTTP/1.1\r\n\
                  Host: localhost\r\n\
                  Content-Type: application/json\r\n\
@@ -5478,13 +5422,8 @@ mod tests {
                  {}",
                 body.len(),
                 body
-            )
-            .as_bytes(),
-        )
-        .expect("write");
-        let mut buf = Vec::new();
-        s.read_to_end(&mut buf).expect("read");
-        let resp = String::from_utf8_lossy(&buf);
+            ),
+        );
 
         assert!(
             resp.lines().any(|l| l
@@ -5492,8 +5431,6 @@ mod tests {
                 .starts_with("access-control-allow-origin:")),
             "POST response must carry Access-Control-Allow-Origin header, got:\n{resp}"
         );
-
-        server.stop().expect("stop");
     }
 
     // --- N1.2: listen-address resolution ----------------------------------
