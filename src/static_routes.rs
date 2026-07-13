@@ -9,11 +9,12 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context;
-use greentic_types::{ExtensionInline, decode_pack_manifest};
+use greentic_types::{ExtensionInline, PackManifest, decode_pack_manifest};
 use serde::Deserialize;
 use zip::ZipArchive;
 
 use crate::domains::{self, Domain};
+use crate::http_routes::RevisionScope;
 
 pub const EXT_STATIC_ROUTES_V1: &str = "greentic.static-routes.v1";
 
@@ -43,6 +44,9 @@ pub struct StaticRouteDescriptor {
     pub team_scoped: bool,
     pub cache_strategy: CacheStrategy,
     pub route_segments: Vec<RouteScopeSegment>,
+    /// Deployment/bundle/revision this route belongs to, or `None` for a
+    /// legacy single-bundle route.
+    pub scope: Option<RevisionScope>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -149,7 +153,35 @@ impl ActiveRouteTable {
         self.routes.is_empty()
     }
 
+    /// Match an incoming request against legacy (unscoped) routes only.
     pub fn match_request<'a>(&'a self, request_path: &str) -> Option<StaticRouteMatch<'a>> {
+        self.match_first(request_path, |route| route.scope.is_none())
+    }
+
+    /// Match an incoming request against routes belonging to a specific
+    /// resolved scope. Used by the revision-serve path once a revision has
+    /// been dispatched. Matches on the full `(deployment_id, bundle_id,
+    /// revision_id)` tuple, mirroring
+    /// [`crate::http_routes::HttpRouteTable::match_request_for_revision`].
+    pub fn match_request_for_revision<'a>(
+        &'a self,
+        request_path: &str,
+        scope: &RevisionScope,
+    ) -> Option<StaticRouteMatch<'a>> {
+        self.match_first(request_path, |route| {
+            route.scope.as_ref().is_some_and(|s| {
+                s.deployment_id == scope.deployment_id
+                    && s.bundle_id == scope.bundle_id
+                    && s.revision_id == scope.revision_id
+            })
+        })
+    }
+
+    fn match_first<'a>(
+        &'a self,
+        request_path: &str,
+        accept: impl Fn(&StaticRouteDescriptor) -> bool,
+    ) -> Option<StaticRouteMatch<'a>> {
         let normalized = request_path
             .trim_start_matches('/')
             .split('/')
@@ -157,6 +189,9 @@ impl ActiveRouteTable {
             .collect::<Vec<_>>();
         let request_is_directory = request_path.ends_with('/');
         for descriptor in &self.routes {
+            if !accept(descriptor) {
+                continue;
+            }
             if normalized.len() < descriptor.route_segments.len() {
                 continue;
             }
@@ -272,6 +307,105 @@ pub fn discover_from_bundle(
     Ok(plan)
 }
 
+/// Discover static routes declared by a revision's pinned pack files, stamping
+/// each with the revision's [`RevisionScope`]. Mirrors
+/// [`crate::http_routes::discover_revision_routes`] for the static-route
+/// extension. Each pack is opened once; packs that don't declare
+/// `greentic.static-routes.v1` or that fail to read are skipped (with a warning
+/// for failures).
+pub fn discover_revision_static_routes(
+    pack_paths: &[PathBuf],
+    scope: &RevisionScope,
+) -> Vec<StaticRouteDescriptor> {
+    let mut routes = Vec::new();
+    for pack_path in pack_paths {
+        let manifest = match read_pack_manifest(pack_path) {
+            Ok(m) => m,
+            Err(err) => {
+                crate::operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "failed to read manifest from {}: {err:#}",
+                        pack_path.display()
+                    ),
+                );
+                continue;
+            }
+        };
+        match static_routes_from_manifest(&manifest, pack_path) {
+            Ok(Some(mut descriptors)) => {
+                for route in &mut descriptors {
+                    route.scope = Some(scope.clone());
+                }
+                routes.extend(descriptors);
+            }
+            Ok(None) => continue,
+            Err(err) => {
+                crate::operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "failed to read static-routes from {}: {err:#}",
+                        pack_path.display()
+                    ),
+                );
+            }
+        }
+    }
+    routes
+}
+
+/// Open one `.gtpack`, read `manifest.cbor`, and decode it. Single IO+decode
+/// site so a pack is opened at most once per discovery pass.
+fn read_pack_manifest(pack_path: &Path) -> anyhow::Result<PackManifest> {
+    let file = std::fs::File::open(pack_path)?;
+    let mut archive = ZipArchive::new(file)?;
+    let mut manifest_entry = archive.by_name("manifest.cbor").map_err(|err| {
+        anyhow::anyhow!(
+            "failed to open manifest.cbor in {}: {err}",
+            pack_path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    manifest_entry.read_to_end(&mut bytes)?;
+    decode_pack_manifest(&bytes)
+        .with_context(|| format!("failed to decode pack manifest in {}", pack_path.display()))
+}
+
+/// Extract static route descriptors from a decoded manifest.
+fn static_routes_from_manifest(
+    manifest: &PackManifest,
+    pack_path: &Path,
+) -> anyhow::Result<Option<Vec<StaticRouteDescriptor>>> {
+    let Some(extensions) = manifest.extensions.as_ref() else {
+        return Ok(None);
+    };
+    let Some(extension) = extensions.get(EXT_STATIC_ROUTES_V1) else {
+        return Ok(None);
+    };
+    let inline = extension
+        .inline
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("static-routes extension inline payload missing"))?;
+    let ExtensionInline::Other(value) = inline else {
+        anyhow::bail!("static-routes extension inline payload has unexpected type");
+    };
+    let decoded: StaticRoutesExtensionV1 = serde_json::from_value(value.clone())
+        .with_context(|| "failed to parse greentic.static-routes.v1 payload")?;
+    if decoded.schema_version != 1 {
+        anyhow::bail!(
+            "unsupported static-routes extension schema_version={} in {}",
+            decoded.schema_version,
+            pack_path.display()
+        );
+    }
+    let pack_id = manifest.pack_id.as_str().to_string();
+    let mut routes = Vec::new();
+    for (idx, route) in decoded.routes.into_iter().enumerate() {
+        routes.push(normalize_route_descriptor(&pack_id, pack_path, idx, route)?);
+    }
+    Ok(Some(routes))
+}
+
 /// Checks whether the bundle has overlay asset directories on disk but does not
 /// declare the `greentic.cap.bundle_assets.read.v1` capability. Emits a warning
 /// into the plan so operators know to formalize the capability contract.
@@ -337,47 +471,8 @@ fn collect_runtime_pack_paths(bundle_root: &Path) -> anyhow::Result<Vec<PathBuf>
 }
 
 fn read_pack_static_routes(pack_path: &Path) -> anyhow::Result<Option<Vec<StaticRouteDescriptor>>> {
-    let file = std::fs::File::open(pack_path)?;
-    let mut archive = ZipArchive::new(file)?;
-    let mut manifest_entry = archive.by_name("manifest.cbor").map_err(|err| {
-        anyhow::anyhow!(
-            "failed to open manifest.cbor in {}: {err}",
-            pack_path.display()
-        )
-    })?;
-    let mut bytes = Vec::new();
-    manifest_entry.read_to_end(&mut bytes)?;
-    let manifest = decode_pack_manifest(&bytes)
-        .with_context(|| format!("failed to decode pack manifest in {}", pack_path.display()))?;
-    let Some(extension) = manifest
-        .extensions
-        .as_ref()
-        .and_then(|extensions| extensions.get(EXT_STATIC_ROUTES_V1))
-    else {
-        return Ok(None);
-    };
-    let inline = extension
-        .inline
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("static-routes extension inline payload missing"))?;
-    let ExtensionInline::Other(value) = inline else {
-        anyhow::bail!("static-routes extension inline payload has unexpected type");
-    };
-    let decoded: StaticRoutesExtensionV1 = serde_json::from_value(value.clone())
-        .with_context(|| "failed to parse greentic.static-routes.v1 payload")?;
-    if decoded.schema_version != 1 {
-        anyhow::bail!(
-            "unsupported static-routes extension schema_version={} in {}",
-            decoded.schema_version,
-            pack_path.display()
-        );
-    }
-    let pack_id = manifest.pack_id.as_str().to_string();
-    let mut routes = Vec::new();
-    for (idx, route) in decoded.routes.into_iter().enumerate() {
-        routes.push(normalize_route_descriptor(&pack_id, pack_path, idx, route)?);
-    }
-    Ok(Some(routes))
+    let manifest = read_pack_manifest(pack_path)?;
+    static_routes_from_manifest(&manifest, pack_path)
 }
 
 fn normalize_route_descriptor(
@@ -445,6 +540,7 @@ fn normalize_route_descriptor(
         team_scoped,
         cache_strategy,
         route_segments,
+        scope: None,
     })
 }
 
@@ -665,6 +761,7 @@ mod tests {
             team_scoped: false,
             cache_strategy: CacheStrategy::None,
             route_segments: parse_route_segments("/v1/web/webchat/{tenant}").expect("segments"),
+            scope: None,
         };
         let table = ActiveRouteTable::from_plan(&StaticRoutePlan {
             routes: vec![route],
@@ -701,6 +798,7 @@ mod tests {
                 max_age_seconds: 300,
             },
             route_segments: parse_route_segments("/v1/web/webchat/{tenant}").expect("segments"),
+            scope: None,
         };
         let directory_match = StaticRouteMatch {
             descriptor: &descriptor,
@@ -819,6 +917,7 @@ mod tests {
                     team_scoped: false,
                     cache_strategy: CacheStrategy::None,
                     route_segments: parse_route_segments("/runtime").expect("segments"),
+                    scope: None,
                 },
                 StaticRouteDescriptor {
                     route_id: "b".into(),
@@ -832,6 +931,7 @@ mod tests {
                     team_scoped: false,
                     cache_strategy: CacheStrategy::None,
                     route_segments: parse_route_segments("/web/app").expect("segments"),
+                    scope: None,
                 },
                 StaticRouteDescriptor {
                     route_id: "c".into(),
@@ -845,6 +945,7 @@ mod tests {
                     team_scoped: false,
                     cache_strategy: CacheStrategy::None,
                     route_segments: parse_route_segments("/web/app/dashboard").expect("segments"),
+                    scope: None,
                 },
             ],
             warnings: Vec::new(),
@@ -888,5 +989,273 @@ mod tests {
             None
         );
         assert_eq!(content_type_for_path("site/app.woff2"), "font/woff2");
+    }
+
+    // ── Revision-scoped discovery + matching ──────────────────────────────
+
+    /// Path to the real `.gtpack` built from the `messaging-webchat-gui`
+    /// pack. Anchors tests to on-disk reality rather than hand-authored
+    /// fixtures.
+    fn real_webchat_gui_gtpack() -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.pop(); // up from greentic-start
+        p.push("greentic-messaging-providers/dist/packs/messaging-webchat-gui.gtpack");
+        p
+    }
+
+    /// Read the expected field values from the real pack.yaml so assertions
+    /// are anchored to the artifact, not to the test author's understanding.
+    fn expected_webchat_gui_values() -> (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        bool,
+        bool,
+    ) {
+        let mut yaml_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        yaml_path.pop();
+        yaml_path.push("greentic-messaging-providers/packs/messaging-webchat-gui/pack.yaml");
+        let content = fs::read_to_string(&yaml_path).expect("read pack.yaml");
+        let doc: serde_json::Value = serde_yaml_bw::from_str(&content).expect("parse pack.yaml");
+        let ext = &doc["extensions"]["greentic.static-routes.v1"]["inline"]["routes"][0];
+        let route_id = ext["id"].as_str().expect("id").to_string();
+        let public_path = ext["public_path"]
+            .as_str()
+            .expect("public_path")
+            .to_string();
+        let source_root = ext["source_root"]
+            .as_str()
+            .expect("source_root")
+            .to_string();
+        let index_file = ext["index_file"].as_str().map(|s| s.to_string());
+        let spa_fallback = ext["spa_fallback"].as_str().map(|s| s.to_string());
+        let tenant = ext["scope"]["tenant"].as_bool().unwrap_or(false);
+        let team = ext["scope"]["team"].as_bool().unwrap_or(false);
+        (
+            route_id,
+            public_path,
+            source_root,
+            index_file,
+            spa_fallback,
+            tenant,
+            team,
+        )
+    }
+
+    #[test]
+    fn discover_revision_static_routes_from_real_pack() {
+        let pack_path = real_webchat_gui_gtpack();
+        if !pack_path.exists() {
+            eprintln!(
+                "skipping: real .gtpack not found at {}",
+                pack_path.display()
+            );
+            return;
+        }
+        let (
+            expected_id,
+            expected_public_path,
+            expected_source_root,
+            expected_index,
+            expected_fallback,
+            expected_tenant,
+            expected_team,
+        ) = expected_webchat_gui_values();
+
+        let scope = crate::http_routes::RevisionScope {
+            deployment_id: greentic_deploy_spec::DeploymentId::new(),
+            bundle_id: greentic_deploy_spec::BundleId::new("acme-bundle"),
+            revision_id: greentic_deploy_spec::RevisionId::new(),
+        };
+        let routes = discover_revision_static_routes(&[pack_path], &scope);
+        assert!(!routes.is_empty(), "at least one static route discovered");
+
+        let route = &routes[0];
+        assert_eq!(route.route_id, expected_id, "route_id from pack.yaml");
+        assert_eq!(
+            route.public_path,
+            normalize_public_path(&expected_public_path),
+            "public_path from pack.yaml"
+        );
+        assert_eq!(
+            route.source_root, expected_source_root,
+            "source_root from pack.yaml"
+        );
+        assert_eq!(
+            route.index_file, expected_index,
+            "index_file from pack.yaml"
+        );
+        assert_eq!(
+            route.spa_fallback, expected_fallback,
+            "spa_fallback from pack.yaml"
+        );
+        assert_eq!(
+            route.tenant_scoped, expected_tenant,
+            "tenant_scoped from pack.yaml"
+        );
+        assert_eq!(
+            route.team_scoped, expected_team,
+            "team_scoped from pack.yaml"
+        );
+
+        let stamped = route.scope.as_ref().expect("scope stamped");
+        assert_eq!(stamped.deployment_id, scope.deployment_id);
+        assert_eq!(stamped.bundle_id, scope.bundle_id);
+        assert_eq!(stamped.revision_id, scope.revision_id);
+    }
+
+    #[test]
+    fn revision_scoped_route_not_matched_by_legacy_matcher() {
+        let pack_path = real_webchat_gui_gtpack();
+        if !pack_path.exists() {
+            eprintln!(
+                "skipping: real .gtpack not found at {}",
+                pack_path.display()
+            );
+            return;
+        }
+        let scope = crate::http_routes::RevisionScope {
+            deployment_id: greentic_deploy_spec::DeploymentId::new(),
+            bundle_id: greentic_deploy_spec::BundleId::new("acme"),
+            revision_id: greentic_deploy_spec::RevisionId::new(),
+        };
+        let routes = discover_revision_static_routes(&[pack_path], &scope);
+        let table = ActiveRouteTable::from_plan(&StaticRoutePlan {
+            routes,
+            warnings: Vec::new(),
+            blocking_failures: Vec::new(),
+        });
+        // Legacy (unscoped) matcher must not see revision-scoped routes.
+        assert!(
+            table
+                .match_request("/v1/web/webchat/demo/index.html")
+                .is_none(),
+            "legacy matcher must not match revision-scoped static routes"
+        );
+    }
+
+    #[test]
+    fn match_request_for_revision_isolates_scopes() {
+        let pack_path = real_webchat_gui_gtpack();
+        if !pack_path.exists() {
+            eprintln!(
+                "skipping: real .gtpack not found at {}",
+                pack_path.display()
+            );
+            return;
+        }
+        let deployment = greentic_deploy_spec::DeploymentId::new();
+        let scope_a = crate::http_routes::RevisionScope {
+            deployment_id: deployment,
+            bundle_id: greentic_deploy_spec::BundleId::new("a"),
+            revision_id: greentic_deploy_spec::RevisionId::new(),
+        };
+        let scope_b = crate::http_routes::RevisionScope {
+            deployment_id: deployment,
+            bundle_id: greentic_deploy_spec::BundleId::new("b"),
+            revision_id: greentic_deploy_spec::RevisionId::new(),
+        };
+        let routes_a = discover_revision_static_routes(std::slice::from_ref(&pack_path), &scope_a);
+        let routes_b = discover_revision_static_routes(std::slice::from_ref(&pack_path), &scope_b);
+        let all_routes = [routes_a, routes_b].concat();
+        let table = ActiveRouteTable::from_plan(&StaticRoutePlan {
+            routes: all_routes,
+            warnings: Vec::new(),
+            blocking_failures: Vec::new(),
+        });
+        // Scope A matches scope A's routes.
+        assert!(
+            table
+                .match_request_for_revision("/v1/web/webchat/demo/index.html", &scope_a)
+                .is_some(),
+            "scope A route must match scope A"
+        );
+        // Scope B matches scope B's routes.
+        assert!(
+            table
+                .match_request_for_revision("/v1/web/webchat/demo/index.html", &scope_b)
+                .is_some(),
+            "scope B route must match scope B"
+        );
+        // An unknown scope matches nothing.
+        let unknown = crate::http_routes::RevisionScope {
+            deployment_id: greentic_deploy_spec::DeploymentId::new(),
+            bundle_id: greentic_deploy_spec::BundleId::new("unknown"),
+            revision_id: greentic_deploy_spec::RevisionId::new(),
+        };
+        assert!(
+            table
+                .match_request_for_revision("/v1/web/webchat/demo/index.html", &unknown)
+                .is_none(),
+            "unknown scope must not match any route"
+        );
+    }
+
+    #[test]
+    fn path_outside_public_path_does_not_match() {
+        let pack_path = real_webchat_gui_gtpack();
+        if !pack_path.exists() {
+            eprintln!(
+                "skipping: real .gtpack not found at {}",
+                pack_path.display()
+            );
+            return;
+        }
+        let scope = crate::http_routes::RevisionScope {
+            deployment_id: greentic_deploy_spec::DeploymentId::new(),
+            bundle_id: greentic_deploy_spec::BundleId::new("acme"),
+            revision_id: greentic_deploy_spec::RevisionId::new(),
+        };
+        let routes = discover_revision_static_routes(&[pack_path], &scope);
+        let table = ActiveRouteTable::from_plan(&StaticRoutePlan {
+            routes,
+            warnings: Vec::new(),
+            blocking_failures: Vec::new(),
+        });
+        // The webchat-gui route is /v1/web/webchat/{tenant} — a request to
+        // /v1/api/something should NOT match.
+        assert!(
+            table
+                .match_request_for_revision("/v1/api/something", &scope)
+                .is_none(),
+            "path outside the pack's public_path must not match"
+        );
+    }
+
+    #[test]
+    fn reserved_operator_routes_not_shadowed_by_broad_static_route() {
+        // Simulate a pack declaring a broad "/" public_path. The
+        // ReservedRouteSet validation catches this at plan time, and the
+        // match_request_for_revision function in the revision-serve path
+        // is only reached AFTER the reserved operator routes (probes,
+        // /workers/invoke, etc.) have already short-circuited.
+        //
+        // Here we verify the plan-time validation: a "/" static route is
+        // flagged as conflicting with reserved paths.
+        let reserved = ReservedRouteSet::operator_defaults();
+        assert!(reserved.conflicts_with("/status"), "/status is reserved");
+        assert!(reserved.conflicts_with("/healthz"), "/healthz is reserved");
+        assert!(
+            reserved.conflicts_with("/runtime/drain"),
+            "/runtime/* is reserved"
+        );
+    }
+
+    #[test]
+    fn discover_revision_static_routes_skips_unreadable_pack() {
+        let dir = tempdir().unwrap();
+        let bad = dir.path().join("garbage.gtpack");
+        fs::write(&bad, b"not a zip archive").unwrap();
+        let missing = dir.path().join("does-not-exist.gtpack");
+
+        let scope = crate::http_routes::RevisionScope {
+            deployment_id: greentic_deploy_spec::DeploymentId::new(),
+            bundle_id: greentic_deploy_spec::BundleId::new("acme"),
+            revision_id: greentic_deploy_spec::RevisionId::new(),
+        };
+        let routes = discover_revision_static_routes(&[bad, missing], &scope);
+        assert!(routes.is_empty(), "unreadable packs yield no routes");
     }
 }

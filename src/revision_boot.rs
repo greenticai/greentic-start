@@ -57,6 +57,9 @@ use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig, p
 use crate::revision_pin::RevisionPinStore;
 use crate::runtime_config::{LoadedRuntimeConfig, env_dir_in};
 use crate::secrets_gate::DynSecretsManager;
+use crate::static_routes::{
+    ActiveRouteTable, StaticRouteDescriptor, StaticRoutePlan, discover_revision_static_routes,
+};
 
 /// Filename of the per-env revision-dispatcher HMAC signing key, kept under the
 /// env directory so cookie/pin stickiness survives restarts. 32 raw bytes,
@@ -224,6 +227,8 @@ pub(crate) async fn activate_runtime_config(
     // ingress matches against these via `match_request_for_revision` once the
     // dispatcher picks a revision.
     let mut scoped_routes: Vec<HttpRouteDescriptor> = Vec::new();
+    // Revision-scoped static routes, parallel to `scoped_routes`.
+    let mut scoped_static_routes: Vec<StaticRouteDescriptor> = Vec::new();
 
     let configs = host.tenant_configs();
     for block in &rc.revisions {
@@ -276,6 +281,7 @@ pub(crate) async fn activate_runtime_config(
             &scope,
             &meta.path_prefixes,
         ));
+        scoped_static_routes.extend(discover_revision_static_routes(&pack_paths, &scope));
 
         // Session isolation: give each revision its OWN session and state store
         // rather than sharing the host's. The session/resume/state backend keys
@@ -336,6 +342,11 @@ pub(crate) async fn activate_runtime_config(
         deployment_routes: DeploymentRouteTable::from_environment(env),
         endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),
         deployment_config_overrides: Arc::new(deployment_config_overrides_from_environment(env)),
+        static_routes: ActiveRouteTable::from_plan(&StaticRoutePlan {
+            routes: scoped_static_routes,
+            warnings: Vec::new(),
+            blocking_failures: Vec::new(),
+        }),
     };
 
     Ok(RuntimeConfigActivation { host, routing })

@@ -26,7 +26,7 @@ pub const INGEST_HTTP_OP: &str = "ingest_http";
 /// materialized runtime-config (multi-revision deployments, produced in B4).
 /// Routes discovered from a single bundle have no scope (`None` = legacy),
 /// matching the `Option = legacy` discipline used by `RuntimeKey`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RevisionScope {
     pub deployment_id: DeploymentId,
     pub bundle_id: BundleId,
