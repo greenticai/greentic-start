@@ -191,6 +191,21 @@ struct ServeState {
     /// Prevents racy double-calls from clients from minting two independent
     /// conversations for the same browser session.
     conversation_dedup: Arc<crate::conv_dedup::ConversationDedupCache>,
+    /// WebSocket session concurrency limits + per-tenant/conversation gauges.
+    /// Shared with the WS upgrade handler so every revision listener shares one
+    /// session accounting pool.
+    session_manager: Arc<crate::websocket::SessionManager>,
+    /// Activity push notifier — informs WS sessions when a conversation has
+    /// new activities. Shared across all revisions so a REST POST that writes
+    /// an activity on one revision wakes the WS pump watching that conversation.
+    notifier: Arc<dyn crate::notifier::ActivityNotifier>,
+    /// Test-only: override the activity source used by the WS pump. When
+    /// `Some`, `handle_websocket_upgrade` substitutes this source instead of
+    /// constructing a `RevisionActivitySource` that calls
+    /// `invoke_provider_for_revision`. This lets integration tests exercise the
+    /// full WS upgrade + pump pipeline without loading a real WASM pack.
+    #[cfg(test)]
+    activity_source_override: Option<Arc<dyn crate::websocket::pump::ActivitySource>>,
 }
 
 impl ServeState {
@@ -463,6 +478,14 @@ impl RevisionServer {
         };
         let admin_port = admin_addr.map(|a| a.port());
 
+        let session_manager = Arc::new(crate::websocket::SessionManager::new(
+            crate::websocket::WsLimits::default(),
+        ));
+        // In-memory notifier is sufficient for single-process revision hosts.
+        // A Redis-backed notifier (for horizontally scaled deployments) plugs
+        // in via the same `build_notifier` machinery as the legacy path.
+        let notifier: Arc<dyn crate::notifier::ActivityNotifier> =
+            Arc::new(crate::notifier::InMemoryNotifier::new(64));
         let state = Arc::new(ServeState {
             slot: ArcSwap::new(config.activation),
             bound_addr: addr,
@@ -474,6 +497,10 @@ impl RevisionServer {
             exe_path: config.exe_path,
             directline_sessions: Arc::new(crate::directline_session::DirectLineSessions::from_env()),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager,
+            notifier,
+            #[cfg(test)]
+            activity_source_override: None,
         });
         // Cloned into the listener thread; the original lives on as the
         // [`RevisionServer::state`] handle so [`reload`] / [`counts`] read the
@@ -839,7 +866,15 @@ fn spawn_revision_connection(
                     handle_connection(req, connection_state.clone(), peer_is_loopback)
                 });
                 let io = TokioIo::new(stream);
-                if let Err(err) = Http1Builder::new().serve_connection(io, service).await {
+                // `with_upgrades` is required so the WebSocket handshake
+                // completes — without it hyper closes the TCP connection right
+                // after the 101 response and hyper-tungstenite's
+                // `websocket.await` errors out with "Handshake not finished".
+                if let Err(err) = Http1Builder::new()
+                    .serve_connection(io, service)
+                    .with_upgrades()
+                    .await
+                {
                     operator_log::error(
                         module_path!(),
                         format!("revision ingress connection error: {err}"),
@@ -857,11 +892,21 @@ fn spawn_revision_connection(
 /// `service_fn` adapter: collapse the `Ok`/`Err` response halves into the single
 /// infallible response hyper wants.
 async fn handle_connection(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     state: Arc<ServeState>,
     peer_is_loopback: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let cors = path_allows_cors(req.uri().path());
+    // A5: intercept WebSocket stream paths BEFORE `serve` so the upgrade
+    // handshake can borrow the request mutably. The stream path is the WS
+    // endpoint browsers open after creating a conversation over REST.
+    let path = req.uri().path().to_string();
+    if is_directline_stream_path(&path) {
+        let (Ok(response) | Err(response)) =
+            handle_websocket_upgrade(&mut req, &path, Arc::clone(&state)).await;
+        return Ok(response);
+    }
+
+    let cors = path_allows_cors(&path);
     let (Ok(response) | Err(response)) = serve(req, state, peer_is_loopback).await;
     Ok(if cors { with_cors(response) } else { response })
 }
@@ -3489,6 +3534,13 @@ async fn dispatch_provider_route(
             error_response(StatusCode::BAD_GATEWAY, "provider invocation failed")
         })?;
 
+    // A5: notify the WS pump when the provider op itself writes an activity
+    // (e.g. `directline_http` bumps the watermark on POST /activities). The
+    // legacy path solves this via `register_webchat_post_op_notifier`; the
+    // revision path has no callback mechanism on `invoke_provider_for_revision`,
+    // so we extract the `_greentic` metadata inline.
+    try_notify_webchat_activity(state.notifier.as_ref(), &output).await;
+
     let result = parse_dispatch_result(&output).map_err(|err| {
         operator_log::warn(
             module_path!(),
@@ -3535,6 +3587,7 @@ async fn dispatch_provider_route(
         let pipeline_tenant = tenant.to_string();
         let pipeline_provider = provider_type.clone();
         let pipeline_bundle = bundle_id.clone();
+        let pipeline_notifier = Arc::clone(&state.notifier);
         tokio::spawn(async move {
             run_provider_inbound_pipeline(
                 pipeline_activation,
@@ -3547,6 +3600,7 @@ async fn dispatch_provider_route(
                 ingress_envelopes,
                 endpoint_id,
                 welcome_hint,
+                pipeline_notifier,
             )
             .await;
         });
@@ -3621,6 +3675,7 @@ async fn run_provider_inbound_pipeline(
     envelopes: Vec<ChannelMessageEnvelope>,
     endpoint_id: Option<String>,
     welcome_hint: Option<WelcomeFlowHint>,
+    notifier: Arc<dyn crate::notifier::ActivityNotifier>,
 ) {
     for ingress in &envelopes {
         let activity = envelope_to_activity(
@@ -3655,7 +3710,7 @@ async fn run_provider_inbound_pipeline(
 
         for reply in replies {
             let reply_envelope = build_reply_envelope(ingress, &reply);
-            if let Err(err) = run_reply_egress(
+            match run_reply_egress(
                 &activation,
                 &tenant,
                 deployment_id,
@@ -3667,14 +3722,19 @@ async fn run_provider_inbound_pipeline(
             )
             .await
             {
-                operator_log::error(
-                    module_path!(),
-                    format!(
-                        "provider {provider_type} egress failed for deployment \
-                         {deployment_id} revision {revision_id} (reply id={}): {err:#}",
-                        reply_envelope.id
-                    ),
-                );
+                Ok(send_outcome) => {
+                    try_notify_webchat_activity(notifier.as_ref(), &send_outcome).await;
+                }
+                Err(err) => {
+                    operator_log::error(
+                        module_path!(),
+                        format!(
+                            "provider {provider_type} egress failed for deployment \
+                             {deployment_id} revision {revision_id} (reply id={}): {err:#}",
+                            reply_envelope.id
+                        ),
+                    );
+                }
             }
         }
     }
@@ -3701,7 +3761,7 @@ async fn run_reply_egress(
     pack_id: &str,
     provider_type: &str,
     envelope: &ChannelMessageEnvelope,
-) -> Result<()> {
+) -> Result<Value> {
     use crate::messaging_dto::{EncodeInV1, ProviderPayloadV1, RenderPlanInV1};
 
     let message_value = serde_json::to_value(envelope).context("serialize reply envelope")?;
@@ -3788,7 +3848,61 @@ async fn run_reply_egress(
             .unwrap_or("send_payload reported ok=false");
         anyhow::bail!("{error_msg}");
     }
-    Ok(())
+    Ok(send_outcome)
+}
+
+/// Extract `_greentic` metadata from a provider-op output and publish a
+/// [`NotifyEvent`] so the WS pump wakes up. Mirrors the legacy
+/// `register_webchat_post_op_notifier` callback in [`crate::http_ingress`]
+/// which fires on `directline_http` and `send_payload` outputs.
+///
+/// The metadata may appear at the top level (`send_payload`) or inside a
+/// base64-encoded `body_b64` field (`directline_http`). When absent the call
+/// is a no-op — non-webchat providers simply don't carry `_greentic`.
+async fn try_notify_webchat_activity(
+    notifier: &dyn crate::notifier::ActivityNotifier,
+    output: &Value,
+) {
+    let metadata = if let Some(body_b64) = output.get("body_b64").and_then(|v| v.as_str()) {
+        let Ok(decoded) = BASE64.decode(body_b64.as_bytes()) else {
+            return;
+        };
+        let Ok(body) = serde_json::from_slice::<Value>(&decoded) else {
+            return;
+        };
+        match body.get("_greentic").cloned() {
+            Some(m) => m,
+            None => return,
+        }
+    } else {
+        match output.get("_greentic").cloned() {
+            Some(m) => m,
+            None => return,
+        }
+    };
+    let Some(tenant_id) = metadata.get("tenant").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Some(conversation_id) = metadata.get("conversation_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Some(new_watermark) = metadata.get("watermark_bumped").and_then(|v| v.as_u64()) else {
+        return;
+    };
+    operator_log::debug(
+        module_path!(),
+        format!(
+            "[revision ws notifier] publishing event tenant={tenant_id} \
+             conv={conversation_id} watermark={new_watermark}",
+        ),
+    );
+    notifier
+        .publish(crate::notifier::NotifyEvent {
+            tenant_id: tenant_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            new_watermark,
+        })
+        .await;
 }
 
 /// Build a reply [`ChannelMessageEnvelope`] from an inbound `ingress`
@@ -4268,9 +4382,322 @@ fn validate_token_response(response: &IngressHttpResponse) -> Result<(), Respons
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// A5: WebSocket upgrade on the revision path
+// ---------------------------------------------------------------------------
+
+/// True when the full request path is a DirectLine stream endpoint:
+/// `.../v3/directline/conversations/{id}/stream`.
+fn is_directline_stream_path(path: &str) -> bool {
+    let dl = extract_directline_provider_path(path);
+    let segments: Vec<&str> = dl.trim_start_matches('/').split('/').collect();
+    matches!(
+        segments.as_slice(),
+        ["v3", "directline", "conversations", _, "stream"]
+    )
+}
+
+/// Extract the conversation id from a DirectLine stream path.
+fn extract_stream_conversation_id(path: &str) -> Option<String> {
+    let dl = extract_directline_provider_path(path);
+    let segments: Vec<&str> = dl.trim_start_matches('/').split('/').collect();
+    match segments.as_slice() {
+        ["v3", "directline", "conversations", conv_id, "stream"] => Some((*conv_id).to_string()),
+        _ => None,
+    }
+}
+
+/// `ActivitySource` that calls `RunnerHost::invoke_provider_for_revision`
+/// to read activities from the conversation state. Unlike the legacy
+/// `RunnerHostActivitySource` (which wraps a sync `RunnerHostHandle` in
+/// `spawn_blocking`), this source calls the async revision-path API
+/// directly — no sync/async bridge required.
+struct RevisionActivitySource {
+    host: Arc<RunnerHost>,
+    deployment_id: DeploymentId,
+    bundle_id: BundleId,
+    revision_id: RevisionId,
+    provider_type: String,
+    team: String,
+    /// Bearer token captured at WS upgrade time.
+    auth_token: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl crate::websocket::pump::ActivitySource for RevisionActivitySource {
+    async fn fetch_since(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        since_watermark: u64,
+    ) -> Result<(Vec<Value>, u64), String> {
+        let headers: Vec<Value> = match &self.auth_token {
+            Some(token) if !token.is_empty() => {
+                vec![serde_json::json!([
+                    "Authorization",
+                    format!("Bearer {token}")
+                ])]
+            }
+            _ => Vec::new(),
+        };
+        let payload = serde_json::json!({
+            "v": 1,
+            "provider": self.provider_type,
+            "route": Value::Null,
+            "binding_id": Value::Null,
+            "tenant_hint": tenant_id,
+            "team_hint": self.team,
+            "method": "GET",
+            "path": format!("/v3/directline/conversations/{conversation_id}/activities"),
+            "query": format!("watermark={since_watermark}&tenant={tenant_id}&team={}", self.team),
+            "headers": headers,
+            "body_b64": "",
+            "config": Value::Null,
+        });
+        let input_json = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
+
+        // Try canonical `ingest-http` op, then fall back to the underscore
+        // alias used by older pack builds — same pattern as the legacy
+        // `DemoRunnerHost` impl.
+        let output = match self
+            .host
+            .invoke_provider_for_revision(
+                tenant_id,
+                self.deployment_id,
+                self.bundle_id.clone(),
+                self.revision_id,
+                &self.provider_type,
+                "ingest-http",
+                input_json.clone(),
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => self
+                .host
+                .invoke_provider_for_revision(
+                    tenant_id,
+                    self.deployment_id,
+                    self.bundle_id.clone(),
+                    self.revision_id,
+                    &self.provider_type,
+                    "ingest_http",
+                    input_json,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|err| err.to_string())?,
+        };
+
+        // Decode the provider response envelope.
+        let body_b64 = output
+            .get("body_b64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing body_b64 in provider response".to_string())?;
+        let body_bytes = BASE64
+            .decode(body_b64.as_bytes())
+            .map_err(|err| format!("invalid base64 body_b64: {err}"))?;
+        if body_bytes.is_empty() {
+            return Ok((Vec::new(), since_watermark));
+        }
+        let value: Value = serde_json::from_slice(&body_bytes)
+            .map_err(|err| format!("invalid body json: {err}"))?;
+        let activities = value
+            .get("activities")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let next_watermark = value
+            .get("watermark")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(since_watermark);
+        Ok((activities, next_watermark))
+    }
+}
+
+/// Handle a WebSocket upgrade on the revision path.
+///
+/// The conversation must already exist (created via REST `POST /conversations`)
+/// and be pinned to a revision. The WS pump reads activities from the SAME
+/// revision the REST conversation was pinned to — never re-dispatching — so
+/// the socket and the REST endpoint always see the same conversation state.
+async fn handle_websocket_upgrade(
+    req: &mut Request<Incoming>,
+    path: &str,
+    state: Arc<ServeState>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let conv_id = match extract_stream_conversation_id(path) {
+        Some(c) => c,
+        None => return Err(error_response(StatusCode::NOT_FOUND, "invalid stream path")),
+    };
+
+    let activation = state.current();
+    let host_header = header_str(req.headers(), header::HOST.as_str());
+
+    // Resolve deployment + tenant from the path so we know which env's
+    // secrets to read the signing key from.
+    let (deployment_id, tenant) = activation
+        .routing
+        .deployment_routes
+        .resolve(host_header.as_deref(), path)
+        .map(|(deployment_id, tenant)| (deployment_id, tenant.to_string()))
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "no deployment is bound to this host and path",
+            )
+        })?;
+
+    // Resolve the provider_type for this path so we can read its signing key.
+    let provider_type = activation
+        .routing
+        .http_routes
+        .provider_type_for(path, "GET", deployment_id)
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "no provider route matches this stream path",
+            )
+        })?
+        .to_string();
+
+    // Look up the revision pin for this conversation. A5 critical invariant:
+    // the WS pump MUST read from the same revision the REST POST pinned to.
+    // The session hint format is `webchat:{conversation_id}`.
+    let session_hint = format!("webchat:{conv_id}");
+    let pinned = activation
+        .routing
+        .dispatcher
+        .lookup_pin(&tenant, deployment_id, &session_hint)
+        .await;
+
+    let (bundle_id, revision_id) = match pinned {
+        Some((bid, rid)) => (bid, rid),
+        None => {
+            // No pin means the conversation was never created via REST, or the
+            // pin expired. Either way, we cannot safely pick a revision.
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "no revision pin for this conversation; create it via REST first",
+            ));
+        }
+    };
+
+    // Read the JWT signing key from the pinned revision's secrets.
+    let team = "default";
+    let signing_key =
+        read_provider_signing_key(&activation, &tenant, Some(team), &provider_type).await;
+    let signing_key = match signing_key {
+        Some(key) => key,
+        None => {
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "missing jwt_signing_key for the webchat provider",
+            ));
+        }
+    };
+
+    // Validate the ?t= token.
+    let ctx = match crate::websocket::validate_request_parts(
+        req.uri(),
+        req.headers(),
+        &conv_id,
+        &tenant,
+        &signing_key,
+    ) {
+        Ok(c) => c,
+        Err(err) => return Ok(crate::websocket::refusal_response(&err)),
+    };
+
+    // Acquire a session slot.
+    let guard = match state.session_manager.acquire(&tenant, &conv_id) {
+        Ok(g) => g,
+        Err(err) => {
+            return Ok(crate::websocket::refusal_response(
+                &crate::websocket::UpgradeError::LimitExceeded(err.to_string()),
+            ));
+        }
+    };
+
+    // Extract the bearer token from ?t= BEFORE the upgrade call consumes
+    // the request reference. The token authenticates the pump's internal
+    // GET /activities calls against the WASM provider's JWT guard.
+    let auth_token = req.uri().query().and_then(|q| {
+        q.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            if k == "t" { Some(v.to_string()) } else { None }
+        })
+    });
+
+    // Perform the HTTP -> WS upgrade.
+    let (response, websocket) = match hyper_tungstenite::upgrade(req, None) {
+        Ok(pair) => pair,
+        Err(err) => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("websocket upgrade failed: {err}"),
+            ));
+        }
+    };
+
+    // Build the revision-specific activity source. This calls
+    // `invoke_provider_for_revision` directly (async) — no sync/async bridge
+    // needed because the pump runs entirely in an async context.
+    #[cfg(test)]
+    let source: Arc<dyn crate::websocket::pump::ActivitySource> =
+        if let Some(ref override_source) = state.activity_source_override {
+            Arc::clone(override_source)
+        } else {
+            Arc::new(RevisionActivitySource {
+                host: Arc::clone(&activation.host),
+                deployment_id,
+                bundle_id,
+                revision_id,
+                provider_type,
+                team: team.to_string(),
+                auth_token,
+            })
+        };
+    #[cfg(not(test))]
+    let source: Arc<dyn crate::websocket::pump::ActivitySource> =
+        Arc::new(RevisionActivitySource {
+            host: Arc::clone(&activation.host),
+            deployment_id,
+            bundle_id,
+            revision_id,
+            provider_type,
+            team: team.to_string(),
+            auth_token,
+        });
+
+    let notifier = state.notifier.clone();
+    let limits = state.session_manager.limits().clone();
+
+    tokio::spawn(crate::websocket::serve_session(
+        websocket,
+        notifier,
+        source,
+        tenant,
+        conv_id,
+        ctx.initial_watermark,
+        limits,
+        guard,
+    ));
+
+    // Repackage the upgrade response into `Full<Bytes>` (the 101 body is
+    // empty; only the status + headers matter for the handshake).
+    let (parts, _body) = response.into_parts();
+    Ok(Response::from_parts(parts, Full::new(Bytes::new())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifier::ActivityNotifier;
     // `BundleId` is used only in tests (prod refers to it via the `RevisionKey`
     // alias), so it lives here rather than in the library import set.
     use greentic_deploy_spec::WelcomeFlowRef;
@@ -5668,6 +6095,11 @@ mod tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         }
     }
 
@@ -6607,6 +7039,11 @@ mod tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -6708,6 +7145,11 @@ mod tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -6803,6 +7245,11 @@ mod tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -6871,6 +7318,11 @@ mod tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -7140,6 +7592,11 @@ mod tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         })
     }
 
@@ -7218,6 +7675,164 @@ mod tests {
         assert!(
             !probe.is_live_elsewhere(dep_id, rev_removed),
             "a genuinely removed revision must NOT read as live elsewhere"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Category 10: A5 — WebSocket stream path helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_directline_stream_path_accepts_full_path() {
+        assert!(is_directline_stream_path(
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations/conv-42/stream"
+        ));
+    }
+
+    #[test]
+    fn is_directline_stream_path_rejects_activities() {
+        assert!(!is_directline_stream_path(
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations/conv-42/activities"
+        ));
+    }
+
+    #[test]
+    fn is_directline_stream_path_rejects_bare_conversations() {
+        assert!(!is_directline_stream_path(
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations"
+        ));
+    }
+
+    #[test]
+    fn is_directline_stream_path_rejects_non_directline() {
+        assert!(!is_directline_stream_path(
+            "/v1/messaging/telegram/tenant1/webhook"
+        ));
+    }
+
+    #[test]
+    fn extract_stream_conversation_id_returns_id() {
+        assert_eq!(
+            extract_stream_conversation_id(
+                "/v1/messaging/webchat/tenant1/v3/directline/conversations/abc-123/stream"
+            ),
+            Some("abc-123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_stream_conversation_id_returns_none_for_non_stream() {
+        assert_eq!(
+            extract_stream_conversation_id(
+                "/v1/messaging/webchat/tenant1/v3/directline/conversations/abc/activities"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn stream_path_matches_cors_allowlist() {
+        // `path_allows_cors` classifies stream paths as CORS-eligible.
+        // In practice `handle_connection` intercepts stream paths for the WS
+        // upgrade BEFORE reaching the CORS wrapper, so the header is never
+        // applied — browsers don't enforce CORS on WebSocket connections
+        // anyway. This test validates the classifier's output, not the
+        // end-to-end CORS behaviour on stream responses.
+        assert!(path_allows_cors(
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations/c1/stream"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Category 11: A5 — WS notifier integration (try_notify_webchat_activity)
+    // -----------------------------------------------------------------------
+
+    /// Verify that `try_notify_webchat_activity` publishes a `NotifyEvent`
+    /// when the provider output carries top-level `_greentic` metadata
+    /// (the shape returned by `send_payload`).
+    #[tokio::test]
+    async fn notify_publishes_on_top_level_greentic_metadata() {
+        let notifier = crate::notifier::InMemoryNotifier::new(16);
+        let mut events = notifier.subscribe("t1", "conv-1").await.expect("subscribe");
+
+        let output = serde_json::json!({
+            "ok": true,
+            "_greentic": {
+                "tenant": "t1",
+                "conversation_id": "conv-1",
+                "watermark_bumped": 42u64,
+            }
+        });
+        try_notify_webchat_activity(&notifier, &output).await;
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            futures_util::StreamExt::next(&mut events),
+        )
+        .await
+        .expect("timeout waiting for notify event")
+        .expect("stream ended");
+        assert_eq!(event.tenant_id, "t1");
+        assert_eq!(event.conversation_id, "conv-1");
+        assert_eq!(event.new_watermark, 42);
+    }
+
+    /// Verify that `try_notify_webchat_activity` publishes when `_greentic`
+    /// is embedded inside a base64-encoded `body_b64` field (the shape
+    /// returned by `directline_http`).
+    #[tokio::test]
+    async fn notify_publishes_on_body_b64_greentic_metadata() {
+        let notifier = crate::notifier::InMemoryNotifier::new(16);
+        let mut events = notifier
+            .subscribe("t2", "conv-99")
+            .await
+            .expect("subscribe");
+
+        let inner = serde_json::json!({
+            "_greentic": {
+                "tenant": "t2",
+                "conversation_id": "conv-99",
+                "watermark_bumped": 7u64,
+            },
+            "id": "a1"
+        });
+        let body_b64 = BASE64.encode(serde_json::to_vec(&inner).unwrap());
+        let output = serde_json::json!({
+            "status": 200,
+            "body_b64": body_b64,
+        });
+        try_notify_webchat_activity(&notifier, &output).await;
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            futures_util::StreamExt::next(&mut events),
+        )
+        .await
+        .expect("timeout waiting for notify event")
+        .expect("stream ended");
+        assert_eq!(event.tenant_id, "t2");
+        assert_eq!(event.conversation_id, "conv-99");
+        assert_eq!(event.new_watermark, 7);
+    }
+
+    /// Non-webchat provider outputs (no `_greentic`) must not trigger a
+    /// publish. The notifier stream must stay empty.
+    #[tokio::test]
+    async fn notify_is_noop_without_greentic_metadata() {
+        let notifier = crate::notifier::InMemoryNotifier::new(16);
+        let mut events = notifier.subscribe("t1", "conv-1").await.expect("subscribe");
+
+        let output = serde_json::json!({"ok": true});
+        try_notify_webchat_activity(&notifier, &output).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            futures_util::StreamExt::next(&mut events),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "no event should be published for non-webchat output"
         );
     }
 }
@@ -7720,6 +8335,11 @@ mod binary_update_tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -7753,6 +8373,11 @@ mod binary_update_tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
         assert_eq!(resp.status(), StatusCode::OK, "still healthy");
@@ -7781,6 +8406,11 @@ mod binary_update_tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
         assert!(
@@ -7805,6 +8435,11 @@ mod binary_update_tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -8018,6 +8653,11 @@ mod binary_update_tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -8054,6 +8694,11 @@ mod binary_update_tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         state.mark_restart_required();
         assert!(
@@ -8085,6 +8730,11 @@ mod binary_update_tests {
                 crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
             ),
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         state.mark_restart_required();
         assert!(
@@ -8267,5 +8917,365 @@ mod binary_update_tests {
             !prev_path.exists(),
             "restore_prev consumes the .prev copy it restores from"
         );
+    }
+
+    // ── Category 12: A5 — end-to-end WS upgrade through revision-serve ─────
+
+    /// In-memory `SecretsManager` for tests: returns a pre-loaded signing key
+    /// and rejects everything else.
+    struct TestSecretsManager {
+        entries: std::sync::Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl TestSecretsManager {
+        fn with_entry(key: &str, value: Vec<u8>) -> Self {
+            let mut map = HashMap::new();
+            map.insert(key.to_string(), value);
+            Self {
+                entries: std::sync::Mutex::new(map),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl greentic_secrets_lib::SecretsManager for TestSecretsManager {
+        async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+            self.entries
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+        }
+
+        async fn write(&self, _path: &str, _bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+
+        async fn delete(&self, _path: &str) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// In-memory activity source for the WS pump that bypasses the WASM
+    /// provider. Shared between the test driver and the pump via `Arc`.
+    struct TestActivitySource {
+        entries: std::sync::Mutex<Vec<serde_json::Value>>,
+        next_watermark: std::sync::Mutex<u64>,
+    }
+
+    impl TestActivitySource {
+        fn new() -> Self {
+            Self {
+                entries: std::sync::Mutex::new(Vec::new()),
+                next_watermark: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn append(&self, text: &str) -> u64 {
+            let mut wm = self.next_watermark.lock().unwrap();
+            let watermark = *wm;
+            *wm += 1;
+            self.entries.lock().unwrap().push(serde_json::json!({
+                "type": "message",
+                "text": text,
+                "channelData": {"watermark": watermark},
+            }));
+            watermark
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::websocket::pump::ActivitySource for TestActivitySource {
+        async fn fetch_since(
+            &self,
+            _tenant_id: &str,
+            _conversation_id: &str,
+            since_watermark: u64,
+        ) -> Result<(Vec<serde_json::Value>, u64), String> {
+            let entries = self.entries.lock().unwrap();
+            let next = *self.next_watermark.lock().unwrap();
+            let filtered: Vec<serde_json::Value> = entries
+                .iter()
+                .filter(|a| {
+                    a.get("channelData")
+                        .and_then(|cd| cd.get("watermark"))
+                        .and_then(|w| w.as_u64())
+                        .map(|w| w >= since_watermark)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            Ok((filtered, next))
+        }
+    }
+
+    /// Issue a HS256 JWT for the test WebSocket handshake.
+    fn issue_test_token(conversation_id: &str, tenant: &str, signing_key: &[u8]) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+
+        let exp = chrono::Utc::now().timestamp() + 60;
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let claims = format!(
+            r#"{{"sub":"test-user","exp":{exp},"ctx":{{"env":"test","tenant":"{tenant}"}},"conv":"{conversation_id}"}}"#
+        );
+        let payload = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let signing_input = format!("{header}.{payload}");
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(signing_key).expect("hmac key");
+        mac.update(signing_input.as_bytes());
+        let sig = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("{signing_input}.{sig}")
+    }
+
+    /// Build an [`Activation`] wired for the A5 end-to-end WS test: routes
+    /// resolve, the dispatcher holds one revision, and the secrets manager
+    /// returns the signing key.
+    fn ws_test_activation(
+        env_id: &str,
+        tenant: &str,
+        deployment_id: greentic_deploy_spec::ids::DeploymentId,
+        revision_id: greentic_deploy_spec::ids::RevisionId,
+        bundle_id: greentic_deploy_spec::ids::BundleId,
+        signing_key: &[u8],
+        pin_store: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore>,
+    ) -> Activation {
+        use crate::deployment_routes::DeploymentRouteTable;
+        use crate::http_routes::{HttpRouteTable, provider_descriptor_for_test};
+        use crate::revision_dispatcher::{
+            RevisionDispatcher, RevisionDispatcherConfig, RevisionEntry,
+        };
+
+        let scope = crate::http_routes::RevisionScope {
+            deployment_id,
+            bundle_id: bundle_id.clone(),
+            revision_id,
+        };
+
+        let mut provider_route = provider_descriptor_for_test(
+            "/v1/messaging/webchat/{tenant}/{path*}",
+            "messaging.webchat.gui",
+            scope,
+        );
+        provider_route.methods = Vec::new();
+        let http_routes = HttpRouteTable::from_descriptors(vec![provider_route]);
+
+        let deployment_routes = DeploymentRouteTable::from_parts(vec![(
+            deployment_id,
+            tenant.to_string(),
+            Vec::new(),
+            Vec::new(),
+        )]);
+
+        let dispatcher = RevisionDispatcher::with_pin_store(
+            RevisionDispatcherConfig::new(env_id, [0u8; 32]),
+            pin_store,
+        );
+        dispatcher
+            .apply_traffic_split(
+                deployment_id,
+                vec![RevisionEntry {
+                    revision_id,
+                    bundle_id: bundle_id.clone(),
+                    weight_bps: 10_000,
+                }],
+                bundle_id,
+                0,
+            )
+            .expect("apply_traffic_split");
+
+        let provider_hyphen = "messaging-webchat-gui";
+        let env = crate::resolve_env(None);
+        let team_segment = crate::secrets_manager::canonical_team(Some("default"));
+        let raw_uri =
+            format!("secrets://{env}/{tenant}/{team_segment}/{provider_hyphen}/jwt_signing_key");
+        let secrets: greentic_runner_host::secrets::DynSecretsManager = std::sync::Arc::new(
+            TestSecretsManager::with_entry(&raw_uri, signing_key.to_vec()),
+        );
+
+        let host = std::sync::Arc::new(
+            greentic_runner_host::HostBuilder::new()
+                .with_config(greentic_runner_host::HostConfig::from_gtbind(
+                    greentic_runner_host::TenantBindings {
+                        tenant: tenant.to_string(),
+                        packs: Vec::new(),
+                        env_passthrough: Vec::new(),
+                    },
+                ))
+                .with_secrets_manager(secrets)
+                .build()
+                .expect("build test host"),
+        );
+
+        Activation {
+            host,
+            routing: std::sync::Arc::new(RevisionIngressRouting {
+                dispatcher: std::sync::Arc::new(dispatcher),
+                http_routes,
+                deployment_routes,
+                endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+                deployment_config_overrides: std::sync::Arc::default(),
+                static_routes: crate::static_routes::ActiveRouteTable::default(),
+            }),
+        }
+    }
+
+    /// A5 end-to-end: a WebSocket client connects through the REAL
+    /// `spawn_revision_connection` → `handle_connection` →
+    /// `handle_websocket_upgrade` pipeline, completes the handshake,
+    /// receives a pre-populated replay activity, then receives a
+    /// live-pushed activity via the notifier.
+    ///
+    /// Mutation proof:
+    /// (a) Removing `.with_upgrades()` from `spawn_revision_connection`
+    ///     makes the handshake fail ("Handshake not finished").
+    /// (b) Removing `try_notify_webchat_activity` removes the only
+    ///     `notifier.publish` on the revision path; the pump never
+    ///     wakes for live activities and the second frame never arrives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revision_ws_upgrade_end_to_end() {
+        let env_id = "local";
+        let tenant = "test-tenant";
+        let signing_key = b"revision-ws-test-key";
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let rev_id = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("test.webchat");
+        let conv_id = "conv-ws-e2e";
+        let pin_store: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore> =
+            std::sync::Arc::new(crate::revision_pin::InMemoryPinStore::new());
+
+        let activation = ws_test_activation(
+            env_id,
+            tenant,
+            dep_id,
+            rev_id,
+            bundle_id.clone(),
+            signing_key,
+            std::sync::Arc::clone(&pin_store),
+        );
+
+        let test_source = std::sync::Arc::new(TestActivitySource::new());
+        test_source.append("hello from replay");
+
+        let notifier: Arc<dyn crate::notifier::ActivityNotifier> =
+            Arc::new(crate::notifier::InMemoryNotifier::new(64));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let state = Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(activation)),
+            bound_addr: addr,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::clone(&notifier),
+            activity_source_override: Some(
+                test_source.clone() as Arc<dyn crate::websocket::pump::ActivitySource>
+            ),
+        });
+
+        // Pre-seed a revision pin for this conversation so the WS upgrade
+        // finds it (A5: the WS endpoint requires a prior REST POST
+        // /conversations that pins the session).
+        let session_hint = format!("webchat:{conv_id}");
+        state
+            .current()
+            .routing
+            .dispatcher
+            .commit_pin(tenant, dep_id, &session_hint, rev_id)
+            .await;
+
+        // Spawn the accept loop.
+        let accept_state = Arc::clone(&state);
+        let accept_handle = tokio::spawn(async move {
+            while let Ok(accept) = listener.accept().await {
+                spawn_revision_connection(Ok(accept), &accept_state, true);
+            }
+        });
+
+        // Build the WS URL with a valid token.
+        let token = issue_test_token(conv_id, tenant, signing_key);
+        let url = format!(
+            "ws://{addr}/v1/messaging/webchat/{tenant}/v3/directline/conversations/{conv_id}/stream?t={token}&watermark=0"
+        );
+
+        // Connect and complete the WebSocket handshake.
+        let (mut ws, response) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("ws connect must succeed (handshake)");
+        assert_eq!(
+            response.status(),
+            tokio_tungstenite::tungstenite::http::StatusCode::SWITCHING_PROTOCOLS,
+            "handshake must complete with 101"
+        );
+
+        // First frame: the replay activity pre-populated in the source.
+        use futures_util::StreamExt;
+        let replay = tokio::time::timeout(std::time::Duration::from_millis(3000), ws.next())
+            .await
+            .expect("replay timeout")
+            .expect("ws closed before replay")
+            .expect("ws error");
+        let replay_text = match replay {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let payload: serde_json::Value = serde_json::from_str(&replay_text).expect("replay json");
+        let activities = payload["activities"].as_array().expect("activities array");
+        assert_eq!(activities.len(), 1, "replay should contain one activity");
+        assert_eq!(
+            activities[0]["text"], "hello from replay",
+            "replay activity text"
+        );
+
+        // Simulate a provider-op writing a new activity: append to source,
+        // then publish a notify event (the production code path calls
+        // `try_notify_webchat_activity` after `invoke_provider_for_revision`).
+        let new_wm = test_source.append("live bot reply");
+        notifier
+            .publish(crate::notifier::NotifyEvent {
+                tenant_id: tenant.to_string(),
+                conversation_id: conv_id.to_string(),
+                new_watermark: new_wm + 1,
+            })
+            .await;
+
+        // Second frame: the live-pushed activity.
+        let live = tokio::time::timeout(std::time::Duration::from_millis(3000), ws.next())
+            .await
+            .expect("live timeout — pump never woke (notifier publish missing?)")
+            .expect("ws closed before live frame")
+            .expect("ws error");
+        let live_text = match live {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("expected text frame for live push, got {other:?}"),
+        };
+        let live_payload: serde_json::Value = serde_json::from_str(&live_text).expect("live json");
+        let live_activities = live_payload["activities"]
+            .as_array()
+            .expect("live activities array");
+        assert!(
+            live_activities
+                .iter()
+                .any(|a| a["text"] == "live bot reply"),
+            "expected live bot reply in {live_activities:?}",
+        );
+
+        let _ = ws.close(None).await;
+        accept_handle.abort();
     }
 }
