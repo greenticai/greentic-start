@@ -192,6 +192,17 @@ impl ServeState {
     fn current(&self) -> Arc<Activation> {
         self.slot.load_full()
     }
+
+    /// Record that a restart is required (binary swap succeeded) and, when
+    /// auto-restart is enabled on this platform, arm the auto-restart flag
+    /// so the shutdown loop returns `BinaryUpdateRestart`.
+    fn mark_restart_required(&self) {
+        self.restart_required.store(true, Ordering::Relaxed);
+        #[cfg(unix)]
+        if self.auto_restart_enabled {
+            self.auto_restart_pending.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// [`RevisionKey`]s present in `prev` but absent from `next`. Used by
@@ -2118,11 +2129,7 @@ async fn handle_update_notify(
                 .and_then(Value::as_bool)
                 == Some(true)
             {
-                state.restart_required.store(true, Ordering::Relaxed);
-                #[cfg(unix)]
-                if state.auto_restart_enabled {
-                    state.auto_restart_pending.store(true, Ordering::Relaxed);
-                }
+                state.mark_restart_required();
             }
             let bytes = serde_json::to_vec(&body).map_err(|err| {
                 error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
@@ -2230,11 +2237,7 @@ async fn run_update_poll_loop(state: Arc<ServeState>, store_root: std::path::Pat
             Ok((new_sequence, interval_secs, restart)) => {
                 last_sequence = new_sequence;
                 if restart {
-                    state.restart_required.store(true, Ordering::Relaxed);
-                    #[cfg(unix)]
-                    if state.auto_restart_enabled {
-                        state.auto_restart_pending.store(true, Ordering::Relaxed);
-                    }
+                    state.mark_restart_required();
                 }
                 interval_secs
             }
@@ -6916,25 +6919,7 @@ mod binary_update_tests {
             auto_restart_enabled: true,
             exe_path: None,
         });
-        // Simulate the response-processing logic from handle_update_notify.
-        let body = serde_json::json!({
-            "binary": {
-                "restart_required": true,
-                "version": "1.1.12",
-            }
-        });
-        if body
-            .get("binary")
-            .and_then(|b| b.get("restart_required"))
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            state.restart_required.store(true, Ordering::Relaxed);
-            #[cfg(unix)]
-            if state.auto_restart_enabled {
-                state.auto_restart_pending.store(true, Ordering::Relaxed);
-            }
-        }
+        state.mark_restart_required();
         assert!(
             state.restart_required.load(Ordering::Relaxed),
             "restart_required must be set"
@@ -6961,24 +6946,7 @@ mod binary_update_tests {
             auto_restart_enabled: false,
             exe_path: None,
         });
-        let body = serde_json::json!({
-            "binary": {
-                "restart_required": true,
-                "version": "1.1.12",
-            }
-        });
-        if body
-            .get("binary")
-            .and_then(|b| b.get("restart_required"))
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            state.restart_required.store(true, Ordering::Relaxed);
-            #[cfg(unix)]
-            if state.auto_restart_enabled {
-                state.auto_restart_pending.store(true, Ordering::Relaxed);
-            }
-        }
+        state.mark_restart_required();
         assert!(
             state.restart_required.load(Ordering::Relaxed),
             "restart_required must still be set"

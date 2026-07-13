@@ -843,15 +843,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // P7e: disarm the boot rollback guard — boot succeeded.
         #[cfg(unix)]
         if let Some(guard) = &mut _boot_rollback_guard {
-            // We ARE the new binary and boot succeeded. Clear the marker.
-            let own_version = env!("CARGO_PKG_VERSION");
-            if guard.marker.to_version == own_version {
-                operator_log::info(
-                    module_path!(),
-                    format!("binary-update: activated {own_version}"),
-                );
-                revision_serve::clear_binary_update_marker(&env_dir);
-            }
+            operator_log::info(
+                module_path!(),
+                format!("binary-update: activated {}", guard.marker.to_version,),
+            );
+            revision_serve::clear_binary_update_marker(&env_dir);
             guard.disarmed = true;
         }
 
@@ -1594,8 +1590,9 @@ impl Drop for BootRollbackGuard {
 #[cfg(unix)]
 fn exec_into_self(exe: &Path) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
-    let args: Vec<String> = std::env::args().collect();
-    let err = std::process::Command::new(exe).args(&args[1..]).exec();
+    let err = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .exec();
     // exec() only returns on error.
     Err(anyhow::anyhow!("exec failed: {err}"))
 }
@@ -1605,13 +1602,18 @@ fn exec_into_self(exe: &Path) -> anyhow::Result<()> {
 /// `GREENTIC_NO_AUTO_RESTART` not set to a truthy value.
 #[cfg(unix)]
 pub(crate) fn resolve_auto_restart(no_flag: bool) -> bool {
-    !no_flag
-        && std::env::var("GREENTIC_NO_AUTO_RESTART")
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                !matches!(v.as_str(), "1" | "true" | "yes" | "on")
-            })
-            .unwrap_or(true)
+    if no_flag {
+        return false;
+    }
+    let is_env_disabled = std::env::var("GREENTIC_NO_AUTO_RESTART")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    !is_env_disabled
 }
 
 #[cfg(not(unix))]
