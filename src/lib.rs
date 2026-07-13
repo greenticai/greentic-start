@@ -483,11 +483,16 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 revision_serve::BootAction::ArmGuard(mut marker) => {
                     marker.boot_attempts += 1;
                     if let Err(err) = revision_serve::write_marker_durable(&env_dir, &marker) {
+                        // The guard below is still armed, so a graceful boot
+                        // failure still rolls back. Only the hard-kill (SIGKILL
+                        // / OOM) loop breaker is degraded: an unpersisted
+                        // counter never advances.
                         operator_log::error(
                             module_path!(),
                             format!(
                                 "binary-update: failed to persist boot-attempt counter: {err}; \
-                                 proceeding without rollback guard"
+                                 rollback guard is still armed, but a hard-kill boot loop will \
+                                 not be broken automatically"
                             ),
                         );
                     }

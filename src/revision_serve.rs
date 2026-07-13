@@ -1640,6 +1640,38 @@ pub(crate) fn decide_boot_action(
 /// Durably write the marker to disk: create, write_all, fsync. Returns an
 /// error if any step fails — the caller must treat a failure as "rollback
 /// state not persisted."
+/// Persist the rollback marker, undoing the binary swap if it cannot be written.
+///
+/// The marker is the rollback state: without it on disk the boot-fail guard
+/// cannot arm, so a new binary that fails to boot would never be rolled back.
+/// Rather than exec into a binary with no rollback coverage, restore the
+/// previous one and fail the binary step (content staging is unaffected).
+fn persist_marker_or_undo_swap(
+    env_dir: &std::path::Path,
+    marker: &BinaryUpdateMarker,
+    exe_path: &std::path::Path,
+) -> Result<(), NotifyError> {
+    let Err(err) = write_marker_durable(env_dir, marker) else {
+        return Ok(());
+    };
+    operator_log::error(
+        module_path!(),
+        format!("binary-update: failed to persist rollback marker: {err}; undoing swap"),
+    );
+    if let Err(restore_err) = binswap::restore_prev(exe_path) {
+        operator_log::error(
+            module_path!(),
+            format!(
+                "binary-update: restore_prev ALSO failed after marker write failure: \
+                 {restore_err}; manual recovery required"
+            ),
+        );
+    }
+    Err(NotifyError::Internal(format!(
+        "binary update aborted: rollback marker not persisted: {err}"
+    )))
+}
+
 pub(crate) fn write_marker_durable(
     env_dir: &std::path::Path,
     marker: &BinaryUpdateMarker,
@@ -1933,24 +1965,7 @@ fn try_apply_binary_update(
         digest: Some(binary.digest.clone()),
         boot_attempts: 0,
     };
-    if let Err(err) = write_marker_durable(&env_dir, &marker) {
-        operator_log::error(
-            module_path!(),
-            format!("binary-update: failed to persist rollback marker: {err}; undoing swap"),
-        );
-        if let Err(restore_err) = binswap::restore_prev(&current_exe) {
-            operator_log::error(
-                module_path!(),
-                format!(
-                    "binary-update: restore_prev ALSO failed after marker write failure: \
-                     {restore_err}; manual recovery required"
-                ),
-            );
-        }
-        return Err(NotifyError::Internal(format!(
-            "binary update aborted: rollback marker not persisted: {err}"
-        )));
-    }
+    persist_marker_or_undo_swap(&env_dir, &marker, &current_exe)?;
 
     operator_log::warn(
         module_path!(),
@@ -7207,9 +7222,24 @@ mod binary_update_tests {
         std::fs::set_permissions(&env_dir, perms).unwrap();
 
         let marker = make_pending_marker("1.1.11", "1.1.12", 0);
-        let result = write_marker_durable(&env_dir, &marker);
-        assert!(result.is_err(), "write to read-only dir must fail");
+        let result = persist_marker_or_undo_swap(&env_dir, &marker, &exe_path);
 
         std::fs::set_permissions(&env_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "an unpersistable marker must fail the binary step"
+        );
+        // The swap must be undone: exec'ing into a binary with no rollback
+        // state on disk is exactly the case the marker exists to prevent.
+        assert_eq!(
+            std::fs::read(&exe_path).unwrap(),
+            old_binary,
+            "the previous binary must be restored when the marker cannot be persisted"
+        );
+        assert!(
+            !prev_path.exists(),
+            "restore_prev consumes the .prev copy it restores from"
+        );
     }
 }
