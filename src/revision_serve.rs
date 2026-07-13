@@ -183,6 +183,14 @@ struct ServeState {
     /// `/proc/self/exe`). Used by `try_apply_binary_update` as a fallback
     /// and by the exec-into-self logic after shutdown.
     exe_path: Option<std::path::PathBuf>,
+    /// Sliding-window registry of active DirectLine conversations, used to
+    /// re-mint session tokens on activity so long-running chats don't 401 once
+    /// the original session JWT lapses. See [`crate::directline_session`].
+    directline_sessions: Arc<crate::directline_session::DirectLineSessions>,
+    /// Short-window idempotency cache for `POST /v3/directline/conversations`.
+    /// Prevents racy double-calls from clients from minting two independent
+    /// conversations for the same browser session.
+    conversation_dedup: Arc<crate::conv_dedup::ConversationDedupCache>,
 }
 
 impl ServeState {
@@ -464,6 +472,8 @@ impl RevisionServer {
             auto_restart_pending: AtomicBool::new(false),
             auto_restart_enabled: config.auto_restart_enabled,
             exe_path: config.exe_path,
+            directline_sessions: Arc::new(crate::directline_session::DirectLineSessions::from_env()),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
         });
         // Cloned into the listener thread; the original lives on as the
         // [`RevisionServer::state`] handle so [`reload`] / [`counts`] read the
@@ -1073,9 +1083,18 @@ async fn serve(
     // a stable chat/channel-level hint from the webhook body so the pin store keeps
     // the conversation on one revision. provider_type is revision-independent so it
     // resolves before dispatch. Loopback callers already supply their own hint.
+    //
+    // A4: webchat/DirectLine carries the conversation_id in the URL path, not
+    // the body. Try path-based extraction first (cheap, no parse) then fall
+    // back to body-based for other providers.
     let session_hint = session_hint.or_else(|| {
         if peer_is_loopback {
             return None;
+        }
+        // A4: DirectLine conversation stickiness — the conversation_id is in
+        // the URL path, not the webhook body.
+        if let Some(hint) = crate::session_hint_extractor::extract_webchat_session_hint(&path) {
+            return Some(hint);
         }
         let provider_type = activation.routing.http_routes.provider_type_for(
             &path,
@@ -1169,6 +1188,7 @@ async fn serve(
         Admission::ProviderRoute => {
             return dispatch_provider_route(
                 Arc::clone(&activation),
+                Arc::clone(&state),
                 &tenant,
                 &scope,
                 &path,
@@ -3232,6 +3252,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_provider_route(
     activation: Arc<Activation>,
+    state: Arc<ServeState>,
     tenant: &str,
     scope: &RevisionScope,
     path: &str,
@@ -3268,9 +3289,86 @@ async fn dispatch_provider_route(
     };
     let descriptor_pack_id = route_match.descriptor.pack_id.clone();
     let provider_op = route_match.descriptor.provider_op.clone();
+    let route_tenant = route_match.tenant.clone();
+    let route_team = route_match.team.clone();
     let deployment_id = scope.deployment_id;
     let bundle_id = scope.bundle_id.clone();
     let revision_id = scope.revision_id;
+
+    // A4: detect DirectLine routes by provider_type. When the request is
+    // DirectLine, apply the same pre/post processing the legacy path does:
+    // path normalization, query augmentation, session-token preflight,
+    // conversation dedup, streamUrl rewrite, POST /token validation.
+    let is_directline = provider_type.starts_with("messaging.webchat");
+    let (dl_method, dl_path, dl_query, mut dl_headers, dl_forward_plan, dl_dedup_key);
+    if is_directline {
+        // Extract the provider-relative path from the full request path.
+        // The http-routes.v1 routes carry the full URL pattern
+        // (e.g. /v1/messaging/webchat/{tenant}/v3/directline/{path*}), so
+        // the provider path is everything from /v3/directline onward. Fall
+        // back to the legacy parse for /token, /auth/config, etc.
+        let provider_path = extract_directline_provider_path(path);
+        let (norm_method, norm_path) = normalize_directline_dispatch(method, &provider_path);
+        let parsed_query = parse_query_pairs(query);
+        let augmented = augment_directline_queries(&parsed_query, &route_tenant, Some(&route_team));
+        dl_headers = request_headers.to_vec();
+
+        // Session-token renewal preflight: loads the provider's
+        // jwt_signing_key, applies any Authorization rewrite, and may
+        // short-circuit (auth failure, /tokens/refresh served locally).
+        let signing_key =
+            read_provider_signing_key(&activation, tenant, Some(&route_team), &provider_type).await;
+        let preflight_outcome = crate::directline_session::preflight(
+            &hyper::Method::from_bytes(norm_method.as_bytes()).unwrap_or(hyper::Method::POST),
+            &norm_path,
+            &dl_headers,
+            signing_key.as_deref(),
+            &state.directline_sessions,
+        );
+        let forward_plan = match preflight_outcome {
+            crate::directline_session::Preflight::Respond(response) => {
+                return Err(response);
+            }
+            crate::directline_session::Preflight::Forward(plan) => plan,
+        };
+        if let Some(authorization) = forward_plan.rewrite_authorization.as_deref() {
+            crate::directline_session::apply_authorization_rewrite(&mut dl_headers, authorization);
+        }
+
+        // Conversation dedup: for POST /conversations, check if we already
+        // have a cached response for this user.
+        let dedup_key = if norm_method == "POST"
+            && (norm_path == "/v3/directline/conversations"
+                || norm_path.ends_with("/conversations"))
+        {
+            crate::conv_dedup::extract_user_id(body).map(|user_id| crate::conv_dedup::DedupKey {
+                tenant: route_tenant.clone(),
+                team: route_team.clone(),
+                user_id,
+            })
+        } else {
+            None
+        };
+        if let Some(ref key) = dedup_key
+            && let Some(mut cached) = state.conversation_dedup.get(key)
+        {
+            apply_directline_forward_plan_to_response(&state, &forward_plan, &mut cached);
+            return Ok(synthesize_provider_response(&cached));
+        }
+
+        dl_method = norm_method;
+        dl_path = norm_path;
+        dl_query = encode_directline_query_string(&augmented);
+        dl_forward_plan = Some(forward_plan);
+        dl_dedup_key = dedup_key;
+    } else {
+        dl_method = method.to_string();
+        dl_path = path.to_string();
+        dl_query = query.map(str::to_string);
+        dl_headers = request_headers.to_vec();
+        dl_forward_plan = None;
+        dl_dedup_key = None;
+    }
 
     // Phase D.3 / M1 IID auth gate: for provider classes whose endpoint
     // declares `webhook_secret_ref`, constant-time compare the inbound
@@ -3353,10 +3451,10 @@ async fn dispatch_provider_route(
     let http_in = build_provider_http_in(
         &provider_type,
         tenant,
-        method,
-        path,
-        query,
-        request_headers,
+        &dl_method,
+        &dl_path,
+        dl_query.as_deref(),
+        &dl_headers,
         body,
     );
     let input_json = serde_json::to_vec(&http_in).map_err(|err| {
@@ -3454,7 +3552,36 @@ async fn dispatch_provider_route(
         });
     }
 
-    Ok(synthesize_provider_response(&result.response))
+    // A4: DirectLine post-processing — apply the forward plan (seed sliding
+    // window, inject renewed token), rewrite streamUrl to absolute, validate
+    // POST /token response, cache for conversation dedup.
+    let mut response = result.response;
+    if is_directline {
+        if let Some(ref plan) = dl_forward_plan {
+            apply_directline_forward_plan_to_response(&state, plan, &mut response);
+        }
+
+        // streamUrl rewrite: the provider returns a relative path, but
+        // DirectLineJS requires an absolute ws:// URL.
+        if dl_method == "POST"
+            && (dl_path == "/v3/directline/conversations" || dl_path.ends_with("/conversations"))
+            && (200..300).contains(&response.status)
+        {
+            rewrite_stream_url(&dl_headers, &mut response, &state);
+
+            // Cache the post-rewrite response for conversation dedup.
+            if let Some(key) = dl_dedup_key {
+                state.conversation_dedup.insert(key, response.clone());
+            }
+        }
+
+        // POST /token response validation (same as legacy path).
+        if dl_path == "/v3/directline/tokens/generate" {
+            validate_token_response(&response)?;
+        }
+    }
+
+    Ok(synthesize_provider_response(&response))
 }
 
 /// Per-ingress pipeline: for each inbound envelope, drive the flow runtime
@@ -3878,6 +4005,242 @@ fn synthesize_provider_response(response: &IngressHttpResponse) -> Response<Full
     builder
         .body(Full::new(body))
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "invalid provider response"))
+}
+
+// ---------------------------------------------------------------------------
+// A4: DirectLine helpers (revision-path equivalents of the legacy
+// `http_ingress` helpers). These are pure functions — no state, no I/O —
+// except `read_provider_signing_key` which reads the secrets manager.
+// ---------------------------------------------------------------------------
+
+/// Read the `jwt_signing_key` for a provider from the secrets manager.
+/// Returns `None` when the key is absent or the read fails (best-effort —
+/// a missing key just means no token renewal, not a hard failure).
+async fn read_provider_signing_key(
+    activation: &Activation,
+    tenant: &str,
+    team: Option<&str>,
+    provider_type: &str,
+) -> Option<Vec<u8>> {
+    let secrets = activation.host.secrets_manager();
+    let env = crate::resolve_env(None);
+    let team_segment = crate::secrets_manager::canonical_team(team);
+    // The provider type uses dots (`messaging.webchat.gui`) while secrets
+    // are stored under the hyphenated form (`messaging-webchat-gui`).
+    // Build both raw-hyphenated and canonical-underscored URIs, matching
+    // the resolution order in `DemoRunnerHost::get_secret`.
+    let provider_hyphen = provider_type.replace('.', "-");
+    let raw_uri =
+        format!("secrets://{env}/{tenant}/{team_segment}/{provider_hyphen}/jwt_signing_key");
+    let canonical_uri = crate::secrets_gate::canonical_secret_uri(
+        &env,
+        tenant,
+        team,
+        &provider_hyphen,
+        "jwt_signing_key",
+    );
+    for uri in [&raw_uri, &canonical_uri] {
+        match secrets.read(uri).await {
+            Ok(bytes) => return Some(bytes),
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
+/// Extract the DirectLine-relative path from a full request path.
+///
+/// Revision-path routes carry the full URL pattern
+/// (e.g. `/v1/messaging/webchat/{tenant}/v3/directline/conversations/{id}/activities`).
+/// The provider path is everything from `/v3/directline` onward. Falls back
+/// to `/token` when the path ends with `/token` (the legacy shorthand).
+fn extract_directline_provider_path(path: &str) -> String {
+    // Fast path: find `/v3/directline` anywhere in the path.
+    if let Some(idx) = path.find("/v3/directline") {
+        return path[idx..].to_string();
+    }
+    // Legacy `/token` shorthand: the path ends with `/token`.
+    let segments: Vec<&str> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.last() == Some(&"token") {
+        return "/token".to_string();
+    }
+    // Fallback: return the path as-is (should not happen for well-formed
+    // webchat routes, but avoids a panic).
+    path.to_string()
+}
+
+/// Map shorthand DirectLine paths to canonical API paths.
+/// `/token` → `POST /v3/directline/tokens/generate`
+/// `/directline/...` → `/v3/directline/...`
+fn normalize_directline_dispatch(method: &str, path: &str) -> (String, String) {
+    if path == "/token" {
+        return (
+            "POST".to_string(),
+            "/v3/directline/tokens/generate".to_string(),
+        );
+    }
+    if path == "/directline" {
+        return (method.to_string(), "/v3/directline".to_string());
+    }
+    if let Some(rest) = path.strip_prefix("/directline/") {
+        return (method.to_string(), format!("/v3/directline/{rest}"));
+    }
+    (method.to_string(), path.to_string())
+}
+
+/// Inject `tenant` and `team` query parameters when not already present.
+fn augment_directline_queries(
+    queries: &[(String, String)],
+    tenant: &str,
+    team: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut augmented = queries.to_vec();
+    if !augmented.iter().any(|(name, _)| name == "tenant") {
+        augmented.push(("tenant".to_string(), tenant.to_string()));
+    }
+    if let Some(team) = team.filter(|value| !value.is_empty())
+        && !augmented.iter().any(|(name, _)| name == "team")
+    {
+        augmented.push(("team".to_string(), team.to_string()));
+    }
+    augmented
+}
+
+/// Percent-encode a query-string key or value per RFC 3986 unreserved set.
+fn percent_encode_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            b' ' => encoded.push_str("%20"),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+/// Serialize query pairs into a percent-encoded query string.
+/// Returns `None` for an empty list (no `?` suffix needed).
+fn encode_directline_query_string(queries: &[(String, String)]) -> Option<String> {
+    if queries.is_empty() {
+        return None;
+    }
+    Some(
+        queries
+            .iter()
+            .map(|(name, value)| {
+                format!(
+                    "{}={}",
+                    percent_encode_query_component(name),
+                    percent_encode_query_component(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&"),
+    )
+}
+
+/// Apply the post-response side of a [`crate::directline_session::ForwardPlan`]:
+/// seed the sliding window from a `POST /conversations` response and/or inject
+/// `_directline.renewed_token` into the body.
+fn apply_directline_forward_plan_to_response(
+    state: &ServeState,
+    plan: &crate::directline_session::ForwardPlan,
+    response: &mut IngressHttpResponse,
+) {
+    if plan.seed_from_response
+        && let Some(conv) = crate::directline_session::conversation_id_from_response(response)
+    {
+        state.directline_sessions.touch(&conv);
+    }
+    if let Some(renewed) = plan.inject_renewed_token.as_deref() {
+        crate::directline_session::inject_renewed_token(
+            response,
+            renewed,
+            state.directline_sessions.ttl_secs(),
+        );
+    }
+}
+
+/// Rewrite a relative `streamUrl` in a `POST /conversations` response body
+/// to an absolute `ws://` URL using the request's `Host` header. DirectLineJS
+/// requires an absolute URL on the WebSocket constructor; a relative path
+/// makes the SDK fall back to HTTP polling.
+fn rewrite_stream_url(
+    headers: &[(String, String)],
+    response: &mut IngressHttpResponse,
+    _state: &ServeState,
+) {
+    let Some(body_bytes) = response.body.as_ref() else {
+        return;
+    };
+    let Ok(mut body_json) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
+        return;
+    };
+    let needs_rewrite = body_json
+        .get("streamUrl")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| s.starts_with('/'));
+    if !needs_rewrite {
+        return;
+    }
+    let Some(host) = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.clone())
+    else {
+        return;
+    };
+    let relative = body_json["streamUrl"].as_str().unwrap_or("").to_string();
+    let absolute = format!("ws://{host}{relative}");
+    body_json["streamUrl"] = serde_json::Value::String(absolute);
+    if let Ok(rewritten) = serde_json::to_vec(&body_json) {
+        response.body = Some(rewritten);
+    }
+}
+
+/// Validate a `POST /tokens/generate` response: the body must be JSON with a
+/// non-empty `token` field. Returns an error response on failure so the
+/// upstream gets a clear `502` instead of a malformed token.
+#[allow(clippy::result_large_err)]
+fn validate_token_response(response: &IngressHttpResponse) -> Result<(), Response<Full<Bytes>>> {
+    let body = response.body.as_deref().unwrap_or_default();
+    if !(200..300).contains(&response.status) {
+        operator_log::error(
+            module_path!(),
+            format!(
+                "[webchat directline] token request failed status={} body={}",
+                response.status,
+                String::from_utf8_lossy(body)
+                    .chars()
+                    .take(500)
+                    .collect::<String>()
+            ),
+        );
+    }
+    let token_ok = (200..300).contains(&response.status)
+        && serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("token")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .is_some_and(|token| !token.trim().is_empty());
+    if !token_ok {
+        return Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            "invalid directline token response: expected JSON body with non-empty token",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5249,6 +5612,10 @@ mod tests {
             auto_restart_pending: AtomicBool::new(false),
             auto_restart_enabled: false,
             exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
         }
     }
 
@@ -5533,6 +5900,319 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("access-control-allow-origin"),
             "/workers/invoke response must not be readable cross-origin, got:\n{posted}"
+        );
+    }
+
+    // --- A4: DirectLine dispatch helpers unit tests -------------------------
+
+    // Category 1: extract_directline_provider_path
+
+    #[test]
+    fn extract_directline_provider_path_finds_v3_directline() {
+        assert_eq!(
+            extract_directline_provider_path(
+                "/v1/messaging/webchat/demo/v3/directline/conversations"
+            ),
+            "/v3/directline/conversations"
+        );
+    }
+
+    #[test]
+    fn extract_directline_provider_path_with_subpath() {
+        assert_eq!(
+            extract_directline_provider_path(
+                "/v1/messaging/webchat/demo/v3/directline/conversations/abc123/activities"
+            ),
+            "/v3/directline/conversations/abc123/activities"
+        );
+    }
+
+    #[test]
+    fn extract_directline_provider_path_legacy_token_shorthand() {
+        assert_eq!(
+            extract_directline_provider_path("/v1/messaging/webchat/demo/token"),
+            "/token"
+        );
+    }
+
+    #[test]
+    fn extract_directline_provider_path_passthrough_on_unknown() {
+        assert_eq!(
+            extract_directline_provider_path("/v1/messaging/webchat/demo/unknown"),
+            "/v1/messaging/webchat/demo/unknown"
+        );
+    }
+
+    // Category 2: normalize_directline_dispatch
+
+    #[test]
+    fn normalize_directline_dispatch_maps_token_to_canonical() {
+        let (method, path) = normalize_directline_dispatch("GET", "/token");
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/v3/directline/tokens/generate");
+    }
+
+    #[test]
+    fn normalize_directline_dispatch_expands_directline_prefix() {
+        let (method, path) = normalize_directline_dispatch("GET", "/directline/conversations");
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/v3/directline/conversations");
+    }
+
+    #[test]
+    fn normalize_directline_dispatch_bare_directline() {
+        let (method, path) = normalize_directline_dispatch("GET", "/directline");
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/v3/directline");
+    }
+
+    #[test]
+    fn normalize_directline_dispatch_already_canonical() {
+        let (method, path) = normalize_directline_dispatch("POST", "/v3/directline/conversations");
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/v3/directline/conversations");
+    }
+
+    // Category 3: augment_directline_queries
+
+    #[test]
+    fn augment_directline_queries_injects_tenant_and_team() {
+        let queries = vec![];
+        let result = augment_directline_queries(&queries, "acme", Some("support"));
+        assert!(
+            result.iter().any(|(k, v)| k == "tenant" && v == "acme"),
+            "must inject tenant"
+        );
+        assert!(
+            result.iter().any(|(k, v)| k == "team" && v == "support"),
+            "must inject team"
+        );
+    }
+
+    #[test]
+    fn augment_directline_queries_preserves_existing_tenant() {
+        let queries = vec![("tenant".to_string(), "existing".to_string())];
+        let result = augment_directline_queries(&queries, "acme", Some("support"));
+        assert_eq!(
+            result.iter().filter(|(k, _)| k == "tenant").count(),
+            1,
+            "must not duplicate tenant"
+        );
+        assert_eq!(result[0].1, "existing", "existing tenant must be preserved");
+    }
+
+    #[test]
+    fn augment_directline_queries_skips_empty_team() {
+        let queries = vec![];
+        let result = augment_directline_queries(&queries, "acme", Some(""));
+        assert!(
+            !result.iter().any(|(k, _)| k == "team"),
+            "empty team must not be injected"
+        );
+    }
+
+    // Category 4: encode_directline_query_string
+
+    #[test]
+    fn encode_directline_query_string_serializes_pairs() {
+        let pairs = vec![
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "two three".to_string()),
+        ];
+        let result = encode_directline_query_string(&pairs);
+        assert_eq!(result, Some("a=1&b=two%20three".to_string()));
+    }
+
+    #[test]
+    fn encode_directline_query_string_empty_returns_none() {
+        assert_eq!(encode_directline_query_string(&[]), None);
+    }
+
+    // Category 5: rewrite_stream_url
+
+    #[test]
+    fn rewrite_stream_url_makes_relative_absolute() {
+        let headers = vec![("Host".to_string(), "example.com:8080".to_string())];
+        let mut response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "conversationId": "abc123",
+                    "streamUrl": "/v3/directline/conversations/abc123/stream?t=TOKEN"
+                }))
+                .unwrap(),
+            ),
+        };
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = empty_state("local", bound);
+        rewrite_stream_url(&headers, &mut response, &state);
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["streamUrl"],
+            "ws://example.com:8080/v3/directline/conversations/abc123/stream?t=TOKEN",
+            "relative streamUrl must become an absolute ws:// URL using the Host header"
+        );
+    }
+
+    #[test]
+    fn rewrite_stream_url_noop_when_already_absolute() {
+        let headers = vec![("Host".to_string(), "example.com".to_string())];
+        let original_url = "wss://other.example.com/stream";
+        let mut response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "streamUrl": original_url
+                }))
+                .unwrap(),
+            ),
+        };
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = empty_state("local", bound);
+        rewrite_stream_url(&headers, &mut response, &state);
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["streamUrl"], original_url,
+            "already-absolute streamUrl must not be touched"
+        );
+    }
+
+    // Category 6: validate_token_response
+
+    #[test]
+    fn validate_token_response_accepts_valid_token() {
+        let response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "token": "eyJhbGciOiJIUzI1NiJ9.e30.test",
+                    "expires_in": 1800
+                }))
+                .unwrap(),
+            ),
+        };
+        assert!(
+            validate_token_response(&response).is_ok(),
+            "a valid token response must pass validation"
+        );
+    }
+
+    #[test]
+    fn validate_token_response_rejects_missing_token_field() {
+        let response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(serde_json::to_vec(&serde_json::json!({"expires_in": 1800})).unwrap()),
+        };
+        assert!(
+            validate_token_response(&response).is_err(),
+            "a response without a token field must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_token_response_rejects_empty_token() {
+        let response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(serde_json::to_vec(&serde_json::json!({"token": "  "})).unwrap()),
+        };
+        assert!(
+            validate_token_response(&response).is_err(),
+            "a whitespace-only token must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_token_response_rejects_non_2xx() {
+        let response = IngressHttpResponse {
+            status: 500,
+            headers: vec![],
+            body: Some(serde_json::to_vec(&serde_json::json!({"token": "valid"})).unwrap()),
+        };
+        assert!(
+            validate_token_response(&response).is_err(),
+            "a non-2xx status must be rejected even if the body has a token"
+        );
+    }
+
+    // Category 7: CORS asymmetry — DirectLine paths get CORS,
+    //              /workers/invoke does not (the existing test above
+    //              `worker_invoke_is_not_exposed_cross_origin` covers
+    //              the /workers/invoke side; these prove DirectLine gets CORS).
+
+    #[test]
+    fn cors_allows_directline_conversations_path() {
+        assert!(
+            path_allows_cors("/v3/directline/conversations"),
+            "DirectLine conversations path must allow CORS"
+        );
+    }
+
+    #[test]
+    fn cors_allows_directline_activities_path() {
+        assert!(
+            path_allows_cors(
+                "/v1/messaging/webchat/demo/v3/directline/conversations/abc/activities"
+            ),
+            "DirectLine activities path must allow CORS"
+        );
+    }
+
+    #[test]
+    fn cors_allows_directline_token_path() {
+        assert!(
+            path_allows_cors("/v1/messaging/webchat/demo/token"),
+            "DirectLine token path must allow CORS"
+        );
+    }
+
+    #[test]
+    fn cors_blocks_workers_invoke() {
+        assert!(
+            !path_allows_cors("/workers/invoke"),
+            "/workers/invoke must NOT allow CORS"
+        );
+    }
+
+    // Category 8: session hint extraction for webchat
+
+    #[test]
+    fn webchat_session_hint_extracts_conversation_id() {
+        let hint = crate::session_hint_extractor::extract_webchat_session_hint(
+            "/v1/messaging/webchat/demo/v3/directline/conversations/conv-42/activities",
+        );
+        assert_eq!(
+            hint,
+            Some("webchat:conv-42".to_string()),
+            "must extract conversation_id from DirectLine URL path"
+        );
+    }
+
+    #[test]
+    fn webchat_session_hint_none_for_conversations_list() {
+        let hint = crate::session_hint_extractor::extract_webchat_session_hint(
+            "/v1/messaging/webchat/demo/v3/directline/conversations",
+        );
+        assert!(
+            hint.is_none(),
+            "POST /conversations has no conv_id yet — hint must be None"
+        );
+    }
+
+    #[test]
+    fn webchat_session_hint_none_for_non_directline_path() {
+        let hint = crate::session_hint_extractor::extract_webchat_session_hint(
+            "/v1/messaging/telegram/demo/webhook",
+        );
+        assert!(
+            hint.is_none(),
+            "non-DirectLine paths must not produce a webchat hint"
         );
     }
 
@@ -5867,6 +6547,10 @@ mod tests {
             auto_restart_pending: AtomicBool::new(false),
             auto_restart_enabled: false,
             exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -5964,6 +6648,10 @@ mod tests {
             auto_restart_pending: AtomicBool::new(false),
             auto_restart_enabled: false,
             exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -6055,6 +6743,10 @@ mod tests {
             auto_restart_pending: AtomicBool::new(false),
             auto_restart_enabled: false,
             exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -6119,6 +6811,10 @@ mod tests {
             auto_restart_pending: AtomicBool::new(false),
             auto_restart_enabled: false,
             exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -6384,6 +7080,10 @@ mod tests {
             auto_restart_pending: AtomicBool::new(false),
             auto_restart_enabled: false,
             exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
         })
     }
 
@@ -6960,6 +7660,10 @@ mod binary_update_tests {
             auto_restart_pending: AtomicBool::new(false),
             auto_restart_enabled: false,
             exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -6989,6 +7693,10 @@ mod binary_update_tests {
             auto_restart_pending: AtomicBool::new(false),
             auto_restart_enabled: false,
             exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
         assert_eq!(resp.status(), StatusCode::OK, "still healthy");
@@ -7013,6 +7721,10 @@ mod binary_update_tests {
             auto_restart_pending: AtomicBool::new(false),
             auto_restart_enabled: false,
             exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
         assert!(
@@ -7033,6 +7745,10 @@ mod binary_update_tests {
             auto_restart_pending: AtomicBool::new(false),
             auto_restart_enabled: false,
             exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -7242,6 +7958,10 @@ mod binary_update_tests {
             auto_restart_pending: AtomicBool::new(false),
             auto_restart_enabled: false,
             exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
         let body_bytes = resp.into_body();
@@ -7274,6 +7994,10 @@ mod binary_update_tests {
             auto_restart_pending: AtomicBool::new(false),
             auto_restart_enabled: true,
             exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
         });
         state.mark_restart_required();
         assert!(
@@ -7301,6 +8025,10 @@ mod binary_update_tests {
             auto_restart_pending: AtomicBool::new(false),
             auto_restart_enabled: false,
             exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
         });
         state.mark_restart_required();
         assert!(
