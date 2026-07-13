@@ -3,9 +3,7 @@
 // Consumed by the http_ingress dispatch in Task 11.
 #![allow(dead_code)]
 
-use crate::http_ingress::helpers::{
-    DirectLineTokenClaims, TokenVerifyError, verify_directline_token,
-};
+use crate::directline_token::{DirectLineTokenClaims, TokenVerifyError, verify_directline_token};
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Response, StatusCode};
