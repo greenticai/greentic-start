@@ -58,7 +58,7 @@ use crate::revision_pin::RevisionPinStore;
 use crate::runtime_config::{LoadedRuntimeConfig, env_dir_in};
 use crate::secrets_gate::DynSecretsManager;
 use crate::static_routes::{
-    ActiveRouteTable, StaticRouteDescriptor, StaticRoutePlan, discover_revision_static_routes,
+    ActiveRouteTable, ReservedRouteSet, StaticRoutePlan, discover_revision_static_routes,
 };
 
 /// Filename of the per-env revision-dispatcher HMAC signing key, kept under the
@@ -227,8 +227,12 @@ pub(crate) async fn activate_runtime_config(
     // ingress matches against these via `match_request_for_revision` once the
     // dispatcher picks a revision.
     let mut scoped_routes: Vec<HttpRouteDescriptor> = Vec::new();
-    // Revision-scoped static routes, parallel to `scoped_routes`.
-    let mut scoped_static_routes: Vec<StaticRouteDescriptor> = Vec::new();
+    // Revision-scoped static routes, parallel to `scoped_routes`. Accumulated
+    // as a `StaticRoutePlan` so validation results (blocking_failures, warnings)
+    // propagate to the caller the same way `discover_from_bundle` does on the
+    // bundle path.
+    let mut static_plan = StaticRoutePlan::default();
+    let reserved_routes = ReservedRouteSet::operator_defaults();
 
     let configs = host.tenant_configs();
     for block in &rc.revisions {
@@ -281,7 +285,12 @@ pub(crate) async fn activate_runtime_config(
             &scope,
             &meta.path_prefixes,
         ));
-        scoped_static_routes.extend(discover_revision_static_routes(&pack_paths, &scope));
+        let rev_static = discover_revision_static_routes(&pack_paths, &scope, &reserved_routes);
+        static_plan.routes.extend(rev_static.routes);
+        static_plan.warnings.extend(rev_static.warnings);
+        static_plan
+            .blocking_failures
+            .extend(rev_static.blocking_failures);
 
         // Session isolation: give each revision its OWN session and state store
         // rather than sharing the host's. The session/resume/state backend keys
@@ -336,17 +345,23 @@ pub(crate) async fn activate_runtime_config(
     )
     .context("building revision dispatcher")?;
 
+    if !static_plan.blocking_failures.is_empty() {
+        bail!(
+            "static route validation failed: {}",
+            static_plan.blocking_failures.join("; ")
+        );
+    }
+    for warning in &static_plan.warnings {
+        crate::operator_log::warn(module_path!(), format!("static route warning: {warning}"));
+    }
+
     let routing = RevisionIngressRouting {
         dispatcher: Arc::new(dispatcher),
         http_routes: HttpRouteTable::from_descriptors(scoped_routes),
         deployment_routes: DeploymentRouteTable::from_environment(env),
         endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),
         deployment_config_overrides: Arc::new(deployment_config_overrides_from_environment(env)),
-        static_routes: ActiveRouteTable::from_plan(&StaticRoutePlan {
-            routes: scoped_static_routes,
-            warnings: Vec::new(),
-            blocking_failures: Vec::new(),
-        }),
+        static_routes: ActiveRouteTable::from_plan(&static_plan),
     };
 
     Ok(RuntimeConfigActivation { host, routing })

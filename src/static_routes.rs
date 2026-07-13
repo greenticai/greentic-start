@@ -313,11 +313,17 @@ pub fn discover_from_bundle(
 /// extension. Each pack is opened once; packs that don't declare
 /// `greentic.static-routes.v1` or that fail to read are skipped (with a warning
 /// for failures).
+///
+/// The returned [`StaticRoutePlan`] has been through [`validate_plan`] — the
+/// same reserved-route / duplicate / overlap validation that
+/// [`discover_from_bundle`] applies — so the caller can inspect
+/// `blocking_failures` and bail before activating.
 pub fn discover_revision_static_routes(
     pack_paths: &[PathBuf],
     scope: &RevisionScope,
-) -> Vec<StaticRouteDescriptor> {
-    let mut routes = Vec::new();
+    reserved_routes: &ReservedRouteSet,
+) -> StaticRoutePlan {
+    let mut plan = StaticRoutePlan::default();
     for pack_path in pack_paths {
         let manifest = match read_pack_manifest(pack_path) {
             Ok(m) => m,
@@ -337,7 +343,7 @@ pub fn discover_revision_static_routes(
                 for route in &mut descriptors {
                     route.scope = Some(scope.clone());
                 }
-                routes.extend(descriptors);
+                plan.routes.extend(descriptors);
             }
             Ok(None) => continue,
             Err(err) => {
@@ -351,7 +357,8 @@ pub fn discover_revision_static_routes(
             }
         }
     }
-    routes
+    validate_plan(&mut plan, reserved_routes);
+    plan
 }
 
 /// Open one `.gtpack`, read `manifest.cbor`, and decode it. Single IO+decode
@@ -1069,10 +1076,22 @@ mod tests {
             bundle_id: greentic_deploy_spec::BundleId::new("acme-bundle"),
             revision_id: greentic_deploy_spec::RevisionId::new(),
         };
-        let routes = discover_revision_static_routes(&[pack_path], &scope);
-        assert!(!routes.is_empty(), "at least one static route discovered");
+        let plan = discover_revision_static_routes(
+            &[pack_path],
+            &scope,
+            &ReservedRouteSet::operator_defaults(),
+        );
+        assert!(
+            plan.blocking_failures.is_empty(),
+            "real webchat-gui pack must not trigger blocking failures: {:?}",
+            plan.blocking_failures
+        );
+        assert!(
+            !plan.routes.is_empty(),
+            "at least one static route discovered"
+        );
 
-        let route = &routes[0];
+        let route = &plan.routes[0];
         assert_eq!(route.route_id, expected_id, "route_id from pack.yaml");
         assert_eq!(
             route.public_path,
@@ -1121,12 +1140,12 @@ mod tests {
             bundle_id: greentic_deploy_spec::BundleId::new("acme"),
             revision_id: greentic_deploy_spec::RevisionId::new(),
         };
-        let routes = discover_revision_static_routes(&[pack_path], &scope);
-        let table = ActiveRouteTable::from_plan(&StaticRoutePlan {
-            routes,
-            warnings: Vec::new(),
-            blocking_failures: Vec::new(),
-        });
+        let plan = discover_revision_static_routes(
+            &[pack_path],
+            &scope,
+            &ReservedRouteSet::operator_defaults(),
+        );
+        let table = ActiveRouteTable::from_plan(&plan);
         // Legacy (unscoped) matcher must not see revision-scoped routes.
         assert!(
             table
@@ -1146,6 +1165,7 @@ mod tests {
             );
             return;
         }
+        let reserved = ReservedRouteSet::operator_defaults();
         let deployment = greentic_deploy_spec::DeploymentId::new();
         let scope_a = crate::http_routes::RevisionScope {
             deployment_id: deployment,
@@ -1157,14 +1177,16 @@ mod tests {
             bundle_id: greentic_deploy_spec::BundleId::new("b"),
             revision_id: greentic_deploy_spec::RevisionId::new(),
         };
-        let routes_a = discover_revision_static_routes(std::slice::from_ref(&pack_path), &scope_a);
-        let routes_b = discover_revision_static_routes(std::slice::from_ref(&pack_path), &scope_b);
-        let all_routes = [routes_a, routes_b].concat();
-        let table = ActiveRouteTable::from_plan(&StaticRoutePlan {
-            routes: all_routes,
+        let plan_a =
+            discover_revision_static_routes(std::slice::from_ref(&pack_path), &scope_a, &reserved);
+        let plan_b =
+            discover_revision_static_routes(std::slice::from_ref(&pack_path), &scope_b, &reserved);
+        let combined = StaticRoutePlan {
+            routes: [plan_a.routes, plan_b.routes].concat(),
             warnings: Vec::new(),
             blocking_failures: Vec::new(),
-        });
+        };
+        let table = ActiveRouteTable::from_plan(&combined);
         // Scope A matches scope A's routes.
         assert!(
             table
@@ -1208,12 +1230,12 @@ mod tests {
             bundle_id: greentic_deploy_spec::BundleId::new("acme"),
             revision_id: greentic_deploy_spec::RevisionId::new(),
         };
-        let routes = discover_revision_static_routes(&[pack_path], &scope);
-        let table = ActiveRouteTable::from_plan(&StaticRoutePlan {
-            routes,
-            warnings: Vec::new(),
-            blocking_failures: Vec::new(),
-        });
+        let plan = discover_revision_static_routes(
+            &[pack_path],
+            &scope,
+            &ReservedRouteSet::operator_defaults(),
+        );
+        let table = ActiveRouteTable::from_plan(&plan);
         // The webchat-gui route is /v1/web/webchat/{tenant} — a request to
         // /v1/api/something should NOT match.
         assert!(
@@ -1224,22 +1246,160 @@ mod tests {
         );
     }
 
+    /// Build a minimal `.gtpack` ZIP containing a `manifest.cbor` that
+    /// declares a single `greentic.static-routes.v1` route at the given
+    /// `public_path`. Used to drive the REAL discovery pipeline from the
+    /// test rather than asserting helper internals.
+    fn build_test_gtpack(dir: &Path, name: &str, public_path: &str) -> PathBuf {
+        use greentic_types::{
+            ExtensionInline, ExtensionRef, PackId, PackKind, PackManifest, PackSignatures,
+            encode_pack_manifest,
+        };
+        use semver::Version;
+        use std::io::Write;
+
+        let route_payload = serde_json::json!({
+            "schema_version": 1,
+            "routes": [{
+                "id": name,
+                "public_path": public_path,
+                "source_root": "assets",
+            }]
+        });
+        let mut extensions = std::collections::BTreeMap::new();
+        extensions.insert(
+            EXT_STATIC_ROUTES_V1.to_string(),
+            ExtensionRef {
+                kind: EXT_STATIC_ROUTES_V1.to_string(),
+                version: "1.0.0".to_string(),
+                digest: None,
+                location: None,
+                inline: Some(ExtensionInline::Other(route_payload)),
+            },
+        );
+        let manifest = PackManifest {
+            agents: Default::default(),
+            schema_version: "pack-v1".to_string(),
+            pack_id: PackId::new(name).expect("pack id"),
+            name: None,
+            version: Version::parse("0.1.0").expect("version"),
+            kind: PackKind::Provider,
+            publisher: "test".to_string(),
+            components: Vec::new(),
+            flows: Vec::new(),
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            secret_requirements: Vec::new(),
+            signatures: PackSignatures::default(),
+            bootstrap: None,
+            extensions: Some(extensions),
+        };
+        let cbor_bytes = encode_pack_manifest(&manifest).expect("encode manifest");
+        let pack_path = dir.join(format!("{name}.gtpack"));
+        let file = std::fs::File::create(&pack_path).expect("create gtpack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file::<_, ()>("manifest.cbor", Default::default())
+            .expect("start manifest.cbor");
+        zip.write_all(&cbor_bytes).expect("write manifest.cbor");
+        zip.finish().expect("finish zip");
+        pack_path
+    }
+
     #[test]
-    fn reserved_operator_routes_not_shadowed_by_broad_static_route() {
-        // Simulate a pack declaring a broad "/" public_path. The
-        // ReservedRouteSet validation catches this at plan time, and the
-        // match_request_for_revision function in the revision-serve path
-        // is only reached AFTER the reserved operator routes (probes,
-        // /workers/invoke, etc.) have already short-circuited.
-        //
-        // Here we verify the plan-time validation: a "/" static route is
-        // flagged as conflicting with reserved paths.
-        let reserved = ReservedRouteSet::operator_defaults();
-        assert!(reserved.conflicts_with("/status"), "/status is reserved");
-        assert!(reserved.conflicts_with("/healthz"), "/healthz is reserved");
+    fn revision_discovery_rejects_reserved_route_conflict() {
+        // Drive the REAL discovery pipeline with a pack declaring a route
+        // that collides with a reserved provider-ingress prefix. The bundle
+        // path rejects this via validate_plan; the revision path must do
+        // the same.
+        let dir = tempdir().unwrap();
+        let pack = build_test_gtpack(dir.path(), "evil", "/v1/messaging/ingress/telegram");
+        let scope = crate::http_routes::RevisionScope {
+            deployment_id: greentic_deploy_spec::DeploymentId::new(),
+            bundle_id: greentic_deploy_spec::BundleId::new("acme"),
+            revision_id: greentic_deploy_spec::RevisionId::new(),
+        };
+        let plan = discover_revision_static_routes(
+            &[pack],
+            &scope,
+            &ReservedRouteSet::operator_defaults(),
+        );
         assert!(
-            reserved.conflicts_with("/runtime/drain"),
-            "/runtime/* is reserved"
+            !plan.blocking_failures.is_empty(),
+            "a route colliding with a reserved provider-ingress prefix must produce \
+             a blocking failure, got none"
+        );
+        assert!(
+            plan.blocking_failures
+                .iter()
+                .any(|f| f.contains("reserved operator path")),
+            "blocking failure must mention reserved path conflict, got: {:?}",
+            plan.blocking_failures
+        );
+        // The route must NOT be servable through the active table when
+        // blocking_failures is non-empty: the caller (revision_boot) bails
+        // before constructing the table. Verify the contract: if someone
+        // ignores blocking_failures and builds a table anyway, the route IS
+        // in there (the validation is advisory, not filtering), so the gate
+        // is the caller's bail.
+        let table = ActiveRouteTable::from_plan(&plan);
+        assert!(
+            table
+                .match_request_for_revision("/v1/messaging/ingress/telegram/webhook", &scope)
+                .is_some(),
+            "the route descriptor is still in the plan (validation is advisory); \
+             the caller must bail on blocking_failures before building the table"
+        );
+    }
+
+    #[test]
+    fn revision_discovery_rejects_duplicate_route_ids() {
+        // Two packs declaring the same public_path must produce a blocking
+        // failure (duplicate detection), mirroring the bundle path.
+        let dir = tempdir().unwrap();
+        let pack_a = build_test_gtpack(dir.path(), "dup-a", "/web/app");
+        let pack_b = build_test_gtpack(dir.path(), "dup-b", "/web/app");
+        let scope = crate::http_routes::RevisionScope {
+            deployment_id: greentic_deploy_spec::DeploymentId::new(),
+            bundle_id: greentic_deploy_spec::BundleId::new("acme"),
+            revision_id: greentic_deploy_spec::RevisionId::new(),
+        };
+        let plan = discover_revision_static_routes(
+            &[pack_a, pack_b],
+            &scope,
+            &ReservedRouteSet::operator_defaults(),
+        );
+        assert!(
+            plan.blocking_failures
+                .iter()
+                .any(|f| f.contains("duplicates public_path")),
+            "duplicate public_path must be a blocking failure, got: {:?}",
+            plan.blocking_failures
+        );
+    }
+
+    #[test]
+    fn revision_discovery_rejects_overlapping_routes() {
+        // Two routes where one is a prefix of the other must be flagged as
+        // overlapping, mirroring the bundle path validation.
+        let dir = tempdir().unwrap();
+        let pack_a = build_test_gtpack(dir.path(), "parent", "/web/app");
+        let pack_b = build_test_gtpack(dir.path(), "child", "/web/app/dashboard");
+        let scope = crate::http_routes::RevisionScope {
+            deployment_id: greentic_deploy_spec::DeploymentId::new(),
+            bundle_id: greentic_deploy_spec::BundleId::new("acme"),
+            revision_id: greentic_deploy_spec::RevisionId::new(),
+        };
+        let plan = discover_revision_static_routes(
+            &[pack_a, pack_b],
+            &scope,
+            &ReservedRouteSet::operator_defaults(),
+        );
+        assert!(
+            plan.blocking_failures
+                .iter()
+                .any(|f| f.contains("overlap ambiguously")),
+            "overlapping routes must be a blocking failure, got: {:?}",
+            plan.blocking_failures
         );
     }
 
@@ -1255,7 +1415,11 @@ mod tests {
             bundle_id: greentic_deploy_spec::BundleId::new("acme"),
             revision_id: greentic_deploy_spec::RevisionId::new(),
         };
-        let routes = discover_revision_static_routes(&[bad, missing], &scope);
-        assert!(routes.is_empty(), "unreadable packs yield no routes");
+        let plan = discover_revision_static_routes(
+            &[bad, missing],
+            &scope,
+            &ReservedRouteSet::operator_defaults(),
+        );
+        assert!(plan.routes.is_empty(), "unreadable packs yield no routes");
     }
 }
