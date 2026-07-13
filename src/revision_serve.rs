@@ -3583,7 +3583,7 @@ async fn dispatch_provider_route(
                     .await;
             }
 
-            rewrite_stream_url(&dl_headers, &mut response, &state);
+            rewrite_stream_url(&dl_headers, &mut response);
 
             // Cache the post-rewrite response for conversation dedup.
             if let Some(key) = dl_dedup_key {
@@ -4198,11 +4198,7 @@ fn apply_directline_forward_plan_to_response(
 /// to an absolute `ws://` URL using the request's `Host` header. DirectLineJS
 /// requires an absolute URL on the WebSocket constructor; a relative path
 /// makes the SDK fall back to HTTP polling.
-fn rewrite_stream_url(
-    headers: &[(String, String)],
-    response: &mut IngressHttpResponse,
-    _state: &ServeState,
-) {
+fn rewrite_stream_url(headers: &[(String, String)], response: &mut IngressHttpResponse) {
     let Some(body_bytes) = response.body.as_ref() else {
         return;
     };
@@ -4249,18 +4245,21 @@ fn validate_token_response(response: &IngressHttpResponse) -> Result<(), Respons
                     .collect::<String>()
             ),
         );
+        return Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            "invalid directline token response: expected JSON body with non-empty token",
+        ));
     }
-    let token_ok = (200..300).contains(&response.status)
-        && serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("token")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
-            .is_some_and(|token| !token.trim().is_empty());
-    if !token_ok {
+    let has_token = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("token")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|token| !token.trim().is_empty());
+    if !has_token {
         return Err(error_response(
             StatusCode::BAD_GATEWAY,
             "invalid directline token response: expected JSON body with non-empty token",
@@ -6105,9 +6104,7 @@ mod tests {
                 .unwrap(),
             ),
         };
-        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let state = empty_state("local", bound);
-        rewrite_stream_url(&headers, &mut response, &state);
+        rewrite_stream_url(&headers, &mut response);
         let body: serde_json::Value =
             serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
         assert_eq!(
@@ -6131,9 +6128,7 @@ mod tests {
                 .unwrap(),
             ),
         };
-        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let state = empty_state("local", bound);
-        rewrite_stream_url(&headers, &mut response, &state);
+        rewrite_stream_url(&headers, &mut response);
         let body: serde_json::Value =
             serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
         assert_eq!(
