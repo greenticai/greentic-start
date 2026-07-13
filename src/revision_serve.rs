@@ -1535,7 +1535,7 @@ const BINARY_UPDATE_PENDING_FILE: &str = "binary-update-pending.json";
 /// Typed marker written to [`BINARY_UPDATE_PENDING_FILE`] after a binary swap.
 /// Old markers (pre-P7e) that lack `phase` deserialize as [`MarkerPhase::Pending`]
 /// via the serde default.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BinaryUpdateMarker {
     name: String,
     pub(crate) from_version: String,
@@ -1550,6 +1550,12 @@ pub(crate) struct BinaryUpdateMarker {
     /// build artifact) from the exact binary that already failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) digest: Option<String>,
+    /// Number of times this pending marker has been booted. Incremented and
+    /// persisted (fsync) before boot proceeds; when it exceeds
+    /// [`MAX_BOOT_ATTEMPTS`] the boot-time logic rolls back immediately
+    /// instead of arming the RAII guard, breaking hard-kill crash loops.
+    #[serde(default)]
+    pub(crate) boot_attempts: u32,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1575,6 +1581,78 @@ pub(crate) fn read_binary_update_marker(env_dir: &std::path::Path) -> Option<Bin
 pub(crate) fn clear_binary_update_marker(env_dir: &std::path::Path) {
     let path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
     let _ = std::fs::remove_file(&path);
+}
+
+/// Maximum number of boot attempts before the boot-time logic rolls back
+/// immediately instead of arming the RAII guard. A hard-killed process
+/// (OOM-kill, SIGKILL, SIGSEGV) runs no destructors, so the guard never
+/// fires; the counter breaks the infinite crash-loop.
+pub(crate) const MAX_BOOT_ATTEMPTS: u32 = 3;
+
+/// Decision the boot-time marker processing should execute. Extracted as a
+/// pure function so the logic is unit-testable without standing up the full
+/// `run_start` environment.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BootAction {
+    /// No marker on disk — proceed with a normal boot.
+    Proceed,
+    /// Pending marker, `to_version == own`: arm the rollback guard with the
+    /// (already-incremented) marker.
+    ArmGuard(BinaryUpdateMarker),
+    /// Pending marker, `to_version == own`, but `boot_attempts >= MAX`:
+    /// roll back immediately (tombstone + restore_prev + exec).
+    RollbackNow(BinaryUpdateMarker),
+    /// Marker is stale or matches a different version lineage — delete it.
+    ClearMarker,
+    /// Rolled-back tombstone where `to_version == own` (restore_prev failed,
+    /// supervisor restarted the broken binary): keep the tombstone so the
+    /// anti-retry guard still blocks re-swap.
+    PreserveTombstone,
+}
+
+/// Decide what the boot should do given an optional on-disk marker and the
+/// version of the running binary.
+pub(crate) fn decide_boot_action(
+    marker: Option<BinaryUpdateMarker>,
+    own_version: &str,
+) -> BootAction {
+    let marker = match marker {
+        Some(m) => m,
+        None => return BootAction::Proceed,
+    };
+    match marker.phase {
+        MarkerPhase::Pending if marker.to_version == own_version => {
+            if marker.boot_attempts >= MAX_BOOT_ATTEMPTS {
+                BootAction::RollbackNow(marker)
+            } else {
+                BootAction::ArmGuard(marker)
+            }
+        }
+        MarkerPhase::Pending if marker.from_version == own_version => BootAction::Proceed,
+        MarkerPhase::RolledBack if marker.from_version == own_version => BootAction::Proceed,
+        MarkerPhase::RolledBack if marker.to_version == own_version => {
+            BootAction::PreserveTombstone
+        }
+        _ => BootAction::ClearMarker,
+    }
+}
+
+/// Durably write the marker to disk: create, write_all, fsync. Returns an
+/// error if any step fails — the caller must treat a failure as "rollback
+/// state not persisted."
+pub(crate) fn write_marker_durable(
+    env_dir: &std::path::Path,
+    marker: &BinaryUpdateMarker,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
+    let bytes = serde_json::to_vec_pretty(marker).map_err(std::io::Error::other)?;
+    let file = std::fs::File::create(&path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    writer.write_all(&bytes)?;
+    let file = writer.into_inner()?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Write a rolled-back tombstone marker.
@@ -1840,7 +1918,11 @@ fn try_apply_binary_update(
             NotifyError::Internal("binary update swap failed".to_string())
         })?;
 
-    // 6. Write the restart-required marker file.
+    // 6. Durably persist the rollback marker BEFORE reporting success. The
+    //    marker is the rollback state — without it the boot-fail guard cannot
+    //    arm, and a crash-looping new binary is never rolled back. If the
+    //    write fails, undo the swap so we never exec into a binary that has
+    //    no rollback coverage.
     let marker = BinaryUpdateMarker {
         name: own_name.to_string(),
         from_version: current_version.to_string(),
@@ -1849,13 +1931,25 @@ fn try_apply_binary_update(
         phase: MarkerPhase::Pending,
         rolled_back_at: None,
         digest: Some(binary.digest.clone()),
+        boot_attempts: 0,
     };
-    if let Err(err) = std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()) {
-        // Non-fatal: the swap already succeeded; the marker is advisory.
-        operator_log::warn(
+    if let Err(err) = write_marker_durable(&env_dir, &marker) {
+        operator_log::error(
             module_path!(),
-            format!("binary-update: failed to write marker: {err}"),
+            format!("binary-update: failed to persist rollback marker: {err}; undoing swap"),
         );
+        if let Err(restore_err) = binswap::restore_prev(&current_exe) {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "binary-update: restore_prev ALSO failed after marker write failure: \
+                     {restore_err}; manual recovery required"
+                ),
+            );
+        }
+        return Err(NotifyError::Internal(format!(
+            "binary update aborted: rollback marker not persisted: {err}"
+        )));
     }
 
     operator_log::warn(
@@ -6760,6 +6854,7 @@ mod binary_update_tests {
             phase: MarkerPhase::Pending,
             rolled_back_at: None,
             digest: None,
+            boot_attempts: 0,
         };
         let bytes = serde_json::to_vec(&marker).unwrap();
         let back: BinaryUpdateMarker = serde_json::from_slice(&bytes).unwrap();
@@ -6778,6 +6873,7 @@ mod binary_update_tests {
             phase: MarkerPhase::RolledBack,
             rolled_back_at: Some("2026-07-13T01:00:00Z".to_string()),
             digest: Some("abc123".to_string()),
+            boot_attempts: 0,
         };
         let bytes = serde_json::to_vec(&marker).unwrap();
         let back: BinaryUpdateMarker = serde_json::from_slice(&bytes).unwrap();
@@ -6802,6 +6898,7 @@ mod binary_update_tests {
             phase: MarkerPhase::Pending,
             rolled_back_at: None,
             digest: None,
+            boot_attempts: 0,
         };
         std::fs::write(
             dir.path().join(BINARY_UPDATE_PENDING_FILE),
@@ -6841,6 +6938,7 @@ mod binary_update_tests {
             phase: MarkerPhase::Pending,
             rolled_back_at: None,
             digest: Some("sha256:abc".to_string()),
+            boot_attempts: 0,
         };
         write_rollback_tombstone(dir.path(), &marker);
         let read = read_binary_update_marker(dir.path()).expect("should read tombstone");
@@ -6861,6 +6959,7 @@ mod binary_update_tests {
             phase: MarkerPhase::Pending,
             rolled_back_at: None,
             digest: Some("sha256:deadbeef".to_string()),
+            boot_attempts: 0,
         };
         write_rollback_tombstone(dir.path(), &marker);
         let read = read_binary_update_marker(dir.path()).expect("should read tombstone");
@@ -6955,5 +7054,162 @@ mod binary_update_tests {
             !state.auto_restart_pending.load(Ordering::Relaxed),
             "auto_restart_pending must NOT be set when disabled"
         );
+    }
+
+    // --- boot_attempts field and decide_boot_action tests ---
+
+    fn make_pending_marker(from: &str, to: &str, attempts: u32) -> BinaryUpdateMarker {
+        BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: from.to_string(),
+            to_version: to.to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::Pending,
+            rolled_back_at: None,
+            digest: Some("sha256:abc".to_string()),
+            boot_attempts: attempts,
+        }
+    }
+
+    fn make_rolled_back_marker(from: &str, to: &str) -> BinaryUpdateMarker {
+        BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: from.to_string(),
+            to_version: to.to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::RolledBack,
+            rolled_back_at: Some("2026-07-13T01:00:00Z".to_string()),
+            digest: Some("sha256:abc".to_string()),
+            boot_attempts: 0,
+        }
+    }
+
+    #[test]
+    fn boot_attempts_defaults_to_zero_on_missing_field() {
+        let json = r#"{"name":"x","from_version":"1","to_version":"2","staged_at":"t"}"#;
+        let marker: BinaryUpdateMarker = serde_json::from_str(json).unwrap();
+        assert_eq!(marker.boot_attempts, 0);
+    }
+
+    #[test]
+    fn marker_roundtrip_with_boot_attempts() {
+        let marker = make_pending_marker("1.1.11", "1.1.12", 2);
+        let bytes = serde_json::to_vec(&marker).unwrap();
+        let back: BinaryUpdateMarker = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.boot_attempts, 2);
+        assert_eq!(back.phase, MarkerPhase::Pending);
+        assert_eq!(back.to_version, "1.1.12");
+    }
+
+    #[test]
+    fn decide_boot_action_no_marker() {
+        assert_eq!(decide_boot_action(None, "1.1.12"), BootAction::Proceed);
+    }
+
+    #[test]
+    fn decide_boot_action_pending_to_eq_own_below_max() {
+        let marker = make_pending_marker("1.1.11", "1.1.12", 0);
+        let action = decide_boot_action(Some(marker.clone()), "1.1.12");
+        assert_eq!(action, BootAction::ArmGuard(marker));
+    }
+
+    #[test]
+    fn decide_boot_action_pending_to_eq_own_at_max() {
+        let marker = make_pending_marker("1.1.11", "1.1.12", MAX_BOOT_ATTEMPTS);
+        let action = decide_boot_action(Some(marker.clone()), "1.1.12");
+        assert_eq!(action, BootAction::RollbackNow(marker));
+    }
+
+    #[test]
+    fn decide_boot_action_pending_to_eq_own_above_max() {
+        let marker = make_pending_marker("1.1.11", "1.1.12", MAX_BOOT_ATTEMPTS + 5);
+        let action = decide_boot_action(Some(marker.clone()), "1.1.12");
+        assert_eq!(action, BootAction::RollbackNow(marker));
+    }
+
+    #[test]
+    fn decide_boot_action_pending_from_eq_own() {
+        let marker = make_pending_marker("1.1.12", "1.1.13", 0);
+        assert_eq!(
+            decide_boot_action(Some(marker), "1.1.12"),
+            BootAction::Proceed
+        );
+    }
+
+    #[test]
+    fn decide_boot_action_rolled_back_from_eq_own() {
+        let marker = make_rolled_back_marker("1.1.12", "1.1.13");
+        assert_eq!(
+            decide_boot_action(Some(marker), "1.1.12"),
+            BootAction::Proceed
+        );
+    }
+
+    #[test]
+    fn decide_boot_action_rolled_back_to_eq_own() {
+        let marker = make_rolled_back_marker("1.1.11", "1.1.12");
+        assert_eq!(
+            decide_boot_action(Some(marker), "1.1.12"),
+            BootAction::PreserveTombstone
+        );
+    }
+
+    #[test]
+    fn decide_boot_action_stale_marker() {
+        let marker = make_pending_marker("1.0.0", "1.0.1", 0);
+        assert_eq!(
+            decide_boot_action(Some(marker), "1.1.12"),
+            BootAction::ClearMarker
+        );
+    }
+
+    #[test]
+    fn write_marker_durable_persists_and_survives_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = make_pending_marker("1.1.11", "1.1.12", 2);
+        write_marker_durable(dir.path(), &marker).expect("durable write should succeed");
+        let read = read_binary_update_marker(dir.path()).expect("should parse");
+        assert_eq!(read.boot_attempts, 2);
+        assert_eq!(read.to_version, "1.1.12");
+        assert_eq!(read.phase, MarkerPhase::Pending);
+    }
+
+    #[test]
+    fn boot_attempt_counter_persisted_before_boot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut marker = make_pending_marker("1.1.11", "1.1.12", 0);
+        marker.boot_attempts += 1;
+        write_marker_durable(dir.path(), &marker).expect("write");
+        let on_disk = read_binary_update_marker(dir.path()).expect("read");
+        assert_eq!(
+            on_disk.boot_attempts, 1,
+            "incremented counter must be visible on disk before boot proceeds"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_write_failure_returns_err_and_restores_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let exe_path = dir.path().join("greentic-start");
+        let prev_path = dir.path().join("greentic-start.prev");
+        let old_binary = b"old-binary-content";
+        let new_binary = b"new-binary-content";
+
+        std::fs::write(&prev_path, old_binary).unwrap();
+        std::fs::write(&exe_path, new_binary).unwrap();
+
+        let env_dir = dir.path().join("env");
+        std::fs::create_dir_all(&env_dir).unwrap();
+        let perms = std::fs::Permissions::from_mode(0o500);
+        std::fs::set_permissions(&env_dir, perms).unwrap();
+
+        let marker = make_pending_marker("1.1.11", "1.1.12", 0);
+        let result = write_marker_durable(&env_dir, &marker);
+        assert!(result.is_err(), "write to read-only dir must fail");
+
+        std::fs::set_permissions(&env_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }

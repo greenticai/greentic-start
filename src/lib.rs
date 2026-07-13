@@ -472,65 +472,63 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
 
         // P7e: boot-time marker processing. Determines whether this process
         // is the NEW binary after a successful exec, the OLD binary after a
-        // rollback, or a fresh/stale start. On unix, arms a rollback guard
-        // when we are the new binary (to_version == own).
+        // rollback, or a fresh/stale start. The decision is made by a pure
+        // function (`decide_boot_action`) so the logic is unit-testable.
         #[cfg(unix)]
         let mut _boot_rollback_guard = {
             let own_version = env!("CARGO_PKG_VERSION");
-            if let Some(marker) = revision_serve::read_binary_update_marker(&env_dir) {
-                match marker.phase {
-                    revision_serve::MarkerPhase::Pending if marker.to_version == own_version => {
-                        // We ARE the new binary. Arm a rollback guard; it fires
-                        // if we fail before reaching "boot succeeded".
-                        Some(BootRollbackGuard {
-                            env_dir: env_dir.clone(),
-                            exe_path: own_exe.clone(),
-                            marker,
-                            disarmed: false,
-                        })
-                    }
-                    revision_serve::MarkerPhase::Pending if marker.from_version == own_version => {
-                        // Old binary, swap happened but exec didn't run (or
-                        // auto-restart disabled). Leave marker for idempotency.
-                        None
-                    }
-                    revision_serve::MarkerPhase::RolledBack
-                        if marker.from_version == own_version =>
-                    {
-                        // We are the rolled-back old binary. Tombstone stays.
-                        operator_log::info(
+            let marker = revision_serve::read_binary_update_marker(&env_dir);
+            match revision_serve::decide_boot_action(marker, own_version) {
+                revision_serve::BootAction::Proceed => None,
+                revision_serve::BootAction::ArmGuard(mut marker) => {
+                    marker.boot_attempts += 1;
+                    if let Err(err) = revision_serve::write_marker_durable(&env_dir, &marker) {
+                        operator_log::error(
                             module_path!(),
                             format!(
-                                "binary-update: running as rolled-back version {own_version}; \
-                                 version {} will not be retried until tombstone is cleared",
-                                marker.to_version,
+                                "binary-update: failed to persist boot-attempt counter: {err}; \
+                                 proceeding without rollback guard"
                             ),
                         );
-                        None
                     }
-                    revision_serve::MarkerPhase::RolledBack if marker.to_version == own_version => {
-                        // We ARE the version that failed to boot (restore_prev
-                        // failed, so the broken binary is still on disk and the
-                        // supervisor restarted it). Preserve the tombstone so the
-                        // anti-rollback guard in try_apply_binary_update still
-                        // blocks this version.
-                        operator_log::warn(
-                            module_path!(),
-                            format!(
-                                "binary-update: running as the failed version {own_version} \
-                                 (restore_prev may have failed); tombstone preserved",
-                            ),
-                        );
-                        None
-                    }
-                    _ => {
-                        // Stale marker from a different version lineage.
-                        revision_serve::clear_binary_update_marker(&env_dir);
-                        None
-                    }
+                    Some(BootRollbackGuard {
+                        env_dir: env_dir.clone(),
+                        exe_path: own_exe.clone(),
+                        marker,
+                        disarmed: false,
+                    })
                 }
-            } else {
-                None
+                revision_serve::BootAction::RollbackNow(marker) => {
+                    operator_log::error(
+                        module_path!(),
+                        format!(
+                            "binary-update: version {} failed to complete boot {} times \
+                             (hard-kill loop); rolling back to {}",
+                            marker.to_version, marker.boot_attempts, marker.from_version,
+                        ),
+                    );
+                    execute_rollback(&env_dir, &own_exe, &marker);
+                    anyhow::bail!(
+                        "binary-update: rollback after {} failed boot attempts for version {}; \
+                         restore_prev or re-exec failed — exiting",
+                        marker.boot_attempts,
+                        marker.to_version,
+                    );
+                }
+                revision_serve::BootAction::ClearMarker => {
+                    revision_serve::clear_binary_update_marker(&env_dir);
+                    None
+                }
+                revision_serve::BootAction::PreserveTombstone => {
+                    operator_log::warn(
+                        module_path!(),
+                        format!(
+                            "binary-update: running as the failed version {own_version} \
+                             (restore_prev may have failed); tombstone preserved",
+                        ),
+                    );
+                    None
+                }
             }
         };
 
@@ -1562,25 +1560,30 @@ impl Drop for BootRollbackGuard {
                 self.marker.to_version, self.marker.from_version,
             ),
         );
-        revision_serve::write_rollback_tombstone(&self.env_dir, &self.marker);
-        if let Err(err) = greentic_update::binswap::restore_prev(&self.exe_path) {
-            operator_log::error(
-                module_path!(),
-                format!("binary-update: restore_prev failed: {err}; manual recovery required"),
-            );
-            return;
-        }
-        // Flush stderr before exec so the diagnostic messages logged above
-        // survive the process replacement. The trace guard (declared before
-        // this guard) would normally flush on drop, but exec replaces the
-        // process before that destructor runs.
-        let _ = std::io::Write::flush(&mut std::io::stderr());
-        if let Err(err) = exec_into_self(&self.exe_path) {
-            operator_log::error(
-                module_path!(),
-                format!("binary-update: re-exec into old binary failed: {err}"),
-            );
-        }
+        execute_rollback(&self.env_dir, &self.exe_path, &self.marker);
+    }
+}
+
+/// Shared rollback body: write tombstone, restore previous binary, flush
+/// stderr, exec into the old binary. Used by both `BootRollbackGuard::drop`
+/// (graceful failure) and the boot-attempt-limit path (hard-kill loop
+/// breaker).
+#[cfg(unix)]
+fn execute_rollback(env_dir: &Path, exe_path: &Path, marker: &revision_serve::BinaryUpdateMarker) {
+    revision_serve::write_rollback_tombstone(env_dir, marker);
+    if let Err(err) = greentic_update::binswap::restore_prev(exe_path) {
+        operator_log::error(
+            module_path!(),
+            format!("binary-update: restore_prev failed: {err}; manual recovery required"),
+        );
+        return;
+    }
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    if let Err(err) = exec_into_self(exe_path) {
+        operator_log::error(
+            module_path!(),
+            format!("binary-update: re-exec into old binary failed: {err}"),
+        );
     }
 }
 
