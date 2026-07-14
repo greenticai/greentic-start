@@ -2628,9 +2628,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deploy-spec"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33844530b686aac0b28dd2a4470a028b50d00fa51ee60dd26b6c9e81507b7dc3"
+checksum = "edf0d6b72d929d29cfa02ecbc0c1aed2b614d89a455dcd795f126005619dc177"
 dependencies = [
  "chrono",
  "greentic-config-types",
@@ -2663,13 +2663,13 @@ dependencies = [
  "greentic-bundle",
  "greentic-config",
  "greentic-config-types",
- "greentic-deploy-spec 0.2.2",
+ "greentic-deploy-spec 0.2.3",
  "greentic-distributor-client",
  "greentic-operator-trust",
  "greentic-secrets-lib",
  "greentic-telemetry",
  "greentic-types",
- "greentic-update",
+ "greentic-update 0.1.28859386871",
  "hex",
  "indexmap 2.14.0",
  "jsonschema 0.46.10",
@@ -3012,7 +3012,7 @@ checksum = "a031e3571c44d2aa0e1ee91c1bc18dc6393140aabfea9f73d53637cffb68d717"
 dependencies = [
  "chrono",
  "ed25519-dalek",
- "greentic-deploy-spec 0.2.2",
+ "greentic-deploy-spec 0.2.3",
  "greentic-distributor-client",
  "hex",
  "libc",
@@ -3114,7 +3114,7 @@ dependencies = [
  "greentic-aw-runtime",
  "greentic-config",
  "greentic-config-types",
- "greentic-deploy-spec 0.2.2",
+ "greentic-deploy-spec 0.2.3",
  "greentic-distributor-client",
  "greentic-ext-runtime",
  "greentic-flow",
@@ -3324,7 +3324,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-start"
-version = "1.1.19"
+version = "1.1.20"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3341,7 +3341,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "greentic-aw-runtime",
- "greentic-deploy-spec 0.2.2",
+ "greentic-deploy-spec 0.2.3",
  "greentic-deployer",
  "greentic-distributor-client",
  "greentic-llm",
@@ -3351,7 +3351,7 @@ dependencies = [
  "greentic-setup",
  "greentic-telemetry",
  "greentic-types",
- "greentic-update",
+ "greentic-update 1.1.0",
  "hmac 0.13.0",
  "http-body-util",
  "hyper",
@@ -3509,6 +3509,29 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "x509-parser",
+ "zip 2.4.2",
+]
+
+[[package]]
+name = "greentic-update"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe570b94c48e71bf1b8e71c311d3245775721b8455b8f16f768f38fbd261eeac"
+dependencies = [
+ "chrono",
+ "flate2",
+ "fs4",
+ "greentic-distributor-client",
+ "hex",
+ "reqwest 0.13.4",
+ "self-replace",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
  "zip 2.4.2",
 ]
 
