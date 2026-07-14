@@ -1,0 +1,170 @@
+name: Publish Update Plans
+
+# Publishes DSSE-signed binary-update plans to all subscribed environments
+# after a successful release. Plans are signed with a dedicated CI key
+# (distinct from the human operator key) so a compromise is recoverable
+# by removing the CI key from each env's trust roots.
+#
+# Trigger chain: tag push -> "Release Binaries" builds + uploads assets ->
+# this workflow fires on workflow_run(completed) -> derives binary artifacts
+# from the GitHub release -> signs and publishes plans to every env on the
+# plan server.
+#
+# Manual fallback: workflow_dispatch with a version input. A preflight step
+# verifies the corresponding GitHub release exists and has assets.
+#
+# Required repo secrets:
+#   UPDATER_CI_SIGNING_KEY_PEM  - PKCS#8 Ed25519 private key PEM (CI-only)
+#   PLAN_UPLOAD_TOKEN           - plan-server upload credential
+#
+# Required repo variables (Settings > Variables, NOT secrets):
+#   PLAN_SERVER_URL             - base URL of the plan server
+#   UPDATER_TRUST_ROOT_JSON     - trust-root.json content (public keys only)
+
+on:
+  workflow_run:
+    workflows: ["Release Binaries"]
+    types:
+      - completed
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to publish plans for (e.g. 1.1.18)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-update-plans
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish plans to all environments
+    runs-on: ubuntu-24.04
+    # workflow_run: only proceed when the triggering run succeeded AND was
+    # a tag push (not a workflow_dispatch of release-binaries, which skips
+    # all jobs but still reports conclusion=success).
+    # workflow_dispatch: always proceed (preflight validates the release).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        startsWith(github.event.workflow_run.head_branch, 'v')
+      )
+    steps:
+      - name: Resolve version
+        id: version
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            version="${INPUT_VERSION}"
+          else
+            version="${HEAD_BRANCH#v}"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version '${version}' — expected M.m.p"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify GitHub release exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v${{ steps.version.outputs.version }}"
+          echo "Checking release ${tag} ..."
+          if ! gh release view "${tag}" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            echo "::error::GitHub release ${tag} not found"
+            exit 1
+          fi
+          # 6 target archives + one .sha256 sidecar each. --expected-target-count
+          # below re-checks the archive count; this catches a missing sidecar too.
+          asset_count=$(gh release view "${tag}" --repo "${{ github.repository }}" --json assets --jq '.assets | length')
+          echo "Release ${tag} has ${asset_count} assets"
+          if [ "${asset_count}" -lt 12 ]; then
+            echo "::error::Expected 12 release assets (6 archives + 6 sidecars), found ${asset_count} — possible partial release"
+            exit 1
+          fi
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install greentic-deployer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo binstall -y --force 'greentic-deployer@>=1.1.13'
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
+
+      - name: Write signing key
+        shell: bash
+        env:
+          CI_SIGNING_KEY: ${{ secrets.UPDATER_CI_SIGNING_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${CI_SIGNING_KEY}"
+          key_file="${RUNNER_TEMP}/ci-signing-key.pem"
+          printf '%s\n' "${CI_SIGNING_KEY}" > "${key_file}"
+          chmod 600 "${key_file}"
+          echo "key_file=${key_file}" >> "$GITHUB_OUTPUT"
+        id: key
+
+      - name: Write trust root
+        shell: bash
+        env:
+          TRUST_ROOT_JSON: ${{ vars.UPDATER_TRUST_ROOT_JSON }}
+        run: |
+          set -euo pipefail
+          trust_file="${RUNNER_TEMP}/trust-root.json"
+          printf '%s\n' "${TRUST_ROOT_JSON}" > "${trust_file}"
+          echo "trust_file=${trust_file}" >> "$GITHUB_OUTPUT"
+        id: trust
+
+      - name: Publish update plans
+        shell: bash
+        env:
+          GREENTIC_PLAN_UPLOAD_TOKEN: ${{ secrets.PLAN_UPLOAD_TOKEN }}
+          PLAN_SERVER_URL: ${{ vars.PLAN_SERVER_URL }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          key_file="${{ steps.key.outputs.key_file }}"
+          trust_file="${{ steps.trust.outputs.trust_file }}"
+
+          greentic-deployer op updates publish \
+            --all-envs \
+            --release "${version}" \
+            --signing-key "${key_file}" \
+            --trust-root "${trust_file}" \
+            --plan-server-url "${PLAN_SERVER_URL}" \
+            --expected-target-count 6 \
+            --min-runtime 1.1.12
+
+      - name: Cleanup signing key
+        if: always()
+        shell: bash
+        run: rm -f "${RUNNER_TEMP}/ci-signing-key.pem"
+
+  notify-failure:
+    name: Notify on failure
+    needs: [publish]
+    if: failure()
+    uses: greenticai/.github/.github/workflows/notify-failure.yml@main
+    with:
+      workflow-name: Publish Update Plans
+      repo: ${{ github.repository }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    secrets: inherit
