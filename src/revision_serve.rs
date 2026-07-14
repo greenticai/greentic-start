@@ -34,6 +34,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -56,7 +57,7 @@ use hyper_util::rt::tokio::TokioIo;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::runtime::{Handle, Runtime};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 use greentic_runner_host::{Activity, RunnerHost, WelcomeFlowHint};
 
@@ -69,6 +70,7 @@ use greentic_deployer::environment::{LocalFsStore, load_trust_root};
 use greentic_types::EnvId;
 use greentic_update::binswap;
 use greentic_update::plan::{select_binary, verify_update_plan};
+use greentic_update::stream::{StreamError, build_stream_client, run_stream};
 
 use crate::deployment_routes::RevisionIngressRouting;
 use crate::endpoint_resolver;
@@ -511,18 +513,24 @@ impl RevisionServer {
         // `ServeState`. AND-ed into the per-connection loopback decision below.
         let trust_loopback_peers = config.trust_loopback_peers;
 
-        // Updater pull path: the ingress runtime runs a poll loop against the
-        // env's configured plan endpoint (see `run_update_poll_loop`). The loop
-        // re-reads `update-channel.json` every cycle and no-ops while the channel
-        // is absent, disabled, or endpoint-less, so deny-by-default lives there —
+        // Updater: the ingress runtime runs two cooperating tasks against the
+        // env's configured update channel. `run_update_stream_loop` holds an SSE
+        // connection and is the *primary* discovery path; `run_update_poll_loop`
+        // does the actual verified fetch and is the fallback that also runs on a
+        // timer. Both re-read `update-channel.json` and no-op while the channel is
+        // absent, disabled, or endpoint-less, so deny-by-default lives in them —
         // not in a boot-time sidecar probe, which would strand an env that
         // subscribes *after* boot until the next restart. `--no-updates` (and a
-        // missing store root) is the only thing that keeps the task from spawning.
+        // missing store root) is the only thing that keeps them from spawning.
         let update_poll_root = config
             .updates_enabled
             .then(LocalFsStore::default_root)
             .flatten();
         let poll_state = Arc::clone(&state);
+        let stream_state = Arc::clone(&state);
+        // Wakes the poll loop out of its interval wait when a plan is published.
+        let update_wake = Arc::new(Notify::new());
+        let poll_wake = Arc::clone(&update_wake);
 
         let (tx, rx) = oneshot::channel();
         // The startup channel ships the Tokio runtime handle alongside the
@@ -577,25 +585,35 @@ impl RevisionServer {
                             format!("revision ingress admin/console listening on http://{a}"),
                         );
                     }
-                    // Spawn the updater poll loop on this runtime when the env
-                    // opted in (sidecar present). It re-reads config each cycle,
-                    // so a disabled or endpoint-less channel simply no-ops.
-                    // Aborted on shutdown below.
-                    let update_poll_task = update_poll_root
-                        .map(|root| tokio::spawn(run_update_poll_loop(poll_state, root)));
+                    // Spawn the updater tasks on this runtime when the env opted in
+                    // (sidecar present). Both re-read config as they go, so a
+                    // disabled or endpoint-less channel simply no-ops. Aborted on
+                    // shutdown below.
+                    let update_poll_task = update_poll_root.as_ref().map(|root| {
+                        tokio::spawn(run_update_poll_loop(poll_state, root.clone(), poll_wake))
+                    });
+                    let update_stream_task = update_poll_root.map(|root| {
+                        tokio::spawn(run_update_stream_loop(stream_state, root, update_wake))
+                    });
                     let mut shutdown = rx;
                     loop {
                         tokio::select! {
                             _ = &mut shutdown => {
-                                // Stop the poll loop. The abort is prompt when the
-                                // task is sleeping between cycles (the common case).
+                                // Stop the updater tasks. The abort is prompt when the
+                                // poll task is waiting between cycles (the common case).
                                 // A cycle already inside its `spawn_blocking`
                                 // (mid fetch/stage) runs to completion before the
                                 // runtime tears down — the same property the push
                                 // receiver's `spawn_blocking(run_update_notify)` has;
                                 // `updates::get`'s staging FSM is resumable, so no
                                 // half-staged state results, only a bounded delay.
+                                // The stream task's `spawn_blocking` is parked on a
+                                // socket read, so it unblocks when the connection is
+                                // dropped or recycled; it holds no staging state.
                                 if let Some(task) = &update_poll_task {
+                                    task.abort();
+                                }
+                                if let Some(task) = &update_stream_task {
                                     task.abort();
                                 }
                                 break;
@@ -2402,17 +2420,28 @@ const MAX_PLAN_META_BYTES: u64 = 64 * 1024;
 const MAX_PLAN_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PLAN_SIG_BYTES: u64 = 64 * 1024;
 
-/// Updater pull path: periodically fetch the latest signed plan from the env's
-/// configured `plan_endpoint` and hand it to the same receiver core the push
-/// path uses ([`run_update_notify`]) — so `on_update: apply` converges on the
-/// pull path too. Spawned by [`RevisionServer::start`] unless `--no-updates`; the
+/// Updater pull path: fetch the latest signed plan from the env's configured
+/// `plan_endpoint` and hand it to the same receiver core the push path uses
+/// ([`run_update_notify`]) — so `on_update: apply` converges on the pull path
+/// too. Spawned by [`RevisionServer::start`] unless `--no-updates`; the
 /// per-cycle config read enforces deny-by-default (an absent, disabled, or
 /// endpoint-less channel no-ops) and lets a channel written *after* boot — by
 /// `op env apply` or `op updates config-set` — take effect without a restart.
 ///
+/// The wait between cycles is **interruptible**: [`run_update_stream_loop`]
+/// notifies `wake` the moment the server publishes a plan, so `interval` is the
+/// fallback ceiling for discovery latency, not its typical value. With the
+/// stream connected, a publish is picked up in roughly the time one poll cycle
+/// takes; with it unavailable, this loop degrades to exactly the polling
+/// behavior it had before.
+///
 /// Cancelled (via the returned task's `abort`) when the ingress shuts down; it
-/// is otherwise sleeping between cycles, so cancellation is prompt.
-async fn run_update_poll_loop(state: Arc<ServeState>, store_root: std::path::PathBuf) {
+/// is otherwise waiting between cycles, so cancellation is prompt.
+async fn run_update_poll_loop(
+    state: Arc<ServeState>,
+    store_root: std::path::PathBuf,
+    wake: Arc<Notify>,
+) {
     // Build the blocking HTTP client off the runtime (the blocking client must
     // not be constructed or used on an async runtime thread).
     let client = match tokio::task::spawn_blocking(|| {
@@ -2479,7 +2508,197 @@ async fn run_update_poll_loop(state: Arc<ServeState>, store_root: std::path::Pat
                 POLL_FALLBACK_INTERVAL_SECS
             }
         };
-        tokio::time::sleep(Duration::from_secs(interval)).await;
+        wait_for_next_cycle(&wake, interval).await;
+    }
+}
+
+/// Wait until the next poll cycle is due, or until a pushed plan event cuts the
+/// wait short. Returns `true` when a push woke us, `false` on interval expiry.
+///
+/// [`Notify::notify_one`] stores a permit when no waiter is registered, so an
+/// event that lands *while a cycle is still running* is not lost — the next call
+/// here returns immediately. Permits do not accumulate, so a burst of events
+/// coalesces into a single extra cycle rather than a thundering herd of them.
+/// Both properties are what make the stream a safe accelerator for the poll
+/// loop rather than a second, racing control path.
+async fn wait_for_next_cycle(wake: &Notify, interval: u64) -> bool {
+    tokio::time::timeout(Duration::from_secs(interval), wake.notified())
+        .await
+        .is_ok()
+}
+
+/// Signal the poll loop that the server published a plan.
+///
+/// `notify_one`, deliberately — NOT `notify_waiters`. `notify_one` stores a
+/// permit when no waiter is registered, so an event arriving while a poll cycle
+/// is still running survives to the next wait. `notify_waiters` wakes only
+/// currently-registered waiters and drops the signal otherwise, which would lose
+/// exactly the events that matter most: the ones a publish triggers while we are
+/// mid-fetch. The permit does not accumulate, so a burst still costs one cycle.
+fn signal_plan_published(wake: &Notify) {
+    wake.notify_one();
+}
+
+/// How often the stream task re-reads `update-channel.json` while push is not in
+/// play (channel absent, disabled, or `push_enabled: false`). This is a local
+/// file read, not a network call — it exists so that *enabling* push takes
+/// effect without a restart, the same promise the poll loop's per-cycle config
+/// read already makes.
+const STREAM_CONFIG_RECHECK_SECS: u64 = 60;
+
+/// The SSE endpoint this channel says to hold open, or `None` when push is not
+/// in play.
+///
+/// Deny-by-default, the same shape as [`notify_action`]: `enabled` is the gate
+/// and `push_enabled` is the policy, so a disabled channel never streams no
+/// matter what `push_enabled` says. A channel with no endpoint to derive a
+/// stream URL from also yields `None`.
+fn stream_endpoint_for(cfg: &UpdateChannelConfig) -> Option<String> {
+    if !cfg.resolved_enabled() || !cfg.resolved_push_enabled() {
+        return None;
+    }
+    cfg.resolved_stream_endpoint()
+}
+
+/// Read `env_id`'s update channel off disk and resolve it through
+/// [`stream_endpoint_for`]. An absent or unreadable channel yields `None`, which
+/// is the same deny-by-default answer as a disabled one.
+fn resolve_stream_endpoint(store_root: &std::path::Path, env_id: &str) -> Option<String> {
+    let store = LocalFsStore::new(store_root);
+    let env_typed = EnvId::new(env_id).ok()?;
+    let cfg = store.load_update_channel(&env_typed).ok()??;
+    stream_endpoint_for(&cfg)
+}
+
+/// Updater push path: hold an SSE connection to the env's `stream_endpoint` and
+/// wake [`run_update_poll_loop`] the moment the server publishes a plan.
+///
+/// The event is a **hint whose contents are never read**. Waking simply runs the
+/// ordinary poll cycle, which re-fetches `/meta`, the plan, and its signature
+/// and DSSE-verifies them exactly as it always has. So the worst a spoofed,
+/// replayed, or stale event can do is cost one wasted `/meta` GET — adding this
+/// transport does not widen the trust model, which is precisely why the event
+/// carries no plan bytes.
+///
+/// [`run_stream`] owns reconnection, the resume cursor, and backoff internally,
+/// so it returns only when `should_stop` fires (the config changed underneath
+/// us) or when the server does not implement the endpoint at all
+/// ([`StreamError::Unsupported`]). The latter is the old-server case: fall back
+/// to polling and re-check on a long interval, so upgrading the server heals it
+/// without a restart.
+///
+/// Cancelled (via the returned task's `abort`) when the ingress shuts down.
+async fn run_update_stream_loop(
+    state: Arc<ServeState>,
+    store_root: std::path::PathBuf,
+    wake: Arc<Notify>,
+) {
+    // The blocking client must not be constructed on a runtime thread.
+    let client = match tokio::task::spawn_blocking(build_stream_client).await {
+        Ok(Ok(client)) => client,
+        Ok(Err(err)) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-stream: failed to build HTTP client, push disabled: {err}"),
+            );
+            return;
+        }
+        Err(err) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-stream: client-build task failed, push disabled: {err}"),
+            );
+            return;
+        }
+    };
+
+    loop {
+        // Read the served env id fresh each attempt (a cheap ArcSwap load), like
+        // the poll loop, so a reload that changes it is picked up.
+        let env_id = state.current().routing.dispatcher.env_id().to_string();
+        let root = store_root.clone();
+
+        let resolve_root = root.clone();
+        let resolve_env = env_id.clone();
+        let endpoint = tokio::task::spawn_blocking(move || {
+            resolve_stream_endpoint(&resolve_root, &resolve_env)
+        })
+        .await
+        .unwrap_or(None);
+        let Some(endpoint) = endpoint else {
+            tokio::time::sleep(Duration::from_secs(STREAM_CONFIG_RECHECK_SECS)).await;
+            continue;
+        };
+
+        operator_log::info(
+            module_path!(),
+            format!("update-stream: env `{env_id}` subscribing to {endpoint}"),
+        );
+
+        let client_for_task = client.clone();
+        let wake_for_task = Arc::clone(&wake);
+        let stop_state = Arc::clone(&state);
+        let stop_root = root;
+        let held_endpoint = endpoint.clone();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            run_stream(
+                &client_for_task,
+                &held_endpoint,
+                None,
+                // Checked before each (re)connect. Resolves against the *current*
+                // env rather than the one we started with, so a reload that swaps
+                // the served env drops this stream instead of leaving it wedged on
+                // the previous env's endpoint (the env id is part of the URL, so a
+                // swap always changes it). Retargeting or disabling push via
+                // `op env apply` lands the same way — no restart needed.
+                || {
+                    let env = stop_state.current().routing.dispatcher.env_id().to_string();
+                    resolve_stream_endpoint(&stop_root, &env).as_deref()
+                        != Some(held_endpoint.as_str())
+                },
+                |_event| {
+                    signal_plan_published(&wake_for_task);
+                    ControlFlow::Continue(())
+                },
+            )
+        })
+        .await;
+
+        match outcome {
+            // `should_stop` fired: the config no longer names this endpoint. Loop
+            // straight around to re-resolve — it cannot spin, because reaching
+            // here means the config changed since we resolved it moments ago, and
+            // the next iteration either connects to the new endpoint or (push now
+            // off) falls into the idle sleep above.
+            Ok(Ok(())) => continue,
+            Ok(Err(StreamError::Unsupported { status })) => {
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "update-stream: server does not implement the stream endpoint \
+                         (HTTP {status}) for env `{env_id}`; using the poll fallback"
+                    ),
+                );
+                tokio::time::sleep(Duration::from_secs(POLL_FALLBACK_INTERVAL_SECS)).await;
+            }
+            // `run_stream` retries every other transport error internally, so it
+            // does not surface them; treat an unexpected one as a bad moment.
+            Ok(Err(err)) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!("update-stream: stream ended for env `{env_id}`: {err}"),
+                );
+                tokio::time::sleep(Duration::from_secs(STREAM_CONFIG_RECHECK_SECS)).await;
+            }
+            Err(err) => {
+                operator_log::error(
+                    module_path!(),
+                    format!("update-stream: worker task failed: {err}"),
+                );
+                tokio::time::sleep(Duration::from_secs(STREAM_CONFIG_RECHECK_SECS)).await;
+            }
+        }
     }
 }
 
@@ -8084,6 +8303,142 @@ mod update_notify_tests {
         cfg.set_action(UpdateAction::Apply);
         cfg.enabled = Some(false);
         assert_eq!(notify_action(&cfg), NotifyAction::Ignore);
+    }
+
+    // ── push path: the stream gate ──────────────────────────────────
+
+    /// `enabled` is the gate, `push_enabled` is the policy. A channel the
+    /// operator never enabled must not open an outbound connection, even if it
+    /// carries a plan endpoint and push defaults on.
+    #[test]
+    fn stream_endpoint_denies_by_default() {
+        assert_eq!(
+            stream_endpoint_for(&UpdateChannelConfig::disabled(env("local"))),
+            None
+        );
+
+        // Endpoint present but the channel was never enabled: still nothing.
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.plan_endpoint = Some("https://updates.example/v1/environments/local/plan".into());
+        cfg.enabled = None;
+        assert_eq!(stream_endpoint_for(&cfg), None);
+
+        cfg.enabled = Some(false);
+        assert_eq!(stream_endpoint_for(&cfg), None);
+
+        // The gate outranks the policy: explicit push on a disabled channel is
+        // still off.
+        cfg.push_enabled = Some(true);
+        assert_eq!(stream_endpoint_for(&cfg), None);
+    }
+
+    /// An enabled channel streams by default — `push_enabled` is opt-*out*. The
+    /// URL is derived from the plan endpoint, so an operator who configured the
+    /// channel before this feature existed gets push with no config change.
+    #[test]
+    fn stream_endpoint_derives_from_the_plan_endpoint_and_push_is_opt_out() {
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.plan_endpoint = Some("https://updates.example/v1/environments/local/plan".into());
+
+        assert_eq!(
+            stream_endpoint_for(&cfg).as_deref(),
+            Some("https://updates.example/v1/environments/local/updates/stream"),
+        );
+
+        // Opt out explicitly and the stream must not be held open.
+        cfg.push_enabled = Some(false);
+        assert_eq!(stream_endpoint_for(&cfg), None);
+
+        // Opt back in.
+        cfg.push_enabled = Some(true);
+        assert!(stream_endpoint_for(&cfg).is_some());
+    }
+
+    /// An explicit `stream_endpoint` overrides the derived one, so an operator
+    /// can front the stream with a different host than the plan.
+    #[test]
+    fn explicit_stream_endpoint_overrides_the_derived_one() {
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.plan_endpoint = Some("https://updates.example/v1/environments/local/plan".into());
+        cfg.stream_endpoint = Some("https://push.example/stream".into());
+
+        assert_eq!(
+            stream_endpoint_for(&cfg).as_deref(),
+            Some("https://push.example/stream")
+        );
+    }
+
+    // ── push path: the interruptible wait ───────────────────────────
+
+    /// THE load-bearing property. A plan published while a poll cycle is still
+    /// running lands on `notify_one` with no waiter registered. If that wake is
+    /// dropped, the push is lost and discovery silently falls back to the poll
+    /// interval — the exact regression this whole change exists to prevent, and
+    /// one that no amount of "it compiled" would catch.
+    ///
+    /// `start_paused` means the 1-hour interval below costs no wall-clock: if the
+    /// permit were dropped, this test would hang on the virtual clock rather than
+    /// pass slowly.
+    #[tokio::test(start_paused = true)]
+    async fn a_push_landing_mid_cycle_is_not_lost() {
+        let wake = Notify::new();
+
+        // Goes through the SAME function the stream task's `on_plan` calls, so
+        // swapping it to `notify_waiters` (which drops a signal with no waiter
+        // registered) fails here rather than silently in production.
+        signal_plan_published(&wake);
+
+        assert!(
+            wait_for_next_cycle(&wake, 3600).await,
+            "a wake stored while the cycle was running must survive to the next wait"
+        );
+    }
+
+    /// With nothing pushed, the wait must expire on the interval and run the
+    /// cycle anyway. This is the fallback that keeps updates flowing when the
+    /// stream is down, and it is what makes push a pure accelerator.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_push_the_wait_falls_back_to_the_interval() {
+        let wake = Notify::new();
+
+        // Bounded deliberately. The regression this guards against — dropping the
+        // `timeout` and awaiting the wake forever — makes `wait_for_next_cycle`
+        // never return, which would HANG this test rather than fail it, wedging CI
+        // instead of reporting. The outer bound turns that into a clean failure.
+        // Virtual time, so the 2h ceiling costs no wall-clock.
+        let woke =
+            tokio::time::timeout(Duration::from_secs(7200), wait_for_next_cycle(&wake, 3600))
+                .await
+                .expect("wait_for_next_cycle must return on its interval, not block forever");
+
+        assert!(
+            !woke,
+            "an un-pushed wait must expire on the interval, not wake early"
+        );
+    }
+
+    /// A burst of events must coalesce into ONE extra cycle, not one per event.
+    /// `Notify` holds at most a single permit, so ten publishes in a row cost one
+    /// poll — otherwise a chatty server would queue up a cycle per event and
+    /// hammer the plan endpoint.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_pushes_coalesces_into_one_cycle() {
+        let wake = Notify::new();
+
+        for _ in 0..10 {
+            signal_plan_published(&wake);
+        }
+
+        assert!(
+            wait_for_next_cycle(&wake, 3600).await,
+            "the burst must wake the loop"
+        );
+        assert!(
+            !wait_for_next_cycle(&wake, 3600).await,
+            "10 events must not buy 10 cycles — the permits coalesce into one"
+        );
     }
 
     #[test]

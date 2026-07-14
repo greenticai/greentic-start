@@ -2,7 +2,7 @@ bench = [{ name = "perf", harness = false }]
 
 [package]
 name = "greentic-start"
-version = "1.1.19"
+version = "1.1.20"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -144,7 +144,11 @@ default-features = false
 # `greentic-runner-host` pins `<0.3.0-0`, so a 0.3 here would fork the copy it
 # shares with us (E0308) and drag the runner into the release train.
 [dependencies.greentic-deploy-spec]
-version = ">=0.2.2, <0.3"
+# Floor bumped to 0.2.3 (deployer#460) — the update-stream task reads
+# `UpdateChannelConfig::{resolved_push_enabled, resolved_stream_endpoint}`, and
+# neither exists before 0.2.3. An API floor, so a stale `--locked` build fails
+# to compile rather than silently degrading to poll-only.
+version = ">=0.2.3, <0.3"
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
 # (per-env trust root + operator key, deployer #226). Floor bumped to the
@@ -250,12 +254,27 @@ features = ["serde"]
 # greentic-types graph-wide and break greentic-setup's 0.5 line.
 
 [dependencies.greentic-update]
-# Floor bumped to 0.1.28859386871 (2026-07-07): first publish carrying the
-# `binswap` feature (P7a) + the `binaries` / `select_binary` schema (P7b) that
-# the P7d stage-only binary self-update path consumes. `binswap` pulls the
-# archive-unpack + atomic-swap primitive.
-version = ">=0.1.28859386871, <0.2"
-features = ["binswap"]
+# MOVED LANES, not just bumped (update#21). This crate used to track
+# greentic-update's `0.1.<RUN_ID>` dev line, because that was its only line. That
+# stopped working when develop moved `greentic-distributor-client` to the 1.2 dev
+# lane: we pin that same crate `<1.2.0-0` right above, and no version can satisfy
+# both — cargo admits a `1.2.0-dev.N` pre-release only when a comparator shares
+# its exact `1.2.0`, so the ranges cannot be reconciled from either side. Every
+# greentic-update publish after 2026-07-13 was therefore unresolvable here, and
+# this crate sat frozen on the 2026-07-07 build without anything failing loudly.
+#
+# greentic-update now ships a stable 1.1.x line from its `main` branch, pinned to
+# the same 1.1 fleet we are. Track that; the 0.1.x dev line is for `develop`
+# consumers only, and the two ranges deliberately do not overlap.
+#
+# `binswap` carries the archive-unpack + atomic-swap primitive behind the P7d
+# stage-only binary self-update path (`binaries` / `select_binary`). `stream`
+# carries the SSE client the push path uses (`stream::{build_stream_client,
+# run_stream}`). Push is the *primary* discovery path and this poll loop is the
+# fallback, so losing `stream` is a silent latency regression (seconds ->
+# `poll_interval_secs`), not a compile error — which is why it is a hard floor.
+version = ">=1.1.0, <1.2.0-0"
+features = ["binswap", "stream"]
 
 [dependencies.hyper]
 version = "1"
