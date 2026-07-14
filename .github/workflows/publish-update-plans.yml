@@ -90,10 +90,12 @@ jobs:
             echo "::error::GitHub release ${tag} not found"
             exit 1
           fi
+          # 6 target archives + one .sha256 sidecar each. --expected-target-count
+          # below re-checks the archive count; this catches a missing sidecar too.
           asset_count=$(gh release view "${tag}" --repo "${{ github.repository }}" --json assets --jq '.assets | length')
           echo "Release ${tag} has ${asset_count} assets"
-          if [ "${asset_count}" -lt 6 ]; then
-            echo "::error::Expected at least 6 release assets, found ${asset_count} — possible partial release"
+          if [ "${asset_count}" -lt 12 ]; then
+            echo "::error::Expected 12 release assets (6 archives + 6 sidecars), found ${asset_count} — possible partial release"
             exit 1
           fi
 
