@@ -3,7 +3,6 @@ mod conv_dedup;
 mod directline_session;
 mod helpers;
 mod messaging;
-pub(crate) mod static_handler;
 pub mod websocket;
 
 use std::{
@@ -42,6 +41,7 @@ use crate::static_routes::{
 };
 use rand::Rng;
 
+use crate::static_handler::serve_static_route;
 use admin_relay::{
     AdminRelayConfig, handle_admin_relay, load_admin_relay_config_from_env, relay_target_path,
 };
@@ -52,7 +52,6 @@ use helpers::{
     handle_oauth_token_exchange, parse_domain, parse_route_segments, with_cors,
 };
 use messaging::route_messaging_envelopes;
-use static_handler::serve_static_route;
 
 const LEGACY_DIRECTLINE_COMPAT_ENV: &str = "GREENTIC_START_ENABLE_LEGACY_DIRECTLINE";
 

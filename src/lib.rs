@@ -104,6 +104,7 @@ mod setup_input;
 mod setup_to_formspec;
 mod startup_contract;
 mod state_layout;
+mod static_handler;
 mod static_routes;
 mod subscription_updater;
 mod subscriptions_universal;
