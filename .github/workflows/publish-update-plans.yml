@@ -57,8 +57,35 @@ jobs:
         startsWith(github.event.workflow_run.head_branch, 'v')
       )
     steps:
+      # The workflow lands on main before the signing key and plan server are
+      # configured. Until they are, a release must not turn this job red: an
+      # automatic run reports "not configured" and stops. A manual dispatch is
+      # an explicit request, so it fails loudly instead of quietly doing nothing.
+      - name: Check configuration
+        id: config
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PLAN_SERVER_URL: ${{ vars.PLAN_SERVER_URL }}
+          HAS_SIGNING_KEY: ${{ secrets.UPDATER_CI_SIGNING_KEY_PEM != '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PLAN_SERVER_URL}" ] && [ "${HAS_SIGNING_KEY}" = "true" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+          msg="update-plan publishing is not configured — set vars.PLAN_SERVER_URL and secrets.UPDATER_CI_SIGNING_KEY_PEM (see docs/ci-update-signing-key.md)"
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "::error::${msg}"
+            exit 1
+          fi
+          echo "::notice::Skipping — ${msg}"
+          echo "Skipped — ${msg}" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Resolve version
         id: version
+        if: steps.config.outputs.configured == 'true'
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -79,6 +106,7 @@ jobs:
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
       - name: Verify GitHub release exists
+        if: steps.config.outputs.configured == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -100,9 +128,11 @@ jobs:
           fi
 
       - name: Install cargo-binstall
+        if: steps.config.outputs.configured == 'true'
         uses: cargo-bins/cargo-binstall@main
 
       - name: Install greentic-deployer
+        if: steps.config.outputs.configured == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -110,6 +140,7 @@ jobs:
           echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
 
       - name: Write signing key
+        if: steps.config.outputs.configured == 'true'
         shell: bash
         env:
           CI_SIGNING_KEY: ${{ secrets.UPDATER_CI_SIGNING_KEY_PEM }}
@@ -123,6 +154,7 @@ jobs:
         id: key
 
       - name: Write trust root
+        if: steps.config.outputs.configured == 'true'
         shell: bash
         env:
           TRUST_ROOT_JSON: ${{ vars.UPDATER_TRUST_ROOT_JSON }}
@@ -134,6 +166,7 @@ jobs:
         id: trust
 
       - name: Publish update plans
+        if: steps.config.outputs.configured == 'true'
         shell: bash
         env:
           GREENTIC_PLAN_UPLOAD_TOKEN: ${{ secrets.PLAN_UPLOAD_TOKEN }}

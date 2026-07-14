@@ -74,6 +74,12 @@ An environment's `trust-root.json` then looks like:
 `PLAN_SERVER_URL` and `UPDATER_TRUST_ROOT_JSON` are repo *variables*, not
 secrets: one is a URL, the other holds public keys only.
 
+Until `PLAN_SERVER_URL` and `UPDATER_CI_SIGNING_KEY_PEM` both exist, the
+workflow is dormant: a release run reports "not configured" and stops
+without publishing (it does not fail the release). A manual
+`workflow_dispatch` fails loudly instead — an explicit request to publish
+should never silently do nothing.
+
 The workflow writes the private key to `$RUNNER_TEMP` with mode `600`,
 masks it in the log, and removes it in an `if: always()` cleanup step.
 
