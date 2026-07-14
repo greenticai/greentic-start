@@ -15,7 +15,7 @@ use crate::static_routes::{
     fallback_asset_path, normalize_relative_asset_path, read_pack_asset_bytes, resolve_asset_path,
 };
 
-use super::helpers::error_response;
+use crate::http_helpers::error_response;
 
 /// Serve a static route directly from the pack (no bundle-root overlay).
 /// Used by the revision-serve path where no bundle root exists.
@@ -98,7 +98,7 @@ fn serve_pack_asset(
     Ok(Some(response))
 }
 
-pub(super) fn serve_static_route(
+pub(crate) fn serve_static_route(
     route_match: &StaticRouteMatch<'_>,
     bundle_root: &Path,
     request_path: &str,

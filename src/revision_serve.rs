@@ -1217,8 +1217,7 @@ async fn serve(
             .static_routes
             .match_request_for_revision(&path, &scope)
     {
-        let response =
-            crate::http_ingress::static_handler::serve_static_route_from_pack(&route_match, &path);
+        let response = crate::static_handler::serve_static_route_from_pack(&route_match, &path);
         return Ok(with_cors(response));
     }
 
@@ -3132,8 +3131,13 @@ fn try_probe_response(path: &str, state: &ServeState) -> Option<Response<Full<By
 /// 3. `GREENTIC_GATEWAY_LISTEN_ADDR` — accepts a full `SocketAddr`
 ///    (`0.0.0.0:9090`) or a bare `IpAddr` (`0.0.0.0`); for the bare-IP form
 ///    the port is taken from layer (1) or (2).
-/// 4. `PORT` — port-only override matching the convention used by Heroku /
-///    Cloud Run / Fly and the rest of the gateway configuration.
+/// 4. `GREENTIC_GATEWAY_PORT` — port-only override. The legacy `http_ingress`
+///    boot honoured this (via `bundle_config`) and the revision path did not,
+///    so callers that set it — the greentic-e2e Playwright fixture and
+///    greentic-designer's local-deploy — silently landed on the default port.
+/// 5. `PORT` — port-only override matching the convention used by Heroku /
+///    Cloud Run / Fly and the rest of the gateway configuration. Kept as the
+///    outermost layer so existing deployments that set it are unaffected.
 ///
 /// Operators set `host_config.listen_addr` once at env init; the env-vars
 /// stay available for ad-hoc overrides (CI ports, local debugging) without
@@ -3159,6 +3163,23 @@ pub(crate) fn resolve_bind_addr(host_config: Option<&EnvironmentHostConfig>) -> 
                     format!(
                         "GREENTIC_GATEWAY_LISTEN_ADDR={trimmed:?} is not a valid SocketAddr or IP; \
                          falling back to {addr}"
+                    ),
+                );
+            }
+        }
+    }
+
+    if let Ok(raw) = std::env::var("GREENTIC_GATEWAY_PORT") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            if let Ok(port) = trimmed.parse::<u16>() {
+                addr.set_port(port);
+            } else {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "GREENTIC_GATEWAY_PORT={trimmed:?} is not a valid u16; keeping port {}",
+                        addr.port()
                     ),
                 );
             }
@@ -9277,5 +9298,88 @@ mod binary_update_tests {
 
         let _ = ws.close(None).await;
         accept_handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod bind_addr_env_tests {
+    use super::{DEFAULT_LISTEN_ADDR, resolve_bind_addr};
+
+    /// Clear every env-var layer so each case starts from the spec default.
+    fn clear_bind_env() {
+        unsafe {
+            std::env::remove_var("GREENTIC_GATEWAY_LISTEN_ADDR");
+            std::env::remove_var("GREENTIC_GATEWAY_PORT");
+            std::env::remove_var("PORT");
+        }
+    }
+
+    /// The legacy `http_ingress` boot honoured `GREENTIC_GATEWAY_PORT`
+    /// (`bundle_config.rs`); the revision path did not. Callers that set it —
+    /// the greentic-e2e Playwright fixture and greentic-designer's local-deploy —
+    /// silently got the default port instead of the one they asked for.
+    #[test]
+    fn gateway_port_env_overrides_the_default_port() {
+        let _lock = crate::test_env_lock().lock().unwrap();
+        clear_bind_env();
+        unsafe { std::env::set_var("GREENTIC_GATEWAY_PORT", "19311") };
+
+        let addr = resolve_bind_addr(None);
+
+        clear_bind_env();
+        assert_eq!(addr.port(), 19311);
+        assert_eq!(addr.ip(), DEFAULT_LISTEN_ADDR.ip());
+    }
+
+    /// A bare IP in `GREENTIC_GATEWAY_LISTEN_ADDR` takes its port from the layer
+    /// below; `GREENTIC_GATEWAY_PORT` must supply it. This is exactly the pair
+    /// the Playwright fixture sets (`127.0.0.1` + a per-worker port).
+    #[test]
+    fn gateway_port_supplies_the_port_for_a_bare_listen_ip() {
+        let _lock = crate::test_env_lock().lock().unwrap();
+        clear_bind_env();
+        unsafe {
+            std::env::set_var("GREENTIC_GATEWAY_LISTEN_ADDR", "127.0.0.1");
+            std::env::set_var("GREENTIC_GATEWAY_PORT", "19312");
+        }
+
+        let addr = resolve_bind_addr(None);
+
+        clear_bind_env();
+        assert_eq!(addr.to_string(), "127.0.0.1:19312");
+    }
+
+    /// `PORT` stays the outermost layer: adding `GREENTIC_GATEWAY_PORT` must not
+    /// change the precedence any existing deployment already relies on.
+    #[test]
+    fn port_still_wins_over_gateway_port() {
+        let _lock = crate::test_env_lock().lock().unwrap();
+        clear_bind_env();
+        unsafe {
+            std::env::set_var("GREENTIC_GATEWAY_PORT", "19313");
+            std::env::set_var("PORT", "19314");
+        }
+
+        let addr = resolve_bind_addr(None);
+
+        clear_bind_env();
+        assert_eq!(addr.port(), 19314);
+    }
+
+    /// Deployment systems expose unset env-vars as empty strings; an unparseable
+    /// value must not panic or zero the port.
+    #[test]
+    fn empty_or_garbage_gateway_port_is_ignored() {
+        let _lock = crate::test_env_lock().lock().unwrap();
+        clear_bind_env();
+        unsafe { std::env::set_var("GREENTIC_GATEWAY_PORT", "   ") };
+        let empty = resolve_bind_addr(None);
+
+        unsafe { std::env::set_var("GREENTIC_GATEWAY_PORT", "not-a-port") };
+        let garbage = resolve_bind_addr(None);
+
+        clear_bind_env();
+        assert_eq!(empty.port(), DEFAULT_LISTEN_ADDR.port());
+        assert_eq!(garbage.port(), DEFAULT_LISTEN_ADDR.port());
     }
 }
