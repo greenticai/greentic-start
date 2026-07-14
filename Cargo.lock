@@ -2649,9 +2649,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.1.14"
+version = "1.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee4c1f6e56a3a7b63d4d1e1d8b4caee04827f9701f468b15de0a438aedd8954e"
+checksum = "e4c7fd4777caad1821c8d58e7ce5581afc163a3d67323097d60cbb36f8b3217e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3324,7 +3324,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-start"
-version = "1.1.18"
+version = "1.1.19"
 dependencies = [
  "anyhow",
  "arc-swap",

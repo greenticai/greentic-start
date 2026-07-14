@@ -2,7 +2,7 @@ bench = [{ name = "perf", harness = false }]
 
 [package]
 name = "greentic-start"
-version = "1.1.18"
+version = "1.1.19"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -170,8 +170,16 @@ version = ">=0.2.2, <0.3"
 # deploy-spec that 1.1.10 pulls; earlier publishes drag in 0.2.1 and fork the copy.
 # Floor bumped to 1.1.14 (deployer#456) — `runtime_config` calls
 # `pack_ref::classify_pack_ref`, which does not exist before it.
+# Floor bumped to 1.1.15 (deployer#459) — a BEHAVIOUR floor, not an API one, so
+# it needs the Cargo.lock bump beside it: we stage bundles in-process via
+# `cli::bundle_stage`, and before 1.1.15 that only scanned `packs/`. A bundle's
+# `extension_providers` land in `providers/<domain>/`, so none of them reached
+# `pack-list.lock` — and `revision_boot` takes its pack paths exclusively from
+# that lock. The result was an env that served NO provider routes at all
+# (webchat GUI 405 on `/v1/web/webchat/{tenant}/`). Nothing failed to compile,
+# so only the lock keeps a `--locked` release build off the broken copy.
 [dependencies.greentic-deployer]
-version = ">=1.1.14, <1.2.0-0"
+version = ">=1.1.15, <1.2.0-0"
 default-features = false
 
 # Lower bound pinned to the first dev build exposing the `signing` module
