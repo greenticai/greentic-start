@@ -20,10 +20,10 @@ Keep the public-facing overview in [README.md](README.md) focused on humans.
 bash ci/local_check.sh
 
 # Standard commands
-cargo build -p greentic-start --all-features
-cargo test -p greentic-start --all-features
+cargo build -p greentic-start
+cargo test -p greentic-start
 cargo fmt -p greentic-start -- --check
-cargo clippy -p greentic-start --all-targets --all-features -- -D warnings
+cargo clippy -p greentic-start --all-targets -- -D warnings
 
 # Run a single test
 cargo test -p greentic-start -- test_name_here
@@ -42,8 +42,8 @@ Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is commi
 ## Release Flow
 
 1. Bump `version` in `Cargo.toml`
-2. Create and push tag `vX.Y.Z` (must match Cargo.toml)
-3. Tag push triggers `.github/workflows/publish.yml` (needs `CARGO_REGISTRY_TOKEN`)
+2. Merge the bump to `main` — `tag-on-version-bump.yml` creates and pushes tag `vX.Y.Z` automatically (a manually pushed matching tag also works)
+3. The tag triggers `.github/workflows/release-binaries.yml` (release binaries). There is no `publish.yml`; crates.io dev publishing runs separately via `dev-publish.yml` on the nightly train
 
 ## Architecture
 
