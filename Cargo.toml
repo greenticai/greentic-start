@@ -2,7 +2,7 @@ bench = [{ name = "perf", harness = false }]
 
 [package]
 name = "greentic-start"
-version = "1.1.17"
+version = "1.1.18"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -168,8 +168,10 @@ version = ">=0.2.2, <0.3"
 # Floor bumped to 1.1.10 (deployer#443) — the `NotifyAction::Apply` arm calls
 # `cli::updates::{apply_updates, ApplyUpdatesPayload}` and needs the 0.2.2
 # deploy-spec that 1.1.10 pulls; earlier publishes drag in 0.2.1 and fork the copy.
+# Floor bumped to 1.1.14 (deployer#456) — `runtime_config` calls
+# `pack_ref::classify_pack_ref`, which does not exist before it.
 [dependencies.greentic-deployer]
-version = ">=1.1.10, <1.2.0-0"
+version = ">=1.1.14, <1.2.0-0"
 default-features = false
 
 # Lower bound pinned to the first dev build exposing the `signing` module
