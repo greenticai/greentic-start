@@ -68,6 +68,31 @@ fn write_env_home_fixture(store_root: &Path) {
     .expect("write runtime-config.json");
 }
 
+/// RAII guard that pins `GREENTIC_GATEWAY_PORT` for the lifetime of a test
+/// and always clears it on drop, including when the test body panics — a
+/// plain set_var/remove_var pair would leak the var into the other tests
+/// sharing this process if an `.expect()`/`assert!` in between panicked
+/// before the manual `remove_var` ran.
+struct GatewayPortGuard;
+
+impl GatewayPortGuard {
+    fn set(port: &str) -> Self {
+        // SAFETY: only `boots_from_env_home_and_stops_cleanly` in this
+        // binary mutates GREENTIC_GATEWAY_PORT, so there is no other test
+        // thread racing this write; the guard clears it on every exit path,
+        // including panics, so it never leaks into the other tests sharing
+        // this process.
+        unsafe { std::env::set_var("GREENTIC_GATEWAY_PORT", port) };
+        Self
+    }
+}
+
+impl Drop for GatewayPortGuard {
+    fn drop(&mut self) {
+        unsafe { std::env::remove_var("GREENTIC_GATEWAY_PORT") };
+    }
+}
+
 fn env_home_start_request(store_root: &Path, log_dir: &Path) -> StartRequest {
     StartRequest {
         bundle: None,
@@ -104,9 +129,7 @@ fn boots_from_env_home_and_stops_cleanly() {
     write_env_home_fixture(&store_root);
 
     // See the module doc: the listener always binds, so pin a unique port.
-    unsafe {
-        std::env::set_var("GREENTIC_GATEWAY_PORT", "19905");
-    }
+    let _gateway_port = GatewayPortGuard::set("19905");
 
     let bundle_dir = store_root.join("local/revisions/r1/bundle");
     let log_dir = temp.path().join("logs");
@@ -146,9 +169,6 @@ fn boots_from_env_home_and_stops_cleanly() {
             .is_none(),
         "stop request should be cleared after a clean shutdown"
     );
-    unsafe {
-        std::env::remove_var("GREENTIC_GATEWAY_PORT");
-    }
 }
 
 #[test]

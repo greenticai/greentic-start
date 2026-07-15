@@ -1197,6 +1197,29 @@ mod tests {
         .expect("write demo config");
     }
 
+    /// RAII guard that pins `GREENTIC_GATEWAY_PORT` for the lifetime of a
+    /// test and always clears it on drop, including when the test body
+    /// panics — a plain set_var/remove_var pair would leak the var into
+    /// later tests in this binary if an `.expect()`/`assert!` in between
+    /// panicked before the manual `remove_var` ran.
+    struct GatewayPortGuard;
+
+    impl GatewayPortGuard {
+        fn set(port: &str) -> Self {
+            // SAFETY: tests in this binary that mutate this variable are
+            // serialized by test_env_lock(); the guard clears it on every
+            // exit path, including panics.
+            unsafe { std::env::set_var("GREENTIC_GATEWAY_PORT", port) };
+            Self
+        }
+    }
+
+    impl Drop for GatewayPortGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("GREENTIC_GATEWAY_PORT") };
+        }
+    }
+
     fn request_runtime_stop(bundle: &Path) -> thread::JoinHandle<()> {
         let runtime_paths =
             runtime_state::RuntimePaths::new(bundle.join("state"), "demo", "default");
@@ -1224,9 +1247,7 @@ mod tests {
         // whatever else owns 8080 on a dev machine). Strict bind (range 0)
         // turns such a collision into a hard failure, so the port must be
         // deterministic and unique per test.
-        unsafe {
-            std::env::set_var("GREENTIC_GATEWAY_PORT", "19903");
-        }
+        let _gateway_port = GatewayPortGuard::set("19903");
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path().join("bundle");
         write_demo_bundle(&bundle);
@@ -1243,9 +1264,6 @@ mod tests {
                 .expect("read stop")
                 .is_none()
         );
-        unsafe {
-            std::env::remove_var("GREENTIC_GATEWAY_PORT");
-        }
     }
 
     #[test]
@@ -1254,9 +1272,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         crate::operator_log::reset_for_tests();
-        unsafe {
-            std::env::set_var("GREENTIC_GATEWAY_PORT", "19904");
-        }
+        let _gateway_port = GatewayPortGuard::set("19904");
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path().join("bundle");
         write_demo_bundle(&bundle);
@@ -1274,9 +1290,6 @@ mod tests {
                 .expect("read stop")
                 .is_none()
         );
-        unsafe {
-            std::env::remove_var("GREENTIC_GATEWAY_PORT");
-        }
     }
 
     #[test]
