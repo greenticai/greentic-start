@@ -53,6 +53,7 @@ const ENVIRONMENT_FILE: &str = "environment.json";
 use crate::operator_log;
 use crate::revision_boot::{self, RuntimeConfigActivation};
 use crate::revision_pin::RevisionPinStore;
+use crate::revision_secrets;
 use crate::revision_serve::{Activation, RevisionServer};
 use crate::runtime_config::{self, LoadedRuntimeConfig};
 use crate::secrets_gate::DynSecretsManager;
@@ -372,6 +373,16 @@ fn rebuild_once(
     {
         return Ok(None);
     }
+    // A reload can attach revisions of packs whose `generated` secrets were
+    // never minted (the deployer stages packs, not secrets). Seed before
+    // activating, exactly like the cold-start boot; on failure this reload is
+    // aborted (logged by the watcher) and the old activation keeps serving.
+    let env_dir = runtime_config::env_dir_in(store_root, env_id)?;
+    activation_rt.block_on(revision_secrets::ensure_generated_secrets_for_activation(
+        &env_dir,
+        &rc,
+        &environment,
+    ))?;
     let RuntimeConfigActivation { host, routing } =
         activation_rt.block_on(revision_boot::activate_runtime_config(
             store_root,

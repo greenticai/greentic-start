@@ -79,6 +79,7 @@ pub mod revision_health_gate;
 mod revision_pin;
 mod revision_pull;
 mod revision_reload;
+mod revision_secrets;
 mod revision_serve;
 mod revision_webhook_register;
 mod rollout_telemetry;
@@ -644,6 +645,18 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // `GREENTIC_REVISION_PIN_REDIS_URL` is configured (fail-open to
         // in-memory); see that fn for the rationale.
         let pin_store = revision_pin::resolve_pin_store(&activation_rt);
+        // Mint declared `generated` provider secrets (e.g. the webchat-gui
+        // `jwt_signing_key`) before serving — the env path's counterpart to
+        // the `--bundle` boot's `ensure_generated_provider_secrets`. Without
+        // it, provider token ops 500 with `secret_error: not-found` on any
+        // bundle that never went through a legacy boot.
+        activation_rt
+            .block_on(revision_secrets::ensure_generated_secrets_for_activation(
+                &env_dir,
+                &rc,
+                &environment,
+            ))
+            .context("failed to seed generated provider secrets")?;
         let activation = activation_rt.block_on(revision_boot::activate_runtime_config(
             &store_root,
             &rc,
@@ -664,8 +677,20 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let bind_addr = revision_serve::resolve_bind_addr(Some(&environment.host_config));
         // On by default for the `local` env, off elsewhere unless the operator
         // opted in (`op config set gui_enabled` / env-manifest). When on, the
-        // server serves the built-in webchat console at `/chat`.
-        let gui_enabled = environment.host_config.resolved_gui_enabled();
+        // server serves the built-in webchat console at `/chat`. A deployed
+        // pack that ships its own webchat UI (a `/v1/web/webchat/...` static
+        // route, e.g. messaging-webchat-gui) supersedes the console: the
+        // default turns it off so only the pack's qualified UI is exposed,
+        // while an explicit `gui_enabled: true` still forces the console on.
+        let pack_webchat_routes: Vec<String> = routing
+            .static_routes
+            .routes()
+            .iter()
+            .filter(|route| route.public_path.starts_with("/v1/web/webchat"))
+            .map(|route| route.public_path.clone())
+            .collect();
+        let gui_enabled =
+            resolve_console_enabled(&environment.host_config, !pack_webchat_routes.is_empty());
         // A public tunnel (`--cloudflared on` / `--ngrok on`) forwards external
         // traffic to this listener over loopback, so a tunneled request's TCP
         // peer reads as 127.0.0.1 and would defeat the loopback trust gate on
@@ -720,6 +745,35 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         };
         operator_log::info(module_path!(), banner.clone());
         println!("\n{banner}. Press Ctrl+C to stop.");
+        // Advertise the pack-provided webchat UI(s) — one URL per bound
+        // tenant — instead of (or alongside, if explicitly forced) the
+        // built-in console.
+        if !pack_webchat_routes.is_empty() {
+            let tenants: std::collections::BTreeSet<&str> = environment
+                .bundles
+                .iter()
+                .map(|dep| dep.route_binding.tenant_selector.tenant.as_str())
+                .collect();
+            let mut urls = std::collections::BTreeSet::new();
+            for route in &pack_webchat_routes {
+                let base = route.trim_end_matches('/');
+                if base.contains("{tenant}") {
+                    for tenant in &tenants {
+                        urls.insert(format!(
+                            "http://{listen}{}/",
+                            base.replace("{tenant}", tenant)
+                        ));
+                    }
+                } else {
+                    urls.insert(format!("http://{listen}{base}/"));
+                }
+            }
+            for url in urls {
+                let line = format!("UI: {url}");
+                operator_log::info(module_path!(), line.clone());
+                println!("{line}");
+            }
+        }
         if gui_enabled {
             // With a tunnel up, the console lives on the loopback admin listener
             // (the public port serves provider webhooks only); point operators
@@ -1688,6 +1742,24 @@ async fn wait_for_shutdown_inner(
     }
 }
 
+/// Decide whether the built-in `/chat` webchat console is served on the
+/// env/revision path.
+///
+/// Explicit operator intent (`gui_enabled` in the env host config) always
+/// wins. By default the console follows `resolved_gui_enabled()` (on for the
+/// `local` env) — unless a deployed pack ships its own webchat UI, which
+/// supersedes the console so only the qualified `/v1/web/webchat/{tenant}/`
+/// surface is exposed.
+fn resolve_console_enabled(
+    host_config: &greentic_deploy_spec::EnvironmentHostConfig,
+    has_pack_webchat_ui: bool,
+) -> bool {
+    match host_config.gui_enabled {
+        Some(explicit) => explicit,
+        None => host_config.resolved_gui_enabled() && !has_pack_webchat_ui,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -1700,6 +1772,47 @@ mod tests {
     use std::path::Path;
     use std::thread;
     use std::time::Duration;
+
+    fn host_config_with_gui(
+        gui_enabled: Option<bool>,
+    ) -> greentic_deploy_spec::EnvironmentHostConfig {
+        greentic_deploy_spec::EnvironmentHostConfig {
+            env_id: greentic_types::EnvId::try_from("local").unwrap(),
+            region: None,
+            tenant_org_id: None,
+            listen_addr: None,
+            public_base_url: None,
+            gui_enabled,
+        }
+    }
+
+    #[test]
+    fn console_defaults_on_for_local_without_pack_webchat_ui() {
+        assert!(resolve_console_enabled(&host_config_with_gui(None), false));
+    }
+
+    #[test]
+    fn console_suppressed_by_default_when_pack_ships_webchat_ui() {
+        // The old behavior: the qualified /v1/web/webchat/{tenant}/ UI is THE
+        // chat; the built-in console must not appear alongside it.
+        assert!(!resolve_console_enabled(&host_config_with_gui(None), true));
+    }
+
+    #[test]
+    fn console_explicit_true_wins_over_pack_webchat_ui() {
+        assert!(resolve_console_enabled(
+            &host_config_with_gui(Some(true)),
+            true
+        ));
+    }
+
+    #[test]
+    fn console_explicit_false_disables_unconditionally() {
+        assert!(!resolve_console_enabled(
+            &host_config_with_gui(Some(false)),
+            false
+        ));
+    }
 
     #[test]
     fn build_trace_filter_clamps_noisy_targets_even_when_rust_log_unset() {
