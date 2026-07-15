@@ -550,7 +550,7 @@ impl RevisionServer {
                         }
                     };
                 let runtime_handle = runtime.handle().clone();
-                runtime.block_on(async move {
+                let serve_result = runtime.block_on(async move {
                     let listener = match TcpListener::bind(addr)
                         .await
                         .context("failed to bind revision ingress listener")
@@ -646,7 +646,20 @@ impl RevisionServer {
                         }
                     }
                     Ok(())
-                })
+                });
+                // The updater's SSE stream loop runs on a `spawn_blocking` thread
+                // parked in a synchronous socket read that, by design, has no read
+                // timeout: reqwest's blocking client exposes none, so the stream
+                // bounds a silently-wedged read with a 900s connection recycle
+                // instead (see greentic-update `stream.rs`). Letting this `Runtime`
+                // drop would join the blocking pool and block shutdown until that
+                // read returns — up to the full recycle interval — which an operator
+                // experiences as "Ctrl+C does nothing." This is the terminal shutdown
+                // path (`RevisionServer::stop`), so detach the blocking pool rather
+                // than wait for it: the parked read's socket and thread are reclaimed
+                // by the OS as the process exits.
+                runtime.shutdown_background();
+                serve_result
             })?;
         let runtime_handle = startup_rx
             .recv()
