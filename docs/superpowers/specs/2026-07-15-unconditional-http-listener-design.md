@@ -110,32 +110,55 @@ it with a *silent port shift* would relocate the disease, not cure it.
 
 **Accepted behavior change.** `gtc start` on a channel-less bundle while the default port
 8080 (`src/config.rs:409-411`) is occupied now fails to boot where it previously ran
-portless. This is honest and actionable. The error already exists
-(`src/port_utils.rs:14-17`, "no available port found"); improve it to name the port and
-suggest `GREENTIC_GATEWAY_PORT`.
+portless. This is honest and actionable. The operator-facing error at
+`src/http_ingress/mod.rs:242-250` already names the port, gives an `ss` command to find the
+owning process, and tells you to kill the orphan. It has one gap: it never mentions
+`GREENTIC_GATEWAY_PORT`, the supported way to run side-by-side instances — which matters
+more now that channel-less bundles bind where they previously did not. Add that line.
 
 Designer is unaffected: it allocates a free port and passes `GREENTIC_GATEWAY_PORT`
 explicitly (`greentic-designer/src/orchestrate/local_deploy/manager.rs:94`, `:125`).
 
-### 3. Retire the obsolete static-routes guard
+### 3. The static-routes guard stays
 
-`src/startup_contract.rs:116-127` fails fast with *"bundle declares static routes but this
-launch mode does not expose public HTTP"*. Once the listener always binds, that condition
-is unreachable. Delete the guard and its test `resolve_rejects_missing_public_http`
-(`src/startup_contract.rs:275`) explicitly rather than leaving misleading dead code.
+*(Amended 2026-07-15 after reading the code during planning. An earlier revision of this
+spec called for deleting the guard. That was wrong.)*
 
-### 4. Decouple the pack HTTP route table from static routes
+`src/startup_contract.rs:116-121` fails fast with *"bundle declares static routes but this
+launch mode does not expose public HTTP"*. It is tempting to call this unreachable once the
+listener always binds — but `startup_contract::resolve` is a **pure function** and
+`http_listener_enabled` is one of its *inputs*, not a global. The real caller
+(`src/runtime.rs:1308` → `:1335`) will always pass `true`; `resolve` itself stays callable
+with `false`, and the guard stays ordinary input validation.
+
+Keep the guard and its test `resolve_rejects_missing_public_http` (`src/startup_contract.rs:275`).
+`greentic_types::FlowKind::Job` ("Batch/background jobs") already exists as a spec-only
+variant — a batch launch mode with no listener is exactly when this guard would catch a real
+bug.
+
+### 4. The pack HTTP route table is out of scope
+
+*(Amended 2026-07-15. An earlier revision folded this in; planning showed it cannot be
+honestly delivered here.)*
 
 `src/http_ingress/mod.rs:146` builds the `greentic.http-routes.v1` route table only when
 `enable_static_routes` is true, so a pack declaring HTTP routes but not static routes has
-its table silently dropped to `HttpRouteTable::default()`. This is the same class of
-coupling, in the same file, and would become the next silent-failure bug. Build the route
-table whenever the pack declares one.
+its table silently dropped to `HttpRouteTable::default()`. That is a real bug — but it
+belongs to the flow→ingress project, not here:
 
-Note the independent second trap at `src/http_ingress/mod.rs:713`: `state.domains.contains(&domain)`
-applies to pack-declared route matches too, so a declared route can still 404 as
-"domain disabled". That is out of scope here (it needs the flow→ingress work) but must not
-be mistaken for this fix failing.
+- **It is unobservable on its own.** A pack-declared route matches at
+  `src/http_ingress/mod.rs:687`, then still passes `state.domains.contains(&domain)`
+  (`:718` → 404 "domain disabled") and `supports_op(domain, provider, "ingest_http")`
+  (`:721` → 404). Populating the table changes behaviour only when a real `ingest_http`
+  provider is present *and* the pack declares http-routes *and* ships no static assets.
+- **It has no test fixture.** `discover_http_routes_from_bundle` (`src/http_routes.rs:240`)
+  has zero coverage; `src/http_routes.rs`'s tests build in-memory descriptors only
+  (`make_route`, `:359`). Covering it needs a `.gtpack` fixture writing
+  `greentic.http-routes.v1` into `manifest.cbor`, plus a real provider to observe the effect.
+- Adding an uncovered, unobservable change to a PR whose purpose is to stop silent
+  behaviour would repeat the mistake in a new place.
+
+Fix it together with the `:718`/`:721` domain check, where it becomes observable.
 
 ## Consequences to announce
 
@@ -176,8 +199,8 @@ Without explicit ports these three race for 8080 and the loser hard-fails under 
 ### New tests
 
 - Zero-provider bundle boots → `ingress_server.is_some()` and `/healthz` returns 200.
-- Zero-provider bundle on an occupied port → boot fails with an error naming the port.
-- Pack declaring `greentic.http-routes.v1` without static routes → route table is populated.
+- Zero-provider bundle on an occupied port → boot fails with an error naming the port and
+  pointing at `GREENTIC_GATEWAY_PORT`.
 
 ### Live verification (required — tests alone do not answer the question)
 
@@ -213,7 +236,9 @@ projects** — neither blocks nor is blocked by this spec:
 ## Rollout
 
 Branch `feat/unconditional-http-listener` off `origin/research`. Single PR: the gate, the
-port-error message, the static-routes guard removal, the route-table decoupling, and all
-test updates belong together — landing the gate alone leaves CI flaky.
+port-error hint, and all test updates belong together — landing the gate without the test
+port pinning leaves CI flaky.
+
+Implementation plan: `docs/superpowers/plans/2026-07-15-unconditional-http-listener.md`.
 
 `bash ci/local_check.sh` must pass before the PR is declared done.
