@@ -2924,12 +2924,20 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// lives in `response`, so unwrap a pending envelope first — otherwise the
 /// menu (and every intermediate waiting card) would surface as an opaque
 /// `activity` and never render.
-fn activity_to_worker_message(activity: &Activity) -> WorkerInvokeMessage {
-    let raw = activity.payload();
-    let payload = match raw.get("status").and_then(Value::as_str) {
+/// Unwrap a `session.wait` "pending" reply: a paused flow returns
+/// `{ "status": "pending", "response": <activity> }`, and the activity to
+/// actually forward is the inner `response`. Anything else is returned as-is.
+/// Shared so the content lift and the DirectLine passthrough copy operate on
+/// the same JSON.
+fn unwrap_pending_response(raw: &Value) -> &Value {
+    match raw.get("status").and_then(Value::as_str) {
         Some("pending") => raw.get("response").unwrap_or(raw),
         _ => raw,
-    };
+    }
+}
+
+fn activity_to_worker_message(activity: &Activity) -> WorkerInvokeMessage {
+    let payload = unwrap_pending_response(activity.payload());
     if let Some(card) = payload.get("renderedCard") {
         WorkerInvokeMessage {
             kind: "adaptive-card".to_string(),
@@ -4239,6 +4247,19 @@ fn build_reply_envelope(
         }
         _ => {}
     }
+
+    // Forward the reply's DirectLine passthrough fields (attachments /
+    // channelData / entities / suggestedActions / speak / inputHint / rag) into
+    // the outbound envelope's extensions, using the exact same mapping the
+    // legacy `messaging_app` path applies. The egress chain
+    // (`render_plan` → `encode` → `send_payload`) reads these from
+    // `extensions`; without this copy a rich reply reaches the provider as
+    // text only and attachments/channelData/entities are dropped. Operates on
+    // the pending-unwrapped payload so it matches the content lift above.
+    crate::messaging_app::copy_directline_passthrough(
+        unwrap_pending_response(reply.payload()),
+        &mut envelope,
+    );
 
     envelope
 }
@@ -6049,6 +6070,71 @@ mod tests {
         assert_eq!(envelope.to.len(), 1);
         assert_eq!(envelope.text.as_deref(), Some("scripted-reply"));
         assert!(!envelope.id.is_empty(), "id backfilled from uuid");
+    }
+
+    #[test]
+    fn build_reply_envelope_forwards_directline_passthrough_fields() {
+        // Regression for the env-path attachment-strip (greentic-e2e webchat
+        // passthrough): a flow reply carrying attachments + channelData +
+        // entities alongside text must forward those into `extensions` so the
+        // provider's egress chain renders them. Before the fix the env path
+        // kept only the text and dropped the rest — the legacy `--bundle` boot
+        // preserved them, so the nightly (on the legacy boot) never caught it.
+        let ingress: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-in-dl",
+            "tenant": { "env": "dev", "tenant": "acme", "tenant_id": "acme", "attempt": 0 },
+            "channel": "webchat-gui",
+            "session_id": "conv-1",
+            "to": [{ "id": "room-1", "kind": "room" }],
+            "text": "hi",
+        }))
+        .expect("ingress envelope");
+
+        let card = json!({
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type": "AdaptiveCard",
+            "version": "1.5",
+        });
+        let reply = Activity::custom(
+            "message",
+            json!({
+                "ok": true,
+                "text": "Bug 3 probe — reply carries a rich envelope",
+                "attachments": [
+                    { "contentType": "application/vnd.microsoft.card.adaptive", "content": card }
+                ],
+                "channelData": { "bug3_probe": true },
+                "entities": [{ "type": "bug3-probe", "id": "attachment-passthrough-check" }],
+            }),
+        );
+
+        let envelope = build_reply_envelope(&ingress, &reply);
+
+        // Text still lifted.
+        assert_eq!(
+            envelope.text.as_deref(),
+            Some("Bug 3 probe — reply carries a rich envelope")
+        );
+        // The three DirectLine fields the probe checks reach `extensions`.
+        assert!(
+            envelope.extensions.contains_key(ext_keys::ATTACHMENTS),
+            "attachments must be forwarded, not dropped"
+        );
+        assert_eq!(
+            envelope.extensions.get(ext_keys::CHANNEL_DATA),
+            Some(&json!({ "bug3_probe": true }))
+        );
+        assert_eq!(
+            envelope.extensions.get(ext_keys::ENTITIES),
+            Some(&json!([{ "type": "bug3-probe", "id": "attachment-passthrough-check" }]))
+        );
+        // Attachments carry the card, so it is NOT also lifted into
+        // ADAPTIVE_CARD (that would duplicate it on the outbound activity) —
+        // matches the legacy `copy_directline_passthrough` contract.
+        assert!(
+            !envelope.extensions.contains_key(ext_keys::ADAPTIVE_CARD),
+            "card rides inside forwarded attachments; no separate lift"
+        );
     }
 
     #[test]
