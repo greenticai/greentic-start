@@ -163,8 +163,17 @@ Fix it together with the `:718`/`:721` domain check, where it becomes observable
 ## Consequences to announce
 
 - `startup_contract.json` now reports `public_http_enabled: true` for probes-only runs.
-- `endpoints.json` (`src/runtime.rs:1523`) now carries `http_url`/`gateway_port` for
-  probes-only runs. Consumers will see a URL that serves only probes.
+  (Verified live.)
+- The startup banner now prints an `HTTP: http://…` line for probes-only runs, where it
+  previously printed none — `StartupInfo.http_url` (`src/runtime.rs:71`, populated at
+  `:1482`) is `Some` whenever the listener exists. Operators will see a URL that serves
+  only probes.
+- `endpoints.json` is **unchanged**. An earlier revision of this spec claimed it would gain
+  `http_url`/`gateway_port`; both halves were wrong. `DemoEndpoints` (`src/runtime.rs:2074-2082`)
+  has no `http_url` field at all — that belongs to the banner struct — and its `gateway_port`
+  was always written, falling back to `config.services.gateway.port` when no listener existed
+  (`:1470-1473`). Since strict bind means `actual_port == config port`, the file is
+  byte-identical before and after. Do not repeat this claim in the PR body.
 - `--cloudflared on` / `--ngrok on` on a zero-provider bundle now opens a real tunnel to a
   probes-only listener instead of warning and skipping (`src/runtime.rs:1106`, `:1182`).
 - The `GREENTIC_HEALTH_LIVENESS_PATH` / `GREENTIC_HEALTH_READINESS_PATH` escape hatch

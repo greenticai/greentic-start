@@ -627,7 +627,7 @@ git push -u origin feat/unconditional-http-listener
 ```
 
 PR body must state:
-- The behaviour change: `startup_contract.json` now reports `public_http_enabled: true` and `endpoints.json` carries `http_url`/`gateway_port` for probes-only runs. Consumers will see a URL that serves only probes.
+- The behaviour change: `startup_contract.json` now reports `public_http_enabled: true` for probes-only runs, and the startup banner prints an `HTTP: http://…` line where it previously printed none. Do NOT claim `endpoints.json` changed — it does not (`DemoEndpoints` has no `http_url`, and its `gateway_port` was always written); an earlier draft of this plan said otherwise and was wrong.
 - `--cloudflared on` / `--ngrok on` on a zero-provider bundle now opens a real tunnel to a probes-only listener instead of warning and skipping (`src/runtime.rs:1106`, `:1182`).
 - `gtc start` on a channel-less bundle now fails loudly if the port is busy, where it previously ran portless. This is intentional.
 - The live verification output from Steps 3 and 4.
