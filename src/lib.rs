@@ -1202,13 +1202,18 @@ mod tests {
     /// panics — a plain set_var/remove_var pair would leak the var into
     /// later tests in this binary if an `.expect()`/`assert!` in between
     /// panicked before the manual `remove_var` ran.
+    #[must_use = "bind the guard to a named variable (e.g. `let _gateway_port = ...`); \
+                  dropping it immediately clears the variable it just set"]
     struct GatewayPortGuard;
 
     impl GatewayPortGuard {
         fn set(port: &str) -> Self {
-            // SAFETY: tests in this binary that mutate this variable are
-            // serialized by test_env_lock(); the guard clears it on every
-            // exit path, including panics.
+            // Writes to this variable are serialized against other writers by
+            // test_env_lock(), and the guard clears it on every exit path,
+            // including panics. This mirrors the env-mutation pattern already
+            // used across this crate's tests (bundle_config.rs,
+            // bin_resolver.rs); it does not establish the absence of
+            // concurrent readers that set_var's contract formally asks for.
             unsafe { std::env::set_var("GREENTIC_GATEWAY_PORT", port) };
             Self
         }

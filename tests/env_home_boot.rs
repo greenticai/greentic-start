@@ -73,15 +73,20 @@ fn write_env_home_fixture(store_root: &Path) {
 /// plain set_var/remove_var pair would leak the var into the other tests
 /// sharing this process if an `.expect()`/`assert!` in between panicked
 /// before the manual `remove_var` ran.
+#[must_use = "bind the guard to a named variable (e.g. `let _gateway_port = ...`); \
+              dropping it immediately clears the variable it just set"]
 struct GatewayPortGuard;
 
 impl GatewayPortGuard {
     fn set(port: &str) -> Self {
-        // SAFETY: only `boots_from_env_home_and_stops_cleanly` in this
-        // binary mutates GREENTIC_GATEWAY_PORT, so there is no other test
-        // thread racing this write; the guard clears it on every exit path,
-        // including panics, so it never leaks into the other tests sharing
-        // this process.
+        // The three tests in this file share one process, and only
+        // `boots_from_env_home_and_stops_cleanly` writes this variable, so
+        // there is no competing writer. The guard clears it on every exit
+        // path, including panics, so it never leaks into the other two. This
+        // mirrors the env-mutation pattern already used across this crate's
+        // tests (bundle_config.rs, bin_resolver.rs); it does not establish
+        // the absence of concurrent readers that set_var's contract formally
+        // asks for.
         unsafe { std::env::set_var("GREENTIC_GATEWAY_PORT", port) };
         Self
     }
