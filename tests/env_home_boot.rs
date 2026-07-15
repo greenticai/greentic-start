@@ -16,7 +16,12 @@
 //! and passes through a real `load_env_home` call, a real
 //! `bundle_config::load_runtime_demo_config`, and a real `demo_up_services`
 //! run, then exits cleanly via a stop-request file — with no external
-//! binaries, no network ports, and no gating/skip needed.
+//! binaries and no gating/skip needed.
+//!
+//! The ingress listener always binds (it is not gated on discovering a
+//! messaging provider), so this test pins `GREENTIC_GATEWAY_PORT` to a fixed
+//! high port rather than inheriting the 8080 default, which would race with
+//! the boot tests in `src/lib.rs` running as a separate process.
 
 use std::path::Path;
 use std::thread;
@@ -34,7 +39,7 @@ use greentic_start::{
 /// just `tenant`/`team` — the same minimal shape
 /// `write_demo_bundle`/`make_start_request` use in `src/lib.rs`'s own
 /// embedded-mode boot tests, so this exercises exactly that already-proven
-/// "zero packs -> embedded runner mode, no gateway" path.
+/// "zero packs -> embedded runner mode, no supervised gateway process" path.
 fn write_env_home_fixture(store_root: &Path) {
     let env_home = store_root.join("local");
     let rev_dir = env_home.join("revisions").join("r1");
@@ -98,6 +103,11 @@ fn boots_from_env_home_and_stops_cleanly() {
     let store_root = temp.path().join("store-root");
     write_env_home_fixture(&store_root);
 
+    // See the module doc: the listener always binds, so pin a unique port.
+    unsafe {
+        std::env::set_var("GREENTIC_GATEWAY_PORT", "19905");
+    }
+
     let bundle_dir = store_root.join("local/revisions/r1/bundle");
     let log_dir = temp.path().join("logs");
 
@@ -136,6 +146,9 @@ fn boots_from_env_home_and_stops_cleanly() {
             .is_none(),
         "stop request should be cleared after a clean shutdown"
     );
+    unsafe {
+        std::env::remove_var("GREENTIC_GATEWAY_PORT");
+    }
 }
 
 #[test]

@@ -1219,6 +1219,14 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         crate::operator_log::reset_for_tests();
+        // Pin an explicit port: since the ingress listener now always binds,
+        // the default 8080 would race with the other boot tests (and with
+        // whatever else owns 8080 on a dev machine). Strict bind (range 0)
+        // turns such a collision into a hard failure, so the port must be
+        // deterministic and unique per test.
+        unsafe {
+            std::env::set_var("GREENTIC_GATEWAY_PORT", "19903");
+        }
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path().join("bundle");
         write_demo_bundle(&bundle);
@@ -1235,6 +1243,9 @@ mod tests {
                 .expect("read stop")
                 .is_none()
         );
+        unsafe {
+            std::env::remove_var("GREENTIC_GATEWAY_PORT");
+        }
     }
 
     #[test]
@@ -1243,6 +1254,9 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         crate::operator_log::reset_for_tests();
+        unsafe {
+            std::env::set_var("GREENTIC_GATEWAY_PORT", "19904");
+        }
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path().join("bundle");
         write_demo_bundle(&bundle);
@@ -1260,6 +1274,9 @@ mod tests {
                 .expect("read stop")
                 .is_none()
         );
+        unsafe {
+            std::env::remove_var("GREENTIC_GATEWAY_PORT");
+        }
     }
 
     #[test]
