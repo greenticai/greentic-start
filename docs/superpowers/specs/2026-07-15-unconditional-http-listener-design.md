@@ -1,0 +1,219 @@
+# Unconditional HTTP listener: decouple `expose` from messaging channels
+
+Date: 2026-07-15
+Status: design approved, not implemented
+Repo: `greentic-start` (branch `research`)
+
+## Problem
+
+A bundle with no messaging channel never binds an HTTP port, so `/healthz` never
+answers and the worker is reported dead. The failure is silent — the only symptom
+is a generic health timeout in whatever supervises the process.
+
+The gate is `src/runtime.rs:1679-1681`:
+
+```rust
+// Start HTTP server if we have ingress domains, static routes, or health probes to serve.
+if domains.is_empty() && !enable_static_routes && !health_probe_listener_required {
+    return Ok(None);
+}
+```
+
+`domains` comes from `detect_http_ingress_domains` (`src/runtime.rs:1617-1651`), which
+requires a discovered provider pack supporting `ingest_http`. Every component in the
+ecosystem that declares `ingest_http` is a messaging provider. So "does a port open?"
+is decided by "did you attach a chat channel?" — two questions that have nothing to
+do with each other.
+
+`discovery::discover_with_options` (`src/discovery.rs:42-100`) scans only
+`root.join("providers")`. Flows are never inspected, so a flows-only bundle cannot
+open the gate no matter what it declares.
+
+### This is not hypothetical
+
+`greentic-flow`'s `map_flow_type` (`src/lib.rs:63-75`) admits five flow kinds:
+`messaging`, `event`/`events`, `component-config`, `job`, `http`. Four need no channel.
+
+`greentic-secrets/packs/{aws-sm,azure-kv,gcp-sm,k8s,vault-kv}/` ships 5 packs × 6 flows
+= 30 `type: event` flows with zero messaging references. They are driven by named
+entrypoints declared in `pack.yaml` (`read_secret`, `write_secret`, `breakglass`, …).
+Booting one under `gtc start` today yields no listener and no health.
+
+### Why `--store-root` does not already solve it
+
+The env-home boot (SP1, #352) is a *resolver*, not a boot mode. `src/env_home/loader.rs:5-12`
+states it verifies pinned packs in place, points `bundle_config::resolve_bundle_dir_paths`
+at `<rev>/bundle/`, then calls the unchanged loader. The only fork is `src/lib.rs:318-342`;
+both arms rejoin at `src/lib.rs:343` and converge on `src/runtime.rs:859` →
+the same gate. `--store-root` is channel-gated identically to `--bundle`.
+
+### Why `main` does not already solve it
+
+`main` carries `src/revision_serve.rs` (9838 lines), whose listener binds unconditionally
+and which routes `/workers/invoke`. But `main`'s gate at `src/runtime.rs:1679` is
+byte-identical to `research`'s: `revision_serve` is a *parallel* path taken only when
+`bundle_less == true` (`main:src/lib.rs:404`). Callers passing `--bundle` — including
+`greentic-designer` (`src/orchestrate/local_deploy/manager.rs:113`) — stay on the legacy
+ingress on both branches. `main:src/lib.rs:662` records this as deliberate.
+
+Adopting `revision_serve` here is not available: `research` cannot absorb `main`
+(`greentic-deploy-spec` caps `greentic-config-types <1.2.0-0` against `research`'s
+`=1.3.0-research.0` pins — a release-train blocker, not a merge conflict).
+
+## Goals
+
+- The HTTP listener always binds. Probes (`/healthz`, `/readyz`, `/status`) answer for
+  every booted bundle, channel or not.
+- Channel presence decides *routing* only, never whether a port opens.
+- One change serves both `--bundle` and `--store-root`, since the gate sits below their
+  convergence point.
+
+## Non-goals
+
+- **No `/workers/invoke`.** Channel-less workers are triggered by NATS business events,
+  cron, or named entrypoints. Adding an inbound invoke surface is a separate decision with
+  its own attack surface; `main` deliberately loopback-gates it (`revision_serve.rs:1394`).
+- **No flow→ingress wiring.** Making `type: event` flows with `http:/path` entrypoints
+  serve real webhooks requires discovery to read flows — a domain-model change, tracked
+  separately.
+- **No designer changes.** See "Relationship to designer" below.
+- **No `revision_serve` port.** Blocked by the release train; also unnecessary for probes.
+
+## Design
+
+### 1. Remove the gate
+
+Delete `src/runtime.rs:1679-1681`. `start_http_ingress_server` always returns `Some`.
+
+No new probe code is needed: `handle_builtin_health_request` is already dispatched ahead
+of all routing at `src/http_ingress/mod.rs:456` (implementation at
+`src/http_ingress/helpers.rs:123-141`) and never consults a provider. Probes go green the
+moment a listener exists.
+
+Requests for a domain with no provider keep returning 404 (`src/http_ingress/mod.rs:713`,
+`:723-728`). That is correct: the port is open, the route genuinely does not exist.
+
+### 2. Port conflicts fail loudly (keep strict bind)
+
+`research` binds with `find_available_port(&listen_addr_str, requested_port, 0)`
+(`src/http_ingress/mod.rs:241`) — range 0, no fallback. `main`'s ingress and
+`revision_serve` both use range 10.
+
+**Keep range 0.** The rationale at `src/http_ingress/mod.rs:230-237` still holds: displayed
+URLs are hardcoded to the requested port, so silently rebinding points browsers at an
+orphaned process and surfaces as `secret_error`/stale-state symptoms that masquerade as
+runtime bugs. `src/port_utils.rs:60-72` locks this in as a contract test
+(`range_zero_refuses_fallback_when_port_busy`).
+
+This is consistent with the change's purpose: we are deleting a *silent* failure. Replacing
+it with a *silent port shift* would relocate the disease, not cure it.
+
+**Accepted behavior change.** `gtc start` on a channel-less bundle while the default port
+8080 (`src/config.rs:409-411`) is occupied now fails to boot where it previously ran
+portless. This is honest and actionable. The error already exists
+(`src/port_utils.rs:14-17`, "no available port found"); improve it to name the port and
+suggest `GREENTIC_GATEWAY_PORT`.
+
+Designer is unaffected: it allocates a free port and passes `GREENTIC_GATEWAY_PORT`
+explicitly (`greentic-designer/src/orchestrate/local_deploy/manager.rs:94`, `:125`).
+
+### 3. Retire the obsolete static-routes guard
+
+`src/startup_contract.rs:116-127` fails fast with *"bundle declares static routes but this
+launch mode does not expose public HTTP"*. Once the listener always binds, that condition
+is unreachable. Delete the guard and its test `resolve_rejects_missing_public_http`
+(`src/startup_contract.rs:275`) explicitly rather than leaving misleading dead code.
+
+### 4. Decouple the pack HTTP route table from static routes
+
+`src/http_ingress/mod.rs:146` builds the `greentic.http-routes.v1` route table only when
+`enable_static_routes` is true, so a pack declaring HTTP routes but not static routes has
+its table silently dropped to `HttpRouteTable::default()`. This is the same class of
+coupling, in the same file, and would become the next silent-failure bug. Build the route
+table whenever the pack declares one.
+
+Note the independent second trap at `src/http_ingress/mod.rs:713`: `state.domains.contains(&domain)`
+applies to pack-declared route matches too, so a declared route can still 404 as
+"domain disabled". That is out of scope here (it needs the flow→ingress work) but must not
+be mistaken for this fix failing.
+
+## Consequences to announce
+
+- `startup_contract.json` now reports `public_http_enabled: true` for probes-only runs.
+- `endpoints.json` (`src/runtime.rs:1523`) now carries `http_url`/`gateway_port` for
+  probes-only runs. Consumers will see a URL that serves only probes.
+- `--cloudflared on` / `--ngrok on` on a zero-provider bundle now opens a real tunnel to a
+  probes-only listener instead of warning and skipping (`src/runtime.rs:1106`, `:1182`).
+- The `GREENTIC_HEALTH_LIVENESS_PATH` / `GREENTIC_HEALTH_READINESS_PATH` escape hatch
+  (`src/runtime.rs:1671-1677`) becomes redundant. Leave it in place — it is set by
+  `greentic-deployer/src/single_vm.rs:892-893` and removing it is a separate cross-repo
+  change. It simply stops being load-bearing.
+
+## Testing
+
+### Tests that must be inverted (intentional behavior change)
+
+- `src/runtime.rs:2422-2431` — asserts `start_http_ingress_server(&config, &[], …)?.is_none()`
+- `src/runtime.rs:2547` — `assert!(handles.ingress_server.is_none())`
+- `src/runtime.rs:2556` — `assert!(!startup_contract.public_http_enabled)`
+
+### Hermetic boot tests that will now bind — must pin a port
+
+These currently rely on "zero packs → no network ports" and will otherwise race for 8080:
+
+- `src/lib.rs:1217` `run_start_request_embedded_mode_stops_cleanly`
+- `src/lib.rs:1241` `run_restart_request_embedded_mode_stops_cleanly`
+- `tests/env_home_boot.rs:98` `boots_from_env_home_and_stops_cleanly`
+
+Each must allocate a free port and set `GREENTIC_GATEWAY_PORT`. Update the module doc at
+`tests/env_home_boot.rs:15-19`, which advertises "no network ports" as a design property.
+
+**This is mandatory, not hygiene.** `ci/local_check.sh:19` runs `cargo test` with default
+parallelism, and cargo runs test *binaries* as separate processes. `test_env_lock()`
+(`src/lib.rs:942`) is an in-process mutex and cannot serialize `tests/env_home_boot.rs`.
+Without explicit ports these three race for 8080 and the loser hard-fails under range 0.
+
+### New tests
+
+- Zero-provider bundle boots → `ingress_server.is_some()` and `/healthz` returns 200.
+- Zero-provider bundle on an occupied port → boot fails with an error naming the port.
+- Pack declaring `greentic.http-routes.v1` without static routes → route table is populated.
+
+### Live verification (required — tests alone do not answer the question)
+
+Boot `greentic-secrets/packs/vault-kv` (6 `type: event` flows, zero messaging providers)
+via `gtc start` and `curl /healthz` → 200. This is the only evidence that the original
+report is fixed.
+
+## Relationship to designer
+
+**This change is a no-op for `greentic-designer`.** Since #1046, designer injects
+`messaging-webchat-gui` into every bundle unconditionally
+(`src/orchestrate/local_deploy/provider_refs.rs:23-25`), so its bundles already always bind.
+Only bundles that are portless today change behavior — exactly the ones this targets.
+
+Consequently this work has no designer prerequisite and cannot regress designer.
+
+Two designer-side problems were found while scoping this and are **explicitly separate
+projects** — neither blocks nor is blocked by this spec:
+
+- **Designer has no flow-kind concept.** `type: messaging` is hardcoded at
+  `src/orchestrate/pack_via_packc/mod.rs:1300`, `src/orchestrate/dw_application_pack.rs:65`,
+  and defaulted on the single-flow path. No `flow_kind` column exists; the frontend has no
+  such concept. Every designer-built pack is `messaging` by construction, which is why
+  designer's "No channel" option (`web/src/features/deploy-run/setup-wizard/ChannelStep.tsx:30`)
+  cannot be made honest without first making flow kind an authored property.
+- **`FlowType::Scheduled` emits an uncompilable flow.** `src/flow_generator/compiler/emit.rs:71`
+  emits `"scheduled"`, which `map_flow_type` rejects as `UnknownFlowType`. Designer's
+  `FlowType {Messaging, Event, Scheduled}` (`src/flow_generator/intent.rs:67`) does not match
+  `greentic_types::FlowKind {Messaging, Event, ComponentConfig, Job, Http}`, though
+  `greentic-types` is already a designer dependency (`Cargo.toml:106`) and `FlowKind` is
+  already used at `src/orchestrate/cbor_flow_post.rs:30`.
+
+## Rollout
+
+Branch `feat/unconditional-http-listener` off `origin/research`. Single PR: the gate, the
+port-error message, the static-routes guard removal, the route-table decoupling, and all
+test updates belong together — landing the gate alone leaves CI flaky.
+
+`bash ci/local_check.sh` must pass before the PR is declared done.
