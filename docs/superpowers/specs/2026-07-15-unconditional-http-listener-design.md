@@ -1,7 +1,7 @@
 # Unconditional HTTP listener: decouple `expose` from messaging channels
 
 Date: 2026-07-15
-Status: design approved, not implemented
+Status: implemented
 Repo: `greentic-start` (branch `research`)
 
 ## Problem
@@ -164,6 +164,20 @@ Fix it together with the `:718`/`:721` domain check, where it becomes observable
 
 - `startup_contract.json` now reports `public_http_enabled: true` for probes-only runs.
   (Verified live.)
+- **`PUBLIC_HTTP_ENABLED` flips `false` → `true` in the environment of four supervised child
+  processes.** `StartupContract::apply_env` (`src/startup_contract.rs:67-87`) injects the
+  resolved launch flags into every child spawned via `build_env(…, Some(&startup_contract))`:
+  nats (`src/runtime.rs:1357`), gateway (`:1387`), egress (`:1401`), subscriptions (`:1424`).
+  `.codex/repo_overview.md:35` documents this env export — not `startup_contract.json` — as the
+  real cross-process interface, so it is the contract that actually moves here. Since
+  `run_gsm_services = config.services.nats.enabled` (`:1075`) and NATS defaults on, a
+  channel-less bundle booted with default NATS now hands all four children
+  `PUBLIC_HTTP_ENABLED=true` where they previously got `false`.
+  **Nothing on this branch exercised this.** Both live runs used `--nats off`, and the new tests
+  either set `nats.enabled: false` or bypass `demo_up_services` entirely — so no child process
+  has been observed reading the changed value. Whether any consumer branches on it is
+  **unverified**: `greentic-runner` is `.git`-only on this machine and its source cannot be read
+  here.
 - The startup banner now prints an `HTTP: http://…` line for probes-only runs, where it
   previously printed none — `StartupInfo.http_url` (`src/runtime.rs:71`, populated at
   `:1482`) is `Some` whenever the listener exists. Operators will see a URL that serves
@@ -197,8 +211,12 @@ These currently rely on "zero packs → no network ports" and will otherwise rac
 - `src/lib.rs:1241` `run_restart_request_embedded_mode_stops_cleanly`
 - `tests/env_home_boot.rs:98` `boots_from_env_home_and_stops_cleanly`
 
-Each must allocate a free port and set `GREENTIC_GATEWAY_PORT`. Update the module doc at
-`tests/env_home_boot.rs:15-19`, which advertises "no network ports" as a design property.
+Each must pin a fixed high port (19903/19904/19905) via `GREENTIC_GATEWAY_PORT`. Fixed ports
+beat dynamic allocation here because under strict bind (range 0) a lost TOCTOU race between
+"find a free port" and "bind it" is a hard boot failure, so allocating is *less* reliable than
+pinning ports nothing else claims — which is also the existing convention in `src/port_utils.rs`'s
+own tests (19876, 19890, …). Update the module doc at `tests/env_home_boot.rs:15-19`, which
+advertises "no network ports" as a design property.
 
 **This is mandatory, not hygiene.** `ci/local_check.sh:19` runs `cargo test` with default
 parallelism, and cargo runs test *binaries* as separate processes. `test_env_lock()`

@@ -4,7 +4,7 @@
 
 **Goal:** Make `greentic-start` always bind its HTTP listener so a bundle with no messaging channel still answers `/healthz`, instead of being silently portless and reported dead.
 
-**Architecture:** Delete the channel-dependent gate in `start_http_ingress_server` so it always returns `Some`. Probes need no new code — `handle_builtin_health_request` is already dispatched ahead of all routing and never consults a provider. Strict bind (range 0) is retained on purpose: we are removing a *silent* failure, and a silent port shift would relocate it. The PR is deliberately narrow — see "Deviations from the spec" at the end for the two cleanups the spec asked for and this plan defers, with reasons.
+**Architecture:** Delete the channel-dependent gate in `start_http_ingress_server` so it always returns `Some`. Probes need no new code — `handle_builtin_health_request` is already dispatched ahead of all routing and never consults a provider. Strict bind (range 0) is retained on purpose: we are removing a *silent* failure, and a silent port shift would relocate it. The PR is deliberately narrow — see "Decisions recorded in spec §3/§4" at the end for why the static-routes guard stays and the HTTP route-table decoupling is deferred.
 
 **Tech Stack:** Rust 1.95.0, `anyhow`, `tokio`, `hyper` (ingress), `reqwest` (blocking, already a main dependency at `Cargo.toml:63`), `tempfile` (dev-dep).
 
@@ -636,23 +636,23 @@ PR body must state:
 
 ---
 
-## Deviations from the spec (deliberate — flag in review)
+## Decisions recorded in spec §3/§4
 
-Both deviations were found by reading the code while writing this plan. The spec was written before that reading and is wrong on these two points; it should be amended to match. Nothing else in the spec changes.
+Both decisions came out of reading the code while writing this plan. An earlier revision of the spec, written before that reading, called for the opposite on each point; the spec was amended to match and now reads as below. They are settled — recorded here for the reasoning, not reopened.
 
-### 1. The static-routes guard stays (spec §3 said delete it)
+### 1. The static-routes guard stays (spec §3)
 
-The spec says to delete the guard at `src/startup_contract.rs:116-121` and its test `resolve_rejects_missing_public_http` (`src/startup_contract.rs:275`), on the grounds that they become unreachable dead code.
+An earlier revision of the spec called for deleting the guard at `src/startup_contract.rs:116-121` and its test `resolve_rejects_missing_public_http` (`src/startup_contract.rs:275`), on the grounds that they become unreachable dead code.
 
-**This plan keeps both.** The premise is wrong: `startup_contract::resolve` is a **pure function** and `http_listener_enabled` is one of its *inputs*, not a global. Removing the gate makes the real caller (`src/runtime.rs:1308` → `:1335`) always pass `true`, but `resolve` remains callable with `false` and its guard remains ordinary input validation. Deleting it removes a safety net and drops coverage of a legitimate input combination, buying nothing.
+**Both stay, and the spec now says so.** That premise was wrong: `startup_contract::resolve` is a **pure function** and `http_listener_enabled` is one of its *inputs*, not a global. Removing the gate makes the real caller (`src/runtime.rs:1308` → `:1335`) always pass `true`, but `resolve` remains callable with `false` and its guard remains ordinary input validation. Deleting it removes a safety net and drops coverage of a legitimate input combination, buying nothing.
 
 It also guards a future this codebase already gestures at: `greentic_types::FlowKind::Job` ("Batch/background jobs") exists as a spec-only variant today. A batch launch mode with no listener is exactly when "bundle declares static routes but this launch mode does not expose public HTTP" would be a real bug worth catching.
 
-### 2. The HTTP route-table decoupling is deferred (spec §4 said do it here)
+### 2. The HTTP route-table decoupling is deferred (spec §4)
 
-The spec says to stop gating pack-declared HTTP route discovery (`greentic.http-routes.v1`) on `enable_static_routes` at `src/http_ingress/mod.rs:146`, arguing it is "the same class of coupling, in the same file".
+An earlier revision of the spec folded in the removal of the `enable_static_routes` gate on pack-declared HTTP route discovery (`greentic.http-routes.v1`, `src/http_ingress/mod.rs:146`), arguing it is "the same class of coupling, in the same file".
 
-**This plan defers it to the flow→ingress project.** Three reasons, in order of weight:
+**It is deferred to the flow→ingress project, and the spec now says so.** Three reasons, in order of weight:
 
 1. **It cannot be observed without also fixing an out-of-scope check.** A pack-declared route matches at `src/http_ingress/mod.rs:687`, but then still passes through `state.domains.contains(&domain)` (`:718` → 404 "domain disabled") and `supports_op(domain, provider, "ingest_http")` (`:721` → 404). So populating the table changes behaviour only for a bundle that has a real `ingest_http` provider **and** declares http-routes **and** ships no static assets — a narrow shape that the listener change does not affect either way.
 2. **The fixture to test it does not exist.** `discover_http_routes_from_bundle` (`src/http_routes.rs:240`) has **zero test coverage** today; `src/http_routes.rs`'s tests only build in-memory descriptors via `make_route` (`:359`). Covering this properly needs a new `.gtpack` fixture writing `greentic.http-routes.v1` into `manifest.cbor` (`read_pack_http_routes` parses it out of the zip), plus a real `ingest_http` provider to observe the effect end-to-end.
