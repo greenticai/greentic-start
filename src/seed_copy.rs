@@ -445,33 +445,44 @@ mod tests {
         maybe_seed_env_store().unwrap();
     }
 
+    // Sets HOME + GREENTIC_SEED_DIR + GREENTIC_ENV under the process-wide env
+    // lock, runs `f`, then restores every var before returning its result.
     #[cfg(unix)]
-    #[test]
-    fn maybe_seed_copies_into_resolved_env_dir_writable() {
+    fn with_seed_env<R>(home: &Path, seed: &Path, env: &str, f: impl FnOnce() -> R) -> R {
         let _guard = crate::test_env_lock().lock().unwrap();
-        let seed = tempdir().unwrap();
-        let home = tempdir().unwrap();
-        fs::write(seed.path().join("environment.json"), b"{}").unwrap();
-
         let prev_home = std::env::var_os("HOME");
         let prev_seed = std::env::var_os(SEED_DIR_ENV);
         let prev_env = std::env::var_os("GREENTIC_ENV");
-        // SAFETY: guarded by the process-wide test env lock; restored below.
+        // SAFETY: guarded by the process-wide test env lock; restored before return.
         unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var(SEED_DIR_ENV, seed.path());
-            std::env::set_var("GREENTIC_ENV", crate::DEFAULT_ENV_ID);
+            std::env::set_var("HOME", home);
+            std::env::set_var(SEED_DIR_ENV, seed);
+            std::env::set_var("GREENTIC_ENV", env);
         }
-
-        let res = maybe_seed_env_store();
-
-        // SAFETY: still holding the env lock; restore before asserting.
+        let out = f();
+        // SAFETY: still holding the env lock.
         unsafe {
             restore("HOME", prev_home);
             restore(SEED_DIR_ENV, prev_seed);
             restore("GREENTIC_ENV", prev_env);
         }
-        res.unwrap();
+        out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maybe_seed_copies_into_resolved_env_dir_writable() {
+        let seed = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        fs::write(seed.path().join("environment.json"), b"{}").unwrap();
+
+        with_seed_env(
+            home.path(),
+            seed.path(),
+            crate::DEFAULT_ENV_ID,
+            maybe_seed_env_store,
+        )
+        .unwrap();
 
         let landed = home
             .path()
@@ -487,29 +498,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn maybe_seed_rejects_dot_dot_env_id() {
-        let _guard = crate::test_env_lock().lock().unwrap();
         let seed = tempdir().unwrap();
         let home = tempdir().unwrap();
         fs::write(seed.path().join("environment.json"), b"{}").unwrap();
 
-        let prev_home = std::env::var_os("HOME");
-        let prev_seed = std::env::var_os(SEED_DIR_ENV);
-        let prev_env = std::env::var_os("GREENTIC_ENV");
-        // SAFETY: guarded by the process-wide test env lock; restored below.
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var(SEED_DIR_ENV, seed.path());
-            std::env::set_var("GREENTIC_ENV", "..");
-        }
-
-        let res = maybe_seed_env_store();
-
-        // SAFETY: still holding the env lock; restore before asserting.
-        unsafe {
-            restore("HOME", prev_home);
-            restore(SEED_DIR_ENV, prev_seed);
-            restore("GREENTIC_ENV", prev_env);
-        }
+        let res = with_seed_env(home.path(), seed.path(), "..", maybe_seed_env_store);
 
         let err = res.expect_err("`..` env id must be rejected");
         assert!(

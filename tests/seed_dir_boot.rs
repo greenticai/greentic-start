@@ -63,9 +63,15 @@ fn seeding_is_idempotent_and_overwrites() {
 }
 
 #[test]
-fn empty_seed_is_rejected() {
+fn empty_seed_is_rejected_and_leaves_dest_untouched() {
     let seed = tempdir().unwrap();
     let dest = tempdir().unwrap();
     let err = greentic_start::seed_env_store_from(seed.path(), dest.path()).unwrap_err();
     assert!(err.to_string().contains("no files to seed"));
+    // Beyond the unit-level error check: prove no partial write reached the
+    // destination through the public API.
+    assert!(
+        fs::read_dir(dest.path()).unwrap().next().is_none(),
+        "a rejected empty seed must not create any files at the destination"
+    );
 }
