@@ -848,6 +848,24 @@ async fn serve(
             )
         })?;
 
+    // Deployment-scoped static route serving (pack SPA assets). Checked
+    // AFTER deployment resolution so the response is scoped to the correct
+    // deployment, and gated to loopback + GET/HEAD (mirrors the `/chat`
+    // console gate above).
+    if peer_is_loopback
+        && (method == hyper::Method::GET || method == hyper::Method::HEAD)
+        && let Some(table) = activation.routing.static_routes.get(&deployment_id)
+        && let Some(route_match) = table.match_request(&path)
+    {
+        return Ok(
+            crate::http_ingress::static_handler::serve_static_route_from_pack(
+                &route_match,
+                &path,
+                &method,
+            ),
+        );
+    }
+
     let body_bytes = read_body_limited(req).await.map_err(|_| {
         error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -3813,6 +3831,7 @@ mod tests {
                 deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
+                static_routes: std::collections::BTreeMap::new(),
             }),
         }
     }
@@ -4625,6 +4644,7 @@ mod tests {
             )]),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: std::sync::Arc::default(),
+            static_routes: std::collections::BTreeMap::new(),
         });
         let activation = Activation {
             host: base.host,

@@ -482,6 +482,7 @@ mod tests {
             deployment_routes: DeploymentRouteTable::default(),
             endpoint_admit: Arc::new(EndpointAdmit::default()),
             deployment_config_overrides: Arc::default(),
+            static_routes: std::collections::BTreeMap::new(),
         });
         let activation = Arc::new(Activation { host, routing });
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();

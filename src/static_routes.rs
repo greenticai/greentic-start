@@ -250,6 +250,32 @@ fn default_schema_version() -> u32 {
     1
 }
 
+/// Discover static routes from a set of pack paths (env/no-bundle model).
+///
+/// Unlike [`discover_from_bundle`] this does NOT call
+/// `check_bundle_assets_capability` — there is no `bundle.yaml` in the
+/// env model. Otherwise mirrors that function's structure: reads each
+/// pack, collects descriptors, validates against reserved routes.
+pub(crate) fn discover_from_packs(
+    pack_paths: &[PathBuf],
+    reserved_routes: &ReservedRouteSet,
+) -> StaticRoutePlan {
+    let mut plan = StaticRoutePlan::default();
+    for pack_path in pack_paths {
+        let descriptors = match read_pack_static_routes(pack_path) {
+            Ok(Some(descriptors)) => descriptors,
+            Ok(None) => continue,
+            Err(err) => {
+                plan.blocking_failures.push(err.to_string());
+                continue;
+            }
+        };
+        plan.routes.extend(descriptors);
+    }
+    validate_plan(&mut plan, reserved_routes);
+    plan
+}
+
 pub fn discover_from_bundle(
     bundle_root: &Path,
     reserved_routes: &ReservedRouteSet,
@@ -888,5 +914,176 @@ mod tests {
             None
         );
         assert_eq!(content_type_for_path("site/app.woff2"), "font/woff2");
+    }
+
+    /// Build a minimal `.gtpack` ZIP whose manifest declares a
+    /// `greentic.static-routes.v1` extension serving `/v1/web/webchat/{tenant}`.
+    fn write_webchat_gui_gtpack(path: &Path) {
+        write_static_route_gtpack(path, "/v1/web/webchat/{tenant}");
+    }
+
+    /// Build a minimal `.gtpack` ZIP whose `greentic.static-routes.v1`
+    /// extension claims `public_path`, plus a sample asset file.
+    fn write_static_route_gtpack(path: &Path, public_path: &str) {
+        use greentic_types::cbor::encode_pack_manifest;
+        use greentic_types::{
+            ExtensionInline, ExtensionRef, PackKind, PackManifest, PackSignatures,
+        };
+        use std::io::Write;
+
+        let static_routes_payload = serde_json::json!({
+            "schema_version": 1,
+            "routes": [{
+                "id": "webchat-gui",
+                "public_path": public_path,
+                "source_root": "assets/webchat-gui",
+                "index_file": "index.html",
+                "spa_fallback": "index.html",
+                "scope": { "tenant": true, "team": false }
+            }]
+        });
+        let mut extensions = std::collections::BTreeMap::new();
+        extensions.insert(
+            EXT_STATIC_ROUTES_V1.to_string(),
+            ExtensionRef {
+                kind: EXT_STATIC_ROUTES_V1.to_string(),
+                version: "1".to_string(),
+                digest: None,
+                location: None,
+                inline: Some(ExtensionInline::Other(static_routes_payload)),
+            },
+        );
+        let manifest = PackManifest {
+            schema_version: "1".to_string(),
+            pack_id: "messaging-webchat-gui".parse().expect("pack_id"),
+            name: None,
+            version: semver::Version::new(0, 1, 0),
+            kind: PackKind::Provider,
+            publisher: "test".to_string(),
+            components: Vec::new(),
+            flows: Vec::new(),
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            secret_requirements: Vec::new(),
+            signatures: PackSignatures::default(),
+            bootstrap: None,
+            extensions: Some(extensions),
+            agents: std::collections::BTreeMap::new(),
+        };
+        let cbor = encode_pack_manifest(&manifest).expect("encode manifest");
+
+        let file = std::fs::File::create(path).expect("create gtpack");
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("manifest.cbor", opts)
+            .expect("start manifest.cbor");
+        zip.write_all(&cbor).expect("write manifest.cbor");
+        zip.start_file("assets/webchat-gui/index.html", opts)
+            .expect("start index.html");
+        zip.write_all(b"<html><body>SPA</body></html>")
+            .expect("write index.html");
+        zip.finish().expect("finish gtpack");
+    }
+
+    #[test]
+    fn discover_from_packs_finds_static_routes_and_match_works() {
+        let dir = tempdir().expect("tempdir");
+        let pack_path = dir.path().join("messaging-webchat-gui.gtpack");
+        write_webchat_gui_gtpack(&pack_path);
+
+        let reserved = ReservedRouteSet::operator_defaults();
+        let plan = discover_from_packs(&[pack_path], &reserved);
+
+        assert!(
+            plan.blocking_failures.is_empty(),
+            "{:?}",
+            plan.blocking_failures
+        );
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(plan.routes.len(), 1);
+        assert_eq!(plan.routes[0].pack_id, "messaging-webchat-gui");
+        assert_eq!(plan.routes[0].public_path, "/v1/web/webchat/{tenant}");
+        assert!(plan.routes[0].tenant_scoped);
+
+        let table = ActiveRouteTable::from_plan(&plan);
+        let m = table
+            .match_request("/v1/web/webchat/demo/index.html")
+            .expect("should match");
+        assert_eq!(m.asset_path, "index.html");
+        assert_eq!(m.descriptor.pack_id, "messaging-webchat-gui");
+
+        // Directory request matches too
+        let m2 = table
+            .match_request("/v1/web/webchat/demo/")
+            .expect("should match directory");
+        assert!(m2.asset_path.is_empty());
+        assert!(m2.request_is_directory);
+    }
+
+    #[test]
+    fn discover_from_packs_flags_reserved_path_conflict_as_blocking() {
+        // A pack that claims a reserved operator prefix (`/runtime`) must
+        // surface a blocking failure so `revision_boot` fails closed and
+        // serves NONE of that deployment's static routes.
+        let dir = tempdir().expect("tempdir");
+        let pack_path = dir.path().join("bad-pack.gtpack");
+        // `/runtime` is a reserved operator prefix; `{tenant}` keeps the route
+        // scope-consistent so it reaches the reserved-path check (not the
+        // scope-flag check).
+        write_static_route_gtpack(&pack_path, "/runtime/{tenant}");
+
+        let reserved = ReservedRouteSet::operator_defaults();
+        let plan = discover_from_packs(&[pack_path], &reserved);
+
+        assert!(
+            plan.blocking_failures
+                .iter()
+                .any(|f| f.contains("reserved operator path")),
+            "expected a reserved-path blocking failure, got {:?}",
+            plan.blocking_failures
+        );
+    }
+
+    #[test]
+    fn discover_from_packs_skips_packs_without_static_routes() {
+        let dir = tempdir().expect("tempdir");
+        // Create a pack with no static routes extension — just a minimal manifest
+        let pack_path = dir.path().join("other.gtpack");
+        {
+            use greentic_types::cbor::encode_pack_manifest;
+            use greentic_types::{PackKind, PackManifest, PackSignatures};
+            use std::io::Write;
+
+            let manifest = PackManifest {
+                schema_version: "1".to_string(),
+                pack_id: "other-pack".parse().expect("pack_id"),
+                name: None,
+                version: semver::Version::new(0, 1, 0),
+                kind: PackKind::Provider,
+                publisher: "test".to_string(),
+                components: Vec::new(),
+                flows: Vec::new(),
+                dependencies: Vec::new(),
+                capabilities: Vec::new(),
+                secret_requirements: Vec::new(),
+                signatures: PackSignatures::default(),
+                bootstrap: None,
+                extensions: None,
+                agents: std::collections::BTreeMap::new(),
+            };
+            let cbor = encode_pack_manifest(&manifest).expect("encode");
+            let file = std::fs::File::create(&pack_path).expect("create");
+            let mut zip = zip::ZipWriter::new(file);
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("manifest.cbor", opts).expect("start");
+            zip.write_all(&cbor).expect("write");
+            zip.finish().expect("finish");
+        }
+
+        let plan = discover_from_packs(&[pack_path], &ReservedRouteSet::operator_defaults());
+        assert!(plan.routes.is_empty());
+        assert!(plan.blocking_failures.is_empty());
     }
 }

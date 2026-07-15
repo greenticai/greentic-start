@@ -638,6 +638,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             };
             operator_log::info(module_path!(), chat.clone());
             println!("{chat}");
+            let gui_hint = format!(
+                "webchat GUI (if pack present) at http://{listen}/v1/web/webchat/<tenant>/"
+            );
+            operator_log::info(module_path!(), gui_hint.clone());
+            println!("{gui_hint}");
         }
 
         // `--cloudflared on` / `--ngrok on`: spawn the quick tunnel against

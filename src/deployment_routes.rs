@@ -243,6 +243,10 @@ pub struct RevisionIngressRouting {
     /// the routing-table swap a reload performs — the egress reads it on
     /// every reply.
     pub deployment_config_overrides: Arc<DeploymentConfigOverrides>,
+    /// Per-deployment static route tables built from pack manifests at
+    /// activation. Keyed by `DeploymentId` so the ingress serves assets
+    /// scoped to the deployment the request resolved to.
+    pub static_routes: BTreeMap<DeploymentId, crate::static_routes::ActiveRouteTable>,
 }
 
 /// Strip a trailing `:port` from a host header value. IPv6 literals are bracketed

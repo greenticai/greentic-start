@@ -3,7 +3,7 @@ mod conv_dedup;
 mod directline_session;
 mod helpers;
 mod messaging;
-mod static_handler;
+pub(crate) mod static_handler;
 pub mod websocket;
 
 use std::{
@@ -2441,6 +2441,7 @@ mod tests {
             http_routes: HttpRouteTable::default(),
             deployment_routes,
             deployment_config_overrides: Arc::default(),
+            static_routes: std::collections::BTreeMap::new(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
@@ -2483,6 +2484,7 @@ mod tests {
             http_routes: HttpRouteTable::default(),
             deployment_routes,
             deployment_config_overrides: Arc::default(),
+            static_routes: std::collections::BTreeMap::new(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));

@@ -78,6 +78,109 @@ pub(super) fn serve_static_route(
     error_response(StatusCode::NOT_FOUND, "file not found")
 }
 
+/// Serve a static-route asset straight from the `.gtpack` ZIP (env/no-bundle
+/// model). Unlike [`serve_static_route`] this skips bundle overlay,
+/// i18n-manifest synthesis, and tenant-config synthesis (those require a
+/// `bundle_root` that doesn't exist in the env model).
+///
+/// Anti-framing headers are added on HTML responses to prevent cross-site
+/// iframe embedding (mirrors `asset_response` in `revision_serve`).
+pub(crate) fn serve_static_route_from_pack(
+    route_match: &StaticRouteMatch<'_>,
+    request_path: &str,
+    method: &hyper::Method,
+) -> Response<Full<Bytes>> {
+    // Trailing-slash redirect for bare directory requests — same logic as
+    // `serve_static_route`.
+    if route_match.asset_path.is_empty() && !route_match.request_is_directory {
+        let redirect_path = format!("{}/", request_path.trim_end_matches('/'));
+        return Response::builder()
+            .status(StatusCode::MOVED_PERMANENTLY)
+            .header("Location", &redirect_path)
+            .header("Content-Length", "0")
+            .body(Full::from(Bytes::new()))
+            .unwrap_or_else(|_| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "redirect failed")
+            });
+    }
+
+    if let Some(asset_path) = resolve_asset_path(route_match) {
+        match serve_pack_only_asset(route_match.descriptor, &asset_path) {
+            Ok(Some(response)) => return maybe_strip_body(response, method),
+            Ok(None) => {}
+            Err(err) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+            }
+        }
+    }
+    if let Some(asset_path) = fallback_asset_path(route_match) {
+        match serve_pack_only_asset(route_match.descriptor, &asset_path) {
+            Ok(Some(response)) => return maybe_strip_body(response, method),
+            Ok(None) => {}
+            Err(err) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+            }
+        }
+    }
+    maybe_strip_body(
+        error_response(StatusCode::NOT_FOUND, "file not found"),
+        method,
+    )
+}
+
+/// Read an asset from the pack only (no bundle overlay) and build the HTTP
+/// response. Adds anti-framing headers on HTML responses.
+fn serve_pack_only_asset(
+    descriptor: &StaticRouteDescriptor,
+    asset_path: &str,
+) -> anyhow::Result<Option<Response<Full<Bytes>>>> {
+    let Some(asset_path) = normalize_relative_asset_path(asset_path) else {
+        return Ok(None);
+    };
+    let full_path = format!("{}/{}", descriptor.source_root, asset_path);
+
+    let body = match read_pack_asset_bytes(&descriptor.pack_path, &full_path)? {
+        Some(bytes) => bytes,
+        None => return Ok(None),
+    };
+
+    let content_type = content_type_for_path(&full_path);
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_LENGTH, body.len().to_string());
+    if let Some(cache_control) = cache_control_value(&descriptor.cache_strategy) {
+        builder = builder.header(CACHE_CONTROL, cache_control);
+    }
+    // Anti-framing headers on HTML responses to prevent cross-site iframe
+    // embedding — mirrors `asset_response` in revision_serve.rs.
+    if content_type.starts_with("text/html") {
+        builder = builder
+            .header(hyper::header::X_FRAME_OPTIONS, "DENY")
+            .header(
+                hyper::header::CONTENT_SECURITY_POLICY,
+                "frame-ancestors 'none'",
+            );
+    }
+    let response = builder
+        .body(Full::from(Bytes::from(body)))
+        .map_err(|err| anyhow::anyhow!("build static response: {err}"))?;
+    Ok(Some(response))
+}
+
+/// Strip the body for HEAD requests, preserving status and headers.
+fn maybe_strip_body(
+    response: Response<Full<Bytes>>,
+    method: &hyper::Method,
+) -> Response<Full<Bytes>> {
+    if method == hyper::Method::HEAD {
+        let (parts, _body) = response.into_parts();
+        Response::from_parts(parts, Full::from(Bytes::new()))
+    } else {
+        response
+    }
+}
+
 fn serve_static_asset(
     descriptor: &StaticRouteDescriptor,
     asset_path: &str,
