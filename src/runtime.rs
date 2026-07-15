@@ -1110,8 +1110,9 @@ pub fn demo_up_services(
             );
             None
         } else {
-            // Use the actual port the ingress server bound to (may differ from
-            // the configured port when port cycling is active).
+            // Use the port the ingress server bound to. The bind is strict, so
+            // this always equals the configured port — read it from the server
+            // rather than the config so the two can never drift.
             if let Some(ref server) = ingress_server {
                 cfg.local_port = server.actual_port;
             }

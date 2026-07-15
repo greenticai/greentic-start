@@ -70,8 +70,9 @@ pub struct HttpIngressServer {
     handle: Option<thread::JoinHandle<Result<()>>>,
     /// WebChat GUI URLs discovered from static routes during startup.
     pub ui_urls: Vec<String>,
-    /// The port the server actually bound to (may differ from requested port
-    /// when port cycling is active).
+    /// The port the server bound to. Always equals the requested port: the
+    /// bind is strict (see the rationale at the `find_available_port` call
+    /// below) and startup fails rather than moving to a neighbouring port.
     pub actual_port: u16,
 }
 
@@ -233,8 +234,10 @@ impl HttpIngressServer {
         // pointing at whatever else owns the requested port — most commonly
         // an orphaned greentic-start from a previous run, which produces
         // confusing "secret_error" / stale-state symptoms that look like a
-        // runtime bug. Operators who want side-by-side instances must pass
-        // distinct ports via the bundle's bind_addr config.
+        // runtime bug. Operators who want side-by-side instances should give
+        // each one its own port via GREENTIC_GATEWAY_PORT (or the bundle's
+        // `services.gateway.port`), which is what the failure message below
+        // points them at.
         let requested_port = config.bind_addr.port();
         let listen_addr_str = config.bind_addr.ip().to_string();
         let actual_port =
