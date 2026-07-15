@@ -245,6 +245,7 @@ impl HttpIngressServer {
                          Likely cause: an orphaned greentic-start (or other process) from a previous run.\n\
                          Diagnose:  ss -tlnp 2>/dev/null | grep ':{requested_port} '\n\
                          Resolve:   kill the listener PID and re-run gtc start\n\
+                         Or:        pick a different port with GREENTIC_GATEWAY_PORT=<port>\n\
                          (underlying error: {err})"
                     )
                 })?;

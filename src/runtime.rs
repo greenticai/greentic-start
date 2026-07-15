@@ -2552,6 +2552,65 @@ mod tests {
     }
 
     #[test]
+    fn zero_provider_bundle_fails_loudly_when_port_busy() -> anyhow::Result<()> {
+        // Strict bind is deliberate: we removed a silent failure, so we must
+        // not replace it with a silent port shift. A busy port is a loud,
+        // actionable boot failure.
+        let dir = tempdir()?;
+        let discovery = DiscoveryResult {
+            domains: DetectedDomains {
+                messaging: false,
+                events: false,
+                oauth: false,
+            },
+            providers: Vec::new(),
+        };
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))?;
+        let runner_host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )?;
+
+        let _hold = std::net::TcpListener::bind("127.0.0.1:19907").context("hold port busy")?;
+
+        let config = DemoConfig {
+            services: crate::config::DemoServicesConfig {
+                gateway: crate::config::DemoGatewayConfig {
+                    port: 19907,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // `expect_err` is unavailable: `HttpIngressServer` is not `Debug`. Match
+        // instead, as the sibling bind-failure test above does.
+        let err = match start_http_ingress_server(
+            &config,
+            &[],
+            Arc::new(runner_host),
+            false,
+            None,
+            crate::notifier::NotifierConfig::default(),
+        ) {
+            Ok(_) => panic!("a busy port must fail the boot, not silently shift ports"),
+            Err(err) => err,
+        };
+
+        let text = format!("{err:#}");
+        assert!(text.contains("19907"), "error must name the port: {text}");
+        assert!(
+            text.contains("GREENTIC_GATEWAY_PORT"),
+            "error must point at the supported way to pick another port: {text}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn demo_up_runs_in_embedded_mode_without_supervised_services() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let bundle_root = dir.path().join("bundle");
