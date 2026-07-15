@@ -1671,9 +1671,9 @@ fn start_http_ingress_server(
 ) -> anyhow::Result<Option<HttpIngressServer>> {
     // The listener now always binds: channel presence decides routing, never
     // whether a port opens. These probe-path env vars used to be the only way
-    // to force a listener with zero providers (they are set by
-    // greentic-deployer's systemd unit); they are now redundant but remain
-    // read so that removing them from the deployer stays a separate,
+    // to force a listener with no ingress domains and no static routes (they
+    // are set by greentic-deployer's systemd unit); they are now redundant but
+    // remain read so that removing them from the deployer stays a separate,
     // deliberate cross-repo change rather than a silent behaviour drift.
     let health_probe_listener_required = std::env::var("GREENTIC_HEALTH_LIVENESS_PATH")
         .ok()
