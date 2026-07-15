@@ -995,7 +995,14 @@ fn summarize_output_shape(value: &JsonValue) -> String {
 /// card entry (`contentType == "application/vnd.microsoft.card.adaptive"`),
 /// its `content` is lifted into `extensions[ADAPTIVE_CARD]` so the render
 /// planner can classify the reply as TierA.
-fn copy_directline_passthrough(output: &JsonValue, envelope: &mut ChannelMessageEnvelope) {
+///
+/// `pub(crate)` so the revision-serve egress path can reuse the identical
+/// mapping — the env-path runtime builds its reply envelopes in
+/// `revision_serve::build_reply_envelope` and must forward the same fields.
+pub(crate) fn copy_directline_passthrough(
+    output: &JsonValue,
+    envelope: &mut ChannelMessageEnvelope,
+) {
     // (ext_key, [json_aliases])
     const PASSTHROUGH: &[(&str, &[&str])] = &[
         (ext_keys::ATTACHMENTS, &["attachments"]),
