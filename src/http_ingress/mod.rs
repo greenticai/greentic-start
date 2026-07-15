@@ -2382,7 +2382,7 @@ mod tests {
     }
 
     #[test]
-    fn http_ingress_server_fails_fast_when_all_ports_occupied() {
+    fn http_ingress_server_fails_fast_when_requested_port_is_occupied() {
         let dir = tempdir().unwrap();
         let discovery = crate::discovery::discover(dir.path()).unwrap();
         let secrets_handle =
@@ -2398,19 +2398,15 @@ mod tests {
             .unwrap(),
         );
 
-        // Occupy a contiguous block of ports so port cycling exhausts the range.
-        let base = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let base_port = base.local_addr().unwrap().port();
-        let mut _holders = vec![base];
-        for offset in 1..=10u16 {
-            if let Ok(listener) =
-                std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, base_port + offset))
-            {
-                _holders.push(listener);
-            }
-        }
+        // Occupy the requested port. Strict bind (range 0) considers only that
+        // port and never scans neighbours, so holding this one is enough to
+        // force the failure — and neighbours being free is what makes the
+        // assertion below discriminating: if strict bind were relaxed to a
+        // range, startup would succeed on another port and this test would fail.
+        let holder = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let requested_port = holder.local_addr().unwrap().port();
 
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, base_port));
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, requested_port));
 
         let err = match HttpIngressServer::start(HttpIngressConfig {
             bind_addr: addr,
@@ -2421,7 +2417,7 @@ mod tests {
             public_base_url: None,
             notifier_config: crate::notifier::NotifierConfig::default(),
         }) {
-            Ok(_) => panic!("occupied port range should fail ingress startup"),
+            Ok(_) => panic!("occupied requested port should fail ingress startup"),
             Err(err) => err,
         };
 
