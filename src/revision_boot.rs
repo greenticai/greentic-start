@@ -226,16 +226,17 @@ pub(crate) async fn activate_runtime_config(
     let mut scoped_routes: Vec<HttpRouteDescriptor> = Vec::new();
 
     // Per-deployment static route tables for pack-declared SPA assets, taken
-    // from each deployment's PRIMARY (highest-weight) revision. Per-request
-    // revision-scoped static routing (following the dispatcher's selection)
-    // lands with the DirectLine PR; until then the primary revision's SPA is
-    // authoritative, so a drained/zero-weight old revision never keeps serving
-    // stale assets after a rollout completes.
+    // from each deployment's PRIMARY (highest-weight) revision. The value pairs
+    // the winning revision's weight with its table so a heavier revision can
+    // replace it. Per-request revision-scoped static routing (following the
+    // dispatcher's selection) lands with the DirectLine PR; until then the
+    // primary revision's SPA is authoritative, so a drained/zero-weight old
+    // revision never keeps serving stale assets after a rollout completes.
+    let reserved_static_routes = crate::static_routes::ReservedRouteSet::operator_defaults();
     let mut static_routes_by_deployment: BTreeMap<
         DeploymentId,
-        crate::static_routes::ActiveRouteTable,
+        (u32, crate::static_routes::ActiveRouteTable),
     > = BTreeMap::new();
-    let mut static_route_primary_weight: BTreeMap<DeploymentId, u32> = BTreeMap::new();
 
     let configs = host.tenant_configs();
     for block in &rc.revisions {
@@ -293,14 +294,12 @@ pub(crate) async fn activate_runtime_config(
         // revision. A deployment usually has one active revision; during a
         // canary the highest-weight revision's SPA is authoritative, so a
         // drained/zero-weight old revision cannot keep serving stale assets.
-        let is_primary_for_static = static_route_primary_weight
+        let is_primary_for_static = static_routes_by_deployment
             .get(&deployment_id)
-            .is_none_or(|weight| block.weight_bps > *weight);
+            .is_none_or(|(weight, _)| block.weight_bps > *weight);
         if is_primary_for_static {
-            let plan = crate::static_routes::discover_from_packs(
-                &pack_paths,
-                &crate::static_routes::ReservedRouteSet::operator_defaults(),
-            );
+            let plan =
+                crate::static_routes::discover_from_packs(&pack_paths, &reserved_static_routes);
             for warning in &plan.warnings {
                 crate::operator_log::warn(
                     module_path!(),
@@ -324,8 +323,7 @@ pub(crate) async fn activate_runtime_config(
                 }
                 crate::static_routes::ActiveRouteTable::default()
             };
-            static_routes_by_deployment.insert(deployment_id, table);
-            static_route_primary_weight.insert(deployment_id, block.weight_bps);
+            static_routes_by_deployment.insert(deployment_id, (block.weight_bps, table));
         }
 
         // Session isolation: give each revision its OWN session and state store
@@ -387,7 +385,10 @@ pub(crate) async fn activate_runtime_config(
         deployment_routes: DeploymentRouteTable::from_environment(env),
         endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),
         deployment_config_overrides: Arc::new(deployment_config_overrides_from_environment(env)),
-        static_routes: static_routes_by_deployment,
+        static_routes: static_routes_by_deployment
+            .into_iter()
+            .map(|(deployment_id, (_weight, table))| (deployment_id, table))
+            .collect(),
     };
 
     Ok(RuntimeConfigActivation { host, routing })

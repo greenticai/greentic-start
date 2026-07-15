@@ -104,14 +104,10 @@ pub(crate) fn serve_static_route_from_pack(
             });
     }
 
-    if let Some(asset_path) = resolve_asset_path(route_match) {
-        match serve_pack_only_asset(route_match.descriptor, &asset_path) {
-            Ok(Some(response)) => return maybe_strip_body(response, method),
-            Ok(None) => {}
-            Err(err) => {
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
-            }
-        }
+    if let Some(asset_path) = resolve_asset_path(route_match)
+        && let Some(response) = try_pack_asset(route_match.descriptor, &asset_path)
+    {
+        return maybe_strip_body(response, method);
     }
     // Only fall back to the SPA shell (`index.html`) for navigation requests
     // (client-side routes). A concrete file request with a non-HTML extension
@@ -121,19 +117,31 @@ pub(crate) fn serve_static_route_from_pack(
     // the DirectLine PR.)
     if spa_fallback_applies(&route_match.asset_path)
         && let Some(asset_path) = fallback_asset_path(route_match)
+        && let Some(response) = try_pack_asset(route_match.descriptor, &asset_path)
     {
-        match serve_pack_only_asset(route_match.descriptor, &asset_path) {
-            Ok(Some(response)) => return maybe_strip_body(response, method),
-            Ok(None) => {}
-            Err(err) => {
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
-            }
-        }
+        return maybe_strip_body(response, method);
     }
     maybe_strip_body(
         error_response(StatusCode::NOT_FOUND, "file not found"),
         method,
     )
+}
+
+/// Serve a single pack asset, flattening the `Result<Option<_>>` from
+/// [`serve_pack_only_asset`]: a missing asset is `None` (caller falls through),
+/// while a read error becomes a `500` response so the caller returns it.
+fn try_pack_asset(
+    descriptor: &StaticRouteDescriptor,
+    asset_path: &str,
+) -> Option<Response<Full<Bytes>>> {
+    match serve_pack_only_asset(descriptor, asset_path) {
+        Ok(Some(response)) => Some(response),
+        Ok(None) => None,
+        Err(err) => Some(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            err.to_string(),
+        )),
+    }
 }
 
 /// Whether a missing asset should fall back to the SPA shell (`index.html`)
