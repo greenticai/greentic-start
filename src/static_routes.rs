@@ -290,20 +290,8 @@ pub fn discover_from_bundle(
     bundle_root: &Path,
     reserved_routes: &ReservedRouteSet,
 ) -> anyhow::Result<StaticRoutePlan> {
-    let mut plan = StaticRoutePlan::default();
     let pack_paths = collect_runtime_pack_paths(bundle_root)?;
-    for pack_path in pack_paths {
-        let descriptors = match read_pack_static_routes(&pack_path) {
-            Ok(Some(descriptors)) => descriptors,
-            Ok(None) => continue,
-            Err(err) => {
-                plan.blocking_failures.push(err.to_string());
-                continue;
-            }
-        };
-        plan.routes.extend(descriptors);
-    }
-    validate_plan(&mut plan, reserved_routes);
+    let mut plan = discover_from_packs(&pack_paths, reserved_routes);
     check_bundle_assets_capability(bundle_root, &mut plan);
     Ok(plan)
 }
