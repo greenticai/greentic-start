@@ -14,25 +14,36 @@
 //! directory's tree into the store directory of the **resolved** environment
 //! (`LocalFsStore::default_root()/<GREENTIC_ENV>`, alias-normalized so it matches
 //! what the store itself opens) **before** `bootstrap_local_environment` opens it.
-//! Each file is installed atomically (copy to a sibling temp file, force
-//! owner-read/write `0600`, then `rename`), so a read-only source lands writable,
-//! a pre-existing destination symlink is replaced rather than written through,
-//! and a partial copy never leaves a truncated file. The seed is authoritative
-//! immutable boot configuration re-materialized identically on every cold start:
-//! existing destination files are overwritten (seed wins) and unrelated files are
-//! left in place (overlay).
 //!
-//! Security posture: the copy is scoped to a single resolved environment dir,
-//! symlinks are **skipped** (never followed into or out of the store), and the
-//! seed and destination must not overlap. An empty seed is rejected as a
-//! misconfiguration rather than silently booting a blank environment.
+//! Containment and safety:
+//! - the destination is built through [`crate::runtime_config::env_dir_in`], which
+//!   rejects `.`/`..` and non-identifier env ids (bare dots slip past
+//!   `EnvId::new`), so a hostile `GREENTIC_ENV` cannot escape the env dir;
+//! - every destination directory component is checked and a **symlink is
+//!   refused** (never followed), so a pre-existing `<env>/.greentic` link cannot
+//!   redirect writes outside the store;
+//! - each file is installed atomically: copy into a pid-scoped sibling temp file
+//!   created `O_EXCL` (`create_new`), force owner-read/write `0600`, then `rename`.
+//!   A read-only source lands writable, a pre-existing destination symlink at the
+//!   final name is replaced rather than written through, a partial copy never
+//!   leaves a truncated file, and the `O_EXCL`/pid temp avoids clobbering a
+//!   concurrent process's temp;
+//! - the seed and destination must not overlap; an empty seed is rejected.
+//!
+//! The seed is authoritative immutable boot configuration re-materialized
+//! identically on every cold start: existing destination files are overwritten
+//! (seed wins) and unrelated files are left in place (overlay). Symlinks in the
+//! source are skipped (never followed into or out of the store).
 //!
 //! Deliberately out of scope for this step (deployer-contract / follow-up work):
-//! multi-file transactional publication with a completion marker, a per-file
-//! digest manifest that rejects incomplete/extra files, and pruning of stale
-//! seed-owned files. On Cloud Run the container filesystem is fresh per instance
-//! and the copy completes before any reader starts, so a boot-time abort is
-//! fail-closed; cross-instance durability is a separate durable-store follow-up.
+//! a versioned completion **manifest** that rejects partial/extra/incomplete
+//! mounts and publishes the file set transactionally, a cross-process per-env
+//! **flock** around the overlay, and `openat2(RESOLVE_BENEATH)` no-follow
+//! traversal. On Cloud Run the container filesystem is fresh per instance and the
+//! copy completes before any reader starts, so a boot-time abort is fail-closed;
+//! completeness is properly the producer/consumer contract owned by the deployer
+//! PR that stages the mount, and cross-instance durability is a separate durable
+//! -store follow-up.
 //!
 //! Contract with the deployer (producer, a later PR): the directory named by
 //! `GREENTIC_SEED_DIR` mirrors a **single** environment's store directory, e.g.
@@ -40,6 +51,8 @@
 //! deployer sets `GREENTIC_ENV` to that environment's id.
 
 use std::fs;
+use std::fs::File;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -66,31 +79,14 @@ pub(crate) fn maybe_seed_env_store() -> anyhow::Result<()> {
     // alias), so the seed lands in the directory `bootstrap_local_environment`
     // and the dev-store will actually open — not a divergent raw `$GREENTIC_ENV`.
     let env_id = crate::resolve_env(None);
-    greentic_types::EnvId::new(&env_id)
-        .with_context(|| format!("cannot seed: invalid environment id `{env_id}`"))?;
-
     let store_root = greentic_deployer::environment::LocalFsStore::default_root().context(
         "GREENTIC_SEED_DIR is set but no home directory is available to seed the \
          environment store into (set $HOME to a writable path)",
     )?;
-    let dest = store_root.join(&env_id);
-
-    // Refuse to copy the seed into (or from) itself: an overlap would let the
-    // recursive walk truncate a file onto itself or grow into its own output.
-    let seed_canon = fs::canonicalize(&seed_dir).with_context(|| {
-        format!(
-            "GREENTIC_SEED_DIR points to a path that does not exist or is unreadable: `{}`",
-            seed_dir.display()
-        )
-    })?;
-    if dest.starts_with(&seed_canon) || seed_canon.starts_with(&dest) {
-        anyhow::bail!(
-            "GREENTIC_SEED_DIR `{}` overlaps the environment store destination `{}`; \
-             refusing to copy",
-            seed_canon.display(),
-            dest.display()
-        );
-    }
+    // `env_dir_in` rejects `.`/`..` and non-identifier ids (bare dots pass
+    // `EnvId::new`) and joins the segment safely — never a raw join.
+    let dest = crate::runtime_config::env_dir_in(&store_root, &env_id)
+        .with_context(|| format!("cannot seed: unsafe environment id `{env_id}`"))?;
 
     operator_log::info(
         module_path!(),
@@ -109,25 +105,35 @@ pub(crate) fn maybe_seed_env_store() -> anyhow::Result<()> {
 }
 
 /// Copy `seed_dir` recursively into `dest_root`, returning the number of files
-/// copied. Fails if `seed_dir` does not exist, is not a directory, or contains no
-/// files (a zero-file seed is treated as a misconfigured/partial mount).
+/// copied. Fails if `seed_dir` does not exist, is not a directory, overlaps
+/// `dest_root`, or contains no files (a zero-file seed is treated as a
+/// misconfigured/partial mount).
 ///
 /// Exposed for integration tests; production callers use `maybe_seed_env_store`.
 pub fn seed_env_store_from(seed_dir: &Path, dest_root: &Path) -> anyhow::Result<u64> {
-    let meta = fs::metadata(seed_dir).with_context(|| {
+    let seed_canon = fs::canonicalize(seed_dir).with_context(|| {
         format!(
             "GREENTIC_SEED_DIR points to a path that does not exist or is unreadable: `{}`",
             seed_dir.display()
         )
     })?;
-    if !meta.is_dir() {
+    if !seed_canon.is_dir() {
         anyhow::bail!(
             "GREENTIC_SEED_DIR must be a directory, but `{}` is not",
             seed_dir.display()
         );
     }
+    // Refuse to copy the seed into (or from) itself: an overlap would let the
+    // recursive walk truncate a file onto itself or grow into its own output.
+    if dest_root.starts_with(&seed_canon) || seed_canon.starts_with(dest_root) {
+        anyhow::bail!(
+            "GREENTIC_SEED_DIR `{}` overlaps the destination `{}`; refusing to copy",
+            seed_canon.display(),
+            dest_root.display()
+        );
+    }
 
-    let copied = copy_tree_into(seed_dir, dest_root)
+    let copied = copy_tree_into(&seed_canon, dest_root)
         .with_context(|| format!("seeding environment store from `{}`", seed_dir.display()))?;
     if copied == 0 {
         anyhow::bail!(
@@ -140,11 +146,21 @@ pub fn seed_env_store_from(seed_dir: &Path, dest_root: &Path) -> anyhow::Result<
 
 /// Recursively overlay the regular files of `src` onto `dst`, creating
 /// directories as needed. Real directories are recursed; real files are installed
-/// atomically and writable via [`install_file`]. Symlinks and special files are
-/// **skipped** (never followed) — a read-only Secret Manager mount exposes only
-/// regular files, and refusing symlinks keeps the copy from escaping the seed
-/// root or writing through a destination link.
+/// atomically and writable via [`install_file`]. A pre-existing **symlink** at any
+/// destination directory component is refused (never followed), so the copy
+/// cannot escape the store through a redirected parent. Symlinks and special
+/// files in the source are skipped.
 fn copy_tree_into(src: &Path, dst: &Path) -> anyhow::Result<u64> {
+    // Never follow a symlinked destination directory component: writing through
+    // it would escape the env store. Applied at every level via the recursion.
+    if let Ok(meta) = fs::symlink_metadata(dst)
+        && meta.file_type().is_symlink()
+    {
+        anyhow::bail!(
+            "refusing to seed through symlinked destination directory `{}`",
+            dst.display()
+        );
+    }
     fs::create_dir_all(dst)
         .with_context(|| format!("creating seed destination `{}`", dst.display()))?;
 
@@ -179,11 +195,13 @@ fn copy_tree_into(src: &Path, dst: &Path) -> anyhow::Result<u64> {
     Ok(copied)
 }
 
-/// Install one regular file at `to`, atomically and writable: copy `from` to a
-/// sibling temp file, force owner read/write (`0600` on Unix, clear the
-/// read-only attribute elsewhere), then `rename` over `to`. The rename replaces a
-/// pre-existing destination — including a symlink — with a regular file, and a
-/// crash mid-copy leaves only the temp file, never a truncated `to`.
+/// Install one regular file at `to`, atomically and writable: copy `from` into a
+/// pid-scoped sibling temp file created `O_EXCL` (so it never follows a
+/// pre-existing temp symlink and never clobbers a concurrent process's temp),
+/// force owner read/write (`0600` on Unix, clear the read-only attribute
+/// elsewhere), then `rename` over `to`. The rename replaces a pre-existing
+/// destination — including a symlink — with a regular file, and a crash mid-copy
+/// leaves only the temp file, never a truncated `to`.
 fn install_file(from: &Path, to: &Path) -> anyhow::Result<()> {
     let parent = to
         .parent()
@@ -192,12 +210,22 @@ fn install_file(from: &Path, to: &Path) -> anyhow::Result<()> {
         .file_name()
         .with_context(|| format!("destination `{}` has no file name", to.display()))?;
     let mut tmp_name = std::ffi::OsString::from(".seedtmp.");
+    tmp_name.push(std::process::id().to_string());
+    tmp_name.push(".");
     tmp_name.push(file_name);
     let tmp = parent.join(tmp_name);
 
     let result = (|| {
-        fs::copy(from, &tmp)
+        let mut dst_f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .with_context(|| format!("creating seed temp file `{}`", tmp.display()))?;
+        let mut src_f = File::open(from)
+            .with_context(|| format!("opening seed source `{}`", from.display()))?;
+        io::copy(&mut src_f, &mut dst_f)
             .with_context(|| format!("copying `{}` -> `{}`", from.display(), tmp.display()))?;
+        drop(dst_f);
         set_writable(&tmp)?;
         fs::rename(&tmp, to)
             .with_context(|| format!("installing `{}` -> `{}`", tmp.display(), to.display()))?;
@@ -293,11 +321,11 @@ mod tests {
         let landed = dst.path().join(".dev.secrets.env");
         let mode = fs::metadata(&landed).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "seeded secret must be owner read/write");
-        // Prove it is genuinely writable (open for write, as the dev-store does).
         assert!(
             fs::OpenOptions::new().write(true).open(&landed).is_ok(),
             "seeded file must be writable"
         );
+        assert_eq!(fs::read(&landed).unwrap(), b"TOKEN=abc");
     }
 
     #[cfg(unix)]
@@ -329,7 +357,7 @@ mod tests {
         fs::write(&victim, b"do-not-touch").unwrap();
 
         fs::write(src.path().join("environment.json"), b"seed").unwrap();
-        // A pre-existing destination symlink must NOT be written through.
+        // A pre-existing destination symlink at the final name must NOT be written through.
         symlink(&victim, dst.path().join("environment.json")).unwrap();
 
         copy_tree_into(src.path(), dst.path()).unwrap();
@@ -347,6 +375,30 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read(&landed).unwrap(), b"seed");
+    }
+
+    // A pre-existing symlinked destination *directory* component must be refused,
+    // not followed (it could redirect writes outside the env store).
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_destination_directory() {
+        use std::os::unix::fs::symlink;
+        let src = tempdir().unwrap();
+        let dst = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+
+        fs::create_dir_all(src.path().join(".greentic/dev")).unwrap();
+        fs::write(src.path().join(".greentic/dev/.dev.secrets.env"), b"S=1").unwrap();
+        // `<dst>/.greentic` is a symlink pointing outside the store.
+        symlink(outside.path(), dst.path().join(".greentic")).unwrap();
+
+        let err = copy_tree_into(src.path(), dst.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("symlinked destination directory"),
+            "unexpected error: {err}"
+        );
+        // Nothing was written through the symlink into the outside directory.
+        assert!(!outside.path().join("dev").exists());
     }
 
     #[test]
@@ -372,6 +424,15 @@ mod tests {
         fs::write(&file, b"x").unwrap();
         let err = seed_env_store_from(&file, dir.path()).unwrap_err();
         assert!(err.to_string().contains("must be a directory"));
+    }
+
+    #[test]
+    fn errors_on_overlapping_seed_and_dest() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("environment.json"), b"{}").unwrap();
+        // dest == seed: overlapping roots must be refused.
+        let err = seed_env_store_from(dir.path(), dir.path()).unwrap_err();
+        assert!(err.to_string().contains("overlaps the destination"));
     }
 
     #[test]
@@ -404,8 +465,7 @@ mod tests {
 
         let res = maybe_seed_env_store();
 
-        // Restore before asserting so a failing assert never poisons sibling tests.
-        // SAFETY: still holding the env lock.
+        // SAFETY: still holding the env lock; restore before asserting.
         unsafe {
             restore("HOME", prev_home);
             restore(SEED_DIR_ENV, prev_seed);
@@ -420,6 +480,45 @@ mod tests {
             .join("environment.json");
         assert!(landed.is_file(), "expected {} to exist", landed.display());
         assert!(fs::OpenOptions::new().write(true).open(&landed).is_ok());
+    }
+
+    // A hostile env id (`.`/`..`) must be rejected before any copy, so the seed
+    // cannot escape the environment directory into the shared `.greentic` tree.
+    #[cfg(unix)]
+    #[test]
+    fn maybe_seed_rejects_dot_dot_env_id() {
+        let _guard = crate::test_env_lock().lock().unwrap();
+        let seed = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        fs::write(seed.path().join("environment.json"), b"{}").unwrap();
+
+        let prev_home = std::env::var_os("HOME");
+        let prev_seed = std::env::var_os(SEED_DIR_ENV);
+        let prev_env = std::env::var_os("GREENTIC_ENV");
+        // SAFETY: guarded by the process-wide test env lock; restored below.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var(SEED_DIR_ENV, seed.path());
+            std::env::set_var("GREENTIC_ENV", "..");
+        }
+
+        let res = maybe_seed_env_store();
+
+        // SAFETY: still holding the env lock; restore before asserting.
+        unsafe {
+            restore("HOME", prev_home);
+            restore(SEED_DIR_ENV, prev_seed);
+            restore("GREENTIC_ENV", prev_env);
+        }
+
+        let err = res.expect_err("`..` env id must be rejected");
+        assert!(
+            err.to_string().contains("unsafe environment id")
+                || err.to_string().contains("not a safe directory segment"),
+            "unexpected error: {err}"
+        );
+        // The seed must not have escaped into the shared `.greentic` tree.
+        assert!(!home.path().join(".greentic/environment.json").exists());
     }
 
     #[cfg(unix)]
