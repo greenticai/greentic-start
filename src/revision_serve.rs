@@ -9835,4 +9835,68 @@ mod binary_update_tests {
         let _ = ws.close(None).await;
         accept_handle.abort();
     }
+
+    /// Combined regression for the webchat token 502: the store is keyed the
+    /// way greentic-setup/`SecretsSetup` persist (canonical underscore
+    /// provider segment, tenant-level `_` team), the serve-path manager built
+    /// by `resolve_serve_secrets_manager` is installed via
+    /// `HostBuilder::with_secrets_manager` exactly like `revision_boot`, and
+    /// the read uses the raw hyphenated pack-stem URI the runner-host's
+    /// provider self-read emits. Before the fallback wrapper this read was
+    /// NotFound → webchat-gui returned 500 secret_error → `/token` 502'd.
+    #[tokio::test]
+    async fn serve_secrets_stack_resolves_component_self_read_uri() {
+        use greentic_secrets_lib::{
+            SecretFormat, SeedDoc, SeedEntry, SeedValue,
+            core::seed::{ApplyOptions, DevStore, apply_seed},
+        };
+
+        let env_dir = tempfile::tempdir().expect("tempdir");
+        let store_path = env_dir.path().join(".greentic/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).expect("store dir");
+        let store = DevStore::with_path(store_path).expect("dev store");
+        let seed = SeedDoc {
+            entries: vec![SeedEntry {
+                uri: "secrets://local/demo/_/messaging_webchat_gui/jwt_signing_key".to_string(),
+                format: SecretFormat::Text,
+                value: SeedValue::Text {
+                    text: "signing-key".to_string(),
+                },
+                description: None,
+            }],
+        };
+        let report = apply_seed(&store, &seed, ApplyOptions::default()).await;
+        assert_eq!(report.ok, 1);
+
+        let (secrets, _scope) = {
+            let guard = crate::test_env_lock().lock().unwrap();
+            unsafe {
+                std::env::remove_var(crate::secrets_gate::ENV_SERVE_SECRETS_BACKEND);
+                std::env::remove_var("GREENTIC_DEV_SECRETS_PATH");
+            }
+            let resolved =
+                crate::secrets_gate::resolve_serve_secrets_manager(env_dir.path(), "demo");
+            drop(guard);
+            resolved.expect("serve secrets manager")
+        };
+
+        let host = greentic_runner_host::HostBuilder::new()
+            .with_config(greentic_runner_host::HostConfig::from_gtbind(
+                greentic_runner_host::TenantBindings {
+                    tenant: "demo".to_string(),
+                    packs: Vec::new(),
+                    env_passthrough: Vec::new(),
+                },
+            ))
+            .with_secrets_manager(secrets)
+            .build()
+            .expect("build host");
+
+        let value = host
+            .secrets_manager()
+            .read("secrets://local/demo/_/messaging-webchat-gui/jwt_signing_key")
+            .await
+            .expect("hyphenated self-read URI must resolve the underscore-keyed store");
+        assert_eq!(value, b"signing-key");
+    }
 }

@@ -79,6 +79,7 @@ pub mod revision_health_gate;
 mod revision_pin;
 mod revision_pull;
 mod revision_reload;
+mod revision_secrets;
 mod revision_serve;
 mod revision_webhook_register;
 mod rollout_telemetry;
@@ -644,6 +645,18 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // `GREENTIC_REVISION_PIN_REDIS_URL` is configured (fail-open to
         // in-memory); see that fn for the rationale.
         let pin_store = revision_pin::resolve_pin_store(&activation_rt);
+        // Mint declared `generated` provider secrets (e.g. the webchat-gui
+        // `jwt_signing_key`) before serving — the env path's counterpart to
+        // the `--bundle` boot's `ensure_generated_provider_secrets`. Without
+        // it, provider token ops 500 with `secret_error: not-found` on any
+        // bundle that never went through a legacy boot.
+        activation_rt
+            .block_on(revision_secrets::ensure_generated_secrets_for_activation(
+                &env_dir,
+                &rc,
+                &environment,
+            ))
+            .context("failed to seed generated provider secrets")?;
         let activation = activation_rt.block_on(revision_boot::activate_runtime_config(
             &store_root,
             &rc,
