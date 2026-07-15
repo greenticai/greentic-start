@@ -173,11 +173,17 @@ Fix it together with the `:718`/`:721` domain check, where it becomes observable
   `run_gsm_services = config.services.nats.enabled` (`:1075`) and NATS defaults on, a
   channel-less bundle booted with default NATS now hands all four children
   `PUBLIC_HTTP_ENABLED=true` where they previously got `false`.
-  **Nothing on this branch exercised this.** Both live runs used `--nats off`, and the new tests
-  either set `nats.enabled: false` or bypass `demo_up_services` entirely — so no child process
-  has been observed reading the changed value. Whether any consumer branches on it is
-  **unverified**: `greentic-runner` is `.git`-only on this machine and its source cannot be read
-  here.
+  **Resolved 2026-07-15 — the flip is inert, because nothing reads the variable.**
+  `greentic-start/src/startup_contract.rs` is its only occurrence in the entire workspace, and
+  `strings $(which greentic-runner)` finds zero hits — the compiled runner does not even contain
+  the string. `greentic-runner`'s tree (crates: greentic-runner, greentic-runner-host,
+  greentic-aw-runtime, runner-core, …) has no occurrence in any file type, and neither does
+  `~/.cargo/registry/src/`. The `gateway` / `egress` binaries are external, resolved by bare name
+  from PATH (`src/config.rs:401`, `default_gateway_binary() -> "gateway"`), and are not installed
+  here at all. `PUBLIC_HTTP_ENABLED` is a write-only contract.
+  *(An earlier revision of this bullet called this unverified, on the grounds that `greentic-runner`
+  is `.git`-only per the workspace `CLAUDE.md`. That claim is stale — the runner is fully checked
+  out, and the question was answerable with one grep.)*
 - The startup banner now prints an `HTTP: http://…` line for probes-only runs, where it
   previously printed none — `StartupInfo.http_url` (`src/runtime.rs:71`, populated at
   `:1482`) is `Some` whenever the listener exists. Operators will see a URL that serves
