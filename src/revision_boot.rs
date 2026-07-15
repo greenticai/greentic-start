@@ -225,11 +225,17 @@ pub(crate) async fn activate_runtime_config(
     // dispatcher picks a revision.
     let mut scoped_routes: Vec<HttpRouteDescriptor> = Vec::new();
 
-    // Per-deployment static route tables for pack-declared SPA assets.
+    // Per-deployment static route tables for pack-declared SPA assets, taken
+    // from each deployment's PRIMARY (highest-weight) revision. Per-request
+    // revision-scoped static routing (following the dispatcher's selection)
+    // lands with the DirectLine PR; until then the primary revision's SPA is
+    // authoritative, so a drained/zero-weight old revision never keeps serving
+    // stale assets after a rollout completes.
     let mut static_routes_by_deployment: BTreeMap<
         DeploymentId,
         crate::static_routes::ActiveRouteTable,
     > = BTreeMap::new();
+    let mut static_route_primary_weight: BTreeMap<DeploymentId, u32> = BTreeMap::new();
 
     let configs = host.tenant_configs();
     for block in &rc.revisions {
@@ -283,42 +289,44 @@ pub(crate) async fn activate_runtime_config(
             &meta.path_prefixes,
         ));
 
-        // Discover static routes for this deployment's packs. Multiple
-        // revisions of the same deployment merge into a single table; in
-        // practice each deployment has one active revision so the entry is
-        // simply inserted once.
-        static_routes_by_deployment
-            .entry(deployment_id)
-            .or_insert_with(|| {
-                let plan = crate::static_routes::discover_from_packs(
-                    &pack_paths,
-                    &crate::static_routes::ReservedRouteSet::operator_defaults(),
+        // Discover static routes from this deployment's PRIMARY (highest-weight)
+        // revision. A deployment usually has one active revision; during a
+        // canary the highest-weight revision's SPA is authoritative, so a
+        // drained/zero-weight old revision cannot keep serving stale assets.
+        let is_primary_for_static = static_route_primary_weight
+            .get(&deployment_id)
+            .is_none_or(|weight| block.weight_bps > *weight);
+        if is_primary_for_static {
+            let plan = crate::static_routes::discover_from_packs(
+                &pack_paths,
+                &crate::static_routes::ReservedRouteSet::operator_defaults(),
+            );
+            for warning in &plan.warnings {
+                crate::operator_log::warn(
+                    module_path!(),
+                    format!("static route warning (deployment {deployment_id}): {warning}"),
                 );
-                for warning in &plan.warnings {
-                    crate::operator_log::warn(
+            }
+            // Fail closed on validation failures (reserved-path conflicts,
+            // duplicate/overlapping public paths): serve NONE of this
+            // deployment's static routes rather than let a pack shadow an
+            // operator path. Mirrors the bundle path's guard (which bails in
+            // `http_ingress`), but scoped per deployment so one bad pack cannot
+            // take down the rest of the env runtime.
+            let table = if plan.blocking_failures.is_empty() {
+                crate::static_routes::ActiveRouteTable::from_plan(&plan)
+            } else {
+                for failure in &plan.blocking_failures {
+                    crate::operator_log::error(
                         module_path!(),
-                        format!("static route warning (deployment {deployment_id}): {warning}"),
+                        format!("static route rejected (deployment {deployment_id}): {failure}"),
                     );
                 }
-                // Fail closed on validation failures (reserved-path conflicts,
-                // duplicate/overlapping public paths): serve NONE of this
-                // deployment's static routes rather than let a pack shadow an
-                // operator path. Mirrors the bundle path's guard (which bails in
-                // `http_ingress`), but scoped per deployment so one bad pack
-                // cannot take down the rest of the env runtime.
-                if !plan.blocking_failures.is_empty() {
-                    for failure in &plan.blocking_failures {
-                        crate::operator_log::error(
-                            module_path!(),
-                            format!(
-                                "static route rejected (deployment {deployment_id}): {failure}"
-                            ),
-                        );
-                    }
-                    return crate::static_routes::ActiveRouteTable::default();
-                }
-                crate::static_routes::ActiveRouteTable::from_plan(&plan)
-            });
+                crate::static_routes::ActiveRouteTable::default()
+            };
+            static_routes_by_deployment.insert(deployment_id, table);
+            static_route_primary_weight.insert(deployment_id, block.weight_bps);
+        }
 
         // Session isolation: give each revision its OWN session and state store
         // rather than sharing the host's. The session/resume/state backend keys

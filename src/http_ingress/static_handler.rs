@@ -113,7 +113,15 @@ pub(crate) fn serve_static_route_from_pack(
             }
         }
     }
-    if let Some(asset_path) = fallback_asset_path(route_match) {
+    // Only fall back to the SPA shell (`index.html`) for navigation requests
+    // (client-side routes). A concrete file request with a non-HTML extension
+    // (e.g. `config/tenants/x.json`, `i18n/_manifest.json`) must 404 so the
+    // SPA's `fetch` sees a real miss rather than HTML parsed as the wrong type.
+    // (Tenant-config / i18n-manifest synthesis for the env model is deferred to
+    // the DirectLine PR.)
+    if spa_fallback_applies(&route_match.asset_path)
+        && let Some(asset_path) = fallback_asset_path(route_match)
+    {
         match serve_pack_only_asset(route_match.descriptor, &asset_path) {
             Ok(Some(response)) => return maybe_strip_body(response, method),
             Ok(None) => {}
@@ -126,6 +134,21 @@ pub(crate) fn serve_static_route_from_pack(
         error_response(StatusCode::NOT_FOUND, "file not found"),
         method,
     )
+}
+
+/// Whether a missing asset should fall back to the SPA shell (`index.html`)
+/// rather than 404. Only extensionless "navigation" paths (client-side SPA
+/// routes) get the fallback; a concrete file request with a non-HTML extension
+/// must 404 so the SPA's `fetch` sees a real miss instead of HTML.
+fn spa_fallback_applies(asset_path: &str) -> bool {
+    match asset_path
+        .rsplit('/')
+        .next()
+        .and_then(|seg| seg.rsplit_once('.'))
+    {
+        None => true,
+        Some((_, ext)) => ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm"),
+    }
 }
 
 /// Read an asset from the pack only (no bundle overlay) and build the HTTP
@@ -523,6 +546,18 @@ mod tests {
                 .to_bytes()
         });
         assert!(String::from_utf8_lossy(&body).contains("<html>ok</html>"));
+    }
+
+    #[test]
+    fn spa_fallback_only_for_navigation_paths() {
+        // Navigation (client-side route) requests fall back to the SPA shell.
+        assert!(spa_fallback_applies("")); // directory / index
+        assert!(spa_fallback_applies("settings")); // extensionless SPA route
+        assert!(spa_fallback_applies("app/index.html"));
+        // Concrete non-HTML file requests must 404 (no HTML fallback).
+        assert!(!spa_fallback_applies("config/tenants/x.json"));
+        assert!(!spa_fallback_applies("i18n/_manifest.json"));
+        assert!(!spa_fallback_applies("assets/index-abc123.js"));
     }
 
     #[test]

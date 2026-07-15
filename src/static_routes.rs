@@ -109,11 +109,21 @@ impl ReservedRouteSet {
 
     pub fn conflicts_with(&self, public_path: &str) -> bool {
         let normalized = normalize_public_path(public_path);
+        // `{tenant}`/`{team}` placeholders match ANY concrete segment, so a
+        // route like `/{tenant}` or `/v1/{tenant}` could shadow a reserved
+        // namespace. Compare using the literal prefix up to the first
+        // placeholder, and check BOTH directions: the route sitting at/under a
+        // reserved path, AND the route being an ancestor of (thus matching
+        // requests to) a reserved path.
+        let literal = literal_prefix(&normalized);
         self.exact_paths.contains(&normalized)
             || self
-                .prefix_paths
+                .exact_paths
                 .iter()
-                .any(|prefix| path_has_prefix(&normalized, prefix))
+                .any(|exact| path_has_prefix(exact, &literal))
+            || self.prefix_paths.iter().any(|prefix| {
+                path_has_prefix(&normalized, prefix) || path_has_prefix(prefix, &literal)
+            })
     }
 }
 
@@ -608,6 +618,22 @@ fn path_has_prefix(path: &str, prefix: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The literal path prefix up to (not including) the first `{...}` placeholder
+/// segment. `/v1/web/webchat/{tenant}` → `/v1/web/webchat`; `/{tenant}` → `/`.
+/// Used so a placeholder route is tested against reserved paths by the part of
+/// the path it pins concretely.
+fn literal_prefix(path: &str) -> String {
+    let mut out = String::new();
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        if segment.contains('{') {
+            break;
+        }
+        out.push('/');
+        out.push_str(segment);
+    }
+    if out.is_empty() { "/".to_string() } else { out }
+}
+
 fn normalize_public_path(path: &str) -> String {
     let trimmed = path.trim();
     let normalized = if trimmed.starts_with('/') {
@@ -1043,6 +1069,20 @@ mod tests {
             "expected a reserved-path blocking failure, got {:?}",
             plan.blocking_failures
         );
+    }
+
+    #[test]
+    fn conflicts_with_catches_ancestor_and_placeholder_routes() {
+        let reserved = ReservedRouteSet::operator_defaults();
+        // Ancestor of a reserved prefix (`/v1/messaging/ingress`) — a request
+        // to the reserved path would match this route.
+        assert!(reserved.conflicts_with("/v1"));
+        // Leading/embedded placeholders can match any operator namespace.
+        assert!(reserved.conflicts_with("/{tenant}"));
+        assert!(reserved.conflicts_with("/v1/{tenant}"));
+        // The real webchat SPA route pins enough literal prefix to be safe.
+        assert!(!reserved.conflicts_with("/v1/web/webchat/{tenant}"));
+        assert!(!reserved.conflicts_with("/v1/web/webchat/demo"));
     }
 
     #[test]
