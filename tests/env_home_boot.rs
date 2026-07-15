@@ -16,7 +16,12 @@
 //! and passes through a real `load_env_home` call, a real
 //! `bundle_config::load_runtime_demo_config`, and a real `demo_up_services`
 //! run, then exits cleanly via a stop-request file — with no external
-//! binaries, no network ports, and no gating/skip needed.
+//! binaries and no gating/skip needed.
+//!
+//! The ingress listener always binds (it is not gated on discovering a
+//! messaging provider), so this test pins `GREENTIC_GATEWAY_PORT` to a fixed
+//! high port rather than inheriting the 8080 default, which would race with
+//! the boot tests in `src/lib.rs` running as a separate process.
 
 use std::path::Path;
 use std::thread;
@@ -34,7 +39,7 @@ use greentic_start::{
 /// just `tenant`/`team` — the same minimal shape
 /// `write_demo_bundle`/`make_start_request` use in `src/lib.rs`'s own
 /// embedded-mode boot tests, so this exercises exactly that already-proven
-/// "zero packs -> embedded runner mode, no gateway" path.
+/// "zero packs -> embedded runner mode, no supervised gateway process" path.
 fn write_env_home_fixture(store_root: &Path) {
     let env_home = store_root.join("local");
     let rev_dir = env_home.join("revisions").join("r1");
@@ -61,6 +66,36 @@ fn write_env_home_fixture(store_root: &Path) {
         r#"{"schema":"greentic.runtime-config.v1","env_id":"local","revisions":[{"deployment_id":"d1","revision_id":"r1","bundle_id":"app","pack_list_refs":["revisions/r1/pack-list.lock"],"pack_config_refs":[],"weight_bps":10000}]}"#,
     )
     .expect("write runtime-config.json");
+}
+
+/// RAII guard that pins `GREENTIC_GATEWAY_PORT` for the lifetime of a test
+/// and always clears it on drop, including when the test body panics — a
+/// plain set_var/remove_var pair would leak the var into the other tests
+/// sharing this process if an `.expect()`/`assert!` in between panicked
+/// before the manual `remove_var` ran.
+#[must_use = "bind the guard to a named variable (e.g. `let _gateway_port = ...`); \
+              dropping it immediately clears the variable it just set"]
+struct GatewayPortGuard;
+
+impl GatewayPortGuard {
+    fn set(port: &str) -> Self {
+        // The three tests in this file share one process, and only
+        // `boots_from_env_home_and_stops_cleanly` writes this variable, so
+        // there is no competing writer. The guard clears it on every exit
+        // path, including panics, so it never leaks into the other two. This
+        // mirrors the env-mutation pattern already used across this crate's
+        // tests (bundle_config.rs, bin_resolver.rs); it does not establish
+        // the absence of concurrent readers that set_var's contract formally
+        // asks for.
+        unsafe { std::env::set_var("GREENTIC_GATEWAY_PORT", port) };
+        Self
+    }
+}
+
+impl Drop for GatewayPortGuard {
+    fn drop(&mut self) {
+        unsafe { std::env::remove_var("GREENTIC_GATEWAY_PORT") };
+    }
 }
 
 fn env_home_start_request(store_root: &Path, log_dir: &Path) -> StartRequest {
@@ -97,6 +132,9 @@ fn boots_from_env_home_and_stops_cleanly() {
     let temp = tempfile::tempdir().expect("tempdir");
     let store_root = temp.path().join("store-root");
     write_env_home_fixture(&store_root);
+
+    // See the module doc: the listener always binds, so pin a unique port.
+    let _gateway_port = GatewayPortGuard::set("19905");
 
     let bundle_dir = store_root.join("local/revisions/r1/bundle");
     let log_dir = temp.path().join("logs");

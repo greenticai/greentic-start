@@ -1110,8 +1110,9 @@ pub fn demo_up_services(
             );
             None
         } else {
-            // Use the actual port the ingress server bound to (may differ from
-            // the configured port when port cycling is active).
+            // Use the port the ingress server bound to. The bind is strict, so
+            // this always equals the configured port — read it from the server
+            // rather than the config so the two can never drift.
             if let Some(ref server) = ingress_server {
                 cfg.local_port = server.actual_port;
             }
@@ -1668,16 +1669,23 @@ fn start_http_ingress_server(
     public_base_url: Option<String>,
     notifier_config: crate::notifier::NotifierConfig,
 ) -> anyhow::Result<Option<HttpIngressServer>> {
-    // In cloud deploys we may need a public listener only for health probes.
+    // The listener now always binds: channel presence decides routing, never
+    // whether a port opens. These probe-path env vars used to be the only way
+    // to force a listener with no ingress domains and no static routes (they
+    // are set by greentic-deployer's systemd unit); they are now redundant but
+    // remain read so that removing them from the deployer stays a separate,
+    // deliberate cross-repo change rather than a silent behaviour drift.
     let health_probe_listener_required = std::env::var("GREENTIC_HEALTH_LIVENESS_PATH")
         .ok()
         .is_some_and(|value| !value.trim().is_empty())
         || std::env::var("GREENTIC_HEALTH_READINESS_PATH")
             .ok()
             .is_some_and(|value| !value.trim().is_empty());
-    // Start HTTP server if we have ingress domains, static routes, or health probes to serve.
-    if domains.is_empty() && !enable_static_routes && !health_probe_listener_required {
-        return Ok(None);
+    if health_probe_listener_required {
+        operator_log::debug(
+            module_path!(),
+            "health-probe env vars set; listener would bind regardless (now unconditional)",
+        );
     }
     let addr = format!(
         "{}:{}",
@@ -2418,7 +2426,18 @@ mod tests {
         let detected = detect_http_ingress_domains(&discovery, &runner_host);
         assert_eq!(detected, vec![Domain::Events]);
 
-        let config = DemoConfig::default();
+        // An empty domain list no longer suppresses the listener: the port is
+        // opened unconditionally and `/healthz` answers regardless of channels.
+        let config = DemoConfig {
+            services: crate::config::DemoServicesConfig {
+                gateway: crate::config::DemoGatewayConfig {
+                    port: 19901,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         assert!(
             start_http_ingress_server(
                 &config,
@@ -2428,7 +2447,7 @@ mod tests {
                 None,
                 crate::notifier::NotifierConfig::default(),
             )?
-            .is_none()
+            .is_some()
         );
 
         let invalid_config = DemoConfig {
@@ -2471,6 +2490,124 @@ mod tests {
         )?;
         demo_down_runtime(dir.path(), "demo", "default", false)?;
         demo_down_runtime(dir.path(), "demo", "default", true)?;
+        Ok(())
+    }
+
+    #[test]
+    fn zero_provider_bundle_binds_listener_and_serves_healthz() -> anyhow::Result<()> {
+        // A bundle with no messaging/events provider at all — the exact shape
+        // that used to be silently portless. greentic-secrets' provider packs
+        // (30 `type: event` flows, zero messaging) are the real-world case.
+        let dir = tempdir()?;
+        let discovery = DiscoveryResult {
+            domains: DetectedDomains {
+                messaging: false,
+                events: false,
+                oauth: false,
+            },
+            providers: Vec::new(),
+        };
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))?;
+        let runner_host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )?;
+
+        let domains = detect_http_ingress_domains(&discovery, &runner_host);
+        assert!(
+            domains.is_empty(),
+            "fixture must have no ingress domains: that is the point of the test"
+        );
+
+        let config = DemoConfig {
+            services: crate::config::DemoServicesConfig {
+                gateway: crate::config::DemoGatewayConfig {
+                    port: 19906,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let server = start_http_ingress_server(
+            &config,
+            &domains,
+            Arc::new(runner_host),
+            false,
+            None,
+            crate::notifier::NotifierConfig::default(),
+        )?
+        .expect("listener must bind even with zero providers");
+
+        let response = reqwest::blocking::Client::new()
+            .get(format!("http://127.0.0.1:{}/healthz", server.actual_port))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .context("GET /healthz")?;
+        assert_eq!(response.status().as_u16(), 200);
+        Ok(())
+    }
+
+    #[test]
+    fn zero_provider_bundle_fails_loudly_when_port_busy() -> anyhow::Result<()> {
+        // Strict bind is deliberate: we removed a silent failure, so we must
+        // not replace it with a silent port shift. A busy port is a loud,
+        // actionable boot failure.
+        let dir = tempdir()?;
+        let discovery = DiscoveryResult {
+            domains: DetectedDomains {
+                messaging: false,
+                events: false,
+                oauth: false,
+            },
+            providers: Vec::new(),
+        };
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))?;
+        let runner_host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )?;
+
+        let _hold = std::net::TcpListener::bind("127.0.0.1:19907").context("hold port busy")?;
+
+        let config = DemoConfig {
+            services: crate::config::DemoServicesConfig {
+                gateway: crate::config::DemoGatewayConfig {
+                    port: 19907,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // `expect_err` is unavailable: `HttpIngressServer` is not `Debug`. Match
+        // instead, as the sibling bind-failure test above does.
+        let err = match start_http_ingress_server(
+            &config,
+            &[],
+            Arc::new(runner_host),
+            false,
+            None,
+            crate::notifier::NotifierConfig::default(),
+        ) {
+            Ok(_) => panic!("a busy port must fail the boot, not silently shift ports"),
+            Err(err) => err,
+        };
+
+        let text = format!("{err:#}");
+        assert!(text.contains("19907"), "error must name the port: {text}");
+        assert!(
+            text.contains("GREENTIC_GATEWAY_PORT"),
+            "error must point at the supported way to pick another port: {text}"
+        );
         Ok(())
     }
 
@@ -2523,6 +2660,10 @@ mod tests {
                     enabled: false,
                     ..Default::default()
                 },
+                gateway: crate::config::DemoGatewayConfig {
+                    port: 19902,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             providers: None,
@@ -2544,7 +2685,10 @@ mod tests {
             true,
             false,
         )?;
-        assert!(handles.ingress_server.is_none());
+        // Embedded runner mode (nats off, zero packs) still opens its port:
+        // "embedded" governs whether GSM sidecar processes are spawned, not
+        // whether the in-process HTTP ingress listens.
+        assert!(handles.ingress_server.is_some());
 
         let paths = RuntimePaths::new(bundle_root.join("state"), "demo", "default");
         let runtime_root = paths.runtime_root();
@@ -2553,7 +2697,7 @@ mod tests {
 
         let startup_contract: StartupContract =
             serde_json::from_slice(&fs::read(runtime_root.join("startup_contract.json"))?)?;
-        assert!(!startup_contract.public_http_enabled);
+        assert!(startup_contract.public_http_enabled);
         assert!(!startup_contract.static_routes_enabled);
 
         let endpoints: serde_json::Value =

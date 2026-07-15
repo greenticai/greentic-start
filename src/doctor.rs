@@ -1076,7 +1076,7 @@ fn check_ports(ctx: &mut DoctorCtx<'_>, config: &crate::config::DemoConfig) {
             DiagnosticComponent::Runtime,
             "Gateway port is not currently bindable.",
             json!({ "addr": addr, "error": err.to_string() }),
-            Some("Stop the process using this port, change GREENTIC_GATEWAY_PORT, or let startup use its port-cycling behavior if applicable."),
+            Some("Stop the process using this port, or change GREENTIC_GATEWAY_PORT. Startup binds this exact port and fails if it is taken — it does not fall back to a neighbouring one."),
         ),
     }
 }

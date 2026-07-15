@@ -70,8 +70,9 @@ pub struct HttpIngressServer {
     handle: Option<thread::JoinHandle<Result<()>>>,
     /// WebChat GUI URLs discovered from static routes during startup.
     pub ui_urls: Vec<String>,
-    /// The port the server actually bound to (may differ from requested port
-    /// when port cycling is active).
+    /// The port the server bound to. Always equals the requested port: the
+    /// bind is strict (see the rationale at the `find_available_port` call
+    /// below) and startup fails rather than moving to a neighbouring port.
     pub actual_port: u16,
 }
 
@@ -233,8 +234,10 @@ impl HttpIngressServer {
         // pointing at whatever else owns the requested port — most commonly
         // an orphaned greentic-start from a previous run, which produces
         // confusing "secret_error" / stale-state symptoms that look like a
-        // runtime bug. Operators who want side-by-side instances must pass
-        // distinct ports via the bundle's bind_addr config.
+        // runtime bug. Operators who want side-by-side instances should give
+        // each one its own port via GREENTIC_GATEWAY_PORT (or the bundle's
+        // `services.gateway.port`), which is what the failure message below
+        // points them at.
         let requested_port = config.bind_addr.port();
         let listen_addr_str = config.bind_addr.ip().to_string();
         let actual_port =
@@ -245,6 +248,7 @@ impl HttpIngressServer {
                          Likely cause: an orphaned greentic-start (or other process) from a previous run.\n\
                          Diagnose:  ss -tlnp 2>/dev/null | grep ':{requested_port} '\n\
                          Resolve:   kill the listener PID and re-run gtc start\n\
+                         Or:        pick a different port with GREENTIC_GATEWAY_PORT=<port>\n\
                          (underlying error: {err})"
                     )
                 })?;
@@ -2378,7 +2382,7 @@ mod tests {
     }
 
     #[test]
-    fn http_ingress_server_fails_fast_when_all_ports_occupied() {
+    fn http_ingress_server_fails_fast_when_requested_port_is_occupied() {
         let dir = tempdir().unwrap();
         let discovery = crate::discovery::discover(dir.path()).unwrap();
         let secrets_handle =
@@ -2394,19 +2398,15 @@ mod tests {
             .unwrap(),
         );
 
-        // Occupy a contiguous block of ports so port cycling exhausts the range.
-        let base = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let base_port = base.local_addr().unwrap().port();
-        let mut _holders = vec![base];
-        for offset in 1..=10u16 {
-            if let Ok(listener) =
-                std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, base_port + offset))
-            {
-                _holders.push(listener);
-            }
-        }
+        // Occupy the requested port. Strict bind (range 0) considers only that
+        // port and never scans neighbours, so holding this one is enough to
+        // force the failure — and neighbours being free is what makes the
+        // assertion below discriminating: if strict bind were relaxed to a
+        // range, startup would succeed on another port and this test would fail.
+        let holder = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let requested_port = holder.local_addr().unwrap().port();
 
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, base_port));
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, requested_port));
 
         let err = match HttpIngressServer::start(HttpIngressConfig {
             bind_addr: addr,
@@ -2417,7 +2417,7 @@ mod tests {
             public_base_url: None,
             notifier_config: crate::notifier::NotifierConfig::default(),
         }) {
-            Ok(_) => panic!("occupied port range should fail ingress startup"),
+            Ok(_) => panic!("occupied requested port should fail ingress startup"),
             Err(err) => err,
         };
 

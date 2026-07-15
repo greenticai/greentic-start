@@ -1197,6 +1197,34 @@ mod tests {
         .expect("write demo config");
     }
 
+    /// RAII guard that pins `GREENTIC_GATEWAY_PORT` for the lifetime of a
+    /// test and always clears it on drop, including when the test body
+    /// panics — a plain set_var/remove_var pair would leak the var into
+    /// later tests in this binary if an `.expect()`/`assert!` in between
+    /// panicked before the manual `remove_var` ran.
+    #[must_use = "bind the guard to a named variable (e.g. `let _gateway_port = ...`); \
+                  dropping it immediately clears the variable it just set"]
+    struct GatewayPortGuard;
+
+    impl GatewayPortGuard {
+        fn set(port: &str) -> Self {
+            // Writes to this variable are serialized against other writers by
+            // test_env_lock(), and the guard clears it on every exit path,
+            // including panics. This mirrors the env-mutation pattern already
+            // used across this crate's tests (bundle_config.rs,
+            // bin_resolver.rs); it does not establish the absence of
+            // concurrent readers that set_var's contract formally asks for.
+            unsafe { std::env::set_var("GREENTIC_GATEWAY_PORT", port) };
+            Self
+        }
+    }
+
+    impl Drop for GatewayPortGuard {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("GREENTIC_GATEWAY_PORT") };
+        }
+    }
+
     fn request_runtime_stop(bundle: &Path) -> thread::JoinHandle<()> {
         let runtime_paths =
             runtime_state::RuntimePaths::new(bundle.join("state"), "demo", "default");
@@ -1219,6 +1247,12 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         crate::operator_log::reset_for_tests();
+        // Pin an explicit port: since the ingress listener now always binds,
+        // the default 8080 would race with the other boot tests (and with
+        // whatever else owns 8080 on a dev machine). Strict bind (range 0)
+        // turns such a collision into a hard failure, so the port must be
+        // deterministic and unique per test.
+        let _gateway_port = GatewayPortGuard::set("19903");
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path().join("bundle");
         write_demo_bundle(&bundle);
@@ -1243,6 +1277,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         crate::operator_log::reset_for_tests();
+        let _gateway_port = GatewayPortGuard::set("19904");
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path().join("bundle");
         write_demo_bundle(&bundle);
