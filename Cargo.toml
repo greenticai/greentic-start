@@ -93,40 +93,39 @@ features = ["derive"]
 
 [dependencies.greentic-aw-runtime]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "1df54513a850143488c840565141f43bccd013e5"
+rev = "9412530a0fae92bf8ac18c1459bdf540dfd65c85"
 default-features = false
 
 [dependencies.greentic-distributor-client]
-version = "=1.3.0-research.0"
+version = "=1.3.0-research.1"
 default-features = false
 features = ["pack-fetch"]
 
-# Pinned to runner rev f97c587 (greentic-runner#507, based on the #503 merge
-# 9d56b88), which moves onto the greentic-types 1.2.0-research line, enables the
-# multi-provider in-process LLM backend for dw.agent (DeepSeek/Anthropic/… via
-# greentic-llm) through the opt-in `greentic-llm-backend` feature below, pins
-# greentic-ext-runtime c47a0738 (#94 OAuth broker host import + sdk 1.2.19) so
-# OAuth-enabled design extensions load and instantiate, carries #502
-# (preflight-warn on tool load failure), AND makes the desktop ephemeral AW
-# state store process-global so dw.agent keeps multi-turn memory with no Redis.
-# Based on 9d56b88 (NOT research HEAD) to stay before the knowledge-chronicle
-# merge, which pulls a private dep that breaks the workspace resolve.
-# Requires greentic-setup, greentic-types, secrets-lib, distributor-client +
-# qa-spec all on the 1.2.0-research line (see greenticai/greentic-setup#162).
+# Pinned to runner rev 9412530a (greentic-runner#587): exposes prior node
+# outputs to routing conditions, so `node.<id>.field` in a .ygtc route
+# condition resolves under `gtc start`. Before this rev, build_routing_context
+# carried only entry/in/response/event — a `node.*` route condition rendered
+# "" and took the wrong branch silently. Descends from the previous pin
+# 1df54513 (121 commits), so it keeps the multi-provider in-process LLM backend
+# for dw.agent (via greentic-llm, the opt-in `greentic-llm-backend` feature
+# below), the greentic-ext-runtime OAuth-broker host import, and the
+# process-global desktop ephemeral AW state store. Requires greentic-setup,
+# greentic-types, secrets-lib, distributor-client + qa-spec all on the
+# 1.3.0-research.1 line (bumped together below; see greenticai/greentic-setup#216).
 [dependencies.greentic-runner-desktop]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "1df54513a850143488c840565141f43bccd013e5"
+rev = "9412530a0fae92bf8ac18c1459bdf540dfd65c85"
 default-features = false
 features = ["agentic-worker", "greentic-llm-backend", "desktop-agent-ephemeral"]
 
 [dependencies.greentic-runner-host]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "1df54513a850143488c840565141f43bccd013e5"
+rev = "9412530a0fae92bf8ac18c1459bdf540dfd65c85"
 default-features = false
 features = ["agentic-worker", "greentic-llm-backend"]
 
 [dependencies.greentic-secrets-lib]
-version = "=1.3.0-research.0"
+version = "=1.3.0-research.1"
 features = ["providers-dev"]
 
 # Consumed as a git dep on the research branch (like greentic-runner) so it
@@ -144,7 +143,7 @@ branch = "research"
 # build directly avoids the old git [patch] that force-unified greentic-types and
 # broke greentic-setup. Bump this when a newer research build is published.
 [dependencies.greentic-types]
-version = "=1.3.0-research.0"
+version = "=1.3.0-research.1"
 features = ["serde"]
 
 [dependencies.hyper]
@@ -152,7 +151,7 @@ version = "1"
 features = ["full"]
 
 [dependencies.qa-spec]
-version = "=1.3.0-research.0"
+version = "=1.3.0-research.1"
 
 [dependencies.serde]
 version = "1.0"
@@ -185,24 +184,33 @@ criterion = "0.8"
 greentic-llm = { version = "=1.3.0-research.0", features = ["test-mock"] }
 tempfile = "3"
 
-# greentic-runner (rev ad08c976) pulls greentic-extension-sdk-contract
-# =1.2.11-research and greentic-mcp-exec (list_tools), both git-tag/branch-only
+# greentic-runner (rev 9412530a) pulls greentic-extension-sdk-contract
+# =1.3.0-research.1 and greentic-mcp-exec (list_tools), both git-tag/branch-only
 # (not republished to crates.io). Cargo [patch] does NOT propagate through git
 # dependencies, so greentic-start must declare the same redirects to resolve the
 # agentic-worker graph. NOTE: unlike the runner, we do NOT patch greentic-types
 # here (we pin the published research build above) — a git patch would unify
 # greentic-types graph-wide and break greentic-setup's 0.5 line.
+[patch."https://github.com/greenticai/greentic-llm"]
+# greentic-dw's provider crates (operala-invoker et al.) pin greentic-llm via a
+# git tag (v1.2.6-research); this workspace and the runner use the crates.io
+# release (=1.3.0-research.0). Two sources -> two `LlmProvider` traits ->
+# DeepWorkerInvoker::new type-mismatch (E0308). The runner unifies them with this
+# exact patch in ITS root, but a Cargo [patch] does NOT propagate through a git
+# dependency, so greentic-start must mirror it. Verify with
+# `cargo tree -i greentic-llm` (must show a single version). Drop once
+# greentic-dw consumes the crates.io release directly.
+greentic-llm = { version = "=1.3.0-research.0" }
+
 [patch.crates-io]
-greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.0" }
+greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.1" }
 greentic-mcp-exec = { git = "https://github.com/greenticai/greentic-mcp.git", rev = "1f353b4b494354e8923ed40409970f3eb865f69a" }
 
-# NOTE: greentic-ext-runtime is NOT patched here. The runner revs pinned above
-# (f97c587, runner `research`) already pin greentic-ext-runtime to rev c47a0738,
-# which carries #94 (the `greentic:oauth-broker/broker-v1` host import + the
-# `oauthProviders` describe field) plus the sdk 1.2.19 bump. That rev is what
-# lets OAuth-enabled design extensions (e.g. greentic.hubspot) load AND
-# instantiate — pre-#94 ext-runtime (rev 50ce911) understood neither, so the
-# extension's tools never reached the agent. Bumping the runner rev is the
+# NOTE: greentic-ext-runtime is NOT patched here. The runner rev pinned above
+# (9412530a) already pins greentic-ext-runtime to rev 82d1bb24, which carries the
+# `greentic:oauth-broker/broker-v1` host import + `oauthProviders` describe field
+# so OAuth-enabled design extensions (e.g. greentic.hubspot) load AND instantiate
+# and the extension's tools reach the agent. Bumping the runner rev is the
 # coordinated, in-graph fix; a local ext-runtime [patch] cannot satisfy the
 # graph's exact sdk-contract pins.
 
