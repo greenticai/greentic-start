@@ -93,7 +93,7 @@ features = ["derive"]
 
 [dependencies.greentic-aw-runtime]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "9412530a0fae92bf8ac18c1459bdf540dfd65c85"
+rev = "0baa65355013a154d0a34b7fafb1ae6389ff0fb6"
 default-features = false
 
 [dependencies.greentic-distributor-client]
@@ -114,13 +114,13 @@ features = ["pack-fetch"]
 # 1.3.0-research.1 line (bumped together below; see greenticai/greentic-setup#216).
 [dependencies.greentic-runner-desktop]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "9412530a0fae92bf8ac18c1459bdf540dfd65c85"
+rev = "0baa65355013a154d0a34b7fafb1ae6389ff0fb6"
 default-features = false
 features = ["agentic-worker", "greentic-llm-backend", "desktop-agent-ephemeral"]
 
 [dependencies.greentic-runner-host]
 git = "https://github.com/greenticai/greentic-runner.git"
-rev = "9412530a0fae92bf8ac18c1459bdf540dfd65c85"
+rev = "0baa65355013a154d0a34b7fafb1ae6389ff0fb6"
 default-features = false
 features = ["agentic-worker", "greentic-llm-backend"]
 
