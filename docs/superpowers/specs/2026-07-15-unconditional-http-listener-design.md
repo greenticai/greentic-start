@@ -35,9 +35,14 @@ open the gate no matter what it declares.
 `messaging`, `event`/`events`, `component-config`, `job`, `http`. Four need no channel.
 
 `greentic-secrets/packs/{aws-sm,azure-kv,gcp-sm,k8s,vault-kv}/` ships 5 packs × 6 flows
-= 30 `type: event` flows with zero messaging references. They are driven by named
-entrypoints declared in `pack.yaml` (`read_secret`, `write_secret`, `breakglass`, …).
-Booting one under `gtc start` today yields no listener and no health.
+= 30 `type: event` flows with zero messaging references. Booting one under `gtc start` today
+yields no listener and no health — which is what this spec fixes.
+
+*(Corrected 2026-07-15: this paragraph originally said those flows "are driven by named
+entrypoints declared in `pack.yaml`". They are not — see the `/workers/invoke` non-goal below.
+Named entrypoints are discoverability metadata with no runtime dispatcher. This does not change
+the problem statement: the flows are real, legitimately channel-less, and were silently portless.
+It changes what triggers them once they are up — today, only NATS business events.)*
 
 ### Why `--store-root` does not already solve it
 
@@ -70,12 +75,41 @@ Adopting `revision_serve` here is not available: `research` cannot absorb `main`
 
 ## Non-goals
 
-- **No `/workers/invoke`.** Channel-less workers are triggered by NATS business events,
-  cron, or named entrypoints. Adding an inbound invoke surface is a separate decision with
-  its own attack surface; `main` deliberately loopback-gates it (`revision_serve.rs:1394`).
-- **No flow→ingress wiring.** Making `type: event` flows with `http:/path` entrypoints
-  serve real webhooks requires discovery to read flows — a domain-model change, tracked
-  separately.
+- **No `/workers/invoke`.** Adding an inbound invoke surface is a separate decision with its
+  own attack surface; `main` deliberately loopback-gates it (`revision_serve.rs:1394`).
+
+  *(Corrected 2026-07-15. This bullet originally justified itself with "channel-less workers
+  are triggered by NATS business events, cron, or named entrypoints." Two of those three are
+  false, and the correction weakens — not strengthens — the case for omitting an invoke
+  surface. Recording it rather than quietly editing the sentence.*
+  - ***cron does not exist.*** `greentic-triggers` is a 209-line library whose only
+    `Cargo.toml` reference is its own — **zero consumers**. Its `src/lib.rs:6-7` claims "the
+    running scheduler lives in operax"; `grep -riE "cron|scheduler"` across all of
+    `greentic-operax` returns **zero hits**. The live timer path
+    (`greentic-start/src/timer_scheduler.rs`, wired at `runtime.rs:876-905`) is
+    interval-only, provider-mediated, and understands no cron expressions.
+  - ***Named entrypoints are not a trigger.*** `PackFlowEntry.entrypoints` documents itself
+    as "for discoverability". `read_secret` is a **host Rust function**
+    (`greentic-runner-host/src/secrets.rs:277`), called from Rust — not dispatched to by any
+    runtime. Worse, the runner reads only the `"default"` key
+    (`greentic-runner-host/src/runner/engine.rs:2843`) and `flow_adapter.rs:126` only ever
+    *writes* `"default"` — every other entrypoint name is silently discarded.
+  - **So NATS business events are the *only* working trigger for a channel-less worker**
+    (`greentic-start/src/business_event_listener.rs`, gated solely on
+    `GREENTIC_EVENTS_NATS_URL`, needing no provider pack). The 30 `type: event` flows in
+    `greentic-secrets` cited above have no other path in. Whether that justifies
+    `/workers/invoke` is now an open question, not a settled non-goal.)*
+- **No flow→ingress wiring.** Making `type: event` flows serve real webhooks requires
+  discovery to read flows — a domain-model change, tracked separately.
+
+  *(Corrected 2026-07-15: this originally said "flows with `http:/path` entrypoints", which
+  implied that syntax means something. It does not — `http:/path` appears only in a schema
+  description (`greentic-flow/schemas/ygtc.flow.schema.json:58-61`, `additionalProperties:
+  true`, zero validation) and no parser anywhere reads it. The runtime's actual flow-selection
+  key is `subscribes_to` (`greentic-start/src/event_router.rs:36`), which **cannot be authored
+  at all**: it is absent from `FlowDoc` and `PackFlowEntry`, and no `.ygtc`/`.yaml`/`.json` in
+  any repo declares it. `select_target_flows` therefore returns empty and every event falls back
+  to `select_app_flow` — one default flow per pack, regardless of the event.)*
 - **No designer changes.** See "Relationship to designer" below.
 - **No `revision_serve` port.** Blocked by the release train; also unnecessary for probes.
 
