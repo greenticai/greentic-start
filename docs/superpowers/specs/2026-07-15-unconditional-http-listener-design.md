@@ -29,15 +29,31 @@ do with each other.
 `root.join("providers")`. Flows are never inspected, so a flows-only bundle cannot
 open the gate no matter what it declares.
 
-### This is not hypothetical
+### The gate is real; the motivating example was not
 
 `greentic-flow`'s `map_flow_type` (`src/lib.rs:63-75`) admits five flow kinds:
-`messaging`, `event`/`events`, `component-config`, `job`, `http`. Four need no channel.
+`messaging`, `event`/`events`, `component-config`, `job`, `http`. Four need no channel. A bundle
+with no messaging provider gets no listener — proven live: the pre-change binary
+(`origin/research` @ `89348cf`) booted against a provider-less bundle refuses connections; this
+branch answers `/healthz` with 200 on the same bundle.
 
-`greentic-secrets/packs/{aws-sm,azure-kv,gcp-sm,k8s,vault-kv}/` ships 5 packs × 6 flows
-= 30 `type: event` flows with zero messaging references. They are driven by named
-entrypoints declared in `pack.yaml` (`read_secret`, `write_secret`, `breakglass`, …).
-Booting one under `gtc start` today yields no listener and no health.
+*(Corrected 2026-07-15 — twice, and the second correction retires this section's example.*
+
+*This section originally cited `greentic-secrets/packs/{aws-sm,…}` — "5 packs × 6 flows = 30
+`type: event` flows" — as proof that channel-less workers exist in the wild. **They are not an
+example of this problem.** Those packs are `kind: provider` whose `gtpack.yaml` maps named
+operations (`onboard`, `read_secret`, `breakglass`, …) to flow files; they are executed by the
+`greentic-provision` CLI as a subprocess (`greentic-secrets-test/src/lib.rs:83-84`, `:995`,
+`--executor wasm`), never by `gtc start`, and runtime secret reads bypass those flows entirely
+via a host function (`greentic-runner-host/src/engine/runtime.rs:500-506`). `type: event` there
+means "RPC-shaped flow", not "subscribes to a bus".*
+
+*So the honest position: **no bundle in this workspace is both channel-less and `gtc start`-ed
+today.** The gate was real and the fix is verified, but it was fixed for a shape nobody currently
+ships — the live verification had to construct one (`greentic-bundle init`, no `providers/` dir).
+That is still worth doing (a port should not depend on a chat channel, and the failure was silent
+and undiagnosable), but it is an enabler, not a rescue. Recording this rather than leaving a
+motivation the code does not support.)*
 
 ### Why `--store-root` does not already solve it
 
@@ -70,12 +86,65 @@ Adopting `revision_serve` here is not available: `research` cannot absorb `main`
 
 ## Non-goals
 
-- **No `/workers/invoke`.** Channel-less workers are triggered by NATS business events,
-  cron, or named entrypoints. Adding an inbound invoke surface is a separate decision with
-  its own attack surface; `main` deliberately loopback-gates it (`revision_serve.rs:1394`).
-- **No flow→ingress wiring.** Making `type: event` flows with `http:/path` entrypoints
-  serve real webhooks requires discovery to read flows — a domain-model change, tracked
-  separately.
+- **No `/workers/invoke`.** Adding an inbound invoke surface is a separate decision with its
+  own attack surface; `main` deliberately loopback-gates it (`revision_serve.rs:1394`).
+
+  *(Corrected 2026-07-15. This bullet originally justified itself with "channel-less workers
+  are triggered by NATS business events, cron, or named entrypoints." Two of those three are
+  false, and the correction weakens — not strengthens — the case for omitting an invoke
+  surface. Recording it rather than quietly editing the sentence.*
+  - ***cron does not exist.*** `greentic-triggers` is a 209-line library whose only
+    `Cargo.toml` reference is its own — **zero consumers**. Its `src/lib.rs:6-7` claims "the
+    running scheduler lives in operax"; `grep -riE "cron|scheduler"` across all of
+    `greentic-operax` returns **zero hits**. The live timer path
+    (`greentic-start/src/timer_scheduler.rs`, wired at `runtime.rs:876-905`) is
+    interval-only, provider-mediated, and understands no cron expressions.
+  - ***Named entrypoints are not a trigger.*** `PackFlowEntry.entrypoints` documents itself
+    as "for discoverability". `read_secret` is a **host Rust function**
+    (`greentic-runner-host/src/secrets.rs:277`), called from Rust — not dispatched to by any
+    runtime. Worse, the runner reads only the `"default"` key
+    (`greentic-runner-host/src/runner/engine.rs:2843`) and `flow_adapter.rs:126` only ever
+    *writes* `"default"` — every other entrypoint name is silently discarded.
+  - **So NATS business events are the only *bus-style* trigger** that exists
+    (`greentic-start/src/business_event_listener.rs`, gated solely on `GREENTIC_EVENTS_NATS_URL`,
+    needing no provider pack) — and it is set in **zero** deployments, so it has never run.
+  - **The right reason to omit `/workers/invoke` is neither of the above: it has no consumer in
+    this deployment model.** On `main` the endpoint is genuinely load-bearing — `assets/chat.html`
+    (`origin/main:assets/chat.html:99`) POSTs to it, `greentic-deployer`'s k8s E2E drives it, and
+    it was built for greentic-gui's `HttpWorkerBackend` (PR #207). But `research` has **no
+    `assets/` directory at all**, greentic-gui is not part of this deployment model, and zero
+    clients reference `workers/invoke` across greentic-designer, -admin, -dev, -e2e, or
+    -runner-cli. Designer runs flows two other ways entirely (sidecar `/agent/chat`, and a
+    server-side reverse proxy into `greentic-start`) and never touches it. Adding it now would be
+    attack surface with no caller. **If `research` later grows a `/chat` console like `main`'s,
+    that is when it becomes a real requirement — it is that console's transport.**)*
+- **No flow→ingress wiring.** Making `type: event` flows serve real webhooks requires
+  discovery to read flows — a domain-model change, tracked separately.
+
+  *(Corrected 2026-07-15: this originally said "flows with `http:/path` entrypoints", which
+  implied that syntax means something. It does not — `http:/path` appears only in a schema
+  description (`greentic-flow/schemas/ygtc.flow.schema.json:58-61`, `additionalProperties:
+  true`, zero validation) and no parser anywhere reads it. The runtime's actual flow-selection
+  key is `subscribes_to` (`greentic-start/src/event_router.rs:16`), which **cannot be authored
+  at all**: it is absent from `greentic-types::PackFlowEntry` (`pack_manifest.rs:136-149` — the
+  type that actually writes `manifest.cbor`), and no `.ygtc`/`.yaml`/`.json` in any repo declares
+  it. Confirmed empirically by decoding a real `manifest.cbor`
+  (`greentic-demo/apps/quickstart-app/dist/`): flows carry `id`/`kind`/`flow`/`tags`/`entrypoints`
+  and **no `subscribes_to`**. `select_target_flows` therefore always returns empty and every event
+  falls back to `select_app_flow`.*
+
+  *This is **declared debt, not a hidden bug**: PR #287, which introduced `subscribes_to`, listed
+  "Authoring `subscribes_to`/emitted topics in the designer/SoRLa" under "Not in this PR
+  (follow-ups)" and stated the fallback keeps all deployments behaving identically. It is also
+  triply inert today — the listener is enabled nowhere, and the SoRX publisher the architecture
+  doc claims "exists" does not: `greentic.events`, `EventEnvelope`, and `async-nats` all return
+  zero hits across `greentic-sorx/` and `greentic-sorla/`.*
+
+  *A sharper bug lives next to it, if anyone revives this: `select_app_flow`
+  (`messaging_app.rs:186-199`) only selects flows with `kind == "messaging"`, so `on_event` — the
+  only event-kind flow in the entire workspace — is structurally unreachable via event routing.
+  "Any event → default flow" is more precisely "any event → a *messaging* flow; event flows never
+  run".)*
 - **No designer changes.** See "Relationship to designer" below.
 - **No `revision_serve` port.** Blocked by the release train; also unnecessary for probes.
 
@@ -173,11 +242,17 @@ Fix it together with the `:718`/`:721` domain check, where it becomes observable
   `run_gsm_services = config.services.nats.enabled` (`:1075`) and NATS defaults on, a
   channel-less bundle booted with default NATS now hands all four children
   `PUBLIC_HTTP_ENABLED=true` where they previously got `false`.
-  **Nothing on this branch exercised this.** Both live runs used `--nats off`, and the new tests
-  either set `nats.enabled: false` or bypass `demo_up_services` entirely — so no child process
-  has been observed reading the changed value. Whether any consumer branches on it is
-  **unverified**: `greentic-runner` is `.git`-only on this machine and its source cannot be read
-  here.
+  **Resolved 2026-07-15 — the flip is inert, because nothing reads the variable.**
+  `greentic-start/src/startup_contract.rs` is its only occurrence in the entire workspace, and
+  `strings $(which greentic-runner)` finds zero hits — the compiled runner does not even contain
+  the string. `greentic-runner`'s tree (crates: greentic-runner, greentic-runner-host,
+  greentic-aw-runtime, runner-core, …) has no occurrence in any file type, and neither does
+  `~/.cargo/registry/src/`. The `gateway` / `egress` binaries are external, resolved by bare name
+  from PATH (`src/config.rs:401`, `default_gateway_binary() -> "gateway"`), and are not installed
+  here at all. `PUBLIC_HTTP_ENABLED` is a write-only contract.
+  *(An earlier revision of this bullet called this unverified, on the grounds that `greentic-runner`
+  is `.git`-only per the workspace `CLAUDE.md`. That claim is stale — the runner is fully checked
+  out, and the question was answerable with one grep.)*
 - The startup banner now prints an `HTTP: http://…` line for probes-only runs, where it
   previously printed none — `StartupInfo.http_url` (`src/runtime.rs:71`, populated at
   `:1482`) is `Some` whenever the listener exists. Operators will see a URL that serves
