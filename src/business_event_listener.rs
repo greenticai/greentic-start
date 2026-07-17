@@ -2,7 +2,7 @@
 //!
 //! Subscribes to `greentic.events.>`, converts each raw NATS message
 //! (`subject`, `body`) into an `(OperatorContext, EventEnvelopeV1)` pair, and
-//! routes it to flows via `crate::event_router::route_events`. Mirrors
+//! routes it to flows via `crate::event_router::route_events_to_default_flow`. Mirrors
 //! `crate::threshold_watcher`'s shape: a background thread (owning a
 //! dedicated single-thread Tokio runtime, exactly like
 //! `crate::threshold_watcher::watcher` owns its polling thread) that is off
@@ -25,7 +25,7 @@
 //!
 //! [`handle_message`] is generic over the `route` call purely for
 //! testability: production code (the loop below, and `crate::runtime`)
-//! always passes `event_router::route_events`; tests substitute a stand-in
+//! always passes `event_router::route_events_to_default_flow`; tests substitute a stand-in
 //! to drive the message -> route path deterministically, without a running
 //! NATS server or flow.
 
@@ -75,7 +75,7 @@ const SUBJECT_PREFIX: &str = "greentic.events.";
 /// Extracts the routable topic from a `greentic.events.<tenant>.<topic...>`
 /// NATS subject: everything after the tenant segment, re-joined with `.`.
 ///
-/// `route_events`/`select_target_flows` (`crate::event_router`) match a
+/// `route_events_to_default_flow`/`select_target_flows` (`crate::event_router`) match a
 /// flow's `subscribes_to` patterns against `EventEnvelopeV1.event_type`.
 /// Setting `event_type` to this subject-derived topic (e.g.
 /// `sorla.pack.order.created`) is what makes a flow declaring
@@ -106,7 +106,7 @@ pub fn tenant_from_subject(subject: &str) -> Option<String> {
 }
 
 /// Decodes `body` as a `greentic_types::EventEnvelope` and converts it into
-/// the `(OperatorContext, EventEnvelopeV1)` pair `route_events` expects.
+/// the `(OperatorContext, EventEnvelopeV1)` pair `route_events_to_default_flow` expects.
 ///
 /// `event_type` precedence (see [`topic_from_subject`] for why): the
 /// subject-derived topic first, falling back to the decoded envelope's
@@ -197,7 +197,7 @@ pub fn convert(subject: &str, body: &[u8]) -> Option<(OperatorContext, EventEnve
 /// error.
 ///
 /// Generic over `route` purely for testability — production callers (the
-/// subscribe loop below) always pass `event_router::route_events`.
+/// subscribe loop below) always pass `event_router::route_events_to_default_flow`.
 pub fn handle_message<R>(subject: &str, body: &[u8], bundle_root: &Path, route: R)
 where
     R: FnOnce(&Path, &OperatorContext, &[EventEnvelopeV1]) -> anyhow::Result<usize>,
@@ -225,7 +225,7 @@ where
 
 /// Configuration for one running [`BusinessEventListener`]: the NATS URL to
 /// connect to (connecting happens *inside* the listener's own thread/
-/// runtime — see the module docs) and the bundle root `route_events`
+/// runtime — see the module docs) and the bundle root `route_events_to_default_flow`
 /// dispatches against.
 #[derive(Clone)]
 pub struct BusinessEventListenerConfig {
@@ -410,14 +410,14 @@ async fn run_listener_loop(
 
 /// FIX I2: offloads one message's decode-and-route work
 /// ([`handle_message`], which calls the synchronous, flow-executing
-/// `event_router::route_events`) onto the blocking thread pool via
+/// `event_router::route_events_to_default_flow`) onto the blocking thread pool via
 /// `tokio::task::spawn_blocking`, so a slow flow never stalls this loop's
 /// `subscriber.next().await` (head-of-line blocking across the whole
 /// subscription).
 ///
 /// Fire-and-forget from the caller's perspective: a separate task awaits
 /// the `spawn_blocking` join handle purely to log a join failure (e.g. a
-/// panic inside `route_events`) — it is never propagated or re-panicked.
+/// panic inside `route_events_to_default_flow`) — it is never propagated or re-panicked.
 fn dispatch_message(message: async_nats::Message, bundle_root: &Path) {
     let subject = message.subject.to_string();
     let payload = message.payload.to_vec();
@@ -429,7 +429,7 @@ fn dispatch_message(message: async_nats::Message, bundle_root: &Path) {
             &subject,
             &payload,
             &bundle_root,
-            crate::event_router::route_events,
+            crate::event_router::route_events_to_default_flow,
         );
     });
 

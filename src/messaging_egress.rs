@@ -1,13 +1,34 @@
 use anyhow::Context;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use greentic_deploy_spec::DeploymentId;
 use serde_json::{Value as JsonValue, json};
 
+use crate::deployment_routes::DeploymentConfigOverrides;
 use crate::domains::Domain;
 use crate::messaging_dto::{
     EncodeInV1, ProviderPayloadV1, RenderPlanInV1, SendPayloadInV1, TenantHint,
 };
 use crate::runner_host::{DemoRunnerHost, FlowOutcome, OperatorContext};
+
+/// Pick the override map for a `(deployment_id, pack_id)` pair, materialized
+/// as a JSON object ready to hand to [`build_send_payload`]. Returns `None`
+/// when no overrides are configured for the pack or the inner map is empty —
+/// the egress path skips config injection in that case (preserves the
+/// "no config" behaviour for packs the operator hasn't touched).
+pub fn pack_config_overrides_as_json(
+    table: &DeploymentConfigOverrides,
+    deployment_id: DeploymentId,
+    pack_id: &str,
+) -> Option<JsonValue> {
+    table
+        .get(&deployment_id)
+        .and_then(|by_pack| by_pack.get(pack_id))
+        .filter(|cfg| !cfg.is_empty())
+        .map(|cfg| {
+            serde_json::to_value(cfg).expect("BTreeMap<String, JsonValue> serializes infallibly")
+        })
+}
 
 pub fn build_render_plan_input(message: JsonValue) -> RenderPlanInV1 {
     RenderPlanInV1 { v: 1, message }
@@ -226,6 +247,64 @@ mod tests {
         let body = STANDARD.decode(send.payload.body_b64).unwrap();
         let body: JsonValue = serde_json::from_slice(&body).unwrap();
         assert!(body.get("config").is_none());
+    }
+
+    #[test]
+    fn pack_config_overrides_round_trip_through_send_payload_body() {
+        // End-to-end projection: BundleDeployment.config_overrides →
+        // routing.deployment_config_overrides → pack_config_overrides_as_json →
+        // build_send_payload → injected into the envelope body. This is the
+        // chain run_reply_egress walks at egress time.
+        use std::collections::BTreeMap;
+
+        let pack_id = "telegram-pack";
+        let dep_id = DeploymentId::new();
+        let mut table = DeploymentConfigOverrides::new();
+        table.insert(
+            dep_id,
+            BTreeMap::from([(
+                pack_id.to_string(),
+                BTreeMap::from([
+                    (
+                        "api_base_url".to_string(),
+                        JsonValue::String("https://staging.example.com".to_string()),
+                    ),
+                    (
+                        "default_chat_id".to_string(),
+                        JsonValue::String("-100123".to_string()),
+                    ),
+                ]),
+            )]),
+        );
+
+        // Lookup returns the per-pack overrides as a JSON object.
+        let config = pack_config_overrides_as_json(&table, dep_id, pack_id)
+            .expect("override config must be present for the matched pack");
+        assert_eq!(config["api_base_url"], "https://staging.example.com");
+
+        // Cross-pack lookup: same deployment, different pack → None.
+        assert!(pack_config_overrides_as_json(&table, dep_id, "slack-pack").is_none());
+
+        // build_send_payload injects the looked-up config into the envelope body.
+        let envelope = json!({
+            "tenant": {"tenant": "demo"},
+            "session_id": "s-1",
+            "text": "hello",
+        });
+        let payload = ProviderPayloadV1 {
+            content_type: "application/json".to_string(),
+            body_b64: STANDARD.encode(serde_json::to_vec(&envelope).unwrap()),
+            metadata_json: None,
+            metadata: None,
+        };
+        let send = build_send_payload(payload, "messaging-telegram", "demo", None, Some(config));
+        let body = STANDARD.decode(&send.payload.body_b64).unwrap();
+        let body: JsonValue = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["config"]["api_base_url"], "https://staging.example.com",
+            "config_overrides must reach the WASM provider via the envelope body"
+        );
+        assert_eq!(body["config"]["default_chat_id"], "-100123");
     }
 
     #[test]

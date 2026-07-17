@@ -72,6 +72,13 @@ These are the supported `start` and `restart` flags from [src/cli_args.rs](/proj
   Points at the bundle root to run.
 - `--config <path>`
   Uses an explicit runtime config path instead of bundle auto-resolution.
+- `--env <id>`
+  Environment id whose persisted state the bundle-less boot serves.
+  Precedence: flag > `$GREENTIC_ENV` > `local`. The resolved value is
+  propagated into `$GREENTIC_ENV` for the process so downstream resolution
+  (runner-host paths, secret stores, startup contract) agrees with the
+  boot. Ignored (with a warning) on the legacy `--bundle`/`--config` path,
+  which has no environment concept.
 - `--tenant <name>`
   Overrides the tenant.
 - `--team <name>`
@@ -146,6 +153,22 @@ Important automatic behavior from [src/lib.rs](/projects/ai/greentic-ng/greentic
 - if still not explicit, the runtime may prompt for tunnel selection in interactive use
 - if `--ngrok on` and `--cloudflared on` are both present, `ngrok` wins unless you intentionally override the combination
 
+Tunnels on the bundle-less (env-serving) boot, from `src/env_tunnel.rs`:
+
+- `--cloudflared on` / `--ngrok on` also work without `--bundle`: the tunnel
+  is spawned against the bound revision-serve port after the listener is up,
+  and its URL becomes the highest-precedence public base URL
+  (tunnel > env-store `public_base_url` > `PUBLIC_BASE_URL` env var) for
+  provider webhook auto-registration, including re-registration on config
+  reloads
+- there is no auto-enable and no interactive prompt on this path — tunnels
+  are off unless a flag asks for one, and a tunnel that fails to start fails
+  the boot (explicit opt-in, never a silent local-only fallback)
+- tunnel children are tracked under
+  `<env_dir>/state/pids/env.<env_id>/<service>.pid` and deliberately survive
+  Ctrl+C so a quick restart reuses the same URL; `greentic-start stop` tears
+  them down
+
 ### Runner selection
 
 - `--runner-binary <path>`
@@ -185,6 +208,26 @@ That defaulting is applied in [src/lib.rs](/projects/ai/greentic-ng/greentic-sta
   Reduces terminal noise.
 
 Logging initialization happens in [src/lib.rs](/projects/ai/greentic-ng/greentic-start/src/lib.rs:137).
+
+### Updates
+
+- `--no-updates`
+  Opts this process out of the environment's update channel: no poll loop runs and
+  `/v1/updates/notify` is not reserved (the path falls through to deployment
+  routing). It is a host-local kill switch, not a policy knob — the env's
+  `update-channel.json` (`enabled`, `on_update`) is left untouched, so a restart
+  without the flag resumes whatever the operator declared.
+
+Without the flag the runtime always runs the poll loop. The loop re-reads
+`update-channel.json` every cycle and no-ops while the channel is absent, disabled,
+or endpoint-less, so an env that subscribes *after* boot starts polling without a
+restart. Deny-by-default is unchanged: an env with no `update-channel.json` never
+fetches anything, and a notification to a disabled channel is ignored.
+
+`on_update: apply` (deploy-spec 0.2.2) makes a verified, staged plan converge the
+environment in place — the apply rewrites `runtime-config.json`, which this process
+already watches, so traffic moves with no restart. `stage` (the default) leaves the
+content on disk for a human to apply.
 
 ### Admin API
 
@@ -247,6 +290,7 @@ Failure modes:
 The `stop` command supports the flags defined in [src/cli_args.rs](/projects/ai/greentic-ng/greentic-start/src/cli_args.rs:64).
 
 - `--bundle <path>`
+- `--env <id>`
 - `--state-dir <path>`
 - `--tenant <name>`
 - `--team <name>`
@@ -254,6 +298,19 @@ The `stop` command supports the flags defined in [src/cli_args.rs](/projects/ai/
 The stop request entrypoint is [src/lib.rs](/projects/ai/greentic-ng/greentic-start/src/lib.rs:93).
 
 Use `stop` when you want to shut down an already-running runtime cleanly.
+
+With no `--bundle` / `--state-dir` and no legacy `./state` directory in the
+CWD, `stop` targets the bundle-less env runtime instead: it writes a
+stop-request file under `<env_dir>/state/runtime/env.<env_id>/control/` (a
+serving `greentic-start` polls it every 250ms and exits cleanly) and stops
+env-rooted tunnel children via their pidfiles. It does NOT pkill arbitrary
+`cloudflared`/`ngrok` processes on this path — a hand-started tunnel is left
+alone, unlike the legacy bundle stop.
+
+`--env <id>` picks which environment's runtime to stop (flag >
+`$GREENTIC_ENV` > `local`). An explicit `--env` naming an environment with
+no store directory is an error, not a fall-through to the legacy path; on
+the legacy `--bundle`/`--state-dir` path the flag is ignored with a warning.
 
 ## Automatic Behaviors Agents Must Remember
 

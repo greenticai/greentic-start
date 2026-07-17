@@ -138,7 +138,7 @@ fn run_watcher_loop(config: ThresholdWatcherConfig, rx: mpsc::Receiver<()>) {
                 &config.state_dir,
                 &watch.config,
                 fetch_metric,
-                crate::event_router::route_events,
+                crate::event_router::route_events_to_default_flow,
             );
             watch.next_tick =
                 Instant::now() + Duration::from_secs(watch.config.interval_seconds.max(1));

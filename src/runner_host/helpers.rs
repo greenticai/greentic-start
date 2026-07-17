@@ -1,15 +1,15 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::{env, fs};
 
 use anyhow::{Context, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use greentic_runner_host::config::{
-    FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
-    WebhookPolicy,
+    Fast2FlowRoutingConfig, FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy,
+    StateStorePolicy, WebhookPolicy,
 };
 use greentic_runner_host::trace::TraceConfig;
 use greentic_runner_host::validate::ValidationConfig;
@@ -242,8 +242,8 @@ pub(super) fn read_transcript_outputs(run_dir: &Path) -> anyhow::Result<Option<J
     Ok(last)
 }
 
-pub(super) fn build_demo_host_config(tenant: &str, bundle_root: &std::path::Path) -> HostConfig {
-    let mut config = HostConfig {
+pub(super) fn build_demo_host_config(tenant: &str) -> HostConfig {
+    HostConfig {
         tenant: tenant.to_string(),
         bindings_path: PathBuf::from("<demo-provider>"),
         flow_type_bindings: HashMap::new(),
@@ -261,49 +261,9 @@ pub(super) fn build_demo_host_config(tenant: &str, bundle_root: &std::path::Path
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
-        // No agent-graphs in the synthetic demo host config.
-        graphs: HashMap::new(),
-        // Populated below: first from DwApplication packs in the bundle, then
-        // overridden/supplemented by GREENTIC_AW_AGENTS_FILE when set.
-        agents: HashMap::new(),
-    };
-    // Bundle-derived DwApplication agents are the primary source.
-    for (agent_id, cfg) in crate::runner_host::dw_agents::dw_agents_from_bundle(bundle_root, tenant)
-    {
-        config.agents.insert(agent_id, cfg);
-    }
-    // GREENTIC_AW_AGENTS_FILE (when set) overrides/supplements (dev workflow).
-    apply_demo_agents(&mut config);
-    config
-}
-
-/// Source Digital Worker agent definitions from `GREENTIC_AW_AGENTS_FILE` (a
-/// YAML map of `<agent_id>: AgentConfig`) into the host config. Absent, empty,
-/// unreadable, or unparseable → no agents (fail-soft, logged), so a bad file
-/// never blocks `gtc start`; the agentic-worker node simply stays disabled.
-fn apply_demo_agents(config: &mut HostConfig) {
-    let Ok(path) = env::var("GREENTIC_AW_AGENTS_FILE") else {
-        return;
-    };
-    if path.trim().is_empty() {
-        return;
-    }
-    match fs::read_to_string(&path) {
-        Ok(contents) => parse_demo_agents_into(config, &contents, &path),
-        Err(error) => {
-            tracing::warn!(path = %path, error = %error, "GREENTIC_AW_AGENTS_FILE unreadable; no demo agents");
-        }
-    }
-}
-
-/// Parse a YAML `<agent_id>: AgentConfig` map into `config.agents`. Split from
-/// [`apply_demo_agents`] so it is unit-testable without mutating process env.
-fn parse_demo_agents_into(config: &mut HostConfig, contents: &str, src: &str) {
-    match serde_yaml_bw::from_str(contents) {
-        Ok(agents) => config.agents = agents,
-        Err(error) => {
-            tracing::warn!(src = %src, error = %error, "GREENTIC_AW_AGENTS_FILE parse failed; no demo agents");
-        }
+        fast2flow: Fast2FlowRoutingConfig::default(),
+        agents: Default::default(),
+        graphs: Default::default(),
     }
 }
 
@@ -318,7 +278,7 @@ pub(super) fn secret_error_context(
     op_id: &str,
     pack: &ProviderPack,
 ) -> String {
-    let env = env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string());
+    let env = crate::resolve_env(None);
     let team = secrets_manager::canonical_team(ctx.team.as_deref()).into_owned();
     format!(
         "secret lookup context env={} tenant={} team={} provider={} flow={} pack_id={} pack_path={}",
@@ -406,46 +366,8 @@ pub(super) fn capability_route_error_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use tempfile::tempdir;
-
-    #[test]
-    fn parse_demo_agents_into_populates_agents_from_yaml() {
-        let mut config = build_demo_host_config("acme", std::path::Path::new("/nonexistent"));
-        assert!(
-            config.agents.is_empty(),
-            "demo config starts with no agents"
-        );
-
-        let yaml = r#"
-research-bot:
-  agent_id: research-bot
-  system_prompt: "be helpful"
-  llm:
-    provider: openai
-    model: gpt-4o-mini
-  tools:
-    - extension_id: greentic.tavily
-      tool_name: web_search
-"#;
-        parse_demo_agents_into(&mut config, yaml, "test");
-
-        assert_eq!(config.agents.len(), 1);
-        let agent = config.agents.get("research-bot").expect("agent present");
-        assert_eq!(agent.system_prompt, "be helpful");
-        assert_eq!(agent.llm.model, "gpt-4o-mini");
-        assert_eq!(agent.tools.len(), 1);
-        assert_eq!(agent.tools[0].tool_name, "web_search");
-    }
-
-    #[test]
-    fn parse_demo_agents_into_is_fail_soft_on_garbage() {
-        let mut config = build_demo_host_config("acme", std::path::Path::new("/nonexistent"));
-        parse_demo_agents_into(&mut config, "{not valid agents yaml", "test");
-        assert!(
-            config.agents.is_empty(),
-            "a malformed agents file must leave agents empty, not panic"
-        );
-    }
 
     #[test]
     fn helper_functions_cover_domains_aliases_and_secret_detection() {
@@ -472,47 +394,6 @@ research-bot:
             "secret store error while fetching key"
         ));
         assert!(!needs_secret_context("ordinary validation failure"));
-    }
-
-    /// Write a minimal DwApplication `.gtpack` (a zip) at `dest`.
-    fn write_dw_pack(dest: &std::path::Path) {
-        use std::io::Write as _;
-        let file = std::fs::File::create(dest).expect("create gtpack");
-        let mut zip = zip::ZipWriter::new(file);
-        let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
-        zip.start_file("metadata.json", opts)
-            .expect("start metadata.json");
-        zip.write_all(br#"{"kind":"DwApplication"}"#)
-            .expect("write metadata.json");
-        zip.start_file("manifest.json", opts)
-            .expect("start manifest.json");
-        zip.write_all(br#"{"manifest_id":"onboarding-companion","manifest":{"capability_plan":{"default_provider_ids":{"cap://llm/chat":"provider.llm.deepseek.chat"}},"defaults":{"values":{"system_prompt":"hi","provider.llm.deepseek.chat::model":"deepseek-chat"}}}}"#)
-            .expect("write manifest.json");
-        zip.finish().expect("finish zip");
-    }
-
-    #[test]
-    fn build_demo_host_config_registers_bundle_dw_agent() {
-        let root = tempdir().expect("tempdir");
-        let packs_dir = root.path().join("tenants").join("acme").join("packs");
-        std::fs::create_dir_all(&packs_dir).expect("create packs dir");
-        write_dw_pack(&packs_dir.join("onboarding.gtpack"));
-
-        let config = build_demo_host_config("acme", root.path());
-
-        assert!(
-            config.agents.contains_key("onboarding-companion"),
-            "expected 'onboarding-companion' in config.agents; got keys: {:?}",
-            config.agents.keys().collect::<Vec<_>>()
-        );
-        let agent = config
-            .agents
-            .get("onboarding-companion")
-            .expect("agent present");
-        assert_eq!(
-            agent.llm.model, "deepseek-chat",
-            "expected llm.model=deepseek-chat"
-        );
     }
 
     #[test]

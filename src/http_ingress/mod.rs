@@ -3,7 +3,6 @@ mod conv_dedup;
 mod directline_session;
 mod helpers;
 mod messaging;
-mod static_handler;
 pub mod websocket;
 
 use std::{
@@ -25,6 +24,7 @@ use hyper::{
 use hyper_util::rt::tokio::TokioIo;
 use tokio::{net::TcpListener, runtime::Runtime, sync::oneshot};
 
+use crate::deployment_routes::RevisionIngressRouting;
 use crate::domains::Domain;
 use crate::http_routes::{HttpRouteTable, discover_http_routes_from_bundle};
 use crate::ingress_dispatch::{
@@ -32,11 +32,16 @@ use crate::ingress_dispatch::{
 };
 use crate::ingress_types::{IngressHttpResponse, IngressRequestV1};
 use crate::operator_log;
+use crate::revision_dispatcher::{
+    DispatchRequest, RevisionDispatcher, SetCookieDirective, cookie_name,
+};
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
 use crate::static_routes::{
     ActiveRouteTable, ReservedRouteSet, RouteScopeSegment, StaticRouteMatch, discover_from_bundle,
 };
+use rand::Rng;
 
+use crate::static_handler::serve_static_route;
 use admin_relay::{
     AdminRelayConfig, handle_admin_relay, load_admin_relay_config_from_env, relay_target_path,
 };
@@ -47,11 +52,9 @@ use helpers::{
     handle_oauth_token_exchange, parse_domain, parse_route_segments, with_cors,
 };
 use messaging::route_messaging_envelopes;
-use static_handler::serve_static_route;
 
 const LEGACY_DIRECTLINE_COMPAT_ENV: &str = "GREENTIC_START_ENABLE_LEGACY_DIRECTLINE";
 
-#[derive(Clone)]
 pub struct HttpIngressConfig {
     pub bind_addr: SocketAddr,
     pub domains: Vec<Domain>,
@@ -63,6 +66,11 @@ pub struct HttpIngressConfig {
     /// Notifier backend to use for WebChat push events.
     /// Defaults to `NotifierConfig::Memory` when not specified.
     pub notifier_config: crate::notifier::NotifierConfig,
+    /// Revision-routing wiring when booting from a materialized runtime-config
+    /// (dispatcher + revision-scoped HTTP routes + request→deployment map).
+    /// `None` for the legacy single-bundle boot path, where the ingress never
+    /// consults revision routing.
+    pub revision_routing: Option<RevisionIngressRouting>,
 }
 
 pub struct HttpIngressServer {
@@ -213,6 +221,9 @@ impl HttpIngressServer {
             domains,
             active_route_table,
             http_route_table,
+            // Carries the revision-routing wiring when booting from a
+            // materialized runtime-config; `None` on the single-bundle path.
+            revision_routing: config.revision_routing,
             admin_relay,
             notifier,
             session_manager: Arc::new(websocket::SessionManager::new(
@@ -373,6 +384,11 @@ struct HttpIngressState {
     domains: Vec<Domain>,
     active_route_table: ActiveRouteTable,
     http_route_table: HttpRouteTable,
+    /// Revision-routing wiring (dispatcher + revision-scoped HTTP routes +
+    /// request→deployment map) when booting from a materialized runtime-config.
+    /// `None` for the legacy single-bundle path, where the ingress never
+    /// consults revision routing.
+    revision_routing: Option<RevisionIngressRouting>,
     admin_relay: Option<Arc<AdminRelayConfig>>,
     // Used by WebSocket session handlers (Task 11+) to subscribe to activity events.
     pub notifier: std::sync::Arc<dyn crate::notifier::ActivityNotifier>,
@@ -500,6 +516,16 @@ where
     // - /v1/messaging/webchat/{tenant}/v3/directline/*
     // - /v1/web/webchat/{tenant}/token
     // - /v1/web/webchat/{tenant}/v3/directline/*
+    //
+    // NOTE (revision routing): these high-volume chat paths return here, BEFORE
+    // the `revision_routing` block below, so they always take the legacy
+    // single-bundle `state.runner_host` handlers and never consult the revision
+    // dispatcher — no traffic split, no drain awareness, no revision stickiness
+    // cookie. This is inert today (revision routing is dormant until a producer
+    // sets `revision_routing: Some`), but the execution-bridge PR that turns it
+    // on MUST resolve the deployment/revision before these shortcuts (or make
+    // these handlers consume the selected revision) — otherwise a rollout looks
+    // healthy on generic HTTP routes while WebChat ignores the split.
     if let Some((tenant, dl_path)) = parse_webchat_directline_route(&path) {
         let provider = state
             .active_route_table
@@ -682,20 +708,77 @@ where
     }
 
     // Resolve path to a parsed ingress route.
-    // Tries: (1) pack-declared HTTP routes, (2) static routes, (3) standard ingress.
+    // Tries: (0) revision routing, (1) pack-declared HTTP routes, (2) static
+    // routes, (3) standard ingress.
     let method = req.method().clone();
+    // Host header drives request→deployment resolution (the resolver strips the
+    // port and lowercases). Borrowed, not allocated — only the revision-routing
+    // block reads it, and that runs before the body is consumed below.
+    let host = req
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    // Set-Cookie directive carried out of revision selection so the chosen
+    // revision stays sticky for the session. Applied to the primary ingress
+    // response below.
+    let mut pending_set_cookie: Option<SetCookieDirective> = None;
     let parsed = 'resolve: {
+        // Revision routing (B3): when booting from a materialized runtime-config,
+        // resolve the deployment for this request, let the dispatcher pick a
+        // revision by traffic split / stickiness, and route to that revision's
+        // scoped route. `revision_routing` is `None` on the legacy single-bundle
+        // boot path, so that path stays the only live one there.
+        //
+        // The WebChat / DirectLine / WS-upgrade shortcuts above return before
+        // reaching this block, so they are NOT revision-routed yet — see the
+        // note there; integrating them is part of the execution-bridge PR.
+        if let Some(routing) = state.revision_routing.as_ref()
+            && let Some((deployment_id, tenant)) = routing.deployment_routes.resolve(host, &path)
+        {
+            let cookie = extract_cookie(req.headers(), &cookie_name(deployment_id));
+            let dispatch_req = DispatchRequest {
+                env_id: routing.dispatcher.env_id(),
+                tenant,
+                deployment_id,
+                session_hint: None,
+                defer_pin: false,
+                // Public ingress traffic never trusts the revision header.
+                trusted: false,
+                header_revision: None,
+                cookie: cookie.as_deref(),
+            };
+            // Fail closed: once a request is bound to a deployment, revision
+            // routing is authoritative. A route miss or dispatch error must NOT
+            // fall through to the legacy single-bundle path, which would bypass
+            // the traffic split and serve the request from the wrong pack.
+            // `ThreadRng` is `!Send`, so it can't survive the `.await` in the
+            // async dispatcher (B6 made `dispatch` async). `SmallRng` seeded
+            // from the OS is Send + matches the existing
+            // `revision_dispatcher` test fixture's RNG choice.
+            let mut rng: rand::rngs::SmallRng = rand::make_rng();
+            match dispatch_bound_deployment(
+                routing.dispatcher.as_ref(),
+                &routing.http_routes,
+                &dispatch_req,
+                &path,
+                method.as_str(),
+                &mut rng,
+            )
+            .await
+            {
+                Ok((route, set_cookie)) => {
+                    pending_set_cookie = set_cookie;
+                    break 'resolve route;
+                }
+                Err(response) => return Err(*response),
+            }
+        }
+
         // Pack-declared HTTP routes (greentic.http-routes.v1): provider packs declare
         // which URL patterns they handle, and the ingress server dispatches to them
         // via the generic `dispatch_http_ingress` pipeline.
         if let Some(route_match) = state.http_route_table.match_request(&path, method.as_str()) {
-            break 'resolve helpers::ParsedIngressRoute {
-                domain: route_match.descriptor.domain,
-                provider: route_match.descriptor.pack_id.clone(),
-                tenant: route_match.tenant,
-                team: route_match.team,
-                handler: None,
-            };
+            break 'resolve route_match.into();
         }
 
         // Static route handling — serve assets from .gtpack files
@@ -857,7 +940,9 @@ where
             .filter_map(|value| serde_json::from_value(value).ok())
             .collect();
         std::thread::spawn(move || {
-            if let Err(err) = crate::event_router::route_events(&bundle, &ctx, &events) {
+            if let Err(err) =
+                crate::event_router::route_events_to_default_flow(&bundle, &ctx, &events)
+            {
                 crate::operator_log::warn(module_path!(), format!("event routing failed: {err:#}"));
             }
         });
@@ -890,6 +975,7 @@ where
             .collect();
         if envelopes.is_empty() {
             return build_http_response(&result.response)
+                .map(|resp| apply_set_cookie(resp, pending_set_cookie.take()))
                 .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err));
         }
         let provider = parsed.provider.clone();
@@ -927,7 +1013,113 @@ where
     }
 
     build_http_response(&result.response)
+        .map(|resp| apply_set_cookie(resp, pending_set_cookie.take()))
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err))
+}
+
+/// A resolved revision route plus the optional stickiness cookie to emit.
+type RoutedRevision = (helpers::ParsedIngressRoute, Option<SetCookieDirective>);
+
+/// Pick a revision via the dispatcher, then resolve the request to that
+/// revision's route, keyed on the full `(deployment, bundle, revision)` scope.
+/// Returns `Ok(None)` when the selected revision declares no route for this
+/// path. Pure (no HTTP types) so the fail-closed policy lives in the wrapper.
+async fn select_revision_route<R: Rng + ?Sized>(
+    dispatcher: &RevisionDispatcher,
+    table: &HttpRouteTable,
+    req: &DispatchRequest<'_>,
+    path: &str,
+    method: &str,
+    rng: &mut R,
+) -> anyhow::Result<Option<RoutedRevision>> {
+    let outcome = dispatcher.dispatch(req, rng).await?;
+    let scope = crate::http_routes::RevisionScope {
+        deployment_id: req.deployment_id,
+        bundle_id: outcome.bundle_id.clone(),
+        revision_id: outcome.revision_id,
+    };
+    let Some(route_match) = table.match_request_for_revision(path, method, &scope) else {
+        return Ok(None);
+    };
+    Ok(Some((route_match.into(), outcome.set_cookie)))
+}
+
+/// Fail-closed revision routing for a request already bound to a deployment.
+/// Maps the pure [`select_revision_route`] result to either the resolved route
+/// or an error response — never a fall-through to legacy routing:
+/// - selected revision serves no route for this path → `404`;
+/// - dispatch error (e.g. a resolver/dispatcher config mismatch) → `500`.
+async fn dispatch_bound_deployment<R: Rng + ?Sized>(
+    dispatcher: &RevisionDispatcher,
+    table: &HttpRouteTable,
+    req: &DispatchRequest<'_>,
+    path: &str,
+    method: &str,
+    rng: &mut R,
+) -> Result<RoutedRevision, Box<Response<Full<Bytes>>>> {
+    match select_revision_route(dispatcher, table, req, path, method, rng).await {
+        Ok(Some(routed)) => Ok(routed),
+        Ok(None) => Err(Box::new(error_response(
+            StatusCode::NOT_FOUND,
+            "no route for the selected revision in this deployment",
+        ))),
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "revision dispatch for deployment `{}` failed: {err:#}",
+                    req.deployment_id
+                ),
+            );
+            Err(Box::new(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "revision dispatch failed",
+            )))
+        }
+    }
+}
+
+/// Look up a single cookie value by name across all `Cookie` request headers
+/// (RFC 6265 permits more than one).
+fn extract_cookie(headers: &hyper::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get_all(hyper::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|header| header.split(';'))
+        .find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k.trim() == name).then(|| v.trim().to_string())
+        })
+}
+
+/// Attach a `Set-Cookie` header for the revision stickiness directive. Cookie
+/// attributes (`Path`, `Secure`, `HttpOnly`, `SameSite=Lax`) are an ingress
+/// concern, so they are stamped here rather than by the dispatcher.
+fn apply_set_cookie(
+    mut response: Response<Full<Bytes>>,
+    directive: Option<SetCookieDirective>,
+) -> Response<Full<Bytes>> {
+    if let Some(directive) = directive {
+        let header = directive.to_header_value();
+        match hyper::header::HeaderValue::from_str(&header) {
+            Ok(value) => {
+                response
+                    .headers_mut()
+                    .append(hyper::header::SET_COOKIE, value);
+            }
+            // The value is base64 (URL_SAFE_NO_PAD), so this should never fire;
+            // log rather than silently drop the stickiness cookie if it does.
+            Err(err) => operator_log::warn(
+                module_path!(),
+                format!(
+                    "failed to encode revision Set-Cookie `{}`: {err}",
+                    directive.name
+                ),
+            ),
+        }
+    }
+    response
 }
 
 async fn handle_legacy_directline_request<B>(
@@ -1318,6 +1510,29 @@ where
         directline_session::Preflight::Respond(response) => return Err(response),
         directline_session::Preflight::Forward(plan) => plan,
     };
+    // Fail-closed on an unresolvable `ext://` config reference (see
+    // `ingress_dispatch::build_injected_config`) rather than forwarding a
+    // provider call with dropped config.
+    let injected_config = build_injected_config(
+        &state.runner_host,
+        Domain::Messaging,
+        request.provider,
+        &ctx,
+    )
+    .map_err(|err| {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "config resolution failed for provider `{}`: {err:#}",
+                request.provider
+            ),
+        );
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provider config resolution failed",
+        )
+    })?
+    .unwrap_or(serde_json::Value::Null);
     let payload = serde_json::json!({
         "v": 1,
         "provider": request.provider,
@@ -1330,12 +1545,7 @@ where
         "query": provider_query_string,
         "headers": headers,
         "body_b64": base64::engine::general_purpose::STANDARD.encode(&body),
-        "config": build_injected_config(
-            &state.runner_host,
-            Domain::Messaging,
-            request.provider,
-            &ctx,
-        ).unwrap_or(serde_json::Value::Null),
+        "config": injected_config,
     });
     let payload_bytes = serde_json::to_vec(&payload).map_err(|err| {
         error_response(
@@ -2067,6 +2277,98 @@ fn extract_greentic_metadata(output: &serde_json::Value) -> Option<(String, Stri
     Some((tenant, conversation_id, watermark))
 }
 
+// ---------------------------------------------------------------------------
+// RunnerHostHandle impl for DemoRunnerHost — legacy-coupled, stays here.
+// The trait definition lives in `crate::websocket` (hoisted from A.1); the
+// revision path will supply its own impl in a later PR.
+// ---------------------------------------------------------------------------
+
+impl websocket::RunnerHostHandle for DemoRunnerHost {
+    fn invoke_directline_get_activities(
+        &self,
+        tenant: &str,
+        team: &str,
+        provider: &str,
+        conversation_id: &str,
+        watermark: u64,
+        auth_token: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let headers: Vec<serde_json::Value> = match auth_token {
+            Some(token) if !token.is_empty() => {
+                vec![serde_json::json!([
+                    "Authorization",
+                    format!("Bearer {token}")
+                ])]
+            }
+            _ => Vec::new(),
+        };
+        let payload = serde_json::json!({
+            "v": 1,
+            "provider": provider,
+            "route": serde_json::Value::Null,
+            "binding_id": serde_json::Value::Null,
+            "tenant_hint": tenant,
+            "team_hint": team,
+            "method": "GET",
+            "path": format!("/v3/directline/conversations/{conversation_id}/activities"),
+            "query": format!("watermark={watermark}&tenant={tenant}&team={team}"),
+            "headers": headers,
+            "body_b64": "",
+            "config": serde_json::Value::Null,
+        });
+        let payload_bytes = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
+        let ctx = OperatorContext {
+            tenant: tenant.to_string(),
+            team: Some(team.to_string()),
+            correlation_id: None,
+        };
+        // The webchat provider exposes its directline routing under the
+        // generic `ingest_http` op (with hyphen alias). Try the canonical
+        // name first, then fall back to the underscore alias used by older
+        // pack builds.
+        let outcome = self
+            .invoke_provider_op(
+                Domain::Messaging,
+                provider,
+                "ingest-http",
+                &payload_bytes,
+                &ctx,
+            )
+            .or_else(|_| {
+                self.invoke_provider_op(
+                    Domain::Messaging,
+                    provider,
+                    "ingest_http",
+                    &payload_bytes,
+                    &ctx,
+                )
+            })
+            .map_err(|err| err.to_string())?;
+        if !outcome.success {
+            return Err(outcome
+                .error
+                .or(outcome.raw)
+                .unwrap_or_else(|| "provider ingest_http failed".to_string()));
+        }
+        let value = outcome
+            .output
+            .ok_or_else(|| "directline_http returned no output".to_string())?;
+        let body_b64 = value
+            .get("body_b64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing body_b64 in directline_http response".to_string())?;
+        let body_bytes = base64::engine::general_purpose::STANDARD
+            .decode(body_b64.as_bytes())
+            .map_err(|err| format!("invalid base64 body_b64: {err}"))?;
+        // Empty body -> empty object so callers can keep consistent shape.
+        if body_bytes.is_empty() {
+            return Ok(serde_json::json!({"activities": [], "watermark": watermark.to_string()}));
+        }
+        serde_json::from_slice::<serde_json::Value>(&body_bytes)
+            .map_err(|err| format!("invalid directline_http body json: {err}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::helpers::{handle_builtin_health_request, parse_route_segments};
@@ -2084,6 +2386,13 @@ mod tests {
     use tokio::runtime::Runtime;
 
     async fn test_state(domains: Vec<Domain>) -> Arc<HttpIngressState> {
+        build_test_state(domains, None).await
+    }
+
+    async fn build_test_state(
+        domains: Vec<Domain>,
+        revision_routing: Option<RevisionIngressRouting>,
+    ) -> Arc<HttpIngressState> {
         let dir = tempdir().unwrap();
         let discovery = crate::discovery::discover(dir.path()).unwrap();
         let secrets_handle =
@@ -2106,6 +2415,7 @@ mod tests {
             domains,
             active_route_table: ActiveRouteTable::default(),
             http_route_table: HttpRouteTable::default(),
+            revision_routing,
             admin_relay: None,
             notifier,
             session_manager: Arc::new(websocket::SessionManager::new(
@@ -2186,6 +2496,113 @@ mod tests {
             ))
             .unwrap_err();
         assert_eq!(invalid_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn revision_routing_resolves_then_fails_closed_when_no_scoped_route() {
+        // End-to-end through `handle_request_inner` with `revision_routing:
+        // Some`: a matching deployment binding resolves the request, the
+        // dispatcher selects the (only) revision, and — because no scoped HTTP
+        // route is declared for it — the request fails closed with 404 rather
+        // than falling through to the legacy single-bundle path. Proves the B3
+        // seam is reachable and authoritative once a producer wires it in.
+        use crate::deployment_routes::DeploymentRouteTable;
+        use crate::revision_dispatcher::{
+            RevisionDispatcher, RevisionDispatcherConfig, RevisionEntry,
+        };
+        use greentic_deploy_spec::{BundleId, DeploymentId, RevisionId};
+
+        let runtime = Runtime::new().unwrap();
+
+        let deployment_id = DeploymentId::new();
+        let bundle_id = BundleId::new("acme.bundle");
+        let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new("demo", [7u8; 32]));
+        dispatcher
+            .apply_traffic_split(
+                deployment_id,
+                vec![RevisionEntry {
+                    revision_id: RevisionId::new(),
+                    bundle_id: bundle_id.clone(),
+                    weight_bps: 10_000,
+                }],
+                bundle_id,
+                0,
+            )
+            .expect("apply traffic split");
+        // Empty-binding deployment route → matches any host/path.
+        let deployment_routes = DeploymentRouteTable::from_parts(vec![(
+            deployment_id,
+            "default".to_string(),
+            Vec::new(),
+            Vec::new(),
+        )]);
+        let routing = RevisionIngressRouting {
+            dispatcher: Arc::new(dispatcher),
+            endpoint_admit: Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+            // No revision-scoped routes declared → forces the fail-closed path.
+            http_routes: HttpRouteTable::default(),
+            deployment_routes,
+            deployment_config_overrides: Arc::default(),
+            static_routes: ActiveRouteTable::default(),
+        };
+
+        let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
+        let response = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::GET, "/v1/events/ingress/p/demo"),
+                state,
+            ))
+            .expect_err("revision routing must fail closed");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = runtime.block_on(response_json(response));
+        assert_eq!(
+            body["message"], "no route for the selected revision in this deployment",
+            "404 must come from revision routing, not the legacy path"
+        );
+    }
+
+    #[test]
+    fn revision_routing_falls_back_to_legacy_when_deployment_unresolved() {
+        // `revision_routing: Some`, but the deployment binding requires a host
+        // the request does not carry → resolution returns `None`, so the revision
+        // block is skipped and the request takes the legacy path. The legacy
+        // events path then 404s for a *different* reason (no ingest handler),
+        // proving revision routing did not claim the request.
+        use crate::deployment_routes::DeploymentRouteTable;
+        use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
+        use greentic_deploy_spec::DeploymentId;
+
+        let runtime = Runtime::new().unwrap();
+        let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new("demo", [7u8; 32]));
+        let deployment_routes = DeploymentRouteTable::from_parts(vec![(
+            DeploymentId::new(),
+            "default".to_string(),
+            vec!["only.example.com".to_string()],
+            Vec::new(),
+        )]);
+        let routing = RevisionIngressRouting {
+            dispatcher: Arc::new(dispatcher),
+            endpoint_admit: Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+            http_routes: HttpRouteTable::default(),
+            deployment_routes,
+            deployment_config_overrides: Arc::default(),
+            static_routes: ActiveRouteTable::default(),
+        };
+
+        let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
+        // No Host header → the host-bound deployment does not resolve.
+        let response = runtime
+            .block_on(handle_request_inner(
+                empty_request(Method::GET, "/v1/events/ingress/p/demo"),
+                state,
+            ))
+            .expect_err("legacy path 404s without an ingest handler");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = runtime.block_on(response_json(response));
+        assert_ne!(
+            body["message"], "no route for the selected revision in this deployment",
+            "unresolved deployment must not enter revision routing"
+        );
     }
 
     #[test]
@@ -2367,6 +2784,7 @@ mod tests {
             tenant: "demo".to_string(),
             public_base_url: None,
             notifier_config: crate::notifier::NotifierConfig::default(),
+            revision_routing: None,
         })
         .expect("start ingress server");
 
@@ -2416,6 +2834,7 @@ mod tests {
             tenant: "demo".to_string(),
             public_base_url: None,
             notifier_config: crate::notifier::NotifierConfig::default(),
+            revision_routing: None,
         }) {
             Ok(_) => panic!("occupied requested port should fail ingress startup"),
             Err(err) => err,
@@ -2465,6 +2884,7 @@ mod tests {
             team_scoped: false,
             cache_strategy: CacheStrategy::None,
             route_segments: vec![RouteScopeSegment::Literal("web".to_string())],
+            scope: None,
         };
         let notifier = runtime
             .block_on(crate::notifier::build_notifier(
@@ -2480,6 +2900,7 @@ mod tests {
                 blocking_failures: vec![],
             }),
             http_route_table: HttpRouteTable::default(),
+            revision_routing: None,
             admin_relay: None,
             notifier,
             session_manager: Arc::new(websocket::SessionManager::new(
@@ -2555,6 +2976,7 @@ mod tests {
                 RouteScopeSegment::Literal("webchat".to_string()),
                 RouteScopeSegment::Tenant,
             ],
+            scope: None,
         };
         let notifier = runtime
             .block_on(crate::notifier::build_notifier(
@@ -2570,6 +2992,7 @@ mod tests {
                 blocking_failures: vec![],
             }),
             http_route_table: HttpRouteTable::default(),
+            revision_routing: None,
             admin_relay: None,
             notifier,
             session_manager: Arc::new(websocket::SessionManager::new(
@@ -2637,6 +3060,7 @@ mod tests {
                 RouteScopeSegment::Tenant,
                 RouteScopeSegment::Team,
             ],
+            scope: None,
         };
         let route_match = StaticRouteMatch {
             descriptor: &descriptor,
@@ -2675,6 +3099,7 @@ mod tests {
                 RouteScopeSegment::Tenant,
                 RouteScopeSegment::Team,
             ],
+            scope: None,
         };
         let route_match = StaticRouteMatch {
             descriptor: &descriptor,
@@ -2916,5 +3341,255 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "no event should be delivered");
+    }
+
+    mod revision_routing {
+        use super::*;
+        use crate::http_routes::{RevisionScope, descriptor_for_test};
+        use crate::revision_dispatcher::{
+            DispatchRequest, RevisionDispatcher, RevisionDispatcherConfig, RevisionEntry,
+        };
+        use greentic_deploy_spec::{BundleId, DeploymentId, RevisionId};
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        fn dispatcher_with_single_revision(
+            deployment_id: DeploymentId,
+            bundle_id: BundleId,
+            revision_id: RevisionId,
+        ) -> RevisionDispatcher {
+            let dispatcher =
+                RevisionDispatcher::new(RevisionDispatcherConfig::new("demo", [7u8; 32]));
+            dispatcher
+                .apply_traffic_split(
+                    deployment_id,
+                    vec![RevisionEntry {
+                        revision_id,
+                        bundle_id: bundle_id.clone(),
+                        weight_bps: 10_000,
+                    }],
+                    bundle_id,
+                    0,
+                )
+                .expect("apply split");
+            dispatcher
+        }
+
+        #[tokio::test]
+        async fn select_revision_route_routes_to_selected_revisions_route() {
+            let deployment_id = DeploymentId::new();
+            let bundle_id = BundleId::new("acme-bundle");
+            let revision_id = RevisionId::new();
+            let dispatcher =
+                dispatcher_with_single_revision(deployment_id, bundle_id.clone(), revision_id);
+
+            let table = HttpRouteTable::from_descriptors(vec![descriptor_for_test(
+                "/v1/messaging/webchat/{tenant}/token",
+                &["GET"],
+                Domain::Messaging,
+                Some(RevisionScope {
+                    deployment_id,
+                    bundle_id,
+                    revision_id,
+                }),
+            )]);
+
+            let req = DispatchRequest {
+                env_id: "demo",
+                tenant: "acme",
+                deployment_id,
+                session_hint: None,
+                defer_pin: false,
+                trusted: false,
+                header_revision: None,
+                cookie: None,
+            };
+            let (route, set_cookie) = select_revision_route(
+                &dispatcher,
+                &table,
+                &req,
+                "/v1/messaging/webchat/acme/token",
+                "GET",
+                &mut StdRng::seed_from_u64(0),
+            )
+            .await
+            .expect("dispatch ok")
+            .expect("route matched");
+
+            assert_eq!(route.provider, "test-pack");
+            assert_eq!(route.tenant, "acme");
+            // Weighted selection always emits a stickiness cookie.
+            let directive = set_cookie.expect("weighted pick sets a cookie");
+            assert_eq!(directive.name, cookie_name(deployment_id));
+        }
+
+        #[tokio::test]
+        async fn select_revision_route_returns_none_when_revision_has_no_route() {
+            let deployment_id = DeploymentId::new();
+            let bundle_id = BundleId::new("acme-bundle");
+            let revision_id = RevisionId::new();
+            let dispatcher = dispatcher_with_single_revision(deployment_id, bundle_id, revision_id);
+
+            // Table holds a route for a *different* revision only.
+            let table = HttpRouteTable::from_descriptors(vec![descriptor_for_test(
+                "/v1/messaging/webchat/{tenant}/token",
+                &["GET"],
+                Domain::Messaging,
+                Some(RevisionScope {
+                    deployment_id,
+                    bundle_id: BundleId::new("acme-bundle"),
+                    revision_id: RevisionId::new(),
+                }),
+            )]);
+
+            let req = DispatchRequest {
+                env_id: "demo",
+                tenant: "acme",
+                deployment_id,
+                session_hint: None,
+                defer_pin: false,
+                trusted: false,
+                header_revision: None,
+                cookie: None,
+            };
+            let outcome = select_revision_route(
+                &dispatcher,
+                &table,
+                &req,
+                "/v1/messaging/webchat/acme/token",
+                "GET",
+                &mut StdRng::seed_from_u64(0),
+            )
+            .await
+            .expect("dispatch ok");
+            assert!(outcome.is_none(), "no route for the selected revision");
+        }
+
+        fn bound_request(deployment_id: DeploymentId) -> DispatchRequest<'static> {
+            DispatchRequest {
+                env_id: "demo",
+                tenant: "acme",
+                deployment_id,
+                session_hint: None,
+                defer_pin: false,
+                trusted: false,
+                header_revision: None,
+                cookie: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn dispatch_bound_deployment_routes_on_match() {
+            let deployment_id = DeploymentId::new();
+            let bundle_id = BundleId::new("acme-bundle");
+            let revision_id = RevisionId::new();
+            let dispatcher =
+                dispatcher_with_single_revision(deployment_id, bundle_id.clone(), revision_id);
+            let table = HttpRouteTable::from_descriptors(vec![descriptor_for_test(
+                "/v1/messaging/webchat/{tenant}/token",
+                &["GET"],
+                Domain::Messaging,
+                Some(RevisionScope {
+                    deployment_id,
+                    bundle_id,
+                    revision_id,
+                }),
+            )]);
+            let result = dispatch_bound_deployment(
+                &dispatcher,
+                &table,
+                &bound_request(deployment_id),
+                "/v1/messaging/webchat/acme/token",
+                "GET",
+                &mut StdRng::seed_from_u64(0),
+            )
+            .await;
+            assert!(result.is_ok(), "matching route resolves");
+        }
+
+        #[tokio::test]
+        async fn dispatch_bound_deployment_fails_closed_on_route_miss() {
+            let deployment_id = DeploymentId::new();
+            let bundle_id = BundleId::new("acme-bundle");
+            let revision_id = RevisionId::new();
+            let dispatcher = dispatcher_with_single_revision(deployment_id, bundle_id, revision_id);
+            // No route declared for the selected revision.
+            let err = dispatch_bound_deployment(
+                &dispatcher,
+                &HttpRouteTable::default(),
+                &bound_request(deployment_id),
+                "/v1/messaging/webchat/acme/token",
+                "GET",
+                &mut StdRng::seed_from_u64(0),
+            )
+            .await
+            .expect_err("a bound deployment must not fall through on a route miss");
+            assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn dispatch_bound_deployment_fails_closed_on_unknown_deployment() {
+            let dispatcher =
+                RevisionDispatcher::new(RevisionDispatcherConfig::new("demo", [7u8; 32]));
+            let err = dispatch_bound_deployment(
+                &dispatcher,
+                &HttpRouteTable::default(),
+                &bound_request(DeploymentId::new()),
+                "/v1/messaging/webchat/acme/token",
+                "GET",
+                &mut StdRng::seed_from_u64(0),
+            )
+            .await
+            .expect_err("a dispatch error must not fall through to legacy");
+            assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        #[test]
+        fn extract_cookie_finds_named_value_among_many() {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert(
+                hyper::header::COOKIE,
+                "a=1; _gt_rev_X=payload.sig; b=2".parse().unwrap(),
+            );
+            assert_eq!(
+                extract_cookie(&headers, "_gt_rev_X"),
+                Some("payload.sig".to_string())
+            );
+            assert_eq!(extract_cookie(&headers, "missing"), None);
+        }
+
+        #[test]
+        fn extract_cookie_absent_header_is_none() {
+            let headers = hyper::HeaderMap::new();
+            assert_eq!(extract_cookie(&headers, "_gt_rev_X"), None);
+        }
+
+        #[test]
+        fn apply_set_cookie_stamps_attributes() {
+            let response = Response::new(Full::new(Bytes::new()));
+            let directive = SetCookieDirective {
+                name: "_gt_rev_X".to_string(),
+                value: "body.sig".to_string(),
+                max_age: std::time::Duration::from_secs(3600),
+            };
+            let response = apply_set_cookie(response, Some(directive));
+            let header = response
+                .headers()
+                .get(hyper::header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(header.starts_with("_gt_rev_X=body.sig;"));
+            assert!(header.contains("Max-Age=3600"));
+            assert!(header.contains("Secure"));
+            assert!(header.contains("HttpOnly"));
+            assert!(header.contains("SameSite=Lax"));
+        }
+
+        #[test]
+        fn apply_set_cookie_none_leaves_response_untouched() {
+            let response = apply_set_cookie(Response::new(Full::new(Bytes::new())), None);
+            assert!(response.headers().get(hyper::header::SET_COOKIE).is_none());
+        }
     }
 }

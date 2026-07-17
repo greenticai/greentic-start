@@ -79,7 +79,7 @@ mod tests {
         StartRequest {
             bundle: None,
             store_root: None,
-            env: "local".to_string(),
+            env: None,
             tenant: None,
             team: None,
             no_nats: false,
@@ -96,6 +96,8 @@ mod tests {
             verbose: false,
             quiet: false,
             no_browser: false,
+            no_updates: false,
+            no_auto_restart: false,
             admin: false,
             admin_port: 8443,
             admin_certs_dir: None,

@@ -386,7 +386,7 @@ impl DemoRunnerHost {
         let payload = payload_bytes.to_vec();
         let result = make_runtime_or_thread_scope(|runtime| {
             runtime.block_on(async {
-                let host_config = Arc::new(build_demo_host_config(&ctx.tenant, &self.bundle_root));
+                let host_config = Arc::new(build_demo_host_config(&ctx.tenant));
                 // Reuse the cached secrets handle — the CachingSecretsManager
                 // layer handles TTL expiry and write-through invalidation, so
                 // newly-written secrets are picked up after cache expiry.
@@ -507,7 +507,7 @@ impl DemoRunnerHost {
         let input_json = serde_json::to_string(input)?;
         let result = make_runtime_or_thread_scope(|runtime| {
             runtime.block_on(async {
-                let host_config = Arc::new(build_demo_host_config(&ctx.tenant, &self.bundle_root));
+                let host_config = Arc::new(build_demo_host_config(&ctx.tenant));
                 let pack_runtime = PackRuntime::load(
                     &pack.path,
                     host_config.clone(),
@@ -618,7 +618,7 @@ impl DemoRunnerHost {
                 node_id: Some("sync-subscriptions".to_string()),
             };
             let http_client = Arc::new(reqwest::blocking::Client::new());
-            let host_config = Arc::new(build_demo_host_config(&tenant, &self.bundle_root));
+            let host_config = Arc::new(build_demo_host_config(&tenant));
             let engine = Engine::default();
             let component = Component::from_binary(&engine, &component_bytes)?;
             let mut linker = Linker::new(&engine);
@@ -635,6 +635,8 @@ impl DemoRunnerHost {
                 Some(exec_ctx),
                 Some(component_ref),
                 true,
+                None,
+                None,
             )?;
             let store_state =
                 ComponentState::new(host_state, Arc::new(RunnerWasiPolicy::default()))?;
@@ -714,7 +716,7 @@ impl DemoRunnerHost {
                 node_id: Some(extension.export_name.clone()),
             };
             let http_client = Arc::new(reqwest::blocking::Client::new());
-            let host_config = Arc::new(build_demo_host_config(&tenant, &self.bundle_root));
+            let host_config = Arc::new(build_demo_host_config(&tenant));
             let engine = Engine::default();
             let component = Component::from_binary(&engine, &component_bytes)?;
             let mut linker = Linker::new(&engine);
@@ -731,6 +733,8 @@ impl DemoRunnerHost {
                 Some(exec_ctx),
                 Some(extension.component_ref.clone()),
                 true,
+                None,
+                None,
             )?;
             let store_state =
                 ComponentState::new(host_state, Arc::new(RunnerWasiPolicy::default()))?;

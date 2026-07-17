@@ -101,7 +101,7 @@ PY
 echo "[local_check] package binstall artifact for $HOST_TARGET (version=$VERSION)"
 "$ROOT_DIR/ci/package_binstall.sh" --target "$HOST_TARGET" --out "$PACKAGE_OUT" --version "$VERSION"
 
-if ! ls "$PACKAGE_OUT"/greentic-start-"$VERSION"-"$HOST_TARGET"* >/dev/null 2>&1; then
+if ! ls "$PACKAGE_OUT"/greentic-start-v"$VERSION"-"$HOST_TARGET"* >/dev/null 2>&1; then
   echo "Package artifact not created." >&2
   exit 1
 fi

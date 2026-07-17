@@ -1,25 +1,17 @@
 #![allow(dead_code)]
 
-mod agent_preflight;
 mod dispatch;
-mod dw_agents;
 mod helpers;
 mod hooks;
-mod sor_discovery;
-mod sor_invoke;
 mod token_validation;
 mod types;
 
 pub use helpers::primary_provider_type;
-// Re-export the `dw.agent` pre-flight guard so the `gtc start` boot path
-// (`crate::runtime`) can call it before the HTTP ingress server serves.
-pub(crate) use agent_preflight::check_bundle_dw_agents;
 // RunnerExecutionMode is re-exported because it is a public field of FlowOutcome.
 #[allow(unused_imports)]
 pub use types::{FlowOutcome, OperatorContext, RunnerExecutionMode};
 
 use std::collections::{BTreeMap, HashMap};
-use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -101,10 +93,6 @@ impl DemoRunnerHost {
         ctx: &OperatorContext,
     ) -> anyhow::Result<Option<Vec<u8>>> {
         use crate::secrets_setup::resolve_env;
-
-        if let Some(bytes) = load_setup_answer_secret(&self.bundle_root, provider, key) {
-            return Ok(Some(bytes));
-        }
 
         let env = resolve_env(None);
         let uris = secret_read_uris(&env, &ctx.tenant, ctx.team.as_deref(), provider, key);
@@ -195,8 +183,7 @@ impl DemoRunnerHost {
                 }
             }
         }
-        let mut capability_registry = CapabilityRegistry::build_from_pack_index(&pack_index)?;
-        sor_discovery::discover_and_register_remote_offers(&mut capability_registry);
+        let capability_registry = CapabilityRegistry::build_from_pack_index(&pack_index)?;
         Ok(Self {
             bundle_root,
             runner_mode: mode,
@@ -253,19 +240,6 @@ impl DemoRunnerHost {
             .resolve(cap_id, min_version, &scope)
     }
 
-    /// Register remote offers directly into the host's capability registry.
-    /// Only available in test builds; used to inject remote offers without
-    /// needing a running SoRX instance.
-    #[cfg(test)]
-    pub(super) fn register_remote_offers_for_test(
-        &mut self,
-        instances: &[crate::capability_discovery::DiscoveredInstance],
-        sor_base_url: &str,
-    ) {
-        self.capability_registry
-            .register_remote_offers(instances, sor_base_url);
-    }
-
     pub fn resolve_hook_chain(&self, stage: HookStage, op_name: &str) -> Vec<CapabilityBinding> {
         self.capability_registry.resolve_hook_chain(stage, op_name)
     }
@@ -278,7 +252,7 @@ impl DemoRunnerHost {
 
     pub fn capability_setup_plan(&self, ctx: &OperatorContext) -> Vec<CapabilityBinding> {
         let scope = ResolveScope {
-            env: Some(env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string())),
+            env: Some(crate::resolve_env(None)),
             tenant: Some(ctx.tenant.clone()),
             team: ctx.team.clone(),
         };
@@ -296,7 +270,6 @@ impl DemoRunnerHost {
                 version: offer.version,
                 requires_setup: offer.requires_setup,
                 setup_qa_ref: offer.setup_qa_ref,
-                remote: offer.remote,
             })
             .collect()
     }
@@ -333,19 +306,6 @@ impl DemoRunnerHost {
         payload_bytes: &[u8],
         ctx: &OperatorContext,
     ) -> anyhow::Result<FlowOutcome> {
-        self.invoke_capability_with_http(&sor_invoke::UreqSorInvoke, cap_id, op, payload_bytes, ctx)
-    }
-
-    /// Testable inner: identical to `invoke_capability` but accepts an injected
-    /// HTTP seam so tests can drive the remote-SoR branch without a live network.
-    pub(super) fn invoke_capability_with_http(
-        &self,
-        http: &dyn sor_invoke::SorInvokeHttp,
-        cap_id: &str,
-        op: &str,
-        payload_bytes: &[u8],
-        ctx: &OperatorContext,
-    ) -> anyhow::Result<FlowOutcome> {
         let requested_op = op.trim();
         if cap_id == CAP_OAUTH_BROKER_V1 {
             if requested_op.is_empty() {
@@ -376,7 +336,7 @@ impl DemoRunnerHost {
             }
         }
         let scope = ResolveScope {
-            env: Some(env::var("GREENTIC_ENV").unwrap_or_else(|_| "dev".to_string())),
+            env: Some(crate::resolve_env(None)),
             tenant: Some(ctx.tenant.clone()),
             team: ctx.team.clone(),
         };
@@ -389,23 +349,26 @@ impl DemoRunnerHost {
         let Some(binding) = binding else {
             return Ok(missing_capability_outcome(cap_id, op, None));
         };
-
-        // Local-only pre-checks: remote bindings skip the install-record and
-        // pack-path lookups — the SoR operator owns those concerns.
-        if binding.remote.is_none()
-            && !is_binding_ready(
-                &self.bundle_root,
-                &ctx.tenant,
-                ctx.team.as_deref(),
-                &binding,
-            )?
-        {
+        if !is_binding_ready(
+            &self.bundle_root,
+            &ctx.tenant,
+            ctx.team.as_deref(),
+            &binding,
+        )? {
             return Ok(capability_not_installed_outcome(
                 cap_id,
                 op,
                 &binding.stable_id,
             ));
         }
+
+        let Some(pack) = self.packs_by_path.get(&binding.pack_path) else {
+            return Ok(capability_route_error_outcome(
+                cap_id,
+                op,
+                format!("resolved pack not found at {}", binding.pack_path.display()),
+            ));
+        };
 
         let target_op = if cap_id == CAP_OAUTH_BROKER_V1 || requested_op.is_empty() {
             // OAuth broker cap.invoke always routes through the selected provider op.
@@ -442,27 +405,14 @@ impl DemoRunnerHost {
             ));
         }
 
-        // Executor branch: remote bindings delegate to the SoR over HTTP;
-        // local bindings look up the pack and invoke the WASM component op.
-        let outcome = if let Some(remote) = binding.remote.clone() {
-            sor_invoke::invoke_remote_sor_with(http, &remote, &binding.cap_id, payload_bytes, ctx)
-        } else {
-            let Some(pack) = self.packs_by_path.get(&binding.pack_path) else {
-                return Ok(capability_route_error_outcome(
-                    cap_id,
-                    target_op,
-                    format!("resolved pack not found at {}", binding.pack_path.display()),
-                ));
-            };
-            self.invoke_provider_component_op(
-                binding.domain,
-                pack,
-                &binding.pack_id,
-                target_op,
-                payload_bytes,
-                ctx,
-            )?
-        };
+        let outcome = self.invoke_provider_component_op(
+            binding.domain,
+            pack,
+            &binding.pack_id,
+            target_op,
+            payload_bytes,
+            ctx,
+        )?;
 
         envelope.status = if outcome.success {
             OperationStatus::Ok
@@ -606,8 +556,15 @@ mod tests {
     }
 
     #[test]
-    fn get_secret_prefers_setup_answers_when_present() {
+    fn get_secret_reads_from_secrets_manager() {
+        use crate::secrets_gate::canonical_secret_uri;
+        use crate::secrets_setup::resolve_env;
+        use greentic_secrets_lib::{DevStore, SecretFormat, SecretsStore};
+        use tokio::runtime::Runtime;
+
         let dir = tempdir().unwrap();
+        // A stale plaintext value at the legacy sink MUST be ignored — B12a
+        // closed that reader path.
         let config_dir = dir
             .path()
             .join("state")
@@ -616,15 +573,40 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
             config_dir.join("setup-answers.json"),
-            r#"{"jwt_signing_key":"from-setup-answers"}"#,
+            r#"{"jwt_signing_key":"STALE-PLAINTEXT-MUST-NOT-LEAK"}"#,
         )
         .unwrap();
 
         let discovery = discovery::discover(dir.path()).unwrap();
         let secrets_handle =
             secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
-        let host =
-            DemoRunnerHost::new(dir.keep(), &discovery, None, secrets_handle, false).unwrap();
+        let dev_store_path = secrets_handle
+            .dev_store_path
+            .clone()
+            .expect("dev store path");
+        let host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )
+        .unwrap();
+
+        let env = resolve_env(None);
+        let uri = canonical_secret_uri(
+            &env,
+            "demo",
+            Some("default"),
+            "messaging-webchat-gui",
+            "jwt_signing_key",
+        );
+        let store = DevStore::with_path(dev_store_path).unwrap();
+        let runtime = Runtime::new().unwrap();
+        runtime
+            .block_on(store.put(&uri, SecretFormat::Text, b"from-secrets-manager"))
+            .unwrap();
+
         let ctx = OperatorContext {
             tenant: "demo".to_string(),
             team: Some("default".to_string()),
@@ -634,7 +616,7 @@ mod tests {
         let value = host
             .get_secret("messaging-webchat-gui", "jwt_signing_key", &ctx)
             .unwrap();
-        assert_eq!(value, Some(b"from-setup-answers".to_vec()));
+        assert_eq!(value, Some(b"from-secrets-manager".to_vec()));
     }
 
     #[test]
@@ -649,13 +631,13 @@ mod tests {
             .block_on(async {
                 manager
                     .write(
-                        "secrets://dev/demo/_/messaging-webchat-gui/jwt_signing_key",
+                        "secrets://local/demo/_/messaging-webchat-gui/jwt_signing_key",
                         b"raw-provider-key",
                     )
                     .await?;
                 manager
                     .write(
-                        "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key",
+                        "secrets://local/demo/_/messaging_webchat_gui/jwt_signing_key",
                         b"canonical-provider-key",
                     )
                     .await
@@ -705,48 +687,5 @@ mod tests {
                 .unwrap_or_default()
                 .contains("unsupported oauth broker op")
         );
-    }
-
-    #[test]
-    fn invoke_capability_routes_remote_binding_to_sor() {
-        use crate::capability_discovery::DiscoveredInstance;
-
-        let mut host = empty_host_for_tests();
-        host.register_remote_offers_for_test(
-            &[DiscoveredInstance {
-                tenant_id: "acme".into(),
-                sor_name: "landlord".into(),
-                alias: "stable".into(),
-                deployment_id: "d1".into(),
-                pack_name: "landlord".into(),
-                pack_version: "0.1.0".into(),
-                base_path: "/acme/landlord".into(),
-                capabilities: vec!["cap://x/v1".into()],
-            }],
-            "http://sorx:9080",
-        );
-
-        struct FakeHttp;
-        impl sor_invoke::SorInvokeHttp for FakeHttp {
-            fn post_invoke(
-                &self,
-                _url: &str,
-                _headers: &[(String, String)],
-                _body: &str,
-            ) -> Result<(u16, String), String> {
-                Ok((200, r#"{"ok":true}"#.into()))
-            }
-        }
-
-        let ctx = OperatorContext {
-            tenant: "acme".into(),
-            team: None,
-            correlation_id: None,
-        };
-        let out = host
-            .invoke_capability_with_http(&FakeHttp, "cap://x/v1", "", b"{}", &ctx)
-            .unwrap();
-        assert!(out.success);
-        assert_eq!(out.mode, RunnerExecutionMode::RemoteSor);
     }
 }

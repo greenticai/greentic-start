@@ -67,9 +67,9 @@ pub(crate) fn resolve_demo_paths(
 /// Resolve a bundle directory (a local bundle ref target, or a
 /// greentic-deployer env-home revision's `<rev>/bundle/`) into [`DemoPaths`].
 ///
-/// Shared by [`resolve_demo_paths`]'s `--bundle` branch and
-/// `env_home::load_env_home`, which points this at a routed revision's
-/// extracted bundle directory after verifying its pinned packs.
+/// Shared by [`resolve_demo_paths`]'s `--bundle` branch and the revision
+/// engine, which points this at a routed revision's extracted bundle
+/// directory after verifying its pinned packs.
 pub(crate) fn resolve_bundle_dir_paths(root_dir: &Path) -> anyhow::Result<DemoPaths> {
     let (config_path, config_source) = resolve_bundle_config_path(root_dir)?;
     Ok(DemoPaths {
@@ -510,7 +510,7 @@ mod tests {
         StartRequest {
             bundle: bundle.map(|s| s.to_string()),
             store_root: None,
-            env: "local".to_string(),
+            env: None,
             tenant: None,
             team: None,
             no_nats: false,
@@ -527,6 +527,8 @@ mod tests {
             verbose: false,
             quiet: false,
             no_browser: false,
+            no_updates: false,
+            no_auto_restart: false,
             admin: false,
             admin_port: 9443,
             admin_certs_dir: None,

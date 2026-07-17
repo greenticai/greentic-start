@@ -12,7 +12,10 @@ use std::{
 
 use anyhow::{Context, Error as AnyhowError, Result as AnyhowResult, anyhow};
 use async_trait::async_trait;
+use greentic_secrets_lib::core::rt::sync_await;
+use greentic_secrets_lib::core::{CoreBuilder, SecretsCore, SecretsError as CoreSecretsError};
 use greentic_secrets_lib::env::EnvSecretsManager;
+use greentic_secrets_lib::spec::Error as SpecError;
 use greentic_secrets_lib::{Result as SecretResult, SecretError, SecretsManager};
 use serde::Deserialize;
 use serde_cbor::value::Value as CborValue;
@@ -133,12 +136,6 @@ struct LoggingSecretsManager {
     inner: DynSecretsManager,
     dev_store_path_display: String,
     using_env_fallback: bool,
-    /// App-pack provider id used by `gtc setup` when it persisted secrets under
-    /// the pack's own namespace. Used to reconstruct dev-store candidate paths.
-    pack_id: Option<String>,
-    /// Environment segment `gtc setup` wrote under (`GREENTIC_ENV` or `dev`),
-    /// which may differ from the canonical env a runtime read requests.
-    setup_env: String,
 }
 
 impl LoggingSecretsManager {
@@ -146,8 +143,6 @@ impl LoggingSecretsManager {
         inner: DynSecretsManager,
         dev_store_path: Option<&Path>,
         using_env_fallback: bool,
-        pack_id: Option<String>,
-        setup_env: String,
     ) -> Self {
         let dev_store_path_display = dev_store_path
             .map(|path| path.display().to_string())
@@ -156,8 +151,6 @@ impl LoggingSecretsManager {
             inner,
             dev_store_path_display,
             using_env_fallback,
-            pack_id,
-            setup_env,
         }
     }
 }
@@ -206,32 +199,6 @@ impl SecretsManager for LoggingSecretsManager {
                     operator_log::info(
                         module_path!(),
                         format!("WASM secrets read fallback: trying uri={candidate}"),
-                    );
-                    if let Ok(value) = self.inner.read(&candidate).await {
-                        operator_log::debug(
-                            module_path!(),
-                            format!(
-                                "WASM secrets read fallback resolved uri={candidate}; value={}",
-                                SecretValue::new(value.as_slice()),
-                            ),
-                        );
-                        return Ok(value);
-                    }
-                }
-                // Zero-env reconciliation: `gtc setup` persists secrets under the
-                // app-pack provider at the setup env (e.g.
-                // `secrets://dev/{t}/_/{pack}/llm_deepseek`), while runtimes read
-                // canonical scopes (`secrets://default/{t}/_/llm/deepseek`). Try
-                // the bridged candidates before giving up so `gtc start` resolves
-                // store-provisioned secrets without runtime env vars.
-                for candidate in
-                    store_scope_candidates(path, self.pack_id.as_deref(), &self.setup_env)
-                {
-                    operator_log::info(
-                        module_path!(),
-                        format!(
-                            "WASM secrets read fallback: trying store-scope candidate uri={candidate}",
-                        ),
                     );
                     if let Ok(value) = self.inner.read(&candidate).await {
                         operator_log::debug(
@@ -298,81 +265,14 @@ fn canonicalize_provider_segment(path: &str) -> Option<String> {
         segments[0], segments[1], segments[2], canonical_provider, canonical_key
     ))
 }
-
-/// The environment segment `gtc setup` writes under: `GREENTIC_ENV` or `dev`.
-/// Mirrors `greentic_setup::resolve_env` so runtime reads can bridge to the
-/// scope setup actually persisted.
-fn resolve_setup_env() -> String {
-    env::var("GREENTIC_ENV")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "dev".to_string())
-}
-
-/// Build the ordered dev-store candidate URIs to try when a canonical runtime
-/// read (`secrets://default/{tenant}/_/llm/deepseek`) misses, because
-/// `gtc setup` persisted the value under the app-pack provider at the setup env
-/// (`secrets://{setup_env}/{tenant}/_/{pack}/llm_deepseek` plus the question-id
-/// alias `…/{pack}/deepseek`). Candidates vary three dimensions independently —
-/// env (`default`/`dev`/setup_env), team (requested or `_` wildcard), and the
-/// `{provider}/{key}` shape (canonical, or pack-namespaced with the joined and
-/// plain key) — and are de-duplicated, excluding the already-tried `path`.
-fn store_scope_candidates(path: &str, pack_id: Option<&str>, setup_env: &str) -> Vec<String> {
-    let Some(trimmed) = path.strip_prefix("secrets://") else {
-        return Vec::new();
-    };
-    let segments: Vec<&str> = trimmed.split('/').collect();
-    if segments.len() != 5 {
-        return Vec::new();
-    }
-    let (req_env, tenant, req_team, req_provider, req_key) = (
-        segments[0],
-        segments[1],
-        segments[2],
-        segments[3],
-        segments[4],
-    );
-
-    let mut envs = vec![req_env.to_string(), setup_env.to_string()];
-    envs.push("default".to_string());
-    envs.push("dev".to_string());
-
-    let mut teams = vec![req_team.to_string()];
-    if req_team != "_" {
-        teams.push("_".to_string());
-    }
-
-    // (provider, key) shapes the value may have been stored under.
-    let mut shapes: Vec<(String, String)> = vec![(req_provider.to_string(), req_key.to_string())];
-    if let Some(pack) = pack_id.filter(|pack| !pack.is_empty()) {
-        // Alias form: `{pack}/{provider}_{key}` (e.g. `{pack}/llm_deepseek`).
-        shapes.push((pack.to_string(), format!("{req_provider}_{req_key}")));
-        // Question-id form: `{pack}/{key}` (e.g. `{pack}/deepseek`).
-        shapes.push((pack.to_string(), req_key.to_string()));
-    }
-
-    let mut seen = std::collections::HashSet::new();
-    let mut candidates = Vec::new();
-    for env_segment in &envs {
-        for team_segment in &teams {
-            for (provider_segment, key_segment) in &shapes {
-                let candidate = format!(
-                    "secrets://{env_segment}/{tenant}/{team_segment}/{provider_segment}/{key_segment}"
-                );
-                if candidate == path {
-                    continue;
-                }
-                if seen.insert(candidate.clone()) {
-                    candidates.push(candidate);
-                }
-            }
-        }
-    }
-    candidates
-}
-
 const ENV_ALLOW_ENV_SECRETS: &str = "GREENTIC_ALLOW_ENV_SECRETS";
 const ENV_REQUIRE_PROVIDER_BINDING: &str = "GREENTIC_REQUIRE_SECRETS_PROVIDER_BINDING";
+/// Selects the runtime secrets backend on the bundle-less `start --env` serve
+/// path. The deployer renders this onto the worker pod (E.3); unlike the
+/// `--bundle` path, the serve loop has no `.gtpack` to read a
+/// `secrets_backend.json` from, so the kind comes from the process environment
+/// instead. Absent/empty/`dev-store` keeps the env's own DevStore.
+pub const ENV_SERVE_SECRETS_BACKEND: &str = "GREENTIC_SECRETS_BACKEND";
 
 #[derive(Clone)]
 pub struct SecretsManagerHandle {
@@ -389,13 +289,11 @@ impl SecretsManagerHandle {
         self.manager.clone()
     }
 
-    pub fn runtime_manager(&self, pack_id: Option<&str>) -> DynSecretsManager {
+    pub fn runtime_manager(&self, _pack_id: Option<&str>) -> DynSecretsManager {
         Arc::new(LoggingSecretsManager::new(
             self.manager(),
             self.dev_store_path.as_deref(),
             self.using_env_fallback,
-            pack_id.map(|pack| pack.to_string()),
-            resolve_setup_env(),
         ))
     }
 }
@@ -409,7 +307,14 @@ pub fn resolve_secrets_manager(
     let team_owned = canonical_team.into_owned();
     let allow_env = matches!(env::var(ENV_ALLOW_ENV_SECRETS).as_deref(), Ok("1"));
     if let Some((binding_path, binding)) = SecretsProviderBinding::load_from_bundle(bundle_root)? {
-        return resolve_bound_secrets_manager(bundle_root, team, allow_env, binding_path, binding);
+        return resolve_bound_secrets_manager(
+            bundle_root,
+            tenant,
+            team,
+            allow_env,
+            binding_path,
+            binding,
+        );
     }
     if matches!(
         env::var(ENV_REQUIRE_PROVIDER_BINDING).as_deref(),
@@ -475,6 +380,8 @@ pub fn resolve_secrets_manager(
     );
     let (manager, store_path, using_env_fallback) = instantiate_manager_from_selection(
         bundle_root,
+        tenant,
+        &team_owned,
         &selection,
         allow_env,
         &pack_desc,
@@ -538,6 +445,7 @@ pub fn resolve_secrets_manager(
 
 fn resolve_bound_secrets_manager(
     bundle_root: &Path,
+    tenant: &str,
     team: Option<&str>,
     allow_env: bool,
     binding_path: PathBuf,
@@ -577,7 +485,13 @@ fn resolve_bound_secrets_manager(
         })
         .unwrap_or_else(|err| format!("ERR({err})"));
     let (manager, store_path, using_env_fallback) = match backend_kind {
-        Ok(Some(kind)) => match instantiate_manager_for_backend(bundle_root, &selection, kind) {
+        Ok(Some(kind)) => match instantiate_manager_for_backend(
+            bundle_root,
+            tenant,
+            &canonical_team,
+            &selection,
+            kind,
+        ) {
             Ok((manager, path)) => Ok((manager, path, false)),
             Err(err) => fallback_to_env(allow_env, kind.to_string(), &pack_desc, err),
         },
@@ -650,16 +564,26 @@ fn resolve_bound_secrets_manager(
 
 fn instantiate_manager_from_selection(
     bundle_root: &Path,
+    tenant: &str,
+    canonical_team: &str,
     selection: &secrets_manager::SecretsManagerSelection,
     allow_env: bool,
     pack_desc: &str,
     backend_kind_result: Result<SecretsBackendKind, AnyhowError>,
 ) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>, bool)> {
     match backend_kind_result {
-        Ok(kind) => match instantiate_manager_for_backend(bundle_root, selection, kind) {
-            Ok((manager, path)) => Ok((manager, path, false)),
-            Err(err) => fallback_to_env(allow_env, kind.to_string(), pack_desc, err),
-        },
+        Ok(kind) => {
+            match instantiate_manager_for_backend(
+                bundle_root,
+                tenant,
+                canonical_team,
+                selection,
+                kind,
+            ) {
+                Ok((manager, path)) => Ok((manager, path, false)),
+                Err(err) => fallback_to_env(allow_env, kind.to_string(), pack_desc, err),
+            }
+        }
         Err(err) => fallback_to_env(allow_env, "<unknown>".to_string(), pack_desc, err),
     }
 }
@@ -687,13 +611,88 @@ fn fallback_to_env(
 
 fn instantiate_manager_for_backend(
     bundle_root: &Path,
+    tenant: &str,
+    canonical_team: &str,
     _selection: &secrets_manager::SecretsManagerSelection,
     backend_kind: SecretsBackendKind,
 ) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>)> {
     match backend_kind {
         SecretsBackendKind::DevStore => open_dev_store_manager(bundle_root),
         SecretsBackendKind::Env => Ok((Arc::new(EnvSecretsManager) as DynSecretsManager, None)),
+        SecretsBackendKind::Vault => build_vault_manager(tenant, canonical_team),
     }
+}
+
+/// Select the bundle-less serve-path secrets manager from
+/// [`ENV_SERVE_SECRETS_BACKEND`] (the env var the deployer renders onto the
+/// worker pod).
+///
+/// Unlike [`resolve_secrets_manager`], the `start --env` serve loop has no
+/// `.gtpack` to read a `secrets_backend.json` from, so the backend kind comes
+/// from the process environment. An absent/empty/`dev-store` value opens the
+/// env's own DevStore rooted at `env_dir` — byte-identical to the prior
+/// hardcoded boot. `vault` resolves `secret://` refs under the pod's workload
+/// identity, scoped to `tenant` (the env's single `tenant_org_id`) and the
+/// whole-env team placeholder (tenant-level, no specific team). An unknown kind
+/// fails closed. HostBuilder's default env-var backend rejects non-local envs,
+/// so the serve path always supplies its own manager here.
+///
+/// Returns the manager and the tenant org it is scoped to: `Some(tenant)` for
+/// Vault (whose embedded `SecretsCore` resolves a single tenant org), `None`
+/// for the unscoped DevStore/Env backends. The serve path uses this scope to
+/// fail closed when a served deployment's tenant falls outside it (a single
+/// worker pod's Vault manager cannot resolve another tenant org's secrets) —
+/// see `activate_runtime_config`.
+pub fn resolve_serve_secrets_manager(
+    env_dir: &Path,
+    tenant: &str,
+) -> AnyhowResult<(DynSecretsManager, Option<String>)> {
+    let raw = env::var(ENV_SERVE_SECRETS_BACKEND).unwrap_or_default();
+    let kind = SecretsBackendKind::parse(&raw)
+        .with_context(|| format!("invalid {ENV_SERVE_SECRETS_BACKEND}={raw:?}"))?;
+    let (manager, dev_store_path) = serve_secrets_manager_for_kind(kind, env_dir, tenant)?;
+    // Wrap with the same canonicalization/team-wildcard fallback chain the
+    // `--bundle` runner-host gets via `SecretsManagerHandle::runtime_manager`:
+    // stores are keyed with canonical underscore provider segments while the
+    // external runner-host requests raw pack-stem providers (e.g.
+    // `messaging-webchat-gui`), so a raw manager misses on every provider
+    // self-read (webchat `jwt_signing_key` → 500 secret_error → token 502).
+    let manager: DynSecretsManager = Arc::new(LoggingSecretsManager::new(
+        manager,
+        dev_store_path.as_deref(),
+        false,
+    ));
+    let tenant_scope = matches!(kind, SecretsBackendKind::Vault).then(|| tenant.to_string());
+    Ok((manager, tenant_scope))
+}
+
+/// Pure backend dispatch behind [`resolve_serve_secrets_manager`], split out so
+/// the DevStore/Vault/Env mapping is unit-testable without mutating the
+/// process-wide [`ENV_SERVE_SECRETS_BACKEND`]. Returns the dev-store path (the
+/// `DevStore` arm only) for assertion + logging.
+fn serve_secrets_manager_for_kind(
+    kind: SecretsBackendKind,
+    env_dir: &Path,
+    tenant: &str,
+) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>)> {
+    let (manager, dev_store_path) = match kind {
+        SecretsBackendKind::DevStore => open_dev_store_manager(env_dir)?,
+        SecretsBackendKind::Env => (Arc::new(EnvSecretsManager) as DynSecretsManager, None),
+        SecretsBackendKind::Vault => {
+            build_vault_manager(tenant, greentic_secrets_lib::TEAM_PLACEHOLDER)?
+        }
+    };
+    operator_log::info(
+        module_path!(),
+        format!(
+            "serve-path secrets backend selected: kind={kind} tenant={tenant} dev_store_path={}",
+            dev_store_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+        ),
+    );
+    Ok((manager, dev_store_path))
 }
 
 fn open_dev_store_manager(
@@ -702,6 +701,90 @@ fn open_dev_store_manager(
     let client = SecretsClient::open(bundle_root)?;
     let path = client.store_path().map(|path| path.to_path_buf());
     Ok((Arc::new(client) as DynSecretsManager, path))
+}
+
+/// Construct a Vault-backed runtime secrets manager under the pod's workload
+/// identity.
+///
+/// The Vault connection (`VAULT_ADDR`, `VAULT_K8S_ROLE` or `VAULT_TOKEN`, KV
+/// mount/prefix) is read from the process environment, which the deployer
+/// renders onto the worker pod (E.3). With `VAULT_K8S_ROLE` set, the provider
+/// exchanges the pod's projected ServiceAccount JWT for a short-lived Vault
+/// token — no long-lived secret is baked into the workload. Records are
+/// envelope-decrypted by the embedded [`SecretsCore`]; the pod's Vault role is
+/// expected to grant read-only access to its KV path, so the resulting manager
+/// rejects writes.
+///
+/// The core is scoped to `tenant` and — for a concrete team — to
+/// `canonical_team`, so it rejects reads of another team's
+/// `secrets://<env>/<tenant>/<other-team>/...` even when the pod's Vault role
+/// would permit the broader tenant path. The `_` placeholder means tenant-level
+/// (no specific team); it is left unscoped so the tenant-level wildcard (which
+/// parses to no team) still resolves — matching the dev-store manager.
+///
+/// `build_backend()` and `CoreBuilder::build()` are async, so the whole
+/// construction is driven via [`sync_await`] — which reuses the ambient Tokio
+/// runtime when present and otherwise spins the shared secrets runtime, never
+/// nesting runtimes.
+fn build_vault_manager(
+    tenant: &str,
+    canonical_team: &str,
+) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>)> {
+    let tenant = tenant.to_string();
+    let team = (canonical_team != greentic_secrets_lib::TEAM_PLACEHOLDER)
+        .then(|| canonical_team.to_string());
+    let core = sync_await(async move {
+        let components = greentic_secrets_lib::vault::build_backend()
+            .await
+            .context("initialize vault secrets backend")?;
+        let mut builder = CoreBuilder::default().tenant(tenant);
+        if let Some(team) = team {
+            builder = builder.team(team);
+        }
+        builder
+            .backend(components.backend, components.key_provider)
+            .build()
+            .await
+            .context("build vault secrets core")
+    })?;
+    Ok((
+        Arc::new(CoreSecretsManager { core }) as DynSecretsManager,
+        None,
+    ))
+}
+
+/// Adapts an embedded [`SecretsCore`] — which envelope-decrypts records,
+/// enforces the configured tenant/team scope, and caches reads — to the runtime
+/// [`SecretsManager`] interface. Backend-agnostic: the Vault wiring lives in
+/// [`build_vault_manager`]. Writes and deletes are rejected because runtime
+/// workloads resolve secrets under a read-only identity.
+struct CoreSecretsManager {
+    core: SecretsCore,
+}
+
+#[async_trait]
+impl SecretsManager for CoreSecretsManager {
+    async fn read(&self, path: &str) -> SecretResult<Vec<u8>> {
+        match self.core.get_bytes(path).await {
+            Ok(bytes) => Ok(bytes),
+            Err(CoreSecretsError::Core(SpecError::NotFound { .. })) => {
+                Err(SecretError::NotFound(path.to_string()))
+            }
+            Err(err) => Err(SecretError::Backend(err.to_string().into())),
+        }
+    }
+
+    async fn write(&self, _: &str, _: &[u8]) -> SecretResult<()> {
+        Err(SecretError::Permission(
+            "vault runtime secrets backend is read-only".into(),
+        ))
+    }
+
+    async fn delete(&self, _: &str) -> SecretResult<()> {
+        Err(SecretError::Permission(
+            "vault runtime secrets backend is read-only".into(),
+        ))
+    }
 }
 
 /// Build the canonical secrets URI for the provided identity.
@@ -1213,102 +1296,6 @@ mod tests {
     }
 
     #[test]
-    fn store_scope_candidates_bridge_llm_credential_to_setup_scope() {
-        // Runtime reads the canonical LLM credential scope; `gtc setup` wrote it
-        // under the app-pack provider at the `dev` setup env.
-        let candidates = store_scope_candidates(
-            "secrets://default/acme/_/llm/deepseek",
-            Some("agentic-research-tavily-demo"),
-            "dev",
-        );
-        // The alias form (`{pack}/llm_deepseek`) and question-id form
-        // (`{pack}/deepseek`) at the setup env must both be offered.
-        assert!(candidates.contains(
-            &"secrets://dev/acme/_/agentic-research-tavily-demo/llm_deepseek".to_string()
-        ));
-        assert!(
-            candidates.contains(
-                &"secrets://dev/acme/_/agentic-research-tavily-demo/deepseek".to_string()
-            )
-        );
-        // The already-tried exact path is never re-offered.
-        assert!(!candidates.contains(&"secrets://default/acme/_/llm/deepseek".to_string()));
-    }
-
-    #[test]
-    fn store_scope_candidates_dedupe_and_ignore_non_canonical() {
-        // Non 5-segment paths yield nothing.
-        assert!(store_scope_candidates("secret://tavily/api_key", Some("p"), "dev").is_empty());
-        // Candidates are unique.
-        let candidates =
-            store_scope_candidates("secrets://default/acme/_/llm/deepseek", Some("p"), "dev");
-        let unique: std::collections::HashSet<_> = candidates.iter().collect();
-        assert_eq!(unique.len(), candidates.len());
-    }
-
-    /// End-to-end through the real read path: seed a dev store exactly the way
-    /// `gtc setup` does (pack-namespaced provider, setup env), then read the
-    /// canonical runtime scopes through `LoggingSecretsManager` and confirm the
-    /// candidate fallback bridges them. This is the binary-level proof of the
-    /// zero-env LLM credential + tool-secret resolution.
-    #[test]
-    fn logging_manager_bridges_setup_scope_to_canonical_runtime_reads() -> anyhow::Result<()> {
-        const PACK: &str = "agentic-research-tavily-demo";
-        let dir = tempdir()?;
-        let store_path = dir.path().join("secrets.env");
-        let store = DevStore::with_path(store_path.clone())?;
-        let runtime = Runtime::new()?;
-
-        // What `gtc setup` persists: the requirement alias (`{pack}/llm_deepseek`,
-        // `{pack}/tavily_api_key`) under the setup env `dev`.
-        let seed = SeedDoc {
-            entries: vec![
-                SeedEntry {
-                    uri: format!("secrets://dev/demo/_/{PACK}/llm_deepseek"),
-                    format: SecretFormat::Text,
-                    value: SeedValue::Text {
-                        text: "sk-deepseek-test".to_string(),
-                    },
-                    description: None,
-                },
-                SeedEntry {
-                    uri: format!("secrets://dev/demo/_/{PACK}/tavily_api_key"),
-                    format: SecretFormat::Text,
-                    value: SeedValue::Text {
-                        text: "tvly-test".to_string(),
-                    },
-                    description: None,
-                },
-            ],
-        };
-        let report =
-            runtime.block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
-        assert_eq!(report.ok, 2, "both secrets seeded");
-
-        let client = SecretsClient::open_with_path(store_path)?;
-        let manager: DynSecretsManager = Arc::new(LoggingSecretsManager::new(
-            Arc::new(client),
-            None,
-            false,
-            Some(PACK.to_string()),
-            "dev".to_string(),
-        ));
-
-        // LLM credential: runtime reads the canonical `default`/`llm` scope.
-        let llm = runtime
-            .block_on(async { manager.read("secrets://default/demo/_/llm/deepseek").await })?;
-        assert_eq!(String::from_utf8(llm)?, "sk-deepseek-test");
-
-        // Tool secret: `StoreToolSecretsBackend` hands the manager the canonical
-        // `secrets://dev/demo/_/tavily/api_key` scope.
-        let tavily = runtime
-            .block_on(async { manager.read("secrets://dev/demo/_/tavily/api_key").await })?;
-        assert_eq!(String::from_utf8(tavily)?, "tvly-test");
-
-        Ok(())
-    }
-
-    #[test]
     fn provider_secrets_missing_when_unsupported() -> anyhow::Result<()> {
         let manager: DynSecretsManager = Arc::new(FakeManager::new(HashMap::new()));
         let result = check_provider_secrets(
@@ -1763,7 +1750,7 @@ mod tests {
         let tenant = "demo";
         let team = "default";
         let pack_dir = secrets_pack_dir(bundle_root.path(), tenant, team);
-        let _ = write_secrets_pack(&pack_dir, "bad-backend.gtpack", r#"{"backend":"vault"}"#)?;
+        let _ = write_secrets_pack(&pack_dir, "bad-backend.gtpack", r#"{"backend":"nonsense"}"#)?;
         let env_guard = crate::test_env_lock().lock().unwrap();
         unsafe {
             env::remove_var(ENV_ALLOW_ENV_SECRETS);
@@ -1780,7 +1767,7 @@ mod tests {
         let tenant = "demo";
         let team = "default";
         let pack_dir = secrets_pack_dir(bundle_root.path(), tenant, team);
-        let _ = write_secrets_pack(&pack_dir, "bad-backend.gtpack", r#"{"backend":"vault"}"#)?;
+        let _ = write_secrets_pack(&pack_dir, "bad-backend.gtpack", r#"{"backend":"nonsense"}"#)?;
         let env_guard = crate::test_env_lock().lock().unwrap();
         unsafe {
             env::set_var(ENV_ALLOW_ENV_SECRETS, "1");
@@ -1859,5 +1846,232 @@ mod tests {
         rand::rng().fill(&mut bytes);
         let encoded = URL_SAFE_NO_PAD.encode(bytes);
         format!("TEST_OPAQUE_{encoded}")
+    }
+
+    #[test]
+    fn vault_backend_kind_parsed_from_pack() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let pack_path =
+            write_secrets_pack(dir.path(), "vault-backend.gtpack", r#"{"backend":"vault"}"#)?;
+        assert_eq!(
+            crate::secrets_backend::backend_kind_from_pack(&pack_path)?,
+            SecretsBackendKind::Vault
+        );
+        assert_eq!(SecretsBackendKind::Vault.to_string(), "vault");
+
+        let alias_path = write_secrets_pack(
+            dir.path(),
+            "vault-alias.gtpack",
+            r#"{"backend":"hashicorp-vault"}"#,
+        )?;
+        assert_eq!(
+            crate::secrets_backend::backend_kind_from_pack(&alias_path)?,
+            SecretsBackendKind::Vault
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_secrets_manager_reads_plaintext_and_is_read_only() -> anyhow::Result<()> {
+        use greentic_secrets_lib::core::{MemoryBackend, MemoryKeyProvider};
+
+        let runtime = Runtime::new()?;
+        let uri = "secrets://dev/acme/_/messaging-telegram/telegram_bot_token";
+        let payload = serde_json::json!("XYZ");
+
+        // A single core so the in-memory key provider decrypts what it wrote.
+        let manager = runtime.block_on(async {
+            let core = CoreBuilder::default()
+                .tenant("acme")
+                .backend(MemoryBackend::new(), MemoryKeyProvider::default())
+                .build()
+                .await?;
+            core.put_json(uri, &payload).await?;
+            anyhow::Ok(CoreSecretsManager { core })
+        })?;
+
+        // Reads return the decrypted plaintext bytes.
+        let bytes = runtime.block_on(async { manager.read(uri).await })?;
+        assert_eq!(bytes, serde_json::to_vec(&payload)?);
+
+        // Missing secrets surface as NotFound so the missing-secret UX works.
+        let missing = runtime.block_on(async {
+            manager
+                .read("secrets://dev/acme/_/messaging-telegram/absent")
+                .await
+        });
+        assert!(matches!(missing, Err(SecretError::NotFound(_))));
+
+        // Runtime resolution is read-only: writes and deletes are rejected.
+        let write = runtime.block_on(async { manager.write(uri, b"new").await });
+        assert!(matches!(write, Err(SecretError::Permission(_))));
+        let delete = runtime.block_on(async { manager.delete(uri).await });
+        assert!(matches!(delete, Err(SecretError::Permission(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn core_secrets_manager_enforces_team_scope() -> anyhow::Result<()> {
+        use greentic_secrets_lib::core::{MemoryBackend, MemoryKeyProvider};
+
+        let runtime = Runtime::new()?;
+        let own = "secrets://dev/acme/sales/messaging-telegram/telegram_bot_token";
+        let wildcard = "secrets://dev/acme/_/messaging-telegram/shared_token";
+
+        // A team-scoped core — what build_vault_manager configures for a
+        // concrete team: tenant `acme`, team `sales`.
+        let manager = runtime.block_on(async {
+            let core = CoreBuilder::default()
+                .tenant("acme")
+                .team("sales")
+                .backend(MemoryBackend::new(), MemoryKeyProvider::default())
+                .build()
+                .await?;
+            core.put_json(own, &serde_json::json!("S")).await?;
+            core.put_json(wildcard, &serde_json::json!("W")).await?;
+            anyhow::Ok(CoreSecretsManager { core })
+        })?;
+
+        // The configured team and the `_` wildcard (which parses to no team)
+        // both resolve.
+        assert!(runtime.block_on(async { manager.read(own).await }).is_ok());
+        assert!(
+            runtime
+                .block_on(async { manager.read(wildcard).await })
+                .is_ok()
+        );
+
+        // Another concrete team is refused by the scope guard before the backend
+        // is consulted — a hard denial, not a NotFound.
+        let cross = runtime.block_on(async {
+            manager
+                .read("secrets://dev/acme/marketing/messaging-telegram/telegram_bot_token")
+                .await
+        });
+        assert!(cross.is_err());
+        assert!(!matches!(cross, Err(SecretError::NotFound(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn serve_secrets_manager_for_kind_dev_store_opens_env_dir() -> anyhow::Result<()> {
+        // DevStore is the byte-identical replacement for the prior hardcoded
+        // `SecretsClient::open(env_dir)` serve-path boot: it roots the dev store
+        // at the env dir and reports its path.
+        let env_dir = tempdir()?;
+        let (_manager, dev_store_path) =
+            serve_secrets_manager_for_kind(SecretsBackendKind::DevStore, env_dir.path(), "demo")?;
+        assert!(dev_store_path.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn serve_secrets_manager_for_kind_env_has_no_dev_store() -> anyhow::Result<()> {
+        let env_dir = tempdir()?;
+        let (_manager, dev_store_path) =
+            serve_secrets_manager_for_kind(SecretsBackendKind::Env, env_dir.path(), "demo")?;
+        assert!(dev_store_path.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_serve_secrets_manager_defaults_to_dev_store_when_unset() -> anyhow::Result<()> {
+        // Unset env var → DevStore (the deployer omits the var for dev-store
+        // envs). `parse("")` pins the default; the resolver then succeeds.
+        assert_eq!(SecretsBackendKind::parse("")?, SecretsBackendKind::DevStore);
+        let env_dir = tempdir()?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var(ENV_SERVE_SECRETS_BACKEND);
+        }
+        let resolved = resolve_serve_secrets_manager(env_dir.path(), "demo");
+        drop(env_guard);
+        let (_manager, tenant_scope) = resolved?;
+        assert!(tenant_scope.is_none(), "dev-store is tenant-unscoped");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_serve_secrets_manager_rejects_unknown_backend() -> anyhow::Result<()> {
+        let env_dir = tempdir()?;
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::set_var(ENV_SERVE_SECRETS_BACKEND, "bogus");
+        }
+        let result = resolve_serve_secrets_manager(env_dir.path(), "demo");
+        unsafe {
+            env::remove_var(ENV_SERVE_SECRETS_BACKEND);
+        }
+        drop(env_guard);
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    /// Seed a DevStore at the env dir's default location with a single
+    /// underscore-keyed entry (the canonical form greentic-setup and
+    /// `SecretsSetup` persist), then hand back the serve-path manager.
+    fn serve_manager_over_underscore_store(
+        env_dir: &Path,
+        runtime: &Runtime,
+    ) -> anyhow::Result<DynSecretsManager> {
+        let store_path = env_dir.join(".greentic/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap())?;
+        let store = DevStore::with_path(store_path)?;
+        let seed = SeedDoc {
+            entries: vec![SeedEntry {
+                uri: "secrets://local/demo/_/messaging_webchat_gui/jwt_signing_key".to_string(),
+                format: SecretFormat::Text,
+                value: SeedValue::Text {
+                    text: "signing-key".to_string(),
+                },
+                description: None,
+            }],
+        };
+        let report =
+            runtime.block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
+        assert_eq!(report.ok, 1);
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var(ENV_SERVE_SECRETS_BACKEND);
+            env::remove_var("GREENTIC_DEV_SECRETS_PATH");
+        }
+        let resolved = resolve_serve_secrets_manager(env_dir, "demo");
+        drop(env_guard);
+        let (manager, _tenant_scope) = resolved?;
+        Ok(manager)
+    }
+
+    #[test]
+    fn serve_manager_resolves_underscore_store_from_hyphenated_uri() -> anyhow::Result<()> {
+        // The external runner-host (provider self-reads on the revision path)
+        // requests raw pack-stem providers: `messaging-webchat-gui`. The store
+        // is keyed canonically: `messaging_webchat_gui`. Without the fallback
+        // wrapper this read is NotFound and the webchat token op 500s.
+        let env_dir = tempdir()?;
+        let runtime = Runtime::new()?;
+        let manager = serve_manager_over_underscore_store(env_dir.path(), &runtime)?;
+        let value = runtime.block_on(async {
+            manager
+                .read("secrets://local/demo/_/messaging-webchat-gui/jwt_signing_key")
+                .await
+        })?;
+        assert_eq!(value, b"signing-key");
+        Ok(())
+    }
+
+    #[test]
+    fn serve_manager_applies_team_wildcard_fallback() -> anyhow::Result<()> {
+        // Reads carrying a concrete team (e.g. `default` from the routing
+        // context) must fall back to the tenant-level `_` wildcard entry.
+        let env_dir = tempdir()?;
+        let runtime = Runtime::new()?;
+        let manager = serve_manager_over_underscore_store(env_dir.path(), &runtime)?;
+        let value = runtime.block_on(async {
+            manager
+                .read("secrets://local/demo/default/messaging-webchat-gui/jwt_signing_key")
+                .await
+        })?;
+        assert_eq!(value, b"signing-key");
+        Ok(())
     }
 }

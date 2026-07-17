@@ -61,6 +61,15 @@ struct DoctorBundle {
     digest: Option<String>,
 }
 
+/// Environment-store target of the PR-3 readiness checks (trust root,
+/// endpoint linkage, secret-ref resolvability). Present in the report only
+/// when doctor ran in env mode (`--env` given or bundle omitted).
+#[derive(Clone, Debug, Serialize)]
+struct DoctorEnvironment {
+    env_id: String,
+    store_root: PathBuf,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 struct DoctorSummary {
     errors: usize,
@@ -73,7 +82,10 @@ struct DoctorReport {
     schema_version: u32,
     tool: String,
     command: String,
-    bundle: DoctorBundle,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle: Option<DoctorBundle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<DoctorEnvironment>,
     summary: DoctorSummary,
     diagnostics: Vec<Diagnostic>,
 }
@@ -89,21 +101,83 @@ pub fn run_doctor(args: DoctorArgs) -> anyhow::Result<bool> {
             schema_version: 1,
             tool: "greentic-start".to_string(),
             command: "doctor".to_string(),
-            bundle: DoctorBundle {
-                input: args.bundle.clone(),
+            bundle: args.bundle.as_deref().map(|bundle| DoctorBundle {
+                input: bundle.to_string(),
                 resolved_root: None,
-                source_kind: bundle_source_kind(&args.bundle).to_string(),
+                source_kind: bundle_source_kind(bundle).to_string(),
                 digest: None,
-            },
+            }),
+            environment: None,
             summary: DoctorSummary::default(),
             diagnostics: Vec::new(),
         },
         args: &args,
     };
 
-    let resolved_root = match crate::bundle_ref::resolve_bundle_ref(&args.bundle) {
+    if let Some(bundle) = args.bundle.as_deref() {
+        run_bundle_checks(&mut ctx, bundle);
+    }
+
+    // Env-store readiness checks (PR-3 of `plans/env-manifest-apply.md`).
+    if args.env_mode() {
+        let env_id = crate::resolve_env(args.env.as_deref());
+        match greentic_deployer::environment::LocalFsStore::default_root() {
+            Some(store_root) => {
+                ctx.report.environment = Some(DoctorEnvironment {
+                    env_id: env_id.clone(),
+                    store_root: store_root.clone(),
+                });
+                for diagnostic in crate::doctor_env::environment_diagnostics(&store_root, &env_id) {
+                    // Env prerequisite failures (resolve/load) must bypass
+                    // the --stage filter — a filtered-out prerequisite Error
+                    // silently produces exit 0 without running the requested
+                    // checks. Classification lives next to the producers in
+                    // `doctor_env` so this routing can't drift.
+                    if crate::doctor_env::is_prerequisite_failure(&diagnostic) {
+                        ctx.push_unfiltered(diagnostic);
+                    } else {
+                        ctx.push(diagnostic);
+                    }
+                }
+            }
+            None => {
+                // No home directory — a prerequisite failure that must
+                // bypass the stage filter, like the resolve/load errors.
+                ctx.push_unfiltered(crate::doctor_env::error(
+                    crate::doctor_env::CHECK_ENV_RESOLVE,
+                    DiagnosticComponent::Runtime,
+                    "Cannot determine the default environment store root (no home directory).",
+                    json!({ "env_id": env_id }),
+                    (
+                        json!({ "store_root_resolves": true }),
+                        json!({ "store_root_resolves": false }),
+                    ),
+                    Some("Run with a resolvable HOME so ~/.greentic/environments/ can be located."),
+                ));
+            }
+        }
+    }
+
+    ctx.finalize_summary();
+    let has_errors = ctx.report.summary.errors > 0;
+    let report = ctx.report.filtered(args.show_info);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_human_report(&report, args.fix_hints, args.show_info);
+    }
+    Ok(has_errors)
+}
+
+/// The pre-PR-3 bundle-scoped check suite, byte-for-byte: resolve the bundle
+/// ref, then run every shape/cache/pack/route/setup/port check against the
+/// resolved root.
+fn run_bundle_checks(ctx: &mut DoctorCtx<'_>, bundle: &str) {
+    let resolved_root = match crate::bundle_ref::resolve_bundle_ref(bundle) {
         Ok(resolved) => {
-            ctx.report.bundle.resolved_root = Some(resolved.bundle_dir.clone());
+            if let Some(report_bundle) = ctx.report.bundle.as_mut() {
+                report_bundle.resolved_root = Some(resolved.bundle_dir.clone());
+            }
             ctx.info(
                 "start.bundle.resolve",
                 DiagnosticComponent::Start,
@@ -128,34 +202,24 @@ pub fn run_doctor(args: DoctorArgs) -> anyhow::Result<bool> {
         }
     };
 
-    check_tag_refs(&mut ctx);
+    check_tag_refs(ctx, bundle);
 
     if let Some(root) = resolved_root.as_deref() {
-        check_bundle_shape(&mut ctx, root);
-        let demo = check_runtime_config(&mut ctx, root);
-        check_cache(&mut ctx, root);
-        check_pack_manifests(&mut ctx, root);
-        check_dependencies(&mut ctx, root);
-        check_discovery(&mut ctx, root);
-        check_static_routes(&mut ctx, root);
-        check_app_pack_flow(&mut ctx, root, demo.as_ref());
-        check_setup_outputs(&mut ctx, root, demo.as_ref());
-        check_runtime_metadata(&mut ctx, root, demo.as_ref());
-        check_secret_requirements(&mut ctx, root);
+        check_bundle_shape(ctx, root);
+        let demo = check_runtime_config(ctx, root);
+        check_cache(ctx, root);
+        check_pack_manifests(ctx, root);
+        check_dependencies(ctx, root);
+        check_discovery(ctx, root);
+        check_static_routes(ctx, root);
+        check_app_pack_flow(ctx, root, demo.as_ref());
+        check_setup_outputs(ctx, root, demo.as_ref());
+        check_runtime_metadata(ctx, root, demo.as_ref());
+        check_secret_requirements(ctx, root);
         if let Some((_, config)) = demo.as_ref() {
-            check_ports(&mut ctx, config);
+            check_ports(ctx, config);
         }
     }
-
-    ctx.finalize_summary();
-    let has_errors = ctx.report.summary.errors > 0;
-    let report = ctx.report.filtered(args.show_info);
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print_human_report(&report, args.fix_hints, args.show_info);
-    }
-    Ok(has_errors)
 }
 
 impl DoctorReport {
@@ -207,6 +271,19 @@ impl DoctorCtx<'_> {
         if !self.include(diagnostic.component) {
             return;
         }
+        if self.args.strict && should_promote_in_strict(&diagnostic) {
+            diagnostic.severity = Severity::Error;
+        }
+        self.report.diagnostics.push(diagnostic);
+    }
+
+    /// Like [`push`](Self::push) but skips the `include()` stage filter.
+    /// Used for env prerequisite failures (`start.env.resolve`,
+    /// `start.env.load`) that must remain visible even when `--stage`
+    /// restricts output to a single component — otherwise a
+    /// missing/malformed env silently produces zero diagnostics and
+    /// exit 0 ("success") without running the requested checks.
+    fn push_unfiltered(&mut self, mut diagnostic: Diagnostic) {
         if self.args.strict && should_promote_in_strict(&diagnostic) {
             diagnostic.severity = Severity::Error;
         }
@@ -292,7 +369,8 @@ fn should_promote_in_strict(diagnostic: &Diagnostic) -> bool {
         && (diagnostic.check_id.contains(".tag_refs")
             || diagnostic.check_id.contains(".cache")
             || diagnostic.check_id.contains(".current")
-            || diagnostic.check_id.contains(".dependencies"))
+            || diagnostic.check_id.contains(".dependencies")
+            || diagnostic.check_id.starts_with("start.env."))
 }
 
 fn bundle_source_kind(input: &str) -> &'static str {
@@ -309,8 +387,8 @@ fn bundle_source_kind(input: &str) -> &'static str {
     }
 }
 
-fn check_tag_refs(ctx: &mut DoctorCtx<'_>) {
-    let value = ctx.args.bundle.trim();
+fn check_tag_refs(ctx: &mut DoctorCtx<'_>, bundle: &str) {
+    let value = bundle.trim();
     if !matches!(bundle_source_kind(value), "oci" | "repo" | "store") {
         return;
     }
@@ -449,7 +527,7 @@ fn default_start_request(bundle: Option<String>) -> StartRequest {
     StartRequest {
         bundle,
         store_root: None,
-        env: "local".to_string(),
+        env: None,
         tenant: None,
         team: None,
         no_nats: false,
@@ -466,6 +544,8 @@ fn default_start_request(bundle: Option<String>) -> StartRequest {
         verbose: false,
         quiet: true,
         no_browser: true,
+        no_updates: true,
+        no_auto_restart: false,
         admin: false,
         admin_port: 8443,
         admin_certs_dir: None,
@@ -1083,9 +1163,18 @@ fn check_ports(ctx: &mut DoctorCtx<'_>, config: &crate::config::DemoConfig) {
 
 fn print_human_report(report: &DoctorReport, fix_hints: bool, show_info: bool) {
     println!("greentic-start doctor");
-    println!("  bundle: {}", report.bundle.input);
-    if let Some(root) = report.bundle.resolved_root.as_ref() {
-        println!("  root:   {}", root.display());
+    if let Some(bundle) = report.bundle.as_ref() {
+        println!("  bundle: {}", bundle.input);
+        if let Some(root) = bundle.resolved_root.as_ref() {
+            println!("  root:   {}", root.display());
+        }
+    }
+    if let Some(environment) = report.environment.as_ref() {
+        println!(
+            "  env:    {} (store {})",
+            environment.env_id,
+            environment.store_root.display()
+        );
     }
     if show_info {
         println!(
@@ -1153,4 +1242,95 @@ fn component_label(component: DiagnosticComponent) -> &'static str {
 
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "<unprintable>".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_diagnostic(check_id: &str, severity: Severity) -> Diagnostic {
+        Diagnostic {
+            check_id: check_id.to_string(),
+            severity,
+            component: DiagnosticComponent::Runtime,
+            message: "test".to_string(),
+            evidence: Value::Null,
+            expected: Value::Null,
+            actual: Value::Null,
+            fix_hint: None,
+            related_file: None,
+            related_pack: None,
+            related_component: None,
+        }
+    }
+
+    // ---- Finding 3: strict promotion for env warnings ---------------------
+
+    #[test]
+    fn strict_promotes_env_warnings() {
+        let warn = make_diagnostic("start.env.endpoint_links", Severity::Warn);
+        assert!(
+            should_promote_in_strict(&warn),
+            "start.env.* warnings should be promoted in strict mode"
+        );
+    }
+
+    #[test]
+    fn strict_does_not_promote_non_env_warnings() {
+        let warn = make_diagnostic("start.setup.completed", Severity::Warn);
+        assert!(
+            !should_promote_in_strict(&warn),
+            "start.setup.* warnings should NOT be promoted"
+        );
+    }
+
+    #[test]
+    fn strict_does_not_promote_env_errors() {
+        // Only Warn → Error promotion; an existing Error is untouched.
+        let err = make_diagnostic("start.env.trust_root", Severity::Error);
+        assert!(!should_promote_in_strict(&err));
+    }
+
+    // ---- Finding 4: stage-filter bypass for prerequisite errors -----------
+
+    #[test]
+    fn push_unfiltered_bypasses_stage_filter() {
+        let args = DoctorArgs {
+            bundle: None,
+            env: None,
+            json: false,
+            strict: false,
+            fix_hints: false,
+            show_info: false,
+            stage: DoctorStageArg::Routes,
+        };
+        let mut ctx = DoctorCtx {
+            report: DoctorReport {
+                schema_version: 1,
+                tool: "test".to_string(),
+                command: "doctor".to_string(),
+                bundle: None,
+                environment: None,
+                summary: DoctorSummary::default(),
+                diagnostics: Vec::new(),
+            },
+            args: &args,
+        };
+
+        // A Runtime-component Error through `push` is filtered out by
+        // --stage routes.
+        let filtered = make_diagnostic("start.env.resolve", Severity::Error);
+        assert!(!ctx.include(filtered.component));
+        ctx.push(filtered);
+        assert!(
+            ctx.report.diagnostics.is_empty(),
+            "push() should filter Runtime under --stage routes"
+        );
+
+        // The same diagnostic through `push_unfiltered` bypasses the filter.
+        let unfiltered = make_diagnostic("start.env.resolve", Severity::Error);
+        ctx.push_unfiltered(unfiltered);
+        assert_eq!(ctx.report.diagnostics.len(), 1);
+        assert_eq!(ctx.report.diagnostics[0].check_id, "start.env.resolve");
+    }
 }
