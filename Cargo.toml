@@ -90,15 +90,27 @@ features = ["derive"]
 
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
 # / `Revision` cross the deployer boundary, so resolution must not pick an
-# older deploy-spec. Floor bumped to the publish that adds
-# `EnvironmentHostConfig.gui_enabled` + `resolved_gui_enabled()` (deployer#322);
-# greentic-start reads the resolver at boot to gate the built-in webchat
-# console, and earlier publishes lack both the field and the method. Floor
-# bumped again to the M2 PR1 publish (deployer#335) — `revision_pull` reads
-# `Revision.bundle_source_uri` at boot to decide which bundles to pull, and
-# earlier publishes lack that field.
+# older deploy-spec. The same types also cross the `greentic-runner-host`
+# boundary, so all three must share ONE copy.
+#
+# Moved 0.1 -> 0.2 to restore that invariant. It had drifted to
+# ">=0.1.27745539530, <0.2" while `greentic-deployer >=1.2.0-dev` below is built
+# against deploy-spec 0.2; deploy-spec is 0.x, so cargo treats 0.1/0.2 as
+# incompatible, kept both copies, and the ids stopped unifying — E0308 in
+# src/doctor_env.rs and src/revision_pull.rs, which is what held the nightly lock
+# PR red. main has been on 0.2 throughout; the 07-15 forward-port merge resolved
+# this line to develop's stale 0.1 side. Every surface this crate uses
+# (`Environment::validate`, `BundleDeployment`, `ExtensionBinding::answers_ref`,
+# `ids::*`) is present unchanged on the 0.2 line.
+#
+# Floor 0.2.3 rather than 0.2.0 is defensive: deployer consumes `UpdateAction` /
+# `resolved_action()` (deploy-spec 0.2.2) while declaring only `"0.2"`, so a
+# `>=0.2.0` floor here lets a resolve pick 0.2.0 and the *deployer* fails to
+# build (greenticai/greentic-deployer#444). Matches the floor main already runs.
+# The dev lane publishes 0.2.<runid>, which this range admits — do not rewrite it
+# into a ">=1.2.0-dev"-style lane range.
 [dependencies.greentic-deploy-spec]
-version = ">=0.1.27745539530, <0.2"
+version = ">=0.2.3, <0.3"
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
 # (per-env trust root + operator key, deployer #226). Floor bumped to the
@@ -137,8 +149,15 @@ version = ">=1.2.0-dev, <1.3.0-0"
 # `ai.greentic.component-templates` → `ai.greentic`) and fail flow execution
 # with "component '…' not found in pack". This floor supersedes (and still
 # satisfies) the C5 `runtime_refs` floor (#424).
+#
+# Floor raised again to 1.2.0-dev.29565371086: the first dev publish built
+# against deploy-spec 0.2 (greentic-runner#599). runner-host's ids cross into
+# revision_pull / doctor_env alongside the deployer's, so a resolve that picks an
+# earlier dev publish — 1.2.0-dev.29558260044 and older declare deploy-spec
+# ">=0.1.0-0, <0.2.0-0" — drags a second deploy-spec copy back in and
+# reintroduces the E0308 above. An API floor, not a preference: don't lower it.
 [dependencies.greentic-runner-host]
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-dev.29565371086, <1.3.0-0"
 
 [dependencies.greentic-secrets-lib]
 # `providers-vault` brings in the HashiCorp Vault KV backend used for runtime
