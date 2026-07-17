@@ -99,6 +99,7 @@ mod secrets_gate;
 mod secrets_manager;
 mod secrets_provider_binding;
 mod secrets_setup;
+mod seed_copy;
 mod services;
 mod session_hint_extractor;
 mod setup_input;
@@ -134,6 +135,7 @@ use cli_args::{
 pub use cli_args::{
     CloudflaredModeArg, NatsModeArg, NgrokModeArg, RestartTarget, StartRequest, StopRequest,
 };
+pub use seed_copy::seed_env_store_from;
 
 const DEMO_DEFAULT_TENANT: &str = "demo";
 const DEMO_DEFAULT_TEAM: &str = "default";
@@ -428,6 +430,13 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             std::env::set_var("GREENTIC_ENV", DEFAULT_ENV_ID);
         }
     }
+
+    // Init-container-less platforms (Cloud Run, ACA, Fargate) inject the
+    // env-store seed as a read-only mount; copy it into the writable,
+    // $HOME-rooted store before `bootstrap_local_environment` opens it
+    // write+flock. No-op unless GREENTIC_SEED_DIR is set. Must run before the
+    // first store access.
+    seed_copy::maybe_seed_env_store()?;
 
     bootstrap_local_environment()?;
 

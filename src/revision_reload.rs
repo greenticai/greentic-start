@@ -408,6 +408,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc as std_mpsc;
+    use std::time::Instant;
 
     /// A counting rebuild closure suitable for unit tests. Returns
     /// `Ok(None)` always (no real activation is built) but increments a
@@ -601,30 +602,55 @@ mod tests {
 
     #[test]
     fn watcher_coalesces_burst_writes_into_one_rebuild() {
+        // Narrow enough to keep the debouncer's tick fine-grained, wide
+        // enough that a loaded runner still lands the whole burst in one
+        // window; the burst is timed below so a runner slow enough to break
+        // that premise says so instead of failing as "did not coalesce".
+        const DEBOUNCE: Duration = Duration::from_millis(200);
+
         let env = fresh_env_dir();
-        let counter = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = std_mpsc::channel();
         let _handle = spawn_runtime_config_watcher(
             env.path().to_path_buf(),
-            Duration::from_millis(200),
+            DEBOUNCE,
             Duration::ZERO,
             placeholder_server(),
-            counting_rebuild(Arc::clone(&counter)),
+            channel_rebuild(tx),
             |_: &Activation| {},
             || {},
         )
         .expect("spawn watcher");
 
-        // Five back-to-back writes well within the 200ms debounce window.
+        let burst_started = Instant::now();
         for i in 0..5 {
             write_runtime_config(env.path(), &format!(r#"{{"i":{i}}}"#));
         }
-
-        // Wait past the debounce window plus a safety margin.
-        std::thread::sleep(Duration::from_millis(800));
-        let observed = counter.load(Ordering::SeqCst);
+        let burst = burst_started.elapsed();
         assert!(
-            (1..=2).contains(&observed),
-            "burst of 5 writes must coalesce to ~1 rebuild (saw {observed})"
+            burst < DEBOUNCE,
+            "burst of 5 writes took {burst:?}, exceeding the {DEBOUNCE:?} debounce — coalescing was never exercised"
+        );
+
+        // Await the flush; do NOT sleep a fixed margin past the debounce.
+        // `notify-debouncer-full` only emits on a tick boundary (tick =
+        // debounce/4 when unset, as noted in `WatcherHandle::drop`), so the
+        // flush lands anywhere in `[debounce, debounce + tick]` depending on
+        // how the burst aligns with the tick the debouncer thread is already
+        // sleeping in. Any fixed margin narrower than one tick reads the
+        // count before the rebuild has run.
+        rx.recv_timeout(Duration::from_secs(3))
+            .expect("burst of 5 writes must produce a rebuild");
+
+        // Coalescing is the actual claim: the other four writes must not each
+        // produce a rebuild of their own. Drain a quiet window and allow one
+        // straggler batch, nothing more.
+        let mut rebuilds = 1;
+        while rx.recv_timeout(DEBOUNCE * 4).is_ok() {
+            rebuilds += 1;
+        }
+        assert!(
+            rebuilds <= 2,
+            "burst of 5 writes must coalesce to ~1 rebuild (saw {rebuilds})"
         );
     }
 
