@@ -1,22 +1,21 @@
 //! Integration tests for booting `greentic-start` from a greentic-deployer
 //! environment home (`--store-root`) instead of a bundle.
 //!
-//! `greentic-deployer`'s CLI (as installed in this environment, v0.5.15) does
-//! not yet expose the `op env init` / `op deploy` subcommands sketched in the
-//! original task brief, so this test does not shell out to that binary at
-//! all. Instead it hand-builds a minimal, real environment-home tree on disk
-//! (`runtime-config.json` + a routed revision's `pack-list.lock` + an
-//! extracted `bundle/` directory) — the exact on-disk shape
-//! `env_home::load_env_home`'s own unit tests already exercise against the
-//! real resolver/verifier — and drives the full public
-//! `greentic_start::run_start_request` boot path against it.
+//! The bundle-less boot goes through main's revision engine: it loads the
+//! deployer `environment.json` record for the env, reads (or synthesizes an
+//! empty) `runtime-config.json`, activates the revisions, and brings the
+//! listener up. This test hand-builds a bare environment record on disk (via the
+//! deployer's own `EnvironmentStore`, so the schema tracks the pinned
+//! deploy-spec) and drives the full public `greentic_start::run_start_request`
+//! boot path against it — no external binaries, no gating/skip.
 //!
-//! With zero packs in the fixture, `demo_up_services` takes the existing
-//! "embedded runner" path (no gateway/egress/nats spawned), so this reaches
-//! and passes through a real `load_env_home` call, a real
-//! `bundle_config::load_runtime_demo_config`, and a real `demo_up_services`
-//! run, then exits cleanly via a stop-request file — with no external
-//! binaries and no gating/skip needed.
+//! It exercises the zero-revision case: an env with no deployments activates an
+//! empty runtime that serves probes/404s until bundles are attached, so the
+//! boot needs no real `.gtpack`. A *routed* revision cannot be hand-built here —
+//! the revision engine rejects a revision with no pinned packs (`revision_boot`'s
+//! "no pinned packs" guard), and a real pinned pack is a deployer-produced,
+//! digest-verified `.gtpack` that only `op deploy` / `gtc` can mint. The routed
+//! serve path is covered by `revision_boot`'s own unit tests instead.
 //!
 //! The ingress listener always binds (it is not gated on discovering a
 //! messaging provider), so this test pins `GREENTIC_GATEWAY_PORT` to a fixed
@@ -32,48 +31,52 @@ use greentic_start::{
     CloudflaredModeArg, NatsModeArg, NgrokModeArg, StartRequest, run_start_request,
 };
 
-/// Build `<store_root>/local/...` as a minimal env-home: one deployment
-/// (`d1`) fully routed (10000 bps) to revision `r1`, whose `pack-list.lock`
-/// pins zero packs, and whose `<rev>/bundle/` is a normalized bundle
-/// directory (`bundle.yaml` + the `bundle-manifest.json` sentinel) carrying
-/// just `tenant`/`team` — the same minimal shape
-/// `write_demo_bundle`/`make_start_request` use in `src/lib.rs`'s own
-/// embedded-mode boot tests, so this exercises exactly that already-proven
-/// "zero packs -> embedded runner mode, no supervised gateway process" path.
+/// Persist a bare deployer environment record for env `local` under
+/// `<store_root>/local/` — no deployments, so the bundle-less boot activates a
+/// zero-revision runtime (listener up, probes only). Written through the
+/// deployer's `EnvironmentStore` so the on-disk schema matches the pinned
+/// deploy-spec.
 fn write_env_home_fixture(store_root: &Path) {
-    // The revision engine loads the deployer `environment.json` record before the
-    // runtime-config revision plan (the env_home loader this replaced did not).
-    // Create it through the deployer's own bootstrap so its schema stays in sync
-    // with the pinned deploy-spec, then layer the routed revision on top.
-    let store = greentic_deployer::environment::LocalFsStore::new(store_root.to_path_buf());
-    greentic_deployer::cli::bootstrap::ensure_local_environment(&store, None)
-        .expect("create local environment record");
+    use greentic_deploy_spec::{Environment, EnvironmentHostConfig, SchemaVersion};
+    use greentic_deployer::environment::{EnvironmentStore, LocalFsStore};
+    use greentic_types::EnvId;
 
-    let env_home = store_root.join("local");
-    let rev_dir = env_home.join("revisions").join("r1");
-    let bundle_dir = rev_dir.join("bundle");
-    std::fs::create_dir_all(&bundle_dir).expect("create bundle dir");
+    let env_id = EnvId::try_from("local").expect("env id");
 
-    std::fs::write(
-        bundle_dir.join("bundle.yaml"),
-        "tenant: envhome\nteam: default\n",
-    )
-    .expect("write bundle.yaml");
-    // Sentinel marking bundle.yaml as a normalized-bundle payload (see
-    // bundle_config::normalized_bundle_has_runtime_payload).
-    std::fs::write(bundle_dir.join("bundle-manifest.json"), "{}").expect("write bundle-manifest");
-
-    std::fs::write(
-        rev_dir.join("pack-list.lock"),
-        r#"{"schema":"greentic.pack-list-lock.v1","revision_id":"01ARZ3NDEKTSV4RRFFQ69G5FAW","packs":[]}"#,
-    )
-    .expect("write pack-list.lock");
-
-    std::fs::write(
-        env_home.join("runtime-config.json"),
-        r#"{"schema":"greentic.runtime-config.v1","env_id":"local","revisions":[{"deployment_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","revision_id":"01ARZ3NDEKTSV4RRFFQ69G5FAW","bundle_id":"app","pack_list_refs":["revisions/r1/pack-list.lock"],"pack_config_refs":[],"weight_bps":10000}]}"#,
-    )
-    .expect("write runtime-config.json");
+    // A bare deployer environment record (no deployments): the bundle-less boot
+    // loads it, synthesizes an empty runtime-config, and activates a
+    // zero-revision runtime that brings the listener up and serves probes/404s
+    // until bundles are attached. This exercises the `--store-root` ->
+    // revision-engine boot path end-to-end without a real `.gtpack` (a routed
+    // revision requires a deployer-produced, digest-verified pack, which the
+    // revision engine rejects if empty — see `revision_boot`'s "no pinned packs"
+    // guard — and which is out of a hand-built fixture's reach).
+    let environment = Environment {
+        schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
+        environment_id: env_id.clone(),
+        name: "local".to_string(),
+        host_config: EnvironmentHostConfig {
+            env_id: env_id.clone(),
+            region: None,
+            tenant_org_id: None,
+            listen_addr: None,
+            public_base_url: None,
+            gui_enabled: None,
+        },
+        packs: Vec::new(),
+        credentials_ref: None,
+        bundles: Vec::new(),
+        revisions: Vec::new(),
+        traffic_splits: Vec::new(),
+        messaging_endpoints: Vec::new(),
+        extensions: Vec::new(),
+        revocation: Default::default(),
+        retention: Default::default(),
+        health: Default::default(),
+    };
+    LocalFsStore::new(store_root.to_path_buf())
+        .save(&environment)
+        .expect("save environment record");
 }
 
 /// RAII guard that pins `GREENTIC_GATEWAY_PORT` for the lifetime of a test
@@ -137,20 +140,8 @@ fn env_home_start_request(store_root: &Path, log_dir: &Path) -> StartRequest {
     }
 }
 
-// IGNORED after the main->research merge adopted main's revision engine in place
-// of the old `env_home::load_env_home` this test was written for. The revision
-// engine boots a store root by loading the deployer `environment.json` record and
-// cross-checking that every deployment the `runtime-config.json` references is
-// present in that record (env <-> deployment <-> revision consistency). This
-// hand-built fixture can create the empty env record (`ensure_local_environment`)
-// but not a consistent deployment/revision graph — the deployer's `op deploy`
-// path that would generate it is not available here (see the module doc). The
-// `--store-root` boot path itself compiles and its mutual-exclusion guard is
-// covered by the sibling tests; re-enable this once a deployer-generated env-home
-// fixture (or a programmatic deployment builder) is available.
-#[ignore = "needs a deployer-generated env-home fixture (deployment consistent with runtime-config); see comment"]
 #[test]
-fn boots_from_env_home_and_stops_cleanly() {
+fn boots_from_store_root_and_stops_cleanly() {
     let temp = tempfile::tempdir().expect("tempdir");
     let store_root = temp.path().join("store-root");
     write_env_home_fixture(&store_root);
@@ -158,14 +149,14 @@ fn boots_from_env_home_and_stops_cleanly() {
     // See the module doc: the listener always binds, so pin a unique port.
     let _gateway_port = GatewayPortGuard::set("19905");
 
-    let bundle_dir = store_root.join("local/revisions/r1/bundle");
     let log_dir = temp.path().join("logs");
 
-    // The routed bundle's state dir lives under the resolved bundle
-    // directory (see bundle_config::resolve_bundle_dir_paths), and its
-    // tenant/team come from the fixture's bundle.yaml.
+    // The bundle-less boot writes its runtime state (incl. the stop-request file
+    // the serve loop watches) under `<store_root>/<env>/state`, keyed by the
+    // reserved tenant `env` and the env id — mirroring `env_tunnel::
+    // env_runtime_paths`, which is `pub(crate)` so we reconstruct it here.
     let runtime_paths =
-        runtime_state::RuntimePaths::new(bundle_dir.join("state"), "envhome", "default");
+        runtime_state::RuntimePaths::new(store_root.join("local").join("state"), "env", "local");
     let stop_thread = {
         let runtime_paths = runtime_paths.clone();
         thread::spawn(move || {
@@ -182,14 +173,13 @@ fn boots_from_env_home_and_stops_cleanly() {
     };
 
     let request = env_home_start_request(&store_root, &log_dir);
-    run_start_request(request).expect("env-home boot should succeed and stop cleanly");
+    // The `--store-root` boot loads the (bare) environment record, activates a
+    // zero-revision runtime, brings the listener up, then exits when it observes
+    // the stop-request file — proving the store-root -> revision-engine boot
+    // path is wired end-to-end.
+    run_start_request(request).expect("store-root boot should succeed and stop cleanly");
     stop_thread.join().expect("join stop thread");
 
-    // The bundle directory picked by the env-home branch is the routed
-    // revision's `bundle/` dir, not the store root itself — this is the
-    // load-bearing assertion that `load_env_home` (not the `--bundle`
-    // fallback) drove the boot.
-    assert!(runtime_paths.service_manifest_path().exists());
     assert!(
         runtime_state::read_stop_request(&runtime_paths)
             .expect("read stop request")
