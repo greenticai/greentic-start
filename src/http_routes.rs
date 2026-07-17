@@ -26,7 +26,7 @@ pub const INGEST_HTTP_OP: &str = "ingest_http";
 /// materialized runtime-config (multi-revision deployments, produced in B4).
 /// Routes discovered from a single bundle have no scope (`None` = legacy),
 /// matching the `Option = legacy` discipline used by `RuntimeKey`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RevisionScope {
     pub deployment_id: DeploymentId,
     pub bundle_id: BundleId,
@@ -603,6 +603,23 @@ pub(crate) fn synthesize_provider_ingest_routes(
     routes
 }
 
+/// If the manifest declares exactly one `greentic.provider-extension.v1` provider
+/// whose `ops` include `ingest_http`, return its `provider_type`. Returns `None`
+/// when there are zero or more than one eligible provider — the ambiguity is not
+/// resolvable at discovery time and the routes stay `provider_type: None`.
+fn sole_ingest_http_provider_type(manifest: &PackManifest) -> Option<String> {
+    let inline = manifest.provider_extension_inline()?;
+    let mut eligible = inline
+        .providers
+        .iter()
+        .filter(|p| p.ops.iter().any(|op| op == INGEST_HTTP_OP));
+    let first = eligible.next()?;
+    if eligible.next().is_some() {
+        return None; // ambiguous — more than one ingest_http provider
+    }
+    Some(first.provider_type.clone())
+}
+
 fn synthesize_provider_routes_from_manifest(
     manifest: &PackManifest,
     pack_path: &Path,
@@ -681,10 +698,23 @@ pub fn discover_revision_routes(
                 continue;
             }
         };
+        // When the same pack declares both http-routes.v1 routes AND a
+        // provider-extension.v1 with an ingest_http provider, propagate the
+        // provider_type onto the declared routes. This lets dispatch_provider_route
+        // handle them instead of 501ing (the http-routes.v1 routes have no
+        // provider_type of their own). Only done when the pack has exactly one
+        // ingest_http provider — ambiguity is left unresolved (the declared
+        // route stays provider_type: None, which 501s by design).
+        let pack_provider_type = sole_ingest_http_provider_type(&manifest);
         match http_routes_from_manifest(&manifest, pack_path) {
             Ok(Some(mut declared)) => {
                 for route in &mut declared {
                     route.scope = Some(scope.clone());
+                    if route.provider_type.is_none()
+                        && let Some(pt) = pack_provider_type.as_deref()
+                    {
+                        route.provider_type = Some(pt.to_string());
+                    }
                 }
                 routes.extend(declared);
             }

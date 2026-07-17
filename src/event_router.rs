@@ -6,9 +6,29 @@ use serde_json::{Value as JsonValue, json};
 use crate::domains::Domain;
 use crate::ingress_types::EventEnvelopeV1;
 use crate::messaging_app as app;
+use crate::messaging_app::{AppFlowInfo, AppPackInfo};
 use crate::operator_log;
 use crate::runner_exec::{self, RunRequest};
 use crate::runner_host::OperatorContext;
+
+/// Return the flows whose `subscribes_to` patterns match `event_type`.
+///
+/// Subscription-based routing from the research lineage: a flow matches when
+/// any of its `subscribes_to` glob patterns (see [`crate::topic_match`]) match
+/// the event type. The default-flow router
+/// ([`route_events_to_default_flow`]) does not use this — it is retained so
+/// producers/tests that route by subscription keep working alongside the
+/// default-flow path.
+pub fn select_target_flows<'a>(info: &'a AppPackInfo, event_type: &str) -> Vec<&'a AppFlowInfo> {
+    info.flows
+        .iter()
+        .filter(|flow| {
+            flow.subscribes_to
+                .iter()
+                .any(|pattern| crate::topic_match::topic_matches(pattern, event_type))
+        })
+        .collect()
+}
 
 pub fn route_events_to_default_flow(
     bundle: &Path,

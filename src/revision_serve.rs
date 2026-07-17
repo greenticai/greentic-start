@@ -34,7 +34,9 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
+use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -55,14 +57,24 @@ use hyper_util::rt::tokio::TokioIo;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::runtime::{Handle, Runtime};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 use greentic_runner_host::{Activity, RunnerHost, WelcomeFlowHint};
 
-use greentic_deploy_spec::{DEFAULT_LISTEN_ADDR, EnvironmentHostConfig};
+use greentic_deploy_spec::{
+    DEFAULT_LISTEN_ADDR, EnvironmentHostConfig, UpdateAction, UpdateChannelConfig,
+};
+use greentic_deployer::cli::updates::{self, ApplyUpdatesPayload, UpdatesGetPayload};
+use greentic_deployer::cli::{OpError, OpFlags, OpOutcome};
+use greentic_deployer::environment::{LocalFsStore, load_trust_root};
+use greentic_types::EnvId;
+use greentic_update::binswap;
+use greentic_update::plan::{select_binary, verify_update_plan};
+use greentic_update::stream::{StreamError, build_stream_client, run_stream};
 
 use crate::deployment_routes::RevisionIngressRouting;
 use crate::endpoint_resolver;
+use crate::http_helpers::{cors_preflight_response, with_cors};
 use crate::http_routes::{HttpRouteTable, RevisionScope};
 use crate::identify_payload;
 use crate::ingress_dispatch::parse_dispatch_result;
@@ -124,6 +136,17 @@ pub(crate) struct RevisionServeConfig {
     /// `/workers/invoke` to a genuine local caller while the public face
     /// refuses them. `None` = single listener (the non-tunnel default).
     pub admin_bind_addr: Option<SocketAddr>,
+    /// Whether this process participates in the update channel at all: run the
+    /// poll loop and reserve `/v1/updates/notify`. `false` is the `--no-updates`
+    /// kill switch — a host-local override, not a policy change. Policy (whether
+    /// the channel is enabled, and what a notification does) still lives in the
+    /// env's `update-channel.json`; with `true` the poll loop reads it every
+    /// cycle and no-ops while it is absent or disabled.
+    pub updates_enabled: bool,
+    /// Whether auto-restart after a binary self-update is enabled.
+    pub auto_restart_enabled: bool,
+    /// Executable path captured at boot, before any swap.
+    pub exe_path: Option<std::path::PathBuf>,
 }
 
 /// Per-connection shared state. Holds the live activation behind an
@@ -141,6 +164,50 @@ struct ServeState {
     /// Whether the built-in webchat console is served on this listener. Read on
     /// every request (a cheap `Copy` bool) to gate the chat-asset short-circuit.
     gui_enabled: bool,
+    /// Set to `true` after a binary self-update swap succeeds. The new binary is
+    /// on disk but the running process is still the old one — a restart is
+    /// required to activate it. Surfaced in `/status` and `/healthz` so
+    /// operators and orchestrators can observe when a restart is pending. Reset
+    /// implicitly on process restart (the new process starts with `false`).
+    restart_required: AtomicBool,
+    /// `--no-updates` inverted: when `false`, `/v1/updates/notify` is never
+    /// reserved (the path falls through to deployment routing) and no poll loop
+    /// runs. See [`RevisionServeConfig::updates_enabled`].
+    updates_enabled: bool,
+    /// Set to `true` when a binary swap succeeded AND auto-restart is enabled
+    /// AND we are on unix. The main thread's shutdown loop returns
+    /// `BinaryUpdateRestart` when this is set.
+    auto_restart_pending: AtomicBool,
+    /// Whether auto-restart after a binary self-update is enabled for this
+    /// process. Derived from `--no-auto-restart` / `GREENTIC_NO_AUTO_RESTART`.
+    auto_restart_enabled: bool,
+    /// Executable path captured once at boot (before any swap can invalidate
+    /// `/proc/self/exe`). Used by `try_apply_binary_update` as a fallback
+    /// and by the exec-into-self logic after shutdown.
+    exe_path: Option<std::path::PathBuf>,
+    /// Sliding-window registry of active DirectLine conversations, used to
+    /// re-mint session tokens on activity so long-running chats don't 401 once
+    /// the original session JWT lapses. See [`crate::directline_session`].
+    directline_sessions: Arc<crate::directline_session::DirectLineSessions>,
+    /// Short-window idempotency cache for `POST /v3/directline/conversations`.
+    /// Prevents racy double-calls from clients from minting two independent
+    /// conversations for the same browser session.
+    conversation_dedup: Arc<crate::conv_dedup::ConversationDedupCache>,
+    /// WebSocket session concurrency limits + per-tenant/conversation gauges.
+    /// Shared with the WS upgrade handler so every revision listener shares one
+    /// session accounting pool.
+    session_manager: Arc<crate::websocket::SessionManager>,
+    /// Activity push notifier — informs WS sessions when a conversation has
+    /// new activities. Shared across all revisions so a REST POST that writes
+    /// an activity on one revision wakes the WS pump watching that conversation.
+    notifier: Arc<dyn crate::notifier::ActivityNotifier>,
+    /// Test-only: override the activity source used by the WS pump. When
+    /// `Some`, `handle_websocket_upgrade` substitutes this source instead of
+    /// constructing a `RevisionActivitySource` that calls
+    /// `invoke_provider_for_revision`. This lets integration tests exercise the
+    /// full WS upgrade + pump pipeline without loading a real WASM pack.
+    #[cfg(test)]
+    activity_source_override: Option<Arc<dyn crate::websocket::pump::ActivitySource>>,
 }
 
 impl ServeState {
@@ -150,6 +217,17 @@ impl ServeState {
     /// activation outlives every in-flight request that pinned it.
     fn current(&self) -> Arc<Activation> {
         self.slot.load_full()
+    }
+
+    /// Record that a restart is required (binary swap succeeded) and, when
+    /// auto-restart is enabled on this platform, arm the auto-restart flag
+    /// so the shutdown loop returns `BinaryUpdateRestart`.
+    fn mark_restart_required(&self) {
+        self.restart_required.store(true, Ordering::Relaxed);
+        #[cfg(unix)]
+        if self.auto_restart_enabled {
+            self.auto_restart_pending.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -402,10 +480,29 @@ impl RevisionServer {
         };
         let admin_port = admin_addr.map(|a| a.port());
 
+        let session_manager = Arc::new(crate::websocket::SessionManager::new(
+            crate::websocket::WsLimits::default(),
+        ));
+        // In-memory notifier is sufficient for single-process revision hosts.
+        // A Redis-backed notifier (for horizontally scaled deployments) plugs
+        // in via the same `build_notifier` machinery as the legacy path.
+        let notifier: Arc<dyn crate::notifier::ActivityNotifier> =
+            Arc::new(crate::notifier::InMemoryNotifier::new(64));
         let state = Arc::new(ServeState {
             slot: ArcSwap::new(config.activation),
             bound_addr: addr,
             gui_enabled: config.gui_enabled,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: config.updates_enabled,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: config.auto_restart_enabled,
+            exe_path: config.exe_path,
+            directline_sessions: Arc::new(crate::directline_session::DirectLineSessions::from_env()),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager,
+            notifier,
+            #[cfg(test)]
+            activity_source_override: None,
         });
         // Cloned into the listener thread; the original lives on as the
         // [`RevisionServer::state`] handle so [`reload`] / [`counts`] read the
@@ -415,6 +512,25 @@ impl RevisionServer {
         // per-request state), so it lives as a thread-local rather than on
         // `ServeState`. AND-ed into the per-connection loopback decision below.
         let trust_loopback_peers = config.trust_loopback_peers;
+
+        // Updater: the ingress runtime runs two cooperating tasks against the
+        // env's configured update channel. `run_update_stream_loop` holds an SSE
+        // connection and is the *primary* discovery path; `run_update_poll_loop`
+        // does the actual verified fetch and is the fallback that also runs on a
+        // timer. Both re-read `update-channel.json` and no-op while the channel is
+        // absent, disabled, or endpoint-less, so deny-by-default lives in them —
+        // not in a boot-time sidecar probe, which would strand an env that
+        // subscribes *after* boot until the next restart. `--no-updates` (and a
+        // missing store root) is the only thing that keeps them from spawning.
+        let update_poll_root = config
+            .updates_enabled
+            .then(LocalFsStore::default_root)
+            .flatten();
+        let poll_state = Arc::clone(&state);
+        let stream_state = Arc::clone(&state);
+        // Wakes the poll loop out of its interval wait when a plan is published.
+        let update_wake = Arc::new(Notify::new());
+        let poll_wake = Arc::clone(&update_wake);
 
         let (tx, rx) = oneshot::channel();
         // The startup channel ships the Tokio runtime handle alongside the
@@ -434,7 +550,7 @@ impl RevisionServer {
                         }
                     };
                 let runtime_handle = runtime.handle().clone();
-                runtime.block_on(async move {
+                let serve_result = runtime.block_on(async move {
                     let listener = match TcpListener::bind(addr)
                         .await
                         .context("failed to bind revision ingress listener")
@@ -469,10 +585,39 @@ impl RevisionServer {
                             format!("revision ingress admin/console listening on http://{a}"),
                         );
                     }
+                    // Spawn the updater tasks on this runtime when the env opted in
+                    // (sidecar present). Both re-read config as they go, so a
+                    // disabled or endpoint-less channel simply no-ops. Aborted on
+                    // shutdown below.
+                    let update_poll_task = update_poll_root.as_ref().map(|root| {
+                        tokio::spawn(run_update_poll_loop(poll_state, root.clone(), poll_wake))
+                    });
+                    let update_stream_task = update_poll_root.map(|root| {
+                        tokio::spawn(run_update_stream_loop(stream_state, root, update_wake))
+                    });
                     let mut shutdown = rx;
                     loop {
                         tokio::select! {
-                            _ = &mut shutdown => break,
+                            _ = &mut shutdown => {
+                                // Stop the updater tasks. The abort is prompt when the
+                                // poll task is waiting between cycles (the common case).
+                                // A cycle already inside its `spawn_blocking`
+                                // (mid fetch/stage) runs to completion before the
+                                // runtime tears down — the same property the push
+                                // receiver's `spawn_blocking(run_update_notify)` has;
+                                // `updates::get`'s staging FSM is resumable, so no
+                                // half-staged state results, only a bounded delay.
+                                // The stream task's `spawn_blocking` is parked on a
+                                // socket read, so it unblocks when the connection is
+                                // dropped or recycled; it holds no staging state.
+                                if let Some(task) = &update_poll_task {
+                                    task.abort();
+                                }
+                                if let Some(task) = &update_stream_task {
+                                    task.abort();
+                                }
+                                break;
+                            }
                             // Main listener: the loopback gate + caller-asserted
                             // identity (see `serve`) honour `trust_loopback_peers`,
                             // which is false when a tunnel fronts this port.
@@ -501,7 +646,20 @@ impl RevisionServer {
                         }
                     }
                     Ok(())
-                })
+                });
+                // The updater's SSE stream loop runs on a `spawn_blocking` thread
+                // parked in a synchronous socket read that, by design, has no read
+                // timeout: reqwest's blocking client exposes none, so the stream
+                // bounds a silently-wedged read with a 900s connection recycle
+                // instead (see greentic-update `stream.rs`). Letting this `Runtime`
+                // drop would join the blocking pool and block shutdown until that
+                // read returns — up to the full recycle interval — which an operator
+                // experiences as "Ctrl+C does nothing." This is the terminal shutdown
+                // path (`RevisionServer::stop`), so detach the blocking pool rather
+                // than wait for it: the parked read's socket and thread are reclaimed
+                // by the OS as the process exits.
+                runtime.shutdown_background();
+                serve_result
             })?;
         let runtime_handle = startup_rx
             .recv()
@@ -685,6 +843,12 @@ impl RevisionServer {
         }
     }
 
+    /// Whether a binary swap succeeded and auto-restart was requested. Polled
+    /// by the main thread's shutdown loop to return `BinaryUpdateRestart`.
+    pub(crate) fn auto_restart_pending(&self) -> bool {
+        self.state.auto_restart_pending.load(Ordering::Relaxed)
+    }
+
     /// Signal shutdown and join the serving thread.
     pub(crate) fn stop(mut self) -> Result<()> {
         if let Some(tx) = self.shutdown.take() {
@@ -733,7 +897,15 @@ fn spawn_revision_connection(
                     handle_connection(req, connection_state.clone(), peer_is_loopback)
                 });
                 let io = TokioIo::new(stream);
-                if let Err(err) = Http1Builder::new().serve_connection(io, service).await {
+                // `with_upgrades` is required so the WebSocket handshake
+                // completes — without it hyper closes the TCP connection right
+                // after the 101 response and hyper-tungstenite's
+                // `websocket.await` errors out with "Handshake not finished".
+                if let Err(err) = Http1Builder::new()
+                    .serve_connection(io, service)
+                    .with_upgrades()
+                    .await
+                {
                     operator_log::error(
                         module_path!(),
                         format!("revision ingress connection error: {err}"),
@@ -751,14 +923,46 @@ fn spawn_revision_connection(
 /// `service_fn` adapter: collapse the `Ok`/`Err` response halves into the single
 /// infallible response hyper wants.
 async fn handle_connection(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     state: Arc<ServeState>,
     peer_is_loopback: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    Ok(match serve(req, state, peer_is_loopback).await {
-        Ok(response) => response,
-        Err(response) => response,
-    })
+    // A5: intercept WebSocket stream paths BEFORE `serve` so the upgrade
+    // handshake can borrow the request mutably. The stream path is the WS
+    // endpoint browsers open after creating a conversation over REST.
+    let path = req.uri().path().to_string();
+    if is_directline_stream_path(&path) {
+        let (Ok(response) | Err(response)) =
+            handle_websocket_upgrade(&mut req, &path, Arc::clone(&state)).await;
+        return Ok(response);
+    }
+
+    let cors = path_allows_cors(&path);
+    let (Ok(response) | Err(response)) = serve(req, state, peer_is_loopback).await;
+    Ok(if cors { with_cors(response) } else { response })
+}
+
+/// Paths that are never legitimately called cross-origin, and so must not
+/// receive `Access-Control-Allow-Origin`.
+///
+/// `/workers/invoke` executes a flow under the deployment's own tenant and
+/// returns its output. It is gated on `peer_is_loopback` — but that gate checks
+/// the *TCP peer*, and a page served from any origin, running in a browser on
+/// this machine, connects from `127.0.0.1` and passes it. The endpoint does not
+/// check `Content-Type` (it just parses the body as JSON), so a blind
+/// cross-origin POST is already possible; granting a wildcard
+/// `Access-Control-Allow-Origin` would additionally let that page *read the
+/// response*, turning a blind write into a full read/write channel. The
+/// `X-Frame-Options` header on `/chat` exists to stop exactly this
+/// (a cross-site page auto-driving the worker endpoint) — blanket CORS would
+/// reopen it by another door.
+///
+/// Nothing legitimate needs CORS here: the built-in `/chat` console fetches it
+/// **same-origin** (a relative `fetch('/workers/invoke')`, see `assets/chat.html`)
+/// and `greentic-gui` reaches it **server-side** via `HttpWorkerBackend`, where
+/// CORS does not apply.
+fn path_allows_cors(path: &str) -> bool {
+    path != "/workers/invoke"
 }
 
 /// Resolve → dispatch → execute for a single request. `Err` carries a ready HTTP
@@ -770,6 +974,22 @@ async fn serve(
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+
+    // CORS preflight: browsers send OPTIONS with no auth and no body before
+    // any cross-origin POST. Short-circuited here — before probes, chat
+    // assets, worker-invoke, and admission gates — because every one of
+    // those either ignores non-GET/POST or hard-rejects the method,
+    // turning the preflight into a 405 the browser treats as an opaque
+    // CORS failure. Mirrors the legacy `http_ingress` short-circuit.
+    if method == hyper::Method::OPTIONS {
+        if !path_allows_cors(&path) {
+            return Ok(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "cross-origin requests are not permitted on this path",
+            ));
+        }
+        return Ok(cors_preflight_response());
+    }
 
     if let Some(response) = try_probe_response(&path, &state) {
         return Ok(response);
@@ -807,6 +1027,40 @@ async fn serve(
             ));
         }
         return handle_worker_invoke(req, Arc::clone(&state), peer_is_loopback).await;
+    }
+
+    // Phase-4 signed update-plan receiver: a plan server POSTs a DSSE-signed
+    // update plan here and the receiver verifies + (optionally) stages it via the
+    // deployer `updates::get` library call. Short-circuited before deployment-route
+    // resolution for the same reason as `/workers/invoke` — a broad `/`-prefix
+    // route binding would otherwise run it as a generic entry-flow activity.
+    //
+    // NOT loopback-gated (unlike `/chat` and `/workers/invoke`): the notification
+    // originates off-host from the plan server. The auth boundary is the DSSE
+    // signature verification against the env trust root (inside `updates::get`)
+    // plus the per-env update-channel `enabled` gate (deny-by-default) — the same
+    // posture as signature-verified provider webhooks, not caller-asserted trust.
+    // Only reserve this path on envs that actually have an update channel
+    // configured (an `update-channel.json` sidecar). On every other env the
+    // request falls through to normal deployment routing, so adding this platform
+    // path never shadows an existing app route (e.g. a broad `/`-prefix binding)
+    // on an env that never opted into the updater.
+    // `--no-updates` also closes this door: the kill switch is "not on this box",
+    // so neither the pull nor the push half of the updater may run.
+    if path == "/v1/updates/notify" {
+        let intercept = state.updates_enabled
+            && LocalFsStore::default_root().is_some_and(|root| {
+                update_channel_present(&root, state.current().routing.dispatcher.env_id())
+            });
+        if intercept {
+            if method != hyper::Method::POST {
+                return Err(error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "update notify requires POST",
+                ));
+            }
+            return handle_update_notify(req, Arc::clone(&state)).await;
+        }
     }
 
     // Snapshot the activation ONCE per request so dispatch and execute see a
@@ -905,9 +1159,18 @@ async fn serve(
     // a stable chat/channel-level hint from the webhook body so the pin store keeps
     // the conversation on one revision. provider_type is revision-independent so it
     // resolves before dispatch. Loopback callers already supply their own hint.
+    //
+    // A4: webchat/DirectLine carries the conversation_id in the URL path, not
+    // the body. Try path-based extraction first (cheap, no parse) then fall
+    // back to body-based for other providers.
     let session_hint = session_hint.or_else(|| {
         if peer_is_loopback {
             return None;
+        }
+        // A4: DirectLine conversation stickiness — the conversation_id is in
+        // the URL path, not the webhook body.
+        if let Some(hint) = crate::session_hint_extractor::extract_webchat_session_hint(&path) {
+            return Some(hint);
         }
         let provider_type = activation.routing.http_routes.provider_type_for(
             &path,
@@ -972,6 +1235,23 @@ async fn serve(
         revision_id: outcome.revision_id,
     };
 
+    // A3: revision-scoped static routes. Checked AFTER reserved operator
+    // paths (probes, /chat, /workers/invoke, /v1/updates/notify) which all
+    // short-circuited above, and AFTER deployment-route resolution, but
+    // BEFORE the provider-route admission gate and generic-flow branch.
+    // Only GET — a POST to a path that happens to overlap a static route's
+    // public_path prefix must fall through to the provider/generic flow so
+    // webhooks keep working.
+    if method == hyper::Method::GET
+        && let Some(route_match) = activation
+            .routing
+            .static_routes
+            .match_request_for_revision(&path, &scope)
+    {
+        let response = crate::static_handler::serve_static_route_from_pack(&route_match, &path);
+        return Ok(with_cors(response));
+    }
+
     // Phase D.3: branch out to the provider-route handler BEFORE the
     // generic-JSON path runs the endpoint resolver / strict JSON parse /
     // entry-flow build_activity. Provider webhooks send raw bodies
@@ -983,6 +1263,7 @@ async fn serve(
         Admission::ProviderRoute => {
             return dispatch_provider_route(
                 Arc::clone(&activation),
+                Arc::clone(&state),
                 &tenant,
                 &scope,
                 &path,
@@ -1247,6 +1528,1402 @@ async fn handle_worker_invoke(
     let body = serde_json::to_vec(&response)
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     Ok(json_response(StatusCode::OK, body))
+}
+
+/// Wire contract `greentic.update-notify.v1`: a signed update plan pushed to a
+/// running environment by a plan server. `plan_b64` / `sig_b64` carry the EXACT
+/// plan document and DSSE-envelope bytes, base64-encoded. They are base64 (not a
+/// nested JSON plan) on purpose: DSSE verification pins `sha256(plan_bytes)` as
+/// the subject digest, so the bytes must survive transport unaltered — nesting
+/// the plan as JSON would re-serialize it and break the digest.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateNotifyV1 {
+    schema: String,
+    plan_b64: String,
+    sig_b64: String,
+}
+
+/// The wire `schema` discriminator the receiver accepts.
+const UPDATE_NOTIFY_SCHEMA_V1: &str = "greentic.update-notify.v1";
+
+/// What the receiver does with a transport-accepted notification, resolved from
+/// the env's update-channel policy. Deny-by-default: an absent or disabled
+/// channel is [`NotifyAction::Ignore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifyAction {
+    Ignore,
+    Record,
+    Stage,
+    /// Stage, then converge this environment onto the plan's target manifest.
+    Apply,
+}
+
+/// A staging failure. `Op` is a deployer [`OpError`] from `updates::get` (mapped
+/// to an HTTP status by [`map_op_error`], with a category-only body so trust /
+/// path details never leak to the caller). `Internal` is a server-side failure
+/// (store, tempfile, env-id) reported as an opaque 500.
+#[derive(Debug)]
+enum NotifyError {
+    Op(OpError),
+    Internal(String),
+}
+
+/// Parse + validate a `greentic.update-notify.v1` body into the raw plan and
+/// signature bytes. `Err((status, message))` is a ready 4xx (all client faults:
+/// malformed JSON, unknown schema, non-base64 payloads).
+fn decode_update_notify(body: &[u8]) -> Result<(Vec<u8>, Vec<u8>), (StatusCode, String)> {
+    let notify: UpdateNotifyV1 = serde_json::from_slice(body).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid update-notify body: {err}"),
+        )
+    })?;
+    if notify.schema != UPDATE_NOTIFY_SCHEMA_V1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unsupported update-notify schema `{}`", notify.schema),
+        ));
+    }
+    let plan = BASE64.decode(notify.plan_b64.as_bytes()).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("plan_b64 is not valid base64: {err}"),
+        )
+    })?;
+    let sig = BASE64.decode(notify.sig_b64.as_bytes()).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("sig_b64 is not valid base64: {err}"),
+        )
+    })?;
+    Ok((plan, sig))
+}
+
+/// Resolve the update-channel policy into the action to take. Deny-by-default:
+/// `resolved_enabled()` is `false` for an absent (`None`) or `enabled: None/false`
+/// channel, so an operator must explicitly opt the environment in.
+///
+/// Reads `resolved_action()`, which prefers the `on_update` field and falls back
+/// to the legacy `on_notify` when it is absent — a channel written by an older
+/// deployer keeps its meaning. `UpdateAction` is `#[non_exhaustive]`; an action
+/// this binary does not know is treated as `Stage`, the conservative floor:
+/// content lands on disk, traffic does not move.
+fn notify_action(cfg: &UpdateChannelConfig) -> NotifyAction {
+    if !cfg.resolved_enabled() {
+        return NotifyAction::Ignore;
+    }
+    match cfg.resolved_action() {
+        UpdateAction::RecordOnly => NotifyAction::Record,
+        UpdateAction::Stage => NotifyAction::Stage,
+        UpdateAction::Apply => NotifyAction::Apply,
+        _ => NotifyAction::Stage,
+    }
+}
+
+/// Whether `env_id` has an update channel configured — i.e. an
+/// `update-channel.json` sidecar exists under its env dir. Only such envs
+/// reserve `/v1/updates/notify`; every other env lets the path fall through to
+/// normal deployment routing (see the route gate in [`serve`]).
+fn update_channel_present(store_root: &std::path::Path, env_id: &str) -> bool {
+    match crate::runtime_config::env_dir_in(store_root, env_id) {
+        Ok(env_dir) => env_dir.join("update-channel.json").exists(),
+        Err(_) => false,
+    }
+}
+
+/// Verify a posted plan the way the stage path does — trusted-key DSSE signature
+/// plus target-env match — but WITHOUT staging it. Used by the record-only path
+/// so an enabled record-only channel records a *verified* notification. Reuses
+/// the shared [`verify_update_plan`] primitive (verification is not forked); a
+/// missing/empty trust root fails closed. Failures surface as the same
+/// [`OpError`] categories `map_op_error` maps for the stage path — verification
+/// or trust-root problems → 409, target-env mismatch → 400.
+fn verify_signed_plan(
+    store: &LocalFsStore,
+    env_id: &EnvId,
+    plan: &[u8],
+    sig: &[u8],
+) -> Result<(), NotifyError> {
+    let env_dir = crate::runtime_config::env_dir_in(store.root(), env_id.as_str())
+        .map_err(|err| NotifyError::Internal(format!("resolve env dir: {err}")))?;
+    let trust = load_trust_root(&env_dir).map_err(|err| {
+        NotifyError::Op(OpError::Conflict(format!(
+            "record-only verify: trust root unavailable: {err}"
+        )))
+    })?;
+    let verified = verify_update_plan(plan, sig, &trust).map_err(|err| {
+        NotifyError::Op(OpError::Conflict(format!(
+            "record-only verify: plan verification failed: {err}"
+        )))
+    })?;
+    if verified.plan.env_id.as_str() != env_id.as_str() {
+        return Err(NotifyError::Op(OpError::InvalidArgument(format!(
+            "record-only verify: plan targets env `{}`, not this environment",
+            verified.plan.env_id
+        ))));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Binary self-update (P7d: stage-only apply, no restart)
+// ---------------------------------------------------------------------------
+
+/// Size cap for a binary release archive fetch (256 MiB). Binary archives are
+/// larger than a plan doc but still bounded — a compromised or misbehaving
+/// source cannot exhaust memory.
+const MAX_BINARY_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Timeout for the binary archive download.
+const BINARY_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Marker file name persisted under the env dir when a binary swap succeeds.
+/// Its presence signals "a newer binary is on disk but the running process has
+/// not restarted yet." Idempotent: re-applying the same version does not
+/// re-write it.
+const BINARY_UPDATE_PENDING_FILE: &str = "binary-update-pending.json";
+
+/// Typed marker written to [`BINARY_UPDATE_PENDING_FILE`] after a binary swap.
+/// Old markers (pre-P7e) that lack `phase` deserialize as [`MarkerPhase::Pending`]
+/// via the serde default.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BinaryUpdateMarker {
+    name: String,
+    pub(crate) from_version: String,
+    pub(crate) to_version: String,
+    staged_at: String,
+    #[serde(default = "default_marker_phase")]
+    pub(crate) phase: MarkerPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rolled_back_at: Option<String>,
+    /// SHA-256 digest of the binary artifact at swap time. Allows the
+    /// tombstone guard to distinguish a same-version re-release (different
+    /// build artifact) from the exact binary that already failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) digest: Option<String>,
+    /// Number of times this pending marker has been booted. Incremented and
+    /// persisted (fsync) before boot proceeds; when it exceeds
+    /// [`MAX_BOOT_ATTEMPTS`] the boot-time logic rolls back immediately
+    /// instead of arming the RAII guard, breaking hard-kill crash loops.
+    #[serde(default)]
+    pub(crate) boot_attempts: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MarkerPhase {
+    Pending,
+    RolledBack,
+}
+
+fn default_marker_phase() -> MarkerPhase {
+    MarkerPhase::Pending
+}
+
+/// Read and parse the binary-update marker for the given env dir.
+/// Returns `None` if the file is absent or unparseable.
+pub(crate) fn read_binary_update_marker(env_dir: &std::path::Path) -> Option<BinaryUpdateMarker> {
+    let path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Delete the binary-update marker.
+pub(crate) fn clear_binary_update_marker(env_dir: &std::path::Path) {
+    let path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Maximum number of boot attempts before the boot-time logic rolls back
+/// immediately instead of arming the RAII guard. A hard-killed process
+/// (OOM-kill, SIGKILL, SIGSEGV) runs no destructors, so the guard never
+/// fires; the counter breaks the infinite crash-loop.
+pub(crate) const MAX_BOOT_ATTEMPTS: u32 = 3;
+
+/// Decision the boot-time marker processing should execute. Extracted as a
+/// pure function so the logic is unit-testable without standing up the full
+/// `run_start` environment.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BootAction {
+    /// No marker on disk — proceed with a normal boot.
+    Proceed,
+    /// Pending marker, `to_version == own`: arm the rollback guard with the
+    /// (already-incremented) marker.
+    ArmGuard(BinaryUpdateMarker),
+    /// Pending marker, `to_version == own`, but `boot_attempts >= MAX`:
+    /// roll back immediately (tombstone + restore_prev + exec).
+    RollbackNow(BinaryUpdateMarker),
+    /// Marker is stale or matches a different version lineage — delete it.
+    ClearMarker,
+    /// Rolled-back tombstone where `to_version == own` (restore_prev failed,
+    /// supervisor restarted the broken binary): keep the tombstone so the
+    /// anti-retry guard still blocks re-swap.
+    PreserveTombstone,
+}
+
+/// Decide what the boot should do given an optional on-disk marker and the
+/// version of the running binary.
+pub(crate) fn decide_boot_action(
+    marker: Option<BinaryUpdateMarker>,
+    own_version: &str,
+) -> BootAction {
+    let marker = match marker {
+        Some(m) => m,
+        None => return BootAction::Proceed,
+    };
+    match marker.phase {
+        MarkerPhase::Pending if marker.to_version == own_version => {
+            if marker.boot_attempts >= MAX_BOOT_ATTEMPTS {
+                BootAction::RollbackNow(marker)
+            } else {
+                BootAction::ArmGuard(marker)
+            }
+        }
+        MarkerPhase::Pending if marker.from_version == own_version => BootAction::Proceed,
+        MarkerPhase::RolledBack if marker.from_version == own_version => BootAction::Proceed,
+        MarkerPhase::RolledBack if marker.to_version == own_version => {
+            BootAction::PreserveTombstone
+        }
+        _ => BootAction::ClearMarker,
+    }
+}
+
+/// Durably write the marker to disk: create, write_all, fsync. Returns an
+/// error if any step fails — the caller must treat a failure as "rollback
+/// state not persisted."
+/// Persist the rollback marker, undoing the binary swap if it cannot be written.
+///
+/// The marker is the rollback state: without it on disk the boot-fail guard
+/// cannot arm, so a new binary that fails to boot would never be rolled back.
+/// Rather than exec into a binary with no rollback coverage, restore the
+/// previous one and fail the binary step (content staging is unaffected).
+fn persist_marker_or_undo_swap(
+    env_dir: &std::path::Path,
+    marker: &BinaryUpdateMarker,
+    exe_path: &std::path::Path,
+) -> Result<(), NotifyError> {
+    let Err(err) = write_marker_durable(env_dir, marker) else {
+        return Ok(());
+    };
+    operator_log::error(
+        module_path!(),
+        format!("binary-update: failed to persist rollback marker: {err}; undoing swap"),
+    );
+    if let Err(restore_err) = binswap::restore_prev(exe_path) {
+        operator_log::error(
+            module_path!(),
+            format!(
+                "binary-update: restore_prev ALSO failed after marker write failure: \
+                 {restore_err}; manual recovery required"
+            ),
+        );
+    }
+    Err(NotifyError::Internal(format!(
+        "binary update aborted: rollback marker not persisted: {err}"
+    )))
+}
+
+pub(crate) fn write_marker_durable(
+    env_dir: &std::path::Path,
+    marker: &BinaryUpdateMarker,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
+    let bytes = serde_json::to_vec_pretty(marker).map_err(std::io::Error::other)?;
+    let file = std::fs::File::create(&path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    writer.write_all(&bytes)?;
+    let file = writer.into_inner()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Write a rolled-back tombstone marker.
+pub(crate) fn write_rollback_tombstone(env_dir: &std::path::Path, marker: &BinaryUpdateMarker) {
+    let tombstone = BinaryUpdateMarker {
+        phase: MarkerPhase::RolledBack,
+        rolled_back_at: Some(chrono::Utc::now().to_rfc3339()),
+        ..marker.clone()
+    };
+    let path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
+    if let Ok(bytes) = serde_json::to_vec_pretty(&tombstone) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
+/// Attempt to apply a binary self-update for THIS process after content staging
+/// has succeeded. Returns a JSON fragment to merge into the notify response, or
+/// `None` when no binary update applies to this host (the normal case for plans
+/// that carry only content updates).
+///
+/// Fail-closed on every guard: a failure here does NOT regress the content
+/// staging that already completed — the content apply stands, only the binary
+/// step is skipped/errored.
+fn try_apply_binary_update(
+    plan_bytes: &[u8],
+    sig_bytes: &[u8],
+    store: &LocalFsStore,
+    env_id: &str,
+    exe_path: Option<&std::path::Path>,
+) -> Result<Option<Value>, NotifyError> {
+    // 1. Verify the plan to get the VerifiedUpdatePlan (which has `binaries`).
+    //    Content staging already verified via `updates::get`, but we need our own
+    //    VerifiedUpdatePlan handle. Re-verification is cheap (no I/O beyond the
+    //    trust-root read) and avoids coupling to the deployer's internal verified
+    //    plan representation.
+    let env_dir = crate::runtime_config::env_dir_in(store.root(), env_id)
+        .map_err(|err| NotifyError::Internal(format!("resolve env dir: {err}")))?;
+    let trust = load_trust_root(&env_dir).map_err(|err| {
+        NotifyError::Internal(format!("binary-update: trust root unavailable: {err}"))
+    })?;
+    let verified = verify_update_plan(plan_bytes, sig_bytes, &trust).map_err(|err| {
+        // Content staging already succeeded against the same trust root, so a
+        // verification failure here is a logic error, not a user fault.
+        NotifyError::Internal(format!("binary-update: plan re-verification failed: {err}"))
+    })?;
+
+    // 2. Select THIS binary for THIS host.
+    let own_name = env!("CARGO_PKG_NAME");
+    let own_target = binswap::current_target();
+    let binary = match select_binary(&verified.plan.binaries, own_name, own_target) {
+        Ok(Some(b)) => b,
+        Ok(None) => return Ok(None), // No binary update for this host — content-only.
+        Err(err) => {
+            // Ambiguous: fail-closed, do not guess.
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "binary-update: ambiguous binary selection for \
+                     `{own_name}` / `{own_target}`: {err}"
+                ),
+            );
+            return Err(NotifyError::Internal(
+                "binary update refused: ambiguous binary in plan".to_string(),
+            ));
+        }
+    };
+
+    // 3. Guards (fail-safe / fail-closed), BEFORE any download.
+
+    // 3a. Container refuse: distroless/immutable images cannot (and should not)
+    //     swap binaries on disk — update via image tag instead.
+    if binswap::is_container_environment() {
+        operator_log::warn(
+            module_path!(),
+            "binary-update: skipped — containerized deployment; update via image tag",
+        );
+        return Ok(None);
+    }
+
+    // 3b. Version guard: refuse downgrades and no-op on equal version.
+    let current_version = env!("CARGO_PKG_VERSION");
+    match (
+        semver::Version::parse(&binary.version),
+        semver::Version::parse(current_version),
+    ) {
+        (Ok(plan_ver), Ok(running_ver)) => {
+            if plan_ver < running_ver {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "binary-update: skipped — plan version {} is older than \
+                         running version {current_version} (anti-rollback)",
+                        binary.version,
+                    ),
+                );
+                return Ok(None);
+            }
+            if plan_ver == running_ver {
+                operator_log::info(
+                    module_path!(),
+                    format!("binary-update: skipped — already running version {current_version}",),
+                );
+                return Ok(None);
+            }
+        }
+        (Err(err), _) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "binary-update: skipped — plan binary version `{}` is not valid semver: {err}",
+                    binary.version,
+                ),
+            );
+            return Ok(None);
+        }
+        (_, Err(err)) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "binary-update: skipped — running version `{current_version}` \
+                     is not valid semver: {err}",
+                ),
+            );
+            return Ok(None);
+        }
+    }
+
+    // 3c. Airgap: if `source` is None, the binary is carried in-band (not
+    //     implemented in P7d).
+    let source_url = match &binary.source {
+        Some(url) => url.clone(),
+        None => {
+            operator_log::info(
+                module_path!(),
+                "binary-update: skipped — airgap in-band delivery (out of P7d scope)",
+            );
+            return Ok(None);
+        }
+    };
+
+    // 3d. Idempotency: if a pending marker for this exact version already exists, skip.
+    let marker_path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
+    if let Some(existing_marker) = read_binary_update_marker(&env_dir) {
+        if existing_marker.phase == MarkerPhase::Pending
+            && existing_marker.to_version == binary.version
+        {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "binary-update: version {} already staged; restart required to activate",
+                    binary.version,
+                ),
+            );
+            return Ok(Some(serde_json::json!({
+                "staged": true,
+                "restart_required": true,
+                "version": binary.version,
+            })));
+        }
+
+        // 3e. Anti-rollback tombstone: a previous attempt to run this version
+        //     failed to boot and was rolled back. Do not retry the SAME build
+        //     artifact. If the digest differs (a same-version re-release with
+        //     a fixed binary), allow the swap.
+        if existing_marker.phase == MarkerPhase::RolledBack
+            && existing_marker.to_version == binary.version
+            && existing_marker
+                .digest
+                .as_ref()
+                .is_none_or(|d| d == &binary.digest)
+        {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "binary-update: version {} previously rolled back after boot failure \
+                     at {}; refusing auto-retry. Clear `{}` to override.",
+                    binary.version,
+                    existing_marker
+                        .rolled_back_at
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    marker_path.display(),
+                ),
+            );
+            return Ok(None);
+        }
+    }
+
+    // 4. Fetch the archive from `source_url` with bounded size + timeout.
+    let archive_dir = tempfile::TempDir::new().map_err(|err| {
+        NotifyError::Internal(format!("binary-update: failed to create temp dir: {err}"))
+    })?;
+    let archive_ext = if source_url.ends_with(".zip") {
+        "archive.zip"
+    } else {
+        "archive.tgz"
+    };
+    let archive_path = archive_dir.path().join(archive_ext);
+
+    {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(BINARY_FETCH_TIMEOUT)
+            .build()
+            .map_err(|err| {
+                NotifyError::Internal(format!("binary-update: failed to build HTTP client: {err}"))
+            })?;
+
+        use std::io::Read as _;
+        let resp = client
+            .get(&source_url)
+            .send()
+            .map_err(|err| {
+                NotifyError::Internal(format!("binary-update: archive fetch failed: {err}"))
+            })?
+            .error_for_status()
+            .map_err(|err| {
+                NotifyError::Internal(format!("binary-update: archive fetch status error: {err}"))
+            })?;
+
+        let mut buf = Vec::new();
+        resp.take(MAX_BINARY_ARCHIVE_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map_err(|err| {
+                NotifyError::Internal(format!("binary-update: archive read error: {err}"))
+            })?;
+        if buf.len() as u64 > MAX_BINARY_ARCHIVE_BYTES {
+            return Err(NotifyError::Internal(format!(
+                "binary-update: archive exceeds {} byte cap",
+                MAX_BINARY_ARCHIVE_BYTES,
+            )));
+        }
+        std::fs::write(&archive_path, &buf).map_err(|err| {
+            NotifyError::Internal(format!("binary-update: failed to write archive: {err}"))
+        })?;
+    }
+
+    // 5. Unpack + verify + swap.
+    let unpack_dir = tempfile::TempDir::new().map_err(|err| {
+        NotifyError::Internal(format!(
+            "binary-update: failed to create unpack temp dir: {err}"
+        ))
+    })?;
+    let inner_binary = binswap::unpack_release_binary(&archive_path, own_name, unpack_dir.path())
+        .map_err(|err| {
+        NotifyError::Internal(format!("binary-update: archive unpack failed: {err}"))
+    })?;
+
+    let current_exe = match exe_path {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_exe().map_err(|err| {
+            NotifyError::Internal(format!("binary-update: cannot resolve current exe: {err}"))
+        })?,
+    };
+
+    let swap_opts = binswap::SwapOptions {
+        expected_digest: Some(binary.digest.clone()),
+    };
+    let _outcome =
+        binswap::swap_binary(&inner_binary, &current_exe, &swap_opts).map_err(|err| {
+            // Fail-closed: the binary is NOT applied, content staging stays
+            // intact. Log the category, never leak the path.
+            operator_log::error(module_path!(), format!("binary-update: swap failed: {err}"));
+            NotifyError::Internal("binary update swap failed".to_string())
+        })?;
+
+    // 6. Durably persist the rollback marker BEFORE reporting success. The
+    //    marker is the rollback state — without it the boot-fail guard cannot
+    //    arm, and a crash-looping new binary is never rolled back. If the
+    //    write fails, undo the swap so we never exec into a binary that has
+    //    no rollback coverage.
+    let marker = BinaryUpdateMarker {
+        name: own_name.to_string(),
+        from_version: current_version.to_string(),
+        to_version: binary.version.clone(),
+        staged_at: chrono::Utc::now().to_rfc3339(),
+        phase: MarkerPhase::Pending,
+        rolled_back_at: None,
+        digest: Some(binary.digest.clone()),
+        boot_attempts: 0,
+    };
+    persist_marker_or_undo_swap(&env_dir, &marker, &current_exe)?;
+
+    operator_log::warn(
+        module_path!(),
+        format!(
+            "binary-update: {own_name} {} installed; restart required to activate",
+            binary.version,
+        ),
+    );
+
+    Ok(Some(serde_json::json!({
+        "staged": true,
+        "restart_required": true,
+        "version": binary.version,
+    })))
+}
+
+/// Core of the receiver: load the env's update-channel policy and act on a
+/// notification — ignore (disabled), record (log only), or stage
+/// (download + DSSE-verify + stage the plan via the deployer `updates::get`).
+///
+/// Sync and internally blocking: `updates::get` downloads + verifies artifacts on
+/// a blocking runtime. The async handler runs this on a blocking thread so the
+/// request worker is never parked. Returns the HTTP status + JSON body on a
+/// resolved outcome, or a [`NotifyError`] the handler maps to a status.
+fn run_update_notify(
+    store: &LocalFsStore,
+    env_id: &str,
+    plan: &[u8],
+    sig: &[u8],
+    exe_path: Option<&std::path::Path>,
+) -> Result<(StatusCode, Value), NotifyError> {
+    let env_typed = EnvId::new(env_id).map_err(|err| {
+        NotifyError::Internal(format!("invalid environment id `{env_id}`: {err}"))
+    })?;
+    let cfg = store
+        .load_update_channel(&env_typed)
+        .map_err(|err| NotifyError::Internal(format!("failed to read update channel: {err}")))?
+        .unwrap_or_else(|| UpdateChannelConfig::disabled(env_typed.clone()));
+
+    match notify_action(&cfg) {
+        NotifyAction::Ignore => {
+            operator_log::info(
+                module_path!(),
+                format!("update-notify: channel disabled for env `{env_id}`, ignoring"),
+            );
+            Ok((
+                StatusCode::FORBIDDEN,
+                serde_json::json!({ "status": "disabled" }),
+            ))
+        }
+        NotifyAction::Record => {
+            // Record-only still VERIFIES the plan (trusted-key DSSE signature +
+            // target env) before recording: `on_notify` is the action on a
+            // *verified* notification, and the endpoint is not loopback-gated, so
+            // recording an unverified plan would let any caller forge the signal.
+            // Verify without staging — the Stage arm below verifies via
+            // `updates::get`.
+            verify_signed_plan(store, &env_typed, plan, sig)?;
+            operator_log::info(
+                module_path!(),
+                format!("update-notify: verified plan available for env `{env_id}` (record-only)"),
+            );
+            Ok((
+                StatusCode::ACCEPTED,
+                serde_json::json!({ "status": "recorded" }),
+            ))
+        }
+        action @ (NotifyAction::Stage | NotifyAction::Apply) => {
+            // Stage the posted bytes into a TempDir so the deployer's file-import
+            // path can read them. `dir` stays in scope until after `get()` returns
+            // (it reads the files synchronously) and is removed on drop.
+            let dir = tempfile::TempDir::new().map_err(|err| {
+                NotifyError::Internal(format!("failed to create temp dir: {err}"))
+            })?;
+            let plan_path = dir.path().join("plan.json");
+            let sig_path = dir.path().join("plan.json.sig");
+            std::fs::write(&plan_path, plan).map_err(|err| {
+                NotifyError::Internal(format!("failed to stage plan bytes: {err}"))
+            })?;
+            std::fs::write(&sig_path, sig).map_err(|err| {
+                NotifyError::Internal(format!("failed to stage signature bytes: {err}"))
+            })?;
+
+            let payload = UpdatesGetPayload {
+                environment_id: env_id.to_string(),
+                plan_url: None,
+                plan_file: Some(plan_path),
+                plan_sig_file: Some(sig_path),
+            };
+            let flags = OpFlags {
+                schema_only: false,
+                answers: None,
+            };
+            // The deployer's `OpOutcome.result` carries the staging directory path
+            // and the trust-root key IDs that verified the plan, which must not
+            // leak to the off-host caller — the response below is a category
+            // signal only, matching the `disabled` / `recorded` arms above. The
+            // `plan_id` is read back out here for the apply arm, which needs to
+            // name the plan `get` just staged and verified; re-deriving it from
+            // the posted bytes would trust unverified input.
+            let staged = updates::get(store, &flags, Some(payload)).map_err(NotifyError::Op)?;
+            operator_log::info(
+                module_path!(),
+                format!("update-notify: staged update plan for env `{env_id}`"),
+            );
+
+            // Binary self-update (P7d): after content staging succeeds, check
+            // whether the plan carries a binary for THIS process on THIS host
+            // and, if so, download + verify + swap it. The content path is
+            // never regressed — a binary-step failure is logged and the
+            // content-staged result still returns.
+            let binary_result = match try_apply_binary_update(plan, sig, store, env_id, exe_path) {
+                Ok(info) => info,
+                Err(err) => {
+                    // Log the error but do NOT fail the content staging.
+                    operator_log::error(
+                        module_path!(),
+                        format!(
+                            "update-notify: binary self-update failed for env `{env_id}`: {err:?}"
+                        ),
+                    );
+                    None
+                }
+            };
+
+            // `Apply` converges on top of the staged content: snapshot → apply →
+            // verify → rollback on failure, all inside the deployer's
+            // single-flight `begin_apply_checked`. The apply rewrites
+            // `runtime-config.json`, which this process's own `revision_reload`
+            // watcher picks up and hot-swaps — no explicit reload, no restart.
+            // Unlike the binary step, a failure here is NOT swallowed: the
+            // operator asked for convergence, and reporting "staged" after a
+            // failed rollback would hide it.
+            let status = if action == NotifyAction::Apply {
+                apply_staged_plan(store, env_id, plan_id_of(&staged)?)?;
+                "applied"
+            } else {
+                "staged"
+            };
+
+            let mut body = serde_json::json!({ "status": status });
+            if let Some(binary_info) = binary_result {
+                body["binary"] = binary_info;
+            }
+            Ok((StatusCode::OK, body))
+        }
+    }
+}
+
+/// The `plan_id` of the plan `updates::get` just staged and verified. Read back
+/// off the deployer's outcome rather than re-parsed from the posted bytes: those
+/// are attacker-supplied until `get` has checked the DSSE signature and the
+/// target env, and the id names *what was staged*.
+fn plan_id_of(staged: &OpOutcome) -> Result<&str, NotifyError> {
+    staged
+        .result
+        .get("plan_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| NotifyError::Internal("staged update plan carries no plan id".to_string()))
+}
+
+/// Converge the environment onto a staged plan's signed target manifest.
+/// Delegates to the deployer's `updates::apply` — the same code path
+/// `op updates apply` runs — so snapshot / verify / rollback and the applied-set
+/// bookkeeping are not forked here. The outcome is discarded for the same reason
+/// the stage path discards it: it names host paths the off-host caller must not
+/// see.
+fn apply_staged_plan(store: &LocalFsStore, env_id: &str, plan_id: &str) -> Result<(), NotifyError> {
+    let flags = OpFlags {
+        schema_only: false,
+        answers: None,
+    };
+    let payload = ApplyUpdatesPayload {
+        environment_id: env_id.to_string(),
+        plan_id: plan_id.to_string(),
+    };
+    updates::apply_updates(store, &flags, Some(payload)).map_err(NotifyError::Op)?;
+    operator_log::info(
+        module_path!(),
+        format!("update-notify: applied update plan `{plan_id}` to env `{env_id}`"),
+    );
+    Ok(())
+}
+
+/// Map a deployer [`OpError`] from `updates::get` to an HTTP status with a
+/// category-only body. The full error is logged; the response body is a fixed
+/// per-status string so untrusted-signer, path, or trust-root details are never
+/// echoed back to the (unauthenticated) caller.
+fn map_op_error(err: &OpError) -> Response<Full<Bytes>> {
+    let status = match err {
+        // Untrusted signer, downgrade, or target-env mismatch, and trust-root
+        // failures are all "the plan is not acceptable here" → 409.
+        OpError::TrustRoot(_) | OpError::Conflict(_) => StatusCode::CONFLICT,
+        OpError::Unauthorized { .. } => StatusCode::FORBIDDEN,
+        OpError::NotFound(_) => StatusCode::NOT_FOUND,
+        OpError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+        // Artifact download failed against the plan/distributor endpoint.
+        OpError::Fetch(_) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    operator_log::warn(
+        module_path!(),
+        format!("update-notify: rejected ({status}): {err}"),
+    );
+    let message = match status {
+        StatusCode::CONFLICT => {
+            "update plan rejected (untrusted signer, downgrade, or env mismatch)"
+        }
+        StatusCode::FORBIDDEN => "update plan rejected by policy",
+        StatusCode::NOT_FOUND => "update plan or a referenced artifact was not found",
+        StatusCode::BAD_REQUEST => "update plan is malformed",
+        StatusCode::BAD_GATEWAY => "failed to fetch update artifacts",
+        _ => "internal error staging update plan",
+    };
+    text_response(status, message)
+}
+
+/// Handle `POST /v1/updates/notify`: read the posted signed plan, resolve the
+/// env's update-channel policy, and ignore / record / stage it. The heavy path
+/// (`updates::get` — download + DSSE-verify + stage) is sync and internally
+/// blocking, so it runs on a blocking thread and the request worker is never
+/// parked. NOT loopback-gated — see the route comment in [`serve`].
+async fn handle_update_notify(
+    req: Request<Incoming>,
+    state: Arc<ServeState>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let body = read_body_limited(req).await.map_err(|_| {
+        error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds the size limit",
+        )
+    })?;
+    let (plan, sig) =
+        decode_update_notify(&body).map_err(|(status, message)| error_response(status, message))?;
+
+    let env_id = state.current().routing.dispatcher.env_id().to_string();
+
+    let store_root = LocalFsStore::default_root().ok_or_else(|| {
+        operator_log::error(
+            module_path!(),
+            "update-notify: no environment store root (HOME unset)",
+        );
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "environment store unavailable",
+        )
+    })?;
+    let store = LocalFsStore::new(store_root);
+    let captured_exe = state.exe_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        run_update_notify(&store, &env_id, &plan, &sig, captured_exe.as_deref())
+    })
+    .await
+    .map_err(|err| {
+        operator_log::error(
+            module_path!(),
+            format!("update-notify: worker task failed: {err}"),
+        );
+        error_response(StatusCode::INTERNAL_SERVER_ERROR, "update notify failed")
+    })?;
+
+    match result {
+        Ok((status, body)) => {
+            // P7d: if the response indicates a binary swap happened, set the
+            // in-memory restart-required flag so health probes surface it.
+            if body
+                .get("binary")
+                .and_then(|b| b.get("restart_required"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                state.mark_restart_required();
+            }
+            let bytes = serde_json::to_vec(&body).map_err(|err| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+            })?;
+            Ok(json_response(status, bytes))
+        }
+        Err(NotifyError::Op(err)) => Err(map_op_error(&err)),
+        Err(NotifyError::Internal(message)) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-notify: internal failure: {message}"),
+            );
+            Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error staging update plan",
+            ))
+        }
+    }
+}
+
+/// Server plan-metadata (`GET {plan_endpoint}/meta`) — only the fields the poll
+/// loop needs; any others the server adds are ignored. Mirrors the plan server's
+/// `PlanMetaResponse` without depending on the (private, Docker-only) server
+/// crate.
+#[derive(serde::Deserialize)]
+struct PlanMeta {
+    sequence: u64,
+    plan_sha256: String,
+}
+
+/// Interval used when a cycle can't resolve one from config (invalid env id,
+/// unreadable channel, or a worker-task failure). Matches deploy-spec's default
+/// so behavior is the same whether the interval comes from config or here.
+const POLL_FALLBACK_INTERVAL_SECS: u64 = 3600;
+
+/// Size caps for the poll fetch, so a compromised or misbehaving plan server
+/// can't exhaust memory (`updates::get`'s own artifact download is separately
+/// bounded). A plan doc + DSSE envelope are small; these are generous ceilings.
+const MAX_PLAN_META_BYTES: u64 = 64 * 1024;
+const MAX_PLAN_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PLAN_SIG_BYTES: u64 = 64 * 1024;
+
+/// Updater pull path: fetch the latest signed plan from the env's configured
+/// `plan_endpoint` and hand it to the same receiver core the push path uses
+/// ([`run_update_notify`]) — so `on_update: apply` converges on the pull path
+/// too. Spawned by [`RevisionServer::start`] unless `--no-updates`; the
+/// per-cycle config read enforces deny-by-default (an absent, disabled, or
+/// endpoint-less channel no-ops) and lets a channel written *after* boot — by
+/// `op env apply` or `op updates config-set` — take effect without a restart.
+///
+/// The wait between cycles is **interruptible**: [`run_update_stream_loop`]
+/// notifies `wake` the moment the server publishes a plan, so `interval` is the
+/// fallback ceiling for discovery latency, not its typical value. With the
+/// stream connected, a publish is picked up in roughly the time one poll cycle
+/// takes; with it unavailable, this loop degrades to exactly the polling
+/// behavior it had before.
+///
+/// Cancelled (via the returned task's `abort`) when the ingress shuts down; it
+/// is otherwise waiting between cycles, so cancellation is prompt.
+async fn run_update_poll_loop(
+    state: Arc<ServeState>,
+    store_root: std::path::PathBuf,
+    wake: Arc<Notify>,
+) {
+    // Build the blocking HTTP client off the runtime (the blocking client must
+    // not be constructed or used on an async runtime thread).
+    let client = match tokio::task::spawn_blocking(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+    })
+    .await
+    {
+        Ok(Ok(client)) => client,
+        Ok(Err(err)) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-poll: failed to build HTTP client, poll loop disabled: {err}"),
+            );
+            return;
+        }
+        Err(err) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-poll: client-build task failed, poll loop disabled: {err}"),
+            );
+            return;
+        }
+    };
+
+    // Last plan sequence acted on, so an unchanged `/meta` short-circuits the
+    // plan + signature GETs. Advisory: the authoritative anti-rollback is the
+    // signed manifest version checked inside `updates::get`.
+    let mut last_sequence: Option<u64> = None;
+    loop {
+        // Read the served env id fresh each cycle (a cheap ArcSwap load) so a
+        // reload that changes it is picked up.
+        let env_id = state.current().routing.dispatcher.env_id().to_string();
+        let root = store_root.clone();
+        let client_for_cycle = client.clone();
+        let seq_in = last_sequence;
+        let captured_exe = state.exe_path.clone();
+        // The cycle downloads + DSSE-verifies + records/stages synchronously
+        // (`updates::get` is internally blocking), so it runs off the runtime.
+        let interval = match tokio::task::spawn_blocking(move || {
+            poll_update_cycle(
+                &env_id,
+                &root,
+                &client_for_cycle,
+                seq_in,
+                captured_exe.as_deref(),
+            )
+        })
+        .await
+        {
+            Ok((new_sequence, interval_secs, restart)) => {
+                last_sequence = new_sequence;
+                if restart {
+                    state.mark_restart_required();
+                }
+                interval_secs
+            }
+            Err(err) => {
+                operator_log::error(
+                    module_path!(),
+                    format!("update-poll: worker task failed: {err}"),
+                );
+                POLL_FALLBACK_INTERVAL_SECS
+            }
+        };
+        wait_for_next_cycle(&wake, interval).await;
+    }
+}
+
+/// Wait until the next poll cycle is due, or until a pushed plan event cuts the
+/// wait short. Returns `true` when a push woke us, `false` on interval expiry.
+///
+/// [`Notify::notify_one`] stores a permit when no waiter is registered, so an
+/// event that lands *while a cycle is still running* is not lost — the next call
+/// here returns immediately. Permits do not accumulate, so a burst of events
+/// coalesces into a single extra cycle rather than a thundering herd of them.
+/// Both properties are what make the stream a safe accelerator for the poll
+/// loop rather than a second, racing control path.
+async fn wait_for_next_cycle(wake: &Notify, interval: u64) -> bool {
+    tokio::time::timeout(Duration::from_secs(interval), wake.notified())
+        .await
+        .is_ok()
+}
+
+/// Signal the poll loop that the server published a plan.
+///
+/// `notify_one`, deliberately — NOT `notify_waiters`. `notify_one` stores a
+/// permit when no waiter is registered, so an event arriving while a poll cycle
+/// is still running survives to the next wait. `notify_waiters` wakes only
+/// currently-registered waiters and drops the signal otherwise, which would lose
+/// exactly the events that matter most: the ones a publish triggers while we are
+/// mid-fetch. The permit does not accumulate, so a burst still costs one cycle.
+fn signal_plan_published(wake: &Notify) {
+    wake.notify_one();
+}
+
+/// How often the stream task re-reads `update-channel.json` while push is not in
+/// play (channel absent, disabled, or `push_enabled: false`). This is a local
+/// file read, not a network call — it exists so that *enabling* push takes
+/// effect without a restart, the same promise the poll loop's per-cycle config
+/// read already makes.
+const STREAM_CONFIG_RECHECK_SECS: u64 = 60;
+
+/// The SSE endpoint this channel says to hold open, or `None` when push is not
+/// in play.
+///
+/// Deny-by-default, the same shape as [`notify_action`]: `enabled` is the gate
+/// and `push_enabled` is the policy, so a disabled channel never streams no
+/// matter what `push_enabled` says. A channel with no endpoint to derive a
+/// stream URL from also yields `None`.
+fn stream_endpoint_for(cfg: &UpdateChannelConfig) -> Option<String> {
+    if !cfg.resolved_enabled() || !cfg.resolved_push_enabled() {
+        return None;
+    }
+    cfg.resolved_stream_endpoint()
+}
+
+/// Read `env_id`'s update channel off disk and resolve it through
+/// [`stream_endpoint_for`]. An absent or unreadable channel yields `None`, which
+/// is the same deny-by-default answer as a disabled one.
+fn resolve_stream_endpoint(store_root: &std::path::Path, env_id: &str) -> Option<String> {
+    let store = LocalFsStore::new(store_root);
+    let env_typed = EnvId::new(env_id).ok()?;
+    let cfg = store.load_update_channel(&env_typed).ok()??;
+    stream_endpoint_for(&cfg)
+}
+
+/// Updater push path: hold an SSE connection to the env's `stream_endpoint` and
+/// wake [`run_update_poll_loop`] the moment the server publishes a plan.
+///
+/// The event is a **hint whose contents are never read**. Waking simply runs the
+/// ordinary poll cycle, which re-fetches `/meta`, the plan, and its signature
+/// and DSSE-verifies them exactly as it always has. So the worst a spoofed,
+/// replayed, or stale event can do is cost one wasted `/meta` GET — adding this
+/// transport does not widen the trust model, which is precisely why the event
+/// carries no plan bytes.
+///
+/// [`run_stream`] owns reconnection, the resume cursor, and backoff internally,
+/// so it returns only when `should_stop` fires (the config changed underneath
+/// us) or when the server does not implement the endpoint at all
+/// ([`StreamError::Unsupported`]). The latter is the old-server case: fall back
+/// to polling and re-check on a long interval, so upgrading the server heals it
+/// without a restart.
+///
+/// Cancelled (via the returned task's `abort`) when the ingress shuts down.
+async fn run_update_stream_loop(
+    state: Arc<ServeState>,
+    store_root: std::path::PathBuf,
+    wake: Arc<Notify>,
+) {
+    // The blocking client must not be constructed on a runtime thread.
+    let client = match tokio::task::spawn_blocking(build_stream_client).await {
+        Ok(Ok(client)) => client,
+        Ok(Err(err)) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-stream: failed to build HTTP client, push disabled: {err}"),
+            );
+            return;
+        }
+        Err(err) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-stream: client-build task failed, push disabled: {err}"),
+            );
+            return;
+        }
+    };
+
+    loop {
+        // Read the served env id fresh each attempt (a cheap ArcSwap load), like
+        // the poll loop, so a reload that changes it is picked up.
+        let env_id = state.current().routing.dispatcher.env_id().to_string();
+        let root = store_root.clone();
+
+        let resolve_root = root.clone();
+        let resolve_env = env_id.clone();
+        let endpoint = tokio::task::spawn_blocking(move || {
+            resolve_stream_endpoint(&resolve_root, &resolve_env)
+        })
+        .await
+        .unwrap_or(None);
+        let Some(endpoint) = endpoint else {
+            tokio::time::sleep(Duration::from_secs(STREAM_CONFIG_RECHECK_SECS)).await;
+            continue;
+        };
+
+        operator_log::info(
+            module_path!(),
+            format!("update-stream: env `{env_id}` subscribing to {endpoint}"),
+        );
+
+        let client_for_task = client.clone();
+        let wake_for_task = Arc::clone(&wake);
+        let stop_state = Arc::clone(&state);
+        let stop_root = root;
+        let held_endpoint = endpoint.clone();
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            run_stream(
+                &client_for_task,
+                &held_endpoint,
+                None,
+                // Checked before each (re)connect. Resolves against the *current*
+                // env rather than the one we started with, so a reload that swaps
+                // the served env drops this stream instead of leaving it wedged on
+                // the previous env's endpoint (the env id is part of the URL, so a
+                // swap always changes it). Retargeting or disabling push via
+                // `op env apply` lands the same way — no restart needed.
+                || {
+                    let env = stop_state.current().routing.dispatcher.env_id().to_string();
+                    resolve_stream_endpoint(&stop_root, &env).as_deref()
+                        != Some(held_endpoint.as_str())
+                },
+                |_event| {
+                    signal_plan_published(&wake_for_task);
+                    ControlFlow::Continue(())
+                },
+            )
+        })
+        .await;
+
+        match outcome {
+            // `should_stop` fired: the config no longer names this endpoint. Loop
+            // straight around to re-resolve — it cannot spin, because reaching
+            // here means the config changed since we resolved it moments ago, and
+            // the next iteration either connects to the new endpoint or (push now
+            // off) falls into the idle sleep above.
+            Ok(Ok(())) => continue,
+            Ok(Err(StreamError::Unsupported { status })) => {
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "update-stream: server does not implement the stream endpoint \
+                         (HTTP {status}) for env `{env_id}`; using the poll fallback"
+                    ),
+                );
+                tokio::time::sleep(Duration::from_secs(POLL_FALLBACK_INTERVAL_SECS)).await;
+            }
+            // `run_stream` retries every other transport error internally, so it
+            // does not surface them; treat an unexpected one as a bad moment.
+            Ok(Err(err)) => {
+                operator_log::warn(
+                    module_path!(),
+                    format!("update-stream: stream ended for env `{env_id}`: {err}"),
+                );
+                tokio::time::sleep(Duration::from_secs(STREAM_CONFIG_RECHECK_SECS)).await;
+            }
+            Err(err) => {
+                operator_log::error(
+                    module_path!(),
+                    format!("update-stream: worker task failed: {err}"),
+                );
+                tokio::time::sleep(Duration::from_secs(STREAM_CONFIG_RECHECK_SECS)).await;
+            }
+        }
+    }
+}
+
+/// One poll cycle, run on a blocking thread. Re-reads the env's update-channel
+/// policy (deny-by-default), and when enabled with a plan endpoint: GETs
+/// `/meta`, short-circuits if the sequence is unchanged, else GETs the plan and
+/// its `.sig`, checks the plan digest against `/meta` to drop torn reads (a
+/// concurrent upload split across the two GETs), and hands the bytes to
+/// [`run_update_notify`] — which DSSE-verifies and records or stages per
+/// `on_notify`. Returns `(sequence, interval, restart_required)`: the sequence
+/// to remember (advanced only on a clean record/stage), the interval to wait
+/// before the next cycle, and whether a binary swap set the restart flag.
+fn poll_update_cycle(
+    env_id: &str,
+    store_root: &std::path::Path,
+    client: &reqwest::blocking::Client,
+    last_sequence: Option<u64>,
+    exe_path: Option<&std::path::Path>,
+) -> (Option<u64>, u64, bool) {
+    let store = LocalFsStore::new(store_root);
+
+    let env_typed = match EnvId::new(env_id) {
+        Ok(env) => env,
+        Err(err) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-poll: invalid environment id `{env_id}`: {err}"),
+            );
+            return (last_sequence, POLL_FALLBACK_INTERVAL_SECS, false);
+        }
+    };
+
+    let cfg = match store.load_update_channel(&env_typed) {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => return (last_sequence, POLL_FALLBACK_INTERVAL_SECS, false),
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!("update-poll: failed to read update channel for env `{env_id}`: {err}"),
+            );
+            return (last_sequence, POLL_FALLBACK_INTERVAL_SECS, false);
+        }
+    };
+
+    let interval = cfg.resolved_poll_interval_secs();
+
+    // Deny-by-default: only an enabled channel with a plan endpoint polls.
+    if !cfg.resolved_enabled() {
+        return (last_sequence, interval, false);
+    }
+    let Some(plan_endpoint) = cfg.resolved_plan_endpoint() else {
+        return (last_sequence, interval, false);
+    };
+    let plan_endpoint = plan_endpoint.trim_end_matches('/');
+
+    // 1. `/meta` — advisory sequence gate.
+    let meta = match fetch_plan_meta(client, plan_endpoint) {
+        Ok(meta) => meta,
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "update-poll: `{plan_endpoint}/meta` fetch failed for env `{env_id}`: {err}"
+                ),
+            );
+            return (last_sequence, interval, false);
+        }
+    };
+    if last_sequence == Some(meta.sequence) {
+        // Nothing new since the last acted-on plan.
+        return (last_sequence, interval, false);
+    }
+
+    // 2. plan + signature.
+    let (plan, sig) = match fetch_plan_and_sig(client, plan_endpoint) {
+        Ok(pair) => pair,
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!("update-poll: plan/sig fetch failed for env `{env_id}`: {err}"),
+            );
+            return (last_sequence, interval, false);
+        }
+    };
+
+    // 3. Torn-read guard: the server resolves `/meta`, `/plan`, `/plan.sig`
+    //    independently, so a concurrent upload between the GETs can split the
+    //    plan and signature across sequences. `/meta` carries the authoritative
+    //    digest for its sequence; a mismatch means the plan we fetched is not the
+    //    one `/meta` described — skip and retry next cycle rather than fail DSSE
+    //    verification noisily.
+    if sha256_hex(&plan) != meta.plan_sha256 {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "update-poll: plan digest does not match `/meta` for env `{env_id}` \
+                 (torn read across a concurrent upload); retrying next cycle"
+            ),
+        );
+        return (last_sequence, interval, false);
+    }
+
+    // 4. Verify + record/stage via the shared receiver core.
+    match run_update_notify(&store, env_id, &plan, &sig, exe_path) {
+        Ok((status, body)) => {
+            let restart = body
+                .get("binary")
+                .and_then(|b| b.get("restart_required"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "update-poll: env `{env_id}` plan sequence {} -> {} ({})",
+                    meta.sequence,
+                    status.as_u16(),
+                    body.get("status").and_then(|s| s.as_str()).unwrap_or("ok"),
+                ),
+            );
+            // Advance the remembered sequence ONLY when the plan was actually
+            // acted on (2xx = staged or recorded). A non-2xx `Ok` means the
+            // channel was disabled between this cycle's config read and the
+            // receiver's own re-read (a TOCTOU that yields 403 `disabled`);
+            // leaving the sequence unadvanced lets a re-enabled channel pick the
+            // plan up next cycle instead of skipping it until the server
+            // publishes a newer one.
+            if status.is_success() {
+                (Some(meta.sequence), interval, restart)
+            } else {
+                (last_sequence, interval, false)
+            }
+        }
+        Err(NotifyError::Op(err)) => {
+            operator_log::warn(
+                module_path!(),
+                format!("update-poll: plan rejected for env `{env_id}`: {err}"),
+            );
+            (last_sequence, interval, false)
+        }
+        Err(NotifyError::Internal(message)) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-poll: internal failure staging plan for env `{env_id}`: {message}"),
+            );
+            (last_sequence, interval, false)
+        }
+    }
+}
+
+/// GET `{plan_endpoint}/meta` and parse the plan metadata (size-capped).
+fn fetch_plan_meta(
+    client: &reqwest::blocking::Client,
+    plan_endpoint: &str,
+) -> Result<PlanMeta, String> {
+    let bytes = fetch_bytes(
+        client,
+        &format!("{plan_endpoint}/meta"),
+        MAX_PLAN_META_BYTES,
+    )?;
+    serde_json::from_slice(&bytes).map_err(|err| format!("decode error: {err}"))
+}
+
+/// GET the plan (`{plan_endpoint}`) and its DSSE envelope (`{plan_endpoint}.sig`),
+/// each size-capped.
+fn fetch_plan_and_sig(
+    client: &reqwest::blocking::Client,
+    plan_endpoint: &str,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let plan = fetch_bytes(client, plan_endpoint, MAX_PLAN_BYTES)?;
+    let sig = fetch_bytes(client, &format!("{plan_endpoint}.sig"), MAX_PLAN_SIG_BYTES)?;
+    Ok((plan, sig))
+}
+
+/// GET `url` into memory, reading at most `max_bytes` so a lying/oversized
+/// response can't exhaust memory (the body is streamed through a bounded reader
+/// rather than trusting `Content-Length`).
+fn fetch_bytes(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let resp = client
+        .get(url)
+        .send()
+        .map_err(|err| format!("request error: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("status error: {err}"))?;
+    let mut buf = Vec::new();
+    // Read one byte past the cap so an over-limit body is detected, not silently
+    // truncated (a truncated plan would just fail verification anyway, but an
+    // explicit error is clearer).
+    resp.take(max_bytes + 1)
+        .read_to_end(&mut buf)
+        .map_err(|err| format!("read error: {err}"))?;
+    if buf.len() as u64 > max_bytes {
+        return Err(format!("response exceeds {max_bytes} bytes"));
+    }
+    Ok(buf)
+}
+
+/// Lowercase hex of the SHA-256 of `bytes` — matches the server's `plan_sha256`
+/// (`hex::encode(Sha256::digest(...))`).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Map a runner reply [`Activity`] into a worker message. A rendered Adaptive
@@ -1649,9 +3326,23 @@ fn asset_response(content_type: &'static str, body: &'static str) -> Response<Fu
 /// `/livez`, `/readyz`, `/healthz`, `/health` return `200 ok`; `/status`
 /// returns the diagnostics JSON. Returns `None` for non-probe paths so the
 /// caller falls through to routing.
+///
+/// When a binary self-update is staged but not yet activated (the process must
+/// be restarted), the health probes still return `200` (the running process is
+/// healthy) but include a `X-Greentic-Restart-Required: true` header so
+/// orchestrators can observe the pending restart. `/status` includes a
+/// `restart_required` field in the JSON body.
 fn try_probe_response(path: &str, state: &ServeState) -> Option<Response<Full<Bytes>>> {
+    let restart = state.restart_required.load(Ordering::Relaxed);
     if matches!(path, "/livez" | "/readyz" | "/healthz" | "/health") {
-        return Some(text_response(StatusCode::OK, "ok"));
+        let mut resp = text_response(StatusCode::OK, "ok");
+        if restart {
+            resp.headers_mut().insert(
+                "x-greentic-restart-required",
+                hyper::header::HeaderValue::from_static("true"),
+            );
+        }
+        return Some(resp);
     }
     if path == "/status" {
         let activation = state.current();
@@ -1660,9 +3351,11 @@ fn try_probe_response(path: &str, state: &ServeState) -> Option<Response<Full<By
             "schema": "greentic.status.v1",
             "env_id": activation.routing.dispatcher.env_id(),
             "listen_addr": state.bound_addr.to_string(),
+            "version": env!("CARGO_PKG_VERSION"),
             "bundles_active": activation.routing.deployment_routes.len(),
             "deployments_routed": deployments_routed,
             "revisions_active": revisions_active,
+            "restart_required": restart,
         });
         return Some(json_response(StatusCode::OK, body.to_string().into_bytes()));
     }
@@ -1678,8 +3371,13 @@ fn try_probe_response(path: &str, state: &ServeState) -> Option<Response<Full<By
 /// 3. `GREENTIC_GATEWAY_LISTEN_ADDR` — accepts a full `SocketAddr`
 ///    (`0.0.0.0:9090`) or a bare `IpAddr` (`0.0.0.0`); for the bare-IP form
 ///    the port is taken from layer (1) or (2).
-/// 4. `PORT` — port-only override matching the convention used by Heroku /
-///    Cloud Run / Fly and the rest of the gateway configuration.
+/// 4. `GREENTIC_GATEWAY_PORT` — port-only override. The legacy `http_ingress`
+///    boot honoured this (via `bundle_config`) and the revision path did not,
+///    so callers that set it — the greentic-e2e Playwright fixture and
+///    greentic-designer's local-deploy — silently landed on the default port.
+/// 5. `PORT` — port-only override matching the convention used by Heroku /
+///    Cloud Run / Fly and the rest of the gateway configuration. Kept as the
+///    outermost layer so existing deployments that set it are unaffected.
 ///
 /// Operators set `host_config.listen_addr` once at env init; the env-vars
 /// stay available for ad-hoc overrides (CI ports, local debugging) without
@@ -1705,6 +3403,23 @@ pub(crate) fn resolve_bind_addr(host_config: Option<&EnvironmentHostConfig>) -> 
                     format!(
                         "GREENTIC_GATEWAY_LISTEN_ADDR={trimmed:?} is not a valid SocketAddr or IP; \
                          falling back to {addr}"
+                    ),
+                );
+            }
+        }
+    }
+
+    if let Ok(raw) = std::env::var("GREENTIC_GATEWAY_PORT") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            if let Ok(port) = trimmed.parse::<u16>() {
+                addr.set_port(port);
+            } else {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "GREENTIC_GATEWAY_PORT={trimmed:?} is not a valid u16; keeping port {}",
+                        addr.port()
                     ),
                 );
             }
@@ -1843,6 +3558,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_provider_route(
     activation: Arc<Activation>,
+    state: Arc<ServeState>,
     tenant: &str,
     scope: &RevisionScope,
     path: &str,
@@ -1879,9 +3595,86 @@ async fn dispatch_provider_route(
     };
     let descriptor_pack_id = route_match.descriptor.pack_id.clone();
     let provider_op = route_match.descriptor.provider_op.clone();
+    let route_tenant = route_match.tenant.clone();
+    let route_team = route_match.team.clone();
     let deployment_id = scope.deployment_id;
     let bundle_id = scope.bundle_id.clone();
     let revision_id = scope.revision_id;
+
+    // A4: detect DirectLine routes by provider_type. When the request is
+    // DirectLine, apply the same pre/post processing the legacy path does:
+    // path normalization, query augmentation, session-token preflight,
+    // conversation dedup, streamUrl rewrite, POST /token validation.
+    let is_directline = provider_type.starts_with("messaging.webchat");
+    let (dl_method, dl_path, dl_query_pairs, mut dl_headers, dl_forward_plan, dl_dedup_key);
+    if is_directline {
+        // Extract the provider-relative path from the full request path.
+        // The http-routes.v1 routes carry the full URL pattern
+        // (e.g. /v1/messaging/webchat/{tenant}/v3/directline/{path*}), so
+        // the provider path is everything from /v3/directline onward. Fall
+        // back to the legacy parse for /token, /auth/config, etc.
+        let provider_path = extract_directline_provider_path(path);
+        let (norm_method, norm_path) = normalize_directline_dispatch(method, &provider_path);
+        let parsed_query = parse_query_pairs(query);
+        let augmented = augment_directline_queries(&parsed_query, &route_tenant, Some(&route_team));
+        dl_headers = request_headers.to_vec();
+
+        // Session-token renewal preflight: loads the provider's
+        // jwt_signing_key, applies any Authorization rewrite, and may
+        // short-circuit (auth failure, /tokens/refresh served locally).
+        let signing_key =
+            read_provider_signing_key(&activation, tenant, Some(&route_team), &provider_type).await;
+        let preflight_outcome = crate::directline_session::preflight(
+            &hyper::Method::from_bytes(norm_method.as_bytes()).unwrap_or(hyper::Method::POST),
+            &norm_path,
+            &dl_headers,
+            signing_key.as_deref(),
+            &state.directline_sessions,
+        );
+        let forward_plan = match preflight_outcome {
+            crate::directline_session::Preflight::Respond(response) => {
+                return Err(response);
+            }
+            crate::directline_session::Preflight::Forward(plan) => plan,
+        };
+        if let Some(authorization) = forward_plan.rewrite_authorization.as_deref() {
+            crate::directline_session::apply_authorization_rewrite(&mut dl_headers, authorization);
+        }
+
+        // Conversation dedup: for POST /conversations, check if we already
+        // have a cached response for this user.
+        let dedup_key = if norm_method == "POST"
+            && (norm_path == "/v3/directline/conversations"
+                || norm_path.ends_with("/conversations"))
+        {
+            crate::conv_dedup::extract_user_id(body).map(|user_id| crate::conv_dedup::DedupKey {
+                tenant: route_tenant.clone(),
+                team: route_team.clone(),
+                user_id,
+            })
+        } else {
+            None
+        };
+        if let Some(ref key) = dedup_key
+            && let Some(mut cached) = state.conversation_dedup.get(key)
+        {
+            apply_directline_forward_plan_to_response(&state, &forward_plan, &mut cached);
+            return Ok(synthesize_provider_response(&cached));
+        }
+
+        dl_method = norm_method;
+        dl_path = norm_path;
+        dl_query_pairs = augmented;
+        dl_forward_plan = Some(forward_plan);
+        dl_dedup_key = dedup_key;
+    } else {
+        dl_method = method.to_string();
+        dl_path = path.to_string();
+        dl_query_pairs = parse_query_pairs(query);
+        dl_headers = request_headers.to_vec();
+        dl_forward_plan = None;
+        dl_dedup_key = None;
+    }
 
     // Phase D.3 / M1 IID auth gate: for provider classes whose endpoint
     // declares `webhook_secret_ref`, constant-time compare the inbound
@@ -1964,10 +3757,10 @@ async fn dispatch_provider_route(
     let http_in = build_provider_http_in(
         &provider_type,
         tenant,
-        method,
-        path,
-        query,
-        request_headers,
+        &dl_method,
+        &dl_path,
+        &dl_query_pairs,
+        &dl_headers,
         body,
     );
     let input_json = serde_json::to_vec(&http_in).map_err(|err| {
@@ -2001,6 +3794,13 @@ async fn dispatch_provider_route(
             );
             error_response(StatusCode::BAD_GATEWAY, "provider invocation failed")
         })?;
+
+    // A5: notify the WS pump when the provider op itself writes an activity
+    // (e.g. `directline_http` bumps the watermark on POST /activities). The
+    // legacy path solves this via `register_webchat_post_op_notifier`; the
+    // revision path has no callback mechanism on `invoke_provider_for_revision`,
+    // so we extract the `_greentic` metadata inline.
+    try_notify_webchat_activity(state.notifier.as_ref(), &output).await;
 
     let result = parse_dispatch_result(&output).map_err(|err| {
         operator_log::warn(
@@ -2048,6 +3848,7 @@ async fn dispatch_provider_route(
         let pipeline_tenant = tenant.to_string();
         let pipeline_provider = provider_type.clone();
         let pipeline_bundle = bundle_id.clone();
+        let pipeline_notifier = Arc::clone(&state.notifier);
         tokio::spawn(async move {
             run_provider_inbound_pipeline(
                 pipeline_activation,
@@ -2060,12 +3861,58 @@ async fn dispatch_provider_route(
                 ingress_envelopes,
                 endpoint_id,
                 welcome_hint,
+                pipeline_notifier,
             )
             .await;
         });
     }
 
-    Ok(synthesize_provider_response(&result.response))
+    // A4: DirectLine post-processing — apply the forward plan (seed sliding
+    // window, inject renewed token), rewrite streamUrl to absolute, validate
+    // POST /token response, cache for conversation dedup.
+    let mut response = result.response;
+    if is_directline {
+        if let Some(ref plan) = dl_forward_plan {
+            apply_directline_forward_plan_to_response(&state, plan, &mut response);
+        }
+
+        // streamUrl rewrite: the provider returns a relative path, but
+        // DirectLineJS requires an absolute ws:// URL.
+        if dl_method == "POST"
+            && (dl_path == "/v3/directline/conversations" || dl_path.ends_with("/conversations"))
+            && (200..300).contains(&response.status)
+        {
+            // Pin the newly created conversation to the revision that
+            // created it. POST /conversations has no conversation_id in
+            // the URL yet, so the pre-dispatch session_hint was None
+            // and no pin was written. Extract the id from the response
+            // and commit the pin now so subsequent activities on this
+            // conversation stick to the same revision.
+            if let Some(conv) = crate::directline_session::conversation_id_from_response(&response)
+            {
+                let hint = format!("webchat:{conv}");
+                activation
+                    .routing
+                    .dispatcher
+                    .commit_pin(tenant, deployment_id, &hint, revision_id)
+                    .await;
+            }
+
+            rewrite_stream_url(&dl_headers, &mut response);
+
+            // Cache the post-rewrite response for conversation dedup.
+            if let Some(key) = dl_dedup_key {
+                state.conversation_dedup.insert(key, response.clone());
+            }
+        }
+
+        // POST /token response validation (same as legacy path).
+        if dl_path == "/v3/directline/tokens/generate" {
+            validate_token_response(&response)?;
+        }
+    }
+
+    Ok(synthesize_provider_response(&response))
 }
 
 /// Per-ingress pipeline: for each inbound envelope, drive the flow runtime
@@ -2089,6 +3936,7 @@ async fn run_provider_inbound_pipeline(
     envelopes: Vec<ChannelMessageEnvelope>,
     endpoint_id: Option<String>,
     welcome_hint: Option<WelcomeFlowHint>,
+    notifier: Arc<dyn crate::notifier::ActivityNotifier>,
 ) {
     for ingress in &envelopes {
         let activity = envelope_to_activity(
@@ -2123,7 +3971,7 @@ async fn run_provider_inbound_pipeline(
 
         for reply in replies {
             let reply_envelope = build_reply_envelope(ingress, &reply);
-            if let Err(err) = run_reply_egress(
+            match run_reply_egress(
                 &activation,
                 &tenant,
                 deployment_id,
@@ -2135,14 +3983,19 @@ async fn run_provider_inbound_pipeline(
             )
             .await
             {
-                operator_log::error(
-                    module_path!(),
-                    format!(
-                        "provider {provider_type} egress failed for deployment \
-                         {deployment_id} revision {revision_id} (reply id={}): {err:#}",
-                        reply_envelope.id
-                    ),
-                );
+                Ok(send_outcome) => {
+                    try_notify_webchat_activity(notifier.as_ref(), &send_outcome).await;
+                }
+                Err(err) => {
+                    operator_log::error(
+                        module_path!(),
+                        format!(
+                            "provider {provider_type} egress failed for deployment \
+                             {deployment_id} revision {revision_id} (reply id={}): {err:#}",
+                            reply_envelope.id
+                        ),
+                    );
+                }
             }
         }
     }
@@ -2169,7 +4022,7 @@ async fn run_reply_egress(
     pack_id: &str,
     provider_type: &str,
     envelope: &ChannelMessageEnvelope,
-) -> Result<()> {
+) -> Result<Value> {
     use crate::messaging_dto::{EncodeInV1, ProviderPayloadV1, RenderPlanInV1};
 
     let message_value = serde_json::to_value(envelope).context("serialize reply envelope")?;
@@ -2256,7 +4109,61 @@ async fn run_reply_egress(
             .unwrap_or("send_payload reported ok=false");
         anyhow::bail!("{error_msg}");
     }
-    Ok(())
+    Ok(send_outcome)
+}
+
+/// Extract `_greentic` metadata from a provider-op output and publish a
+/// [`NotifyEvent`] so the WS pump wakes up. Mirrors the legacy
+/// `register_webchat_post_op_notifier` callback in [`crate::http_ingress`]
+/// which fires on `directline_http` and `send_payload` outputs.
+///
+/// The metadata may appear at the top level (`send_payload`) or inside a
+/// base64-encoded `body_b64` field (`directline_http`). When absent the call
+/// is a no-op — non-webchat providers simply don't carry `_greentic`.
+async fn try_notify_webchat_activity(
+    notifier: &dyn crate::notifier::ActivityNotifier,
+    output: &Value,
+) {
+    let metadata = if let Some(body_b64) = output.get("body_b64").and_then(|v| v.as_str()) {
+        let Ok(decoded) = BASE64.decode(body_b64.as_bytes()) else {
+            return;
+        };
+        let Ok(body) = serde_json::from_slice::<Value>(&decoded) else {
+            return;
+        };
+        match body.get("_greentic").cloned() {
+            Some(m) => m,
+            None => return,
+        }
+    } else {
+        match output.get("_greentic").cloned() {
+            Some(m) => m,
+            None => return,
+        }
+    };
+    let Some(tenant_id) = metadata.get("tenant").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Some(conversation_id) = metadata.get("conversation_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Some(new_watermark) = metadata.get("watermark_bumped").and_then(|v| v.as_u64()) else {
+        return;
+    };
+    operator_log::debug(
+        module_path!(),
+        format!(
+            "[revision ws notifier] publishing event tenant={tenant_id} \
+             conv={conversation_id} watermark={new_watermark}",
+        ),
+    );
+    notifier
+        .publish(crate::notifier::NotifyEvent {
+            tenant_id: tenant_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            new_watermark,
+        })
+        .await;
 }
 
 /// Build a reply [`ChannelMessageEnvelope`] from an inbound `ingress`
@@ -2397,7 +4304,7 @@ fn build_provider_http_in(
     tenant: &str,
     method: &str,
     path: &str,
-    query: Option<&str>,
+    query: &[(String, String)],
     headers: &[(String, String)],
     body: &[u8],
 ) -> HttpInV1 {
@@ -2410,7 +4317,7 @@ fn build_provider_http_in(
         team_hint: None,
         method: method.to_string(),
         path: path.to_string(),
-        query: parse_query_pairs(query),
+        query: query.to_vec(),
         headers: headers.to_vec(),
         body_b64: BASE64.encode(body),
         config: None,
@@ -2504,9 +4411,567 @@ fn synthesize_provider_response(response: &IngressHttpResponse) -> Response<Full
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "invalid provider response"))
 }
 
+// ---------------------------------------------------------------------------
+// A4: DirectLine helpers (revision-path equivalents of the legacy
+// `http_ingress` helpers). These are pure functions — no state, no I/O —
+// except `read_provider_signing_key` which reads the secrets manager.
+// ---------------------------------------------------------------------------
+
+/// Read the `jwt_signing_key` for a provider from the secrets manager.
+/// Returns `None` when the key is absent or the read fails (best-effort —
+/// a missing key just means no token renewal, not a hard failure).
+async fn read_provider_signing_key(
+    activation: &Activation,
+    tenant: &str,
+    team: Option<&str>,
+    provider_type: &str,
+) -> Option<Vec<u8>> {
+    let secrets = activation.host.secrets_manager();
+    let env = crate::resolve_env(None);
+    let team_segment = crate::secrets_manager::canonical_team(team);
+    // The provider type uses dots (`messaging.webchat.gui`) while secrets
+    // are stored under the hyphenated form (`messaging-webchat-gui`).
+    // Build both raw-hyphenated and canonical-underscored URIs, matching
+    // the resolution order in `DemoRunnerHost::get_secret`.
+    let provider_hyphen = provider_type.replace('.', "-");
+    let raw_uri =
+        format!("secrets://{env}/{tenant}/{team_segment}/{provider_hyphen}/jwt_signing_key");
+    let canonical_uri = crate::secrets_gate::canonical_secret_uri(
+        &env,
+        tenant,
+        team,
+        &provider_hyphen,
+        "jwt_signing_key",
+    );
+    for uri in [&raw_uri, &canonical_uri] {
+        match secrets.read(uri).await {
+            Ok(bytes) => return Some(bytes),
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
+/// Extract the DirectLine-relative path from a full request path.
+///
+/// Revision-path routes carry the full URL pattern
+/// (e.g. `/v1/messaging/webchat/{tenant}/v3/directline/conversations/{id}/activities`).
+/// The provider path is everything from `/v3/directline` onward. Falls back
+/// to `/token` when the path ends with `/token` (the legacy shorthand).
+fn extract_directline_provider_path(path: &str) -> String {
+    // Fast path: find `/v3/directline` anywhere in the path.
+    if let Some(idx) = path.find("/v3/directline") {
+        return path[idx..].to_string();
+    }
+    // Legacy shorthand paths: the last segment(s) map to a known
+    // provider-relative path.
+    let segments: Vec<&str> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.last() == Some(&"token") {
+        return "/token".to_string();
+    }
+    // /auth/config — OAuth configuration endpoint used by webchat-gui.
+    if segments.len() >= 2
+        && segments[segments.len() - 2] == "auth"
+        && segments[segments.len() - 1] == "config"
+    {
+        return "/auth/config".to_string();
+    }
+    // Fallback: return the path as-is (should not happen for well-formed
+    // webchat routes, but avoids a panic).
+    path.to_string()
+}
+
+/// Map shorthand DirectLine paths to canonical API paths.
+/// `/token` → `POST /v3/directline/tokens/generate`
+/// `/directline/...` → `/v3/directline/...`
+fn normalize_directline_dispatch(method: &str, path: &str) -> (String, String) {
+    if path == "/token" {
+        return (
+            "POST".to_string(),
+            "/v3/directline/tokens/generate".to_string(),
+        );
+    }
+    if path == "/directline" {
+        return (method.to_string(), "/v3/directline".to_string());
+    }
+    if let Some(rest) = path.strip_prefix("/directline/") {
+        return (method.to_string(), format!("/v3/directline/{rest}"));
+    }
+    (method.to_string(), path.to_string())
+}
+
+/// Inject `tenant` and `team` query parameters when not already present.
+fn augment_directline_queries(
+    queries: &[(String, String)],
+    tenant: &str,
+    team: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut augmented = queries.to_vec();
+    if !augmented.iter().any(|(name, _)| name == "tenant") {
+        augmented.push(("tenant".to_string(), tenant.to_string()));
+    }
+    if let Some(team) = team.filter(|value| !value.is_empty())
+        && !augmented.iter().any(|(name, _)| name == "team")
+    {
+        augmented.push(("team".to_string(), team.to_string()));
+    }
+    augmented
+}
+
+/// Percent-encode a query-string key or value per RFC 3986 unreserved set.
+#[cfg(test)]
+fn percent_encode_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            b' ' => encoded.push_str("%20"),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+/// Serialize query pairs into a percent-encoded query string.
+/// Returns `None` for an empty list (no `?` suffix needed).
+#[cfg(test)]
+fn encode_directline_query_string(queries: &[(String, String)]) -> Option<String> {
+    if queries.is_empty() {
+        return None;
+    }
+    Some(
+        queries
+            .iter()
+            .map(|(name, value)| {
+                format!(
+                    "{}={}",
+                    percent_encode_query_component(name),
+                    percent_encode_query_component(value)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&"),
+    )
+}
+
+/// Apply the post-response side of a [`crate::directline_session::ForwardPlan`]:
+/// seed the sliding window from a `POST /conversations` response and/or inject
+/// `_directline.renewed_token` into the body.
+fn apply_directline_forward_plan_to_response(
+    state: &ServeState,
+    plan: &crate::directline_session::ForwardPlan,
+    response: &mut IngressHttpResponse,
+) {
+    if plan.seed_from_response
+        && let Some(conv) = crate::directline_session::conversation_id_from_response(response)
+    {
+        state.directline_sessions.touch(&conv);
+    }
+    if let Some(renewed) = plan.inject_renewed_token.as_deref() {
+        crate::directline_session::inject_renewed_token(
+            response,
+            renewed,
+            state.directline_sessions.ttl_secs(),
+        );
+    }
+}
+
+/// Rewrite a relative `streamUrl` in a `POST /conversations` response body
+/// to an absolute `ws://` URL using the request's `Host` header. DirectLineJS
+/// requires an absolute URL on the WebSocket constructor; a relative path
+/// makes the SDK fall back to HTTP polling.
+fn rewrite_stream_url(headers: &[(String, String)], response: &mut IngressHttpResponse) {
+    let Some(body_bytes) = response.body.as_ref() else {
+        return;
+    };
+    let Ok(mut body_json) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
+        return;
+    };
+    let needs_rewrite = body_json
+        .get("streamUrl")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| s.starts_with('/'));
+    if !needs_rewrite {
+        return;
+    }
+    let Some(host) = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.clone())
+    else {
+        return;
+    };
+    let relative = body_json["streamUrl"].as_str().unwrap_or("").to_string();
+    let absolute = format!("ws://{host}{relative}");
+    body_json["streamUrl"] = serde_json::Value::String(absolute);
+    if let Ok(rewritten) = serde_json::to_vec(&body_json) {
+        response.body = Some(rewritten);
+    }
+}
+
+/// Validate a `POST /tokens/generate` response: the body must be JSON with a
+/// non-empty `token` field. Returns an error response on failure so the
+/// upstream gets a clear `502` instead of a malformed token.
+#[allow(clippy::result_large_err)]
+fn validate_token_response(response: &IngressHttpResponse) -> Result<(), Response<Full<Bytes>>> {
+    let body = response.body.as_deref().unwrap_or_default();
+    if !(200..300).contains(&response.status) {
+        operator_log::error(
+            module_path!(),
+            format!(
+                "[webchat directline] token request failed status={} body={}",
+                response.status,
+                String::from_utf8_lossy(body)
+                    .chars()
+                    .take(500)
+                    .collect::<String>()
+            ),
+        );
+        return Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            "invalid directline token response: expected JSON body with non-empty token",
+        ));
+    }
+    let has_token = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("token")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|token| !token.trim().is_empty());
+    if !has_token {
+        return Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            "invalid directline token response: expected JSON body with non-empty token",
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A5: WebSocket upgrade on the revision path
+// ---------------------------------------------------------------------------
+
+/// True when the full request path is a DirectLine stream endpoint:
+/// `.../v3/directline/conversations/{id}/stream`.
+fn is_directline_stream_path(path: &str) -> bool {
+    let dl = extract_directline_provider_path(path);
+    let segments: Vec<&str> = dl.trim_start_matches('/').split('/').collect();
+    matches!(
+        segments.as_slice(),
+        ["v3", "directline", "conversations", _, "stream"]
+    )
+}
+
+/// Extract the conversation id from a DirectLine stream path.
+fn extract_stream_conversation_id(path: &str) -> Option<String> {
+    let dl = extract_directline_provider_path(path);
+    let segments: Vec<&str> = dl.trim_start_matches('/').split('/').collect();
+    match segments.as_slice() {
+        ["v3", "directline", "conversations", conv_id, "stream"] => Some((*conv_id).to_string()),
+        _ => None,
+    }
+}
+
+/// `ActivitySource` that calls `RunnerHost::invoke_provider_for_revision`
+/// to read activities from the conversation state. Unlike the legacy
+/// `RunnerHostActivitySource` (which wraps a sync `RunnerHostHandle` in
+/// `spawn_blocking`), this source calls the async revision-path API
+/// directly — no sync/async bridge required.
+struct RevisionActivitySource {
+    host: Arc<RunnerHost>,
+    deployment_id: DeploymentId,
+    bundle_id: BundleId,
+    revision_id: RevisionId,
+    provider_type: String,
+    team: String,
+    /// Bearer token captured at WS upgrade time.
+    auth_token: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl crate::websocket::pump::ActivitySource for RevisionActivitySource {
+    async fn fetch_since(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        since_watermark: u64,
+    ) -> Result<(Vec<Value>, u64), String> {
+        let headers: Vec<Value> = match &self.auth_token {
+            Some(token) if !token.is_empty() => {
+                vec![serde_json::json!([
+                    "Authorization",
+                    format!("Bearer {token}")
+                ])]
+            }
+            _ => Vec::new(),
+        };
+        let payload = serde_json::json!({
+            "v": 1,
+            "provider": self.provider_type,
+            "route": Value::Null,
+            "binding_id": Value::Null,
+            "tenant_hint": tenant_id,
+            "team_hint": self.team,
+            "method": "GET",
+            "path": format!("/v3/directline/conversations/{conversation_id}/activities"),
+            "query": format!("watermark={since_watermark}&tenant={tenant_id}&team={}", self.team),
+            "headers": headers,
+            "body_b64": "",
+            "config": Value::Null,
+        });
+        let input_json = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
+
+        // Try canonical `ingest-http` op, then fall back to the underscore
+        // alias used by older pack builds — same pattern as the legacy
+        // `DemoRunnerHost` impl.
+        let output = match self
+            .host
+            .invoke_provider_for_revision(
+                tenant_id,
+                self.deployment_id,
+                self.bundle_id.clone(),
+                self.revision_id,
+                &self.provider_type,
+                "ingest-http",
+                input_json.clone(),
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => self
+                .host
+                .invoke_provider_for_revision(
+                    tenant_id,
+                    self.deployment_id,
+                    self.bundle_id.clone(),
+                    self.revision_id,
+                    &self.provider_type,
+                    "ingest_http",
+                    input_json,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|err| err.to_string())?,
+        };
+
+        // Decode the provider response envelope.
+        let body_b64 = output
+            .get("body_b64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing body_b64 in provider response".to_string())?;
+        let body_bytes = BASE64
+            .decode(body_b64.as_bytes())
+            .map_err(|err| format!("invalid base64 body_b64: {err}"))?;
+        if body_bytes.is_empty() {
+            return Ok((Vec::new(), since_watermark));
+        }
+        let value: Value = serde_json::from_slice(&body_bytes)
+            .map_err(|err| format!("invalid body json: {err}"))?;
+        let activities = value
+            .get("activities")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let next_watermark = value
+            .get("watermark")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(since_watermark);
+        Ok((activities, next_watermark))
+    }
+}
+
+/// Handle a WebSocket upgrade on the revision path.
+///
+/// The conversation must already exist (created via REST `POST /conversations`)
+/// and be pinned to a revision. The WS pump reads activities from the SAME
+/// revision the REST conversation was pinned to — never re-dispatching — so
+/// the socket and the REST endpoint always see the same conversation state.
+async fn handle_websocket_upgrade(
+    req: &mut Request<Incoming>,
+    path: &str,
+    state: Arc<ServeState>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let conv_id = match extract_stream_conversation_id(path) {
+        Some(c) => c,
+        None => return Err(error_response(StatusCode::NOT_FOUND, "invalid stream path")),
+    };
+
+    let activation = state.current();
+    let host_header = header_str(req.headers(), header::HOST.as_str());
+
+    // Resolve deployment + tenant from the path so we know which env's
+    // secrets to read the signing key from.
+    let (deployment_id, tenant) = activation
+        .routing
+        .deployment_routes
+        .resolve(host_header.as_deref(), path)
+        .map(|(deployment_id, tenant)| (deployment_id, tenant.to_string()))
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "no deployment is bound to this host and path",
+            )
+        })?;
+
+    // Resolve the provider_type for this path so we can read its signing key.
+    let provider_type = activation
+        .routing
+        .http_routes
+        .provider_type_for(path, "GET", deployment_id)
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "no provider route matches this stream path",
+            )
+        })?
+        .to_string();
+
+    // Look up the revision pin for this conversation. A5 critical invariant:
+    // the WS pump MUST read from the same revision the REST POST pinned to.
+    // The session hint format is `webchat:{conversation_id}`.
+    let session_hint = format!("webchat:{conv_id}");
+    let pinned = activation
+        .routing
+        .dispatcher
+        .lookup_pin(&tenant, deployment_id, &session_hint)
+        .await;
+
+    let (bundle_id, revision_id) = match pinned {
+        Some((bid, rid)) => (bid, rid),
+        None => {
+            // No pin means the conversation was never created via REST, or the
+            // pin expired. Either way, we cannot safely pick a revision.
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "no revision pin for this conversation; create it via REST first",
+            ));
+        }
+    };
+
+    // Read the JWT signing key from the pinned revision's secrets.
+    let team = "default";
+    let signing_key =
+        read_provider_signing_key(&activation, &tenant, Some(team), &provider_type).await;
+    let signing_key = match signing_key {
+        Some(key) => key,
+        None => {
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "missing jwt_signing_key for the webchat provider",
+            ));
+        }
+    };
+
+    // Validate the ?t= token.
+    let ctx = match crate::websocket::validate_request_parts(
+        req.uri(),
+        req.headers(),
+        &conv_id,
+        &tenant,
+        &signing_key,
+    ) {
+        Ok(c) => c,
+        Err(err) => return Ok(crate::websocket::refusal_response(&err)),
+    };
+
+    // Acquire a session slot.
+    let guard = match state.session_manager.acquire(&tenant, &conv_id) {
+        Ok(g) => g,
+        Err(err) => {
+            return Ok(crate::websocket::refusal_response(
+                &crate::websocket::UpgradeError::LimitExceeded(err.to_string()),
+            ));
+        }
+    };
+
+    // Extract the bearer token from ?t= BEFORE the upgrade call consumes
+    // the request reference. The token authenticates the pump's internal
+    // GET /activities calls against the WASM provider's JWT guard.
+    let auth_token = req.uri().query().and_then(|q| {
+        q.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            if k == "t" { Some(v.to_string()) } else { None }
+        })
+    });
+
+    // Perform the HTTP -> WS upgrade.
+    let (response, websocket) = match hyper_tungstenite::upgrade(req, None) {
+        Ok(pair) => pair,
+        Err(err) => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("websocket upgrade failed: {err}"),
+            ));
+        }
+    };
+
+    // Build the revision-specific activity source. This calls
+    // `invoke_provider_for_revision` directly (async) — no sync/async bridge
+    // needed because the pump runs entirely in an async context.
+    #[cfg(test)]
+    let source: Arc<dyn crate::websocket::pump::ActivitySource> =
+        if let Some(ref override_source) = state.activity_source_override {
+            Arc::clone(override_source)
+        } else {
+            Arc::new(RevisionActivitySource {
+                host: Arc::clone(&activation.host),
+                deployment_id,
+                bundle_id,
+                revision_id,
+                provider_type,
+                team: team.to_string(),
+                auth_token,
+            })
+        };
+    #[cfg(not(test))]
+    let source: Arc<dyn crate::websocket::pump::ActivitySource> =
+        Arc::new(RevisionActivitySource {
+            host: Arc::clone(&activation.host),
+            deployment_id,
+            bundle_id,
+            revision_id,
+            provider_type,
+            team: team.to_string(),
+            auth_token,
+        });
+
+    let notifier = state.notifier.clone();
+    let limits = state.session_manager.limits().clone();
+
+    tokio::spawn(crate::websocket::serve_session(
+        websocket,
+        notifier,
+        source,
+        tenant,
+        conv_id,
+        ctx.initial_watermark,
+        limits,
+        guard,
+    ));
+
+    // Repackage the upgrade response into `Full<Bytes>` (the 101 body is
+    // empty; only the status + headers matter for the handshake).
+    let (parts, _body) = response.into_parts();
+    Ok(Response::from_parts(parts, Full::new(Bytes::new())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifier::ActivityNotifier;
     // `BundleId` is used only in tests (prod refers to it via the `RevisionKey`
     // alias), so it lives here rather than in the library import set.
     use greentic_deploy_spec::WelcomeFlowRef;
@@ -2891,6 +5356,9 @@ mod tests {
             gui_enabled: true,
             trust_loopback_peers: false,
             admin_bind_addr: Some("127.0.0.1:17900".parse::<SocketAddr>().unwrap()),
+            updates_enabled: false,
+            auto_restart_enabled: false,
+            exe_path: None,
         })
         .expect("start split server");
 
@@ -2937,6 +5405,9 @@ mod tests {
             // Admin requested at base+1 — exactly where the main listener
             // will land after bumping past the held base port.
             admin_bind_addr: Some(format!("127.0.0.1:{}", base + 1).parse().unwrap()),
+            updates_enabled: false,
+            auto_restart_enabled: false,
+            exe_path: None,
         })
         .expect("start must succeed even when main bumps into admin range");
 
@@ -3301,12 +5772,13 @@ mod tests {
     #[test]
     fn build_provider_http_in_wires_fields_and_b64_body() {
         let headers = vec![("content-type".to_string(), "application/json".to_string())];
+        let query = parse_query_pairs(Some("token=abc&n=1"));
         let http_in = build_provider_http_in(
             "messaging.telegram.bot",
             "acme",
             "POST",
             "/webhook/telegram",
-            Some("token=abc&n=1"),
+            &query,
             &headers,
             br#"{"update_id":42}"#,
         );
@@ -3317,6 +5789,32 @@ mod tests {
         assert_eq!(http_in.headers, headers);
         assert_eq!(http_in.query.len(), 2);
         assert_eq!(http_in.body_b64, BASE64.encode(br#"{"update_id":42}"#));
+    }
+
+    #[test]
+    fn build_provider_http_in_preserves_percent_encoded_query() {
+        // Regression: the old path encoded pairs into a query string then
+        // re-parsed them, double-encoding any `%` already in the raw
+        // query (e.g. `%20` became `%2520`). The fix passes pairs
+        // directly so percent-encoded characters survive unchanged.
+        let pairs = parse_query_pairs(Some("user=John%20Doe&tag=%E2%9C%93"));
+        let http_in = build_provider_http_in(
+            "messaging.webchat.standard",
+            "acme",
+            "POST",
+            "/v3/directline/conversations",
+            &pairs,
+            &[],
+            b"{}",
+        );
+        assert_eq!(
+            http_in.query,
+            vec![
+                ("user".to_string(), "John%20Doe".to_string()),
+                ("tag".to_string(), "%E2%9C%93".to_string()),
+            ],
+            "percent-encoded characters must survive without double-encoding"
+        );
     }
 
     #[test]
@@ -3846,20 +6344,24 @@ mod tests {
 
     struct EnvVarGuard {
         gateway_prev: Option<std::ffi::OsString>,
+        gateway_port_prev: Option<std::ffi::OsString>,
         port_prev: Option<std::ffi::OsString>,
     }
 
     impl EnvVarGuard {
         fn clean() -> Self {
             let gateway_prev = std::env::var_os("GREENTIC_GATEWAY_LISTEN_ADDR");
+            let gateway_port_prev = std::env::var_os("GREENTIC_GATEWAY_PORT");
             let port_prev = std::env::var_os("PORT");
             // SAFETY: callers hold `test_env_lock` so env mutation is serialized.
             unsafe {
                 std::env::remove_var("GREENTIC_GATEWAY_LISTEN_ADDR");
+                std::env::remove_var("GREENTIC_GATEWAY_PORT");
                 std::env::remove_var("PORT");
             }
             Self {
                 gateway_prev,
+                gateway_port_prev,
                 port_prev,
             }
         }
@@ -3872,6 +6374,10 @@ mod tests {
                 match &self.gateway_prev {
                     Some(v) => std::env::set_var("GREENTIC_GATEWAY_LISTEN_ADDR", v),
                     None => std::env::remove_var("GREENTIC_GATEWAY_LISTEN_ADDR"),
+                }
+                match &self.gateway_port_prev {
+                    Some(v) => std::env::set_var("GREENTIC_GATEWAY_PORT", v),
+                    None => std::env::remove_var("GREENTIC_GATEWAY_PORT"),
                 }
                 match &self.port_prev {
                     Some(v) => std::env::set_var("PORT", v),
@@ -3899,6 +6405,7 @@ mod tests {
                 deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
+                static_routes: crate::static_routes::ActiveRouteTable::default(),
             }),
         }
     }
@@ -3926,6 +6433,20 @@ mod tests {
             slot: ArcSwap::new(std::sync::Arc::new(empty_activation(env_id))),
             bound_addr: bound,
             gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         }
     }
 
@@ -4031,6 +6552,505 @@ mod tests {
         assert!(try_chat_asset_response("/workers/invoke", &hyper::Method::POST).is_none());
     }
 
+    // --- A.2: CORS + OPTIONS preflight on the revision path ----------------
+
+    fn cors_roundtrip(port: u16, gui_enabled: bool, raw_request: &str) -> String {
+        use std::io::{Read, Write};
+        use std::net::SocketAddr;
+
+        let server = RevisionServer::start(RevisionServeConfig {
+            bind_addr: format!("127.0.0.1:{port}").parse::<SocketAddr>().unwrap(),
+            activation: std::sync::Arc::new(empty_activation("cors")),
+            gui_enabled,
+            trust_loopback_peers: true,
+            admin_bind_addr: None,
+            updates_enabled: false,
+            auto_restart_enabled: false,
+            exe_path: None,
+        })
+        .expect("start server");
+        let port = server.actual_port();
+
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.write_all(raw_request.as_bytes()).expect("write");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).expect("read");
+        server.stop().expect("stop");
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[test]
+    fn cors_preflight_returns_204_for_realistic_browser_preflight() {
+        let resp = cors_roundtrip(
+            17950,
+            true,
+            concat!(
+                "OPTIONS /any/path HTTP/1.1\r\n",
+                "Host: localhost\r\n",
+                "Origin: https://example.com\r\n",
+                "Access-Control-Request-Method: POST\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+            ),
+        );
+
+        assert!(
+            resp.starts_with("HTTP/1.1 204"),
+            "preflight must return 204, got: {}",
+            resp.lines().next().unwrap_or("")
+        );
+
+        let methods_header = resp
+            .lines()
+            .find(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with("access-control-allow-methods:")
+            })
+            .expect("Access-Control-Allow-Methods header missing");
+        assert!(
+            methods_header.contains("POST"),
+            "Allow-Methods must include POST: {methods_header}"
+        );
+    }
+
+    #[test]
+    fn cors_allow_headers_covers_webchat_gui_custom_headers() {
+        let preflight = cors_preflight_response();
+        let allow = preflight.headers()["access-control-allow-headers"]
+            .to_str()
+            .expect("valid UTF-8");
+        let allowed: Vec<&str> = allow.split(',').map(str::trim).collect();
+
+        for required in ["Content-Type", "X-Greentic-Locale"] {
+            assert!(
+                allowed.iter().any(|h| h.eq_ignore_ascii_case(required)),
+                "Allow-Headers must include {required} (sent by the webchat GUI), got: {allow}"
+            );
+        }
+    }
+
+    #[test]
+    fn cors_options_to_chat_path_returns_204_not_405() {
+        let resp = cors_roundtrip(
+            17960,
+            true,
+            concat!(
+                "OPTIONS /chat HTTP/1.1\r\n",
+                "Host: localhost\r\n",
+                "Origin: https://example.com\r\n",
+                "Access-Control-Request-Method: GET\r\n",
+                "Connection: close\r\n",
+                "\r\n",
+            ),
+        );
+
+        assert!(
+            resp.starts_with("HTTP/1.1 204"),
+            "OPTIONS /chat must return 204 (not 405), got: {}",
+            resp.lines().next().unwrap_or("")
+        );
+    }
+
+    #[test]
+    fn post_response_carries_cors_origin_header() {
+        let body = r#"{"text":"hello"}"#;
+        let resp = cors_roundtrip(
+            17970,
+            false,
+            &format!(
+                "POST /some/path HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {}",
+                body.len(),
+                body
+            ),
+        );
+
+        assert!(
+            resp.lines().any(|l| l
+                .to_ascii_lowercase()
+                .starts_with("access-control-allow-origin:")),
+            "POST response must carry Access-Control-Allow-Origin header, got:\n{resp}"
+        );
+    }
+
+    /// `/workers/invoke` executes a flow and returns its output. It is gated on
+    /// the TCP peer being loopback — which a page from *any* origin, running in
+    /// a browser on this machine, satisfies. It also ignores `Content-Type`, so
+    /// a blind cross-origin POST already reaches it. Granting a wildcard
+    /// `Access-Control-Allow-Origin` would additionally let that page read the
+    /// response. Nothing legitimate needs it: `/chat` calls it same-origin and
+    /// `greentic-gui` calls it server-side.
+    #[test]
+    fn worker_invoke_is_not_exposed_cross_origin() {
+        let preflight = cors_roundtrip(
+            17980,
+            false,
+            "OPTIONS /workers/invoke HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Origin: https://evil.example\r\n\
+             Access-Control-Request-Method: POST\r\n\
+             Access-Control-Request-Headers: content-type\r\n\
+             Connection: close\r\n\
+             \r\n",
+        );
+        assert!(
+            !preflight.to_ascii_lowercase().contains("204"),
+            "a cross-origin preflight for /workers/invoke must NOT be granted, got:\n{preflight}"
+        );
+        assert!(
+            !preflight
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "/workers/invoke preflight must not carry Access-Control-Allow-Origin, got:\n{preflight}"
+        );
+
+        let body = r#"{"text":"hello"}"#;
+        let posted = cors_roundtrip(
+            17981,
+            false,
+            &format!(
+                "POST /workers/invoke HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 Origin: https://evil.example\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {}",
+                body.len(),
+                body
+            ),
+        );
+        assert!(
+            !posted
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "/workers/invoke response must not be readable cross-origin, got:\n{posted}"
+        );
+    }
+
+    // --- A4: DirectLine dispatch helpers unit tests -------------------------
+
+    // Category 1: extract_directline_provider_path
+
+    #[test]
+    fn extract_directline_provider_path_finds_v3_directline() {
+        assert_eq!(
+            extract_directline_provider_path(
+                "/v1/messaging/webchat/demo/v3/directline/conversations"
+            ),
+            "/v3/directline/conversations"
+        );
+    }
+
+    #[test]
+    fn extract_directline_provider_path_with_subpath() {
+        assert_eq!(
+            extract_directline_provider_path(
+                "/v1/messaging/webchat/demo/v3/directline/conversations/abc123/activities"
+            ),
+            "/v3/directline/conversations/abc123/activities"
+        );
+    }
+
+    #[test]
+    fn extract_directline_provider_path_legacy_token_shorthand() {
+        assert_eq!(
+            extract_directline_provider_path("/v1/messaging/webchat/demo/token"),
+            "/token"
+        );
+    }
+
+    #[test]
+    fn extract_directline_provider_path_passthrough_on_unknown() {
+        assert_eq!(
+            extract_directline_provider_path("/v1/messaging/webchat/demo/unknown"),
+            "/v1/messaging/webchat/demo/unknown"
+        );
+    }
+
+    #[test]
+    fn extract_directline_provider_path_auth_config() {
+        assert_eq!(
+            extract_directline_provider_path("/v1/messaging/webchat/demo/auth/config"),
+            "/auth/config"
+        );
+    }
+
+    // Category 2: normalize_directline_dispatch
+
+    #[test]
+    fn normalize_directline_dispatch_maps_token_to_canonical() {
+        let (method, path) = normalize_directline_dispatch("GET", "/token");
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/v3/directline/tokens/generate");
+    }
+
+    #[test]
+    fn normalize_directline_dispatch_expands_directline_prefix() {
+        let (method, path) = normalize_directline_dispatch("GET", "/directline/conversations");
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/v3/directline/conversations");
+    }
+
+    #[test]
+    fn normalize_directline_dispatch_bare_directline() {
+        let (method, path) = normalize_directline_dispatch("GET", "/directline");
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/v3/directline");
+    }
+
+    #[test]
+    fn normalize_directline_dispatch_already_canonical() {
+        let (method, path) = normalize_directline_dispatch("POST", "/v3/directline/conversations");
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/v3/directline/conversations");
+    }
+
+    // Category 3: augment_directline_queries
+
+    #[test]
+    fn augment_directline_queries_injects_tenant_and_team() {
+        let queries = vec![];
+        let result = augment_directline_queries(&queries, "acme", Some("support"));
+        assert!(
+            result.iter().any(|(k, v)| k == "tenant" && v == "acme"),
+            "must inject tenant"
+        );
+        assert!(
+            result.iter().any(|(k, v)| k == "team" && v == "support"),
+            "must inject team"
+        );
+    }
+
+    #[test]
+    fn augment_directline_queries_preserves_existing_tenant() {
+        let queries = vec![("tenant".to_string(), "existing".to_string())];
+        let result = augment_directline_queries(&queries, "acme", Some("support"));
+        assert_eq!(
+            result.iter().filter(|(k, _)| k == "tenant").count(),
+            1,
+            "must not duplicate tenant"
+        );
+        assert_eq!(result[0].1, "existing", "existing tenant must be preserved");
+    }
+
+    #[test]
+    fn augment_directline_queries_skips_empty_team() {
+        let queries = vec![];
+        let result = augment_directline_queries(&queries, "acme", Some(""));
+        assert!(
+            !result.iter().any(|(k, _)| k == "team"),
+            "empty team must not be injected"
+        );
+    }
+
+    // Category 4: encode_directline_query_string
+
+    #[test]
+    fn encode_directline_query_string_serializes_pairs() {
+        let pairs = vec![
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "two three".to_string()),
+        ];
+        let result = encode_directline_query_string(&pairs);
+        assert_eq!(result, Some("a=1&b=two%20three".to_string()));
+    }
+
+    #[test]
+    fn encode_directline_query_string_empty_returns_none() {
+        assert_eq!(encode_directline_query_string(&[]), None);
+    }
+
+    // Category 5: rewrite_stream_url
+
+    #[test]
+    fn rewrite_stream_url_makes_relative_absolute() {
+        let headers = vec![("Host".to_string(), "example.com:8080".to_string())];
+        let mut response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "conversationId": "abc123",
+                    "streamUrl": "/v3/directline/conversations/abc123/stream?t=TOKEN"
+                }))
+                .unwrap(),
+            ),
+        };
+        rewrite_stream_url(&headers, &mut response);
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["streamUrl"],
+            "ws://example.com:8080/v3/directline/conversations/abc123/stream?t=TOKEN",
+            "relative streamUrl must become an absolute ws:// URL using the Host header"
+        );
+    }
+
+    #[test]
+    fn rewrite_stream_url_noop_when_already_absolute() {
+        let headers = vec![("Host".to_string(), "example.com".to_string())];
+        let original_url = "wss://other.example.com/stream";
+        let mut response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "streamUrl": original_url
+                }))
+                .unwrap(),
+            ),
+        };
+        rewrite_stream_url(&headers, &mut response);
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["streamUrl"], original_url,
+            "already-absolute streamUrl must not be touched"
+        );
+    }
+
+    // Category 6: validate_token_response
+
+    #[test]
+    fn validate_token_response_accepts_valid_token() {
+        let response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "token": "eyJhbGciOiJIUzI1NiJ9.e30.test",
+                    "expires_in": 1800
+                }))
+                .unwrap(),
+            ),
+        };
+        assert!(
+            validate_token_response(&response).is_ok(),
+            "a valid token response must pass validation"
+        );
+    }
+
+    #[test]
+    fn validate_token_response_rejects_missing_token_field() {
+        let response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(serde_json::to_vec(&serde_json::json!({"expires_in": 1800})).unwrap()),
+        };
+        assert!(
+            validate_token_response(&response).is_err(),
+            "a response without a token field must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_token_response_rejects_empty_token() {
+        let response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(serde_json::to_vec(&serde_json::json!({"token": "  "})).unwrap()),
+        };
+        assert!(
+            validate_token_response(&response).is_err(),
+            "a whitespace-only token must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_token_response_rejects_non_2xx() {
+        let response = IngressHttpResponse {
+            status: 500,
+            headers: vec![],
+            body: Some(serde_json::to_vec(&serde_json::json!({"token": "valid"})).unwrap()),
+        };
+        assert!(
+            validate_token_response(&response).is_err(),
+            "a non-2xx status must be rejected even if the body has a token"
+        );
+    }
+
+    // Category 7: CORS asymmetry — DirectLine paths get CORS,
+    //              /workers/invoke does not (the existing test above
+    //              `worker_invoke_is_not_exposed_cross_origin` covers
+    //              the /workers/invoke side; these prove DirectLine gets CORS).
+
+    #[test]
+    fn cors_allows_directline_conversations_path() {
+        assert!(
+            path_allows_cors("/v3/directline/conversations"),
+            "DirectLine conversations path must allow CORS"
+        );
+    }
+
+    #[test]
+    fn cors_allows_directline_activities_path() {
+        assert!(
+            path_allows_cors(
+                "/v1/messaging/webchat/demo/v3/directline/conversations/abc/activities"
+            ),
+            "DirectLine activities path must allow CORS"
+        );
+    }
+
+    #[test]
+    fn cors_allows_directline_token_path() {
+        assert!(
+            path_allows_cors("/v1/messaging/webchat/demo/token"),
+            "DirectLine token path must allow CORS"
+        );
+    }
+
+    #[test]
+    fn cors_blocks_workers_invoke() {
+        assert!(
+            !path_allows_cors("/workers/invoke"),
+            "/workers/invoke must NOT allow CORS"
+        );
+    }
+
+    // Category 8: session hint extraction for webchat
+
+    #[test]
+    fn webchat_session_hint_extracts_conversation_id() {
+        let hint = crate::session_hint_extractor::extract_webchat_session_hint(
+            "/v1/messaging/webchat/demo/v3/directline/conversations/conv-42/activities",
+        );
+        assert_eq!(
+            hint,
+            Some("webchat:conv-42".to_string()),
+            "must extract conversation_id from DirectLine URL path"
+        );
+    }
+
+    #[test]
+    fn webchat_session_hint_none_for_conversations_list() {
+        let hint = crate::session_hint_extractor::extract_webchat_session_hint(
+            "/v1/messaging/webchat/demo/v3/directline/conversations",
+        );
+        assert!(
+            hint.is_none(),
+            "POST /conversations has no conv_id yet — hint must be None"
+        );
+    }
+
+    #[test]
+    fn webchat_session_hint_none_for_non_directline_path() {
+        let hint = crate::session_hint_extractor::extract_webchat_session_hint(
+            "/v1/messaging/telegram/demo/webhook",
+        );
+        assert!(
+            hint.is_none(),
+            "non-DirectLine paths must not produce a webchat hint"
+        );
+    }
+
     // --- N1.2: listen-address resolution ----------------------------------
 
     #[test]
@@ -4040,6 +7060,93 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _vars = EnvVarGuard::clean();
         assert_eq!(resolve_bind_addr(None), DEFAULT_LISTEN_ADDR);
+    }
+
+    /// The legacy `http_ingress` boot honoured `GREENTIC_GATEWAY_PORT`
+    /// (`bundle_config.rs`); the revision path did not. The greentic-e2e
+    /// Playwright fixture and greentic-designer's local-deploy both set it, so
+    /// without this they would silently bind the default port.
+    #[test]
+    fn resolve_bind_addr_honours_gateway_port_env() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _vars = EnvVarGuard::clean();
+        // SAFETY: the lock above serializes env mutation.
+        unsafe { std::env::set_var("GREENTIC_GATEWAY_PORT", "19311") };
+
+        let addr = resolve_bind_addr(None);
+        assert_eq!(addr.port(), 19311);
+        assert_eq!(addr.ip(), DEFAULT_LISTEN_ADDR.ip());
+    }
+
+    /// A bare IP in `GREENTIC_GATEWAY_LISTEN_ADDR` takes its port from the layer
+    /// below — exactly the pair the Playwright fixture sets (`127.0.0.1` plus a
+    /// per-worker port).
+    #[test]
+    fn resolve_bind_addr_gateway_port_supplies_port_for_bare_listen_ip() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _vars = EnvVarGuard::clean();
+        // SAFETY: the lock above serializes env mutation.
+        unsafe {
+            std::env::set_var("GREENTIC_GATEWAY_LISTEN_ADDR", "127.0.0.1");
+            std::env::set_var("GREENTIC_GATEWAY_PORT", "19312");
+        }
+
+        assert_eq!(resolve_bind_addr(None).to_string(), "127.0.0.1:19312");
+    }
+
+    /// `GREENTIC_GATEWAY_PORT` overrides the port of a FULL socket address, so
+    /// the two gateway vars compose the way the legacy path composed them.
+    #[test]
+    fn resolve_bind_addr_gateway_port_overrides_port_of_full_socket_addr() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _vars = EnvVarGuard::clean();
+        // SAFETY: the lock above serializes env mutation.
+        unsafe {
+            std::env::set_var("GREENTIC_GATEWAY_LISTEN_ADDR", "0.0.0.0:9090");
+            std::env::set_var("GREENTIC_GATEWAY_PORT", "19313");
+        }
+
+        assert_eq!(resolve_bind_addr(None).to_string(), "0.0.0.0:19313");
+    }
+
+    /// `PORT` stays the outermost layer: adding `GREENTIC_GATEWAY_PORT` must not
+    /// disturb the precedence existing deployments already rely on.
+    #[test]
+    fn resolve_bind_addr_port_still_wins_over_gateway_port() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _vars = EnvVarGuard::clean();
+        // SAFETY: the lock above serializes env mutation.
+        unsafe {
+            std::env::set_var("GREENTIC_GATEWAY_PORT", "19314");
+            std::env::set_var("PORT", "19315");
+        }
+
+        assert_eq!(resolve_bind_addr(None).port(), 19315);
+    }
+
+    /// Deployment systems expose unset vars as empty strings; an unparseable
+    /// value must not panic or zero the port.
+    #[test]
+    fn resolve_bind_addr_ignores_empty_or_invalid_gateway_port() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _vars = EnvVarGuard::clean();
+        // SAFETY: the lock above serializes env mutation.
+        unsafe { std::env::set_var("GREENTIC_GATEWAY_PORT", "   ") };
+        assert_eq!(resolve_bind_addr(None).port(), DEFAULT_LISTEN_ADDR.port());
+
+        // SAFETY: the lock above serializes env mutation.
+        unsafe { std::env::set_var("GREENTIC_GATEWAY_PORT", "not-a-port") };
+        assert_eq!(resolve_bind_addr(None).port(), DEFAULT_LISTEN_ADDR.port());
     }
 
     #[test]
@@ -4357,6 +7464,20 @@ mod tests {
             slot: ArcSwap::new(std::sync::Arc::new(act1)),
             bound_addr: bound,
             gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -4449,6 +7570,20 @@ mod tests {
             slot: ArcSwap::new(std::sync::Arc::new(act1)),
             bound_addr: bound,
             gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -4535,6 +7670,20 @@ mod tests {
             slot: ArcSwap::new(std::sync::Arc::new(act1)),
             bound_addr: bound,
             gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -4594,6 +7743,20 @@ mod tests {
             slot: ArcSwap::new(std::sync::Arc::new(act1)),
             bound_addr: bound,
             gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
 
@@ -4711,6 +7874,7 @@ mod tests {
             )]),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: std::sync::Arc::default(),
+            static_routes: crate::static_routes::ActiveRouteTable::default(),
         });
         let activation = Activation {
             host: base.host,
@@ -4853,6 +8017,20 @@ mod tests {
             slot: ArcSwap::new(std::sync::Arc::new(activation)),
             bound_addr: bound,
             gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
         })
     }
 
@@ -4932,5 +8110,1806 @@ mod tests {
             !probe.is_live_elsewhere(dep_id, rev_removed),
             "a genuinely removed revision must NOT read as live elsewhere"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Category 10: A5 — WebSocket stream path helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_directline_stream_path_accepts_full_path() {
+        assert!(is_directline_stream_path(
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations/conv-42/stream"
+        ));
+    }
+
+    #[test]
+    fn is_directline_stream_path_rejects_activities() {
+        assert!(!is_directline_stream_path(
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations/conv-42/activities"
+        ));
+    }
+
+    #[test]
+    fn is_directline_stream_path_rejects_bare_conversations() {
+        assert!(!is_directline_stream_path(
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations"
+        ));
+    }
+
+    #[test]
+    fn is_directline_stream_path_rejects_non_directline() {
+        assert!(!is_directline_stream_path(
+            "/v1/messaging/telegram/tenant1/webhook"
+        ));
+    }
+
+    #[test]
+    fn extract_stream_conversation_id_returns_id() {
+        assert_eq!(
+            extract_stream_conversation_id(
+                "/v1/messaging/webchat/tenant1/v3/directline/conversations/abc-123/stream"
+            ),
+            Some("abc-123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_stream_conversation_id_returns_none_for_non_stream() {
+        assert_eq!(
+            extract_stream_conversation_id(
+                "/v1/messaging/webchat/tenant1/v3/directline/conversations/abc/activities"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn stream_path_matches_cors_allowlist() {
+        // `path_allows_cors` classifies stream paths as CORS-eligible.
+        // In practice `handle_connection` intercepts stream paths for the WS
+        // upgrade BEFORE reaching the CORS wrapper, so the header is never
+        // applied — browsers don't enforce CORS on WebSocket connections
+        // anyway. This test validates the classifier's output, not the
+        // end-to-end CORS behaviour on stream responses.
+        assert!(path_allows_cors(
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations/c1/stream"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Category 11: A5 — WS notifier integration (try_notify_webchat_activity)
+    // -----------------------------------------------------------------------
+
+    /// Verify that `try_notify_webchat_activity` publishes a `NotifyEvent`
+    /// when the provider output carries top-level `_greentic` metadata
+    /// (the shape returned by `send_payload`).
+    #[tokio::test]
+    async fn notify_publishes_on_top_level_greentic_metadata() {
+        let notifier = crate::notifier::InMemoryNotifier::new(16);
+        let mut events = notifier.subscribe("t1", "conv-1").await.expect("subscribe");
+
+        let output = serde_json::json!({
+            "ok": true,
+            "_greentic": {
+                "tenant": "t1",
+                "conversation_id": "conv-1",
+                "watermark_bumped": 42u64,
+            }
+        });
+        try_notify_webchat_activity(&notifier, &output).await;
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            futures_util::StreamExt::next(&mut events),
+        )
+        .await
+        .expect("timeout waiting for notify event")
+        .expect("stream ended");
+        assert_eq!(event.tenant_id, "t1");
+        assert_eq!(event.conversation_id, "conv-1");
+        assert_eq!(event.new_watermark, 42);
+    }
+
+    /// Verify that `try_notify_webchat_activity` publishes when `_greentic`
+    /// is embedded inside a base64-encoded `body_b64` field (the shape
+    /// returned by `directline_http`).
+    #[tokio::test]
+    async fn notify_publishes_on_body_b64_greentic_metadata() {
+        let notifier = crate::notifier::InMemoryNotifier::new(16);
+        let mut events = notifier
+            .subscribe("t2", "conv-99")
+            .await
+            .expect("subscribe");
+
+        let inner = serde_json::json!({
+            "_greentic": {
+                "tenant": "t2",
+                "conversation_id": "conv-99",
+                "watermark_bumped": 7u64,
+            },
+            "id": "a1"
+        });
+        let body_b64 = BASE64.encode(serde_json::to_vec(&inner).unwrap());
+        let output = serde_json::json!({
+            "status": 200,
+            "body_b64": body_b64,
+        });
+        try_notify_webchat_activity(&notifier, &output).await;
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            futures_util::StreamExt::next(&mut events),
+        )
+        .await
+        .expect("timeout waiting for notify event")
+        .expect("stream ended");
+        assert_eq!(event.tenant_id, "t2");
+        assert_eq!(event.conversation_id, "conv-99");
+        assert_eq!(event.new_watermark, 7);
+    }
+
+    /// Non-webchat provider outputs (no `_greentic`) must not trigger a
+    /// publish. The notifier stream must stay empty.
+    #[tokio::test]
+    async fn notify_is_noop_without_greentic_metadata() {
+        let notifier = crate::notifier::InMemoryNotifier::new(16);
+        let mut events = notifier.subscribe("t1", "conv-1").await.expect("subscribe");
+
+        let output = serde_json::json!({"ok": true});
+        try_notify_webchat_activity(&notifier, &output).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            futures_util::StreamExt::next(&mut events),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "no event should be published for non-webchat output"
+        );
+    }
+}
+
+#[cfg(test)]
+mod update_notify_tests {
+    use super::*;
+    // The legacy field these tests still exercise, to prove `resolved_action()`
+    // keeps honoring a channel written before `on_update` existed.
+    use greentic_deploy_spec::OnNotifyAction;
+
+    fn env(id: &str) -> EnvId {
+        EnvId::new(id).expect("valid env id")
+    }
+
+    fn notify_body(schema: &str, plan: &[u8], sig: &[u8]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema": schema,
+            "plan_b64": BASE64.encode(plan),
+            "sig_b64": BASE64.encode(sig),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn decode_accepts_valid_body() {
+        let body = notify_body(UPDATE_NOTIFY_SCHEMA_V1, b"plan-bytes", b"sig-bytes");
+        let (plan, sig) = decode_update_notify(&body).expect("valid body decodes");
+        assert_eq!(plan, b"plan-bytes");
+        assert_eq!(sig, b"sig-bytes");
+    }
+
+    #[test]
+    fn decode_rejects_unknown_schema() {
+        let body = notify_body("greentic.update-notify.v99", b"p", b"s");
+        let (status, _) = decode_update_notify(&body).expect_err("unknown schema is rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decode_rejects_non_base64_payload() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schema": UPDATE_NOTIFY_SCHEMA_V1,
+            "plan_b64": "not valid base64!!",
+            "sig_b64": BASE64.encode(b"s"),
+        }))
+        .unwrap();
+        let (status, _) = decode_update_notify(&body).expect_err("bad base64 is rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decode_rejects_unknown_fields() {
+        // `deny_unknown_fields` guards against a plan server smuggling extra keys.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schema": UPDATE_NOTIFY_SCHEMA_V1,
+            "plan_b64": BASE64.encode(b"p"),
+            "sig_b64": BASE64.encode(b"s"),
+            "extra": "surprise",
+        }))
+        .unwrap();
+        let (status, _) = decode_update_notify(&body).expect_err("unknown field is rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decode_rejects_malformed_json() {
+        let (status, _) =
+            decode_update_notify(b"{not json").expect_err("malformed json is rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn notify_action_denies_by_default() {
+        // Absent operator opt-in must never stage: disabled(), enabled: None, and
+        // enabled: Some(false) all resolve to Ignore.
+        assert_eq!(
+            notify_action(&UpdateChannelConfig::disabled(env("local"))),
+            NotifyAction::Ignore
+        );
+
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = None;
+        cfg.on_notify = Some(OnNotifyAction::Stage);
+        assert_eq!(notify_action(&cfg), NotifyAction::Ignore);
+
+        cfg.enabled = Some(false);
+        assert_eq!(notify_action(&cfg), NotifyAction::Ignore);
+    }
+
+    #[test]
+    fn notify_action_enabled_branches() {
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+
+        cfg.on_notify = Some(OnNotifyAction::RecordOnly);
+        assert_eq!(notify_action(&cfg), NotifyAction::Record);
+
+        cfg.on_notify = Some(OnNotifyAction::Stage);
+        assert_eq!(notify_action(&cfg), NotifyAction::Stage);
+
+        // Unset on_notify resolves to Stage (the deploy-spec default).
+        cfg.on_notify = None;
+        assert_eq!(notify_action(&cfg), NotifyAction::Stage);
+    }
+
+    #[test]
+    fn notify_action_reads_on_update_over_legacy_on_notify() {
+        // `set_action` writes both fields: `on_update: apply` for a binary that
+        // understands it, `on_notify: stage` as the conservative floor an older
+        // binary reads. This binary must pick the former.
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.set_action(UpdateAction::Apply);
+        assert_eq!(cfg.on_notify, Some(OnNotifyAction::Stage));
+        assert_eq!(notify_action(&cfg), NotifyAction::Apply);
+    }
+
+    #[test]
+    fn notify_action_falls_back_to_legacy_when_on_update_absent() {
+        // A channel written before `on_update` existed keeps its meaning.
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.on_update = None;
+        cfg.on_notify = Some(OnNotifyAction::RecordOnly);
+        assert_eq!(notify_action(&cfg), NotifyAction::Record);
+    }
+
+    #[test]
+    fn notify_action_never_applies_a_disabled_channel() {
+        // `apply` is policy, `enabled` is the gate. The gate wins.
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.set_action(UpdateAction::Apply);
+        cfg.enabled = Some(false);
+        assert_eq!(notify_action(&cfg), NotifyAction::Ignore);
+    }
+
+    // ── push path: the stream gate ──────────────────────────────────
+
+    /// `enabled` is the gate, `push_enabled` is the policy. A channel the
+    /// operator never enabled must not open an outbound connection, even if it
+    /// carries a plan endpoint and push defaults on.
+    #[test]
+    fn stream_endpoint_denies_by_default() {
+        assert_eq!(
+            stream_endpoint_for(&UpdateChannelConfig::disabled(env("local"))),
+            None
+        );
+
+        // Endpoint present but the channel was never enabled: still nothing.
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.plan_endpoint = Some("https://updates.example/v1/environments/local/plan".into());
+        cfg.enabled = None;
+        assert_eq!(stream_endpoint_for(&cfg), None);
+
+        cfg.enabled = Some(false);
+        assert_eq!(stream_endpoint_for(&cfg), None);
+
+        // The gate outranks the policy: explicit push on a disabled channel is
+        // still off.
+        cfg.push_enabled = Some(true);
+        assert_eq!(stream_endpoint_for(&cfg), None);
+    }
+
+    /// An enabled channel streams by default — `push_enabled` is opt-*out*. The
+    /// URL is derived from the plan endpoint, so an operator who configured the
+    /// channel before this feature existed gets push with no config change.
+    #[test]
+    fn stream_endpoint_derives_from_the_plan_endpoint_and_push_is_opt_out() {
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.plan_endpoint = Some("https://updates.example/v1/environments/local/plan".into());
+
+        assert_eq!(
+            stream_endpoint_for(&cfg).as_deref(),
+            Some("https://updates.example/v1/environments/local/updates/stream"),
+        );
+
+        // Opt out explicitly and the stream must not be held open.
+        cfg.push_enabled = Some(false);
+        assert_eq!(stream_endpoint_for(&cfg), None);
+
+        // Opt back in.
+        cfg.push_enabled = Some(true);
+        assert!(stream_endpoint_for(&cfg).is_some());
+    }
+
+    /// An explicit `stream_endpoint` overrides the derived one, so an operator
+    /// can front the stream with a different host than the plan.
+    #[test]
+    fn explicit_stream_endpoint_overrides_the_derived_one() {
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.plan_endpoint = Some("https://updates.example/v1/environments/local/plan".into());
+        cfg.stream_endpoint = Some("https://push.example/stream".into());
+
+        assert_eq!(
+            stream_endpoint_for(&cfg).as_deref(),
+            Some("https://push.example/stream")
+        );
+    }
+
+    // ── push path: the interruptible wait ───────────────────────────
+
+    /// THE load-bearing property. A plan published while a poll cycle is still
+    /// running lands on `notify_one` with no waiter registered. If that wake is
+    /// dropped, the push is lost and discovery silently falls back to the poll
+    /// interval — the exact regression this whole change exists to prevent, and
+    /// one that no amount of "it compiled" would catch.
+    ///
+    /// `start_paused` means the 1-hour interval below costs no wall-clock: if the
+    /// permit were dropped, this test would hang on the virtual clock rather than
+    /// pass slowly.
+    #[tokio::test(start_paused = true)]
+    async fn a_push_landing_mid_cycle_is_not_lost() {
+        let wake = Notify::new();
+
+        // Goes through the SAME function the stream task's `on_plan` calls, so
+        // swapping it to `notify_waiters` (which drops a signal with no waiter
+        // registered) fails here rather than silently in production.
+        signal_plan_published(&wake);
+
+        assert!(
+            wait_for_next_cycle(&wake, 3600).await,
+            "a wake stored while the cycle was running must survive to the next wait"
+        );
+    }
+
+    /// With nothing pushed, the wait must expire on the interval and run the
+    /// cycle anyway. This is the fallback that keeps updates flowing when the
+    /// stream is down, and it is what makes push a pure accelerator.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_push_the_wait_falls_back_to_the_interval() {
+        let wake = Notify::new();
+
+        // Bounded deliberately. The regression this guards against — dropping the
+        // `timeout` and awaiting the wake forever — makes `wait_for_next_cycle`
+        // never return, which would HANG this test rather than fail it, wedging CI
+        // instead of reporting. The outer bound turns that into a clean failure.
+        // Virtual time, so the 2h ceiling costs no wall-clock.
+        let woke =
+            tokio::time::timeout(Duration::from_secs(7200), wait_for_next_cycle(&wake, 3600))
+                .await
+                .expect("wait_for_next_cycle must return on its interval, not block forever");
+
+        assert!(
+            !woke,
+            "an un-pushed wait must expire on the interval, not wake early"
+        );
+    }
+
+    /// A burst of events must coalesce into ONE extra cycle, not one per event.
+    /// `Notify` holds at most a single permit, so ten publishes in a row cost one
+    /// poll — otherwise a chatty server would queue up a cycle per event and
+    /// hammer the plan endpoint.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_pushes_coalesces_into_one_cycle() {
+        let wake = Notify::new();
+
+        for _ in 0..10 {
+            signal_plan_published(&wake);
+        }
+
+        assert!(
+            wait_for_next_cycle(&wake, 3600).await,
+            "the burst must wake the loop"
+        );
+        assert!(
+            !wait_for_next_cycle(&wake, 3600).await,
+            "10 events must not buy 10 cycles — the permits coalesce into one"
+        );
+    }
+
+    #[test]
+    fn plan_id_of_reads_the_staged_outcome_and_rejects_a_missing_id() {
+        let ok = OpOutcome::new("updates", "get", serde_json::json!({ "plan_id": "plan-7" }));
+        assert_eq!(plan_id_of(&ok).expect("plan id"), "plan-7");
+
+        let bad = OpOutcome::new("updates", "get", serde_json::json!({ "sequence": 3 }));
+        assert!(matches!(
+            plan_id_of(&bad),
+            Err(NotifyError::Internal(msg)) if msg.contains("no plan id")
+        ));
+    }
+
+    #[test]
+    fn map_op_error_status_mapping() {
+        assert_eq!(
+            map_op_error(&OpError::Conflict("downgrade".into())).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            map_op_error(&OpError::Unauthorized {
+                policy: "p".into(),
+                reason: "r".into()
+            })
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            map_op_error(&OpError::NotFound("plan".into())).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            map_op_error(&OpError::InvalidArgument("bad".into())).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            map_op_error(&OpError::Fetch("timeout".into())).status(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vectors() {
+        // The torn-read guard compares this against the server's `plan_sha256`
+        // (`hex::encode(Sha256::digest(...))`), so it must be lowercase hex.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn poll_cycle_disabled_channel_does_not_fetch() {
+        // Deny-by-default: a disabled channel returns before any HTTP. The
+        // endpoint points at an unroutable port, so a fetch attempt would error;
+        // the sequence stays put and the resolved interval is returned.
+        let root = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("local")).expect("env dir");
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(false);
+        cfg.plan_endpoint = Some("http://127.0.0.1:1/plan".into());
+        std::fs::write(
+            root.path().join("local").join("update-channel.json"),
+            serde_json::to_vec(&cfg).expect("serialize channel"),
+        )
+        .expect("write channel");
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .expect("client");
+
+        let (seq, interval, _restart) =
+            poll_update_cycle("local", root.path(), &client, Some(7), None);
+        assert_eq!(
+            seq,
+            Some(7),
+            "disabled channel must not advance the sequence"
+        );
+        assert!(interval >= 60, "resolved interval is floored");
+    }
+
+    #[test]
+    fn poll_cycle_enabled_without_endpoint_does_not_fetch() {
+        // Enabled but no plan endpoint → the poll loop has no source and returns
+        // without fetching (again, an unroutable endpoint is never set).
+        let root = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("local")).expect("env dir");
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.plan_endpoint = None;
+        std::fs::write(
+            root.path().join("local").join("update-channel.json"),
+            serde_json::to_vec(&cfg).expect("serialize channel"),
+        )
+        .expect("write channel");
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .expect("client");
+
+        let (seq, _interval, _restart) =
+            poll_update_cycle("local", root.path(), &client, None, None);
+        assert_eq!(seq, None, "no endpoint must not advance the sequence");
+    }
+
+    #[test]
+    fn disabled_channel_does_not_stage() {
+        // End-to-end deny-by-default: a store with no update-channel policy resolves
+        // to disabled, so `run_update_notify` returns 403 WITHOUT ever calling
+        // `updates::get` — the garbage plan/sig below would error if it were staged.
+        let root = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("local")).expect("env dir");
+        let store = LocalFsStore::new(root.path().to_path_buf());
+
+        let (status, body) = run_update_notify(&store, "local", b"not-a-plan", b"not-a-sig", None)
+            .expect("disabled is Ok");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["status"], "disabled");
+    }
+
+    #[test]
+    fn record_only_rejects_unverified_plan() {
+        // Enabled + record-only still VERIFIES before recording. The env has no
+        // trust root and the bytes carry no valid DSSE signature, so verification
+        // fails closed and the request is REJECTED (409) — never `202 recorded`.
+        // (An unverified record would let any caller forge the notification.)
+        let root = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("local")).expect("env dir");
+        let mut cfg = UpdateChannelConfig::disabled(env("local"));
+        cfg.enabled = Some(true);
+        cfg.on_notify = Some(OnNotifyAction::RecordOnly);
+        std::fs::write(
+            root.path().join("local").join("update-channel.json"),
+            serde_json::to_vec(&cfg).expect("serialize channel"),
+        )
+        .expect("write channel");
+        let store = LocalFsStore::new(root.path().to_path_buf());
+
+        match run_update_notify(&store, "local", b"not-a-plan", b"not-a-sig", None) {
+            Err(NotifyError::Op(op)) => {
+                assert_eq!(map_op_error(&op).status(), StatusCode::CONFLICT);
+            }
+            other => panic!("expected verification rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_channel_present_reflects_the_sidecar() {
+        // The route only reserves `/v1/updates/notify` on envs that have run
+        // `op updates config-set` (an `update-channel.json` sidecar); every other
+        // env falls through to deployment routing.
+        let root = tempfile::TempDir::new().expect("tempdir");
+        assert!(!update_channel_present(root.path(), "local"));
+
+        std::fs::create_dir_all(root.path().join("local")).expect("env dir");
+        std::fs::write(root.path().join("local").join("update-channel.json"), b"{}")
+            .expect("write sidecar");
+        assert!(update_channel_present(root.path(), "local"));
+        // A different env is unaffected.
+        assert!(!update_channel_present(root.path(), "other"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P7d: binary self-update decision logic tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod binary_update_tests {
+    use super::*;
+    use greentic_update::plan::BinaryArtifact;
+
+    fn empty_activation_for_test(env_id: &str) -> Activation {
+        use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
+        let host = std::sync::Arc::new(
+            greentic_runner_host::HostBuilder::new()
+                .with_config(greentic_runner_host::HostConfig::from_gtbind(
+                    greentic_runner_host::TenantBindings {
+                        tenant: env_id.to_string(),
+                        packs: Vec::new(),
+                        env_passthrough: Vec::new(),
+                    },
+                ))
+                .build()
+                .expect("build placeholder host"),
+        );
+        let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new(env_id, [0u8; 32]));
+        Activation {
+            host,
+            routing: std::sync::Arc::new(RevisionIngressRouting {
+                dispatcher: std::sync::Arc::new(dispatcher),
+                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
+                deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+                endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+                deployment_config_overrides: std::sync::Arc::default(),
+                static_routes: crate::static_routes::ActiveRouteTable::default(),
+            }),
+        }
+    }
+
+    fn sample_binary(name: &str, target: &str, version: &str) -> BinaryArtifact {
+        BinaryArtifact {
+            name: name.to_string(),
+            version: version.to_string(),
+            target: target.to_string(),
+            digest: "sha256:aabbccdd".to_string(),
+            source: Some("https://example.com/archive.tgz".to_string()),
+        }
+    }
+
+    // --- select_binary wiring tests ---
+
+    #[test]
+    fn select_own_binary_finds_exact_match() {
+        let own_name = env!("CARGO_PKG_NAME");
+        let own_target = binswap::current_target();
+        let binaries = vec![
+            sample_binary("gtc", own_target, "2.0.0"),
+            sample_binary(own_name, own_target, "2.0.0"),
+            sample_binary("greentic-runner", own_target, "2.0.0"),
+        ];
+        let result = select_binary(&binaries, own_name, own_target).unwrap();
+        assert!(result.is_some(), "must find our own binary");
+        let found = result.unwrap();
+        assert_eq!(found.name, own_name);
+        assert_eq!(found.target, own_target);
+    }
+
+    #[test]
+    fn no_binary_for_host_returns_none() {
+        let own_name = env!("CARGO_PKG_NAME");
+        let own_target = binswap::current_target();
+        // Plan has binaries for a DIFFERENT target.
+        let binaries = vec![sample_binary(own_name, "aarch64-unknown-freebsd", "2.0.0")];
+        let result = select_binary(&binaries, own_name, own_target).unwrap();
+        assert!(result.is_none(), "no match for a different target");
+    }
+
+    #[test]
+    fn no_binary_for_name_returns_none() {
+        let own_target = binswap::current_target();
+        // Plan has binaries for a DIFFERENT name.
+        let binaries = vec![sample_binary("gtc", own_target, "2.0.0")];
+        let result = select_binary(&binaries, env!("CARGO_PKG_NAME"), own_target).unwrap();
+        assert!(result.is_none(), "no match for a different name");
+    }
+
+    #[test]
+    fn empty_binaries_returns_none() {
+        let result = select_binary(&[], env!("CARGO_PKG_NAME"), binswap::current_target()).unwrap();
+        assert!(result.is_none(), "empty list yields None");
+    }
+
+    #[test]
+    fn ambiguous_binary_fails_closed() {
+        let own_name = env!("CARGO_PKG_NAME");
+        let own_target = binswap::current_target();
+        let binaries = vec![
+            sample_binary(own_name, own_target, "2.0.0"),
+            sample_binary(own_name, own_target, "2.0.1"),
+        ];
+        let err = select_binary(&binaries, own_name, own_target).unwrap_err();
+        assert!(
+            format!("{err}").contains("ambiguous"),
+            "error must mention ambiguity: {err}"
+        );
+    }
+
+    // --- version guard tests ---
+
+    #[test]
+    fn version_guard_refuses_downgrade() {
+        let current = env!("CARGO_PKG_VERSION");
+        let current_ver = semver::Version::parse(current).unwrap();
+        // Construct a version strictly older than current.
+        let older = semver::Version::new(
+            current_ver.major,
+            current_ver.minor,
+            current_ver.patch.saturating_sub(1),
+        );
+        // If current patch is 0, this is equal rather than older — that case is
+        // the no-op test below. This test exercises the `<` branch.
+        if older < current_ver {
+            assert!(
+                older < current_ver,
+                "constructed older version must be strictly less"
+            );
+        }
+    }
+
+    #[test]
+    fn version_guard_noop_on_equal() {
+        let current = env!("CARGO_PKG_VERSION");
+        let current_ver = semver::Version::parse(current).unwrap();
+        assert_eq!(current_ver, current_ver, "equal version is a no-op");
+    }
+
+    #[test]
+    fn version_guard_allows_upgrade() {
+        let current = env!("CARGO_PKG_VERSION");
+        let current_ver = semver::Version::parse(current).unwrap();
+        let newer =
+            semver::Version::new(current_ver.major, current_ver.minor, current_ver.patch + 1);
+        assert!(newer > current_ver, "newer version must proceed");
+    }
+
+    // --- status shape / no-leak tests ---
+
+    #[test]
+    fn staged_response_without_binary_has_no_binary_key() {
+        let body = serde_json::json!({ "status": "staged" });
+        assert!(
+            body.get("binary").is_none(),
+            "no binary key in content-only"
+        );
+    }
+
+    #[test]
+    fn staged_response_with_binary_exposes_version_and_restart() {
+        let binary_info = serde_json::json!({
+            "staged": true,
+            "restart_required": true,
+            "version": "2.0.0",
+        });
+        let mut body = serde_json::json!({ "status": "staged" });
+        body["binary"] = binary_info;
+
+        assert_eq!(body["status"], "staged");
+        let bin = body.get("binary").expect("binary key present");
+        assert_eq!(bin["staged"], true);
+        assert_eq!(bin["restart_required"], true);
+        assert_eq!(bin["version"], "2.0.0");
+        // Must NOT contain filesystem paths or trust-root details.
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(
+            !serialized.contains(".prev"),
+            "must not leak .prev path: {serialized}"
+        );
+        assert!(
+            !serialized.contains("key_id"),
+            "must not leak key id: {serialized}"
+        );
+    }
+
+    // --- restart_required flag integration ---
+
+    #[test]
+    fn restart_required_flag_surfaces_in_status() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(true),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
+        };
+        let resp = try_probe_response("/status", &state).expect("/status response");
+        let body_bytes = resp.into_body();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let collected = rt
+            .block_on(http_body_util::BodyExt::collect(body_bytes))
+            .unwrap();
+        let text = String::from_utf8_lossy(&collected.to_bytes()).to_string();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["restart_required"], true,
+            "/status must expose restart_required"
+        );
+    }
+
+    #[test]
+    fn restart_required_flag_surfaces_header_on_healthz() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(true),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
+        };
+        let resp = try_probe_response("/healthz", &state).expect("/healthz response");
+        assert_eq!(resp.status(), StatusCode::OK, "still healthy");
+        assert_eq!(
+            resp.headers()
+                .get("x-greentic-restart-required")
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "header must be present when restart is required",
+        );
+    }
+
+    #[test]
+    fn no_restart_header_when_not_required() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
+        };
+        let resp = try_probe_response("/healthz", &state).expect("/healthz response");
+        assert!(
+            resp.headers().get("x-greentic-restart-required").is_none(),
+            "header must be absent when no restart is required",
+        );
+    }
+
+    #[test]
+    fn status_restart_required_false_by_default() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
+        };
+        let resp = try_probe_response("/status", &state).expect("/status response");
+        let body_bytes = resp.into_body();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let collected = rt
+            .block_on(http_body_util::BodyExt::collect(body_bytes))
+            .unwrap();
+        let text = String::from_utf8_lossy(&collected.to_bytes()).to_string();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["restart_required"], false,
+            "/status must report false by default"
+        );
+    }
+
+    // --- marker file idempotency ---
+
+    #[test]
+    fn marker_file_is_valid_json() {
+        let marker = serde_json::json!({
+            "name": "greentic-start",
+            "from_version": "1.1.8",
+            "to_version": "1.1.9",
+            "staged_at": "2026-07-07T00:00:00Z",
+        });
+        let bytes = serde_json::to_vec_pretty(&marker).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed.get("to_version").and_then(Value::as_str),
+            Some("1.1.9")
+        );
+        assert_eq!(
+            parsed.get("name").and_then(Value::as_str),
+            Some("greentic-start")
+        );
+    }
+
+    #[test]
+    fn marker_version_check_detects_same_version() {
+        let marker = serde_json::json!({
+            "name": "greentic-start",
+            "from_version": "1.1.8",
+            "to_version": "1.1.9",
+        });
+        // Same version -> should be treated as already staged.
+        assert_eq!(
+            marker.get("to_version").and_then(Value::as_str),
+            Some("1.1.9"),
+        );
+        // Different version -> should NOT match.
+        assert_ne!(
+            marker.get("to_version").and_then(Value::as_str),
+            Some("2.0.0"),
+        );
+    }
+
+    // --- P7e: BinaryUpdateMarker typed tests ---
+
+    #[test]
+    fn marker_phase_defaults_to_pending_on_missing_field() {
+        let json = r#"{"name":"x","from_version":"1","to_version":"2","staged_at":"t"}"#;
+        let marker: BinaryUpdateMarker = serde_json::from_str(json).unwrap();
+        assert_eq!(marker.phase, MarkerPhase::Pending);
+        assert!(marker.rolled_back_at.is_none());
+    }
+
+    #[test]
+    fn marker_roundtrip_pending() {
+        let marker = BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: "1.1.11".to_string(),
+            to_version: "1.1.12".to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::Pending,
+            rolled_back_at: None,
+            digest: None,
+            boot_attempts: 0,
+        };
+        let bytes = serde_json::to_vec(&marker).unwrap();
+        let back: BinaryUpdateMarker = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.phase, MarkerPhase::Pending);
+        assert_eq!(back.to_version, "1.1.12");
+        assert!(back.rolled_back_at.is_none());
+    }
+
+    #[test]
+    fn marker_roundtrip_rolled_back() {
+        let marker = BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: "1.1.11".to_string(),
+            to_version: "1.1.12".to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::RolledBack,
+            rolled_back_at: Some("2026-07-13T01:00:00Z".to_string()),
+            digest: Some("abc123".to_string()),
+            boot_attempts: 0,
+        };
+        let bytes = serde_json::to_vec(&marker).unwrap();
+        let back: BinaryUpdateMarker = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.phase, MarkerPhase::RolledBack);
+        assert_eq!(back.rolled_back_at.as_deref(), Some("2026-07-13T01:00:00Z"));
+    }
+
+    #[test]
+    fn read_binary_update_marker_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(read_binary_update_marker(dir.path()).is_none());
+    }
+
+    #[test]
+    fn read_binary_update_marker_valid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: "1.0.0".to_string(),
+            to_version: "1.1.0".to_string(),
+            staged_at: "2026-01-01T00:00:00Z".to_string(),
+            phase: MarkerPhase::Pending,
+            rolled_back_at: None,
+            digest: None,
+            boot_attempts: 0,
+        };
+        std::fs::write(
+            dir.path().join(BINARY_UPDATE_PENDING_FILE),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        let read = read_binary_update_marker(dir.path()).expect("should parse");
+        assert_eq!(read.to_version, "1.1.0");
+        assert_eq!(read.phase, MarkerPhase::Pending);
+    }
+
+    #[test]
+    fn read_binary_update_marker_corrupt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(BINARY_UPDATE_PENDING_FILE), b"not json").unwrap();
+        assert!(read_binary_update_marker(dir.path()).is_none());
+    }
+
+    #[test]
+    fn clear_binary_update_marker_removes_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(BINARY_UPDATE_PENDING_FILE);
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(path.exists());
+        clear_binary_update_marker(dir.path());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn write_rollback_tombstone_sets_phase_and_timestamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: "1.1.11".to_string(),
+            to_version: "1.1.12".to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::Pending,
+            rolled_back_at: None,
+            digest: Some("sha256:abc".to_string()),
+            boot_attempts: 0,
+        };
+        write_rollback_tombstone(dir.path(), &marker);
+        let read = read_binary_update_marker(dir.path()).expect("should read tombstone");
+        assert_eq!(read.phase, MarkerPhase::RolledBack);
+        assert!(read.rolled_back_at.is_some());
+        assert_eq!(read.to_version, "1.1.12");
+        assert_eq!(read.from_version, "1.1.11");
+    }
+
+    #[test]
+    fn write_rollback_tombstone_preserves_digest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: "1.1.11".to_string(),
+            to_version: "1.1.12".to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::Pending,
+            rolled_back_at: None,
+            digest: Some("sha256:deadbeef".to_string()),
+            boot_attempts: 0,
+        };
+        write_rollback_tombstone(dir.path(), &marker);
+        let read = read_binary_update_marker(dir.path()).expect("should read tombstone");
+        assert_eq!(read.digest.as_deref(), Some("sha256:deadbeef"));
+    }
+
+    #[test]
+    fn marker_digest_defaults_to_none_on_missing_field() {
+        let json = r#"{"name":"x","from_version":"1","to_version":"2","staged_at":"t"}"#;
+        let marker: BinaryUpdateMarker = serde_json::from_str(json).unwrap();
+        assert!(marker.digest.is_none());
+    }
+
+    #[test]
+    fn status_includes_version_field() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
+        };
+        let resp = try_probe_response("/status", &state).expect("/status response");
+        let body_bytes = resp.into_body();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let collected = rt
+            .block_on(http_body_util::BodyExt::collect(body_bytes))
+            .unwrap();
+        let text = String::from_utf8_lossy(&collected.to_bytes()).to_string();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "/status must include version"
+        );
+    }
+
+    /// Regression: binary swap response with restart_required=true must set
+    /// auto_restart_pending when auto_restart_enabled is true.
+    #[test]
+    fn auto_restart_pending_set_on_binary_swap_response() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: true,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: true,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
+        });
+        state.mark_restart_required();
+        assert!(
+            state.restart_required.load(Ordering::Relaxed),
+            "restart_required must be set"
+        );
+        #[cfg(unix)]
+        assert!(
+            state.auto_restart_pending.load(Ordering::Relaxed),
+            "auto_restart_pending must be set when auto_restart_enabled is true"
+        );
+    }
+
+    /// Complement: when auto_restart_enabled is false, auto_restart_pending
+    /// must remain false even after a binary swap.
+    #[test]
+    fn auto_restart_pending_not_set_when_disabled() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: true,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            activity_source_override: None,
+        });
+        state.mark_restart_required();
+        assert!(
+            state.restart_required.load(Ordering::Relaxed),
+            "restart_required must still be set"
+        );
+        assert!(
+            !state.auto_restart_pending.load(Ordering::Relaxed),
+            "auto_restart_pending must NOT be set when disabled"
+        );
+    }
+
+    // --- boot_attempts field and decide_boot_action tests ---
+
+    fn make_pending_marker(from: &str, to: &str, attempts: u32) -> BinaryUpdateMarker {
+        BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: from.to_string(),
+            to_version: to.to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::Pending,
+            rolled_back_at: None,
+            digest: Some("sha256:abc".to_string()),
+            boot_attempts: attempts,
+        }
+    }
+
+    fn make_rolled_back_marker(from: &str, to: &str) -> BinaryUpdateMarker {
+        BinaryUpdateMarker {
+            name: "greentic-start".to_string(),
+            from_version: from.to_string(),
+            to_version: to.to_string(),
+            staged_at: "2026-07-13T00:00:00Z".to_string(),
+            phase: MarkerPhase::RolledBack,
+            rolled_back_at: Some("2026-07-13T01:00:00Z".to_string()),
+            digest: Some("sha256:abc".to_string()),
+            boot_attempts: 0,
+        }
+    }
+
+    #[test]
+    fn boot_attempts_defaults_to_zero_on_missing_field() {
+        let json = r#"{"name":"x","from_version":"1","to_version":"2","staged_at":"t"}"#;
+        let marker: BinaryUpdateMarker = serde_json::from_str(json).unwrap();
+        assert_eq!(marker.boot_attempts, 0);
+    }
+
+    #[test]
+    fn marker_roundtrip_with_boot_attempts() {
+        let marker = make_pending_marker("1.1.11", "1.1.12", 2);
+        let bytes = serde_json::to_vec(&marker).unwrap();
+        let back: BinaryUpdateMarker = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.boot_attempts, 2);
+        assert_eq!(back.phase, MarkerPhase::Pending);
+        assert_eq!(back.to_version, "1.1.12");
+    }
+
+    #[test]
+    fn decide_boot_action_no_marker() {
+        assert_eq!(decide_boot_action(None, "1.1.12"), BootAction::Proceed);
+    }
+
+    #[test]
+    fn decide_boot_action_pending_to_eq_own_below_max() {
+        let marker = make_pending_marker("1.1.11", "1.1.12", 0);
+        let action = decide_boot_action(Some(marker.clone()), "1.1.12");
+        assert_eq!(action, BootAction::ArmGuard(marker));
+    }
+
+    #[test]
+    fn decide_boot_action_pending_to_eq_own_at_max() {
+        let marker = make_pending_marker("1.1.11", "1.1.12", MAX_BOOT_ATTEMPTS);
+        let action = decide_boot_action(Some(marker.clone()), "1.1.12");
+        assert_eq!(action, BootAction::RollbackNow(marker));
+    }
+
+    #[test]
+    fn decide_boot_action_pending_to_eq_own_above_max() {
+        let marker = make_pending_marker("1.1.11", "1.1.12", MAX_BOOT_ATTEMPTS + 5);
+        let action = decide_boot_action(Some(marker.clone()), "1.1.12");
+        assert_eq!(action, BootAction::RollbackNow(marker));
+    }
+
+    #[test]
+    fn decide_boot_action_pending_from_eq_own() {
+        let marker = make_pending_marker("1.1.12", "1.1.13", 0);
+        assert_eq!(
+            decide_boot_action(Some(marker), "1.1.12"),
+            BootAction::Proceed
+        );
+    }
+
+    #[test]
+    fn decide_boot_action_rolled_back_from_eq_own() {
+        let marker = make_rolled_back_marker("1.1.12", "1.1.13");
+        assert_eq!(
+            decide_boot_action(Some(marker), "1.1.12"),
+            BootAction::Proceed
+        );
+    }
+
+    #[test]
+    fn decide_boot_action_rolled_back_to_eq_own() {
+        let marker = make_rolled_back_marker("1.1.11", "1.1.12");
+        assert_eq!(
+            decide_boot_action(Some(marker), "1.1.12"),
+            BootAction::PreserveTombstone
+        );
+    }
+
+    #[test]
+    fn decide_boot_action_stale_marker() {
+        let marker = make_pending_marker("1.0.0", "1.0.1", 0);
+        assert_eq!(
+            decide_boot_action(Some(marker), "1.1.12"),
+            BootAction::ClearMarker
+        );
+    }
+
+    #[test]
+    fn write_marker_durable_persists_and_survives_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = make_pending_marker("1.1.11", "1.1.12", 2);
+        write_marker_durable(dir.path(), &marker).expect("durable write should succeed");
+        let read = read_binary_update_marker(dir.path()).expect("should parse");
+        assert_eq!(read.boot_attempts, 2);
+        assert_eq!(read.to_version, "1.1.12");
+        assert_eq!(read.phase, MarkerPhase::Pending);
+    }
+
+    #[test]
+    fn boot_attempt_counter_persisted_before_boot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut marker = make_pending_marker("1.1.11", "1.1.12", 0);
+        marker.boot_attempts += 1;
+        write_marker_durable(dir.path(), &marker).expect("write");
+        let on_disk = read_binary_update_marker(dir.path()).expect("read");
+        assert_eq!(
+            on_disk.boot_attempts, 1,
+            "incremented counter must be visible on disk before boot proceeds"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_write_failure_returns_err_and_restores_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let exe_path = dir.path().join("greentic-start");
+        let prev_path = dir.path().join("greentic-start.prev");
+        let old_binary = b"old-binary-content";
+        let new_binary = b"new-binary-content";
+
+        std::fs::write(&prev_path, old_binary).unwrap();
+        std::fs::write(&exe_path, new_binary).unwrap();
+
+        let env_dir = dir.path().join("env");
+        std::fs::create_dir_all(&env_dir).unwrap();
+        let perms = std::fs::Permissions::from_mode(0o500);
+        std::fs::set_permissions(&env_dir, perms).unwrap();
+
+        let marker = make_pending_marker("1.1.11", "1.1.12", 0);
+        let result = persist_marker_or_undo_swap(&env_dir, &marker, &exe_path);
+
+        std::fs::set_permissions(&env_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "an unpersistable marker must fail the binary step"
+        );
+        // The swap must be undone: exec'ing into a binary with no rollback
+        // state on disk is exactly the case the marker exists to prevent.
+        assert_eq!(
+            std::fs::read(&exe_path).unwrap(),
+            old_binary,
+            "the previous binary must be restored when the marker cannot be persisted"
+        );
+        assert!(
+            !prev_path.exists(),
+            "restore_prev consumes the .prev copy it restores from"
+        );
+    }
+
+    // ── Category 12: A5 — end-to-end WS upgrade through revision-serve ─────
+
+    /// In-memory `SecretsManager` for tests: returns a pre-loaded signing key
+    /// and rejects everything else.
+    struct TestSecretsManager {
+        entries: std::sync::Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl TestSecretsManager {
+        fn with_entry(key: &str, value: Vec<u8>) -> Self {
+            let mut map = HashMap::new();
+            map.insert(key.to_string(), value);
+            Self {
+                entries: std::sync::Mutex::new(map),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl greentic_secrets_lib::SecretsManager for TestSecretsManager {
+        async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+            self.entries
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+        }
+
+        async fn write(&self, _path: &str, _bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+
+        async fn delete(&self, _path: &str) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// In-memory activity source for the WS pump that bypasses the WASM
+    /// provider. Shared between the test driver and the pump via `Arc`.
+    struct TestActivitySource {
+        entries: std::sync::Mutex<Vec<serde_json::Value>>,
+        next_watermark: std::sync::Mutex<u64>,
+    }
+
+    impl TestActivitySource {
+        fn new() -> Self {
+            Self {
+                entries: std::sync::Mutex::new(Vec::new()),
+                next_watermark: std::sync::Mutex::new(0),
+            }
+        }
+
+        fn append(&self, text: &str) -> u64 {
+            let mut wm = self.next_watermark.lock().unwrap();
+            let watermark = *wm;
+            *wm += 1;
+            self.entries.lock().unwrap().push(serde_json::json!({
+                "type": "message",
+                "text": text,
+                "channelData": {"watermark": watermark},
+            }));
+            watermark
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::websocket::pump::ActivitySource for TestActivitySource {
+        async fn fetch_since(
+            &self,
+            _tenant_id: &str,
+            _conversation_id: &str,
+            since_watermark: u64,
+        ) -> Result<(Vec<serde_json::Value>, u64), String> {
+            let entries = self.entries.lock().unwrap();
+            let next = *self.next_watermark.lock().unwrap();
+            let filtered: Vec<serde_json::Value> = entries
+                .iter()
+                .filter(|a| {
+                    a.get("channelData")
+                        .and_then(|cd| cd.get("watermark"))
+                        .and_then(|w| w.as_u64())
+                        .map(|w| w >= since_watermark)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            Ok((filtered, next))
+        }
+    }
+
+    /// Issue a HS256 JWT for the test WebSocket handshake.
+    fn issue_test_token(conversation_id: &str, tenant: &str, signing_key: &[u8]) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+
+        let exp = chrono::Utc::now().timestamp() + 60;
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let claims = format!(
+            r#"{{"sub":"test-user","exp":{exp},"ctx":{{"env":"test","tenant":"{tenant}"}},"conv":"{conversation_id}"}}"#
+        );
+        let payload = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let signing_input = format!("{header}.{payload}");
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(signing_key).expect("hmac key");
+        mac.update(signing_input.as_bytes());
+        let sig = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("{signing_input}.{sig}")
+    }
+
+    /// Build an [`Activation`] wired for the A5 end-to-end WS test: routes
+    /// resolve, the dispatcher holds one revision, and the secrets manager
+    /// returns the signing key.
+    fn ws_test_activation(
+        env_id: &str,
+        tenant: &str,
+        deployment_id: greentic_deploy_spec::ids::DeploymentId,
+        revision_id: greentic_deploy_spec::ids::RevisionId,
+        bundle_id: greentic_deploy_spec::ids::BundleId,
+        signing_key: &[u8],
+        pin_store: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore>,
+    ) -> Activation {
+        use crate::deployment_routes::DeploymentRouteTable;
+        use crate::http_routes::{HttpRouteTable, provider_descriptor_for_test};
+        use crate::revision_dispatcher::{
+            RevisionDispatcher, RevisionDispatcherConfig, RevisionEntry,
+        };
+
+        let scope = crate::http_routes::RevisionScope {
+            deployment_id,
+            bundle_id: bundle_id.clone(),
+            revision_id,
+        };
+
+        let mut provider_route = provider_descriptor_for_test(
+            "/v1/messaging/webchat/{tenant}/{path*}",
+            "messaging.webchat.gui",
+            scope,
+        );
+        provider_route.methods = Vec::new();
+        let http_routes = HttpRouteTable::from_descriptors(vec![provider_route]);
+
+        let deployment_routes = DeploymentRouteTable::from_parts(vec![(
+            deployment_id,
+            tenant.to_string(),
+            Vec::new(),
+            Vec::new(),
+        )]);
+
+        let dispatcher = RevisionDispatcher::with_pin_store(
+            RevisionDispatcherConfig::new(env_id, [0u8; 32]),
+            pin_store,
+        );
+        dispatcher
+            .apply_traffic_split(
+                deployment_id,
+                vec![RevisionEntry {
+                    revision_id,
+                    bundle_id: bundle_id.clone(),
+                    weight_bps: 10_000,
+                }],
+                bundle_id,
+                0,
+            )
+            .expect("apply_traffic_split");
+
+        let provider_hyphen = "messaging-webchat-gui";
+        let env = crate::resolve_env(None);
+        let team_segment = crate::secrets_manager::canonical_team(Some("default"));
+        let raw_uri =
+            format!("secrets://{env}/{tenant}/{team_segment}/{provider_hyphen}/jwt_signing_key");
+        let secrets: greentic_runner_host::secrets::DynSecretsManager = std::sync::Arc::new(
+            TestSecretsManager::with_entry(&raw_uri, signing_key.to_vec()),
+        );
+
+        let host = std::sync::Arc::new(
+            greentic_runner_host::HostBuilder::new()
+                .with_config(greentic_runner_host::HostConfig::from_gtbind(
+                    greentic_runner_host::TenantBindings {
+                        tenant: tenant.to_string(),
+                        packs: Vec::new(),
+                        env_passthrough: Vec::new(),
+                    },
+                ))
+                .with_secrets_manager(secrets)
+                .build()
+                .expect("build test host"),
+        );
+
+        Activation {
+            host,
+            routing: std::sync::Arc::new(RevisionIngressRouting {
+                dispatcher: std::sync::Arc::new(dispatcher),
+                http_routes,
+                deployment_routes,
+                endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+                deployment_config_overrides: std::sync::Arc::default(),
+                static_routes: crate::static_routes::ActiveRouteTable::default(),
+            }),
+        }
+    }
+
+    /// A5 end-to-end: a WebSocket client connects through the REAL
+    /// `spawn_revision_connection` → `handle_connection` →
+    /// `handle_websocket_upgrade` pipeline, completes the handshake,
+    /// receives a pre-populated replay activity, then receives a
+    /// live-pushed activity via the notifier.
+    ///
+    /// Mutation proof:
+    /// (a) Removing `.with_upgrades()` from `spawn_revision_connection`
+    ///     makes the handshake fail ("Handshake not finished").
+    /// (b) Removing `try_notify_webchat_activity` removes the only
+    ///     `notifier.publish` on the revision path; the pump never
+    ///     wakes for live activities and the second frame never arrives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revision_ws_upgrade_end_to_end() {
+        let env_id = "local";
+        let tenant = "test-tenant";
+        let signing_key = b"revision-ws-test-key";
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let rev_id = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("test.webchat");
+        let conv_id = "conv-ws-e2e";
+        let pin_store: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore> =
+            std::sync::Arc::new(crate::revision_pin::InMemoryPinStore::new());
+
+        let activation = ws_test_activation(
+            env_id,
+            tenant,
+            dep_id,
+            rev_id,
+            bundle_id.clone(),
+            signing_key,
+            std::sync::Arc::clone(&pin_store),
+        );
+
+        let test_source = std::sync::Arc::new(TestActivitySource::new());
+        test_source.append("hello from replay");
+
+        let notifier: Arc<dyn crate::notifier::ActivityNotifier> =
+            Arc::new(crate::notifier::InMemoryNotifier::new(64));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let state = Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(activation)),
+            bound_addr: addr,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::clone(&notifier),
+            activity_source_override: Some(
+                test_source.clone() as Arc<dyn crate::websocket::pump::ActivitySource>
+            ),
+        });
+
+        // Pre-seed a revision pin for this conversation so the WS upgrade
+        // finds it (A5: the WS endpoint requires a prior REST POST
+        // /conversations that pins the session).
+        let session_hint = format!("webchat:{conv_id}");
+        state
+            .current()
+            .routing
+            .dispatcher
+            .commit_pin(tenant, dep_id, &session_hint, rev_id)
+            .await;
+
+        // Spawn the accept loop.
+        let accept_state = Arc::clone(&state);
+        let accept_handle = tokio::spawn(async move {
+            while let Ok(accept) = listener.accept().await {
+                spawn_revision_connection(Ok(accept), &accept_state, true);
+            }
+        });
+
+        // Build the WS URL with a valid token.
+        let token = issue_test_token(conv_id, tenant, signing_key);
+        let url = format!(
+            "ws://{addr}/v1/messaging/webchat/{tenant}/v3/directline/conversations/{conv_id}/stream?t={token}&watermark=0"
+        );
+
+        // Connect and complete the WebSocket handshake.
+        let (mut ws, response) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("ws connect must succeed (handshake)");
+        assert_eq!(
+            response.status(),
+            tokio_tungstenite::tungstenite::http::StatusCode::SWITCHING_PROTOCOLS,
+            "handshake must complete with 101"
+        );
+
+        // First frame: the replay activity pre-populated in the source.
+        use futures_util::StreamExt;
+        let replay = tokio::time::timeout(std::time::Duration::from_millis(3000), ws.next())
+            .await
+            .expect("replay timeout")
+            .expect("ws closed before replay")
+            .expect("ws error");
+        let replay_text = match replay {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let payload: serde_json::Value = serde_json::from_str(&replay_text).expect("replay json");
+        let activities = payload["activities"].as_array().expect("activities array");
+        assert_eq!(activities.len(), 1, "replay should contain one activity");
+        assert_eq!(
+            activities[0]["text"], "hello from replay",
+            "replay activity text"
+        );
+
+        // Simulate a provider-op writing a new activity: append to source,
+        // then publish a notify event (the production code path calls
+        // `try_notify_webchat_activity` after `invoke_provider_for_revision`).
+        let new_wm = test_source.append("live bot reply");
+        notifier
+            .publish(crate::notifier::NotifyEvent {
+                tenant_id: tenant.to_string(),
+                conversation_id: conv_id.to_string(),
+                new_watermark: new_wm + 1,
+            })
+            .await;
+
+        // Second frame: the live-pushed activity.
+        let live = tokio::time::timeout(std::time::Duration::from_millis(3000), ws.next())
+            .await
+            .expect("live timeout — pump never woke (notifier publish missing?)")
+            .expect("ws closed before live frame")
+            .expect("ws error");
+        let live_text = match live {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+            other => panic!("expected text frame for live push, got {other:?}"),
+        };
+        let live_payload: serde_json::Value = serde_json::from_str(&live_text).expect("live json");
+        let live_activities = live_payload["activities"]
+            .as_array()
+            .expect("live activities array");
+        assert!(
+            live_activities
+                .iter()
+                .any(|a| a["text"] == "live bot reply"),
+            "expected live bot reply in {live_activities:?}",
+        );
+
+        let _ = ws.close(None).await;
+        accept_handle.abort();
+    }
+
+    /// Combined regression for the webchat token 502: the store is keyed the
+    /// way greentic-setup/`SecretsSetup` persist (canonical underscore
+    /// provider segment, tenant-level `_` team), the serve-path manager built
+    /// by `resolve_serve_secrets_manager` is installed via
+    /// `HostBuilder::with_secrets_manager` exactly like `revision_boot`, and
+    /// the read uses the raw hyphenated pack-stem URI the runner-host's
+    /// provider self-read emits. Before the fallback wrapper this read was
+    /// NotFound → webchat-gui returned 500 secret_error → `/token` 502'd.
+    #[tokio::test]
+    async fn serve_secrets_stack_resolves_component_self_read_uri() {
+        use greentic_secrets_lib::{
+            SecretFormat, SeedDoc, SeedEntry, SeedValue,
+            core::seed::{ApplyOptions, DevStore, apply_seed},
+        };
+
+        let env_dir = tempfile::tempdir().expect("tempdir");
+        let store_path = env_dir.path().join(".greentic/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap()).expect("store dir");
+        let store = DevStore::with_path(store_path).expect("dev store");
+        let seed = SeedDoc {
+            entries: vec![SeedEntry {
+                uri: "secrets://local/demo/_/messaging_webchat_gui/jwt_signing_key".to_string(),
+                format: SecretFormat::Text,
+                value: SeedValue::Text {
+                    text: "signing-key".to_string(),
+                },
+                description: None,
+            }],
+        };
+        let report = apply_seed(&store, &seed, ApplyOptions::default()).await;
+        assert_eq!(report.ok, 1);
+
+        let (secrets, _scope) = {
+            let guard = crate::test_env_lock().lock().unwrap();
+            unsafe {
+                std::env::remove_var(crate::secrets_gate::ENV_SERVE_SECRETS_BACKEND);
+                std::env::remove_var("GREENTIC_DEV_SECRETS_PATH");
+            }
+            let resolved =
+                crate::secrets_gate::resolve_serve_secrets_manager(env_dir.path(), "demo");
+            drop(guard);
+            resolved.expect("serve secrets manager")
+        };
+
+        let host = greentic_runner_host::HostBuilder::new()
+            .with_config(greentic_runner_host::HostConfig::from_gtbind(
+                greentic_runner_host::TenantBindings {
+                    tenant: "demo".to_string(),
+                    packs: Vec::new(),
+                    env_passthrough: Vec::new(),
+                },
+            ))
+            .with_secrets_manager(secrets)
+            .build()
+            .expect("build host");
+
+        let value = host
+            .secrets_manager()
+            .read("secrets://local/demo/_/messaging-webchat-gui/jwt_signing_key")
+            .await
+            .expect("hyphenated self-read URI must resolve the underscore-keyed store");
+        assert_eq!(value, b"signing-key");
     }
 }

@@ -650,7 +650,18 @@ pub fn resolve_serve_secrets_manager(
     let raw = env::var(ENV_SERVE_SECRETS_BACKEND).unwrap_or_default();
     let kind = SecretsBackendKind::parse(&raw)
         .with_context(|| format!("invalid {ENV_SERVE_SECRETS_BACKEND}={raw:?}"))?;
-    let (manager, _dev_store_path) = serve_secrets_manager_for_kind(kind, env_dir, tenant)?;
+    let (manager, dev_store_path) = serve_secrets_manager_for_kind(kind, env_dir, tenant)?;
+    // Wrap with the same canonicalization/team-wildcard fallback chain the
+    // `--bundle` runner-host gets via `SecretsManagerHandle::runtime_manager`:
+    // stores are keyed with canonical underscore provider segments while the
+    // external runner-host requests raw pack-stem providers (e.g.
+    // `messaging-webchat-gui`), so a raw manager misses on every provider
+    // self-read (webchat `jwt_signing_key` → 500 secret_error → token 502).
+    let manager: DynSecretsManager = Arc::new(LoggingSecretsManager::new(
+        manager,
+        dev_store_path.as_deref(),
+        false,
+    ));
     let tenant_scope = matches!(kind, SecretsBackendKind::Vault).then(|| tenant.to_string());
     Ok((manager, tenant_scope))
 }
@@ -1993,6 +2004,74 @@ mod tests {
         }
         drop(env_guard);
         assert!(result.is_err());
+        Ok(())
+    }
+
+    /// Seed a DevStore at the env dir's default location with a single
+    /// underscore-keyed entry (the canonical form greentic-setup and
+    /// `SecretsSetup` persist), then hand back the serve-path manager.
+    fn serve_manager_over_underscore_store(
+        env_dir: &Path,
+        runtime: &Runtime,
+    ) -> anyhow::Result<DynSecretsManager> {
+        let store_path = env_dir.join(".greentic/dev/.dev.secrets.env");
+        std::fs::create_dir_all(store_path.parent().unwrap())?;
+        let store = DevStore::with_path(store_path)?;
+        let seed = SeedDoc {
+            entries: vec![SeedEntry {
+                uri: "secrets://local/demo/_/messaging_webchat_gui/jwt_signing_key".to_string(),
+                format: SecretFormat::Text,
+                value: SeedValue::Text {
+                    text: "signing-key".to_string(),
+                },
+                description: None,
+            }],
+        };
+        let report =
+            runtime.block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
+        assert_eq!(report.ok, 1);
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            env::remove_var(ENV_SERVE_SECRETS_BACKEND);
+            env::remove_var("GREENTIC_DEV_SECRETS_PATH");
+        }
+        let resolved = resolve_serve_secrets_manager(env_dir, "demo");
+        drop(env_guard);
+        let (manager, _tenant_scope) = resolved?;
+        Ok(manager)
+    }
+
+    #[test]
+    fn serve_manager_resolves_underscore_store_from_hyphenated_uri() -> anyhow::Result<()> {
+        // The external runner-host (provider self-reads on the revision path)
+        // requests raw pack-stem providers: `messaging-webchat-gui`. The store
+        // is keyed canonically: `messaging_webchat_gui`. Without the fallback
+        // wrapper this read is NotFound and the webchat token op 500s.
+        let env_dir = tempdir()?;
+        let runtime = Runtime::new()?;
+        let manager = serve_manager_over_underscore_store(env_dir.path(), &runtime)?;
+        let value = runtime.block_on(async {
+            manager
+                .read("secrets://local/demo/_/messaging-webchat-gui/jwt_signing_key")
+                .await
+        })?;
+        assert_eq!(value, b"signing-key");
+        Ok(())
+    }
+
+    #[test]
+    fn serve_manager_applies_team_wildcard_fallback() -> anyhow::Result<()> {
+        // Reads carrying a concrete team (e.g. `default` from the routing
+        // context) must fall back to the tenant-level `_` wildcard entry.
+        let env_dir = tempdir()?;
+        let runtime = Runtime::new()?;
+        let manager = serve_manager_over_underscore_store(env_dir.path(), &runtime)?;
+        let value = runtime.block_on(async {
+            manager
+                .read("secrets://local/demo/default/messaging-webchat-gui/jwt_signing_key")
+                .await
+        })?;
+        assert_eq!(value, b"signing-key");
         Ok(())
     }
 }

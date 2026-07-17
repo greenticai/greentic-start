@@ -97,6 +97,11 @@ pub struct DemoConfig {
     pub services: DemoServicesConfig,
     #[serde(default)]
     pub providers: Option<std::collections::BTreeMap<String, DemoProviderConfig>>,
+    /// Optional `sql:` block enabling the localhost SQL gateway (schema +
+    /// query endpoints). Uses the published `greentic-runner-host` sql config
+    /// so the engine types line up with `sql::pool::build`/`SqlConnection`.
+    #[serde(default)]
+    pub sql: Option<greentic_runner_host::sql::config::SqlConfig>,
 }
 
 impl Default for DemoConfig {
@@ -106,6 +111,7 @@ impl Default for DemoConfig {
             team: default_demo_team(),
             services: DemoServicesConfig::default(),
             providers: None,
+            sql: None,
         }
     }
 }

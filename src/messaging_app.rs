@@ -30,6 +30,12 @@ pub struct AppPackInfo {
 pub struct AppFlowInfo {
     pub id: String,
     pub kind: String,
+    /// Event topic patterns this flow subscribes to (from the pack manifest's
+    /// `subscribes_to` array). Empty when the flow declares no subscriptions.
+    /// Consumed by the research-lineage subscription router
+    /// (`event_router::select_target_flows`); the default-flow router
+    /// (`route_events_to_default_flow`) ignores it.
+    pub subscribes_to: Vec<String>,
 }
 
 pub fn resolve_app_pack_path(
@@ -736,10 +742,31 @@ fn parse_flow_entry(value: &CborValue) -> Option<AppFlowInfo> {
     } else {
         extract_text_from_map(map, "kind")
     };
+    let subscribes_to = extract_string_array_from_map(map, "subscribes_to");
     Some(AppFlowInfo {
         id,
         kind: kind.unwrap_or_else(|| "messaging".to_string()),
+        subscribes_to,
     })
+}
+
+/// Extract a `Vec<String>` from a CBOR map field holding a text array;
+/// non-text items and absent/non-array fields yield an empty vec.
+fn extract_string_array_from_map(map: &BTreeMap<CborValue, CborValue>, key: &str) -> Vec<String> {
+    map.get(&CborValue::Text(key.to_string()))
+        .and_then(|value| match value {
+            CborValue::Array(items) => Some(
+                items
+                    .iter()
+                    .filter_map(|item| match item {
+                        CborValue::Text(text) => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn extract_text_from_map(map: &BTreeMap<CborValue, CborValue>, key: &str) -> Option<String> {
@@ -1595,10 +1622,12 @@ mod tests {
                 AppFlowInfo {
                     id: "alternate".to_string(),
                     kind: "messaging".to_string(),
+                    subscribes_to: vec![],
                 },
                 AppFlowInfo {
                     id: "default".to_string(),
                     kind: "workflow".to_string(),
+                    subscribes_to: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1611,10 +1640,12 @@ mod tests {
                 AppFlowInfo {
                     id: "notify".to_string(),
                     kind: "messaging".to_string(),
+                    subscribes_to: vec![],
                 },
                 AppFlowInfo {
                     id: "wizard".to_string(),
                     kind: "setup".to_string(),
+                    subscribes_to: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1635,14 +1666,17 @@ mod tests {
                 AppFlowInfo {
                     id: "main".to_string(),
                     kind: "messaging".to_string(),
+                    subscribes_to: vec![],
                 },
                 AppFlowInfo {
                     id: "on_message".to_string(),
                     kind: "messaging".to_string(),
+                    subscribes_to: vec![],
                 },
                 AppFlowInfo {
                     id: "order_tracking_flow".to_string(),
                     kind: "messaging".to_string(),
+                    subscribes_to: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1664,14 +1698,17 @@ mod tests {
                 AppFlowInfo {
                     id: "main".to_string(),
                     kind: "workflow".to_string(),
+                    subscribes_to: vec![],
                 },
                 AppFlowInfo {
                     id: "alpha".to_string(),
                     kind: "messaging".to_string(),
+                    subscribes_to: vec![],
                 },
                 AppFlowInfo {
                     id: "beta".to_string(),
                     kind: "messaging".to_string(),
+                    subscribes_to: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1692,10 +1729,12 @@ mod tests {
                 AppFlowInfo {
                     id: "one".to_string(),
                     kind: "messaging".to_string(),
+                    subscribes_to: vec![],
                 },
                 AppFlowInfo {
                     id: "two".to_string(),
                     kind: "messaging".to_string(),
+                    subscribes_to: vec![],
                 },
             ],
             capabilities: Vec::new(),

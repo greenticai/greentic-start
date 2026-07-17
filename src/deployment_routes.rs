@@ -19,6 +19,7 @@ use serde_json::Value as JsonValue;
 
 use crate::http_routes::HttpRouteTable;
 use crate::revision_dispatcher::RevisionDispatcher;
+use crate::static_routes::ActiveRouteTable;
 
 /// Per-deployment, per-pack non-secret config overrides projected from each
 /// active `BundleDeployment.config_overrides` (D.4). Outer key is the
@@ -243,6 +244,10 @@ pub struct RevisionIngressRouting {
     /// the routing-table swap a reload performs — the egress reads it on
     /// every reply.
     pub deployment_config_overrides: Arc<DeploymentConfigOverrides>,
+    /// Revision-scoped static routes (`scope = Some(..)`) discovered per
+    /// loaded revision, matched via
+    /// [`ActiveRouteTable::match_request_for_revision`].
+    pub static_routes: ActiveRouteTable,
 }
 
 /// Strip a trailing `:port` from a host header value. IPv6 literals are bracketed

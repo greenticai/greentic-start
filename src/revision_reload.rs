@@ -53,6 +53,7 @@ const ENVIRONMENT_FILE: &str = "environment.json";
 use crate::operator_log;
 use crate::revision_boot::{self, RuntimeConfigActivation};
 use crate::revision_pin::RevisionPinStore;
+use crate::revision_secrets;
 use crate::revision_serve::{Activation, RevisionServer};
 use crate::runtime_config::{self, LoadedRuntimeConfig};
 use crate::secrets_gate::DynSecretsManager;
@@ -372,6 +373,16 @@ fn rebuild_once(
     {
         return Ok(None);
     }
+    // A reload can attach revisions of packs whose `generated` secrets were
+    // never minted (the deployer stages packs, not secrets). Seed before
+    // activating, exactly like the cold-start boot; on failure this reload is
+    // aborted (logged by the watcher) and the old activation keeps serving.
+    let env_dir = runtime_config::env_dir_in(store_root, env_id)?;
+    activation_rt.block_on(revision_secrets::ensure_generated_secrets_for_activation(
+        &env_dir,
+        &rc,
+        &environment,
+    ))?;
     let RuntimeConfigActivation { host, routing } =
         activation_rt.block_on(revision_boot::activate_runtime_config(
             store_root,
@@ -482,6 +493,7 @@ mod tests {
             deployment_routes: DeploymentRouteTable::default(),
             endpoint_admit: Arc::new(EndpointAdmit::default()),
             deployment_config_overrides: Arc::default(),
+            static_routes: crate::static_routes::ActiveRouteTable::default(),
         });
         let activation = Arc::new(Activation { host, routing });
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -492,6 +504,9 @@ mod tests {
                 gui_enabled: false,
                 trust_loopback_peers: true,
                 admin_bind_addr: None,
+                updates_enabled: false,
+                auto_restart_enabled: false,
+                exe_path: None,
             })
             .expect("placeholder server"),
         )

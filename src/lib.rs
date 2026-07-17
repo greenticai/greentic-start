@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 use clap::Parser;
@@ -10,16 +10,20 @@ mod admin_server;
 mod bin_resolver;
 mod bundle_config;
 mod bundle_ref;
+mod business_event_listener;
 mod capabilities;
 mod cards;
 mod cli_args;
 mod cloudflared;
 mod component_qa_ops;
 pub mod config;
+mod conv_dedup;
 mod demo_qa_bridge;
 mod dependency_resolver;
 mod deployment_routes;
 mod dev_store_path;
+mod directline_session;
+mod directline_token;
 mod discovery;
 mod doctor;
 mod doctor_env;
@@ -27,19 +31,25 @@ mod domains;
 mod endpoint_admit;
 mod endpoint_resolver;
 mod env_tunnel;
-mod event_router;
+// `pub` (doc-hidden) so `tests/threshold_watcher.rs` can drive
+// `select_target_flows` and the event-routing types directly.
+#[doc(hidden)]
+pub mod event_router;
 mod extension_resolver;
 mod fast2flow;
 pub(crate) mod flow_log;
 mod gmap;
+mod http_helpers;
 mod http_ingress;
 mod http_routes;
 mod identify_payload;
 mod ingress;
 mod ingress_dispatch;
-mod ingress_types;
+#[doc(hidden)]
+pub mod ingress_types;
 mod llm;
-mod messaging_app;
+#[doc(hidden)]
+pub mod messaging_app;
 mod messaging_dto;
 mod messaging_egress;
 mod metrics;
@@ -69,6 +79,7 @@ pub mod revision_health_gate;
 mod revision_pin;
 mod revision_pull;
 mod revision_reload;
+mod revision_secrets;
 mod revision_serve;
 mod revision_webhook_register;
 mod rollout_telemetry;
@@ -95,18 +106,26 @@ mod setup_input;
 mod setup_to_formspec;
 mod startup_contract;
 mod state_layout;
+mod static_handler;
 mod static_routes;
 mod subscription_updater;
 mod subscriptions_universal;
 pub mod supervisor;
 #[cfg(test)]
 mod test_fixtures;
+// `pub` (doc-hidden) so `tests/threshold_watcher.rs` can drive `poll_once`
+// and the config/state/eval types directly, the same way `ws_test_support`
+// and `perf_harness` are exposed for their own integration tests.
+#[doc(hidden)]
+pub mod threshold_watcher;
 mod timer_scheduler;
+mod topic_match;
 mod tunnel_prompt;
 mod tunnel_state;
 mod warmup;
 mod webhook_secret_resolver;
 mod webhook_updater;
+mod websocket;
 #[doc(hidden)]
 pub mod ws_test_support;
 
@@ -436,6 +455,15 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             .context("cannot determine the default environment store root (no home directory)")?;
         let env_dir = runtime_config::env_dir_in(&store_root, &env_id)?;
 
+        // P7e: capture the exe path ONCE, before any binary swap can
+        // invalidate `/proc/self/exe` (deleted-inode hazard on Linux).
+        let own_exe = std::env::current_exe()
+            .and_then(|p| p.canonicalize())
+            .context("resolving own executable path for auto-restart")?;
+
+        // P7e: resolve auto-restart. CLI flag or env var disables it.
+        let auto_restart = resolve_auto_restart(request.no_auto_restart);
+
         // Initialize operator.log under the env directory before any
         // `operator_log::*` call on this path; otherwise every banner,
         // listener log, and warning is silently dropped (the logger
@@ -457,6 +485,73 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // request aimed at this process.
         let shutdown_paths = env_tunnel::env_runtime_paths(&env_dir, &env_id);
         runtime_state::clear_stop_request(&shutdown_paths)?;
+
+        // P7e: boot-time marker processing. Determines whether this process
+        // is the NEW binary after a successful exec, the OLD binary after a
+        // rollback, or a fresh/stale start. The decision is made by a pure
+        // function (`decide_boot_action`) so the logic is unit-testable.
+        #[cfg(unix)]
+        let mut _boot_rollback_guard = {
+            let own_version = env!("CARGO_PKG_VERSION");
+            let marker = revision_serve::read_binary_update_marker(&env_dir);
+            match revision_serve::decide_boot_action(marker, own_version) {
+                revision_serve::BootAction::Proceed => None,
+                revision_serve::BootAction::ArmGuard(mut marker) => {
+                    marker.boot_attempts += 1;
+                    if let Err(err) = revision_serve::write_marker_durable(&env_dir, &marker) {
+                        // The guard below is still armed, so a graceful boot
+                        // failure still rolls back. Only the hard-kill (SIGKILL
+                        // / OOM) loop breaker is degraded: an unpersisted
+                        // counter never advances.
+                        operator_log::error(
+                            module_path!(),
+                            format!(
+                                "binary-update: failed to persist boot-attempt counter: {err}; \
+                                 rollback guard is still armed, but a hard-kill boot loop will \
+                                 not be broken automatically"
+                            ),
+                        );
+                    }
+                    Some(BootRollbackGuard {
+                        env_dir: env_dir.clone(),
+                        exe_path: own_exe.clone(),
+                        marker,
+                        disarmed: false,
+                    })
+                }
+                revision_serve::BootAction::RollbackNow(marker) => {
+                    operator_log::error(
+                        module_path!(),
+                        format!(
+                            "binary-update: version {} failed to complete boot {} times \
+                             (hard-kill loop); rolling back to {}",
+                            marker.to_version, marker.boot_attempts, marker.from_version,
+                        ),
+                    );
+                    execute_rollback(&env_dir, &own_exe, &marker);
+                    anyhow::bail!(
+                        "binary-update: rollback after {} failed boot attempts for version {}; \
+                         restore_prev or re-exec failed — exiting",
+                        marker.boot_attempts,
+                        marker.to_version,
+                    );
+                }
+                revision_serve::BootAction::ClearMarker => {
+                    revision_serve::clear_binary_update_marker(&env_dir);
+                    None
+                }
+                revision_serve::BootAction::PreserveTombstone => {
+                    operator_log::warn(
+                        module_path!(),
+                        format!(
+                            "binary-update: running as the failed version {own_version} \
+                             (restore_prev may have failed); tombstone preserved",
+                        ),
+                    );
+                    None
+                }
+            }
+        };
 
         // Load the Environment so the bind address can layer on top of the
         // persisted `host_config.listen_addr`. The same `Environment` is
@@ -559,6 +654,18 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // `GREENTIC_REVISION_PIN_REDIS_URL` is configured (fail-open to
         // in-memory); see that fn for the rationale.
         let pin_store = revision_pin::resolve_pin_store(&activation_rt);
+        // Mint declared `generated` provider secrets (e.g. the webchat-gui
+        // `jwt_signing_key`) before serving — the env path's counterpart to
+        // the `--bundle` boot's `ensure_generated_provider_secrets`. Without
+        // it, provider token ops 500 with `secret_error: not-found` on any
+        // bundle that never went through a legacy boot.
+        activation_rt
+            .block_on(revision_secrets::ensure_generated_secrets_for_activation(
+                &env_dir,
+                &rc,
+                &environment,
+            ))
+            .context("failed to seed generated provider secrets")?;
         let activation = activation_rt.block_on(revision_boot::activate_runtime_config(
             &store_root,
             &rc,
@@ -579,8 +686,20 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let bind_addr = revision_serve::resolve_bind_addr(Some(&environment.host_config));
         // On by default for the `local` env, off elsewhere unless the operator
         // opted in (`op config set gui_enabled` / env-manifest). When on, the
-        // server serves the built-in webchat console at `/chat`.
-        let gui_enabled = environment.host_config.resolved_gui_enabled();
+        // server serves the built-in webchat console at `/chat`. A deployed
+        // pack that ships its own webchat UI (a `/v1/web/webchat/...` static
+        // route, e.g. messaging-webchat-gui) supersedes the console: the
+        // default turns it off so only the pack's qualified UI is exposed,
+        // while an explicit `gui_enabled: true` still forces the console on.
+        let pack_webchat_routes: Vec<String> = routing
+            .static_routes
+            .routes()
+            .iter()
+            .filter(|route| route.public_path.starts_with("/v1/web/webchat"))
+            .map(|route| route.public_path.clone())
+            .collect();
+        let gui_enabled =
+            resolve_console_enabled(&environment.host_config, !pack_webchat_routes.is_empty());
         // A public tunnel (`--cloudflared on` / `--ngrok on`) forwards external
         // traffic to this listener over loopback, so a tunneled request's TCP
         // peer reads as 127.0.0.1 and would defeat the loopback trust gate on
@@ -613,6 +732,9 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             gui_enabled,
             trust_loopback_peers: !will_tunnel,
             admin_bind_addr,
+            updates_enabled: !request.no_updates,
+            auto_restart_enabled: auto_restart,
+            exe_path: Some(own_exe.clone()),
         })
         .context("starting the revision ingress server")?;
         let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
@@ -632,6 +754,35 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         };
         operator_log::info(module_path!(), banner.clone());
         println!("\n{banner}. Press Ctrl+C to stop.");
+        // Advertise the pack-provided webchat UI(s) — one URL per bound
+        // tenant — instead of (or alongside, if explicitly forced) the
+        // built-in console.
+        if !pack_webchat_routes.is_empty() {
+            let tenants: std::collections::BTreeSet<&str> = environment
+                .bundles
+                .iter()
+                .map(|dep| dep.route_binding.tenant_selector.tenant.as_str())
+                .collect();
+            let mut urls = std::collections::BTreeSet::new();
+            for route in &pack_webchat_routes {
+                let base = route.trim_end_matches('/');
+                if base.contains("{tenant}") {
+                    for tenant in &tenants {
+                        urls.insert(format!(
+                            "http://{listen}{}/",
+                            base.replace("{tenant}", tenant)
+                        ));
+                    }
+                } else {
+                    urls.insert(format!("http://{listen}{base}/"));
+                }
+            }
+            for url in urls {
+                let line = format!("UI: {url}");
+                operator_log::info(module_path!(), line.clone());
+                println!("{line}");
+            }
+        }
         if gui_enabled {
             // With a tunnel up, the console lives on the loopback admin listener
             // (the public port serves provider webhooks only); point operators
@@ -761,7 +912,21 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // `greentic-start stop` — the same select loop the legacy bundle arm
         // uses, run on the activation runtime this arm already owns. A
         // corrupt stop file fails the wait loudly on both arms.
-        let reason = activation_rt.block_on(wait_for_shutdown_inner(&shutdown_paths))?;
+        // P7e: disarm the boot rollback guard — boot succeeded.
+        #[cfg(unix)]
+        if let Some(guard) = &mut _boot_rollback_guard {
+            operator_log::info(
+                module_path!(),
+                format!("binary-update: activated {}", guard.marker.to_version,),
+            );
+            revision_serve::clear_binary_update_marker(&env_dir);
+            guard.disarmed = true;
+        }
+
+        let reason = activation_rt.block_on(wait_for_shutdown_inner(
+            &shutdown_paths,
+            if auto_restart { Some(&server) } else { None },
+        ))?;
         if matches!(reason, ShutdownReason::AdminStop) {
             runtime_state::clear_stop_request(&shutdown_paths)?;
             let line = operator_i18n::tr(
@@ -797,6 +962,22 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 );
             }
         }
+
+        #[cfg(unix)]
+        if matches!(reason, ShutdownReason::BinaryUpdateRestart) {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "binary-update: auto-restarting into new binary at {}",
+                    own_exe.display(),
+                ),
+            );
+            // Drop the trace guard to flush logs before exec.
+            drop(_trace_guard);
+            exec_into_self(&own_exe)?;
+            // exec_into_self does not return on success.
+        }
+
         return Ok(());
     }
 
@@ -890,6 +1071,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
 
     let mut demo_config = bundle_config::load_runtime_demo_config(&demo_paths, &request)?;
     apply_nats_overrides(&mut demo_config, &request);
+    apply_setup_tunnel_handoff(&mut demo_config, &config_dir);
 
     // Make the bundle's `llm:` instance available to every LLM consumer (the
     // Fast2Flow routing fallback today; other features later). Peeked once at
@@ -1352,6 +1534,35 @@ fn apply_nats_overrides(config: &mut config::DemoConfig, args: &StartRequest) {
     }
 }
 
+/// Binds the gateway to the same local port `greentic-setup` already
+/// speculatively tunneled, when a handoff record exists (see
+/// `startup_contract::configured_gateway_port_from_handoff`). This makes the
+/// boot sequence's shared tunnel record recognise and adopt setup's tunnel
+/// instead of minting a disconnected second one on the configured/default
+/// port. A missing or unreadable handoff is not fatal — the gateway just
+/// keeps whatever port the bundle config (or its default) already specified.
+fn apply_setup_tunnel_handoff(config: &mut config::DemoConfig, config_dir: &Path) {
+    match crate::startup_contract::configured_gateway_port_from_handoff(config_dir) {
+        Ok(Some(port)) if port != config.services.gateway.port => {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "adopting setup tunnel handoff: binding gateway to port {port} (was {}) to reuse its tunnel",
+                    config.services.gateway.port
+                ),
+            );
+            config.services.gateway.port = port;
+        }
+        Ok(_) => {}
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!("failed to read setup tunnel handoff, ignoring: {err:#}"),
+            );
+        }
+    }
+}
+
 fn resolve_state_dir(state_dir: Option<PathBuf>, bundle: Option<&str>) -> anyhow::Result<PathBuf> {
     if let Some(state_dir) = state_dir {
         return Ok(state_dir);
@@ -1398,9 +1609,99 @@ fn load_tunnel_config(bundle_root: &std::path::Path) -> Option<TunnelConfig> {
     serde_json::from_str(&raw).ok()
 }
 
+/// Guard that fires boot-fail rollback on drop if the new binary fails to
+/// boot. Armed when the marker says `to_version == own_version` (we are the
+/// NEW binary). Disarmed at the "boot succeeded" point (just before entering
+/// the shutdown select loop).
+#[cfg(unix)]
+struct BootRollbackGuard {
+    env_dir: PathBuf,
+    exe_path: PathBuf,
+    marker: revision_serve::BinaryUpdateMarker,
+    disarmed: bool,
+}
+
+#[cfg(unix)]
+impl Drop for BootRollbackGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        operator_log::error(
+            module_path!(),
+            format!(
+                "binary-update: new version {} failed to boot; rolling back to {}",
+                self.marker.to_version, self.marker.from_version,
+            ),
+        );
+        execute_rollback(&self.env_dir, &self.exe_path, &self.marker);
+    }
+}
+
+/// Shared rollback body: write tombstone, restore previous binary, flush
+/// stderr, exec into the old binary. Used by both `BootRollbackGuard::drop`
+/// (graceful failure) and the boot-attempt-limit path (hard-kill loop
+/// breaker).
+#[cfg(unix)]
+fn execute_rollback(env_dir: &Path, exe_path: &Path, marker: &revision_serve::BinaryUpdateMarker) {
+    revision_serve::write_rollback_tombstone(env_dir, marker);
+    if let Err(err) = greentic_update::binswap::restore_prev(exe_path) {
+        operator_log::error(
+            module_path!(),
+            format!("binary-update: restore_prev failed: {err}; manual recovery required"),
+        );
+        return;
+    }
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    if let Err(err) = exec_into_self(exe_path) {
+        operator_log::error(
+            module_path!(),
+            format!("binary-update: re-exec into old binary failed: {err}"),
+        );
+    }
+}
+
+/// Replace this process with a fresh copy of the binary at `exe`.
+/// Uses `execv` so the PID is preserved and tunnel children (reparented
+/// to PID 1) survive. Does not return on success.
+#[cfg(unix)]
+fn exec_into_self(exe: &Path) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    // exec() only returns on error.
+    Err(anyhow::anyhow!("exec failed: {err}"))
+}
+
+/// Resolve whether auto-restart after binary self-update is enabled.
+/// Returns `true` when all of: unix, CLI flag not set, and env var
+/// `GREENTIC_NO_AUTO_RESTART` not set to a truthy value.
+#[cfg(unix)]
+pub(crate) fn resolve_auto_restart(no_flag: bool) -> bool {
+    if no_flag {
+        return false;
+    }
+    let is_env_disabled = std::env::var("GREENTIC_NO_AUTO_RESTART")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    !is_env_disabled
+}
+
+#[cfg(not(unix))]
+pub(crate) fn resolve_auto_restart(_no_flag: bool) -> bool {
+    false
+}
+
 enum ShutdownReason {
     CtrlC,
     AdminStop,
+    BinaryUpdateRestart,
 }
 
 impl ShutdownReason {
@@ -1408,6 +1709,7 @@ impl ShutdownReason {
         match self {
             Self::CtrlC => "ctrl_c",
             Self::AdminStop => "admin_stop",
+            Self::BinaryUpdateRestart => "binary_update_restart",
         }
     }
 }
@@ -1415,14 +1717,19 @@ impl ShutdownReason {
 fn wait_for_shutdown(paths: &runtime_state::RuntimePaths) -> anyhow::Result<ShutdownReason> {
     let runtime =
         tokio::runtime::Runtime::new().context("failed to spawn runtime for Ctrl+C listener")?;
-    runtime.block_on(wait_for_shutdown_inner(paths))
+    runtime.block_on(wait_for_shutdown_inner(paths, None))
 }
 
 /// Core Ctrl+C / stop-request select loop, shared by the legacy bundle arm
 /// (via [`wait_for_shutdown`], on its own throwaway runtime) and the
 /// bundle-less env-serving arm (on the activation runtime it already owns).
+///
+/// When `auto_restart_check` is `Some`, the 250ms poll also checks the
+/// auto-restart-pending flag and returns `BinaryUpdateRestart` when set.
+/// The legacy bundle arm passes `None` (auto-restart is env-serve only).
 async fn wait_for_shutdown_inner(
     paths: &runtime_state::RuntimePaths,
+    auto_restart_check: Option<&std::sync::Arc<revision_serve::RevisionServer>>,
 ) -> anyhow::Result<ShutdownReason> {
     loop {
         tokio::select! {
@@ -1434,8 +1741,31 @@ async fn wait_for_shutdown_inner(
                 if runtime_state::read_stop_request(paths)?.is_some() {
                     return Ok(ShutdownReason::AdminStop);
                 }
+                if let Some(server) = auto_restart_check
+                    && server.auto_restart_pending()
+                {
+                    return Ok(ShutdownReason::BinaryUpdateRestart);
+                }
             }
         }
+    }
+}
+
+/// Decide whether the built-in `/chat` webchat console is served on the
+/// env/revision path.
+///
+/// Explicit operator intent (`gui_enabled` in the env host config) always
+/// wins. By default the console follows `resolved_gui_enabled()` (on for the
+/// `local` env) — unless a deployed pack ships its own webchat UI, which
+/// supersedes the console so only the qualified `/v1/web/webchat/{tenant}/`
+/// surface is exposed.
+fn resolve_console_enabled(
+    host_config: &greentic_deploy_spec::EnvironmentHostConfig,
+    has_pack_webchat_ui: bool,
+) -> bool {
+    match host_config.gui_enabled {
+        Some(explicit) => explicit,
+        None => host_config.resolved_gui_enabled() && !has_pack_webchat_ui,
     }
 }
 
@@ -1451,6 +1781,47 @@ mod tests {
     use std::path::Path;
     use std::thread;
     use std::time::Duration;
+
+    fn host_config_with_gui(
+        gui_enabled: Option<bool>,
+    ) -> greentic_deploy_spec::EnvironmentHostConfig {
+        greentic_deploy_spec::EnvironmentHostConfig {
+            env_id: greentic_types::EnvId::try_from("local").unwrap(),
+            region: None,
+            tenant_org_id: None,
+            listen_addr: None,
+            public_base_url: None,
+            gui_enabled,
+        }
+    }
+
+    #[test]
+    fn console_defaults_on_for_local_without_pack_webchat_ui() {
+        assert!(resolve_console_enabled(&host_config_with_gui(None), false));
+    }
+
+    #[test]
+    fn console_suppressed_by_default_when_pack_ships_webchat_ui() {
+        // The old behavior: the qualified /v1/web/webchat/{tenant}/ UI is THE
+        // chat; the built-in console must not appear alongside it.
+        assert!(!resolve_console_enabled(&host_config_with_gui(None), true));
+    }
+
+    #[test]
+    fn console_explicit_true_wins_over_pack_webchat_ui() {
+        assert!(resolve_console_enabled(
+            &host_config_with_gui(Some(true)),
+            true
+        ));
+    }
+
+    #[test]
+    fn console_explicit_false_disables_unconditionally() {
+        assert!(!resolve_console_enabled(
+            &host_config_with_gui(Some(false)),
+            false
+        ));
+    }
 
     #[test]
     fn build_trace_filter_clamps_noisy_targets_even_when_rust_log_unset() {
@@ -1541,6 +1912,8 @@ mod tests {
             verbose: false,
             quiet: false,
             no_browser: false,
+            no_updates: false,
+            no_auto_restart: false,
             admin: false,
             admin_port: 9443,
             admin_certs_dir: None,
@@ -1574,6 +1947,8 @@ mod tests {
             verbose: false,
             quiet: false,
             no_browser: false,
+            no_updates: false,
+            no_auto_restart: false,
             admin: false,
             admin_port: 9443,
             admin_certs_dir: None,
@@ -1584,6 +1959,36 @@ mod tests {
         assert!(config.services.nats.enabled);
         assert!(!config.services.nats.spawn.enabled);
         assert_eq!(config.services.nats.url, "nats://127.0.0.1:5555");
+    }
+
+    #[test]
+    fn apply_setup_tunnel_handoff_binds_gateway_to_recorded_port() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let platform_dir = temp.path().join("state").join("config").join("platform");
+        std::fs::create_dir_all(&platform_dir).unwrap();
+        std::fs::write(
+            platform_dir.join("tunnel-handoff.json"),
+            r#"{"service":"cloudflared","local_port":54213,"public_base_url":"https://example.trycloudflare.com"}"#,
+        )
+        .unwrap();
+
+        let mut config = config::DemoConfig::default();
+        let original_port = config.services.gateway.port;
+        apply_setup_tunnel_handoff(&mut config, temp.path());
+
+        assert_eq!(config.services.gateway.port, 54213);
+        assert_ne!(config.services.gateway.port, original_port);
+    }
+
+    #[test]
+    fn apply_setup_tunnel_handoff_keeps_configured_port_without_a_handoff_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = config::DemoConfig::default();
+        let original_port = config.services.gateway.port;
+
+        apply_setup_tunnel_handoff(&mut config, temp.path());
+
+        assert_eq!(config.services.gateway.port, original_port);
     }
 
     #[test]
@@ -1646,6 +2051,8 @@ mod tests {
             verbose: false,
             quiet: false,
             no_browser: false,
+            no_updates: false,
+            no_auto_restart: false,
             admin: false,
             admin_port: 9443,
             admin_certs_dir: None,
@@ -1987,5 +2394,160 @@ mod tests {
         assert_eq!(resolve_env(Some("local")), "local");
         assert_eq!(resolve_env(Some("staging")), "staging");
         assert_eq!(resolve_env(None), "local");
+    }
+
+    // --- P7e: ShutdownReason + auto-restart tests ---
+
+    #[test]
+    fn shutdown_reason_binary_update_restart_as_str() {
+        assert_eq!(
+            ShutdownReason::BinaryUpdateRestart.as_str(),
+            "binary_update_restart"
+        );
+    }
+
+    #[test]
+    fn auto_restart_env_var_disables() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("GREENTIC_NO_AUTO_RESTART", "1") };
+        let result = super::resolve_auto_restart(false);
+        assert!(
+            !result,
+            "env var GREENTIC_NO_AUTO_RESTART=1 must disable auto-restart"
+        );
+        unsafe { std::env::remove_var("GREENTIC_NO_AUTO_RESTART") };
+    }
+
+    #[test]
+    fn auto_restart_enabled_when_env_var_unset_and_flag_false() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("GREENTIC_NO_AUTO_RESTART") };
+        let result = super::resolve_auto_restart(false);
+        if cfg!(unix) {
+            assert!(
+                result,
+                "auto-restart should be enabled when nothing disables it"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_restart_disabled_by_cli_flag() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("GREENTIC_NO_AUTO_RESTART") };
+        let result = super::resolve_auto_restart(true);
+        assert!(!result, "CLI flag must disable auto-restart");
+    }
+
+    #[test]
+    fn auto_restart_env_var_case_insensitive() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        for val in ["TRUE", "True", "YES", "Yes", "ON", "On", "1"] {
+            unsafe { std::env::set_var("GREENTIC_NO_AUTO_RESTART", val) };
+            let result = super::resolve_auto_restart(false);
+            assert!(
+                !result,
+                "env var GREENTIC_NO_AUTO_RESTART={val} must disable auto-restart"
+            );
+        }
+        unsafe { std::env::remove_var("GREENTIC_NO_AUTO_RESTART") };
+    }
+
+    #[test]
+    fn no_auto_restart_flag_parses() {
+        use clap::Parser;
+        let cli = cli_args::Cli::try_parse_from(["greentic-start", "start", "--no-auto-restart"])
+            .unwrap();
+        let cli_args::Command::Start(args) = cli.command else {
+            panic!("expected start");
+        };
+        let req = cli_args::start_request_from_args(args, false);
+        assert!(req.no_auto_restart);
+    }
+
+    #[test]
+    fn no_auto_restart_defaults_false() {
+        use clap::Parser;
+        let cli = cli_args::Cli::try_parse_from(["greentic-start", "start"]).unwrap();
+        let cli_args::Command::Start(args) = cli.command else {
+            panic!("expected start");
+        };
+        let req = cli_args::start_request_from_args(args, false);
+        assert!(!req.no_auto_restart);
+    }
+
+    /// Regression: a RolledBack tombstone where to_version matches the running
+    /// binary (restore_prev failed scenario) must NOT be cleared by the catch-all.
+    #[test]
+    fn boot_marker_rolled_back_to_version_preserves_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_json = serde_json::json!({
+            "name": "greentic-start",
+            "from_version": "1.1.11",
+            "to_version": "1.1.12",
+            "staged_at": "2026-07-13T00:00:00Z",
+            "phase": "rolled_back",
+            "rolled_back_at": "2026-07-13T01:00:00Z",
+        });
+        std::fs::write(
+            dir.path().join("binary-update-pending.json"),
+            serde_json::to_vec_pretty(&marker_json).unwrap(),
+        )
+        .unwrap();
+
+        // Simulate boot marker processing with own_version == to_version.
+        // This is the failed-binary-restart scenario.
+        let own_version = "1.1.12";
+        let read = revision_serve::read_binary_update_marker(dir.path()).unwrap();
+        let should_clear = match read.phase {
+            revision_serve::MarkerPhase::Pending if read.to_version == own_version => false,
+            revision_serve::MarkerPhase::Pending if read.from_version == own_version => false,
+            revision_serve::MarkerPhase::RolledBack if read.from_version == own_version => false,
+            revision_serve::MarkerPhase::RolledBack if read.to_version == own_version => false,
+            _ => true,
+        };
+        assert!(
+            !should_clear,
+            "RolledBack tombstone with to_version == own must NOT be cleared"
+        );
+        // Verify marker still on disk.
+        assert!(
+            revision_serve::read_binary_update_marker(dir.path()).is_some(),
+            "tombstone must survive"
+        );
+    }
+
+    /// Regression: stale marker from a different version lineage SHOULD be cleared.
+    #[test]
+    fn boot_marker_stale_lineage_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_json = serde_json::json!({
+            "name": "greentic-start",
+            "from_version": "1.0.0",
+            "to_version": "1.0.1",
+            "staged_at": "2026-07-13T00:00:00Z",
+            "phase": "rolled_back",
+            "rolled_back_at": "2026-07-13T01:00:00Z",
+        });
+        std::fs::write(
+            dir.path().join("binary-update-pending.json"),
+            serde_json::to_vec_pretty(&marker_json).unwrap(),
+        )
+        .unwrap();
+
+        // own_version is neither from_version nor to_version.
+        let own_version = "1.1.12";
+        let read = revision_serve::read_binary_update_marker(dir.path()).unwrap();
+        let should_clear = match read.phase {
+            revision_serve::MarkerPhase::Pending if read.to_version == own_version => false,
+            revision_serve::MarkerPhase::Pending if read.from_version == own_version => false,
+            revision_serve::MarkerPhase::RolledBack if read.from_version == own_version => false,
+            revision_serve::MarkerPhase::RolledBack if read.to_version == own_version => false,
+            _ => true,
+        };
+        assert!(
+            should_clear,
+            "stale marker from a different lineage must be cleared"
+        );
     }
 }

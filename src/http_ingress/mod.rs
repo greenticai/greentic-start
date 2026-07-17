@@ -3,7 +3,6 @@ mod conv_dedup;
 mod directline_session;
 mod helpers;
 mod messaging;
-mod static_handler;
 pub mod websocket;
 
 use std::{
@@ -42,6 +41,7 @@ use crate::static_routes::{
 };
 use rand::Rng;
 
+use crate::static_handler::serve_static_route;
 use admin_relay::{
     AdminRelayConfig, handle_admin_relay, load_admin_relay_config_from_env, relay_target_path,
 };
@@ -52,7 +52,6 @@ use helpers::{
     handle_oauth_token_exchange, parse_domain, parse_route_segments, with_cors,
 };
 use messaging::route_messaging_envelopes;
-use static_handler::serve_static_route;
 
 const LEGACY_DIRECTLINE_COMPAT_ENV: &str = "GREENTIC_START_ENABLE_LEGACY_DIRECTLINE";
 
@@ -2267,6 +2266,98 @@ fn extract_greentic_metadata(output: &serde_json::Value) -> Option<(String, Stri
     Some((tenant, conversation_id, watermark))
 }
 
+// ---------------------------------------------------------------------------
+// RunnerHostHandle impl for DemoRunnerHost — legacy-coupled, stays here.
+// The trait definition lives in `crate::websocket` (hoisted from A.1); the
+// revision path will supply its own impl in a later PR.
+// ---------------------------------------------------------------------------
+
+impl websocket::RunnerHostHandle for DemoRunnerHost {
+    fn invoke_directline_get_activities(
+        &self,
+        tenant: &str,
+        team: &str,
+        provider: &str,
+        conversation_id: &str,
+        watermark: u64,
+        auth_token: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let headers: Vec<serde_json::Value> = match auth_token {
+            Some(token) if !token.is_empty() => {
+                vec![serde_json::json!([
+                    "Authorization",
+                    format!("Bearer {token}")
+                ])]
+            }
+            _ => Vec::new(),
+        };
+        let payload = serde_json::json!({
+            "v": 1,
+            "provider": provider,
+            "route": serde_json::Value::Null,
+            "binding_id": serde_json::Value::Null,
+            "tenant_hint": tenant,
+            "team_hint": team,
+            "method": "GET",
+            "path": format!("/v3/directline/conversations/{conversation_id}/activities"),
+            "query": format!("watermark={watermark}&tenant={tenant}&team={team}"),
+            "headers": headers,
+            "body_b64": "",
+            "config": serde_json::Value::Null,
+        });
+        let payload_bytes = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
+        let ctx = OperatorContext {
+            tenant: tenant.to_string(),
+            team: Some(team.to_string()),
+            correlation_id: None,
+        };
+        // The webchat provider exposes its directline routing under the
+        // generic `ingest_http` op (with hyphen alias). Try the canonical
+        // name first, then fall back to the underscore alias used by older
+        // pack builds.
+        let outcome = self
+            .invoke_provider_op(
+                Domain::Messaging,
+                provider,
+                "ingest-http",
+                &payload_bytes,
+                &ctx,
+            )
+            .or_else(|_| {
+                self.invoke_provider_op(
+                    Domain::Messaging,
+                    provider,
+                    "ingest_http",
+                    &payload_bytes,
+                    &ctx,
+                )
+            })
+            .map_err(|err| err.to_string())?;
+        if !outcome.success {
+            return Err(outcome
+                .error
+                .or(outcome.raw)
+                .unwrap_or_else(|| "provider ingest_http failed".to_string()));
+        }
+        let value = outcome
+            .output
+            .ok_or_else(|| "directline_http returned no output".to_string())?;
+        let body_b64 = value
+            .get("body_b64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing body_b64 in directline_http response".to_string())?;
+        let body_bytes = base64::engine::general_purpose::STANDARD
+            .decode(body_b64.as_bytes())
+            .map_err(|err| format!("invalid base64 body_b64: {err}"))?;
+        // Empty body -> empty object so callers can keep consistent shape.
+        if body_bytes.is_empty() {
+            return Ok(serde_json::json!({"activities": [], "watermark": watermark.to_string()}));
+        }
+        serde_json::from_slice::<serde_json::Value>(&body_bytes)
+            .map_err(|err| format!("invalid directline_http body json: {err}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::helpers::{handle_builtin_health_request, parse_route_segments};
@@ -2441,6 +2532,7 @@ mod tests {
             http_routes: HttpRouteTable::default(),
             deployment_routes,
             deployment_config_overrides: Arc::default(),
+            static_routes: ActiveRouteTable::default(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
@@ -2483,6 +2575,7 @@ mod tests {
             http_routes: HttpRouteTable::default(),
             deployment_routes,
             deployment_config_overrides: Arc::default(),
+            static_routes: ActiveRouteTable::default(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
@@ -2784,6 +2877,7 @@ mod tests {
             team_scoped: false,
             cache_strategy: CacheStrategy::None,
             route_segments: vec![RouteScopeSegment::Literal("web".to_string())],
+            scope: None,
         };
         let notifier = runtime
             .block_on(crate::notifier::build_notifier(
@@ -2875,6 +2969,7 @@ mod tests {
                 RouteScopeSegment::Literal("webchat".to_string()),
                 RouteScopeSegment::Tenant,
             ],
+            scope: None,
         };
         let notifier = runtime
             .block_on(crate::notifier::build_notifier(
@@ -2958,6 +3053,7 @@ mod tests {
                 RouteScopeSegment::Tenant,
                 RouteScopeSegment::Team,
             ],
+            scope: None,
         };
         let route_match = StaticRouteMatch {
             descriptor: &descriptor,
@@ -2996,6 +3092,7 @@ mod tests {
                 RouteScopeSegment::Tenant,
                 RouteScopeSegment::Team,
             ],
+            scope: None,
         };
         let route_match = StaticRouteMatch {
             descriptor: &descriptor,

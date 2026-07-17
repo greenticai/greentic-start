@@ -181,6 +181,26 @@ That defaulting is applied in [src/lib.rs](/projects/ai/greentic-ng/greentic-sta
 
 Logging initialization happens in [src/lib.rs](/projects/ai/greentic-ng/greentic-start/src/lib.rs:137).
 
+### Updates
+
+- `--no-updates`
+  Opts this process out of the environment's update channel: no poll loop runs and
+  `/v1/updates/notify` is not reserved (the path falls through to deployment
+  routing). It is a host-local kill switch, not a policy knob — the env's
+  `update-channel.json` (`enabled`, `on_update`) is left untouched, so a restart
+  without the flag resumes whatever the operator declared.
+
+Without the flag the runtime always runs the poll loop. The loop re-reads
+`update-channel.json` every cycle and no-ops while the channel is absent, disabled,
+or endpoint-less, so an env that subscribes *after* boot starts polling without a
+restart. Deny-by-default is unchanged: an env with no `update-channel.json` never
+fetches anything, and a notification to a disabled channel is ignored.
+
+`on_update: apply` (deploy-spec 0.2.2) makes a verified, staged plan converge the
+environment in place — the apply rewrites `runtime-config.json`, which this process
+already watches, so traffic moves with no restart. `stage` (the default) leaves the
+content on disk for a human to apply.
+
 ### Admin API
 
 - `--admin`

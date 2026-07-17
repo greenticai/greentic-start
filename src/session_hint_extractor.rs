@@ -32,6 +32,39 @@ pub(crate) fn extract_session_hint(
     }
 }
 
+/// Extract a webchat/DirectLine session hint from the request path.
+///
+/// DirectLine requests carry the conversation id in the URL path
+/// (`/v3/directline/conversations/{id}/activities`, etc.) and in the JWT
+/// `conv` claim. The URL path is the cheapest and most reliable source.
+/// Returns `Some("webchat:{conversation_id}")` when the path contains a
+/// conversation segment, `None` otherwise (e.g. `POST /conversations`
+/// which creates a new conversation and has no id yet).
+pub(crate) fn extract_webchat_session_hint(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Look for the /v3/directline/conversations/{id}/... pattern anywhere
+    // in the path. The id is present on activities, reconnect, and stream
+    // paths — not on the bare `POST /conversations` create.
+    let mut i = 0;
+    while i + 3 < segments.len() {
+        if segments[i] == "v3"
+            && segments[i + 1] == "directline"
+            && segments[i + 2] == "conversations"
+        {
+            let conv_id = segments[i + 3];
+            if !conv_id.is_empty() {
+                return Some(format!("webchat:{conv_id}"));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 // ── Telegram ────────────────────────────────────────────────────────────────
 
 /// Telegram update types that carry `.chat.id` at a known path.
