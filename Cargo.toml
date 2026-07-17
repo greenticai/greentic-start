@@ -197,7 +197,7 @@ version = "=1.3.0-research.1"
 # deploy-spec `=1.3.0-research.1`), so the git-rev runner's `greentic-config
 # =1.3.0-research.1` and the deployer's deploy-spec both keep a single copy.
 git = "https://github.com/greenticai/greentic-deployer.git"
-rev = "783b33929caeb0f73b21e8df4b86269507027c21"
+rev = "58cb06bfbea51c24dc088082512b32af448de8cc"
 default-features = false
 
 # Lower bound pinned to the first dev build exposing the `signing` module
@@ -237,7 +237,14 @@ features = ["agentic-worker", "greentic-llm-backend"]
 
 [dependencies.greentic-secrets-lib]
 version = "=1.3.0-research.1"
-features = ["providers-dev"]
+# `providers-vault` enables the `vault` module `secrets_gate` calls
+# (`vault::build_backend`). It used to be switched on transitively via feature
+# unification with greentic-deployer's crates.io secrets pin; the full-merge
+# deployer now takes secrets via git-rev, so this crate must request the feature
+# itself. Kept on crates.io =research.1 (NOT git-rev) so it stays the SAME copy
+# as greentic-runner-host's secrets-api — greentic-start hands secrets backends
+# to the host, and a forked copy would fail those calls with E0308.
+features = ["providers-dev", "providers-vault"]
 # Consumed as a git dep on the research branch (matching origin/research): the
 # 1.1.x crates.io `greentic-setup` pulls `qa-spec` on the 1.1.x line, which
 # cannot co-resolve with the git-rev runner's `qa-spec =1.3.0-research.1`. The
