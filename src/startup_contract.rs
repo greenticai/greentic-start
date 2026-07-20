@@ -311,7 +311,7 @@ fn pack_declares_static_routes(path: &Path) -> anyhow::Result<bool> {
         .is_some_and(|extensions| extensions.contains_key(EXT_STATIC_ROUTES_V1)))
 }
 
-fn normalize_public_base_url(value: &str) -> anyhow::Result<String> {
+pub(crate) fn normalize_public_base_url(value: &str) -> anyhow::Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         anyhow::bail!("PUBLIC_BASE_URL cannot be empty");
@@ -343,6 +343,85 @@ fn normalize_public_base_url(value: &str) -> anyhow::Result<String> {
 
 const fn bool_str(value: bool) -> &'static str {
     if value { "true" } else { "false" }
+}
+
+/// Returns `true` when the process is running on Cloud Run. Cloud Run always
+/// sets `K_SERVICE` to the service name.
+///
+/// This checks only the boot-arming condition (cheap). Per-request trust is
+/// enforced separately by [`derive_public_base_url`], which requires
+/// `X-Cloud-Trace-Context` (set by the GFE on every external request) plus
+/// HTTPS scheme and a public DNS host.
+pub(crate) fn running_on_cloud_run() -> bool {
+    std::env::var_os("K_SERVICE").is_some()
+}
+
+/// Derive the runtime's own public base URL from the headers of an inbound
+/// request, gated on Cloud Run's Google Front End (GFE) trust signals.
+///
+/// Returns `Some("https://<host>")` only when ALL of:
+///   1. `X-Cloud-Trace-Context` header is present (GFE sets this on every
+///      external request; Knative ingress controllers do not).
+///   2. `X-Forwarded-Proto` is `https` (defaulting to `https` when absent,
+///      since Cloud Run terminates TLS at the GFE).
+///   3. The `Host` header is a plausible public DNS name: contains a dot, is
+///      not an IP literal, and is not `localhost`.
+///
+/// **Fail-safe:** any check failure returns `None` — the system falls back to
+/// the unchanged manual/`public_base_url` path; it never registers a wrong URL.
+///
+/// NOTE: Cloud Run Host-forwarding is observed GFE behaviour, not a documented
+/// contract. The live acceptance test (plan section 7) confirms it empirically.
+/// If it ever stops working, the fallback is the manual `public_base_url` path.
+pub(crate) fn derive_public_base_url(headers: &hyper::HeaderMap) -> Option<String> {
+    // Gate: require X-Cloud-Trace-Context as proof the request traversed the GFE.
+    if !headers.contains_key("x-cloud-trace-context") {
+        return None;
+    }
+
+    // Scheme: default to https (Cloud Run terminates TLS at GFE); reject http.
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("https");
+    if scheme != "https" {
+        return None;
+    }
+
+    // Host: must be present and a public DNS name.
+    let host = headers.get(hyper::header::HOST)?.to_str().ok()?;
+    if !is_public_dns_host(host) {
+        return None;
+    }
+
+    // Validate via the shared normalizer for consistency with the rest of the
+    // codebase (rejects paths, query strings, non-http schemes, etc.).
+    normalize_public_base_url(&format!("https://{host}")).ok()
+}
+
+/// Returns `true` when `host` looks like a public DNS name: contains at least
+/// one dot, is not an IP literal (v4 or bracketed v6), and is not `localhost`.
+/// Strips an optional `:port` suffix before checking.
+fn is_public_dns_host(host: &str) -> bool {
+    // Strip optional port.
+    let name = host.rsplit_once(':').map(|(h, _port)| h).unwrap_or(host);
+
+    // Reject empty, localhost, and bracket-wrapped (IPv6 literal).
+    if name.is_empty() || name.eq_ignore_ascii_case("localhost") || name.starts_with('[') {
+        return false;
+    }
+
+    // Must contain a dot (DNS host, not a bare hostname).
+    if !name.contains('.') {
+        return false;
+    }
+
+    // Reject IPv4 literals: all-digit-and-dot (e.g. "192.168.1.1").
+    if name.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return false;
+    }
+
+    true
 }
 
 #[cfg(test)]
@@ -669,5 +748,129 @@ mod tests {
         zip.write_all(&bytes)?;
         zip.finish()?;
         Ok(())
+    }
+
+    // --- derive_public_base_url / running_on_cloud_run / is_public_dns_host ---
+
+    fn cloud_run_headers(host: &str, proto: Option<&str>, trace: bool) -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::HOST, host.parse().unwrap());
+        if let Some(p) = proto {
+            headers.insert("x-forwarded-proto", p.parse().unwrap());
+        }
+        if trace {
+            headers.insert("x-cloud-trace-context", "abc123/456;o=1".parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn derive_public_base_url_accepts_cloud_run_shaped_request() {
+        let headers = cloud_run_headers("gtc-svc-abc123-uc.a.run.app", Some("https"), true);
+        assert_eq!(
+            derive_public_base_url(&headers),
+            Some("https://gtc-svc-abc123-uc.a.run.app".to_string()),
+        );
+    }
+
+    #[test]
+    fn derive_public_base_url_defaults_scheme_to_https_when_absent() {
+        // No x-forwarded-proto header — should default to https.
+        let headers = cloud_run_headers("example.run.app", None, true);
+        assert_eq!(
+            derive_public_base_url(&headers),
+            Some("https://example.run.app".to_string()),
+        );
+    }
+
+    #[test]
+    fn derive_public_base_url_rejects_http_scheme() {
+        let headers = cloud_run_headers("gtc-svc.a.run.app", Some("http"), true);
+        assert_eq!(derive_public_base_url(&headers), None);
+    }
+
+    #[test]
+    fn derive_public_base_url_rejects_missing_host() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-cloud-trace-context", "abc/1;o=1".parse().unwrap());
+        assert_eq!(derive_public_base_url(&headers), None);
+    }
+
+    #[test]
+    fn derive_public_base_url_rejects_ip_host() {
+        let headers = cloud_run_headers("192.168.1.1", Some("https"), true);
+        assert_eq!(derive_public_base_url(&headers), None);
+    }
+
+    #[test]
+    fn derive_public_base_url_rejects_localhost() {
+        let headers = cloud_run_headers("localhost", Some("https"), true);
+        assert_eq!(derive_public_base_url(&headers), None);
+    }
+
+    #[test]
+    fn derive_public_base_url_rejects_no_dot_host() {
+        let headers = cloud_run_headers("internalhost", Some("https"), true);
+        assert_eq!(derive_public_base_url(&headers), None);
+    }
+
+    #[test]
+    fn derive_public_base_url_rejects_missing_trace_context() {
+        // No X-Cloud-Trace-Context → not a GFE-fronted request.
+        let headers = cloud_run_headers("example.run.app", Some("https"), false);
+        assert_eq!(derive_public_base_url(&headers), None);
+    }
+
+    #[test]
+    fn derive_public_base_url_accepts_custom_domain() {
+        let headers = cloud_run_headers("bot.example.com", Some("https"), true);
+        assert_eq!(
+            derive_public_base_url(&headers),
+            Some("https://bot.example.com".to_string()),
+        );
+    }
+
+    /// `running_on_cloud_run` reads K_SERVICE. Both the set and unset checks
+    /// live in one test to avoid a race with another env-mutating test
+    /// (`set_var` is not thread-safe).
+    #[test]
+    fn running_on_cloud_run_reads_k_service() {
+        let prev = std::env::var_os("K_SERVICE");
+        // Phase 1: set → should return true.
+        unsafe {
+            std::env::set_var("K_SERVICE", "my-svc");
+        }
+        let when_set = running_on_cloud_run();
+        // Phase 2: remove → should return false.
+        unsafe {
+            std::env::remove_var("K_SERVICE");
+        }
+        let when_unset = running_on_cloud_run();
+        // Restore.
+        unsafe {
+            if let Some(v) = prev {
+                std::env::set_var("K_SERVICE", v);
+            }
+        }
+        assert!(when_set, "must return true when K_SERVICE is set");
+        assert!(!when_unset, "must return false when K_SERVICE is absent");
+    }
+
+    #[test]
+    fn is_public_dns_host_accepts_dotted_names() {
+        assert!(is_public_dns_host("example.com"));
+        assert!(is_public_dns_host("sub.example.com"));
+        assert!(is_public_dns_host("a.run.app:443"));
+    }
+
+    #[test]
+    fn is_public_dns_host_rejects_ip_and_localhost() {
+        assert!(!is_public_dns_host("192.168.1.1"));
+        assert!(!is_public_dns_host("10.0.0.1:8080"));
+        assert!(!is_public_dns_host("localhost"));
+        assert!(!is_public_dns_host("LOCALHOST"));
+        assert!(!is_public_dns_host("[::1]"));
+        assert!(!is_public_dns_host("bare"));
     }
 }
