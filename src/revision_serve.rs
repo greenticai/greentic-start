@@ -90,6 +90,73 @@ use crate::revision_drain::{
     RevisionTeardown,
 };
 
+/// Set-once latch for deferred public-URL capture on Cloud Run.
+///
+/// On Cloud Run, the runtime's own public URL is not known at boot time (no
+/// tunnel, no manifest `public_base_url`). The first inbound request through
+/// the Google Front End carries the real `Host` header, and this struct lets the
+/// request-path writer communicate the derived URL to the boot-side waiter
+/// (the deferred webhook-registration task).
+///
+/// - [`offer`](Self::offer): called from the hot request path; first writer
+///   wins (idempotent via `OnceLock`), then wakes the boot waiter.
+/// - [`captured`](Self::captured): awaited by the boot task; registers
+///   `notified()` before re-checking `get()` to avoid a missed notify.
+/// - [`get`](Self::get): non-async read for the reload path.
+#[derive(Debug, Default)]
+pub(crate) struct PublicUrlCapture {
+    url: std::sync::OnceLock<String>,
+    notify: tokio::sync::Notify,
+    /// K_SERVICE at boot. The derived `Host` must be this service's own
+    /// `<expected_service>-*.run.app` URL (see
+    /// [`crate::startup_contract::derive_public_base_url`]) — the anti-hijack
+    /// pin. Empty in the `Default` case (used only by tests that never
+    /// exercise derivation).
+    expected_service: String,
+}
+
+impl PublicUrlCapture {
+    /// Create an armed capture pinned to `expected_service` (the Cloud Run
+    /// `K_SERVICE`). Only a `Host` of the form `<expected_service>-*.run.app`
+    /// will be captured.
+    pub(crate) fn new(expected_service: String) -> Self {
+        Self {
+            url: std::sync::OnceLock::new(),
+            notify: tokio::sync::Notify::default(),
+            expected_service,
+        }
+    }
+
+    /// Offer a derived URL. Only the first call wins; subsequent calls are
+    /// no-ops (the `OnceLock` rejects them). After a successful set, wakes
+    /// the single boot waiter via `notify_one`.
+    pub(crate) fn offer(&self, url: String) {
+        if self.url.set(url).is_ok() {
+            self.notify.notify_one();
+        }
+    }
+
+    /// Non-async read of the captured URL. Used by the reload path to check
+    /// whether a URL was captured without awaiting.
+    pub(crate) fn get(&self) -> Option<&String> {
+        self.url.get()
+    }
+
+    /// Wait until a URL has been captured. The boot-side deferred registration
+    /// task calls this. Race-free for a single waiter: `notified()` is
+    /// registered BEFORE re-checking `get()`, so a concurrent `offer` between
+    /// the check and the await is not missed.
+    pub(crate) async fn captured(&self) -> String {
+        loop {
+            let waiting = self.notify.notified();
+            if let Some(u) = self.url.get() {
+                return u.clone();
+            }
+            waiting.await;
+        }
+    }
+}
+
 /// Largest request body the revision ingress accepts, in bytes. Even on the
 /// loopback / local posture a cap is required so one oversized POST cannot
 /// exhaust memory before the JSON parse rejects it.
@@ -147,6 +214,11 @@ pub(crate) struct RevisionServeConfig {
     pub auto_restart_enabled: bool,
     /// Executable path captured at boot, before any swap.
     pub exe_path: Option<std::path::PathBuf>,
+    /// Armed on Cloud Run when no boot-time `public_base_url` is available:
+    /// the first inbound request that passes the GFE trust gate sets the URL
+    /// via [`PublicUrlCapture::offer`], waking the deferred registration task.
+    /// `None` = not on Cloud Run, or a URL was already known at boot.
+    pub public_url_capture: Option<Arc<PublicUrlCapture>>,
 }
 
 /// Per-connection shared state. Holds the live activation behind an
@@ -201,6 +273,11 @@ struct ServeState {
     /// new activities. Shared across all revisions so a REST POST that writes
     /// an activity on one revision wakes the WS pump watching that conversation.
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
+    /// Deferred public-URL capture for Cloud Run. When armed, the first
+    /// inbound request that passes the GFE trust gate writes the URL here
+    /// via [`PublicUrlCapture::offer`], waking the deferred registration
+    /// task in `lib.rs`. `None` = not armed.
+    public_url_capture: Option<Arc<PublicUrlCapture>>,
     /// Test-only: override the activity source used by the WS pump. When
     /// `Some`, `handle_websocket_upgrade` substitutes this source instead of
     /// constructing a `RevisionActivitySource` that calls
@@ -501,6 +578,7 @@ impl RevisionServer {
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
             session_manager,
             notifier,
+            public_url_capture: config.public_url_capture,
             #[cfg(test)]
             activity_source_override: None,
         });
@@ -921,12 +999,38 @@ fn spawn_revision_connection(
 }
 
 /// `service_fn` adapter: collapse the `Ok`/`Err` response halves into the single
+/// Cloud Run deferred public-URL capture, extracted from [`handle_connection`]
+/// so the decision is unit-testable without constructing a hyper
+/// `Request<Incoming>`. On the first inbound request whose headers pass the GFE
+/// trust gate AND match this service's own `<service>-*.run.app` URL, records
+/// the derived base URL and wakes the deferred webhook-registration task. A
+/// no-op once captured, and whenever the headers fail the gate.
+///
+/// NOTE: Cloud Run Host-forwarding is observed GFE behaviour, not a documented
+/// contract. See plan section 7 for the live acceptance test.
+fn try_capture_public_url(cap: &PublicUrlCapture, headers: &hyper::HeaderMap) {
+    if cap.get().is_none()
+        && let Some(url) =
+            crate::startup_contract::derive_public_base_url(headers, &cap.expected_service)
+    {
+        cap.offer(url);
+    }
+}
+
 /// infallible response hyper wants.
 async fn handle_connection(
     mut req: Request<Incoming>,
     state: Arc<ServeState>,
     peer_is_loopback: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    // Cloud Run deferred public-URL capture: on the first inbound request
+    // through the GFE, derive the public base URL from the Host header and
+    // wake the deferred webhook-registration task. Placed BEFORE the WS
+    // intercept so even WebSocket-first traffic triggers capture.
+    if let Some(cap) = state.public_url_capture.as_ref() {
+        try_capture_public_url(cap, req.headers());
+    }
+
     // A5: intercept WebSocket stream paths BEFORE `serve` so the upgrade
     // handshake can borrow the request mutably. The stream path is the WS
     // endpoint browsers open after creating a conversation over REST.
@@ -5359,6 +5463,7 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_url_capture: None,
         })
         .expect("start split server");
 
@@ -5408,6 +5513,7 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_url_capture: None,
         })
         .expect("start must succeed even when main bumps into admin range");
 
@@ -6446,6 +6552,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         }
     }
@@ -6567,6 +6674,7 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_url_capture: None,
         })
         .expect("start server");
         let port = server.actual_port();
@@ -7477,6 +7585,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -7583,6 +7692,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -7683,6 +7793,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -7756,6 +7867,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -8030,6 +8142,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         })
     }
@@ -8909,6 +9022,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -8947,6 +9061,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
@@ -8980,6 +9095,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
@@ -9009,6 +9125,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -9227,6 +9344,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -9268,6 +9386,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         });
         state.mark_restart_required();
@@ -9304,6 +9423,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         });
         state.mark_restart_required();
@@ -9753,6 +9873,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::clone(&notifier),
+            public_url_capture: None,
             activity_source_override: Some(
                 test_source.clone() as Arc<dyn crate::websocket::pump::ActivitySource>
             ),
@@ -9911,5 +10032,121 @@ mod binary_update_tests {
             .await
             .expect("hyphenated self-read URI must resolve the underscore-keyed store");
         assert_eq!(value, b"signing-key");
+    }
+}
+
+#[cfg(test)]
+mod public_url_capture_tests {
+    use super::{PublicUrlCapture, try_capture_public_url};
+
+    /// Build a Cloud-Run-shaped request header map.
+    fn cr_headers(host: &str, trace: bool) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(hyper::header::HOST, host.parse().unwrap());
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        if trace {
+            h.insert("x-cloud-trace-context", "abc/1;o=1".parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn try_capture_fires_for_own_service_host() {
+        // Exercises the actual handle_connection hook logic: a GFE-fronted
+        // request to this service's own run.app URL captures the base URL.
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-uc.a.run.app", true));
+        assert_eq!(
+            cap.get().map(String::as_str),
+            Some("https://gtc-svc-abc-uc.a.run.app"),
+        );
+    }
+
+    #[test]
+    fn try_capture_ignores_request_without_trace_context() {
+        // No X-Cloud-Trace-Context → not a GFE-fronted request → no capture.
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-uc.a.run.app", false));
+        assert_eq!(cap.get(), None);
+    }
+
+    #[test]
+    fn try_capture_ignores_foreign_host_hijack() {
+        // Attacker-supplied Host that is not this service's own URL — the
+        // service-name pin must reject it (webhook-hijack defense).
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("evil.attacker.com", true));
+        try_capture_public_url(&cap, &cr_headers("othersvc-1.a.run.app", true));
+        assert_eq!(cap.get(), None);
+    }
+
+    #[test]
+    fn try_capture_is_noop_once_captured() {
+        // First valid capture wins; a later request cannot overwrite it, even
+        // one that would otherwise be valid.
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-uc.a.run.app", true));
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-zz.a.run.app", true));
+        assert_eq!(
+            cap.get().map(String::as_str),
+            Some("https://gtc-svc-abc-uc.a.run.app"),
+        );
+    }
+
+    #[test]
+    fn offer_sets_once_and_second_offer_is_ignored() {
+        let cap = PublicUrlCapture::default();
+        cap.offer("https://first.run.app".to_string());
+        cap.offer("https://second.run.app".to_string());
+        assert_eq!(
+            cap.get().map(String::as_str),
+            Some("https://first.run.app"),
+            "only the first offer should win",
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_resolves_after_offer() {
+        let cap = std::sync::Arc::new(PublicUrlCapture::default());
+        let cap2 = std::sync::Arc::clone(&cap);
+
+        let handle = tokio::spawn(async move { cap2.captured().await });
+
+        // Small yield to let the waiter register before the offer.
+        tokio::task::yield_now().await;
+        cap.offer("https://test.run.app".to_string());
+
+        let url = handle.await.expect("task should not panic");
+        assert_eq!(url, "https://test.run.app");
+    }
+
+    #[tokio::test]
+    async fn captured_returns_immediately_when_already_set() {
+        let cap = PublicUrlCapture::default();
+        cap.offer("https://already.run.app".to_string());
+
+        // Should return immediately — no waiting.
+        let url = cap.captured().await;
+        assert_eq!(url, "https://already.run.app");
+    }
+
+    #[tokio::test]
+    async fn captured_wakes_waiter_registered_before_offer() {
+        // Reproduces the race condition the plan warns about:
+        // the waiter registers notified() before re-checking get().
+        let cap = std::sync::Arc::new(PublicUrlCapture::default());
+        let cap2 = std::sync::Arc::clone(&cap);
+
+        let handle = tokio::spawn(async move { cap2.captured().await });
+
+        // Give the spawned task time to enter the loop and register notified().
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        cap.offer("https://race.run.app".to_string());
+
+        let url = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("should not time out")
+            .expect("task should not panic");
+        assert_eq!(url, "https://race.run.app");
     }
 }

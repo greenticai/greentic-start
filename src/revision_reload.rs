@@ -507,6 +507,7 @@ mod tests {
                 updates_enabled: false,
                 auto_restart_enabled: false,
                 exe_path: None,
+                public_url_capture: None,
             })
             .expect("placeholder server"),
         )
