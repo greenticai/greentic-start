@@ -914,6 +914,18 @@ where
                 parsed.team
             ),
         );
+    } else if result.messaging_envelopes.is_empty() {
+        // A provider that yields neither events nor envelopes has produced nothing routable:
+        // the payload is discarded and the sender still gets a 2xx. Without this line the
+        // drop is completely invisible at default log level.
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "[demo ingress] provider={} tenant={} team={} produced no events or messaging \
+                 envelopes — inbound payload discarded (check the component emits \"events\": [..])",
+                parsed.provider, parsed.tenant, parsed.team
+            ),
+        );
     }
     if domain == Domain::Events && !result.events.is_empty() {
         let bundle = state.runner_host.bundle_root().to_path_buf();

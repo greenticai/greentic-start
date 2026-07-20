@@ -465,12 +465,33 @@ pub(crate) fn parse_dispatch_result(value: &JsonValue) -> anyhow::Result<Ingress
 
     // Some provider WASM components return the WIT ABI envelope {"ok": {...}, "error": ...}
     // instead of the flat dispatch format. Unwrap "ok" when top-level looks like a WIT envelope.
-    let value = if value.get("ok").is_some()
+    // Only unwrap when "ok" actually carries the envelope. Components that report success as
+    // `{"ok": true, ...}` would otherwise be reduced to the scalar `true`, silently discarding
+    // the whole payload and yielding an empty 200.
+    let value = if value.get("ok").is_some_and(JsonValue::is_object)
         && value.get("events").is_none()
         && value.get("status").is_none()
     {
         value.get("ok").unwrap_or(value)
     } else {
+        if value.get("ok").is_some_and(|ok| !ok.is_object())
+            && value.get("events").is_none()
+            && value.get("emitted_events").is_none()
+            && value.get("http").is_none()
+            && value.get("response").is_none()
+        {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "provider response has a non-object \"ok\" and no \"events\"/\"http\" keys; \
+                     no events will be parsed (keys={:?})",
+                    value
+                        .as_object()
+                        .map(|map| map.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                ),
+            );
+        }
         value
     };
 
@@ -896,6 +917,109 @@ mod tests {
         assert_eq!(debug[0]["provider"], "events-webhook");
 
         log_invalid_event_warning(&anyhow::anyhow!("bad event"));
+    }
+
+    /// The shape the fixed Telegram/WhatsApp components emit. This is the contract the
+    /// component tests assert on the other side; if either side drifts, one of the two fails.
+    fn telegram_normalized_response() -> JsonValue {
+        json!({
+            "ok": true,
+            "event": {"update_id": 42, "message": {"text": "weather in paris"}},
+            "events": [messaging_envelope()],
+        })
+    }
+
+    #[test]
+    fn parse_dispatch_result_reads_events_from_provider_with_boolean_ok() {
+        // Regression: `{"ok": true, ...}` used to be collapsed to the scalar `true` by the
+        // WIT-envelope unwrap, discarding the payload and yielding an empty 200 with no logs.
+        let result = parse_dispatch_result(&telegram_normalized_response())
+            .expect("boolean-ok response should parse");
+
+        assert_eq!(
+            result.messaging_envelopes.len(),
+            1,
+            "envelope from a boolean-ok provider response must survive parsing"
+        );
+        assert_eq!(result.messaging_envelopes[0].text.as_deref(), Some("hello"));
+        assert_eq!(result.response.status, 200);
+    }
+
+    #[test]
+    fn parse_dispatch_result_still_unwraps_a_genuine_wit_envelope() {
+        // The unwrap must keep working for its intended case: `ok` carrying the actual envelope.
+        let value = json!({
+            "ok": {
+                "http": {"status": 204, "headers": {"x-test": "1"}},
+                "events": [messaging_envelope()],
+            }
+        });
+
+        let result = parse_dispatch_result(&value).expect("wit envelope should parse");
+
+        assert_eq!(
+            result.response.status, 204,
+            "inner http status must be used"
+        );
+        assert_eq!(result.messaging_envelopes.len(), 1);
+        assert!(
+            result
+                .response
+                .headers
+                .iter()
+                .any(|(k, v)| k == "x-test" && v == "1"),
+            "inner headers must survive the unwrap"
+        );
+    }
+
+    #[test]
+    fn parse_dispatch_result_surfaces_ok_false_instead_of_silently_succeeding() {
+        // Previously `{"ok": false}` was collapsed to the scalar `false`, after which the
+        // ok-false check could not see it and the request returned a misleading 200.
+        let err = parse_dispatch_result(&json!({"ok": false}))
+            .expect_err("ok=false without an http response must be an error");
+
+        assert!(
+            err.to_string().contains("ok=false"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_dispatch_result_reports_explicit_provider_errors() {
+        let err = parse_dispatch_result(&json!({"ok": false, "error": "invalid signature"}))
+            .expect_err("explicit provider error must propagate");
+
+        assert!(
+            err.to_string().contains("invalid signature"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_dispatch_result_yields_nothing_for_the_old_singular_event_shape() {
+        // The pre-fix component output: raw payload under singular "event", no "events" key.
+        // It must parse without panicking, but produce nothing routable — which is exactly the
+        // condition the new warning in http_ingress::handle_request_inner fires on.
+        let value = json!({"ok": true, "event": {"update_id": 1, "message": {"text": "hi"}}});
+
+        let result = parse_dispatch_result(&value).expect("should parse");
+
+        assert!(result.events.is_empty());
+        assert!(
+            result.messaging_envelopes.is_empty(),
+            "singular \"event\" is not a routable shape"
+        );
+        assert_eq!(result.response.status, 200);
+    }
+
+    #[test]
+    fn parse_dispatch_result_accepts_emitted_events_alias() {
+        let value = json!({"ok": true, "emitted_events": [messaging_envelope()]});
+
+        let result = parse_dispatch_result(&value).expect("should parse");
+
+        assert_eq!(result.messaging_envelopes.len(), 1);
     }
 
     #[test]
