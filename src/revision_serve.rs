@@ -102,14 +102,31 @@ use crate::revision_drain::{
 ///   wins (idempotent via `OnceLock`), then wakes the boot waiter.
 /// - [`captured`](Self::captured): awaited by the boot task; registers
 ///   `notified()` before re-checking `get()` to avoid a missed notify.
-/// - [`url`](Self::url): non-async read for the reload path.
+/// - [`get`](Self::get): non-async read for the reload path.
 #[derive(Debug, Default)]
 pub(crate) struct PublicUrlCapture {
     url: std::sync::OnceLock<String>,
     notify: tokio::sync::Notify,
+    /// K_SERVICE at boot. The derived `Host` must be this service's own
+    /// `<expected_service>-*.run.app` URL (see
+    /// [`crate::startup_contract::derive_public_base_url`]) — the anti-hijack
+    /// pin. Empty in the `Default` case (used only by tests that never
+    /// exercise derivation).
+    expected_service: String,
 }
 
 impl PublicUrlCapture {
+    /// Create an armed capture pinned to `expected_service` (the Cloud Run
+    /// `K_SERVICE`). Only a `Host` of the form `<expected_service>-*.run.app`
+    /// will be captured.
+    pub(crate) fn new(expected_service: String) -> Self {
+        Self {
+            url: std::sync::OnceLock::new(),
+            notify: tokio::sync::Notify::default(),
+            expected_service,
+        }
+    }
+
     /// Offer a derived URL. Only the first call wins; subsequent calls are
     /// no-ops (the `OnceLock` rejects them). After a successful set, wakes
     /// the single boot waiter via `notify_one`.
@@ -982,6 +999,24 @@ fn spawn_revision_connection(
 }
 
 /// `service_fn` adapter: collapse the `Ok`/`Err` response halves into the single
+/// Cloud Run deferred public-URL capture, extracted from [`handle_connection`]
+/// so the decision is unit-testable without constructing a hyper
+/// `Request<Incoming>`. On the first inbound request whose headers pass the GFE
+/// trust gate AND match this service's own `<service>-*.run.app` URL, records
+/// the derived base URL and wakes the deferred webhook-registration task. A
+/// no-op once captured, and whenever the headers fail the gate.
+///
+/// NOTE: Cloud Run Host-forwarding is observed GFE behaviour, not a documented
+/// contract. See plan section 7 for the live acceptance test.
+fn try_capture_public_url(cap: &PublicUrlCapture, headers: &hyper::HeaderMap) {
+    if cap.get().is_none()
+        && let Some(url) =
+            crate::startup_contract::derive_public_base_url(headers, &cap.expected_service)
+    {
+        cap.offer(url);
+    }
+}
+
 /// infallible response hyper wants.
 async fn handle_connection(
     mut req: Request<Incoming>,
@@ -992,14 +1027,8 @@ async fn handle_connection(
     // through the GFE, derive the public base URL from the Host header and
     // wake the deferred webhook-registration task. Placed BEFORE the WS
     // intercept so even WebSocket-first traffic triggers capture.
-    //
-    // NOTE: Cloud Run Host-forwarding is observed GFE behaviour, not a
-    // documented contract. See plan section 7 for the live acceptance test.
-    if let Some(cap) = state.public_url_capture.as_ref()
-        && cap.get().is_none()
-        && let Some(url) = crate::startup_contract::derive_public_base_url(req.headers())
-    {
-        cap.offer(url);
+    if let Some(cap) = state.public_url_capture.as_ref() {
+        try_capture_public_url(cap, req.headers());
     }
 
     // A5: intercept WebSocket stream paths BEFORE `serve` so the upgrade
@@ -10008,7 +10037,61 @@ mod binary_update_tests {
 
 #[cfg(test)]
 mod public_url_capture_tests {
-    use super::PublicUrlCapture;
+    use super::{PublicUrlCapture, try_capture_public_url};
+
+    /// Build a Cloud-Run-shaped request header map.
+    fn cr_headers(host: &str, trace: bool) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(hyper::header::HOST, host.parse().unwrap());
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        if trace {
+            h.insert("x-cloud-trace-context", "abc/1;o=1".parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn try_capture_fires_for_own_service_host() {
+        // Exercises the actual handle_connection hook logic: a GFE-fronted
+        // request to this service's own run.app URL captures the base URL.
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-uc.a.run.app", true));
+        assert_eq!(
+            cap.get().map(String::as_str),
+            Some("https://gtc-svc-abc-uc.a.run.app"),
+        );
+    }
+
+    #[test]
+    fn try_capture_ignores_request_without_trace_context() {
+        // No X-Cloud-Trace-Context → not a GFE-fronted request → no capture.
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-uc.a.run.app", false));
+        assert_eq!(cap.get(), None);
+    }
+
+    #[test]
+    fn try_capture_ignores_foreign_host_hijack() {
+        // Attacker-supplied Host that is not this service's own URL — the
+        // service-name pin must reject it (webhook-hijack defense).
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("evil.attacker.com", true));
+        try_capture_public_url(&cap, &cr_headers("othersvc-1.a.run.app", true));
+        assert_eq!(cap.get(), None);
+    }
+
+    #[test]
+    fn try_capture_is_noop_once_captured() {
+        // First valid capture wins; a later request cannot overwrite it, even
+        // one that would otherwise be valid.
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-uc.a.run.app", true));
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-zz.a.run.app", true));
+        assert_eq!(
+            cap.get().map(String::as_str),
+            Some("https://gtc-svc-abc-uc.a.run.app"),
+        );
+    }
 
     #[test]
     fn offer_sets_once_and_second_offer_is_ignored() {

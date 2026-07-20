@@ -726,15 +726,25 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 bind_addr.port().saturating_add(1),
             )
         });
-        // Cloud Run deferred public-URL capture: pre-create when revisions
-        // are loaded AND K_SERVICE is set (Cloud Run). Passed into ServeState
-        // at server start; the deferred registration task (below) only spawns
-        // if public_base_url is None. When a URL is already known at boot the
-        // capture sits unused in ServeState (harmless — the OnceLock fast-path
-        // is a single atomic load per request).
+        // Configured public base URL known WITHOUT a tunnel (env-store then
+        // `PUBLIC_BASE_URL`). Resolved before the server starts so it can gate
+        // capture arming; on Cloud Run there is no tunnel, so this is the whole
+        // boot-time URL. A tunnel (if any) is layered on top below.
+        let boot_configured_url = startup_contract::resolve_public_base_url(&environment)?;
+        // Cloud Run deferred public-URL capture: arm ONLY when revisions are
+        // loaded, K_SERVICE is set (Cloud Run), AND no URL is configured at
+        // boot. Gating on `is_none()` means an operator-configured URL (env-store
+        // / PUBLIC_BASE_URL) always wins and can never be overridden by a
+        // captured one (including on reload). Pinned to K_SERVICE so only this
+        // service's own `<service>-*.run.app` URL is ever captured.
         let cloud_run_capture: Option<std::sync::Arc<revision_serve::PublicUrlCapture>> =
-            (!rc.revisions.is_empty() && startup_contract::running_on_cloud_run())
-                .then(|| std::sync::Arc::new(revision_serve::PublicUrlCapture::default()));
+            (boot_configured_url.is_none()
+                && !rc.revisions.is_empty()
+                && startup_contract::running_on_cloud_run())
+            .then(|| {
+                let service = std::env::var("K_SERVICE").unwrap_or_default();
+                std::sync::Arc::new(revision_serve::PublicUrlCapture::new(service))
+            });
         let server = revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
             bind_addr,
             activation: std::sync::Arc::clone(&activation),
@@ -847,7 +857,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         //   None + no cap  → skip + log (unchanged — no untrusted header trust).
         let public_base_url = match &tunnel_url {
             Some(url) => Some(url.clone()),
-            None => startup_contract::resolve_public_base_url(&environment)?,
+            None => boot_configured_url,
         };
         if revision_count > 0 {
             let boot_activation = std::sync::Arc::clone(&activation);

@@ -357,23 +357,35 @@ pub(crate) fn running_on_cloud_run() -> bool {
 }
 
 /// Derive the runtime's own public base URL from the headers of an inbound
-/// request, gated on Cloud Run's Google Front End (GFE) trust signals.
+/// request, gated on Cloud Run's Google Front End (GFE) trust signals AND
+/// pinned to THIS service's own auto-assigned URL.
 ///
 /// Returns `Some("https://<host>")` only when ALL of:
 ///   1. `X-Cloud-Trace-Context` header is present (GFE sets this on every
 ///      external request; Knative ingress controllers do not).
 ///   2. `X-Forwarded-Proto` is `https` (defaulting to `https` when absent,
 ///      since Cloud Run terminates TLS at the GFE).
-///   3. The `Host` header is a plausible public DNS name: contains a dot, is
-///      not an IP literal, and is not `localhost`.
+///   3. The `Host` header is THIS service's own Cloud Run URL —
+///      `<expected_service>-*.run.app` (see [`is_own_cloud_run_host`]).
+///
+/// The service-name pin (3) is the load-bearing anti-hijack control. Cloud Run
+/// GFE routes by TLS SNI and forwards the client-supplied `Host`, so a `Host`
+/// header is attacker-controllable on its own; pinning the captured URL to the
+/// running service's own name means a forged `Host` (`evil.com`, a custom
+/// domain, or another service's URL) can never be captured. The worst case is
+/// no auto-registration — never a wrong one.
 ///
 /// **Fail-safe:** any check failure returns `None` — the system falls back to
 /// the unchanged manual/`public_base_url` path; it never registers a wrong URL.
 ///
 /// NOTE: Cloud Run Host-forwarding is observed GFE behaviour, not a documented
 /// contract. The live acceptance test (plan section 7) confirms it empirically.
-/// If it ever stops working, the fallback is the manual `public_base_url` path.
-pub(crate) fn derive_public_base_url(headers: &hyper::HeaderMap) -> Option<String> {
+/// A deployment behind a custom domain is intentionally NOT auto-captured (the
+/// pin rejects it) and must set `public_base_url` explicitly.
+pub(crate) fn derive_public_base_url(
+    headers: &hyper::HeaderMap,
+    expected_service: &str,
+) -> Option<String> {
     // Gate: require X-Cloud-Trace-Context as proof the request traversed the GFE.
     if !headers.contains_key("x-cloud-trace-context") {
         return None;
@@ -388,9 +400,9 @@ pub(crate) fn derive_public_base_url(headers: &hyper::HeaderMap) -> Option<Strin
         return None;
     }
 
-    // Host: must be present and a public DNS name.
+    // Host: must be present AND this service's own Cloud Run URL.
     let host = headers.get(hyper::header::HOST)?.to_str().ok()?;
-    if !is_public_dns_host(host) {
+    if !is_own_cloud_run_host(host, expected_service) {
         return None;
     }
 
@@ -399,29 +411,26 @@ pub(crate) fn derive_public_base_url(headers: &hyper::HeaderMap) -> Option<Strin
     normalize_public_base_url(&format!("https://{host}")).ok()
 }
 
-/// Returns `true` when `host` looks like a public DNS name: contains at least
-/// one dot, is not an IP literal (v4 or bracketed v6), and is not `localhost`.
-/// Strips an optional `:port` suffix before checking.
-fn is_public_dns_host(host: &str) -> bool {
-    // Strip optional port.
+/// Returns `true` when `host` is THIS service's own auto-assigned Cloud Run
+/// URL: it ends in `.run.app` and starts with `<expected_service>-`. Both URL
+/// formats begin with the service name — legacy `<service>-<hash>-<region>.a.run.app`
+/// and current `<service>-<projnum>.<region>.run.app`. Case-insensitive; strips
+/// an optional `:port`.
+///
+/// Pinning to the service name is the anti-hijack control: a forged or
+/// attacker-supplied `Host` (`evil.com`, a custom domain, or a different
+/// service's URL) can never match, so it can never be captured. A custom domain
+/// fronting this service also does not match and must set `public_base_url`
+/// explicitly.
+fn is_own_cloud_run_host(host: &str, expected_service: &str) -> bool {
+    if expected_service.is_empty() {
+        return false;
+    }
+    // Strip optional port, lowercase for a case-insensitive compare.
     let name = host.rsplit_once(':').map(|(h, _port)| h).unwrap_or(host);
-
-    // Reject empty, localhost, and bracket-wrapped (IPv6 literal).
-    if name.is_empty() || name.eq_ignore_ascii_case("localhost") || name.starts_with('[') {
-        return false;
-    }
-
-    // Must contain a dot (DNS host, not a bare hostname).
-    if !name.contains('.') {
-        return false;
-    }
-
-    // Reject IPv4 literals: all-digit-and-dot (e.g. "192.168.1.1").
-    if name.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return false;
-    }
-
-    true
+    let name = name.to_ascii_lowercase();
+    let prefix = format!("{}-", expected_service.to_ascii_lowercase());
+    name.ends_with(".run.app") && name.starts_with(&prefix)
 }
 
 #[cfg(test)]
@@ -750,7 +759,7 @@ mod tests {
         Ok(())
     }
 
-    // --- derive_public_base_url / running_on_cloud_run / is_public_dns_host ---
+    // --- derive_public_base_url / running_on_cloud_run / is_own_cloud_run_host ---
 
     fn cloud_run_headers(host: &str, proto: Option<&str>, trace: bool) -> hyper::HeaderMap {
         let mut headers = hyper::HeaderMap::new();
@@ -765,28 +774,39 @@ mod tests {
     }
 
     #[test]
-    fn derive_public_base_url_accepts_cloud_run_shaped_request() {
+    fn derive_public_base_url_accepts_own_service_legacy_url() {
+        // Legacy format: <service>-<hash>-<region>.a.run.app
         let headers = cloud_run_headers("gtc-svc-abc123-uc.a.run.app", Some("https"), true);
         assert_eq!(
-            derive_public_base_url(&headers),
+            derive_public_base_url(&headers, "gtc-svc-abc123"),
             Some("https://gtc-svc-abc123-uc.a.run.app".to_string()),
+        );
+    }
+
+    #[test]
+    fn derive_public_base_url_accepts_own_service_new_url() {
+        // Current format: <service>-<projnum>.<region>.run.app
+        let headers = cloud_run_headers("mysvc-123456.us-central1.run.app", Some("https"), true);
+        assert_eq!(
+            derive_public_base_url(&headers, "mysvc"),
+            Some("https://mysvc-123456.us-central1.run.app".to_string()),
         );
     }
 
     #[test]
     fn derive_public_base_url_defaults_scheme_to_https_when_absent() {
         // No x-forwarded-proto header — should default to https.
-        let headers = cloud_run_headers("example.run.app", None, true);
+        let headers = cloud_run_headers("example-xyz.a.run.app", None, true);
         assert_eq!(
-            derive_public_base_url(&headers),
-            Some("https://example.run.app".to_string()),
+            derive_public_base_url(&headers, "example"),
+            Some("https://example-xyz.a.run.app".to_string()),
         );
     }
 
     #[test]
     fn derive_public_base_url_rejects_http_scheme() {
-        let headers = cloud_run_headers("gtc-svc.a.run.app", Some("http"), true);
-        assert_eq!(derive_public_base_url(&headers), None);
+        let headers = cloud_run_headers("gtc-svc-xyz.a.run.app", Some("http"), true);
+        assert_eq!(derive_public_base_url(&headers, "gtc-svc"), None);
     }
 
     #[test]
@@ -794,41 +814,48 @@ mod tests {
         let mut headers = hyper::HeaderMap::new();
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert("x-cloud-trace-context", "abc/1;o=1".parse().unwrap());
-        assert_eq!(derive_public_base_url(&headers), None);
+        assert_eq!(derive_public_base_url(&headers, "example"), None);
     }
 
     #[test]
     fn derive_public_base_url_rejects_ip_host() {
         let headers = cloud_run_headers("192.168.1.1", Some("https"), true);
-        assert_eq!(derive_public_base_url(&headers), None);
+        assert_eq!(derive_public_base_url(&headers, "example"), None);
     }
 
     #[test]
     fn derive_public_base_url_rejects_localhost() {
         let headers = cloud_run_headers("localhost", Some("https"), true);
-        assert_eq!(derive_public_base_url(&headers), None);
-    }
-
-    #[test]
-    fn derive_public_base_url_rejects_no_dot_host() {
-        let headers = cloud_run_headers("internalhost", Some("https"), true);
-        assert_eq!(derive_public_base_url(&headers), None);
+        assert_eq!(derive_public_base_url(&headers, "example"), None);
     }
 
     #[test]
     fn derive_public_base_url_rejects_missing_trace_context() {
         // No X-Cloud-Trace-Context → not a GFE-fronted request.
-        let headers = cloud_run_headers("example.run.app", Some("https"), false);
-        assert_eq!(derive_public_base_url(&headers), None);
+        let headers = cloud_run_headers("example-xyz.a.run.app", Some("https"), false);
+        assert_eq!(derive_public_base_url(&headers, "example"), None);
     }
 
     #[test]
-    fn derive_public_base_url_accepts_custom_domain() {
-        let headers = cloud_run_headers("bot.example.com", Some("https"), true);
-        assert_eq!(
-            derive_public_base_url(&headers),
-            Some("https://bot.example.com".to_string()),
-        );
+    fn derive_public_base_url_rejects_foreign_host_hijack() {
+        // Attacker-supplied Host that passes the GFE trust signals but is NOT
+        // this service's own run.app URL — must never be captured (webhook
+        // hijack). Covers both a bare domain and a custom domain.
+        for host in ["evil.attacker.com", "bot.example.com"] {
+            let headers = cloud_run_headers(host, Some("https"), true);
+            assert_eq!(
+                derive_public_base_url(&headers, "mysvc"),
+                None,
+                "must reject foreign host {host}",
+            );
+        }
+    }
+
+    #[test]
+    fn derive_public_base_url_rejects_other_services_run_app_url() {
+        // Another Cloud Run service's URL: right suffix, wrong service prefix.
+        let headers = cloud_run_headers("othersvc-abc-uc.a.run.app", Some("https"), true);
+        assert_eq!(derive_public_base_url(&headers, "mysvc"), None);
     }
 
     /// `running_on_cloud_run` reads K_SERVICE. Both the set and unset checks
@@ -858,19 +885,33 @@ mod tests {
     }
 
     #[test]
-    fn is_public_dns_host_accepts_dotted_names() {
-        assert!(is_public_dns_host("example.com"));
-        assert!(is_public_dns_host("sub.example.com"));
-        assert!(is_public_dns_host("a.run.app:443"));
+    fn is_own_cloud_run_host_matches_own_service() {
+        assert!(is_own_cloud_run_host(
+            "gtc-svc-abc-uc.a.run.app",
+            "gtc-svc-abc"
+        ));
+        assert!(is_own_cloud_run_host(
+            "mysvc-123456.us-central1.run.app",
+            "mysvc"
+        ));
+        // Case-insensitive; strips an optional :port.
+        assert!(is_own_cloud_run_host("MYSVC-1.A.RUN.APP", "mysvc"));
+        assert!(is_own_cloud_run_host("mysvc-1.a.run.app:443", "mysvc"));
     }
 
     #[test]
-    fn is_public_dns_host_rejects_ip_and_localhost() {
-        assert!(!is_public_dns_host("192.168.1.1"));
-        assert!(!is_public_dns_host("10.0.0.1:8080"));
-        assert!(!is_public_dns_host("localhost"));
-        assert!(!is_public_dns_host("LOCALHOST"));
-        assert!(!is_public_dns_host("[::1]"));
-        assert!(!is_public_dns_host("bare"));
+    fn is_own_cloud_run_host_rejects_mismatches() {
+        // Foreign / custom domains.
+        assert!(!is_own_cloud_run_host("evil.com", "mysvc"));
+        assert!(!is_own_cloud_run_host("bot.example.com", "mysvc"));
+        // Right suffix, wrong service.
+        assert!(!is_own_cloud_run_host("othersvc-1.a.run.app", "mysvc"));
+        // Right service, wrong suffix (custom domain that starts with the name).
+        assert!(!is_own_cloud_run_host("mysvc-1.example.com", "mysvc"));
+        // IP / localhost.
+        assert!(!is_own_cloud_run_host("192.168.1.1", "mysvc"));
+        assert!(!is_own_cloud_run_host("localhost", "mysvc"));
+        // Empty service never matches (fail-safe).
+        assert!(!is_own_cloud_run_host("mysvc-1.a.run.app", ""));
     }
 }
