@@ -53,6 +53,9 @@ pub struct SecretsSetup {
 
 impl SecretsSetup {
     pub fn new(bundle_root: &Path, env: &str, tenant: &str, team: Option<&str>) -> Result<Self> {
+        // Bare `ensure_path` gates on `$GREENTIC_ENV` exactly like the serve-side
+        // reader, so writer and reader agree on the store path: the shared env
+        // store in production (env selected at boot), bundle-local in tests.
         let store_path = dev_store_path::ensure_path(bundle_root)?;
         info!(path = %store_path.display(), "secrets: using dev store backend");
         let store = DevStore::with_path(&store_path).map_err(|err| {
