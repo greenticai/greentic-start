@@ -64,12 +64,13 @@ use greentic_runner_host::{Activity, RunnerHost, WelcomeFlowHint};
 use greentic_deploy_spec::{
     DEFAULT_LISTEN_ADDR, EnvironmentHostConfig, UpdateAction, UpdateChannelConfig,
 };
+use greentic_deployer::cli::env_manifest::EnvManifest;
 use greentic_deployer::cli::updates::{self, ApplyUpdatesPayload, UpdatesGetPayload};
 use greentic_deployer::cli::{OpError, OpFlags, OpOutcome};
 use greentic_deployer::environment::{LocalFsStore, load_trust_root};
 use greentic_types::EnvId;
 use greentic_update::binswap;
-use greentic_update::plan::{select_binary, verify_update_plan};
+use greentic_update::plan::{plan_targets_env, select_binary, verify_update_plan};
 use greentic_update::stream::{StreamError, build_stream_client, run_stream};
 
 use crate::deployment_routes::RevisionIngressRouting;
@@ -1657,10 +1658,45 @@ fn verify_signed_plan(
             "record-only verify: plan verification failed: {err}"
         )))
     })?;
-    if verified.plan.env_id.as_str() != env_id.as_str() {
+    check_plan_identity(
+        verified.plan.env_id.as_str(),
+        &verified.plan.target,
+        env_id.as_str(),
+    )
+}
+
+/// Both identity checks the stage path runs, in the same order: the plan must be
+/// addressed to this environment (exact match or the broadcast channel), and the
+/// signed target manifest must name the same environment as the plan header.
+///
+/// Split out of [`verify_signed_plan`] because it is the whole of the logic that
+/// can be tested without standing up a trust root and a DSSE-signed plan — the
+/// signature check above is the part that needs the scaffolding, and it is not
+/// what this change touches.
+///
+/// **Both checks are required, and the second only became so with `_`.** While
+/// addressing was exact equality, a plan whose header and manifest disagreed
+/// could never pass the first check, so the second was implied for free.
+/// Accepting the broadcast id breaks that implication: a `_` header carrying a
+/// manifest for some other environment passes addressing, and without the second
+/// check would be recorded as verified while `updates::get` rejects it — exactly
+/// the path divergence this function exists to prevent.
+fn check_plan_identity(plan_env: &str, target: &Value, local_env: &str) -> Result<(), NotifyError> {
+    if !plan_targets_env(plan_env, local_env) {
         return Err(NotifyError::Op(OpError::InvalidArgument(format!(
-            "record-only verify: plan targets env `{}`, not this environment",
-            verified.plan.env_id
+            "record-only verify: plan targets env `{plan_env}`, not this environment"
+        ))));
+    }
+    let manifest: EnvManifest = serde_json::from_value(target.clone()).map_err(|err| {
+        NotifyError::Op(OpError::InvalidArgument(format!(
+            "record-only verify: plan target is not a valid env-manifest: {err}"
+        )))
+    })?;
+    if manifest.environment.id != plan_env {
+        return Err(NotifyError::Op(OpError::InvalidArgument(format!(
+            "record-only verify: plan target manifest names env `{}`, but the plan header \
+             targets `{plan_env}`",
+            manifest.environment.id
         ))));
     }
     Ok(())
@@ -8687,6 +8723,60 @@ mod update_notify_tests {
             }
             other => panic!("expected verification rejection, got {other:?}"),
         }
+    }
+
+    fn manifest_for(id: &str) -> serde_json::Value {
+        serde_json::json!({"schema": "greentic.env-manifest.v1", "environment": {"id": id}})
+    }
+
+    #[test]
+    fn record_only_accepts_a_broadcast_plan() {
+        // Plan addressed to the fleet channel, manifest agreeing: accepted by an
+        // environment with a different name. This is the point of the change.
+        check_plan_identity("_", &manifest_for("_"), "local").expect("broadcast plan is accepted");
+    }
+
+    #[test]
+    fn record_only_accepts_an_exactly_matching_plan() {
+        check_plan_identity("local", &manifest_for("local"), "local").expect("exact match");
+    }
+
+    #[test]
+    fn record_only_rejects_a_plan_for_another_env() {
+        // Widening to `_` must not widen to "any env id".
+        let err = check_plan_identity("other", &manifest_for("other"), "local")
+            .expect_err("foreign plan must be rejected");
+        assert!(format!("{err:?}").contains("other"), "got {err:?}");
+    }
+
+    #[test]
+    fn record_only_rejects_a_broadcast_header_with_a_named_manifest() {
+        // The divergence accepting `_` introduces: this passes addressing, and
+        // WITHOUT the manifest check would be recorded as verified here while
+        // `updates::get` rejects it. Regression guard for exactly that.
+        let err = check_plan_identity("_", &manifest_for("victim-env"), "local")
+            .expect_err("header/manifest disagreement must be rejected");
+        assert!(format!("{err:?}").contains("victim-env"), "got {err:?}");
+    }
+
+    #[test]
+    fn record_only_rejects_a_named_header_with_a_broadcast_manifest() {
+        let err = check_plan_identity("local", &manifest_for("_"), "local")
+            .expect_err("mirror-image disagreement must be rejected");
+        assert!(
+            format!("{err:?}").contains("manifest names env"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn record_only_rejects_a_malformed_target() {
+        let err = check_plan_identity("local", &serde_json::json!({"nope": 1}), "local")
+            .expect_err("malformed target must be rejected");
+        assert!(
+            format!("{err:?}").contains("not a valid env-manifest"),
+            "got {err:?}"
+        );
     }
 
     #[test]
