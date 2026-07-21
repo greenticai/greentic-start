@@ -2,7 +2,7 @@ bench = [{ name = "perf", harness = false }]
 
 [package]
 name = "greentic-start"
-version = "1.1.25"
+version = "1.1.26"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -148,7 +148,13 @@ default-features = false
 # `UpdateChannelConfig::{resolved_push_enabled, resolved_stream_endpoint}`, and
 # neither exists before 0.2.3. An API floor, so a stale `--locked` build fails
 # to compile rather than silently degrading to poll-only.
-version = ">=0.2.3, <0.3"
+# Floor raised to 0.2.4: `greentic-deployer` (below) uses
+# `greentic_deploy_spec::DEFAULT_PLAN_ENDPOINT`, added in 0.2.4, but declares only
+# `>=0.2.3` — an underspecified floor on its side (deployer#495). Its own workspace
+# masks that with a path dep; resolving from crates.io picks 0.2.3 and fails to
+# compile `greentic-deployer`. Our floor is what actually constrains the shared
+# resolution, so raise it here rather than wait for their republish.
+version = ">=0.2.4, <0.3"
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
 # (per-env trust root + operator key, deployer #226). Floor bumped to the
@@ -183,7 +189,14 @@ version = ">=0.2.3, <0.3"
 # (webchat GUI 405 on `/v1/web/webchat/{tenant}/`). Nothing failed to compile,
 # so only the lock keeps a `--locked` release build off the broken copy.
 [dependencies.greentic-deployer]
-version = ">=1.1.15, <1.2.0-0"
+# Floor raised to 1.1.21: the release carrying the broadcast-channel consumer
+# gates AND the broadcast-address localisation. The stage path here delegates
+# to `updates::get` / `updates::apply_updates` in this crate, so below that
+# floor the record-only change above is not merely inert, it is INCONSISTENT:
+# record-only would accept a `_`-addressed plan the delegated stage path then
+# refuses. Also collapses a duplicate `greentic-update` copy in the lockfile —
+# 1.1.15 still pinned the dead `greentic-update 0.1.x` line.
+version = ">=1.1.21, <1.2.0-0"
 default-features = false
 
 # Lower bound pinned to the first dev build exposing the `signing` module
@@ -273,7 +286,9 @@ features = ["serde"]
 # run_stream}`). Push is the *primary* discovery path and this poll loop is the
 # fallback, so losing `stream` is a silent latency regression (seconds ->
 # `poll_interval_secs`), not a compile error — which is why it is a hard floor.
-version = ">=1.1.0, <1.2.0-0"
+# Floor raised to 1.1.1: first publish carrying `plan::plan_targets_env`,
+# the shared plan->environment addressing predicate (broadcast channel `_`).
+version = ">=1.1.1, <1.2.0-0"
 features = ["binswap", "stream"]
 
 [dependencies.hyper]

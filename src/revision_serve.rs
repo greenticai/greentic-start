@@ -69,7 +69,7 @@ use greentic_deployer::cli::{OpError, OpFlags, OpOutcome};
 use greentic_deployer::environment::{LocalFsStore, load_trust_root};
 use greentic_types::EnvId;
 use greentic_update::binswap;
-use greentic_update::plan::{select_binary, verify_update_plan};
+use greentic_update::plan::{plan_targets_env, select_binary, verify_update_plan};
 use greentic_update::stream::{StreamError, build_stream_client, run_stream};
 
 use crate::deployment_routes::RevisionIngressRouting;
@@ -1657,7 +1657,12 @@ fn verify_signed_plan(
             "record-only verify: plan verification failed: {err}"
         )))
     })?;
-    if verified.plan.env_id.as_str() != env_id.as_str() {
+    // Addressing must match the stage path exactly, or the two disagree about
+    // which plans are real: a broadcast plan would be staged-and-applied by the
+    // stage path while the record-only path rejected it, so an operator's audit
+    // trail would silently omit precisely the fleet-wide updates. Shared
+    // predicate, not a re-derived `== "_"`.
+    if !plan_targets_env(verified.plan.env_id.as_str(), env_id.as_str()) {
         return Err(NotifyError::Op(OpError::InvalidArgument(format!(
             "record-only verify: plan targets env `{}`, not this environment",
             verified.plan.env_id
