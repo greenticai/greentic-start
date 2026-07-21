@@ -698,7 +698,17 @@ fn serve_secrets_manager_for_kind(
 fn open_dev_store_manager(
     bundle_root: &Path,
 ) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>)> {
-    let client = SecretsClient::open(bundle_root)?;
+    // `818e5da` routed the setup *writer* and the `dev_store_path` helpers to
+    // the shared env store (`~/.greentic/environments/<env>/.greentic/dev/…`)
+    // when `$GREENTIC_ENV` is set, but this runtime *reader* still rooted the
+    // dev store at the (ephemeral) bundle root — so it never saw the secrets
+    // `gtc setup` registered, and every WASM secret read (weather API key, …)
+    // came back not-found. Resolve the same env-store-aware path the writer
+    // uses; fall back to the bundle root only when no store exists yet.
+    let client = match crate::dev_store_path::find_existing(bundle_root) {
+        Some(store_path) => SecretsClient::open_with_path(store_path)?,
+        None => SecretsClient::open(bundle_root)?,
+    };
     let path = client.store_path().map(|path| path.to_path_buf());
     Ok((Arc::new(client) as DynSecretsManager, path))
 }
@@ -1493,6 +1503,95 @@ mod tests {
         assert!(handle.selection.pack_path.is_none());
         assert!(handle.dev_store_path.is_some());
         assert!(!handle.using_env_fallback);
+        Ok(())
+    }
+
+    /// Regression guard for the env-store secrets move (setup #226 / start #423).
+    ///
+    /// When `$GREENTIC_ENV` is set, the setup *writer* (`dev_store_path::ensure_path`,
+    /// as `gtc setup` uses) and the runtime *reader* (`open_dev_store_manager` ->
+    /// `find_existing`) must independently resolve the SAME shared env store under
+    /// the greentic home — never the ephemeral bundle root. Before the fix the
+    /// reader rooted the store at the bundle root, so secrets `gtc setup`
+    /// registered came back not-found at runtime (the weather-API-key symptom).
+    /// This test deliberately does NOT set `GREENTIC_DEV_SECRETS_PATH`, so it
+    /// exercises the real env-store rendezvous rather than the override shortcut.
+    #[test]
+    fn setup_writer_and_runtime_reader_rendezvous_on_env_store() -> anyhow::Result<()> {
+        let home = tempdir()?;
+        let bundle_root = tempdir()?;
+        let uri = "secrets://local/acme/_/weatherapi_pack/auth_param_get_weather_key";
+        let runtime = Runtime::new()?;
+
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        let prev_home = env::var_os("HOME");
+        let prev_env = env::var_os("GREENTIC_ENV");
+        let prev_override = env::var_os("GREENTIC_DEV_SECRETS_PATH");
+        unsafe {
+            env::set_var("HOME", home.path());
+            env::set_var("GREENTIC_ENV", "local");
+            env::remove_var("GREENTIC_DEV_SECRETS_PATH");
+        }
+
+        // All env-dependent, fallible work in one closure so the env is restored
+        // unconditionally afterwards (keeping `test_env_lock` unpoisoned) and every
+        // assertion runs only once the process env is back to normal.
+        let captured =
+            (|| -> anyhow::Result<(PathBuf, usize, DynSecretsManager, Option<PathBuf>)> {
+                // WRITER: resolve + create the store exactly as `gtc setup` would, then seed.
+                let writer_path = crate::dev_store_path::ensure_path(bundle_root.path())?;
+                let store = DevStore::with_path(writer_path.clone())?;
+                let seed = SeedDoc {
+                    entries: vec![SeedEntry {
+                        uri: uri.to_string(),
+                        format: SecretFormat::Text,
+                        value: SeedValue::Text {
+                            text: "WEATHER_KEY".to_string(),
+                        },
+                        description: None,
+                    }],
+                };
+                let report = runtime
+                    .block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
+                // READER: the runtime side resolves + reads back independently.
+                let (manager, reader_path) = open_dev_store_manager(bundle_root.path())?;
+                Ok((writer_path, report.ok, manager, reader_path))
+            })();
+
+        unsafe {
+            match prev_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+            match prev_env {
+                Some(value) => env::set_var("GREENTIC_ENV", value),
+                None => env::remove_var("GREENTIC_ENV"),
+            }
+            if let Some(value) = prev_override {
+                env::set_var("GREENTIC_DEV_SECRETS_PATH", value);
+            }
+        }
+        drop(env_guard);
+
+        let (writer_path, seeded, manager, reader_path) = captured?;
+        assert_eq!(seeded, 1, "writer should have seeded exactly one secret");
+        assert!(
+            writer_path.starts_with(home.path()),
+            "writer resolved {writer_path:?}; expected the shared env store under {:?}",
+            home.path()
+        );
+        assert!(
+            !writer_path.starts_with(bundle_root.path()),
+            "writer must not fall back to the ephemeral bundle root ({:?})",
+            bundle_root.path()
+        );
+        assert_eq!(
+            reader_path.as_deref(),
+            Some(writer_path.as_path()),
+            "runtime reader must rendezvous on the writer's env-store path"
+        );
+        let value = runtime.block_on(async { manager.read(uri).await })?;
+        assert_eq!(value, b"WEATHER_KEY".to_vec());
         Ok(())
     }
 
