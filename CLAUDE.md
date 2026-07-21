@@ -37,7 +37,7 @@ git config core.hooksPath .githooks
 
 Enables the pre-commit hook that runs `rustfmt` on staged Rust files and `cargo clippy --workspace -- -D warnings`. See `.githooks/README.md`.
 
-Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is committed.
+Crate version 1.2.0-dev.0, edition 2024, Rust 1.95.0 (pinned via `rust-toolchain.toml`). Cargo.lock is committed.
 
 ## Release Flow
 
@@ -50,7 +50,7 @@ Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is commi
 ### Entry Points
 
 - `src/main.rs` — trivial: calls `greentic_start::run_from_env()`
-- `src/lib.rs` — CLI parsing (clap derive), arg normalization (strips legacy `demo` subcommand prefix), dispatches to `run_start`, `run_restart_request`, `run_stop_request`
+- `src/lib.rs` — CLI parsing (clap derive), arg normalization (strips legacy `demo` subcommand prefix), dispatches to `run_start_request`, `run_restart_request`, `run_stop_request`
 - Public API: `StartRequest`, `StopRequest`, `run_start_request()`, `run_restart_request()`, `run_stop_request()`, `run_from_env()`
 - Public modules: `config`, `notifier`, `perf_harness`, `provider_config_envelope`, `revision_health_gate`, `runtime`, `runtime_state`, `supervisor`, `ws_test_support`
 
@@ -68,7 +68,7 @@ Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is commi
 | Secrets | `secrets_*.rs`, `secret_*.rs` | Backend selection (pack vs dev-store), secret URI handling, missing secret seeding |
 | Services | `services/` | Individual service components: NATS, runner, components |
 | Subscriptions | `subscriptions_universal/` | Universal subscription runtime and persistence (e.g., Microsoft Graph) |
-| Revision engine | `revision_boot.rs`, `revision_serve.rs`, `revision_dispatcher.rs`, `revision_drain.rs`, `revision_pull.rs`, `revision_reload.rs`, `revision_pin.rs`, `revision_webhook_register.rs`, `revision_health_gate.rs` | Multi-revision hot-reload runtime (~13k LOC): boots revisions from env-store, dispatches ingress traffic to the active revision, drains old revisions, pulls remote bundles at startup, registers webhooks, and gates readiness |
+| Revision engine | `revision_boot.rs`, `revision_serve.rs`, `revision_dispatcher.rs`, `revision_drain.rs`, `revision_pull.rs`, `revision_reload.rs`, `revision_pin.rs`, `revision_webhook_register.rs`, `revision_health_gate.rs` | Multi-revision hot-reload runtime (~20k LOC): boots revisions from env-store, dispatches ingress traffic to the active revision, drains old revisions, pulls remote bundles at startup, registers webhooks, and gates readiness |
 | Fast2Flow | `fast2flow/` | Chat-to-flow routing subsystem (gate, host_process, llm_router, mapper, contracts, config) — routes inbound chat messages to the matching flow via BM25 + optional LLM fallback |
 | LLM integration | `llm/` | Provider-agnostic LLM layer consumed by fast2flow and other subsystems; wraps `greentic-llm` crate |
 | OAuth engine | `oauth_engine.rs`, `oauth_secret_bridge.rs`, `oauth_state.rs` | Broker-side OAuth flow for provider connections: token exchange, secret bridging, per-provider state |
@@ -102,6 +102,21 @@ Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is commi
 - **i18n**: Source catalog at `i18n/en.json`. Translate via `tools/i18n.sh` (defaults: `LANGS=all`, `BATCH_SIZE=200`). Never hardcode user-facing strings.
 - **Docker**: `Dockerfile.distroless` builds a musl-static binary into a `gcr.io/distroless/static-debian12:nonroot` image (uid 65532, no shell; Chainguard is the optional hardened upgrade). The image is **ELF-only**: it ships no shell or interpreters, so bundle-supplied service helpers (gateway/egress/subscriptions/runner) must be statically-linked ELF binaries, not `#!`-scripts. `build_service_spec` preflights helper shebangs and fails with an actionable error when the interpreter is absent.
 - **Floor-pinned deps**: Cross-repo Greentic deps use `>=M.m.p-dev.RUNID, <M.(m+1).0-0` ranges with inline rationale comments in `Cargo.toml`. Bump the floor when a new publish adds a surface this crate consumes; the comment must explain which PR/feature the floor targets.
+
+## Key Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `GREENTIC_ENV` | Active environment id; flag > env > `local` |
+| `PORT` | HTTP listen port for the revision-serve path |
+| `PUBLIC_BASE_URL` | Public URL for webhook auto-registration (tunnel > env-store > this) |
+| `GREENTIC_EVENTS_NATS_URL` | NATS bus URL; enables SoRX event subscriptions |
+| `GREENTIC_LLM_API_KEY` | LLM provider key for fast2flow routing; keyless for Ollama |
+| `GREENTIC_CACHE_DIR` | Component cache root (set automatically by warmup) |
+| `GREENTIC_DEV_SECRETS_PATH` | Override path for dev-mode secrets store |
+| `GREENTIC_ADMIN_LISTEN` | Admin-relay listen address |
+| `GREENTIC_DIRECTLINE_TOKEN_TTL_SECS` | DirectLine session-token base TTL (seconds, clamped `[60, 604800]`, default `1800`) |
+| `GREENTIC_PROVIDER_CORE_ONLY` | Set to `0` by default in start; `1` enforces provider-core-only mode |
 
 ## Git Conventions
 
