@@ -1615,15 +1615,21 @@ mod tests {
             "messaging-webex",
             "webex_bot_token",
         );
+        // The env backend canonicalizes the `secrets://` URI to a
+        // `GTSEC_{ENV}_{TENANT}_{TEAM}_{CAT}_{NAME}` env-var name (the shape the
+        // cloud deployer injects) before `std::env::var`, so the fixture must be
+        // set under that canonical name, not the raw URI.
+        let env_var_name = canonical_secret_env_var_name(&secret_uri)
+            .expect("canonical secrets:// URI maps to a GTSEC_* env-var name");
         let runtime = Runtime::new()?;
         {
             let _env_guard = crate::test_env_lock().lock().unwrap();
             unsafe {
-                env::set_var(&secret_uri, secret_value);
+                env::set_var(&env_var_name, secret_value);
             }
             let value = runtime.block_on(async { handle.manager().read(&secret_uri).await })?;
             unsafe {
-                env::remove_var(&secret_uri);
+                env::remove_var(&env_var_name);
             }
             assert_eq!(value, expected_bytes);
         }
