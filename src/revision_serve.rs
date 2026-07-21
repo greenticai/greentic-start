@@ -1657,11 +1657,8 @@ fn verify_signed_plan(
             "record-only verify: plan verification failed: {err}"
         )))
     })?;
-    // Addressing must match the stage path exactly, or the two disagree about
-    // which plans are real: a broadcast plan would be staged-and-applied by the
-    // stage path while the record-only path rejected it, so an operator's audit
-    // trail would silently omit precisely the fleet-wide updates. Shared
-    // predicate, not a re-derived `== "_"`.
+    // Must agree with the stage path's addressing — shared predicate, not a
+    // re-derived `== "_"`, or broadcast plans silently drop from the audit trail.
     if !plan_targets_env(verified.plan.env_id.as_str(), env_id.as_str()) {
         return Err(NotifyError::Op(OpError::InvalidArgument(format!(
             "record-only verify: plan targets env `{}`, not this environment",
