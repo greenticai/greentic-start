@@ -616,6 +616,21 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             rc
         };
 
+        // F3: adopt a bundle-shipped component cache from the first materialized
+        // revision that carries one, eliminating Cranelift recompilation on every
+        // cold start. Runs before the multi-thread tokio runtime is built (line
+        // below), so the `set_var` inside `adopt_bundle_cache_dir` is
+        // single-threaded. A bundle without `.cache/v1/` is a silent no-op, and
+        // an explicitly-set `GREENTIC_CACHE_DIR` takes precedence.
+        {
+            let rev_ids: Vec<&str> = rc
+                .revisions
+                .iter()
+                .map(|r| r.revision_id.as_str())
+                .collect();
+            crate::warmup::adopt_env_revision_cache(&env_dir, &rev_ids);
+        }
+
         // C5: open the env's runtime.json snapshot once and share it across
         // every activation rebuild + the `runtime://` resolver every loaded
         // pack reaches. The store is `Arc`-shared so a single in-memory

@@ -37,6 +37,24 @@ pub(crate) fn adopt_bundle_cache_dir(bundle_root: &Path) {
     );
 }
 
+/// Adopt a bundle-shipped component cache from materialized revisions in the
+/// env-serve path. Iterates the revision ids, probes
+/// `<env_dir>/revisions/<rev_id>/bundle/.cache/v1/`, and delegates to
+/// [`adopt_bundle_cache_dir`] (which is a no-op when the dir is absent or
+/// `GREENTIC_CACHE_DIR` is already set). First revision with a cache wins.
+///
+/// Must be called in single-threaded startup before any worker/task spawn —
+/// the same constraint as [`adopt_bundle_cache_dir`].
+pub(crate) fn adopt_env_revision_cache(env_dir: &Path, revision_ids: &[impl AsRef<str>]) {
+    for rev_id in revision_ids {
+        let bundle_dir = env_dir
+            .join("revisions")
+            .join(rev_id.as_ref())
+            .join("bundle");
+        adopt_bundle_cache_dir(&bundle_dir);
+    }
+}
+
 struct CollectedWasm {
     bytes: Vec<u8>,
 }
@@ -282,5 +300,127 @@ mod tests {
             !profile.id().chars().any(is_windows_invalid_path_char),
             "warmup cache profile id must be valid as a Windows path segment"
         );
+    }
+
+    // --- adopt_env_revision_cache tests (F3 env-serve path) ---
+
+    #[test]
+    fn env_revision_cache_adopted_when_present() {
+        with_cache_env_lock(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let env_dir = tmp.path();
+            let rev_id = "rev-abc-123";
+            let cache_dir = env_dir
+                .join("revisions")
+                .join(rev_id)
+                .join("bundle")
+                .join(".cache")
+                .join("v1");
+            std::fs::create_dir_all(&cache_dir).unwrap();
+
+            adopt_env_revision_cache(env_dir, &[rev_id]);
+
+            let value = std::env::var("GREENTIC_CACHE_DIR").expect("env var should be set");
+            let expected = env_dir
+                .join("revisions")
+                .join(rev_id)
+                .join("bundle")
+                .join(".cache");
+            assert_eq!(PathBuf::from(value), expected);
+        });
+    }
+
+    #[test]
+    fn env_revision_cache_noop_when_no_cache_dir() {
+        with_cache_env_lock(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let env_dir = tmp.path();
+            // Create the revision's bundle dir but NOT `.cache/v1/`.
+            let bundle_dir = env_dir
+                .join("revisions")
+                .join("rev-no-cache")
+                .join("bundle");
+            std::fs::create_dir_all(&bundle_dir).unwrap();
+
+            adopt_env_revision_cache(env_dir, &["rev-no-cache"]);
+
+            assert!(
+                std::env::var("GREENTIC_CACHE_DIR").is_err(),
+                "env var must not be set when bundle has no cache"
+            );
+        });
+    }
+
+    #[test]
+    fn env_revision_cache_respects_existing_env_var() {
+        with_cache_env_lock(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let env_dir = tmp.path();
+            let rev_id = "rev-override";
+            let cache_dir = env_dir
+                .join("revisions")
+                .join(rev_id)
+                .join("bundle")
+                .join(".cache")
+                .join("v1");
+            std::fs::create_dir_all(&cache_dir).unwrap();
+
+            // SAFETY: protected by the env lock.
+            unsafe { std::env::set_var("GREENTIC_CACHE_DIR", "/user/explicit") };
+
+            adopt_env_revision_cache(env_dir, &[rev_id]);
+
+            assert_eq!(
+                std::env::var("GREENTIC_CACHE_DIR").unwrap(),
+                "/user/explicit",
+                "user-set GREENTIC_CACHE_DIR must not be overwritten"
+            );
+        });
+    }
+
+    #[test]
+    fn env_revision_cache_first_revision_wins() {
+        with_cache_env_lock(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let env_dir = tmp.path();
+            // Both revisions ship a cache.
+            for rev_id in &["rev-first", "rev-second"] {
+                let cache_dir = env_dir
+                    .join("revisions")
+                    .join(rev_id)
+                    .join("bundle")
+                    .join(".cache")
+                    .join("v1");
+                std::fs::create_dir_all(&cache_dir).unwrap();
+            }
+
+            adopt_env_revision_cache(env_dir, &["rev-first", "rev-second"]);
+
+            let value = std::env::var("GREENTIC_CACHE_DIR").expect("env var should be set");
+            let expected = env_dir
+                .join("revisions")
+                .join("rev-first")
+                .join("bundle")
+                .join(".cache");
+            assert_eq!(
+                PathBuf::from(value),
+                expected,
+                "first revision's cache must win"
+            );
+        });
+    }
+
+    #[test]
+    fn env_revision_cache_noop_when_no_revisions() {
+        with_cache_env_lock(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let empty: &[&str] = &[];
+            adopt_env_revision_cache(tmp.path(), empty);
+
+            assert!(
+                std::env::var("GREENTIC_CACHE_DIR").is_err(),
+                "empty revision list must not set the env var"
+            );
+        });
     }
 }
