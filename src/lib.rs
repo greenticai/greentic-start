@@ -642,10 +642,15 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             // CacheManager lives inside PackRuntime as a private field —
             // surfacing it would require changes to greentic-runner-host.
             match std::env::var("GREENTIC_CACHE_DIR") {
-                Ok(dir) => operator_log::info(
-                    module_path!(),
-                    format!("component cache: GREENTIC_CACHE_DIR={dir}"),
-                ),
+                Ok(dir) => {
+                    operator_log::info(
+                        module_path!(),
+                        format!("component cache: GREENTIC_CACHE_DIR={dir}"),
+                    );
+                    crate::warmup::log_cache_profile_check(&crate::warmup::check_cache_profile(
+                        dir.as_ref(),
+                    ));
+                }
                 Err(_) => operator_log::info(
                     module_path!(),
                     format!(
@@ -1152,6 +1157,9 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     let state_dir = demo_paths.state_dir.clone();
 
     crate::warmup::adopt_bundle_cache_dir(&config_dir);
+    crate::warmup::log_cache_profile_check(&crate::warmup::check_cache_profile(
+        &config_dir.join(".cache"),
+    ));
 
     let resolved_log_dir = config_dir.join("logs");
     if request.log_dir.is_none() && resolved_log_dir != log_dir {
