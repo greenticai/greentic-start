@@ -46,13 +46,40 @@ pub(crate) fn adopt_bundle_cache_dir(bundle_root: &Path) {
 /// Must be called in single-threaded startup before any worker/task spawn —
 /// the same constraint as [`adopt_bundle_cache_dir`].
 pub(crate) fn adopt_env_revision_cache(env_dir: &Path, revision_ids: &[impl AsRef<str>]) {
+    if std::env::var_os("GREENTIC_CACHE_DIR").is_some() {
+        return;
+    }
+    let mut probed = Vec::new();
     for rev_id in revision_ids {
         let bundle_dir = env_dir
             .join("revisions")
             .join(rev_id.as_ref())
             .join("bundle");
         adopt_bundle_cache_dir(&bundle_dir);
+        if std::env::var_os("GREENTIC_CACHE_DIR").is_some() {
+            return;
+        }
+        probed.push(bundle_dir.join(".cache").join("v1"));
     }
+    // Adopting is already announced by `adopt_bundle_cache_dir`; NOT adopting was
+    // silent, which is the case an operator actually needs to see. A cold start
+    // that recompiles every component costs ~20s on Cloud Run and looks identical
+    // to a healthy one in the logs, so say so and name what was probed.
+    eprintln!(
+        "greentic-start: no bundle-shipped component cache found ({}); \
+         components will be compiled on this and every future cold start. \
+         Probed: {}",
+        if probed.is_empty() {
+            "no materialized revisions".to_string()
+        } else {
+            format!("{} revision(s)", probed.len())
+        },
+        probed
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 }
 
 struct CollectedWasm {
