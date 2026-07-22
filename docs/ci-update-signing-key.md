@@ -1,10 +1,21 @@
 # CI Update-Plan Signing Key
 
-The `publish-update-plans.yml` workflow signs binary-update plans with a
-**dedicated CI key** that is distinct from any human operator's key. Both
-keys coexist in each environment's trust root, so a compromised CI key can
-be revoked without invalidating operator-signed plans and without rotating
-the operator key.
+The `publish-update-plans.yml` workflow signs binary-update plans with an
+Ed25519 key stored in `UPDATER_CI_SIGNING_KEY_PEM`. In the current
+deployment, **that key is the fleet `did:web` root key** — the same key
+published at `did:web:trust.greentic.cloud#root-1` (key_id
+`34b690258f1ae48d4a4be0bdbffb7fa3`). No separate operator key exists
+today; see the [kill-switch caveat](#revoking-the-ci-key-kill-switch) for
+what that means during an incident.
+
+The recommended shape is a **dedicated CI key** distinct from any
+operator's key. With both in each environment's trust root, a compromised
+CI key can be revoked without invalidating operator-signed plans. Adopting
+it requires minting a second key ([Minting the key](#minting-the-key)),
+publishing it as an additional assertion method in the `did:web` document,
+letting it propagate, and switching `UPDATER_CI_SIGNING_KEY_PEM` to the
+new private key — the publish-then-propagate-then-remove ordering
+documented under [Revoking](#revoking-the-ci-key-kill-switch).
 
 Environments learn that key through a `did:web` document. Publishing the
 public key once, at a stable URL, is what lets a fresh environment verify
@@ -214,10 +225,41 @@ masks it in the log, and removes it in an `if: always()` cleanup step.
 greentic-deployer op trust-root remove <env-id> --key-id <ci-key-id>
 ```
 
+> **Stop — check your key layout first.** The CI workflow currently
+> signs with the fleet `did:web` root key (key_id
+> `34b690258f1ae48d4a4be0bdbffb7fa3`). A fleet-anchored environment —
+> one configured via
+> [path 1](#1-the-fleet-channel--nothing-to-type) — holds that key as
+> its **only** trust anchor. Removing it does not fall back to an
+> operator key; it **empties the trust root**, and the environment can
+> then verify nothing — no CI plan, no operator plan. The procedure
+> below is safe only once a dedicated CI key is in use alongside a
+> separate operator key.
+
 Run it for every environment, then delete the `UPDATER_CI_SIGNING_KEY_PEM`
-repo secret. Plans signed by the CI key stop verifying immediately;
-operator-signed plans are unaffected, so recovery never requires rotating
-the operator key.
+repo secret. Plans signed by the CI key stop verifying immediately. In
+environments that hold a separate operator key (configured via
+[path 2](#2-your-own-signer--name-the-did) or
+[path 3](#3-no-document--paste-the-key) with an additional key),
+operator-signed plans are unaffected.
+
+**Recovery from an emptied trust root.** If `remove` was run against a
+fleet-anchored environment before a dedicated CI key was adopted, the
+environment's trust root is empty and no plans will verify. To recover,
+re-add a key:
+
+```bash
+# Re-anchor on the fleet DID (restores the root key)
+greentic-deployer op trust-root add-did <env-id> \
+  --did did:web:trust.greentic.cloud
+
+# — or add a key directly —
+greentic-deployer op trust-root add <env-id> \
+  --key-id <key-id> \
+  --public-key-file <key>.pub.pem
+```
+
+This must be done per environment; there is no fleet-wide undo.
 
 Dropping the key from the `did:web` document is **not** a revocation.
 Trusting a DID is add-only, so environments that already resolved it keep
