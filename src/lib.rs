@@ -618,10 +618,17 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
 
         // F3: adopt a bundle-shipped component cache from the first materialized
         // revision that carries one, eliminating Cranelift recompilation on every
-        // cold start. Runs before the multi-thread tokio runtime is built (line
-        // below), so the `set_var` inside `adopt_bundle_cache_dir` is
-        // single-threaded. A bundle without `.cache/v1/` is a silent no-op, and
-        // an explicitly-set `GREENTIC_CACHE_DIR` takes precedence.
+        // cold start. A bundle without `.cache/v1/` is a silent no-op, and an
+        // explicitly-set `GREENTIC_CACHE_DIR` takes precedence.
+        //
+        // This runs before the multi-thread tokio runtime is built, but NOT
+        // before the process is multi-threaded: `init_trace_log` above installs
+        // a `tracing_appender::non_blocking` writer, which spawns a worker
+        // thread. `set_var` therefore does not meet its documented
+        // single-threaded precondition. The adoption cannot simply move earlier
+        // — it needs `rc.revisions`, which only exists after the revision pull
+        // above. Removing the env-var channel entirely (threading the resolved
+        // cache root into `CacheConfig`) is the real fix; tracked in #430.
         {
             let rev_ids: Vec<&str> = rc
                 .revisions

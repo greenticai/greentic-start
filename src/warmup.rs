@@ -43,13 +43,17 @@ pub(crate) fn adopt_bundle_cache_dir(bundle_root: &Path) {
 /// [`adopt_bundle_cache_dir`] (which is a no-op when the dir is absent or
 /// `GREENTIC_CACHE_DIR` is already set). First revision with a cache wins.
 ///
-/// Must be called in single-threaded startup before any worker/task spawn —
-/// the same constraint as [`adopt_bundle_cache_dir`].
 /// Returns the `.cache/v1/` paths that were probed and found absent. Empty when
 /// a cache was adopted, when `GREENTIC_CACHE_DIR` was already set, or when there
 /// are no revisions. The caller logs the outcome — naming the probed paths is
 /// what makes a miss diagnosable, since the whole mechanism rests on the
 /// `<env_dir>/revisions/<rev_id>/bundle/` layout being correct.
+///
+/// Reaches `set_var` via [`adopt_bundle_cache_dir`], so it inherits that
+/// function's single-threaded precondition. The env-serve caller in `lib.rs`
+/// does NOT satisfy it — `init_trace_log` has already spawned a
+/// `tracing_appender` worker thread by then. See the note at that call site;
+/// removing the env-var channel is tracked in #430.
 pub(crate) fn adopt_env_revision_cache(
     env_dir: &Path,
     revision_ids: &[impl AsRef<str>],
