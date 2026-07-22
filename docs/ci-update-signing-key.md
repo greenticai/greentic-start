@@ -4,9 +4,12 @@ The `publish-update-plans.yml` workflow signs binary-update plans with an
 Ed25519 key stored in `UPDATER_CI_SIGNING_KEY_PEM`. In the current
 deployment, **that key is the fleet `did:web` root key** — the same key
 published at `did:web:trust.greentic.cloud#root-1` (key_id
-`34b690258f1ae48d4a4be0bdbffb7fa3`). No separate operator key exists
-today; see the [kill-switch caveat](#revoking-the-ci-key-kill-switch) for
-what that means during an incident.
+`34b690258f1ae48d4a4be0bdbffb7fa3`). The CI key and the fleet root key
+are therefore the same key, not two. Individual environments may still
+hold operator keys of their own, but an environment anchored on the fleet
+channel holds only this one — see the
+[kill-switch caveat](#revoking-the-ci-key-kill-switch) for what that means
+during an incident.
 
 The recommended shape is a **dedicated CI key** distinct from any
 operator's key. With both in each environment's trust root, a compromised
