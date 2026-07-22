@@ -616,6 +616,55 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             rc
         };
 
+        // F3: adopt a bundle-shipped component cache from the first materialized
+        // revision that carries one, eliminating Cranelift recompilation on every
+        // cold start. A bundle without `.cache/v1/` is a silent no-op, and an
+        // explicitly-set `GREENTIC_CACHE_DIR` takes precedence.
+        //
+        // This runs before the multi-thread tokio runtime is built, but NOT
+        // before the process is multi-threaded: `init_trace_log` above installs
+        // a `tracing_appender::non_blocking` writer, which spawns a worker
+        // thread. `set_var` therefore does not meet its documented
+        // single-threaded precondition. The adoption cannot simply move earlier
+        // — it needs `rc.revisions`, which only exists after the revision pull
+        // above. Removing the env-var channel entirely (threading the resolved
+        // cache root into `CacheConfig`) is the real fix; tracked in #430.
+        {
+            let rev_ids: Vec<&str> = rc
+                .revisions
+                .iter()
+                .map(|r| r.revision_id.as_str())
+                .collect();
+            let probed = crate::warmup::adopt_env_revision_cache(&env_dir, &rev_ids);
+            // Log the resolved cache outcome so operators can tell whether the
+            // cache was found, pre-set, or absent. Hit/miss counters
+            // (`CacheManager::metrics()`) are not exposed here because the
+            // CacheManager lives inside PackRuntime as a private field —
+            // surfacing it would require changes to greentic-runner-host.
+            match std::env::var("GREENTIC_CACHE_DIR") {
+                Ok(dir) => operator_log::info(
+                    module_path!(),
+                    format!("component cache: GREENTIC_CACHE_DIR={dir}"),
+                ),
+                Err(_) => operator_log::info(
+                    module_path!(),
+                    format!(
+                        "component cache: none (no bundle-shipped .cache/v1/ found; \
+                         components will be compiled from WASM on first use). Probed: {}",
+                        if probed.is_empty() {
+                            "no materialized revisions".to_string()
+                        } else {
+                            probed
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    ),
+                ),
+            }
+        }
+
         // C5: open the env's runtime.json snapshot once and share it across
         // every activation rebuild + the `runtime://` resolver every loaded
         // pack reaches. The store is `Arc`-shared so a single in-memory
