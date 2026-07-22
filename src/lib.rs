@@ -629,6 +629,22 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 .map(|r| r.revision_id.as_str())
                 .collect();
             crate::warmup::adopt_env_revision_cache(&env_dir, &rev_ids);
+            // Log the resolved cache outcome so operators can tell whether the
+            // cache was found, pre-set, or absent. Hit/miss counters
+            // (`CacheManager::metrics()`) are not exposed here because the
+            // CacheManager lives inside PackRuntime as a private field —
+            // surfacing it would require changes to greentic-runner-host.
+            match std::env::var("GREENTIC_CACHE_DIR") {
+                Ok(dir) => operator_log::info(
+                    module_path!(),
+                    format!("component cache: GREENTIC_CACHE_DIR={dir}"),
+                ),
+                Err(_) => operator_log::info(
+                    module_path!(),
+                    "component cache: none (no bundle-shipped .cache/v1/ found; \
+                     components will be compiled from WASM on first use)",
+                ),
+            }
         }
 
         // C5: open the env's runtime.json snapshot once and share it across
