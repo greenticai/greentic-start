@@ -433,6 +433,30 @@ fn is_own_cloud_run_host(host: &str, expected_service: &str) -> bool {
     name.ends_with(".run.app") && name.starts_with(&prefix)
 }
 
+/// Choose the WebSocket scheme (`ws` / `wss`) for a DirectLine `streamUrl`
+/// advertised to the browser, based on the forwarded protocol of the inbound
+/// request.
+///
+/// A browser on an HTTPS page can only open a `wss://` socket —
+/// `new WebSocket("ws://…")` throws `SecurityError` synchronously, so the
+/// BotFramework SDK never connects and stalls for several seconds before
+/// falling back. Behind a TLS-terminating proxy (Cloud Run's GFE, a K8s
+/// ingress) the container itself sees plain HTTP, so the external scheme has
+/// to be read from `X-Forwarded-Proto`, which such proxies set to `https`.
+///
+/// When multiple proxies chain the header (`"https, http"`) the first,
+/// client-facing value governs. Absent the header entirely — local
+/// plain-HTTP development with no proxy — fall back to `ws`, matching the
+/// page's own `http://` origin.
+pub(crate) fn forwarded_ws_scheme(headers: &[(String, String)]) -> &'static str {
+    let is_https = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-proto"))
+        .and_then(|(_, v)| v.split(',').next())
+        .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"));
+    if is_https { "wss" } else { "ws" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +471,56 @@ mod tests {
     use tempfile::tempdir;
     use zip::ZipWriter;
     use zip::write::FileOptions;
+
+    fn hdr(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn forwarded_ws_scheme_defaults_to_ws_when_header_absent() {
+        // Local plain-HTTP dev: no X-Forwarded-Proto, page is http:// -> ws.
+        assert_eq!(
+            forwarded_ws_scheme(&hdr(&[("host", "localhost:8080")])),
+            "ws"
+        );
+    }
+
+    #[test]
+    fn forwarded_ws_scheme_upgrades_to_wss_for_forwarded_https() {
+        // Cloud Run / TLS-terminating proxy sets X-Forwarded-Proto: https.
+        assert_eq!(
+            forwarded_ws_scheme(&hdr(&[("x-forwarded-proto", "https")])),
+            "wss"
+        );
+    }
+
+    #[test]
+    fn forwarded_ws_scheme_stays_ws_for_forwarded_http() {
+        assert_eq!(
+            forwarded_ws_scheme(&hdr(&[("x-forwarded-proto", "http")])),
+            "ws"
+        );
+    }
+
+    #[test]
+    fn forwarded_ws_scheme_is_case_insensitive_on_name_and_value() {
+        assert_eq!(
+            forwarded_ws_scheme(&hdr(&[("X-Forwarded-Proto", "HTTPS")])),
+            "wss"
+        );
+    }
+
+    #[test]
+    fn forwarded_ws_scheme_uses_first_value_when_chained() {
+        // Proxy chains append; the first (client-facing) value governs.
+        assert_eq!(
+            forwarded_ws_scheme(&hdr(&[("x-forwarded-proto", "https, http")])),
+            "wss"
+        );
+    }
 
     #[test]
     fn inspect_bundle_detects_static_route_extension() -> anyhow::Result<()> {

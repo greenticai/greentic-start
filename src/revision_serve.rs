@@ -4712,7 +4712,12 @@ fn rewrite_stream_url(headers: &[(String, String)], response: &mut IngressHttpRe
         return;
     };
     let relative = body_json["streamUrl"].as_str().unwrap_or("").to_string();
-    let absolute = format!("ws://{host}{relative}");
+    // Behind a TLS-terminating proxy (Cloud Run, K8s ingress) the page is
+    // HTTPS, so the socket must be wss:// — a ws:// URL throws SecurityError in
+    // the browser. Derive the scheme from X-Forwarded-Proto rather than the
+    // container's own (always-plain-HTTP) listener.
+    let scheme = crate::startup_contract::forwarded_ws_scheme(headers);
+    let absolute = format!("{scheme}://{host}{relative}");
     body_json["streamUrl"] = serde_json::Value::String(absolute);
     if let Ok(rewritten) = serde_json::to_vec(&body_json) {
         response.body = Some(rewritten);
@@ -6998,6 +7003,35 @@ mod tests {
             body["streamUrl"],
             "ws://example.com:8080/v3/directline/conversations/abc123/stream?t=TOKEN",
             "relative streamUrl must become an absolute ws:// URL using the Host header"
+        );
+    }
+
+    #[test]
+    fn rewrite_stream_url_uses_wss_when_forwarded_https() {
+        // Behind a TLS-terminating proxy (Cloud Run) the page is HTTPS, so the
+        // rewritten streamUrl must be wss:// or the browser refuses the socket.
+        let headers = vec![
+            ("host".to_string(), "svc.run.app".to_string()),
+            ("x-forwarded-proto".to_string(), "https".to_string()),
+        ];
+        let mut response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "conversationId": "abc123",
+                    "streamUrl": "/v3/directline/conversations/abc123/stream?t=TOKEN"
+                }))
+                .unwrap(),
+            ),
+        };
+        rewrite_stream_url(&headers, &mut response);
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["streamUrl"],
+            "wss://svc.run.app/v3/directline/conversations/abc123/stream?t=TOKEN",
+            "with X-Forwarded-Proto: https the streamUrl must be wss://"
         );
     }
 
