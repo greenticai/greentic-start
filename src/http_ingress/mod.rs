@@ -1822,10 +1822,11 @@ where
             .find(|(k, _)| k.eq_ignore_ascii_case("host"))
             .map(|(_, v)| v.clone())
     {
-        // Use ws:// when the original request was HTTP — operator doesn't
-        // terminate TLS today; if a proxy ahead does, the browser will
-        // negotiate wss:// against the same origin.
-        let scheme = "ws";
+        // A browser on an HTTPS page can only open a wss:// socket — a ws://
+        // URL throws SecurityError, not a same-origin upgrade. When a proxy
+        // ahead terminates TLS it sets X-Forwarded-Proto: https; read the
+        // scheme from there, falling back to ws:// for plain-HTTP (no proxy).
+        let scheme = crate::startup_contract::forwarded_ws_scheme(&ingress_request.headers);
         let relative = body_json["streamUrl"].as_str().unwrap_or("").to_string();
         let absolute = format!("{scheme}://{host}{relative}");
         body_json["streamUrl"] = serde_json::Value::String(absolute);
