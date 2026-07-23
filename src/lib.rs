@@ -386,6 +386,24 @@ fn run_resolve_secret(args: cli_args::ResolveSecretArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether the env-serve boot should default to a cloudflared tunnel so a
+/// messaging provider's inbound webhook can be auto-registered.
+///
+/// True only when the operator hasn't decided the tunnel themselves
+/// (`tunnel_explicit`, which also covers an explicit `--cloudflared off`),
+/// ngrok isn't already the chosen tunnel, a served provider needs an inbound
+/// webhook, and no public URL is already configured (a cloud env carries the
+/// deployer's `public_base_url`, so it never spawns a redundant quick tunnel).
+/// Pure so the policy is unit-tested without booting a server.
+fn should_default_messaging_tunnel(
+    tunnel_explicit: bool,
+    ngrok_on: bool,
+    needs_public_webhook: bool,
+    public_base_url_configured: bool,
+) -> bool {
+    !tunnel_explicit && !ngrok_on && needs_public_webhook && !public_base_url_configured
+}
+
 fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     // Disable provider-core-only mode in demo so WASM components can access secrets directly.
     // Without this, the runner-host blocks secrets_store.get() calls from WASM.
@@ -691,6 +709,42 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             .collect();
         let gui_enabled =
             resolve_console_enabled(&environment.host_config, !pack_webchat_routes.is_empty());
+
+        // Make messaging work out of the box: when the env has a messaging
+        // provider that needs an inbound webhook (Webex, Telegram, …) and no
+        // public URL is already configured, default to a cloudflared tunnel so
+        // `gtc start <bundle>` registers the webhook without an explicit
+        // `--cloudflared on`. This mirrors the legacy bundle arm's "no deployer
+        // pack -> default cloudflared", but scoped to *needs a webhook*:
+        //   - an explicit `--cloudflared/--ngrok` (or `off`) wins (`tunnel_explicit`);
+        //   - a cloud env already carries `host_config.public_base_url` (the
+        //     deployer's ingress), so `resolve_public_base_url` is `Some` and we
+        //     do NOT spawn a redundant quick tunnel;
+        //   - webchat-only bundles have no `messaging_endpoints`, so nothing spawns.
+        let public_base_url_configured = startup_contract::resolve_public_base_url(&environment)
+            .ok()
+            .flatten()
+            .is_some();
+        let needs_public_webhook = revision_webhook_register::env_needs_public_webhook(
+            routing.http_routes.routes(),
+            &environment,
+        );
+        if should_default_messaging_tunnel(
+            request.tunnel_explicit,
+            matches!(request.ngrok, NgrokModeArg::On),
+            needs_public_webhook,
+            public_base_url_configured,
+        ) {
+            operator_log::info(
+                module_path!(),
+                "a served provider needs an inbound webhook and no PUBLIC_BASE_URL is \
+                 configured; defaulting to a cloudflared tunnel so webhook auto-registration \
+                 can run (override with `--cloudflared off`)",
+            );
+            request.cloudflared = CloudflaredModeArg::On;
+            request.tunnel_explicit = true;
+        }
+
         // A public tunnel (`--cloudflared on` / `--ngrok on`) forwards external
         // traffic to this listener over loopback, so a tunneled request's TCP
         // peer reads as 127.0.0.1 and would defeat the loopback trust gate on
@@ -1772,6 +1826,23 @@ mod tests {
     use std::path::Path;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn messaging_tunnel_default_needs_endpoint_and_no_configured_url() {
+        // The out-of-the-box case: a provider needs a webhook, no URL is
+        // configured, and the operator didn't decide the tunnel → default on.
+        assert!(should_default_messaging_tunnel(false, false, true, false));
+
+        // Explicit tunnel choice (incl. `--cloudflared off`) always wins.
+        assert!(!should_default_messaging_tunnel(true, false, true, false));
+        // ngrok already chosen → don't also force cloudflared.
+        assert!(!should_default_messaging_tunnel(false, true, true, false));
+        // No provider needs a webhook (e.g. a webchat-only bundle) → nothing to register.
+        assert!(!should_default_messaging_tunnel(false, false, false, false));
+        // A public URL is already configured (a cloud env's deployer ingress) →
+        // no redundant quick tunnel.
+        assert!(!should_default_messaging_tunnel(false, false, true, true));
+    }
 
     fn host_config_with_gui(
         gui_enabled: Option<bool>,

@@ -47,6 +47,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
 use greentic_types::ChannelMessageEnvelope;
+// Reply-shaping now delegates to `messaging_app::parse_envelopes`, which owns
+// the `ext_keys` writes; the constants are only referenced by tests here.
+#[cfg(test)]
 use greentic_types::messaging::extensions::ext_keys;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
@@ -2987,22 +2990,118 @@ fn unwrap_pending_response(raw: &Value) -> &Value {
 
 fn activity_to_worker_message(activity: &Activity) -> WorkerInvokeMessage {
     let payload = unwrap_pending_response(activity.payload());
-    if let Some(card) = payload.get("renderedCard") {
+    // A rendered adaptive card can arrive nested rather than at the top level:
+    // a terminal `emit.response` node emits `{renderedCard: …}` directly, but a
+    // terminal node that is the adaptive-card component's `card` op (or any
+    // provider whose output is MCP/`result`-wrapped) nests it under
+    // `outputs`/`result`/`structured_content`/`payload`, or inside an array of
+    // per-node outputs. The legacy messaging path finds it by selecting the
+    // terminal envelope-compatible node output (`collect_transcript_outputs`)
+    // before `parse_envelopes`; the env/revision path has no transcript, so
+    // deep-walk the in-process reply for it here. Checking only the top level
+    // (the previous behaviour) dropped these cards to a generic `"activity"`
+    // with no card and no text, which the webchat encoder then renders as the
+    // "webchat universal payload" placeholder.
+    if let Some(card) = find_rendered_card(payload) {
         WorkerInvokeMessage {
             kind: "adaptive-card".to_string(),
-            payload: card.clone(),
+            payload: card,
         }
     } else if payload.get("text").is_some() {
         WorkerInvokeMessage {
             kind: "text".to_string(),
             payload: payload.clone(),
         }
+    } else if let Some(text) = flow_error_reply_text(payload) {
+        // A failed flow lifts `metadata.error_kind`/`error_message` onto the
+        // reply. Surface a categorized, user-safe message (the same classifier
+        // the legacy messaging path uses) as text, instead of dropping the raw
+        // error envelope to a generic activity — which is what rendered the
+        // WeatherAPI "API key is invalid" failure as a blank "universal payload"
+        // rather than telling the user their credentials need attention.
+        WorkerInvokeMessage {
+            kind: "text".to_string(),
+            payload: serde_json::json!({ "text": text }),
+        }
     } else {
+        // Nothing recognizable — log the shape so a future drop of this class is
+        // diagnosable from the operator log rather than only visible as a blank
+        // "universal payload" reply in the channel.
+        operator_log::info(
+            module_path!(),
+            format!(
+                "env-path reply carried no card/text; forwarding as generic activity. \
+                 top-level keys: [{}]; payload={}",
+                match payload {
+                    Value::Object(map) => map.keys().cloned().collect::<Vec<_>>().join(", "),
+                    other => other.to_string().chars().take(80).collect(),
+                },
+                payload.to_string().chars().take(2000).collect::<String>(),
+            ),
+        );
         WorkerInvokeMessage {
             kind: "activity".to_string(),
             payload: payload.clone(),
         }
     }
+}
+
+/// Deep-search a flow reply for a rendered adaptive card, preferring the
+/// terminal (last) one when several are present.
+///
+/// The runner may hand the env/revision path a card at the top level (an
+/// `emit.response` node), nested under a node-output wrapper
+/// (`outputs`/`result`/`structured_content`/`payload`/`response` — e.g. the
+/// adaptive-card component's `card` op or an MCP-`result`-wrapped provider), or
+/// as one element of an array of per-node outputs. Recursion is confined to
+/// those known wrapper keys (and arrays) so an unrelated `renderedCard`-shaped
+/// value elsewhere in the payload is not mistaken for the reply card. Mirrors
+/// the legacy `messaging_app::parse_envelopes` renderedCard handling so the two
+/// reply paths stay in parity.
+fn find_rendered_card(value: &Value) -> Option<Value> {
+    const WRAPPER_KEYS: &[&str] = &[
+        "outputs",
+        "result",
+        "structured_content",
+        "payload",
+        "response",
+    ];
+    match value {
+        Value::Object(map) => {
+            if let Some(card) = map.get("renderedCard").filter(|c| !c.is_null()) {
+                return Some(card.clone());
+            }
+            WRAPPER_KEYS
+                .iter()
+                .find_map(|key| map.get(*key).and_then(find_rendered_card))
+        }
+        // Prefer the LAST array element that yields a card: the runner appends
+        // node outputs in execution order, so the terminal node's card wins.
+        Value::Array(items) => items.iter().rev().find_map(find_rendered_card),
+        _ => None,
+    }
+}
+
+/// A user-safe reply text for a failed flow, or `None` when the payload carries
+/// no flow error.
+///
+/// The runner ends a user-facing flow at its failure point by lifting
+/// `error_kind`/`error_message` onto the reply's `metadata`. Without this, the
+/// env/revision path dropped that envelope to a generic activity that the
+/// channel rendered as "universal payload" — hiding the real cause (e.g.
+/// WeatherAPI's `2006 "API key is invalid"`). Delegates categorization to the
+/// legacy messaging classifier so both paths return the same message.
+fn flow_error_reply_text(payload: &Value) -> Option<String> {
+    let metadata = payload.get("metadata").and_then(Value::as_object)?;
+    let kind = metadata
+        .get("error_kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message = metadata
+        .get("error_message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    crate::messaging_app::flow_error_user_message(kind, message)
 }
 
 /// Shape a worker-invoke payload for the flow engine's routing context.
@@ -4006,31 +4105,34 @@ async fn run_provider_inbound_pipeline(
         };
 
         for reply in replies {
-            let reply_envelope = build_reply_envelope(ingress, &reply);
-            match run_reply_egress(
-                &activation,
-                &tenant,
-                deployment_id,
-                bundle_id.clone(),
-                revision_id,
-                &pack_id,
-                &provider_type,
-                &reply_envelope,
-            )
-            .await
-            {
-                Ok(send_outcome) => {
-                    try_notify_webchat_activity(notifier.as_ref(), &send_outcome).await;
-                }
-                Err(err) => {
-                    operator_log::error(
-                        module_path!(),
-                        format!(
-                            "provider {provider_type} egress failed for deployment \
-                             {deployment_id} revision {revision_id} (reply id={}): {err:#}",
-                            reply_envelope.id
-                        ),
-                    );
+            // One reply payload can fan out to several envelopes (e.g.
+            // `messages[]`), so ship each shaped envelope in turn.
+            for reply_envelope in build_reply_envelopes(ingress, &reply, &pack_id, &tenant) {
+                match run_reply_egress(
+                    &activation,
+                    &tenant,
+                    deployment_id,
+                    bundle_id.clone(),
+                    revision_id,
+                    &pack_id,
+                    &provider_type,
+                    &reply_envelope,
+                )
+                .await
+                {
+                    Ok(send_outcome) => {
+                        try_notify_webchat_activity(notifier.as_ref(), &send_outcome).await;
+                    }
+                    Err(err) => {
+                        operator_log::error(
+                            module_path!(),
+                            format!(
+                                "provider {provider_type} egress failed for deployment \
+                                 {deployment_id} revision {revision_id} (reply id={}): {err:#}",
+                                reply_envelope.id
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -4213,23 +4315,16 @@ async fn try_notify_webchat_activity(
 /// (channel/session/to) from the ingress. Otherwise treat the payload as
 /// the reply text or wholesale `metadata` carrier and start from a
 /// clone of the ingress envelope.
-fn build_reply_envelope(
+fn build_reply_envelopes(
     ingress: &ChannelMessageEnvelope,
     reply: &Activity,
-) -> ChannelMessageEnvelope {
-    // Keys carried forward from the ingress envelope's metadata when the
-    // reply doesn't supply its own. Kept in sync with the legacy
-    // `messaging_app::base_reply_envelope` reset list.
-    const REPLY_METADATA_KEYS: &[&str] = &[
-        "env",
-        "tenant",
-        "team",
-        "route",
-        "locale",
-        "universal",
-        "autoStart",
-    ];
-
+    pack_id: &str,
+    tenant: &str,
+) -> Vec<ChannelMessageEnvelope> {
+    // A reply that is already a full envelope (some flows emit one directly) is
+    // passed through, repairing only the route fields from the ingress.
+    // `parse_envelopes` does not reconstruct a bare envelope, so keep this ahead
+    // of the shared shaper.
     if let Ok(mut envelope) =
         serde_json::from_value::<ChannelMessageEnvelope>(reply.payload().clone())
     {
@@ -4245,72 +4340,79 @@ fn build_reply_envelope(
         if envelope.id.is_empty() {
             envelope.id = uuid::Uuid::new_v4().to_string();
         }
-        return envelope;
+        return vec![envelope];
     }
 
-    let mut envelope = ingress.clone();
-    envelope.id = uuid::Uuid::new_v4().to_string();
-    envelope.from = None;
-    envelope.correlation_id = None;
-    envelope.reply_scope = None;
-    envelope.text = None;
-    envelope.attachments.clear();
-
-    let mut clean = std::collections::BTreeMap::new();
-    for key in REPLY_METADATA_KEYS {
-        if let Some(value) = envelope.metadata.remove(*key) {
-            clean.insert((*key).to_string(), value);
-        }
-    }
-    envelope.metadata = clean;
-
-    // Lift the flow reply's content via the same extractor the worker/chat
-    // path uses (`activity_to_worker_message`), so it handles the `session.wait`
-    // "pending" wrapper and `renderedCard` shape uniformly. An adaptive card
-    // goes into `metadata["adaptive_card"]` — where every provider's
-    // `resolve_adaptive_card` reads it — plus `extensions[ADAPTIVE_CARD]` for
-    // the typed pipeline; otherwise carry the reply text. Without the card lift,
-    // TierD providers (Telegram/Slack/WhatsApp/...) fall back to their
-    // "universal <provider> payload" placeholder instead of the card.
-    let message = activity_to_worker_message(reply);
-    match message.kind.as_str() {
-        "adaptive-card" => {
-            if let Ok(ac_json) = serde_json::to_string(&message.payload) {
-                envelope
-                    .metadata
-                    .insert("adaptive_card".to_string(), ac_json);
-            }
-            envelope
-                .extensions
-                .insert(ext_keys::ADAPTIVE_CARD.to_string(), message.payload);
-        }
-        "text" => {
-            if let Some(text) = message
-                .payload
-                .get("text")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                envelope.text = Some(text.to_string());
-            }
-        }
-        _ => {}
-    }
-
-    // Forward the reply's DirectLine passthrough fields (attachments /
-    // channelData / entities / suggestedActions / speak / inputHint / rag) into
-    // the outbound envelope's extensions, using the exact same mapping the
-    // legacy `messaging_app` path applies. The egress chain
-    // (`render_plan` → `encode` → `send_payload`) reads these from
-    // `extensions`; without this copy a rich reply reaches the provider as
-    // text only and attachments/channelData/entities are dropped. Operates on
-    // the pending-unwrapped payload so it matches the content lift above.
-    crate::messaging_app::copy_directline_passthrough(
-        unwrap_pending_response(reply.payload()),
-        &mut envelope,
+    // Unwrap the `session.wait` "pending" wrapper, then sign any OAuth Connect
+    // card `state` (the host knows pack/tenant/team) so /oauth/callback can
+    // resolve pack-scoped creds — the legacy messaging path does both before
+    // shaping.
+    let mut value = unwrap_pending_response(reply.payload()).clone();
+    let team = ingress
+        .metadata
+        .get("team")
+        .map(String::as_str)
+        .unwrap_or("default");
+    crate::messaging_app::augment_oauth_connect_state(
+        &mut value,
+        pack_id,
+        tenant,
+        team,
+        (!ingress.session_id.is_empty()).then_some(ingress.session_id.as_str()),
     );
 
-    envelope
+    // The legacy path selects the terminal node's output — which carries
+    // `renderedCard` at its top level — from the transcript via
+    // `collect_transcript_outputs` BEFORE calling `parse_envelopes`. The
+    // in-process reply has no transcript, and the adaptive-card `card` op nests
+    // its `renderedCard` under the runner's output wrapper
+    // (`outputs`/`result`/`structured_content`/…). `parse_envelopes` only reads
+    // a TOP-LEVEL `renderedCard`, so without this the nested card would be
+    // shaped as a JSON text dump. Hoist it — this is the env-path analog of the
+    // legacy transcript selection.
+    if value.get("renderedCard").is_none_or(|c| c.is_null())
+        && let Some(card) = find_rendered_card(&value)
+        && let Value::Object(map) = &mut value
+    {
+        map.insert("renderedCard".to_string(), card);
+    }
+
+    // Delegate content shaping to the SINGLE shared shaper. This is the whole
+    // point of the consolidation: the env/revision path now handles exactly the
+    // shapes the legacy path does (typed/nested adaptive cards,
+    // `messages[]`/`events[]` multi-reply, `result` text, flow-error
+    // categorization, DirectLine passthrough) instead of a hand-rolled subset
+    // that dropped unrecognised shapes to a "universal payload" placeholder.
+    match crate::messaging_app::parse_envelopes(&value, ingress) {
+        Ok(envelopes) if !envelopes.is_empty() => envelopes
+            .into_iter()
+            .map(|mut envelope| {
+                // Give each reply its own id — some `parse_envelopes` branches
+                // clone the ingress, whose id is the inbound request's.
+                if envelope.id.is_empty() || envelope.id == ingress.id {
+                    envelope.id = uuid::Uuid::new_v4().to_string();
+                }
+                envelope
+            })
+            .collect(),
+        // Nothing shapeable → deliver nothing, exactly as the legacy messaging
+        // path does (`run_app_flow` returns the `parse_envelopes` error and no
+        // reply is sent). Logged so a genuinely-dropped reply is diagnosable.
+        Ok(_) => {
+            operator_log::info(
+                module_path!(),
+                "flow reply produced no deliverable envelope",
+            );
+            Vec::new()
+        }
+        Err(err) => {
+            operator_log::info(
+                module_path!(),
+                format!("flow reply could not be shaped into an envelope: {err:#}"),
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Collect every request header into `(name_lowercase, value_utf8)` pairs
@@ -5129,6 +5231,86 @@ mod tests {
         let msg = activity_to_worker_message(&pending);
         assert_eq!(msg.kind, "adaptive-card");
         assert_eq!(msg.payload, card);
+    }
+
+    #[test]
+    fn activity_to_worker_message_finds_nested_rendered_card() {
+        // Regression for the "webchat universal payload" bug: a terminal node
+        // that is the adaptive-card component's `card` op (not `emit.response`)
+        // nests `renderedCard` under the runner's output wrapper. The previous
+        // top-level-only check dropped it to a generic `"activity"`, so the
+        // webchat encoder rendered the placeholder instead of the card. Each of
+        // these shapes must resolve back to the card.
+        let card = json!({ "type": "AdaptiveCard", "version": "1.6" });
+
+        // Nested under `outputs`.
+        let a = Activity::custom(
+            "response",
+            json!({ "outputs": { "renderedCard": card.clone() } }),
+        );
+        assert_eq!(activity_to_worker_message(&a).kind, "adaptive-card");
+        assert_eq!(activity_to_worker_message(&a).payload, card);
+
+        // Nested under the MCP `result.structured_content` wrapper.
+        let b = Activity::custom(
+            "response",
+            json!({ "result": { "structured_content": { "renderedCard": card.clone() } } }),
+        );
+        assert_eq!(activity_to_worker_message(&b).payload, card);
+
+        // An array of per-node outputs — the terminal (last) card wins.
+        let earlier = json!({ "type": "AdaptiveCard", "version": "1.0" });
+        let c = Activity::custom(
+            "response",
+            json!([
+                { "outputs": { "renderedCard": earlier } },
+                { "outputs": { "renderedCard": card.clone() } },
+            ]),
+        );
+        assert_eq!(activity_to_worker_message(&c).payload, card);
+    }
+
+    #[test]
+    fn activity_to_worker_message_surfaces_flow_errors_as_text() {
+        // A failed flow lifts `metadata.error_kind`/`error_message` onto the
+        // reply. It must surface as a categorized user message (text), not fall
+        // through to a generic "activity" that the channel renders as the blank
+        // "universal payload" placeholder. The WeatherAPI "API key is invalid"
+        // case is the regression: an `api key` signal → the auth-category
+        // message, so the user learns their credentials need attention.
+        let reply = Activity::custom(
+            "response",
+            json!({
+                "metadata": {
+                    "error_kind": "flow_execution_failed",
+                    "error_message": "component weatherapi_current failed: MCP_TOOL_ERROR: {\"error\":{\"code\":2006,\"message\":\"API key is invalid.\"}}",
+                    "flow_id": "flow_get_weather"
+                }
+            }),
+        );
+        let msg = activity_to_worker_message(&reply);
+        assert_eq!(msg.kind, "text");
+        let text = msg
+            .payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            text.to_ascii_lowercase().contains("authentication"),
+            "an invalid-API-key failure must surface as an auth message, got: {text}"
+        );
+        assert_ne!(text, "webchat universal payload");
+    }
+
+    #[test]
+    fn find_rendered_card_ignores_unrelated_keys() {
+        // A reply with no card anywhere stays cardless (falls through to text or
+        // generic activity), and recursion doesn't invent a card from unrelated
+        // keys that merely nest objects.
+        let no_card = json!({ "meta": { "foo": { "bar": 1 } }, "n": 7 });
+        assert!(find_rendered_card(&no_card).is_none());
+        // A null renderedCard is treated as absent.
+        assert!(find_rendered_card(&json!({ "renderedCard": null })).is_none());
     }
 
     #[test]
@@ -6003,7 +6185,10 @@ mod tests {
         .expect("ingress envelope");
 
         let reply = Activity::text("hello back");
-        let envelope = build_reply_envelope(&ingress, &reply);
+        let envelope = build_reply_envelopes(&ingress, &reply, "pack", "acme")
+            .into_iter()
+            .next()
+            .expect("one reply envelope");
 
         // Route fields preserved.
         assert_eq!(envelope.session_id, "chat-42");
@@ -6044,7 +6229,10 @@ mod tests {
 
         // Direct `renderedCard` shape.
         let reply = Activity::custom("response", json!({ "renderedCard": card.clone() }));
-        let envelope = build_reply_envelope(&ingress, &reply);
+        let envelope = build_reply_envelopes(&ingress, &reply, "pack", "acme")
+            .into_iter()
+            .next()
+            .expect("one reply envelope");
         let stored: Value = serde_json::from_str(
             envelope
                 .metadata
@@ -6068,7 +6256,10 @@ mod tests {
             "response",
             json!({ "status": "pending", "response": { "renderedCard": card.clone() } }),
         );
-        let envelope = build_reply_envelope(&ingress, &pending);
+        let envelope = build_reply_envelopes(&ingress, &pending, "pack", "acme")
+            .into_iter()
+            .next()
+            .expect("one reply envelope");
         let stored: Value = serde_json::from_str(
             envelope
                 .metadata
@@ -6118,7 +6309,10 @@ mod tests {
         });
         let reply = Activity::custom("messaging", reply_payload);
 
-        let envelope = build_reply_envelope(&ingress, &reply);
+        let envelope = build_reply_envelopes(&ingress, &reply, "pack", "acme")
+            .into_iter()
+            .next()
+            .expect("one reply envelope");
         assert_eq!(envelope.session_id, "chat-7");
         assert_eq!(envelope.channel, "telegram");
         assert_eq!(envelope.to.len(), 1);
@@ -6162,7 +6356,10 @@ mod tests {
             }),
         );
 
-        let envelope = build_reply_envelope(&ingress, &reply);
+        let envelope = build_reply_envelopes(&ingress, &reply, "pack", "acme")
+            .into_iter()
+            .next()
+            .expect("one reply envelope");
 
         // Text still lifted.
         assert_eq!(
@@ -6188,6 +6385,99 @@ mod tests {
         assert!(
             !envelope.extensions.contains_key(ext_keys::ADAPTIVE_CARD),
             "card rides inside forwarded attachments; no separate lift"
+        );
+    }
+
+    #[test]
+    fn build_reply_envelopes_delegates_to_shared_shaper_and_fans_out_multi_reply() {
+        // The env/revision path now delegates to `messaging_app::parse_envelopes`
+        // — the same shaper the legacy `--bundle` path uses — so it gains the
+        // shapes the old hand-rolled env-path dropped to "universal payload":
+        // typed adaptive cards and `messages[]` multi-reply. Parity guard: if a
+        // bespoke shortcut is ever reintroduced that bypasses the shared shaper,
+        // this fails.
+        let ingress: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-in-parity",
+            "tenant": { "env": "dev", "tenant": "acme", "tenant_id": "acme", "attempt": 0 },
+            "channel": "webchat-gui",
+            "session_id": "conv-p",
+            "to": [{ "id": "room-1", "kind": "room" }],
+            "text": "hi",
+        }))
+        .expect("ingress envelope");
+        let card = json!({ "type": "AdaptiveCard", "version": "1.6" });
+
+        // (a) Typed `{type:"adaptive_card"}` — previously dropped by the env-path.
+        let typed = Activity::custom(
+            "response",
+            json!({ "type": "adaptive_card", "card": card.clone() }),
+        );
+        let envs = build_reply_envelopes(&ingress, &typed, "pack", "acme");
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].extensions.get(ext_keys::ADAPTIVE_CARD), Some(&card));
+
+        // (b) `messages[]` multi-reply — previously collapsed to a single reply.
+        let multi = Activity::custom(
+            "response",
+            json!({ "messages": [ { "text": "first" }, { "text": "second" } ] }),
+        );
+        let envs = build_reply_envelopes(&ingress, &multi, "pack", "acme");
+        assert_eq!(
+            envs.len(),
+            2,
+            "messages[] must fan out to one envelope each"
+        );
+        let texts: Vec<_> = envs.iter().filter_map(|e| e.text.as_deref()).collect();
+        assert!(texts.contains(&"first") && texts.contains(&"second"));
+
+        // (c) Parity: the env-path result equals calling the shared shaper
+        // directly, modulo the fresh reply id the env-path assigns.
+        let value = json!({ "renderedCard": card.clone() });
+        let direct = crate::messaging_app::parse_envelopes(&value, &ingress).expect("parse");
+        let via_env = build_reply_envelopes(
+            &ingress,
+            &Activity::custom("response", value.clone()),
+            "pack",
+            "acme",
+        );
+        assert_eq!(direct.len(), via_env.len());
+        assert_eq!(
+            direct[0].metadata.get("adaptive_card"),
+            via_env[0].metadata.get("adaptive_card"),
+        );
+    }
+
+    #[test]
+    fn build_reply_envelopes_hoists_nested_card_before_shaping() {
+        // Regression guard for the consolidation: the adaptive-card `card` op
+        // nests `renderedCard` under the runner's output wrapper, and
+        // `parse_envelopes` only reads a TOP-LEVEL `renderedCard`. Without the
+        // hoist the nested card would be shaped as a JSON text dump instead of
+        // an adaptive card — the exact failure the deep-walk selection prevents.
+        let ingress: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-in-nested",
+            "tenant": { "env": "dev", "tenant": "acme", "tenant_id": "acme", "attempt": 0 },
+            "channel": "webchat-gui",
+            "session_id": "conv-n",
+            "to": [{ "id": "room-1", "kind": "room" }],
+            "text": "hi",
+        }))
+        .expect("ingress envelope");
+        let card = json!({ "type": "AdaptiveCard", "version": "1.5" });
+        let reply = Activity::custom(
+            "response",
+            json!({ "result": { "structured_content": { "renderedCard": card.clone() } } }),
+        );
+        let envs = build_reply_envelopes(&ingress, &reply, "pack", "acme");
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].extensions.get(ext_keys::ADAPTIVE_CARD),
+            Some(&card),
+            "a nested renderedCard must be shaped as an adaptive card, not text"
+        );
+        assert!(
+            envs[0].text.is_none(),
+            "no text bubble when a card is present"
         );
     }
 

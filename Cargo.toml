@@ -223,12 +223,12 @@ features = ["pack-fetch"]
 # main's greentic-runner#466 flow-node component-id resolution floor, which must
 # be re-asserted after the merged runner build.
 [dependencies.greentic-runner-desktop]
-version = "=1.1.6"
+version = "=1.1.7"
 default-features = false
 features = ["agentic-worker", "greentic-llm-backend", "desktop-agent-ephemeral"]
 
 [dependencies.greentic-runner-host]
-version = "=1.1.6"
+version = "=1.1.7"
 default-features = false
 features = ["agentic-worker", "greentic-llm-backend"]
 

@@ -351,7 +351,7 @@ pub fn run_app_flow(
 ///
 /// `renderedCard` can be nested anywhere in the node output, so we walk the whole
 /// value and rewrite the `state` of any `oauth/authorize` URL we find.
-fn augment_oauth_connect_state(
+pub(crate) fn augment_oauth_connect_state(
     value: &mut JsonValue,
     pack_id: &str,
     tenant: &str,
@@ -1061,7 +1061,18 @@ pub(crate) fn copy_directline_passthrough(
     }
 }
 
-fn parse_envelopes(
+/// Shape a runner reply value into outbound `ChannelMessageEnvelope`(s).
+///
+/// This is the single reply-shaping implementation shared by the legacy
+/// `--bundle` messaging path (which feeds it a transcript-selected node output)
+/// and the env/revision serve path (which feeds it an in-process reply payload
+/// via [`crate::revision_serve`]). Keeping ONE implementation is deliberate:
+/// the env-path previously hand-rolled a subset and silently dropped every
+/// shape it missed (typed/nested adaptive cards, `messages[]`/`events[]`,
+/// result text, flow errors) to a "universal payload" placeholder. Callers on
+/// the env-path should apply [`augment_oauth_connect_state`] first, mirroring
+/// this module's own wrapper.
+pub(crate) fn parse_envelopes(
     value: &JsonValue,
     ingress_envelope: &ChannelMessageEnvelope,
 ) -> Result<Vec<ChannelMessageEnvelope>> {
@@ -1342,6 +1353,21 @@ struct FlowErrorCategorization {
     category: &'static str,
     user_message: String,
     fault: ErrorFault,
+}
+
+/// The user-safe, categorized message for a failed flow's
+/// `(error_kind, error_message)`. Shared with the env/revision reply path
+/// ([`crate::revision_serve`]) so it surfaces the same message the legacy
+/// messaging path does — instead of dropping the raw error envelope to a
+/// generic reply the channel renders as "universal payload". Returns `None`
+/// only when both inputs are effectively empty (nothing to categorize).
+pub(crate) fn flow_error_user_message(error_kind: &str, error_message: &str) -> Option<String> {
+    let kind = error_kind.trim();
+    let message = error_message.trim();
+    if kind.is_empty() && message.is_empty() {
+        return None;
+    }
+    Some(categorize_flow_error(kind, message).user_message)
 }
 
 /// Map a raw `(error_kind, error_message)` from the engine onto a stable
@@ -2795,5 +2821,323 @@ mod tests {
             "secret key MUST stay absent when SecretsManager has no value — \
              stale plaintext, if any, must not leak in",
         );
+    }
+
+    /// Find the newest on-disk revision bundle that contains the real
+    /// `weatherapi-pack.gtpack`. ULID revision dir names sort lexicographically
+    /// in chronological order, so the max name that has the pack is newest.
+    fn newest_weather_bundle() -> Option<(PathBuf, PathBuf)> {
+        let home = std::env::var("HOME").ok()?;
+        let revisions = PathBuf::from(home).join(".greentic/environments/local/revisions");
+        let mut candidates: Vec<PathBuf> = std::fs::read_dir(&revisions)
+            .ok()?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_dir())
+            .collect();
+        candidates.sort();
+        for rev in candidates.into_iter().rev() {
+            let bundle = rev.join("bundle");
+            let pack = bundle.join("packs").join("weatherapi-pack.gtpack");
+            if pack.exists() {
+                return Some((bundle, pack));
+            }
+        }
+        None
+    }
+
+    /// Build the button-submit envelope mirroring the webchat "Current Weather"
+    /// Action.Submit, run the REAL `default` entry flow (which dispatches to
+    /// `flow_get_weather` -> `weatherapi_current` -> adaptive-card render)
+    /// through the wasmtime runner, and return the raw reply envelopes.
+    ///
+    /// A fresh `DemoRunnerHost` is built here (not passed in) so that any
+    /// `GREENTIC_DEV_SECRETS_PATH` override set by the caller is honored when
+    /// the secrets handle is resolved.
+    fn drive_get_weather(bundle: &Path, pack_path: &Path) -> Result<Vec<ChannelMessageEnvelope>> {
+        let discovery = crate::discovery::discover(bundle).expect("discovery");
+        let secrets_handle =
+            crate::secrets_gate::resolve_secrets_manager(bundle, "demo", Some("default"))
+                .expect("secrets handle");
+        let runner_host = DemoRunnerHost::new(
+            bundle.to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )
+        .expect("runner host");
+
+        let ctx = OperatorContext {
+            tenant: "demo".to_string(),
+            team: Some("default".to_string()),
+            correlation_id: None,
+        };
+
+        // The default entry flow dispatches on `in.input.metadata.operation` to
+        // `flow_{operation}`, and `flow_get_weather`'s `call_weather` node reads
+        // the city from `in.input.metadata.q` (verified by decoding
+        // manifest.cbor). So operation = "get_weather" and q = "Nairobi",
+        // exactly mirroring the webchat "Current Weather" Action.Submit.
+        let mut env = envelope();
+        env.channel = "messaging-webchat".to_string();
+        env.text = None;
+        env.metadata
+            .insert("operation".to_string(), "get_weather".to_string());
+        env.metadata.insert("q".to_string(), "Nairobi".to_string());
+        env.metadata
+            .insert("city".to_string(), "Nairobi".to_string());
+
+        eprintln!(
+            "[repro] input envelope =\n{}",
+            serde_json::to_string_pretty(&env).unwrap_or_default()
+        );
+
+        run_app_flow(
+            &runner_host,
+            bundle,
+            &ctx,
+            pack_path,
+            "weatherapi-pack",
+            "default",
+            &env,
+        )
+    }
+
+    fn print_replies(replies: &[ChannelMessageEnvelope]) {
+        eprintln!(
+            "[repro] run_app_flow => Ok, {} reply envelope(s)",
+            replies.len()
+        );
+        for (i, r) in replies.iter().enumerate() {
+            eprintln!(
+                "[repro] ---- reply[{i}] ----\n{}",
+                serde_json::to_string_pretty(r).unwrap_or_default()
+            );
+            eprintln!("[repro] reply[{i}].text = {:?}", r.text);
+            eprintln!(
+                "[repro] reply[{i}].metadata keys = {:?}",
+                r.metadata.keys().collect::<Vec<_>>()
+            );
+            eprintln!(
+                "[repro] reply[{i}].extensions keys = {:?}",
+                r.extensions.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    fn reply_has_card(reply: &ChannelMessageEnvelope) -> bool {
+        reply.metadata.contains_key("adaptive_card")
+            || reply.extensions.contains_key(ext_keys::ADAPTIVE_CARD)
+    }
+
+    /// End-to-end test for the webchat "Current Weather" reply shape.
+    ///
+    /// Two modes, selected by the `WEATHERAPI_TEST_KEY` env var:
+    ///
+    /// * UNSET — the reproduction. The bundle's dev-secrets store has no
+    ///   WeatherAPI key, so `call_weather` fails with a `service_auth`
+    ///   (`flow_node_failed`) error and NO card is produced. We assert that
+    ///   error shape so CI stays green while still documenting the bug.
+    ///
+    /// * SET (non-empty) — the proof that the render path works with a valid
+    ///   key. We seed a temp dev-secrets store with the key at the exact URIs
+    ///   the `weatherapi_current` component resolves at runtime, point
+    ///   `GREENTIC_DEV_SECRETS_PATH` at it, run the flow, and assert the reply
+    ///   now carries a rendered adaptive card (NOT the auth error).
+    ///
+    /// The key value is read ONLY from the env var — never hardcoded.
+    #[test]
+    fn repro_get_weather_reply_shape() {
+        let Some((bundle, pack_path)) = newest_weather_bundle() else {
+            eprintln!(
+                "[repro] SKIP: no on-disk revision with weatherapi-pack.gtpack found under \
+                 ~/.greentic/environments/local/revisions"
+            );
+            return;
+        };
+        eprintln!("[repro] bundle    = {}", bundle.display());
+        eprintln!("[repro] pack_path = {}", pack_path.display());
+
+        let weather_key = std::env::var("WEATHERAPI_TEST_KEY").unwrap_or_default();
+
+        if weather_key.is_empty() {
+            // ---- Reproduction path (no key): assert the known auth-error shape.
+            eprintln!(
+                "[repro] WEATHERAPI_TEST_KEY not set — running the reproduction \
+                 (expect a service_auth error, no card). Set WEATHERAPI_TEST_KEY \
+                 to exercise the valid-key render path."
+            );
+            let result = drive_get_weather(&bundle, &pack_path);
+            let replies = match &result {
+                Ok(replies) => {
+                    print_replies(replies);
+                    replies
+                }
+                Err(e) => panic!("[repro] run_app_flow returned Err: {e:?}"),
+            };
+            assert_eq!(replies.len(), 1, "expected exactly one reply envelope");
+            let reply = &replies[0];
+            assert!(
+                !reply_has_card(reply),
+                "unexpected: reply carried a card WITHOUT a seeded key — the dev \
+                 secrets store must have gained a WeatherAPI key out-of-band"
+            );
+            assert_eq!(
+                reply.metadata.get("error_kind").map(String::as_str),
+                Some("flow_node_failed"),
+                "expected the reproduction's flow_node_failed error; metadata = {:?}",
+                reply.metadata
+            );
+            assert_eq!(
+                reply.metadata.get("error_category").map(String::as_str),
+                Some("service_auth"),
+                "expected a service_auth error (missing WeatherAPI key); metadata = {:?}",
+                reply.metadata
+            );
+            eprintln!(
+                "[repro] reproduced: call_weather failed service_auth (no key), no card. \
+                 error_message = {:?}",
+                reply.metadata.get("error_message")
+            );
+            return;
+        }
+
+        // ---- Valid-key path: seed a temp dev-secrets store and prove the card renders.
+        use greentic_secrets_lib::core::seed::{ApplyOptions, DevStore, apply_seed};
+        use greentic_secrets_lib::{SecretFormat, SeedDoc, SeedEntry, SeedValue};
+        use tokio::runtime::Runtime;
+
+        eprintln!("[repro] WEATHERAPI_TEST_KEY is set — exercising the valid-key render path.");
+
+        let store_dir = tempdir().expect("tempdir");
+        let store_path = store_dir.path().join("weather.secrets.env");
+        let store = DevStore::with_path(store_path.clone()).expect("dev store");
+
+        // Seed a broad matrix of the URI variants the component / runner could
+        // resolve. The `weatherapi_current` component declares
+        // `host.secrets.required` for `auth_param_get_weather_key` with scope
+        // `{env: dev, tenant: demo}`, while the server's `secret_read_uris`
+        // remaps env `dev -> local` and normalizes the provider/pack segment
+        // (`weatherapi-pack` <-> `weatherapi_pack`). Rather than guess the exact
+        // shape the desktop runner uses, seed the full cross-product so
+        // resolution succeeds regardless of which form is requested. The value
+        // comes ONLY from the env var — never hardcoded.
+        let envs = ["local", "dev"];
+        let tenants = ["demo", "default"];
+        let teams = ["_", "default"];
+        let providers = ["weatherapi_pack", "weatherapi-pack", "weatherapi_current"];
+        let keys = [
+            "auth_param_get_weather_key",
+            "auth_param_get_forecast_weather_key",
+        ];
+        let mut uris: Vec<String> = Vec::new();
+        for e in envs {
+            for t in tenants {
+                for tm in teams {
+                    for p in providers {
+                        for k in keys {
+                            uris.push(format!("secrets://{e}/{t}/{tm}/{p}/{k}"));
+                        }
+                    }
+                }
+            }
+        }
+        let seed = SeedDoc {
+            entries: uris
+                .iter()
+                .map(|uri| SeedEntry {
+                    uri: uri.clone(),
+                    format: SecretFormat::Text,
+                    value: SeedValue::Text {
+                        text: weather_key.clone(),
+                    },
+                    description: None,
+                })
+                .collect(),
+        };
+        let runtime = Runtime::new().expect("tokio runtime");
+        let report =
+            runtime.block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
+        assert_eq!(
+            report.ok,
+            uris.len(),
+            "failed to seed all weather secret URIs: {report:?}"
+        );
+        eprintln!(
+            "[repro] seeded {} WeatherAPI key URIs into temp dev store {}",
+            report.ok,
+            store_path.display()
+        );
+
+        // Point runtime secret resolution at the temp store. Guard the env
+        // mutation with the shared test env lock and restore it afterwards.
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        let prev_override = std::env::var_os("GREENTIC_DEV_SECRETS_PATH");
+        // SAFETY: tests are serialized via test_env_lock above.
+        unsafe {
+            std::env::set_var("GREENTIC_DEV_SECRETS_PATH", &store_path);
+        }
+
+        let result = drive_get_weather(&bundle, &pack_path);
+
+        // SAFETY: restore the previous override under the same lock.
+        unsafe {
+            match &prev_override {
+                Some(value) => std::env::set_var("GREENTIC_DEV_SECRETS_PATH", value),
+                None => std::env::remove_var("GREENTIC_DEV_SECRETS_PATH"),
+            }
+        }
+        drop(env_guard);
+
+        let replies = match &result {
+            Ok(replies) => {
+                print_replies(replies);
+                replies
+            }
+            Err(e) => panic!("[repro] run_app_flow returned Err: {e:?}"),
+        };
+        assert_eq!(replies.len(), 1, "expected exactly one reply envelope");
+        let reply = &replies[0];
+
+        // Distinguish "seeded key never reached the component" from a genuine
+        // render failure. WeatherAPI returns code 1002 ("...invalid or not
+        // provided") when NO key is sent, and 2006 ("API key is invalid") when
+        // a wrong key IS sent. So a lingering 1002 with a seeded key means the
+        // runner did not source the secret at all (the in-process
+        // `run_pack_with_options` harness does not provision the weatherapi
+        // component's declared `host.secrets.required` from this dev store);
+        // a 2006 proves the key DID thread through.
+        let err_msg = reply
+            .metadata
+            .get("error_message")
+            .cloned()
+            .unwrap_or_default();
+        let is_auth_failure =
+            reply.metadata.get("error_kind").map(String::as_str) == Some("flow_node_failed");
+        if is_auth_failure && err_msg.contains("1002") {
+            panic!(
+                "[repro] seeded WeatherAPI key did NOT reach the component: still got \
+                 WeatherAPI code 1002 (\"key not provided\"), not 2006 (\"key invalid\"). \
+                 The seeded secret ({} URI variants in a temp dev store pointed to by \
+                 GREENTIC_DEV_SECRETS_PATH) is not sourced by the weatherapi component in \
+                 this in-process run_pack_with_options harness. error_message = {err_msg:?}",
+                uris.len()
+            );
+        }
+
+        // With a valid key the flow must NOT short-circuit into the auth error.
+        assert!(
+            !is_auth_failure,
+            "flow still failed with a valid key (non-1002). error_message = {err_msg:?}"
+        );
+        assert!(
+            reply_has_card(reply),
+            "valid key but reply carried NO adaptive card. text = {:?}, \
+             metadata keys = {:?}, extensions keys = {:?}",
+            reply.text,
+            reply.metadata.keys().collect::<Vec<_>>(),
+            reply.extensions.keys().collect::<Vec<_>>()
+        );
+        eprintln!("[repro] SUCCESS: valid key produced a rendered adaptive card.");
     }
 }

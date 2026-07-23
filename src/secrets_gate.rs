@@ -136,6 +136,7 @@ struct LoggingSecretsManager {
     inner: DynSecretsManager,
     dev_store_path_display: String,
     using_env_fallback: bool,
+    bundle_tenants: Vec<String>,
 }
 
 impl LoggingSecretsManager {
@@ -143,6 +144,7 @@ impl LoggingSecretsManager {
         inner: DynSecretsManager,
         dev_store_path: Option<&Path>,
         using_env_fallback: bool,
+        bundle_tenants: Vec<String>,
     ) -> Self {
         let dev_store_path_display = dev_store_path
             .map(|path| path.display().to_string())
@@ -151,6 +153,7 @@ impl LoggingSecretsManager {
             inner,
             dev_store_path_display,
             using_env_fallback,
+            bundle_tenants,
         }
     }
 }
@@ -194,6 +197,26 @@ impl SecretsManager for LoggingSecretsManager {
                         candidates.push(canon_fb);
                     }
                     candidates.push(fallback_path);
+                }
+                // Tenant fallback: setup may have scoped the secret under a
+                // different tenant than this runtime read (setup honours the
+                // CLI/answers tenant; the webchat route uses its URL segment).
+                // Retry under each tenant the bundle declares — the tenant
+                // analogue of the team/provider fallbacks above.
+                for tenant in &self.bundle_tenants {
+                    let Some(retenanted) = with_tenant(path, tenant) else {
+                        continue;
+                    };
+                    if let Some(canon) = canonicalize_provider_segment(&retenanted) {
+                        candidates.push(canon);
+                    }
+                    if let Some(team_fb) = team_wildcard_fallback(&retenanted) {
+                        if let Some(canon_fb) = canonicalize_provider_segment(&team_fb) {
+                            candidates.push(canon_fb);
+                        }
+                        candidates.push(team_fb);
+                    }
+                    candidates.push(retenanted);
                 }
                 for candidate in candidates {
                     operator_log::info(
@@ -243,6 +266,21 @@ fn team_wildcard_fallback(path: &str) -> Option<String> {
     ))
 }
 
+/// Return `path` with its tenant segment replaced by `tenant`, or `None` when
+/// the URI isn't a 5-segment `secrets://env/tenant/team/provider/key` URI or
+/// already uses that tenant.
+fn with_tenant(path: &str, tenant: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("secrets://")?;
+    let segments: Vec<&str> = trimmed.split('/').collect();
+    if segments.len() != 5 || segments[1] == tenant {
+        return None;
+    }
+    Some(format!(
+        "secrets://{}/{}/{}/{}/{}",
+        segments[0], tenant, segments[2], segments[3], segments[4]
+    ))
+}
+
 /// If `path` is `secrets://env/tenant/team/provider/key`, return the same URI with the
 /// provider and key segments canonicalized (lowercase, `-`/`.`/`/`/space -> `_`) to match
 /// how setup/store keys are normalized at write time. Returns None if it is already
@@ -282,6 +320,40 @@ pub struct SecretsManagerHandle {
     pub dev_store_path: Option<PathBuf>,
     pub canonical_team: String,
     pub using_env_fallback: bool,
+    /// Tenants the bundle declares (its `tenants/` dir). Used as read-time
+    /// fallback scopes: setup may scope a secret under a different tenant than
+    /// the runtime read (setup honours the CLI/answers tenant, the webchat route
+    /// uses its URL segment), so on a miss the reader retries under each bundle
+    /// tenant — the tenant analogue of the team/provider fallbacks.
+    pub bundle_tenants: Vec<String>,
+}
+
+/// Read the tenants a bundle declares from its `tenants/` directory. The
+/// reader uses these as fallback scopes so a secret written by setup under one
+/// tenant still resolves when the runtime reads under another.
+fn read_bundle_tenants(bundle_root: &Path) -> Vec<String> {
+    std::fs::read_dir(bundle_root.join("tenants"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect()
+}
+
+/// Collect the union of tenants declared across a served env's revision bundles
+/// (`<env>/revisions/*/bundle/tenants/`), for use as read-time fallback scopes
+/// on the bundle-less serve path (which has no single bundle root).
+fn read_env_tenants(env_dir: &Path) -> Vec<String> {
+    let mut tenants = std::collections::BTreeSet::new();
+    if let Ok(revisions) = std::fs::read_dir(env_dir.join("revisions")) {
+        for revision in revisions.flatten() {
+            for tenant in read_bundle_tenants(&revision.path().join("bundle")) {
+                tenants.insert(tenant);
+            }
+        }
+    }
+    tenants.into_iter().collect()
 }
 
 impl SecretsManagerHandle {
@@ -294,6 +366,7 @@ impl SecretsManagerHandle {
             self.manager(),
             self.dev_store_path.as_deref(),
             self.using_env_fallback,
+            self.bundle_tenants.clone(),
         ))
     }
 }
@@ -348,6 +421,7 @@ pub fn resolve_secrets_manager(
                 dev_store_path: store_path,
                 canonical_team: team_owned,
                 using_env_fallback,
+                bundle_tenants: read_bundle_tenants(bundle_root),
             });
         }
     };
@@ -440,6 +514,7 @@ pub fn resolve_secrets_manager(
         dev_store_path: store_path,
         canonical_team: team_owned,
         using_env_fallback,
+        bundle_tenants: read_bundle_tenants(bundle_root),
     })
 }
 
@@ -559,6 +634,7 @@ fn resolve_bound_secrets_manager(
         dev_store_path: store_path,
         canonical_team,
         using_env_fallback,
+        bundle_tenants: read_bundle_tenants(bundle_root),
     })
 }
 
@@ -661,6 +737,7 @@ pub fn resolve_serve_secrets_manager(
         manager,
         dev_store_path.as_deref(),
         false,
+        read_env_tenants(env_dir),
     ));
     let tenant_scope = matches!(kind, SecretsBackendKind::Vault).then(|| tenant.to_string());
     Ok((manager, tenant_scope))
@@ -698,7 +775,17 @@ fn serve_secrets_manager_for_kind(
 fn open_dev_store_manager(
     bundle_root: &Path,
 ) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>)> {
-    let client = SecretsClient::open(bundle_root)?;
+    // `818e5da` routed the setup *writer* and the `dev_store_path` helpers to
+    // the shared env store (`~/.greentic/environments/<env>/.greentic/dev/…`)
+    // when `$GREENTIC_ENV` is set, but this runtime *reader* still rooted the
+    // dev store at the (ephemeral) bundle root — so it never saw the secrets
+    // `gtc setup` registered, and every WASM secret read (weather API key, …)
+    // came back not-found. Resolve the same env-store-aware path the writer
+    // uses; fall back to the bundle root only when no store exists yet.
+    let client = match crate::dev_store_path::find_existing(bundle_root) {
+        Some(store_path) => SecretsClient::open_with_path(store_path)?,
+        None => SecretsClient::open(bundle_root)?,
+    };
     let path = client.store_path().map(|path| path.to_path_buf());
     Ok((Arc::new(client) as DynSecretsManager, path))
 }
@@ -1493,6 +1580,95 @@ mod tests {
         assert!(handle.selection.pack_path.is_none());
         assert!(handle.dev_store_path.is_some());
         assert!(!handle.using_env_fallback);
+        Ok(())
+    }
+
+    /// Regression guard for the env-store secrets move (setup #226 / start #423).
+    ///
+    /// When `$GREENTIC_ENV` is set, the setup *writer* (`dev_store_path::ensure_path`,
+    /// as `gtc setup` uses) and the runtime *reader* (`open_dev_store_manager` ->
+    /// `find_existing`) must independently resolve the SAME shared env store under
+    /// the greentic home — never the ephemeral bundle root. Before the fix the
+    /// reader rooted the store at the bundle root, so secrets `gtc setup`
+    /// registered came back not-found at runtime (the weather-API-key symptom).
+    /// This test deliberately does NOT set `GREENTIC_DEV_SECRETS_PATH`, so it
+    /// exercises the real env-store rendezvous rather than the override shortcut.
+    #[test]
+    fn setup_writer_and_runtime_reader_rendezvous_on_env_store() -> anyhow::Result<()> {
+        let home = tempdir()?;
+        let bundle_root = tempdir()?;
+        let uri = "secrets://local/acme/_/weatherapi_pack/auth_param_get_weather_key";
+        let runtime = Runtime::new()?;
+
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        let prev_home = env::var_os("HOME");
+        let prev_env = env::var_os("GREENTIC_ENV");
+        let prev_override = env::var_os("GREENTIC_DEV_SECRETS_PATH");
+        unsafe {
+            env::set_var("HOME", home.path());
+            env::set_var("GREENTIC_ENV", "local");
+            env::remove_var("GREENTIC_DEV_SECRETS_PATH");
+        }
+
+        // All env-dependent, fallible work in one closure so the env is restored
+        // unconditionally afterwards (keeping `test_env_lock` unpoisoned) and every
+        // assertion runs only once the process env is back to normal.
+        let captured =
+            (|| -> anyhow::Result<(PathBuf, usize, DynSecretsManager, Option<PathBuf>)> {
+                // WRITER: resolve + create the store exactly as `gtc setup` would, then seed.
+                let writer_path = crate::dev_store_path::ensure_path(bundle_root.path())?;
+                let store = DevStore::with_path(writer_path.clone())?;
+                let seed = SeedDoc {
+                    entries: vec![SeedEntry {
+                        uri: uri.to_string(),
+                        format: SecretFormat::Text,
+                        value: SeedValue::Text {
+                            text: "WEATHER_KEY".to_string(),
+                        },
+                        description: None,
+                    }],
+                };
+                let report = runtime
+                    .block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
+                // READER: the runtime side resolves + reads back independently.
+                let (manager, reader_path) = open_dev_store_manager(bundle_root.path())?;
+                Ok((writer_path, report.ok, manager, reader_path))
+            })();
+
+        unsafe {
+            match prev_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+            match prev_env {
+                Some(value) => env::set_var("GREENTIC_ENV", value),
+                None => env::remove_var("GREENTIC_ENV"),
+            }
+            if let Some(value) = prev_override {
+                env::set_var("GREENTIC_DEV_SECRETS_PATH", value);
+            }
+        }
+        drop(env_guard);
+
+        let (writer_path, seeded, manager, reader_path) = captured?;
+        assert_eq!(seeded, 1, "writer should have seeded exactly one secret");
+        assert!(
+            writer_path.starts_with(home.path()),
+            "writer resolved {writer_path:?}; expected the shared env store under {:?}",
+            home.path()
+        );
+        assert!(
+            !writer_path.starts_with(bundle_root.path()),
+            "writer must not fall back to the ephemeral bundle root ({:?})",
+            bundle_root.path()
+        );
+        assert_eq!(
+            reader_path.as_deref(),
+            Some(writer_path.as_path()),
+            "runtime reader must rendezvous on the writer's env-store path"
+        );
+        let value = runtime.block_on(async { manager.read(uri).await })?;
+        assert_eq!(value, b"WEATHER_KEY".to_vec());
         Ok(())
     }
 
