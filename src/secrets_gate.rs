@@ -136,6 +136,7 @@ struct LoggingSecretsManager {
     inner: DynSecretsManager,
     dev_store_path_display: String,
     using_env_fallback: bool,
+    bundle_tenants: Vec<String>,
 }
 
 impl LoggingSecretsManager {
@@ -143,6 +144,7 @@ impl LoggingSecretsManager {
         inner: DynSecretsManager,
         dev_store_path: Option<&Path>,
         using_env_fallback: bool,
+        bundle_tenants: Vec<String>,
     ) -> Self {
         let dev_store_path_display = dev_store_path
             .map(|path| path.display().to_string())
@@ -151,6 +153,7 @@ impl LoggingSecretsManager {
             inner,
             dev_store_path_display,
             using_env_fallback,
+            bundle_tenants,
         }
     }
 }
@@ -194,6 +197,26 @@ impl SecretsManager for LoggingSecretsManager {
                         candidates.push(canon_fb);
                     }
                     candidates.push(fallback_path);
+                }
+                // Tenant fallback: setup may have scoped the secret under a
+                // different tenant than this runtime read (setup honours the
+                // CLI/answers tenant; the webchat route uses its URL segment).
+                // Retry under each tenant the bundle declares — the tenant
+                // analogue of the team/provider fallbacks above.
+                for tenant in &self.bundle_tenants {
+                    let Some(retenanted) = with_tenant(path, tenant) else {
+                        continue;
+                    };
+                    if let Some(canon) = canonicalize_provider_segment(&retenanted) {
+                        candidates.push(canon);
+                    }
+                    if let Some(team_fb) = team_wildcard_fallback(&retenanted) {
+                        if let Some(canon_fb) = canonicalize_provider_segment(&team_fb) {
+                            candidates.push(canon_fb);
+                        }
+                        candidates.push(team_fb);
+                    }
+                    candidates.push(retenanted);
                 }
                 for candidate in candidates {
                     operator_log::info(
@@ -243,6 +266,21 @@ fn team_wildcard_fallback(path: &str) -> Option<String> {
     ))
 }
 
+/// Return `path` with its tenant segment replaced by `tenant`, or `None` when
+/// the URI isn't a 5-segment `secrets://env/tenant/team/provider/key` URI or
+/// already uses that tenant.
+fn with_tenant(path: &str, tenant: &str) -> Option<String> {
+    let trimmed = path.strip_prefix("secrets://")?;
+    let segments: Vec<&str> = trimmed.split('/').collect();
+    if segments.len() != 5 || segments[1] == tenant {
+        return None;
+    }
+    Some(format!(
+        "secrets://{}/{}/{}/{}/{}",
+        segments[0], tenant, segments[2], segments[3], segments[4]
+    ))
+}
+
 /// If `path` is `secrets://env/tenant/team/provider/key`, return the same URI with the
 /// provider and key segments canonicalized (lowercase, `-`/`.`/`/`/space -> `_`) to match
 /// how setup/store keys are normalized at write time. Returns None if it is already
@@ -282,6 +320,40 @@ pub struct SecretsManagerHandle {
     pub dev_store_path: Option<PathBuf>,
     pub canonical_team: String,
     pub using_env_fallback: bool,
+    /// Tenants the bundle declares (its `tenants/` dir). Used as read-time
+    /// fallback scopes: setup may scope a secret under a different tenant than
+    /// the runtime read (setup honours the CLI/answers tenant, the webchat route
+    /// uses its URL segment), so on a miss the reader retries under each bundle
+    /// tenant — the tenant analogue of the team/provider fallbacks.
+    pub bundle_tenants: Vec<String>,
+}
+
+/// Read the tenants a bundle declares from its `tenants/` directory. The
+/// reader uses these as fallback scopes so a secret written by setup under one
+/// tenant still resolves when the runtime reads under another.
+fn read_bundle_tenants(bundle_root: &Path) -> Vec<String> {
+    std::fs::read_dir(bundle_root.join("tenants"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect()
+}
+
+/// Collect the union of tenants declared across a served env's revision bundles
+/// (`<env>/revisions/*/bundle/tenants/`), for use as read-time fallback scopes
+/// on the bundle-less serve path (which has no single bundle root).
+fn read_env_tenants(env_dir: &Path) -> Vec<String> {
+    let mut tenants = std::collections::BTreeSet::new();
+    if let Ok(revisions) = std::fs::read_dir(env_dir.join("revisions")) {
+        for revision in revisions.flatten() {
+            for tenant in read_bundle_tenants(&revision.path().join("bundle")) {
+                tenants.insert(tenant);
+            }
+        }
+    }
+    tenants.into_iter().collect()
 }
 
 impl SecretsManagerHandle {
@@ -294,6 +366,7 @@ impl SecretsManagerHandle {
             self.manager(),
             self.dev_store_path.as_deref(),
             self.using_env_fallback,
+            self.bundle_tenants.clone(),
         ))
     }
 }
@@ -348,6 +421,7 @@ pub fn resolve_secrets_manager(
                 dev_store_path: store_path,
                 canonical_team: team_owned,
                 using_env_fallback,
+                bundle_tenants: read_bundle_tenants(bundle_root),
             });
         }
     };
@@ -440,6 +514,7 @@ pub fn resolve_secrets_manager(
         dev_store_path: store_path,
         canonical_team: team_owned,
         using_env_fallback,
+        bundle_tenants: read_bundle_tenants(bundle_root),
     })
 }
 
@@ -559,6 +634,7 @@ fn resolve_bound_secrets_manager(
         dev_store_path: store_path,
         canonical_team,
         using_env_fallback,
+        bundle_tenants: read_bundle_tenants(bundle_root),
     })
 }
 
@@ -661,6 +737,7 @@ pub fn resolve_serve_secrets_manager(
         manager,
         dev_store_path.as_deref(),
         false,
+        read_env_tenants(env_dir),
     ));
     let tenant_scope = matches!(kind, SecretsBackendKind::Vault).then(|| tenant.to_string());
     Ok((manager, tenant_scope))
