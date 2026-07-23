@@ -2,7 +2,7 @@ bench = [{ name = "perf", harness = false }]
 
 [package]
 name = "greentic-start"
-version = "1.1.26"
+version = "1.1.27"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -196,7 +196,13 @@ version = ">=0.2.4, <0.3"
 # record-only would accept a `_`-addressed plan the delegated stage path then
 # refuses. Also collapses a duplicate `greentic-update` copy in the lockfile —
 # 1.1.15 still pinned the dead `greentic-update 0.1.x` line.
-version = ">=1.1.21, <1.2.0-0"
+#
+# Floor raised to 1.1.26: the release carrying the per-channel resume re-gate
+# (`current_admission_facts` scoped by channel). The delegated `updates::get`
+# resume path here would otherwise wedge a plan resuming after a channel
+# migration against the other channel's applied sequence. Transitively pins
+# greentic-update >= 1.1.2 (the authoritative channel-scoped gate).
+version = ">=1.1.26, <1.2.0-0"
 default-features = false
 
 # Lower bound pinned to the first dev build exposing the `signing` module
