@@ -186,9 +186,8 @@ fn run_loop(config: WallClockSchedulerConfig, rx: mpsc::Receiver<()>) -> anyhow:
         for fire_time in fires {
             fire(&config, &s.def, fire_time);
             s.last_fire = Some(fire_time);
-        }
-        if let Some(lf) = s.last_fire {
-            state.last_fire.insert(s.def.id.clone(), lf);
+            state.last_fire.insert(s.def.id.clone(), fire_time);
+            save_state(&config.state_dir, &state);
         }
     }
     save_state(&config.state_dir, &state);
