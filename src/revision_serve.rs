@@ -3927,38 +3927,59 @@ async fn dispatch_provider_route(
     )
     .await?;
 
-    // Flow targeting: a URL-derived flow_id (from the webchat classifier)
-    // or an X-Greentic-Flow header overrides the endpoint's configured
-    // welcome_flow. Validate against the FlowIndex and construct a
-    // WelcomeFlowHint; unknown flow ids warn and fall back to normal
-    // selection (fail open).
-    let welcome_hint = {
+    // Flow targeting: a URL-derived flow_id (from the webchat classifier) or an
+    // `X-Greentic-Flow` header names the flow directly; with neither, a webchat
+    // request targets the bundle's default flow. Validate against the FlowIndex;
+    // an unknown flow id warns and falls back to normal selection (fail open).
+    //
+    // This target is stamped on the activity as `(pack_id, flow_id)` rather than
+    // carried only as a `WelcomeFlowHint`, because the runner resolves the flow
+    // BEFORE it consults the hint: a bundle with more than one messaging flow
+    // fails resolution with "flow type messaging is ambiguous" and never reaches
+    // the hint. See `dispatch_provider_events`.
+    let flow_target = {
         let url_flow_id = webchat_target.and_then(|t| t.flow_id.as_deref());
-        let candidate_flow = url_flow_id.or(flow_header);
-        if let Some(flow_id) = candidate_flow {
-            let bundle_id_str = scope.bundle_id.as_str();
-            if let Some(pack_id) = activation
+        let bundle_id_str = scope.bundle_id.as_str();
+        let named = url_flow_id.or(flow_header).and_then(|flow_id| {
+            activation
                 .routing
                 .flow_index
                 .pack_id_for_flow(bundle_id_str, flow_id)
-            {
-                Some(WelcomeFlowHint {
+                .map(|pack_id| WelcomeFlowHint {
                     pack_id: pack_id.to_string(),
                     flow_id: flow_id.to_string(),
                 })
-            } else {
-                tracing::warn!(
-                    flow_id,
-                    bundle_id = bundle_id_str,
-                    "URL/header flow hint does not match any known flow in this bundle; \
-                     falling back to normal flow selection",
-                );
-                welcome_hint
-            }
-        } else {
-            welcome_hint
-        }
+                .or_else(|| {
+                    tracing::warn!(
+                        flow_id,
+                        bundle_id = bundle_id_str,
+                        "URL/header flow hint does not match any known flow in this bundle; \
+                         falling back to the bundle's default flow",
+                    );
+                    None
+                })
+        });
+        // No flow named, or the named one is unknown: fall back to the bundle's
+        // default flow. "Fail open" has to mean the default flow, not "leave it
+        // to the runner" — the runner's own fallback matches on `flow_type`,
+        // which is ambiguous for exactly the multi-flow bundles this targeting
+        // exists for. Only the webchat classifier's own routes get this; a
+        // generic provider webhook keeps the runner's resolution untouched.
+        named.or_else(|| {
+            webchat_target?;
+            activation
+                .routing
+                .flow_index
+                .default_flow_for_bundle(bundle_id_str)
+                .map(|(pack_id, flow_id)| WelcomeFlowHint {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                })
+        })
     };
+    // An explicitly targeted flow also overrides the endpoint's configured
+    // welcome_flow on first contact.
+    let welcome_hint = flow_target.clone().or(welcome_hint);
 
     let http_in = build_provider_http_in(
         &provider_type,
@@ -4066,6 +4087,7 @@ async fn dispatch_provider_route(
                 pipeline_provider,
                 ingress_envelopes,
                 endpoint_id,
+                flow_target,
                 welcome_hint,
                 pipeline_notifier,
             )
@@ -4145,15 +4167,17 @@ async fn run_provider_inbound_pipeline(
     provider_type: String,
     envelopes: Vec<ChannelMessageEnvelope>,
     endpoint_id: Option<String>,
+    flow_target: Option<WelcomeFlowHint>,
     welcome_hint: Option<WelcomeFlowHint>,
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
 ) {
     for ingress in &envelopes {
         // Per-envelope flow targeting: if the envelope carries a
-        // `flow_hint` metadata key, validate it against the FlowIndex
-        // and override the request-level welcome hint. Unknown flow ids
-        // warn and fall back to the request-level hint (fail open).
-        let envelope_hint = ingress
+        // `flow_hint` metadata key (the provider echoing back the flow the
+        // conversation was opened against), validate it against the FlowIndex
+        // and override the request-level target. Unknown flow ids warn and
+        // fall back to the request-level target (fail open).
+        let envelope_target = ingress
             .metadata
             .get("flow_hint")
             .and_then(|flow_id| {
@@ -4177,10 +4201,16 @@ async fn run_provider_inbound_pipeline(
                     None
                 }
             })
-            .or_else(|| welcome_hint.clone());
+            .or_else(|| flow_target.clone());
+        let envelope_hint = envelope_target.clone().or_else(|| welcome_hint.clone());
 
-        let activity =
-            envelope_to_activity(ingress, &tenant, endpoint_id.as_deref(), envelope_hint);
+        let activity = envelope_to_activity(
+            ingress,
+            &tenant,
+            endpoint_id.as_deref(),
+            envelope_hint,
+            envelope_target,
+        );
         let replies = match activation
             .host
             .handle_activity_for_revision(
@@ -4587,6 +4617,7 @@ fn envelope_to_activity(
     fallback_tenant: &str,
     endpoint_id: Option<&str>,
     welcome_hint: Option<WelcomeFlowHint>,
+    flow_target: Option<WelcomeFlowHint>,
 ) -> Activity {
     // Serialize the whole envelope as the activity payload so the flow engine
     // sees BOTH `entry.text` and `entry.metadata.*`. `build_routing_context`
@@ -4624,6 +4655,16 @@ fn envelope_to_activity(
     }
     if let Some(hint) = welcome_hint {
         activity = activity.with_welcome_flow_hint(hint);
+    }
+    // Resolve the flow by key, not by type. The runner picks the flow from
+    // `(pack_id, flow_id)` when both are set and only falls back to matching
+    // on `flow_type` — which is `messaging` for every flow here — when they
+    // are absent. A bundle whose app pack ships more than one messaging flow
+    // is unresolvable by type, so without this the request fails before the
+    // welcome hint is ever read. A resumed conversation still wins over this:
+    // the runner prefers its wait snapshot's flow.
+    if let Some(target) = flow_target {
+        activity = activity.with_pack(target.pack_id).with_flow(target.flow_id);
     }
     activity
 }
@@ -6212,7 +6253,7 @@ mod tests {
             "metadata": {},
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback", None, None);
+        let activity = envelope_to_activity(&envelope, "fallback", None, None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.session_id(), Some("sess-1"));
         assert_eq!(activity.user(), Some("u1"));
@@ -6240,7 +6281,7 @@ mod tests {
             "metadata": {},
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback", None, None);
+        let activity = envelope_to_activity(&envelope, "fallback", None, None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.session_id(), None);
     }
@@ -6270,7 +6311,7 @@ mod tests {
             },
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback", None, None);
+        let activity = envelope_to_activity(&envelope, "fallback", None, None, None);
         let entry = activity.payload();
         // `response.action` resolves from `entry.metadata.action`.
         assert_eq!(
@@ -6311,10 +6352,60 @@ mod tests {
             pack_id: "welcome-pack".to_string(),
             flow_id: "welcome-flow".to_string(),
         };
-        let activity =
-            envelope_to_activity(&envelope, "fallback", Some("ep-legal"), Some(hint.clone()));
+        let activity = envelope_to_activity(
+            &envelope,
+            "fallback",
+            Some("ep-legal"),
+            Some(hint.clone()),
+            None,
+        );
         assert_eq!(activity.messaging_endpoint_id(), Some("ep-legal"));
         assert_eq!(activity.welcome_flow_hint(), Some(&hint));
+        assert_eq!(
+            (activity.pack_id(), activity.flow_id()),
+            (None, None),
+            "a welcome hint alone must NOT pin the activity's flow — the runner \
+             gates it on first contact, so pinning would route every turn to it",
+        );
+    }
+
+    #[test]
+    fn envelope_to_activity_pins_flow_by_key_for_an_explicit_target() {
+        // A URL-named flow (`/{tenant}/{bundle}/{flow}`) must reach the runner
+        // as `(pack_id, flow_id)`, not only as a welcome hint. `resolve_flow_id`
+        // runs BEFORE the hint is consulted and matches on `flow_type`, which is
+        // `messaging` for every flow in the bundle: a pack with two messaging
+        // flows fails with "flow type messaging is ambiguous" before the hint
+        // can select one.
+        let envelope: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-1",
+            "tenant": {
+                "env": "dev",
+                "tenant": "acme",
+                "tenant_id": "acme",
+                "attempt": 0,
+            },
+            "channel": "webchat",
+            "session_id": "sess-1",
+            "from": { "id": "u1", "kind": "user" },
+            "text": "hello",
+            "metadata": {},
+        }))
+        .expect("envelope");
+        let target = WelcomeFlowHint {
+            pack_id: "twoflow-demo".to_string(),
+            flow_id: "on_escalate".to_string(),
+        };
+        let activity = envelope_to_activity(
+            &envelope,
+            "fallback",
+            Some("ep-webchat"),
+            Some(target.clone()),
+            Some(target.clone()),
+        );
+        assert_eq!(activity.pack_id(), Some("twoflow-demo"));
+        assert_eq!(activity.flow_id(), Some("on_escalate"));
+        assert_eq!(activity.welcome_flow_hint(), Some(&target));
     }
 
     #[test]

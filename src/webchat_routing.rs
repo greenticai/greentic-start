@@ -193,6 +193,13 @@ impl BundleIndex {
 pub(crate) struct FlowIndex {
     /// `bundle_id (string)` -> set of `(flow_id, pack_id)`.
     flows: HashMap<String, Vec<FlowEntry>>,
+    /// `bundle_id (string)` -> the bundle's default `(flow_id, pack_id)`, for
+    /// the `/{tenant}/{bundle}` URL form that names no flow. A `None` value is
+    /// a tombstone: two packs claimed a default, so the bundle has none (see
+    /// [`register_bundle_default_flow`]).
+    ///
+    /// [`register_bundle_default_flow`]: FlowIndex::register_bundle_default_flow
+    defaults: HashMap<String, Option<FlowEntry>>,
 }
 
 #[derive(Clone, Debug)]
@@ -221,6 +228,48 @@ impl FlowIndex {
                 });
             }
         }
+    }
+
+    /// Record `pack_id`'s default flow as the bundle's default.
+    ///
+    /// A bundle typically holds one app pack plus provider packs that ship no
+    /// flows, so the pack that resolves a default owns the bundle's default.
+    /// When a SECOND pack also claims one the bundle has no unambiguous
+    /// default: the entry is tombstoned — permanently, so registration order
+    /// cannot resurrect it — and the bare-bundle URL falls back to the
+    /// runner's own flow-type resolution (which reports the ambiguity).
+    pub(crate) fn register_bundle_default_flow(
+        &mut self,
+        bundle_id: &str,
+        pack_id: &str,
+        flow_id: &str,
+    ) {
+        match self.defaults.entry(bundle_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(mut existing) => {
+                if existing
+                    .get()
+                    .as_ref()
+                    .is_some_and(|e| e.pack_id != pack_id)
+                {
+                    existing.insert(None);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Some(FlowEntry {
+                    flow_id: flow_id.to_string(),
+                    pack_id: pack_id.to_string(),
+                }));
+            }
+        }
+    }
+
+    /// The bundle's default `(pack_id, flow_id)`, when exactly one pack in it
+    /// resolves one.
+    pub(crate) fn default_flow_for_bundle(&self, bundle_id: &str) -> Option<(&str, &str)> {
+        self.defaults
+            .get(bundle_id)?
+            .as_ref()
+            .map(|e| (e.pack_id.as_str(), e.flow_id.as_str()))
     }
 
     /// Whether `segment` is a known flow id for `bundle_id`.
@@ -1082,6 +1131,33 @@ mod tests {
         assert_eq!(fi.pack_id_for_flow("b1", "aux"), Some("pack-alpha"));
         assert_eq!(fi.pack_id_for_flow("b1", "unknown"), None);
         assert_eq!(fi.pack_id_for_flow("b2", "main"), None);
+    }
+
+    #[test]
+    fn flow_index_records_a_single_packs_default_flow() {
+        // The typical bundle: one app pack with flows plus provider packs that
+        // ship none. Re-registering the SAME pack (one call per revision of the
+        // bundle) must not withdraw the default.
+        let mut fi = FlowIndex::default();
+        fi.register_bundle_default_flow("b1", "app-pack", "main");
+        fi.register_bundle_default_flow("b1", "app-pack", "main");
+        assert_eq!(fi.default_flow_for_bundle("b1"), Some(("app-pack", "main")));
+        assert_eq!(fi.default_flow_for_bundle("b2"), None);
+    }
+
+    #[test]
+    fn flow_index_withdraws_the_default_when_two_packs_claim_one() {
+        // Two app packs each with their own entry flow: the bare-bundle URL has
+        // no unambiguous target, so it must fall back to the runner's own
+        // resolution rather than silently picking whichever pack loaded first.
+        let mut fi = FlowIndex::default();
+        fi.register_bundle_default_flow("b1", "pack-alpha", "main");
+        fi.register_bundle_default_flow("b1", "pack-beta", "main");
+        assert_eq!(fi.default_flow_for_bundle("b1"), None);
+        // The tombstone is permanent: re-registering the first pack must not
+        // resurrect a default the bundle has already been shown not to have.
+        fi.register_bundle_default_flow("b1", "pack-alpha", "main");
+        assert_eq!(fi.default_flow_for_bundle("b1"), None);
     }
 
     // ── BundleIndex ─────────────────────────────────────────────────

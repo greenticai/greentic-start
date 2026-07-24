@@ -313,6 +313,25 @@ pub(crate) async fn activate_runtime_config(
                                 &info.pack_id,
                                 &flow_ids,
                             );
+                            // The `/{tenant}/{bundle}` URL form targets the
+                            // bundle's default flow. Reuse the pack-level
+                            // convention (`default` > `main` > sole messaging
+                            // flow) so this URL and the legacy app path agree
+                            // on what "default" means. Packs with several
+                            // messaging flows and no conventional entry point
+                            // simply register none.
+                            match crate::messaging_app::select_app_flow(&info) {
+                                Ok(default_flow) => flow_index.register_bundle_default_flow(
+                                    &block.bundle_id,
+                                    &info.pack_id,
+                                    &default_flow.id,
+                                ),
+                                Err(err) => tracing::debug!(
+                                    pack = %info.pack_id,
+                                    bundle_id = %block.bundle_id,
+                                    "no default webchat flow for pack: {err:#}"
+                                ),
+                            }
                         }
                     }
                     Err(err) => {
