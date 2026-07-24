@@ -142,14 +142,16 @@ impl BundleIndex {
             .is_some_and(|set| set.contains(segment))
     }
 
-    /// Look up the Active deployment for `(tenant, bundle_id)`.
+    /// Look up the Active deployment for `(tenant, bundle_id)`, enforcing host
+    /// admission. See [`DeploymentRouteTable::resolve_by_bundle`].
     pub(crate) fn resolve(
         &self,
         routes: &DeploymentRouteTable,
         tenant: &str,
         bundle_id: &str,
+        host: Option<&str>,
     ) -> Option<DeploymentId> {
-        routes.resolve_by_bundle(tenant, bundle_id)
+        routes.resolve_by_bundle(tenant, bundle_id, host)
     }
 
     /// The pre-resolved default bundle for `tenant`.
@@ -380,8 +382,17 @@ const WEBCHAT_PREFIX_MSG: &str = "/v1/messaging/webchat/";
 /// Returns `None` when the path is not a webchat path (does not start with
 /// either prefix) or when no Active deployment can be resolved for the
 /// tenant/bundle combination.
+///
+/// **Host admission** is enforced: when the resolved deployment's route
+/// binding carries a non-empty `hosts` list, the request's `Host` header
+/// must be in it. An empty `hosts` list matches any host (the common
+/// local-dev case). **Path-prefix admission** is intentionally skipped:
+/// the webchat URL space (`/v1/web/webchat/…`) is its own addressing
+/// scheme that never appears in operator-authored path bindings, so
+/// enforcing path prefixes would reject every webchat request.
 pub(crate) fn classify_webchat_path(
     path: &str,
+    host: Option<&str>,
     bundle_index: &BundleIndex,
     flow_index: &FlowIndex,
     routes: &DeploymentRouteTable,
@@ -423,6 +434,9 @@ pub(crate) fn classify_webchat_path(
     // No further segments: SPA index on default bundle.
     if rest.is_empty() {
         let (dep_id, bundle_id, reason) = bundle_index.default_for(&tenant)?;
+        if !routes.host_admits(dep_id, host) {
+            return None;
+        }
         return Some(WebchatTarget {
             tenant,
             deployment_id: dep_id,
@@ -441,6 +455,9 @@ pub(crate) fn classify_webchat_path(
     if is_reserved(&seg1_decoded) {
         // DirectLine API on the default bundle.
         let (dep_id, bundle_id, reason) = bundle_index.default_for(&tenant)?;
+        if !routes.host_admits(dep_id, host) {
+            return None;
+        }
         let stripped = format!("{tenant_prefix}{}", rebuild_path(&segments[1..]));
         return Some(WebchatTarget {
             tenant,
@@ -455,7 +472,7 @@ pub(crate) fn classify_webchat_path(
 
     // ── segment after tenant: known bundle id ───────────────────────
     if bundle_index.is_bundle(&tenant, &seg1_decoded) {
-        let dep_id = bundle_index.resolve(routes, &tenant, &seg1_decoded)?;
+        let dep_id = bundle_index.resolve(routes, &tenant, &seg1_decoded, host)?;
         let bundle_id = BundleId::new(&seg1_decoded);
         let bundle_prefix = format!("{tenant_prefix}/{seg1}");
 
@@ -527,6 +544,9 @@ pub(crate) fn classify_webchat_path(
     // asset path under the default bundle. This keeps existing deployments
     // working where `{tenant}/{asset...}` is the current form.
     let (dep_id, bundle_id, reason) = bundle_index.default_for(&tenant)?;
+    if !routes.host_admits(dep_id, host) {
+        return None;
+    }
     let stripped = format!("{tenant_prefix}{}", rebuild_path(rest));
     Some(WebchatTarget {
         tenant,
@@ -743,7 +763,8 @@ mod tests {
         let env = make_env(vec![make_deployment(dep_id, "acme", "chat")]);
         let (routes, bi, fi) = harness(&env);
 
-        let target = classify_webchat_path("/v1/web/webchat/acme", &bi, &fi, &routes).unwrap();
+        let target =
+            classify_webchat_path("/v1/web/webchat/acme", None, &bi, &fi, &routes).unwrap();
         assert_eq!(target.tenant, "acme");
         assert_eq!(target.deployment_id, dep_id);
         assert_eq!(target.bundle_id.as_str(), "chat");
@@ -760,7 +781,7 @@ mod tests {
         let (routes, bi, fi) = harness(&env);
 
         let target =
-            classify_webchat_path("/v1/messaging/webchat/acme", &bi, &fi, &routes).unwrap();
+            classify_webchat_path("/v1/messaging/webchat/acme", None, &bi, &fi, &routes).unwrap();
         assert_eq!(target.tenant, "acme");
         assert_eq!(target.deployment_id, dep_id);
         assert_eq!(target.stream_url_prefix, "/v1/messaging/webchat/acme");
@@ -771,7 +792,7 @@ mod tests {
         let env = make_env(Vec::new());
         let (routes, bi, fi) = harness(&env);
 
-        assert!(classify_webchat_path("/v1/web/webchat/acme", &bi, &fi, &routes).is_none());
+        assert!(classify_webchat_path("/v1/web/webchat/acme", None, &bi, &fi, &routes).is_none());
     }
 
     // ── reserved literal after tenant (DirectLine API) ──────────────
@@ -783,7 +804,7 @@ mod tests {
         let (routes, bi, fi) = harness(&env);
 
         let target =
-            classify_webchat_path("/v1/web/webchat/acme/token", &bi, &fi, &routes).unwrap();
+            classify_webchat_path("/v1/web/webchat/acme/token", None, &bi, &fi, &routes).unwrap();
         assert_eq!(target.stripped_path, "/v1/web/webchat/acme/token");
         assert!(matches!(target.bundle_source, BundleSource::Default(_)));
         assert_eq!(target.stream_url_prefix, "/v1/web/webchat/acme");
@@ -797,6 +818,7 @@ mod tests {
 
         let target = classify_webchat_path(
             "/v1/web/webchat/acme/v3/directline/conversations",
+            None,
             &bi,
             &fi,
             &routes,
@@ -815,9 +837,14 @@ mod tests {
         let env = make_env(vec![make_deployment(dep_id, "acme", "chat")]);
         let (routes, bi, fi) = harness(&env);
 
-        let target =
-            classify_webchat_path("/v1/web/webchat/acme/oauth/callback", &bi, &fi, &routes)
-                .unwrap();
+        let target = classify_webchat_path(
+            "/v1/web/webchat/acme/oauth/callback",
+            None,
+            &bi,
+            &fi,
+            &routes,
+        )
+        .unwrap();
         assert_eq!(target.stripped_path, "/v1/web/webchat/acme/oauth/callback");
     }
 
@@ -830,7 +857,7 @@ mod tests {
         let (routes, bi, fi) = harness(&env);
 
         let target =
-            classify_webchat_path("/v1/web/webchat/acme/hr-chat", &bi, &fi, &routes).unwrap();
+            classify_webchat_path("/v1/web/webchat/acme/hr-chat", None, &bi, &fi, &routes).unwrap();
         assert_eq!(target.deployment_id, dep_id);
         assert_eq!(target.bundle_id.as_str(), "hr-chat");
         assert_eq!(target.bundle_source, BundleSource::Url);
@@ -845,8 +872,14 @@ mod tests {
         let env = make_env(vec![make_deployment(dep_id, "acme", "hr-chat")]);
         let (routes, bi, fi) = harness(&env);
 
-        let target =
-            classify_webchat_path("/v1/web/webchat/acme/hr-chat/token", &bi, &fi, &routes).unwrap();
+        let target = classify_webchat_path(
+            "/v1/web/webchat/acme/hr-chat/token",
+            None,
+            &bi,
+            &fi,
+            &routes,
+        )
+        .unwrap();
         assert_eq!(target.bundle_id.as_str(), "hr-chat");
         assert_eq!(target.bundle_source, BundleSource::Url);
         assert_eq!(target.stripped_path, "/v1/web/webchat/acme/token");
@@ -861,6 +894,7 @@ mod tests {
 
         let target = classify_webchat_path(
             "/v1/web/webchat/acme/hr-chat/v3/directline/conversations",
+            None,
             &bi,
             &fi,
             &routes,
@@ -881,6 +915,7 @@ mod tests {
 
         let target = classify_webchat_path(
             "/v1/web/webchat/acme/hr-chat/static/main.js",
+            None,
             &bi,
             &fi,
             &routes,
@@ -902,9 +937,14 @@ mod tests {
             &[("hr-chat", "hr-pack", &["onboarding", "offboarding"])],
         );
 
-        let target =
-            classify_webchat_path("/v1/web/webchat/acme/hr-chat/onboarding", &bi, &fi, &routes)
-                .unwrap();
+        let target = classify_webchat_path(
+            "/v1/web/webchat/acme/hr-chat/onboarding",
+            None,
+            &bi,
+            &fi,
+            &routes,
+        )
+        .unwrap();
         assert_eq!(target.bundle_id.as_str(), "hr-chat");
         assert_eq!(target.flow_id.as_deref(), Some("onboarding"));
         assert_eq!(target.stripped_path, "/v1/web/webchat/acme");
@@ -919,6 +959,7 @@ mod tests {
 
         let target = classify_webchat_path(
             "/v1/web/webchat/acme/hr-chat/onboarding/styles.css",
+            None,
             &bi,
             &fi,
             &routes,
@@ -938,7 +979,8 @@ mod tests {
 
         // "logo.png" is neither reserved nor a known bundle id.
         let target =
-            classify_webchat_path("/v1/web/webchat/acme/logo.png", &bi, &fi, &routes).unwrap();
+            classify_webchat_path("/v1/web/webchat/acme/logo.png", None, &bi, &fi, &routes)
+                .unwrap();
         assert!(matches!(target.bundle_source, BundleSource::Default(_)));
         assert_eq!(target.stripped_path, "/v1/web/webchat/acme/logo.png");
         assert_eq!(target.stream_url_prefix, "/v1/web/webchat/acme");
@@ -952,7 +994,8 @@ mod tests {
         let env = make_env(vec![make_deployment(dep_id, "acme", "chat")]);
         let (routes, bi, fi) = harness(&env);
 
-        let target = classify_webchat_path("/v1/web/webchat/acme", &bi, &fi, &routes).unwrap();
+        let target =
+            classify_webchat_path("/v1/web/webchat/acme", None, &bi, &fi, &routes).unwrap();
         assert_eq!(target.stream_url_prefix, "/v1/web/webchat/acme");
     }
 
@@ -963,7 +1006,7 @@ mod tests {
         let (routes, bi, fi) = harness(&env);
 
         let target =
-            classify_webchat_path("/v1/web/webchat/acme/hr-chat", &bi, &fi, &routes).unwrap();
+            classify_webchat_path("/v1/web/webchat/acme/hr-chat", None, &bi, &fi, &routes).unwrap();
         assert_eq!(target.stream_url_prefix, "/v1/web/webchat/acme/hr-chat");
     }
 
@@ -979,14 +1022,25 @@ mod tests {
         ]);
         let (routes, bi, fi) = harness(&env);
 
-        let hr =
-            classify_webchat_path("/v1/web/webchat/acme/hr-chat/token", &bi, &fi, &routes).unwrap();
+        let hr = classify_webchat_path(
+            "/v1/web/webchat/acme/hr-chat/token",
+            None,
+            &bi,
+            &fi,
+            &routes,
+        )
+        .unwrap();
         assert_eq!(hr.deployment_id, dep_hr);
         assert_eq!(hr.bundle_id.as_str(), "hr-chat");
 
-        let sales =
-            classify_webchat_path("/v1/web/webchat/acme/sales-chat/token", &bi, &fi, &routes)
-                .unwrap();
+        let sales = classify_webchat_path(
+            "/v1/web/webchat/acme/sales-chat/token",
+            None,
+            &bi,
+            &fi,
+            &routes,
+        )
+        .unwrap();
         assert_eq!(sales.deployment_id, dep_sales);
         assert_eq!(sales.bundle_id.as_str(), "sales-chat");
     }
@@ -1006,7 +1060,8 @@ mod tests {
         ]);
         let (routes, bi, fi) = harness_with_flows(&env, &[("alpha", "pack-a", &["beta", "main"])]);
 
-        let target = classify_webchat_path("/v1/web/webchat/acme/beta", &bi, &fi, &routes).unwrap();
+        let target =
+            classify_webchat_path("/v1/web/webchat/acme/beta", None, &bi, &fi, &routes).unwrap();
         // Must resolve to bundle "beta", not flow "beta" of bundle "alpha".
         assert_eq!(target.bundle_id.as_str(), "beta");
         assert_eq!(target.deployment_id, dep_beta);
@@ -1023,7 +1078,7 @@ mod tests {
         let (routes, bi, fi) = harness(&env);
 
         let target =
-            classify_webchat_path("/v1/web/webchat/acme%20corp", &bi, &fi, &routes).unwrap();
+            classify_webchat_path("/v1/web/webchat/acme%20corp", None, &bi, &fi, &routes).unwrap();
         assert_eq!(target.tenant, "acme corp");
     }
 
@@ -1034,7 +1089,8 @@ mod tests {
         let (routes, bi, fi) = harness(&env);
 
         let target =
-            classify_webchat_path("/v1/web/webchat/acme/my%20bundle", &bi, &fi, &routes).unwrap();
+            classify_webchat_path("/v1/web/webchat/acme/my%20bundle", None, &bi, &fi, &routes)
+                .unwrap();
         assert_eq!(target.bundle_id.as_str(), "my bundle");
         assert_eq!(target.bundle_source, BundleSource::Url);
     }
@@ -1054,7 +1110,8 @@ mod tests {
         );
         let (routes, bi, fi) = harness(&env);
 
-        let target = classify_webchat_path("/v1/web/webchat/acme", &bi, &fi, &routes).unwrap();
+        let target =
+            classify_webchat_path("/v1/web/webchat/acme", None, &bi, &fi, &routes).unwrap();
         assert_eq!(target.bundle_id.as_str(), "sales-chat");
         assert_eq!(target.deployment_id, dep_sales);
         assert!(matches!(
@@ -1070,8 +1127,8 @@ mod tests {
         let env = make_env(vec![make_deployment(DeploymentId::new(), "acme", "chat")]);
         let (routes, bi, fi) = harness(&env);
 
-        assert!(classify_webchat_path("/v1/api/other", &bi, &fi, &routes).is_none());
-        assert!(classify_webchat_path("/health", &bi, &fi, &routes).is_none());
+        assert!(classify_webchat_path("/v1/api/other", None, &bi, &fi, &routes).is_none());
+        assert!(classify_webchat_path("/health", None, &bi, &fi, &routes).is_none());
     }
 
     #[test]
@@ -1080,7 +1137,110 @@ mod tests {
         let (routes, bi, fi) = harness(&env);
 
         // The prefix alone (no tenant) is not a valid webchat path.
-        assert!(classify_webchat_path("/v1/web/webchat/", &bi, &fi, &routes).is_none());
+        assert!(classify_webchat_path("/v1/web/webchat/", None, &bi, &fi, &routes).is_none());
+    }
+
+    // ── host admission ──────────────────────────────────────────────
+
+    fn make_host_bound_deployment(
+        deployment_id: DeploymentId,
+        tenant: &str,
+        bundle_id: &str,
+        hosts: Vec<String>,
+    ) -> BundleDeployment {
+        let mut dep = make_deployment(deployment_id, tenant, bundle_id);
+        dep.route_binding.hosts = hosts;
+        dep
+    }
+
+    #[test]
+    fn mismatched_host_returns_none_for_default_bundle() {
+        let dep_id = DeploymentId::new();
+        let env = make_env(vec![make_host_bound_deployment(
+            dep_id,
+            "acme",
+            "chat",
+            vec!["internal.example.com".into()],
+        )]);
+        let (routes, bi, fi) = harness(&env);
+
+        // The deployment is host-bound to internal.example.com. A request
+        // from external.example.com must NOT resolve.
+        assert!(
+            classify_webchat_path(
+                "/v1/web/webchat/acme",
+                Some("external.example.com"),
+                &bi,
+                &fi,
+                &routes,
+            )
+            .is_none(),
+            "a mismatched Host must not resolve against a host-bound deployment"
+        );
+    }
+
+    #[test]
+    fn mismatched_host_returns_none_for_explicit_bundle() {
+        let dep_id = DeploymentId::new();
+        let env = make_env(vec![make_host_bound_deployment(
+            dep_id,
+            "acme",
+            "hr-chat",
+            vec!["internal.example.com".into()],
+        )]);
+        let (routes, bi, fi) = harness(&env);
+
+        assert!(
+            classify_webchat_path(
+                "/v1/web/webchat/acme/hr-chat/token",
+                Some("external.example.com"),
+                &bi,
+                &fi,
+                &routes,
+            )
+            .is_none(),
+            "an explicit bundle URL with mismatched Host must not resolve"
+        );
+    }
+
+    #[test]
+    fn matching_host_resolves_normally() {
+        let dep_id = DeploymentId::new();
+        let env = make_env(vec![make_host_bound_deployment(
+            dep_id,
+            "acme",
+            "chat",
+            vec!["internal.example.com".into()],
+        )]);
+        let (routes, bi, fi) = harness(&env);
+
+        let target = classify_webchat_path(
+            "/v1/web/webchat/acme",
+            Some("internal.example.com"),
+            &bi,
+            &fi,
+            &routes,
+        )
+        .unwrap();
+        assert_eq!(target.deployment_id, dep_id);
+    }
+
+    #[test]
+    fn empty_hosts_matches_any_host() {
+        // The common case: hosts binding is empty → any host works.
+        let dep_id = DeploymentId::new();
+        let env = make_env(vec![make_deployment(dep_id, "acme", "chat")]);
+        let (routes, bi, fi) = harness(&env);
+
+        let target = classify_webchat_path(
+            "/v1/web/webchat/acme",
+            Some("anything.example.com"),
+            &bi,
+            &fi,
+            &routes,
+        )
+        .unwrap();
+        assert_eq!(target.deployment_id, dep_id);
     }
 
     // ── strip_webchat_bundle_segments ────────────────────────────────
@@ -1333,7 +1493,7 @@ mod tests {
         let (routes, bi, fi) = harness(&env);
 
         let target =
-            classify_webchat_path("/v1/web/webchat/acme/Token", &bi, &fi, &routes).unwrap();
+            classify_webchat_path("/v1/web/webchat/acme/Token", None, &bi, &fi, &routes).unwrap();
         assert_eq!(target.stripped_path, "/v1/web/webchat/acme/Token");
         assert!(matches!(target.bundle_source, BundleSource::Default(_)));
     }
@@ -1408,6 +1568,7 @@ mod tests {
         // "/v1/web/webchat/acme/static/main.js" which matches.
         let target = classify_webchat_path(
             "/v1/web/webchat/acme/hr-chat/static/main.js",
+            None,
             &bi,
             &fi,
             &routes,
@@ -1422,6 +1583,7 @@ mod tests {
         // Also verify a DirectLine API path through a bundle resolves correctly.
         let api_target = classify_webchat_path(
             "/v1/web/webchat/acme/hr-chat/v3/directline/conversations",
+            None,
             &bi,
             &fi,
             &routes,
@@ -1476,6 +1638,7 @@ mod tests {
         // The stripped_path must still match the static route template.
         let target = classify_webchat_path(
             "/v1/web/webchat/acme/runtime-bootstrap.js",
+            None,
             &bi,
             &fi,
             &routes,

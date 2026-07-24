@@ -204,15 +204,43 @@ impl DeploymentRouteTable {
         best.map(|(route, _)| (route.deployment_id, route.tenant.as_str()))
     }
 
-    /// Find the first Active deployment whose `(tenant, bundle_id)` matches.
-    /// Returns the deployment id. Used by [`crate::webchat_routing::BundleIndex`]
-    /// to resolve a bundle segment in a webchat URL to the deployment it belongs
-    /// to.
-    pub(crate) fn resolve_by_bundle(&self, tenant: &str, bundle_id: &str) -> Option<DeploymentId> {
+    /// Find the first Active deployment whose `(tenant, bundle_id)` matches
+    /// AND whose host binding admits the request. Returns the deployment id.
+    /// Used by [`crate::webchat_routing::BundleIndex`] to resolve a bundle
+    /// segment in a webchat URL to the deployment it belongs to.
+    ///
+    /// Host admission mirrors [`Self::resolve`]: a non-empty `hosts` list
+    /// requires the request's `Host` to be in it; an empty list matches any
+    /// host. Path-prefix admission is intentionally skipped — the webchat URL
+    /// space (`/v1/web/webchat/…`) is its own addressing scheme that never
+    /// appears in operator-authored path bindings, so enforcing path prefixes
+    /// would reject every webchat request.
+    pub(crate) fn resolve_by_bundle(
+        &self,
+        tenant: &str,
+        bundle_id: &str,
+        host: Option<&str>,
+    ) -> Option<DeploymentId> {
+        let host = host.map(|h| host_without_port(h).to_ascii_lowercase());
         self.routes
             .iter()
-            .find(|r| r.tenant == tenant && r.bundle_id.as_str() == bundle_id)
+            .find(|r| {
+                r.tenant == tenant
+                    && r.bundle_id.as_str() == bundle_id
+                    && r.host_matches(host.as_deref())
+            })
             .map(|r| r.deployment_id)
+    }
+
+    /// Check whether a deployment's host binding admits the given request host.
+    /// Used by the webchat classifier to enforce host admission on default-bundle
+    /// lookups (which are pre-resolved at build time without host context).
+    pub(crate) fn host_admits(&self, deployment_id: DeploymentId, host: Option<&str>) -> bool {
+        let host = host.map(|h| host_without_port(h).to_ascii_lowercase());
+        self.routes
+            .iter()
+            .find(|r| r.deployment_id == deployment_id)
+            .is_none_or(|r| r.host_matches(host.as_deref()))
     }
 
     /// Resolve a deployment for a worker-invoke call, which carries a tenant but

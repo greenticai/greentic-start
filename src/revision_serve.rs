@@ -1101,6 +1101,7 @@ async fn serve(
     // requests fall through to the existing longest-prefix resolve unchanged.
     let webchat_target = crate::webchat_routing::classify_webchat_path(
         &path,
+        host_header.as_deref(),
         &activation.routing.bundle_index,
         &activation.routing.flow_index,
         &activation.routing.deployment_routes,
@@ -5146,6 +5147,7 @@ async fn handle_websocket_upgrade(
     // arbitrary sibling and the pin lookup below would miss with a 404.
     let (deployment_id, tenant) = match crate::webchat_routing::classify_webchat_path(
         path,
+        host_header.as_deref(),
         &activation.routing.bundle_index,
         &activation.routing.flow_index,
         &activation.routing.deployment_routes,
