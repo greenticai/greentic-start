@@ -919,14 +919,28 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 webchat_open_url.clone()
             } else {
                 // --open-webchat=BUNDLE_ID: build the URL for that
-                // specific bundle. Pick the first tenant that has it.
-                let tenant_bundles = activation.routing.bundle_index.tenants_and_bundles();
-                tenant_bundles
-                    .iter()
-                    .find(|(_, bundles, _)| bundles.contains(&target.as_str()))
-                    .map(|(tenant, _, _)| {
-                        format!("http://{listen}/v1/web/webchat/{tenant}/{target}/")
-                    })
+                // specific bundle. When --tenant narrows the search,
+                // only that tenant is considered; otherwise all tenants
+                // are candidates.
+                match activation
+                    .routing
+                    .bundle_index
+                    .resolve_open_webchat_bundle(target, request.tenant.as_deref())
+                {
+                    Some((tenant, ambiguous)) => {
+                        if ambiguous {
+                            operator_log::warn(
+                                module_path!(),
+                                format!(
+                                    "--open-webchat: bundle `{target}` exists under multiple \
+                                     tenants; opening `{tenant}` — pass --tenant to disambiguate",
+                                ),
+                            );
+                        }
+                        Some(format!("http://{listen}/v1/web/webchat/{tenant}/{target}/"))
+                    }
+                    None => None,
+                }
             };
             match url {
                 Some(u) => {
@@ -938,16 +952,16 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                     }
                 }
                 None => {
+                    let detail = if target.is_empty() {
+                        String::new()
+                    } else if let Some(ref t) = request.tenant {
+                        format!(" for bundle `{target}` under tenant `{t}`")
+                    } else {
+                        format!(" for bundle `{target}`")
+                    };
                     operator_log::warn(
                         module_path!(),
-                        format!(
-                            "--open-webchat: no matching webchat URL found{}",
-                            if target.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" for bundle `{target}`")
-                            }
-                        ),
+                        format!("--open-webchat: no matching webchat URL found{detail}"),
                     );
                 }
             }

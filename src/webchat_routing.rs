@@ -162,6 +162,33 @@ impl BundleIndex {
             .map(|d| (d.deployment_id, &d.bundle_id, d.reason))
     }
 
+    /// Resolve the `--open-webchat=BUNDLE_ID` URL, respecting an optional
+    /// `--tenant` constraint. Returns `(tenant, ambiguous)` where `ambiguous`
+    /// is `true` when multiple tenants hold the bundle and no `--tenant` was
+    /// given (the caller should warn).
+    pub(crate) fn resolve_open_webchat_bundle(
+        &self,
+        bundle_id: &str,
+        tenant_filter: Option<&str>,
+    ) -> Option<(&str, bool)> {
+        // Collect tenants that hold this bundle, sorted for determinism.
+        let mut matching_tenants: Vec<&str> = self
+            .bundles
+            .iter()
+            .filter(|(tenant, set)| {
+                let has = set.contains(bundle_id);
+                match tenant_filter {
+                    Some(t) => has && tenant.as_str() == t,
+                    None => has,
+                }
+            })
+            .map(|(tenant, _)| tenant.as_str())
+            .collect();
+        matching_tenants.sort_unstable();
+        let ambiguous = matching_tenants.len() > 1 && tenant_filter.is_none();
+        matching_tenants.first().map(|t| (*t, ambiguous))
+    }
+
     /// Iterate tenants and their bundles for the boot banner. Each entry is
     /// `(tenant, bundles_sorted, default_bundle_id)` where bundles are
     /// alphabetically sorted and the default may be `None` when no resolution
@@ -1231,6 +1258,70 @@ mod tests {
     fn tenants_and_bundles_empty_index() {
         let bi = BundleIndex::empty();
         assert!(bi.tenants_and_bundles().is_empty());
+    }
+
+    // ── resolve_open_webchat_bundle ───────────────────────────────────
+
+    #[test]
+    fn open_webchat_unique_bundle_resolves_without_ambiguity() {
+        let env = make_env(vec![make_deployment(DeploymentId::new(), "acme", "chat")]);
+        let routes = DeploymentRouteTable::from_environment(&env);
+        let bi = BundleIndex::from_routes_and_env(&routes, &env);
+
+        let (tenant, ambiguous) = bi.resolve_open_webchat_bundle("chat", None).unwrap();
+        assert_eq!(tenant, "acme");
+        assert!(!ambiguous);
+    }
+
+    #[test]
+    fn open_webchat_with_tenant_picks_correct_tenant() {
+        // Same bundle id under two tenants.
+        let env = make_env(vec![
+            make_deployment(DeploymentId::new(), "acme", "legal"),
+            make_deployment(DeploymentId::new(), "beta", "legal"),
+        ]);
+        let routes = DeploymentRouteTable::from_environment(&env);
+        let bi = BundleIndex::from_routes_and_env(&routes, &env);
+
+        let (tenant, ambiguous) = bi
+            .resolve_open_webchat_bundle("legal", Some("beta"))
+            .unwrap();
+        assert_eq!(tenant, "beta");
+        assert!(
+            !ambiguous,
+            "a --tenant filter must suppress the ambiguity flag"
+        );
+    }
+
+    #[test]
+    fn open_webchat_tenant_lacking_bundle_returns_none() {
+        let env = make_env(vec![make_deployment(DeploymentId::new(), "acme", "legal")]);
+        let routes = DeploymentRouteTable::from_environment(&env);
+        let bi = BundleIndex::from_routes_and_env(&routes, &env);
+
+        assert!(
+            bi.resolve_open_webchat_bundle("legal", Some("other"))
+                .is_none(),
+            "a tenant that does not hold the bundle must return None"
+        );
+    }
+
+    #[test]
+    fn open_webchat_ambiguous_without_tenant_flags_ambiguity() {
+        let env = make_env(vec![
+            make_deployment(DeploymentId::new(), "acme", "shared"),
+            make_deployment(DeploymentId::new(), "beta", "shared"),
+        ]);
+        let routes = DeploymentRouteTable::from_environment(&env);
+        let bi = BundleIndex::from_routes_and_env(&routes, &env);
+
+        let (tenant, ambiguous) = bi.resolve_open_webchat_bundle("shared", None).unwrap();
+        assert!(
+            ambiguous,
+            "two tenants with the same bundle must flag ambiguity"
+        );
+        // Deterministic: tenants_and_bundles sorts alphabetically.
+        assert_eq!(tenant, "acme");
     }
 
     // ── reserved segment case-insensitivity ─────────────────────────
