@@ -202,7 +202,11 @@ version = ">=0.2.5, <0.3"
 # resume path here would otherwise wedge a plan resuming after a channel
 # migration against the other channel's applied sequence. Transitively pins
 # greentic-update >= 1.1.2 (the authoritative channel-scoped gate).
-version = ">=1.1.26, <1.2.0-0"
+#
+# Floor raised to 1.1.27 in lockstep with deploy-spec 0.2.5: that release adds
+# `EnvironmentHostConfig::default_bundle`, and 1.1.26 constructs the struct
+# with literals, so resolving the new spec against the old deployer is E0063.
+version = ">=1.1.27, <1.2.0-0"
 default-features = false
 
 # Lower bound pinned to the first dev build exposing the `signing` module
