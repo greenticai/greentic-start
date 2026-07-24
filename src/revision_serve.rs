@@ -4107,7 +4107,7 @@ async fn dispatch_provider_route(
             rewrite_stream_url(
                 &dl_headers,
                 &mut response,
-                webchat_target.map(|t| t.stream_url_prefix.as_str()),
+                webchat_target.and_then(super::webchat_routing::WebchatTarget::url_bundle_segment),
             );
 
             // Cache the post-rewrite response for conversation dedup.
@@ -4826,15 +4826,18 @@ fn apply_directline_forward_plan_to_response(
 /// requires an absolute URL on the WebSocket constructor; a relative path
 /// makes the SDK fall back to HTTP polling.
 ///
-/// When `stream_url_prefix` is `Some`, the relative path from the provider
-/// (e.g. `/v3/directline/conversations/abc/stream`) is prefixed with the
-/// bundle-scoped URL prefix so the resulting WS URL routes back through the
-/// same bundle segment on reconnect. When `None` the output is byte-identical
-/// to the pre-bundle-routing behavior.
+/// When `bundle_segment` is `Some`, it is spliced in directly before
+/// `/v3/directline` so the resulting WS URL routes back through the same
+/// bundle on reconnect. The splice point matters: the provider composes this
+/// URL from the path it was handed, so it may already carry the tenant-scoped
+/// prefix (`/v1/messaging/webchat/{tenant}/v3/directline/...`) rather than the
+/// bare `/v3/directline/...` form. Prefixing the whole bundle-scoped path onto
+/// the former would double it. When `None` the output is byte-identical to the
+/// pre-bundle-routing behavior.
 fn rewrite_stream_url(
     headers: &[(String, String)],
     response: &mut IngressHttpResponse,
-    stream_url_prefix: Option<&str>,
+    bundle_segment: Option<&str>,
 ) {
     let Some(body_bytes) = response.body.as_ref() else {
         return;
@@ -4862,8 +4865,15 @@ fn rewrite_stream_url(
     // the browser. Derive the scheme from X-Forwarded-Proto rather than the
     // container's own (always-plain-HTTP) listener.
     let scheme = crate::startup_contract::forwarded_ws_scheme(headers);
-    let absolute = match stream_url_prefix {
-        Some(prefix) => format!("{scheme}://{host}{prefix}{relative}"),
+    let absolute = match bundle_segment {
+        Some(segment) => match relative.find("/v3/directline") {
+            Some(idx) => format!(
+                "{scheme}://{host}{}{segment}{}",
+                &relative[..idx],
+                &relative[idx..]
+            ),
+            None => format!("{scheme}://{host}{segment}{relative}"),
+        },
         None => format!("{scheme}://{host}{relative}"),
     };
     body_json["streamUrl"] = serde_json::Value::String(absolute);
@@ -5082,22 +5092,33 @@ async fn handle_websocket_upgrade(
     let effective_ws_path = stripped.as_deref().unwrap_or(path);
 
     // Resolve deployment + tenant from the path so we know which env's
-    // secrets to read the signing key from. When the classifier matched
-    // (stripped is Some), use the stripped path for the generic resolve;
-    // the bundle-scoped classify already pinned the deployment in the
-    // REST serve() path and the WS lookup re-derives it here from the
-    // session pin below, so the resolve is only for tenant + signing key.
-    let (deployment_id, tenant) = activation
-        .routing
-        .deployment_routes
-        .resolve(host_header.as_deref(), effective_ws_path)
-        .map(|(deployment_id, tenant)| (deployment_id, tenant.to_string()))
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::NOT_FOUND,
-                "no deployment is bound to this host and path",
-            )
-        })?;
+    // secrets to read the signing key from.
+    //
+    // A bundle-scoped stream path must resolve to ITS OWN deployment, not
+    // whichever one the generic prefix match happens to return: the REST
+    // conversation-create pinned this conversation under the bundle's
+    // deployment id, and sibling bundles in one env share both the tenant and
+    // the `/` path prefix, so resolving the stripped path here would pick an
+    // arbitrary sibling and the pin lookup below would miss with a 404.
+    let (deployment_id, tenant) = match crate::webchat_routing::classify_webchat_path(
+        path,
+        &activation.routing.bundle_index,
+        &activation.routing.flow_index,
+        &activation.routing.deployment_routes,
+    ) {
+        Some(target) => (target.deployment_id, target.tenant),
+        None => activation
+            .routing
+            .deployment_routes
+            .resolve(host_header.as_deref(), effective_ws_path)
+            .map(|(deployment_id, tenant)| (deployment_id, tenant.to_string()))
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "no deployment is bound to this host and path",
+                )
+            })?,
+    };
 
     // Resolve the provider_type using the stripped path so the lookup
     // matches the tenant-scoped provider route pattern even when the
@@ -7427,17 +7448,43 @@ mod tests {
                 .unwrap(),
             ),
         };
-        rewrite_stream_url(
-            &headers,
-            &mut response,
-            Some("/v1/web/webchat/acme/hr-chat"),
-        );
+        rewrite_stream_url(&headers, &mut response, Some("/hr-chat"));
         let body: serde_json::Value =
             serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
         assert_eq!(
             body["streamUrl"],
-            "ws://example.com/v1/web/webchat/acme/hr-chat/v3/directline/conversations/abc123/stream?t=TOKEN",
-            "bundle-scoped streamUrl must include the bundle prefix"
+            "ws://example.com/hr-chat/v3/directline/conversations/abc123/stream?t=TOKEN",
+            "bundle-scoped streamUrl must include the bundle segment"
+        );
+    }
+
+    #[test]
+    fn rewrite_stream_url_splices_bundle_into_tenant_scoped_path() {
+        // The shape the shipping webchat provider actually returns: already
+        // tenant-scoped, not the bare `/v3/directline/...` form. Prefixing the
+        // whole bundle-scoped path here would emit
+        // `/v1/messaging/webchat/default/legal/v1/messaging/webchat/default/v3/...`,
+        // a URL that resolves to no route and silently drops the SPA back to
+        // HTTP polling.
+        let headers = vec![("Host".to_string(), "127.0.0.1:8080".to_string())];
+        let mut response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "conversationId": "abc123",
+                    "streamUrl": "/v1/messaging/webchat/default/v3/directline/conversations/abc123/stream?watermark=-1&t=TOKEN"
+                }))
+                .unwrap(),
+            ),
+        };
+        rewrite_stream_url(&headers, &mut response, Some("/legal"));
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["streamUrl"],
+            "ws://127.0.0.1:8080/v1/messaging/webchat/default/legal/v3/directline/conversations/abc123/stream?watermark=-1&t=TOKEN",
+            "the bundle segment belongs before /v3/directline, not in front of an already tenant-scoped path"
         );
     }
 

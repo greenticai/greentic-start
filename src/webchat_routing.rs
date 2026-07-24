@@ -275,6 +275,24 @@ pub(crate) struct WebchatTarget {
     pub(crate) stream_url_prefix: String,
 }
 
+impl WebchatTarget {
+    /// The bundle segment the URL carried (e.g. `/my-bundle`), or `None` when
+    /// the bundle came from the default ladder and the URL named no bundle.
+    ///
+    /// This is what the DirectLine `streamUrl` rewrite splices in: the provider
+    /// builds that URL from the path it was handed, which is already
+    /// tenant-scoped, so only the bundle segment is missing from it.
+    pub(crate) fn url_bundle_segment(&self) -> Option<&str> {
+        match self.bundle_source {
+            BundleSource::Url => self
+                .stream_url_prefix
+                .rfind('/')
+                .map(|i| &self.stream_url_prefix[i..]),
+            BundleSource::Default(_) => None,
+        }
+    }
+}
+
 // ── classify_webchat_path ───────────────────────────────────────────
 
 /// The webchat path prefix for `web` and `messaging` domains.
