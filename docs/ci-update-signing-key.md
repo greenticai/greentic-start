@@ -1,6 +1,6 @@
 # CI Update-Plan Signing Key
 
-The `publish-update-plans.yml` workflow signs binary-update plans with a
+The `publish-update-plans.yml` workflow (in `greenticai/greentic-dev`) signs binary-update plans with a
 **dedicated CI key** that is distinct from any human operator's key. Both
 keys coexist in each environment's trust root, so a compromised CI key can
 be revoked without invalidating operator-signed plans and without rotating
