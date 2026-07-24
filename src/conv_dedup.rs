@@ -32,6 +32,10 @@ pub struct DedupKey {
     pub tenant: String,
     pub team: String,
     pub user_id: String,
+    /// Flow discriminator for webchat multi-flow bundles. When two flow URLs
+    /// target the same deployment within the TTL, they must mint distinct
+    /// conversations rather than returning the cached response from the first.
+    pub flow_hint: Option<String>,
 }
 
 #[derive(Clone)]
@@ -121,6 +125,7 @@ mod tests {
             tenant: tenant.to_string(),
             team: "default".to_string(),
             user_id: user.to_string(),
+            flow_hint: None,
         }
     }
 
@@ -173,8 +178,41 @@ mod tests {
             tenant: "t".to_string(),
             team: "default".to_string(),
             user_id: "u".to_string(),
+            flow_hint: None,
         };
         assert!(cache.get(&other).is_none());
+    }
+
+    #[test]
+    fn different_flow_hint_does_not_share_entry() {
+        let cache = ConversationDedupCache::new();
+        let mut k1 = key("t", "u");
+        k1.flow_hint = Some("onboarding".to_string());
+        cache.insert(k1.clone(), response("{\"id\":1}"));
+
+        let mut k2 = key("t", "u");
+        k2.flow_hint = Some("offboarding".to_string());
+        assert!(
+            cache.get(&k2).is_none(),
+            "different flow must not share entry"
+        );
+
+        // Same flow should still hit.
+        assert!(cache.get(&k1).is_some());
+    }
+
+    #[test]
+    fn no_flow_hint_does_not_match_flow_hint() {
+        let cache = ConversationDedupCache::new();
+        let k_none = key("t", "u"); // flow_hint = None
+        cache.insert(k_none.clone(), response("{\"id\":1}"));
+
+        let mut k_some = key("t", "u");
+        k_some.flow_hint = Some("onboarding".to_string());
+        assert!(
+            cache.get(&k_some).is_none(),
+            "a flow-targeted request must not reuse a non-targeted entry"
+        );
     }
 
     #[test]

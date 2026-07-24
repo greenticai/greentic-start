@@ -1756,6 +1756,7 @@ where
             tenant: request.tenant.to_string(),
             team: request.team.to_string(),
             user_id,
+            flow_hint: None,
         })
     } else {
         None

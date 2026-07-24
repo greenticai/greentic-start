@@ -3824,6 +3824,9 @@ async fn dispatch_provider_route(
                 tenant: route_tenant.clone(),
                 team: route_team.clone(),
                 user_id,
+                flow_hint: webchat_target
+                    .and_then(|t| t.flow_id.clone())
+                    .or_else(|| flow_header.map(str::to_string)),
             })
         } else {
             None
