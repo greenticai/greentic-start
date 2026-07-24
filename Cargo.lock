@@ -3916,6 +3916,7 @@ dependencies = [
 [[package]]
 name = "greentic-triggers"
 version = "0.1.0"
+source = "git+https://github.com/greentic-biz/greentic-triggers?rev=a5b9b18ba8d1cc83f93a8e2cf82ca615991abbcc#a5b9b18ba8d1cc83f93a8e2cf82ca615991abbcc"
 dependencies = [
  "chrono",
  "cron",
