@@ -621,7 +621,7 @@ pub fn normalize_relative_asset_path(path: &str) -> Option<String> {
     Some(segments.join("/"))
 }
 
-fn parse_route_segments(path: &str) -> anyhow::Result<Vec<RouteScopeSegment>> {
+pub(crate) fn parse_route_segments(path: &str) -> anyhow::Result<Vec<RouteScopeSegment>> {
     let segments = path
         .trim_start_matches('/')
         .split('/')

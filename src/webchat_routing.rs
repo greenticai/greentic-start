@@ -335,7 +335,7 @@ pub(crate) fn classify_webchat_path(
             bundle_id: bundle_id.clone(),
             bundle_source: BundleSource::Default(reason),
             flow_id: None,
-            stripped_path: "/".to_string(),
+            stripped_path: tenant_prefix.clone(),
             stream_url_prefix: tenant_prefix,
         });
     }
@@ -347,7 +347,7 @@ pub(crate) fn classify_webchat_path(
     if is_reserved(&seg1_decoded) {
         // DirectLine API on the default bundle.
         let (dep_id, bundle_id, reason) = bundle_index.default_for(&tenant)?;
-        let stripped = rebuild_path(&segments[1..]);
+        let stripped = format!("{tenant_prefix}{}", rebuild_path(&segments[1..]));
         return Some(WebchatTarget {
             tenant,
             deployment_id: dep_id,
@@ -374,7 +374,7 @@ pub(crate) fn classify_webchat_path(
                 bundle_id,
                 bundle_source: BundleSource::Url,
                 flow_id: None,
-                stripped_path: "/".to_string(),
+                stripped_path: tenant_prefix.clone(),
                 stream_url_prefix: bundle_prefix,
             });
         }
@@ -384,7 +384,7 @@ pub(crate) fn classify_webchat_path(
 
         // Reserved after bundle -> DirectLine API, bundle B.
         if is_reserved(&seg2_decoded) {
-            let stripped = rebuild_path(after_bundle);
+            let stripped = format!("{tenant_prefix}{}", rebuild_path(after_bundle));
             return Some(WebchatTarget {
                 tenant,
                 deployment_id: dep_id,
@@ -400,9 +400,9 @@ pub(crate) fn classify_webchat_path(
         if flow_index.is_flow(&seg1_decoded, &seg2_decoded) {
             let after_flow = &after_bundle[1..];
             let stripped = if after_flow.is_empty() {
-                "/".to_string()
+                tenant_prefix.clone()
             } else {
-                rebuild_path(after_flow)
+                format!("{tenant_prefix}{}", rebuild_path(after_flow))
             };
             return Some(WebchatTarget {
                 tenant,
@@ -416,7 +416,7 @@ pub(crate) fn classify_webchat_path(
         }
 
         // Asset under bundle B (1 segment stripped = the bundle segment).
-        let stripped = rebuild_path(after_bundle);
+        let stripped = format!("{tenant_prefix}{}", rebuild_path(after_bundle));
         return Some(WebchatTarget {
             tenant,
             deployment_id: dep_id,
@@ -433,7 +433,7 @@ pub(crate) fn classify_webchat_path(
     // asset path under the default bundle. This keeps existing deployments
     // working where `{tenant}/{asset...}` is the current form.
     let (dep_id, bundle_id, reason) = bundle_index.default_for(&tenant)?;
-    let stripped = rebuild_path(rest);
+    let stripped = format!("{tenant_prefix}{}", rebuild_path(rest));
     Some(WebchatTarget {
         tenant,
         deployment_id: dep_id,
@@ -655,7 +655,7 @@ mod tests {
         assert_eq!(target.bundle_id.as_str(), "chat");
         assert!(matches!(target.bundle_source, BundleSource::Default(_)));
         assert!(target.flow_id.is_none());
-        assert_eq!(target.stripped_path, "/");
+        assert_eq!(target.stripped_path, "/v1/web/webchat/acme");
         assert_eq!(target.stream_url_prefix, "/v1/web/webchat/acme");
     }
 
@@ -690,7 +690,7 @@ mod tests {
 
         let target =
             classify_webchat_path("/v1/web/webchat/acme/token", &bi, &fi, &routes).unwrap();
-        assert_eq!(target.stripped_path, "/token");
+        assert_eq!(target.stripped_path, "/v1/web/webchat/acme/token");
         assert!(matches!(target.bundle_source, BundleSource::Default(_)));
         assert_eq!(target.stream_url_prefix, "/v1/web/webchat/acme");
     }
@@ -708,7 +708,10 @@ mod tests {
             &routes,
         )
         .unwrap();
-        assert_eq!(target.stripped_path, "/v3/directline/conversations");
+        assert_eq!(
+            target.stripped_path,
+            "/v1/web/webchat/acme/v3/directline/conversations"
+        );
         assert!(matches!(target.bundle_source, BundleSource::Default(_)));
     }
 
@@ -721,7 +724,7 @@ mod tests {
         let target =
             classify_webchat_path("/v1/web/webchat/acme/oauth/callback", &bi, &fi, &routes)
                 .unwrap();
-        assert_eq!(target.stripped_path, "/oauth/callback");
+        assert_eq!(target.stripped_path, "/v1/web/webchat/acme/oauth/callback");
     }
 
     // ── bundle-scoped paths ─────────────────────────────────────────
@@ -738,7 +741,7 @@ mod tests {
         assert_eq!(target.bundle_id.as_str(), "hr-chat");
         assert_eq!(target.bundle_source, BundleSource::Url);
         assert!(target.flow_id.is_none());
-        assert_eq!(target.stripped_path, "/");
+        assert_eq!(target.stripped_path, "/v1/web/webchat/acme");
         assert_eq!(target.stream_url_prefix, "/v1/web/webchat/acme/hr-chat");
     }
 
@@ -752,7 +755,7 @@ mod tests {
             classify_webchat_path("/v1/web/webchat/acme/hr-chat/token", &bi, &fi, &routes).unwrap();
         assert_eq!(target.bundle_id.as_str(), "hr-chat");
         assert_eq!(target.bundle_source, BundleSource::Url);
-        assert_eq!(target.stripped_path, "/token");
+        assert_eq!(target.stripped_path, "/v1/web/webchat/acme/token");
         assert_eq!(target.stream_url_prefix, "/v1/web/webchat/acme/hr-chat");
     }
 
@@ -769,7 +772,10 @@ mod tests {
             &routes,
         )
         .unwrap();
-        assert_eq!(target.stripped_path, "/v3/directline/conversations");
+        assert_eq!(
+            target.stripped_path,
+            "/v1/web/webchat/acme/v3/directline/conversations"
+        );
         assert_eq!(target.bundle_source, BundleSource::Url);
     }
 
@@ -786,7 +792,7 @@ mod tests {
             &routes,
         )
         .unwrap();
-        assert_eq!(target.stripped_path, "/static/main.js");
+        assert_eq!(target.stripped_path, "/v1/web/webchat/acme/static/main.js");
         assert_eq!(target.bundle_source, BundleSource::Url);
         assert!(target.flow_id.is_none());
     }
@@ -807,7 +813,7 @@ mod tests {
                 .unwrap();
         assert_eq!(target.bundle_id.as_str(), "hr-chat");
         assert_eq!(target.flow_id.as_deref(), Some("onboarding"));
-        assert_eq!(target.stripped_path, "/");
+        assert_eq!(target.stripped_path, "/v1/web/webchat/acme");
         assert_eq!(target.stream_url_prefix, "/v1/web/webchat/acme/hr-chat");
     }
 
@@ -825,7 +831,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(target.flow_id.as_deref(), Some("onboarding"));
-        assert_eq!(target.stripped_path, "/styles.css");
+        assert_eq!(target.stripped_path, "/v1/web/webchat/acme/styles.css");
     }
 
     // ── fallback: asset under default bundle ────────────────────────
@@ -840,7 +846,7 @@ mod tests {
         let target =
             classify_webchat_path("/v1/web/webchat/acme/logo.png", &bi, &fi, &routes).unwrap();
         assert!(matches!(target.bundle_source, BundleSource::Default(_)));
-        assert_eq!(target.stripped_path, "/logo.png");
+        assert_eq!(target.stripped_path, "/v1/web/webchat/acme/logo.png");
         assert_eq!(target.stream_url_prefix, "/v1/web/webchat/acme");
     }
 
@@ -1143,7 +1149,7 @@ mod tests {
 
         let target =
             classify_webchat_path("/v1/web/webchat/acme/Token", &bi, &fi, &routes).unwrap();
-        assert_eq!(target.stripped_path, "/Token");
+        assert_eq!(target.stripped_path, "/v1/web/webchat/acme/Token");
         assert!(matches!(target.bundle_source, BundleSource::Default(_)));
     }
 
@@ -1158,5 +1164,143 @@ mod tests {
         assert_eq!(percent_decode("%ZZ"), "%ZZ");
         // Truncated sequence at end.
         assert_eq!(percent_decode("trail%2"), "trail%2");
+    }
+
+    // ── stripped_path ↔ route-matcher integration ──────────────────
+    //
+    // Verifies that the stripped_path produced by classify_webchat_path
+    // is compatible with StaticRouteTable and HttpRouteTable matching.
+    // This is the class of bug that only surfaces when a populated
+    // BundleIndex feeds the serve() pipeline; all earlier serve-level
+    // tests use BundleIndex::empty() so the classified path is never
+    // exercised against route templates.
+
+    #[test]
+    fn stripped_path_matches_static_route_template() {
+        use crate::http_routes::RevisionScope;
+        use crate::static_routes::{
+            ActiveRouteTable, CacheStrategy, StaticRouteDescriptor, StaticRoutePlan,
+        };
+
+        let dep_id = DeploymentId::new();
+        let bundle_id = BundleId::new("hr-chat");
+        let revision_id = greentic_deploy_spec::RevisionId::new();
+        let env = make_env(vec![make_deployment(dep_id, "acme", "hr-chat")]);
+        let (routes, bi, fi) = harness(&env);
+
+        // Build a static route table with the webchat SPA route template,
+        // scoped to the same deployment/bundle/revision that the classifier
+        // resolves to.
+        let scope = RevisionScope {
+            deployment_id: dep_id,
+            bundle_id: bundle_id.clone(),
+            revision_id,
+        };
+        let route = StaticRouteDescriptor {
+            route_id: "tenant-gui".into(),
+            pack_id: "gui".into(),
+            pack_path: std::path::PathBuf::from("gui.gtpack"),
+            public_path: "/v1/web/webchat/{tenant}".into(),
+            source_root: "assets/webchat".into(),
+            index_file: Some("index.html".into()),
+            spa_fallback: Some("index.html".into()),
+            tenant_scoped: true,
+            team_scoped: false,
+            cache_strategy: CacheStrategy::None,
+            route_segments: crate::static_routes::parse_route_segments("/v1/web/webchat/{tenant}")
+                .expect("segments"),
+            scope: Some(scope.clone()),
+        };
+        let table = ActiveRouteTable::from_plan(&StaticRoutePlan {
+            routes: vec![route],
+            warnings: Vec::new(),
+            blocking_failures: Vec::new(),
+        });
+
+        // Classify a bundle-scoped asset URL. Before the fix, the stripped_path
+        // was "/static/main.js" which failed to match the 4-segment route
+        // template ["v1","web","webchat","{tenant}"]. After the fix it is
+        // "/v1/web/webchat/acme/static/main.js" which matches.
+        let target = classify_webchat_path(
+            "/v1/web/webchat/acme/hr-chat/static/main.js",
+            &bi,
+            &fi,
+            &routes,
+        )
+        .unwrap();
+
+        let matched = table
+            .match_request_for_revision(&target.stripped_path, &scope)
+            .expect("stripped_path must match the webchat static route template");
+        assert_eq!(matched.asset_path, "static/main.js");
+
+        // Also verify a DirectLine API path through a bundle resolves correctly.
+        let api_target = classify_webchat_path(
+            "/v1/web/webchat/acme/hr-chat/v3/directline/conversations",
+            &bi,
+            &fi,
+            &routes,
+        )
+        .unwrap();
+        let api_matched = table
+            .match_request_for_revision(&api_target.stripped_path, &scope)
+            .expect("DirectLine API stripped_path must match the webchat route");
+        assert_eq!(api_matched.asset_path, "v3/directline/conversations");
+    }
+
+    #[test]
+    fn stripped_path_matches_static_route_for_default_bundle_fallback() {
+        use crate::http_routes::RevisionScope;
+        use crate::static_routes::{
+            ActiveRouteTable, CacheStrategy, StaticRouteDescriptor, StaticRoutePlan,
+        };
+
+        let dep_id = DeploymentId::new();
+        let bundle_id = BundleId::new("chat");
+        let revision_id = greentic_deploy_spec::RevisionId::new();
+        let env = make_env(vec![make_deployment(dep_id, "acme", "chat")]);
+        let (routes, bi, fi) = harness(&env);
+
+        let scope = RevisionScope {
+            deployment_id: dep_id,
+            bundle_id: bundle_id.clone(),
+            revision_id,
+        };
+        let route = StaticRouteDescriptor {
+            route_id: "tenant-gui".into(),
+            pack_id: "gui".into(),
+            pack_path: std::path::PathBuf::from("gui.gtpack"),
+            public_path: "/v1/web/webchat/{tenant}".into(),
+            source_root: "assets/webchat".into(),
+            index_file: Some("index.html".into()),
+            spa_fallback: Some("index.html".into()),
+            tenant_scoped: true,
+            team_scoped: false,
+            cache_strategy: CacheStrategy::None,
+            route_segments: crate::static_routes::parse_route_segments("/v1/web/webchat/{tenant}")
+                .expect("segments"),
+            scope: Some(scope.clone()),
+        };
+        let table = ActiveRouteTable::from_plan(&StaticRoutePlan {
+            routes: vec![route],
+            warnings: Vec::new(),
+            blocking_failures: Vec::new(),
+        });
+
+        // An unknown segment after tenant falls back to the default bundle.
+        // The stripped_path must still match the static route template.
+        let target = classify_webchat_path(
+            "/v1/web/webchat/acme/runtime-bootstrap.js",
+            &bi,
+            &fi,
+            &routes,
+        )
+        .unwrap();
+        assert!(matches!(target.bundle_source, BundleSource::Default(_)));
+
+        let matched = table
+            .match_request_for_revision(&target.stripped_path, &scope)
+            .expect("fallback stripped_path must match the webchat route");
+        assert_eq!(matched.asset_path, "runtime-bootstrap.js");
     }
 }
