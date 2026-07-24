@@ -1228,7 +1228,6 @@ pub fn demo_up_services(
             if let Some(ref server) = ingress_server {
                 cfg.local_port = server.actual_port;
             }
-            let log_path = operator_log::reserve_service_log(log_dir, gtunnel::SERVICE_ID)?;
             operator_log::info(
                 module_path!(),
                 format!(
@@ -1236,7 +1235,7 @@ pub fn demo_up_services(
                     cfg.tunnel_id, cfg.worker_base_url
                 ),
             );
-            let handle = gtunnel::start_agent(&paths, &cfg, &log_path)?;
+            let handle = gtunnel::start_agent(&cfg)?;
             match cloudflared::wait_tunnel_ready(&handle.url, std::time::Duration::from_secs(30)) {
                 Ok(()) => operator_log::info(module_path!(), "gtunnel verified reachable"),
                 Err(err) => operator_log::warn(

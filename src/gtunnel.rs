@@ -4,7 +4,12 @@
 //! [`crate::gtunnel_agent`]) that connects this box to the Greentic-operated
 //! Worker tunnel. Unlike cloudflared/ngrok there is no URL to discover: the
 //! public URL is `<worker_base_url>/<tunnel_id>`, known up front, so start-up is
-//! just "spawn the agent and report the URL".
+//! just "adopt or spawn the agent and report the URL".
+//!
+//! The agent runs under the machine-wide shared record (`crate::tunnel_state`,
+//! keyed by `("gtunnel", port)`), the same protocol `greentic-setup` writes to.
+//! So if setup already started the agent for this port, `start` ADOPTS it rather
+//! than spawning a second one — the Worker allows only one socket per tunnel id.
 //!
 //! Zero-config by design — the Worker base URL, tunnel id, and secret all have
 //! defaults (see `crate::env_tunnel`), so selecting this tunnel needs no operator
@@ -12,11 +17,16 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use crate::runtime_state::RuntimePaths;
+use crate::runtime_state::atomic_write;
 use crate::supervisor::{self, ServiceId, ServiceSpec};
+use crate::{cloudflared, tunnel_state};
 
 pub const SERVICE_ID: &str = "gtunnel";
+
+/// How long to wait for another process racing the check-then-spawn section.
+const LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// Default Greentic-operated Worker tunnel base. Overridable per boot via
 /// `--gtunnel-worker-url` / `GREENTIC_TUNNEL_WORKER_URL`.
@@ -64,16 +74,44 @@ pub fn registration_url(worker_base_url: &str, tunnel_id: &str) -> String {
     format!("{ws_base}/{tunnel_id}/_tunnel")
 }
 
-/// Spawn (or restart) the supervised tunnel agent for this tenant and return
-/// the public URL it exposes.
-pub fn start_agent(
-    paths: &RuntimePaths,
-    config: &GtunnelConfig,
-    log_path: &Path,
-) -> anyhow::Result<GtunnelHandle> {
+/// Adopt (or spawn) the supervised tunnel agent under the machine-wide shared
+/// record and return the public URL it exposes. Reuses a live agent — e.g. one
+/// started by `greentic-setup` — instead of spawning a duplicate.
+pub fn start_agent(config: &GtunnelConfig) -> anyhow::Result<GtunnelHandle> {
+    let url = public_url(&config.worker_base_url, &config.tunnel_id);
+    let shared = tunnel_state::shared_runtime_paths(SERVICE_ID, config.local_port);
+    let pid_path = shared.pid_path(SERVICE_ID);
+    let url_path = cloudflared::public_url_path(&shared);
+    let log_path = shared.log_path(SERVICE_ID);
+    let _lock = tunnel_state::TunnelLock::acquire(
+        &tunnel_state::lock_path(SERVICE_ID, config.local_port),
+        LOCK_WAIT,
+    )?;
+
     if config.restart {
-        let _ = supervisor::stop_pidfile(&paths.pid_path(SERVICE_ID), 2_000);
+        let _ = supervisor::stop_pidfile(&pid_path, 2_000);
+        let _ = std::fs::remove_file(&url_path);
     }
+
+    // Adopt a live agent (e.g. started by setup) — but only if it is actually
+    // SERVING. A pid can be alive while its WebSocket to the Worker is dead
+    // (evicted, network drop), so a bare pid check would reuse a tunnel that
+    // silently 502s. Verify reachability; a stale agent is killed and replaced.
+    if let Ok(Some(pid)) = read_pid(&pid_path)
+        && supervisor::is_running(pid)
+    {
+        if serving(&url) {
+            let _ = atomic_write(&url_path, url.as_bytes());
+            return Ok(GtunnelHandle { url, log_path });
+        }
+        crate::operator_log::info(
+            module_path!(),
+            format!("gtunnel agent pid {pid} alive but {url} not serving — replacing it"),
+        );
+        let _ = supervisor::stop_pidfile(&pid_path, 2_000);
+    }
+    let _ = std::fs::remove_file(&pid_path); // stale/absent record
+    let _ = std::fs::remove_file(&url_path);
 
     let exe = std::env::current_exe()?;
     let mut env = BTreeMap::new();
@@ -96,11 +134,40 @@ pub fn start_agent(
         cwd: None,
         env,
     };
-    let handle = supervisor::spawn_service(paths, spec, Some(log_path.to_path_buf()))?;
+    let handle = supervisor::spawn_service(&shared, spec, Some(log_path.clone()))?;
+    let _ = atomic_write(&url_path, url.as_bytes());
     Ok(GtunnelHandle {
-        url: public_url(&config.worker_base_url, &config.tunnel_id),
+        url,
         log_path: handle.log_path,
     })
+}
+
+/// Whether the tunnel actually serves end to end: a bounded GET to the public
+/// URL. A routed response (2xx/3xx/4xx) means the agent is connected and
+/// forwarding; the Worker's `502 tunnel offline` (or any 5xx / transport error)
+/// means it is stale. Mirrors the `< 500` convention greentic-setup already uses.
+fn serving(public_url: &str) -> bool {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .new_agent();
+    match agent.get(public_url).call() {
+        Ok(_) => true,
+        Err(ureq::Error::StatusCode(code)) => code < 500,
+        Err(_) => false,
+    }
+}
+
+fn read_pid(path: &Path) -> anyhow::Result<Option<u32>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(path)?;
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.parse()?))
 }
 
 /// Read the agent's config from the environment the provider set. Used by the

@@ -152,9 +152,15 @@ pub(crate) fn start_env_tunnel(
     // takes a distinct, self-contained path (spawn the agent, report the URL).
     if let TunnelChoice::Gtunnel = choice {
         let restart_service = crate::runtime::should_restart(&restart, crate::gtunnel::SERVICE_ID);
-        let config = gtunnel_config(request, env_id, local_port, restart_service);
-        let log_path = operator_log::reserve_service_log(log_dir, crate::gtunnel::SERVICE_ID)?;
-        let handle = crate::gtunnel::start_agent(&paths, &config, &log_path)?;
+        // Derive the tunnel id from tenant/team (same rule setup uses) so both
+        // binaries compute the same id and share one agent — never from env_id.
+        let default_id = format!(
+            "{}-{}",
+            request.tenant.as_deref().unwrap_or("default"),
+            request.team.as_deref().unwrap_or("default"),
+        );
+        let config = gtunnel_config(request, &default_id, local_port, restart_service);
+        let handle = crate::gtunnel::start_agent(&config)?;
         match cloudflared::wait_tunnel_ready(&handle.url, TUNNEL_READY_TIMEOUT) {
             Ok(()) => operator_log::info(
                 module_path!(),
