@@ -154,6 +154,7 @@ impl DeploymentRouteTable {
     /// [`Self::from_environment`]. Lets other modules' tests exercise routing
     /// without constructing a full `Environment`.
     #[cfg(test)]
+    #[allow(clippy::type_complexity)]
     pub(crate) fn from_parts(
         parts: Vec<(DeploymentId, BundleId, String, Vec<String>, Vec<String>)>,
     ) -> Self {
@@ -218,6 +219,7 @@ impl DeploymentRouteTable {
     /// preserving environment order. Used by
     /// [`crate::webchat_routing::BundleIndex`] to enumerate the tenant's
     /// deployed bundles for URL disambiguation.
+    #[allow(dead_code)] // consumed by downstream bundle-listing features
     pub(crate) fn bundles_for_tenant(
         &self,
         tenant: &str,
@@ -282,10 +284,10 @@ pub struct RevisionIngressRouting {
     /// Webchat bundle index: tenant -> Active deployments, with pre-resolved
     /// default-bundle per tenant. Built from the same `Environment` as
     /// `deployment_routes`.
-    pub bundle_index: crate::webchat_routing::BundleIndex,
+    pub(crate) bundle_index: crate::webchat_routing::BundleIndex,
     /// Webchat flow index: bundle_id -> set of flow ids. Built from pack
     /// manifests read during the activation loop.
-    pub flow_index: crate::webchat_routing::FlowIndex,
+    pub(crate) flow_index: crate::webchat_routing::FlowIndex,
 }
 
 /// Strip a trailing `:port` from a host header value. IPv6 literals are bracketed

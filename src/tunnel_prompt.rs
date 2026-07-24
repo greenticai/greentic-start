@@ -95,6 +95,7 @@ mod tests {
             verbose: false,
             quiet: false,
             no_browser: false,
+            open_webchat: None,
             no_updates: false,
             no_auto_restart: false,
             admin: false,

@@ -800,33 +800,73 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         };
         operator_log::info(module_path!(), banner.clone());
         println!("\n{banner}. Press Ctrl+C to stop.");
-        // Advertise the pack-provided webchat UI(s) — one URL per bound
-        // tenant — instead of (or alongside, if explicitly forced) the
-        // built-in console.
+        // Advertise the pack-provided webchat UI(s) — one URL per
+        // (tenant, bundle) pair. The default bundle keeps the bare tenant
+        // URL; non-default bundles get bundle-scoped URLs. Falls back to
+        // the old route-template expansion when no bundles are indexed
+        // (backwards compat with pre-deploy-spec environments).
+        let mut webchat_open_url: Option<String> = None;
         if !pack_webchat_routes.is_empty() {
-            let tenants: std::collections::BTreeSet<&str> = environment
-                .bundles
-                .iter()
-                .map(|dep| dep.route_binding.tenant_selector.tenant.as_str())
-                .collect();
-            let mut urls = std::collections::BTreeSet::new();
-            for route in &pack_webchat_routes {
-                let base = route.trim_end_matches('/');
-                if base.contains("{tenant}") {
-                    for tenant in &tenants {
-                        urls.insert(format!(
-                            "http://{listen}{}/",
-                            base.replace("{tenant}", tenant)
-                        ));
+            let tenant_bundles = activation.routing.bundle_index.tenants_and_bundles();
+            if tenant_bundles.is_empty() {
+                // Fallback: no bundle index (pre-deploy-spec env), expand
+                // route templates the way the banner did before stage 1.
+                let tenants: std::collections::BTreeSet<&str> = environment
+                    .bundles
+                    .iter()
+                    .map(|dep| dep.route_binding.tenant_selector.tenant.as_str())
+                    .collect();
+                for route in &pack_webchat_routes {
+                    let base = route.trim_end_matches('/');
+                    if base.contains("{tenant}") {
+                        for tenant in &tenants {
+                            let url =
+                                format!("http://{listen}{}/", base.replace("{tenant}", tenant));
+                            let line = format!("UI: {url}");
+                            operator_log::info(module_path!(), line.clone());
+                            println!("{line}");
+                            if webchat_open_url.is_none() {
+                                webchat_open_url = Some(url);
+                            }
+                        }
+                    } else {
+                        let url = format!("http://{listen}{base}/");
+                        let line = format!("UI: {url}");
+                        operator_log::info(module_path!(), line.clone());
+                        println!("{line}");
+                        if webchat_open_url.is_none() {
+                            webchat_open_url = Some(url);
+                        }
                     }
-                } else {
-                    urls.insert(format!("http://{listen}{base}/"));
                 }
-            }
-            for url in urls {
-                let line = format!("UI: {url}");
-                operator_log::info(module_path!(), line.clone());
-                println!("{line}");
+            } else {
+                for (tenant, bundles, default_id) in &tenant_bundles {
+                    for bundle_id in bundles {
+                        let is_default = default_id.as_deref() == Some(*bundle_id);
+                        let url = if is_default {
+                            format!("http://{listen}/v1/web/webchat/{tenant}/")
+                        } else {
+                            format!("http://{listen}/v1/web/webchat/{tenant}/{bundle_id}/")
+                        };
+                        let tag = if is_default { " (default)" } else { "" };
+                        let line = format!("UI: {url}{tag}");
+                        operator_log::info(module_path!(), line.clone());
+                        println!("{line}");
+                        // Track the URL to open for --open-webchat.
+                        if webchat_open_url.is_none() && is_default {
+                            webchat_open_url = Some(url.clone());
+                        }
+                    }
+                }
+                // If no default was found, fall back to the first URL.
+                if webchat_open_url.is_none()
+                    && let Some((tenant, bundles, _)) = tenant_bundles.first()
+                    && let Some(bundle_id) = bundles.first()
+                {
+                    webchat_open_url = Some(format!(
+                        "http://{listen}/v1/web/webchat/{tenant}/{bundle_id}/"
+                    ));
+                }
             }
         }
         if gui_enabled {
@@ -865,6 +905,53 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             println!("{line}");
             t.url
         });
+
+        // --open-webchat: open the webchat URL after the listener (and any
+        // tunnel) is up. --no-browser wins when both are given. Strictly
+        // opt-in: the env-serve path must not open a browser by default
+        // (it also runs in containers and on servers).
+        if !request.no_browser
+            && let Some(ref target) = request.open_webchat
+        {
+            let url = if target.is_empty() {
+                // Bare --open-webchat: use the default-bundle URL we
+                // collected during banner printing.
+                webchat_open_url.clone()
+            } else {
+                // --open-webchat=BUNDLE_ID: build the URL for that
+                // specific bundle. Pick the first tenant that has it.
+                let tenant_bundles = activation.routing.bundle_index.tenants_and_bundles();
+                tenant_bundles
+                    .iter()
+                    .find(|(_, bundles, _)| bundles.contains(&target.as_str()))
+                    .map(|(tenant, _, _)| {
+                        format!("http://{listen}/v1/web/webchat/{tenant}/{target}/")
+                    })
+            };
+            match url {
+                Some(u) => {
+                    if let Err(err) = open::that(&u) {
+                        operator_log::warn(
+                            module_path!(),
+                            format!("failed to open browser for {u}: {err}"),
+                        );
+                    }
+                }
+                None => {
+                    operator_log::warn(
+                        module_path!(),
+                        format!(
+                            "--open-webchat: no matching webchat URL found{}",
+                            if target.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" for bundle `{target}`")
+                            }
+                        ),
+                    );
+                }
+            }
+        }
 
         // Phase D: auto-register provider webhooks for the served revisions.
         // Gated on a public_base_url — with none, registration is skipped
@@ -1976,6 +2063,7 @@ mod tests {
             verbose: false,
             quiet: false,
             no_browser: false,
+            open_webchat: None,
             no_updates: false,
             no_auto_restart: false,
             admin: false,
@@ -2011,6 +2099,7 @@ mod tests {
             verbose: false,
             quiet: false,
             no_browser: false,
+            open_webchat: None,
             no_updates: false,
             no_auto_restart: false,
             admin: false,
@@ -2115,6 +2204,7 @@ mod tests {
             verbose: false,
             quiet: false,
             no_browser: false,
+            open_webchat: None,
             no_updates: false,
             no_auto_restart: false,
             admin: false,

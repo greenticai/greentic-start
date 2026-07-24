@@ -56,6 +56,7 @@ pub(crate) struct BundleIndex {
 
 impl BundleIndex {
     /// An empty index for test harnesses that do not exercise webchat routing.
+    #[allow(dead_code)] // used by test_fixtures and downstream test harnesses
     pub(crate) fn empty() -> Self {
         Self {
             bundles: HashMap::new(),
@@ -65,7 +66,7 @@ impl BundleIndex {
 
     /// Build from the route table (carries `bundle_id` per Active deployment)
     /// and the environment (for default-bundle resolution).
-    pub(crate) fn from_routes_and_env(routes: &DeploymentRouteTable, env: &Environment) -> Self {
+    pub(crate) fn from_routes_and_env(_routes: &DeploymentRouteTable, env: &Environment) -> Self {
         // Collect all distinct tenants from the route table.
         let mut bundles: HashMap<String, HashSet<String>> = HashMap::new();
         let mut tenants: HashSet<String> = HashSet::new();
@@ -160,6 +161,28 @@ impl BundleIndex {
             .get(tenant)
             .map(|d| (d.deployment_id, &d.bundle_id, d.reason))
     }
+
+    /// Iterate tenants and their bundles for the boot banner. Each entry is
+    /// `(tenant, bundles_sorted, default_bundle_id)` where bundles are
+    /// alphabetically sorted and the default may be `None` when no resolution
+    /// succeeded. Tenants are returned in alphabetical order.
+    pub(crate) fn tenants_and_bundles(&self) -> Vec<(&str, Vec<&str>, Option<&str>)> {
+        let mut tenants: Vec<&str> = self.bundles.keys().map(|s| s.as_str()).collect();
+        tenants.sort_unstable();
+        tenants
+            .into_iter()
+            .map(|tenant| {
+                let mut bundles: Vec<&str> = self
+                    .bundles
+                    .get(tenant)
+                    .map(|set| set.iter().map(|s| s.as_str()).collect())
+                    .unwrap_or_default();
+                bundles.sort_unstable();
+                let default = self.defaults.get(tenant).map(|d| d.bundle_id.as_str());
+                (tenant, bundles, default)
+            })
+            .collect()
+    }
 }
 
 // ── FlowIndex ───────────────────────────────────────────────────────
@@ -230,6 +253,7 @@ pub(crate) enum BundleSource {
 
 /// A fully classified webchat request.
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // fields consumed by the serve pipeline; some reserved for future flow routing
 pub(crate) struct WebchatTarget {
     /// The tenant extracted from the URL.
     pub(crate) tenant: String,
@@ -497,12 +521,13 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -1074,6 +1099,38 @@ mod tests {
         assert_eq!(id, dep_id);
         assert_eq!(bid.as_str(), "chat");
         assert_eq!(reason, DefaultBundleReason::LoneActive);
+    }
+
+    #[test]
+    fn tenants_and_bundles_returns_sorted_tenants_and_bundles() {
+        let env = make_env(vec![
+            make_deployment(DeploymentId::new(), "zebra", "z-bundle"),
+            make_deployment(DeploymentId::new(), "acme", "beta"),
+            make_deployment(DeploymentId::new(), "acme", "alpha"),
+        ]);
+        let routes = DeploymentRouteTable::from_environment(&env);
+        let bi = BundleIndex::from_routes_and_env(&routes, &env);
+
+        let result = bi.tenants_and_bundles();
+        assert_eq!(result.len(), 2);
+
+        let (tenant, bundles, default) = &result[0];
+        assert_eq!(*tenant, "acme");
+        assert_eq!(*bundles, vec!["alpha", "beta"]);
+        // With two active bundles the default is the newest.
+        assert!(default.is_some());
+
+        let (tenant, bundles, default) = &result[1];
+        assert_eq!(*tenant, "zebra");
+        assert_eq!(*bundles, vec!["z-bundle"]);
+        // Lone active -> default resolved.
+        assert_eq!(*default, Some("z-bundle"));
+    }
+
+    #[test]
+    fn tenants_and_bundles_empty_index() {
+        let bi = BundleIndex::empty();
+        assert!(bi.tenants_and_bundles().is_empty());
     }
 
     // ── reserved segment case-insensitivity ─────────────────────────
