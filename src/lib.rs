@@ -103,6 +103,7 @@ mod services;
 mod session_hint_extractor;
 mod setup_input;
 mod setup_to_formspec;
+mod sorx_append_client;
 mod startup_contract;
 mod state_layout;
 mod static_handler;
