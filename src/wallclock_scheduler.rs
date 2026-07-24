@@ -4,7 +4,8 @@
 //! `TriggerSchedule`, minting a business event routed to subscribing flows
 //! (sink A) and durably appended to SoRX (sink C). Sibling of `timer_scheduler`.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -65,20 +66,132 @@ struct Scheduled {
     last_fire: Option<DateTime<Utc>>,
 }
 
+pub const MAX_CATCHUP_FIRES: usize = 100;
+
+/// Enumerate occurrences in `(last_fire, now]`, keeping at most `cap` of the
+/// MOST RECENT ones. Returns `(fires_oldest_first, truncated_count)`.
+fn missed_occurrences(
+    schedule: &greentic_triggers::schedule::TriggerSchedule,
+    last_fire: DateTime<Utc>,
+    now: DateTime<Utc>,
+    cap: usize,
+) -> (Vec<DateTime<Utc>>, usize) {
+    let mut all = Vec::new();
+    let mut cursor = last_fire;
+    let iter_bound = cap.saturating_mul(50).max(10_000);
+    while let Some(next) = schedule.next_fire(cursor) {
+        if next > now || all.len() >= iter_bound {
+            break;
+        }
+        all.push(next);
+        cursor = next;
+    }
+    let total = all.len();
+    if total > cap {
+        let truncated = total - cap;
+        (all.split_off(truncated), truncated)
+    } else {
+        (all, 0)
+    }
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct TriggerState {
+    last_fire: BTreeMap<String, DateTime<Utc>>,
+}
+
+fn state_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("triggers").join("state.json")
+}
+
+fn load_state(state_dir: &Path) -> TriggerState {
+    match std::fs::read(state_path(state_dir)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => TriggerState::default(),
+    }
+}
+
+fn save_state(state_dir: &Path, state: &TriggerState) {
+    let path = state_path(state_dir);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(state)
+        && let Err(err) = std::fs::write(&path, bytes)
+    {
+        operator_log::warn(
+            module_path!(),
+            format!("persist trigger state failed: {err}"),
+        );
+    }
+}
+
+/// Emit a single coalesced audit event when catch-up truncates a flood.
+fn emit_catchup_truncated(config: &WallClockSchedulerConfig, def: &TriggerDef, skipped: usize) {
+    let audit = TriggerDef {
+        id: format!("{}__catchup", def.id),
+        schedule: def.schedule.clone(),
+        emits: "triggers.catchup-truncated".to_string(),
+        payload_template: serde_json::json!({ "trigger_id": def.id, "skipped": skipped }),
+    };
+    let now = Utc::now();
+    if let Ok(env) = envelope_for(&audit, now, &config.tenant, config.team.as_deref()) {
+        let ctx = OperatorContext {
+            tenant: config.tenant.clone(),
+            team: config.team.clone(),
+            correlation_id: None,
+        };
+        let _ = route_event_to_subscribers(config.runner_host.bundle_root(), &ctx, &env);
+    }
+}
+
 fn run_loop(config: WallClockSchedulerConfig, rx: mpsc::Receiver<()>) -> anyhow::Result<()> {
     if config.triggers.is_empty() {
         return Ok(());
     }
 
-    // Task 10 replaces this seed with catch-up-from-state; core seeds fire-forward.
+    let mut state = load_state(&config.state_dir);
+    let now0 = Utc::now();
     let mut scheduled: Vec<Scheduled> = config
         .triggers
         .iter()
         .map(|def| Scheduled {
             def: def.clone(),
-            last_fire: Some(Utc::now()),
+            last_fire: state.last_fire.get(&def.id).copied(),
         })
         .collect();
+
+    // Catch-up: replay missed occurrences for triggers with prior state.
+    for s in &mut scheduled {
+        let Some(last) = s.last_fire else {
+            // First-ever sighting: fire-forward (no historical replay).
+            s.last_fire = Some(now0);
+            state.last_fire.insert(s.def.id.clone(), now0);
+            continue;
+        };
+        let (fires, truncated) = missed_occurrences(&s.def.schedule, last, now0, MAX_CATCHUP_FIRES);
+        if truncated > 0 {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "trigger '{}' missed {} occurrences during downtime; firing latest {} (skipped {})",
+                    s.def.id,
+                    fires.len() + truncated,
+                    fires.len(),
+                    truncated
+                ),
+            );
+            emit_catchup_truncated(&config, &s.def, truncated);
+        }
+        for fire_time in fires {
+            fire(&config, &s.def, fire_time);
+            s.last_fire = Some(fire_time);
+        }
+        if let Some(lf) = s.last_fire {
+            state.last_fire.insert(s.def.id.clone(), lf);
+        }
+    }
+    save_state(&config.state_dir, &state);
 
     operator_log::info(
         module_path!(),
@@ -101,6 +214,8 @@ fn run_loop(config: WallClockSchedulerConfig, rx: mpsc::Receiver<()>) -> anyhow:
             if next <= now {
                 fire(&config, &s.def, next);
                 s.last_fire = Some(next);
+                state.last_fire.insert(s.def.id.clone(), next);
+                save_state(&config.state_dir, &state);
                 if let Some(following) = s.def.schedule.next_fire(next) {
                     soonest = Some(soonest.map_or(following, |c| c.min(following)));
                 }
@@ -289,5 +404,37 @@ mod tests {
         let fire = Utc.with_ymd_and_hms(2026, 7, 24, 6, 0, 0).unwrap();
         // An empty tenant id must be rejected, not silently mapped to "unknown".
         assert!(envelope_for(&def, fire, "", Some("core")).is_err());
+    }
+
+    #[test]
+    fn missed_occurrences_enumerates_within_window() {
+        use chrono::{TimeZone, Utc};
+        use greentic_triggers::schedule::TriggerSchedule;
+        let sched = TriggerSchedule::Hourly { minute: 0 };
+        let last = Utc.with_ymd_and_hms(2026, 7, 24, 6, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 24, 9, 30, 0).unwrap();
+        let (fires, truncated) = missed_occurrences(&sched, last, now, 100);
+        assert_eq!(fires.len(), 3); // 07:00, 08:00, 09:00
+        assert_eq!(truncated, 0);
+        assert_eq!(
+            fires.first().copied(),
+            Utc.with_ymd_and_hms(2026, 7, 24, 7, 0, 0).single()
+        );
+    }
+
+    #[test]
+    fn missed_occurrences_caps_flood() {
+        use chrono::{TimeZone, Utc};
+        use greentic_triggers::schedule::TriggerSchedule;
+        let sched = TriggerSchedule::EveryMinute;
+        let last = Utc.with_ymd_and_hms(2026, 7, 24, 0, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 24, 12, 0, 0).unwrap(); // 720 minutes
+        let (fires, truncated) = missed_occurrences(&sched, last, now, 100);
+        assert_eq!(fires.len(), 100);
+        assert_eq!(truncated, 620);
+        assert_eq!(
+            fires.last().copied(),
+            Utc.with_ymd_and_hms(2026, 7, 24, 12, 0, 0).single()
+        ); // keeps most-recent
     }
 }
