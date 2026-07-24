@@ -5400,6 +5400,7 @@ mod tests {
                 listen_addr: None,
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             },
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
@@ -5803,6 +5804,7 @@ mod tests {
                 listen_addr: None,
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             },
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
@@ -6670,6 +6672,7 @@ mod tests {
             listen_addr: addr,
             public_base_url: None,
             gui_enabled: None,
+            default_bundle: None,
         }
     }
 
@@ -6737,6 +6740,8 @@ mod tests {
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
             }),
         }
     }
@@ -8228,6 +8233,7 @@ mod tests {
             http_routes: HttpRouteTable::from_descriptors(Vec::new()),
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::from_parts(vec![(
                 deployment_id,
+                greentic_deploy_spec::BundleId::new("test"),
                 tenant.to_string(),
                 Vec::new(),
                 Vec::new(),
@@ -8235,6 +8241,8 @@ mod tests {
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: std::sync::Arc::default(),
             static_routes: crate::static_routes::ActiveRouteTable::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+            flow_index: crate::webchat_routing::FlowIndex::default(),
         });
         let activation = Activation {
             host: base.host,
@@ -9153,6 +9161,8 @@ mod binary_update_tests {
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
             }),
         }
     }
@@ -10047,6 +10057,7 @@ mod binary_update_tests {
 
         let deployment_routes = DeploymentRouteTable::from_parts(vec![(
             deployment_id,
+            greentic_deploy_spec::BundleId::new("test"),
             tenant.to_string(),
             Vec::new(),
             Vec::new(),
@@ -10101,6 +10112,8 @@ mod binary_update_tests {
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
             }),
         }
     }

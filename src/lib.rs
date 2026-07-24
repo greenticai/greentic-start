@@ -122,6 +122,7 @@ mod topic_match;
 mod tunnel_prompt;
 mod tunnel_state;
 mod warmup;
+mod webchat_routing;
 mod webhook_secret_resolver;
 mod webhook_updater;
 mod websocket;
@@ -1854,6 +1855,7 @@ mod tests {
             listen_addr: None,
             public_base_url: None,
             gui_enabled,
+            default_bundle: None,
         }
     }
 

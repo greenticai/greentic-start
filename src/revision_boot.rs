@@ -234,6 +234,12 @@ pub(crate) async fn activate_runtime_config(
     let mut static_plan = StaticRoutePlan::default();
     let reserved_routes = ReservedRouteSet::operator_defaults();
 
+    // Webchat flow index: bundle_id -> set of flow ids. Populated from pack
+    // manifests in the activation loop, deduped per bundle_id so two revisions
+    // of the same bundle do not re-read (they share the same pack set).
+    let mut flow_index = crate::webchat_routing::FlowIndex::default();
+    let mut flow_indexed_bundles: HashSet<String> = HashSet::new();
+
     let configs = host.tenant_configs();
     for block in &rc.revisions {
         // Both lookups are infallible: the validation loop above proved every
@@ -290,6 +296,35 @@ pub(crate) async fn activate_runtime_config(
             &scope,
             &reserved_routes,
         ));
+
+        // Webchat flow index: read each pack's flows and register them under
+        // the bundle id. Skipped when the bundle has already been indexed by
+        // an earlier revision of the same bundle (several revisions of one
+        // bundle share the same pack set and therefore the same flows).
+        if flow_indexed_bundles.insert(block.bundle_id.clone()) {
+            for pack_path in &pack_paths {
+                match crate::messaging_app::load_app_pack_info(pack_path) {
+                    Ok(info) => {
+                        let flow_ids: Vec<String> =
+                            info.flows.iter().map(|f| f.id.clone()).collect();
+                        if !flow_ids.is_empty() {
+                            flow_index.register_bundle_flows(
+                                &block.bundle_id,
+                                &info.pack_id,
+                                &flow_ids,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            pack = %pack_path.display(),
+                            bundle_id = %block.bundle_id,
+                            "skipping flow index for pack: {err:#}"
+                        );
+                    }
+                }
+            }
+        }
 
         // Session isolation: give each revision its OWN session and state store
         // rather than sharing the host's. The session/resume/state backend keys
@@ -354,13 +389,19 @@ pub(crate) async fn activate_runtime_config(
         crate::operator_log::warn(module_path!(), format!("static route warning: {warning}"));
     }
 
+    let deployment_routes = DeploymentRouteTable::from_environment(env);
+    let bundle_index =
+        crate::webchat_routing::BundleIndex::from_routes_and_env(&deployment_routes, env);
+
     let routing = RevisionIngressRouting {
         dispatcher: Arc::new(dispatcher),
         http_routes: HttpRouteTable::from_descriptors(scoped_routes),
-        deployment_routes: DeploymentRouteTable::from_environment(env),
+        deployment_routes,
         endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),
         deployment_config_overrides: Arc::new(deployment_config_overrides_from_environment(env)),
         static_routes: ActiveRouteTable::from_plan(&static_plan),
+        bundle_index,
+        flow_index,
     };
 
     Ok(RuntimeConfigActivation { host, routing })
@@ -647,6 +688,7 @@ mod tests {
                 listen_addr: None,
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             },
             packs: Vec::new(),
             messaging_endpoints: Vec::new(),

@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use greentic_deploy_spec::{BundleDeploymentStatus, DeploymentId, Environment};
+use greentic_deploy_spec::{BundleDeploymentStatus, BundleId, DeploymentId, Environment};
 use serde_json::Value as JsonValue;
 
 use crate::http_routes::HttpRouteTable;
@@ -55,6 +55,7 @@ pub fn deployment_config_overrides_from_environment(
 #[derive(Clone, Debug)]
 struct DeploymentRoute {
     deployment_id: DeploymentId,
+    bundle_id: BundleId,
     tenant: String,
     /// Lowercased host names this deployment answers for. Empty = any host.
     hosts: Vec<String>,
@@ -70,12 +71,14 @@ impl DeploymentRoute {
     /// constructor, so they cannot drift.
     fn new(
         deployment_id: DeploymentId,
+        bundle_id: BundleId,
         tenant: String,
         hosts: &[String],
         path_prefixes: &[String],
     ) -> Self {
         Self {
             deployment_id,
+            bundle_id,
             tenant,
             hosts: hosts
                 .iter()
@@ -131,6 +134,7 @@ impl DeploymentRouteTable {
             .map(|dep| {
                 DeploymentRoute::new(
                     dep.deployment_id,
+                    dep.bundle_id.clone(),
                     dep.route_binding.tenant_selector.tenant.clone(),
                     &dep.route_binding.hosts,
                     &dep.route_binding.path_prefixes,
@@ -150,11 +154,13 @@ impl DeploymentRouteTable {
     /// [`Self::from_environment`]. Lets other modules' tests exercise routing
     /// without constructing a full `Environment`.
     #[cfg(test)]
-    pub(crate) fn from_parts(parts: Vec<(DeploymentId, String, Vec<String>, Vec<String>)>) -> Self {
+    pub(crate) fn from_parts(
+        parts: Vec<(DeploymentId, BundleId, String, Vec<String>, Vec<String>)>,
+    ) -> Self {
         let routes = parts
             .into_iter()
-            .map(|(deployment_id, tenant, hosts, path_prefixes)| {
-                DeploymentRoute::new(deployment_id, tenant, &hosts, &path_prefixes)
+            .map(|(deployment_id, bundle_id, tenant, hosts, path_prefixes)| {
+                DeploymentRoute::new(deployment_id, bundle_id, tenant, &hosts, &path_prefixes)
             })
             .collect();
         Self { routes }
@@ -195,6 +201,31 @@ impl DeploymentRouteTable {
             }
         }
         best.map(|(route, _)| (route.deployment_id, route.tenant.as_str()))
+    }
+
+    /// Find the first Active deployment whose `(tenant, bundle_id)` matches.
+    /// Returns the deployment id. Used by [`crate::webchat_routing::BundleIndex`]
+    /// to resolve a bundle segment in a webchat URL to the deployment it belongs
+    /// to.
+    pub(crate) fn resolve_by_bundle(&self, tenant: &str, bundle_id: &str) -> Option<DeploymentId> {
+        self.routes
+            .iter()
+            .find(|r| r.tenant == tenant && r.bundle_id.as_str() == bundle_id)
+            .map(|r| r.deployment_id)
+    }
+
+    /// All Active `(bundle_id, deployment_id)` pairs for a given tenant,
+    /// preserving environment order. Used by
+    /// [`crate::webchat_routing::BundleIndex`] to enumerate the tenant's
+    /// deployed bundles for URL disambiguation.
+    pub(crate) fn bundles_for_tenant(
+        &self,
+        tenant: &str,
+    ) -> impl Iterator<Item = (&BundleId, DeploymentId)> {
+        self.routes
+            .iter()
+            .filter(move |r| r.tenant == tenant)
+            .map(|r| (&r.bundle_id, r.deployment_id))
     }
 
     /// Resolve a deployment for a worker-invoke call, which carries a tenant but
@@ -248,6 +279,13 @@ pub struct RevisionIngressRouting {
     /// loaded revision, matched via
     /// [`ActiveRouteTable::match_request_for_revision`].
     pub static_routes: ActiveRouteTable,
+    /// Webchat bundle index: tenant -> Active deployments, with pre-resolved
+    /// default-bundle per tenant. Built from the same `Environment` as
+    /// `deployment_routes`.
+    pub bundle_index: crate::webchat_routing::BundleIndex,
+    /// Webchat flow index: bundle_id -> set of flow ids. Built from pack
+    /// manifests read during the activation loop.
+    pub flow_index: crate::webchat_routing::FlowIndex,
 }
 
 /// Strip a trailing `:port` from a host header value. IPv6 literals are bracketed
@@ -361,6 +399,7 @@ mod tests {
                 listen_addr: None,
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             },
             packs: Vec::new(),
             messaging_endpoints: Vec::new(),

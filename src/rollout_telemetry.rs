@@ -120,6 +120,7 @@ mod tests {
                 listen_addr: None,
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             },
             packs: Vec::new(),
             messaging_endpoints: Vec::new(),

@@ -493,6 +493,8 @@ mod tests {
             endpoint_admit: Arc::new(EndpointAdmit::default()),
             deployment_config_overrides: Arc::default(),
             static_routes: crate::static_routes::ActiveRouteTable::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+            flow_index: crate::webchat_routing::FlowIndex::default(),
         });
         let activation = Arc::new(Activation { host, routing });
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -737,6 +739,7 @@ mod tests {
                 listen_addr: None,
                 public_base_url: None,
                 gui_enabled: None,
+                default_bundle: None,
             },
             packs: Vec::new(),
             messaging_endpoints: endpoints,
