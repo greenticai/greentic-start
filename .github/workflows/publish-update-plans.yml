@@ -1,17 +1,15 @@
 name: Publish Update Plans
 
 # Publishes DSSE-signed binary-update plans to all subscribed environments
-# after a successful release. Plans are signed with a dedicated CI key
+# for an already-released version. Plans are signed with a dedicated CI key
 # (distinct from the human operator key) so a compromise is recoverable
 # by removing the CI key from each env's trust roots.
 #
-# Trigger chain: tag push -> "Release Binaries" builds + uploads assets ->
-# this workflow fires on workflow_run(completed) -> derives binary artifacts
-# from the GitHub release -> signs and publishes plans to every env on the
-# plan server.
-#
-# Manual fallback: workflow_dispatch with a version input. A preflight step
-# verifies the corresponding GitHub release exists and has assets.
+# Manual only: dispatch this workflow with the release version. It is
+# deliberately NOT chained to "Release Binaries" — cutting a tag must not push
+# new plans to every environment without a human asking for it. A preflight
+# step verifies the corresponding GitHub release exists and carries its full
+# asset set before anything is signed.
 #
 # Required repo secrets:
 #   UPDATER_CI_SIGNING_KEY_PEM  - PKCS#8 Ed25519 private key PEM (CI-only)
@@ -22,11 +20,6 @@ name: Publish Update Plans
 #   UPDATER_TRUST_ROOT_JSON     - trust-root.json content (public keys only)
 
 on:
-  workflow_run:
-    workflows: ["Release Binaries"]
-    types:
-      - completed
-
   workflow_dispatch:
     inputs:
       version:
@@ -45,60 +38,30 @@ jobs:
   publish:
     name: Publish plans to all environments
     runs-on: ubuntu-24.04
-    # workflow_run: only proceed when the triggering run succeeded AND was
-    # a tag push (not a workflow_dispatch of release-binaries, which skips
-    # all jobs but still reports conclusion=success).
-    # workflow_dispatch: always proceed (preflight validates the release).
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (
-        github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.event == 'push' &&
-        startsWith(github.event.workflow_run.head_branch, 'v')
-      )
     steps:
-      # The workflow lands on main before the signing key and plan server are
-      # configured. Until they are, a release must not turn this job red: an
-      # automatic run reports "not configured" and stops. A manual dispatch is
-      # an explicit request, so it fails loudly instead of quietly doing nothing.
+      # A dispatch is an explicit request to publish, so an unconfigured repo
+      # fails loudly instead of quietly doing nothing.
       - name: Check configuration
-        id: config
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
           PLAN_SERVER_URL: ${{ vars.PLAN_SERVER_URL }}
           HAS_SIGNING_KEY: ${{ secrets.UPDATER_CI_SIGNING_KEY_PEM != '' }}
           HAS_UPLOAD_TOKEN: ${{ secrets.PLAN_UPLOAD_TOKEN != '' }}
         run: |
           set -euo pipefail
-          if [ -n "${PLAN_SERVER_URL}" ] && [ "${HAS_SIGNING_KEY}" = "true" ] && [ "${HAS_UPLOAD_TOKEN}" = "true" ]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "configured=false" >> "$GITHUB_OUTPUT"
-          msg="update-plan publishing is not configured — set vars.PLAN_SERVER_URL, secrets.UPDATER_CI_SIGNING_KEY_PEM, and secrets.PLAN_UPLOAD_TOKEN (see docs/ci-update-signing-key.md)"
-          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
-            echo "::error::${msg}"
+          if [ -z "${PLAN_SERVER_URL}" ] || [ "${HAS_SIGNING_KEY}" != "true" ] || [ "${HAS_UPLOAD_TOKEN}" != "true" ]; then
+            echo "::error::update-plan publishing is not configured — set vars.PLAN_SERVER_URL, secrets.UPDATER_CI_SIGNING_KEY_PEM, and secrets.PLAN_UPLOAD_TOKEN (see docs/ci-update-signing-key.md)"
             exit 1
           fi
-          echo "::notice::Skipping — ${msg}"
-          echo "Skipped — ${msg}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Resolve version
         id: version
-        if: steps.config.outputs.configured == 'true'
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
           INPUT_VERSION: ${{ inputs.version }}
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
-          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
-            version="${INPUT_VERSION}"
-          else
-            version="${HEAD_BRANCH#v}"
-          fi
+          version="${INPUT_VERSION}"
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Invalid version '${version}' — expected M.m.p"
             exit 1
@@ -107,7 +70,6 @@ jobs:
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
       - name: Verify GitHub release exists
-        if: steps.config.outputs.configured == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -134,7 +96,6 @@ jobs:
       # route the publish uses, so a 200 here proves the credential end-to-end
       # before we spend time installing binstall + the deployer.
       - name: Preflight — plan-server auth
-        if: steps.config.outputs.configured == 'true'
         shell: bash
         env:
           GREENTIC_PLAN_UPLOAD_TOKEN: ${{ secrets.PLAN_UPLOAD_TOKEN }}
@@ -162,11 +123,9 @@ jobs:
           esac
 
       - name: Install cargo-binstall
-        if: steps.config.outputs.configured == 'true'
         uses: cargo-bins/cargo-binstall@main
 
       - name: Install greentic-deployer
-        if: steps.config.outputs.configured == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -174,7 +133,6 @@ jobs:
           echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
 
       - name: Write signing key
-        if: steps.config.outputs.configured == 'true'
         shell: bash
         env:
           CI_SIGNING_KEY: ${{ secrets.UPDATER_CI_SIGNING_KEY_PEM }}
@@ -188,7 +146,6 @@ jobs:
         id: key
 
       - name: Write trust root
-        if: steps.config.outputs.configured == 'true'
         shell: bash
         env:
           TRUST_ROOT_JSON: ${{ vars.UPDATER_TRUST_ROOT_JSON }}
@@ -200,7 +157,6 @@ jobs:
         id: trust
 
       - name: Publish update plans
-        if: steps.config.outputs.configured == 'true'
         shell: bash
         env:
           GREENTIC_PLAN_UPLOAD_TOKEN: ${{ secrets.PLAN_UPLOAD_TOKEN }}
