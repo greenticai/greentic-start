@@ -44,6 +44,11 @@ pub struct AgentConfig {
 /// Run the agent forever, reconnecting on failure. Returns only on
 /// unrecoverable setup errors (e.g. the runtime cannot be built).
 pub fn run(config: AgentConfig) -> Result<()> {
+    // Both ring and aws-lc-rs are in the dependency tree, so rustls 0.23 cannot
+    // auto-select a process CryptoProvider for the wss:// handshake — install one.
+    // Err just means another component already installed it; either is fine.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Build the blocking HTTP client OUTSIDE the async runtime — it owns its own
     // background runtime and constructing it inside tokio can wedge.
     let client = reqwest::blocking::Client::builder()

@@ -385,6 +385,7 @@ pub(crate) fn normalize_args(raw_tail: Vec<String>) -> Vec<String> {
         "warmup",
         "doctor",
         "resolve-secret",
+        "__tunnel-agent",
     ];
     let mut first_pos = None;
     let mut skip_next_value = false;
