@@ -126,7 +126,38 @@ fn run_loop(config: WallClockSchedulerConfig, rx: mpsc::Receiver<()>) -> anyhow:
 }
 
 fn fire(config: &WallClockSchedulerConfig, def: &TriggerDef, fire_time: DateTime<Utc>) {
-    let env = match envelope_for(def, fire_time, &config.tenant, config.team.as_deref()) {
+    // Build the tenant context once, up front. An invalid tenant id must
+    // fail the whole fire rather than silently routing events to a shared
+    // "unknown" tenant scope (cross-tenant comingling risk).
+    let tenant = match tenant_ctx(&config.tenant, config.team.as_deref()) {
+        Ok(t) => t,
+        Err(err) => {
+            operator_log::error(
+                module_path!(),
+                format!("trigger '{}' skipped: {err}", def.id),
+            );
+            return;
+        }
+    };
+
+    let business = match business_event_for_fire(def, fire_time, &tenant) {
+        Ok(business) => business,
+        Err(errs) => {
+            operator_log::error(
+                module_path!(),
+                format!("trigger '{}' mint failed: {}", def.id, errs.join("; ")),
+            );
+            return;
+        }
+    };
+
+    let env = match business_to_envelope(
+        &business,
+        def,
+        fire_time,
+        &config.tenant,
+        config.team.as_deref(),
+    ) {
         Ok(env) => env,
         Err(err) => {
             operator_log::error(
@@ -136,6 +167,7 @@ fn fire(config: &WallClockSchedulerConfig, def: &TriggerDef, fire_time: DateTime
             return;
         }
     };
+
     let ctx = OperatorContext {
         tenant: config.tenant.clone(),
         team: config.team.clone(),
@@ -148,11 +180,6 @@ fn fire(config: &WallClockSchedulerConfig, def: &TriggerDef, fire_time: DateTime
         );
     }
     if let Some(sorx) = &config.sorx
-        && let Ok(business) = business_event_for_fire(
-            def,
-            fire_time,
-            &tenant_ctx(&config.tenant, config.team.as_deref()),
-        )
         && let Err(err) = sorx.append(&config.tenant, &business)
     {
         operator_log::warn(
@@ -169,8 +196,23 @@ pub(crate) fn envelope_for(
     tenant: &str,
     team: Option<&str>,
 ) -> anyhow::Result<EventEnvelopeV1> {
-    let business = business_event_for_fire(def, fire_time, &tenant_ctx(tenant, team))
+    let ctx = tenant_ctx(tenant, team)?;
+    let business = business_event_for_fire(def, fire_time, &ctx)
         .map_err(|errs| anyhow::anyhow!("business event build failed: {}", errs.join("; ")))?;
+    business_to_envelope(&business, def, fire_time, tenant, team)
+}
+
+/// Map an already-minted business event to greentic-start's ingress
+/// `EventEnvelopeV1`. Split out from `envelope_for` so `fire()` can build the
+/// business event exactly once per fire and reuse it for both sink A
+/// (routing) and sink C (SoRX append).
+fn business_to_envelope(
+    business: &greentic_types::EventEnvelope,
+    def: &TriggerDef,
+    fire_time: DateTime<Utc>,
+    tenant: &str,
+    team: Option<&str>,
+) -> anyhow::Result<EventEnvelopeV1> {
     let (domain, name) = greentic_types::events::parse_business_event_type(&business.r#type)
         .map_err(|e| anyhow::anyhow!("parse emitted type: {e}"))?;
     Ok(EventEnvelopeV1 {
@@ -187,22 +229,22 @@ pub(crate) fn envelope_for(
             team: team.map(ToString::to_string),
         },
         correlation_id: None,
-        payload: business.payload,
+        payload: business.payload.clone(),
         http: None,
         raw: None,
     })
 }
 
-fn tenant_ctx(tenant: &str, team: Option<&str>) -> greentic_types::TenantCtx {
+fn tenant_ctx(tenant: &str, team: Option<&str>) -> anyhow::Result<greentic_types::TenantCtx> {
     let env = greentic_types::EnvId::try_from("default").expect("static env id");
-    let tid = greentic_types::TenantId::try_from(tenant).unwrap_or_else(|_| {
-        greentic_types::TenantId::try_from("unknown").expect("fallback tenant id")
-    });
+    let tid = greentic_types::TenantId::try_from(tenant)
+        .map_err(|e| anyhow::anyhow!("invalid tenant id '{tenant}': {e}"))?;
     let ctx = greentic_types::TenantCtx::new(env, tid);
-    match team.and_then(|t| greentic_types::TeamId::try_from(t).ok()) {
+    let ctx = match team.and_then(|t| greentic_types::TeamId::try_from(t).ok()) {
         Some(team_id) => ctx.with_team(Some(team_id)),
         None => ctx,
-    }
+    };
+    Ok(ctx)
 }
 
 #[cfg(test)]
@@ -232,5 +274,20 @@ mod tests {
         assert_eq!(env.source.provider, "trigger");
         assert_eq!(env.source.handler_id.as_deref(), Some("daily_rent"));
         assert_eq!(env.payload["at"], fire.to_rfc3339());
+    }
+
+    #[test]
+    fn envelope_for_rejects_invalid_tenant() {
+        let def = TriggerDef {
+            id: "t".into(),
+            schedule: TriggerSchedule::Daily {
+                at: TimeOfDay { hour: 6, minute: 0 },
+            },
+            emits: "cap://greentic/events/tenancy/rent".into(),
+            payload_template: serde_json::json!({}),
+        };
+        let fire = Utc.with_ymd_and_hms(2026, 7, 24, 6, 0, 0).unwrap();
+        // An empty tenant id must be rejected, not silently mapped to "unknown".
+        assert!(envelope_for(&def, fire, "", Some("core")).is_err());
     }
 }
