@@ -215,21 +215,6 @@ impl DeploymentRouteTable {
             .map(|r| r.deployment_id)
     }
 
-    /// All Active `(bundle_id, deployment_id)` pairs for a given tenant,
-    /// preserving environment order. Used by
-    /// [`crate::webchat_routing::BundleIndex`] to enumerate the tenant's
-    /// deployed bundles for URL disambiguation.
-    #[allow(dead_code)] // consumed by downstream bundle-listing features
-    pub(crate) fn bundles_for_tenant(
-        &self,
-        tenant: &str,
-    ) -> impl Iterator<Item = (&BundleId, DeploymentId)> {
-        self.routes
-            .iter()
-            .filter(move |r| r.tenant == tenant)
-            .map(|r| (&r.bundle_id, r.deployment_id))
-    }
-
     /// Resolve a deployment for a worker-invoke call, which carries a tenant but
     /// no `(host, path)` to match on.
     ///
