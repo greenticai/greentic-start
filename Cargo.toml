@@ -211,11 +211,14 @@ version = "=0.2.5"
 # migration against the other channel's applied sequence. Transitively pins
 # greentic-update >= 1.1.2 (the authoritative channel-scoped gate).
 #
-# Floor raised to 1.1.28 in lockstep with deploy-spec 0.2.5: that release adds
-# `EnvironmentHostConfig::default_bundle`, and every deployer up to and
-# including the published 1.1.27 constructs the struct with literals, so
-# resolving the new spec against an older deployer is E0063.
-version = ">=1.1.28, <1.2.0-0"
+# Floor raised to 1.1.29 in lockstep with deploy-spec 0.2.5: that release adds
+# `EnvironmentHostConfig::default_bundle` and makes the struct
+# `#[non_exhaustive]`, and every deployer up to and including the published
+# 1.1.28 constructs it with literals, so resolving the new spec against an
+# older deployer fails inside the registry copy (E0639; E0063 before the
+# attribute). 1.1.29, not 1.1.28: main cut and published 1.1.28 from #520 while
+# this work was open, so that release predates the conversion.
+version = ">=1.1.29, <1.2.0-0"
 default-features = false
 
 # Lower bound pinned to the first dev build exposing the `signing` module
