@@ -123,6 +123,7 @@ mod topic_match;
 mod trigger_discovery;
 mod tunnel_prompt;
 mod tunnel_state;
+mod wallclock_scheduler;
 mod warmup;
 mod webhook_secret_resolver;
 mod webhook_updater;
