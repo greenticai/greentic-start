@@ -213,11 +213,11 @@ the keys there — a DID-sourced key is stored exactly like a hand-added one:
 `PLAN_SERVER_URL` and `UPDATER_TRUST_ROOT_JSON` are repo *variables*, not
 secrets: one is a URL, the other holds public keys only.
 
-Until `PLAN_SERVER_URL` and `UPDATER_CI_SIGNING_KEY_PEM` both exist, the
-workflow is dormant: a release run reports "not configured" and stops
-without publishing (it does not fail the release). A manual
-`workflow_dispatch` fails loudly instead — an explicit request to publish
-should never silently do nothing.
+The workflow runs on `workflow_dispatch` only — cutting a release tag does
+not publish plans. Someone dispatches it with the version once the release
+is out. Until `PLAN_SERVER_URL` and `UPDATER_CI_SIGNING_KEY_PEM` both
+exist, a dispatch fails loudly with "not configured" — an explicit request
+to publish should never silently do nothing.
 
 The workflow writes the private key to `$RUNNER_TEMP` with mode `600`,
 masks it in the log, and removes it in an `if: always()` cleanup step.
