@@ -1,11 +1,4 @@
 //! Discovery of `greentic.triggers.v1` trigger definitions from pack manifests.
-//!
-//! `parse_trigger_defs` is wired into the boot path in a later slice task
-//! (wallclock trigger scheduler boot wiring); until then nothing outside this
-//! module's tests calls these `pub` functions, so silence the resulting
-//! dead-code lint the same way `timer_scheduler.rs` does for its own
-//! pre-wiring functions.
-#![allow(dead_code)]
 
 use std::io::Read;
 
@@ -106,5 +99,67 @@ mod tests {
     #[test]
     fn empty_when_no_extension() {
         assert!(trigger_defs_from_manifest(&serde_json::json!({})).is_empty());
+    }
+
+    // Focused seam test for the boot-path glue (open pack zip -> decode
+    // manifest.cbor -> delegate to `trigger_defs_from_manifest`, mirroring
+    // `timer_scheduler::discover_timer_handlers`). A full live-runner smoke
+    // (real `WallClockScheduler` thread firing a trigger and delivering it via
+    // `event_router::route_event_to_subscribers` to a subscribed flow) is
+    // deferred: it would need a real flow execution through the runner
+    // engine, which is exactly the flaky, slow surface Tasks 1-10 already
+    // isolated behind unit-tested deterministic seams (`envelope_for`,
+    // `trigger_defs_from_manifest`, `SorxAppendClient::events_url`, the
+    // `event_router` subscriber-selection tests). This test covers the one
+    // seam those tasks could not: the zip/CBOR discovery glue itself.
+    #[test]
+    fn parse_trigger_defs_reads_manifest_cbor_from_pack_zip() {
+        use std::io::Write;
+
+        use tempfile::tempdir;
+        use zip::write::FileOptions;
+
+        use crate::discovery::{
+            DetectedDomains, DetectedProvider, DiscoveryResult, ProviderIdSource,
+        };
+
+        let dir = tempdir().expect("tempdir");
+        let pack_path = dir.path().join("events-tick.gtpack");
+        let manifest = serde_json::json!({
+            "extensions": {
+                "greentic.triggers.v1": {
+                    "triggers": [
+                        { "id": "every_minute_tick", "schedule": { "kind": "every_minute" },
+                          "emits": "cap://greentic/events/tenancy/tick",
+                          "payload_template": {} }
+                    ]
+                }
+            }
+        });
+        let manifest_cbor = serde_cbor::to_vec(&manifest).expect("encode manifest.cbor");
+        let file = std::fs::File::create(&pack_path).expect("create pack");
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .expect("start manifest.cbor entry");
+        zip.write_all(&manifest_cbor).expect("write manifest.cbor");
+        zip.finish().expect("finish pack");
+
+        let discovery = DiscoveryResult {
+            domains: DetectedDomains {
+                messaging: false,
+                events: true,
+                oauth: false,
+            },
+            providers: vec![DetectedProvider {
+                provider_id: "events-tick".to_string(),
+                domain: "events".to_string(),
+                pack_path,
+                id_source: ProviderIdSource::Manifest,
+            }],
+        };
+
+        let defs = parse_trigger_defs(&discovery).expect("parse trigger defs");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].id, "every_minute_tick");
     }
 }
