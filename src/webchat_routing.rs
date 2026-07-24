@@ -175,7 +175,6 @@ pub(crate) struct FlowIndex {
 #[derive(Clone, Debug)]
 struct FlowEntry {
     flow_id: String,
-    #[allow(dead_code)] // consumed by stage 2 when selecting the flow
     pack_id: String,
 }
 
@@ -206,6 +205,15 @@ impl FlowIndex {
         self.flows
             .get(bundle_id)
             .is_some_and(|entries| entries.iter().any(|e| e.flow_id == segment))
+    }
+
+    /// Look up the pack id that owns `flow_id` within `bundle_id`.
+    /// Returns `None` when the flow is unknown.
+    pub(crate) fn pack_id_for_flow(&self, bundle_id: &str, flow_id: &str) -> Option<&str> {
+        self.flows
+            .get(bundle_id)
+            .and_then(|entries| entries.iter().find(|e| e.flow_id == flow_id))
+            .map(|e| e.pack_id.as_str())
     }
 }
 
@@ -1015,6 +1023,16 @@ mod tests {
         assert!(!fi.is_flow("b2", "main"));
         // Only 2 entries despite the second registration.
         assert_eq!(fi.flows.get("b1").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn flow_index_pack_id_for_flow() {
+        let mut fi = FlowIndex::default();
+        fi.register_bundle_flows("b1", "pack-alpha", &["main".to_string(), "aux".to_string()]);
+        assert_eq!(fi.pack_id_for_flow("b1", "main"), Some("pack-alpha"));
+        assert_eq!(fi.pack_id_for_flow("b1", "aux"), Some("pack-alpha"));
+        assert_eq!(fi.pack_id_for_flow("b1", "unknown"), None);
+        assert_eq!(fi.pack_id_for_flow("b2", "main"), None);
     }
 
     // ── BundleIndex ─────────────────────────────────────────────────

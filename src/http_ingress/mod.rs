@@ -1752,6 +1752,7 @@ where
             || request.path.ends_with("/conversations"))
     {
         extract_user_id(&body).map(|user_id| DedupKey {
+            deployment_id: greentic_deploy_spec::DeploymentId::default(),
             tenant: request.tenant.to_string(),
             team: request.team.to_string(),
             user_id,

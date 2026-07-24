@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use greentic_deploy_spec::DeploymentId;
+
 use crate::ingress_types::IngressHttpResponse;
 
 const DEFAULT_TTL_SECS: u64 = 30;
@@ -26,6 +28,7 @@ const MAX_ENTRIES: usize = 4096;
 
 #[derive(Clone, Eq, Hash, PartialEq, Debug)]
 pub struct DedupKey {
+    pub deployment_id: DeploymentId,
     pub tenant: String,
     pub team: String,
     pub user_id: String,
@@ -107,8 +110,14 @@ pub fn extract_user_id(body: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Fixed deployment id so the test helper produces equal keys.
+    fn fixed_dep() -> DeploymentId {
+        DeploymentId(ulid::Ulid::from_bytes([1; 16]))
+    }
+
     fn key(tenant: &str, user: &str) -> DedupKey {
         DedupKey {
+            deployment_id: fixed_dep(),
             tenant: tenant.to_string(),
             team: "default".to_string(),
             user_id: user.to_string(),
@@ -153,6 +162,19 @@ mod tests {
         cache.insert(key("t", "u"), response("{}"));
         std::thread::sleep(Duration::from_millis(25));
         assert!(cache.get(&key("t", "u")).is_none());
+    }
+
+    #[test]
+    fn different_deployment_does_not_share_entry() {
+        let cache = ConversationDedupCache::new();
+        cache.insert(key("t", "u"), response("{\"id\":1}"));
+        let other = DedupKey {
+            deployment_id: DeploymentId::new(),
+            tenant: "t".to_string(),
+            team: "default".to_string(),
+            user_id: "u".to_string(),
+        };
+        assert!(cache.get(&other).is_none());
     }
 
     #[test]
