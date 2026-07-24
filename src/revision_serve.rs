@@ -5592,15 +5592,7 @@ mod tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: env_id.clone(),
             name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id,
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-                default_bundle: None,
-            },
+            host_config: EnvironmentHostConfig::new(env_id),
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
             extensions: Vec::new(),
@@ -5996,15 +5988,7 @@ mod tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: env_id.clone(),
             name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id,
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-                default_bundle: None,
-            },
+            host_config: EnvironmentHostConfig::new(env_id),
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
             extensions: Vec::new(),
@@ -6914,15 +6898,9 @@ mod tests {
     // they don't race the other listen-addr/env tests in the crate.
 
     fn host_cfg_with(addr: Option<SocketAddr>) -> EnvironmentHostConfig {
-        EnvironmentHostConfig {
-            env_id: greentic_types::EnvId::new("local").unwrap(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: addr,
-            public_base_url: None,
-            gui_enabled: None,
-            default_bundle: None,
-        }
+        let mut hc = EnvironmentHostConfig::new(greentic_types::EnvId::new("local").unwrap());
+        hc.listen_addr = addr;
+        hc
     }
 
     struct EnvVarGuard {

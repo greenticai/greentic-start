@@ -154,6 +154,9 @@ default-features = false
 # masks that with a path dep; resolving from crates.io picks 0.2.3 and fails to
 # compile `greentic-deployer`. Our floor is what actually constrains the shared
 # resolution, so raise it here rather than wait for their republish.
+# Floor raised to 0.2.5: `EnvironmentHostConfig` is now `#[non_exhaustive]` and
+# must be constructed via `EnvironmentHostConfig::new(env_id)` + builder setters.
+# The `new()` constructor and `#[non_exhaustive]` do not exist before 0.2.5.
 version = ">=0.2.5, <0.3"
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
