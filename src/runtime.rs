@@ -30,6 +30,10 @@ use crate::threshold_watcher::{ThresholdWatcher, ThresholdWatcherConfig};
 use crate::timer_scheduler::{TimerScheduler, TimerSchedulerConfig, discover_timer_handlers};
 use anyhow::Context;
 
+use crate::sorx_append_client::SorxAppendClient;
+use crate::trigger_discovery::parse_trigger_defs;
+use crate::wallclock_scheduler::{WallClockScheduler, WallClockSchedulerConfig};
+
 use crate::cloudflared::{self, CloudflaredConfig};
 use crate::config::{DemoConfig, DemoSubscriptionsMode};
 use crate::ngrok::{self, NgrokConfig};
@@ -43,6 +47,7 @@ use crate::subscriptions_universal::{
 pub struct ForegroundRuntimeHandles {
     pub ingress_server: Option<HttpIngressServer>,
     pub timer_scheduler: Option<TimerScheduler>,
+    pub wallclock_scheduler: Option<WallClockScheduler>,
     pub threshold_watcher: Option<ThresholdWatcher>,
     pub business_event_listener: Option<BusinessEventListener>,
 }
@@ -53,6 +58,9 @@ impl ForegroundRuntimeHandles {
             server.stop()?;
         }
         if let Some(scheduler) = self.timer_scheduler.take() {
+            scheduler.stop()?;
+        }
+        if let Some(scheduler) = self.wallclock_scheduler.take() {
             scheduler.stop()?;
         }
         if let Some(watcher) = self.threshold_watcher.take() {
@@ -894,6 +902,61 @@ pub fn demo_up_services(
         }
     };
 
+    // ── Wall-clock trigger scheduler (optional) ─────────────────────────────
+    // Discover any `greentic.triggers.v1` declarations across events-domain
+    // packs and start the background wall-clock scheduler. Mirrors the timer
+    // scheduler's discover -> start -> store -> stop wiring above; discovery
+    // or start failures are non-fatal (warn and leave the scheduler absent).
+    // When `SORX_URL` is set, fired triggers are additionally appended to the
+    // SoRX durable event log; unset leaves routing-only behavior.
+    let wallclock_scheduler = match parse_trigger_defs(&discovery) {
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!("trigger scheduler disabled: {err:#}"),
+            );
+            None
+        }
+        Ok(triggers) if triggers.is_empty() => None,
+        Ok(triggers) => {
+            let sorx = match std::env::var("SORX_URL") {
+                Ok(url) if !url.is_empty() => {
+                    let secret = std::env::var("SORX_SECRET").ok().filter(|s| !s.is_empty());
+                    Some(SorxAppendClient::new(url, secret))
+                }
+                _ => {
+                    operator_log::warn(
+                        module_path!(),
+                        "SORX_URL unset; trigger events route only (no durable append)",
+                    );
+                    None
+                }
+            };
+            match WallClockScheduler::start(WallClockSchedulerConfig {
+                runner_host: Arc::clone(&runner_host),
+                tenant: tenant.to_string(),
+                team: if team.is_empty() {
+                    None
+                } else {
+                    Some(team.to_string())
+                },
+                triggers,
+                sorx,
+                state_dir: paths.runtime_root(),
+                debug_enabled,
+            }) {
+                Ok(scheduler) => Some(scheduler),
+                Err(err) => {
+                    operator_log::warn(
+                        module_path!(),
+                        format!("trigger scheduler disabled: {err:#}"),
+                    );
+                    None
+                }
+            }
+        }
+    };
+
     // ── Threshold watcher (optional) ────────────────────────────────────────
     // Bundles may declare `threshold-watchers.yaml` at the bundle root to
     // poll a metric endpoint and fire a flow on a threshold crossing. If no
@@ -1545,6 +1608,7 @@ pub fn demo_up_services(
     Ok(ForegroundRuntimeHandles {
         ingress_server,
         timer_scheduler,
+        wallclock_scheduler,
         threshold_watcher,
         business_event_listener,
     })

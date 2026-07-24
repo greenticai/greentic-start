@@ -74,7 +74,6 @@ pub fn route_events_to_default_flow(
 
 /// Route one already-minted event to every flow whose `subscribes_to` matches
 /// its `event_type`; fall back to the default app flow if none match.
-#[allow(dead_code)]
 pub fn route_event_to_subscribers(
     bundle: &Path,
     ctx: &OperatorContext,

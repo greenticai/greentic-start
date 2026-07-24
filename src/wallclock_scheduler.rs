@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Wall-clock trigger scheduler: fires declared `TriggerDef`s on their
 //! `TriggerSchedule`, minting a business event routed to subscribing flows
 //! (sink A) and durably appended to SoRX (sink C). Sibling of `timer_scheduler`.

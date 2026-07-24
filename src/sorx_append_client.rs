@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Thin blocking HTTP client for the SoRX external append ingress
 //! (`POST /v1/sorx/events`). Best-effort: append failures are surfaced to the
 //! caller, which logs and continues (routing must not depend on SoRX).
