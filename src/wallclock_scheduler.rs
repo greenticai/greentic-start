@@ -104,7 +104,13 @@ fn state_path(state_dir: &Path) -> PathBuf {
 
 fn load_state(state_dir: &Path) -> TriggerState {
     match std::fs::read(state_path(state_dir)) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+            operator_log::warn(
+                module_path!(),
+                format!("corrupt trigger state.json, resetting: {err}"),
+            );
+            TriggerState::default()
+        }),
         Err(_) => TriggerState::default(),
     }
 }
@@ -182,6 +188,14 @@ fn run_loop(config: WallClockSchedulerConfig, rx: mpsc::Receiver<()>) -> anyhow:
             emit_catchup_truncated(&config, &s.def, truncated);
         }
         for fire_time in fires {
+            if rx.try_recv().is_ok() {
+                operator_log::info(
+                    module_path!(),
+                    "wall-clock scheduler shutdown during catch-up",
+                );
+                save_state(&config.state_dir, &state);
+                return Ok(());
+            }
             fire(&config, &s.def, fire_time);
             s.last_fire = Some(fire_time);
             state.last_fire.insert(s.def.id.clone(), fire_time);
@@ -348,7 +362,8 @@ fn business_to_envelope(
 }
 
 fn tenant_ctx(tenant: &str, team: Option<&str>) -> anyhow::Result<greentic_types::TenantCtx> {
-    let env = greentic_types::EnvId::try_from("default").expect("static env id");
+    let env = greentic_types::EnvId::try_from("default")
+        .map_err(|e| anyhow::anyhow!("invalid static env id: {e}"))?;
     let tid = greentic_types::TenantId::try_from(tenant)
         .map_err(|e| anyhow::anyhow!("invalid tenant id '{tenant}': {e}"))?;
     let ctx = greentic_types::TenantCtx::new(env, tid);
