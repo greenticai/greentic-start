@@ -31,6 +31,8 @@ mod domains;
 mod endpoint_admit;
 mod endpoint_resolver;
 mod env_tunnel;
+mod gtunnel;
+mod gtunnel_agent;
 // `pub` (doc-hidden) so `tests/threshold_watcher.rs` can drive
 // `select_target_flows` and the event-routing types directly.
 #[doc(hidden)]
@@ -132,7 +134,8 @@ use cli_args::{
     Cli, Command, normalize_args, restart_name, start_request_from_args, stop_request_from_args,
 };
 pub use cli_args::{
-    CloudflaredModeArg, NatsModeArg, NgrokModeArg, RestartTarget, StartRequest, StopRequest,
+    CloudflaredModeArg, GtunnelModeArg, NatsModeArg, NgrokModeArg, RestartTarget, StartRequest,
+    StopRequest,
 };
 
 const DEMO_DEFAULT_TENANT: &str = "demo";
@@ -320,9 +323,9 @@ fn stop_env_runtime(env_dir: &std::path::Path, env_id: &str) -> anyhow::Result<(
 
 pub fn run_from_env() -> anyhow::Result<()> {
     let raw_tail: Vec<String> = std::env::args().skip(1).collect();
-    let tunnel_explicit = raw_tail
-        .iter()
-        .any(|a| a.starts_with("--cloudflared") || a.starts_with("--ngrok"));
+    let tunnel_explicit = raw_tail.iter().any(|a| {
+        a.starts_with("--cloudflared") || a.starts_with("--ngrok") || a.starts_with("--gtunnel")
+    });
     let args = normalize_args(raw_tail);
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
@@ -355,6 +358,9 @@ pub fn run_from_env() -> anyhow::Result<()> {
             strict: args.strict,
         }),
         Command::ResolveSecret(args) => run_resolve_secret(args),
+        Command::TunnelAgent => {
+            crate::gtunnel::agent_config_from_env().and_then(crate::gtunnel_agent::run)
+        }
         Command::Doctor(args) => {
             let has_errors = crate::doctor::run_doctor(args)?;
             if has_errors {
@@ -1210,7 +1216,8 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
 
     // Mutual exclusivity (ngrok wins over cloudflared): single shared policy
     // with the bundle-less arm, owned by `env_tunnel::choose_tunnel`.
-    let tunnel_choice = env_tunnel::choose_tunnel(request.cloudflared, request.ngrok);
+    let tunnel_choice =
+        env_tunnel::choose_tunnel(request.cloudflared, request.ngrok, request.gtunnel);
 
     let cloudflared = match tunnel_choice {
         env_tunnel::TunnelChoice::Cloudflared => {
@@ -1252,6 +1259,16 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         _ => None,
     };
 
+    let gtunnel = match tunnel_choice {
+        env_tunnel::TunnelChoice::Gtunnel => Some(env_tunnel::gtunnel_config(
+            &request,
+            &format!("{}-{}", demo_config.tenant, demo_config.team),
+            demo_config.services.gateway.port,
+            restart.contains("gtunnel") || restart.contains("all"),
+        )),
+        _ => None,
+    };
+
     let handles = runtime::demo_up_services(
         &config_path,
         &demo_config,
@@ -1260,6 +1277,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         env_store_public_base_url,
         cloudflared,
         ngrok,
+        gtunnel,
         &restart,
         request.runner_binary.clone(),
         &log_dir,
@@ -1968,6 +1986,9 @@ mod tests {
             cloudflared_binary: None,
             ngrok: NgrokModeArg::Off,
             ngrok_binary: None,
+            gtunnel: GtunnelModeArg::Off,
+            gtunnel_worker_url: None,
+            gtunnel_tunnel_id: None,
             runner_binary: None,
             restart: Vec::new(),
             log_dir: None,
@@ -2003,6 +2024,9 @@ mod tests {
             cloudflared_binary: None,
             ngrok: NgrokModeArg::Off,
             ngrok_binary: None,
+            gtunnel: GtunnelModeArg::Off,
+            gtunnel_worker_url: None,
+            gtunnel_tunnel_id: None,
             runner_binary: None,
             restart: Vec::new(),
             log_dir: None,
@@ -2107,6 +2131,9 @@ mod tests {
             cloudflared_binary: None,
             ngrok: NgrokModeArg::Off,
             ngrok_binary: None,
+            gtunnel: GtunnelModeArg::Off,
+            gtunnel_worker_url: None,
+            gtunnel_tunnel_id: None,
             runner_binary: None,
             restart: Vec::new(),
             log_dir: None,
