@@ -119,6 +119,7 @@ mod test_fixtures;
 pub mod threshold_watcher;
 mod timer_scheduler;
 mod topic_match;
+mod trigger_discovery;
 mod tunnel_prompt;
 mod tunnel_state;
 mod warmup;
