@@ -1,6 +1,6 @@
 # CI Update-Plan Signing Key
 
-The `publish-update-plans.yml` workflow signs binary-update plans with an
+The `publish-update-plans.yml` workflow (in `greenticai/greentic-dev`) signs binary-update plans with an
 Ed25519 key stored in `UPDATER_CI_SIGNING_KEY_PEM`. In the current
 deployment, **that key is the fleet `did:web` root key** — the same key
 published at `did:web:trust.greentic.cloud#root-1` (key_id
