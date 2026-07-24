@@ -72,6 +72,54 @@ pub fn route_events_to_default_flow(
     Ok(routed)
 }
 
+/// Route one already-minted event to every flow whose `subscribes_to` matches
+/// its `event_type`; fall back to the default app flow if none match.
+#[allow(dead_code)]
+pub fn route_event_to_subscribers(
+    bundle: &Path,
+    ctx: &OperatorContext,
+    event: &EventEnvelopeV1,
+) -> anyhow::Result<usize> {
+    let team = ctx.team.as_deref();
+    let app_pack_path = app::resolve_app_pack_path(bundle, &ctx.tenant, team, None)
+        .context("resolve app pack for subscriber event routing")?;
+    let pack_info = app::load_app_pack_info(&app_pack_path).context("load app pack manifest")?;
+
+    let targets = select_target_flows(&pack_info, &event.event_type);
+    let flows: Vec<&AppFlowInfo> = if targets.is_empty() {
+        vec![app::select_app_flow(&pack_info).context("select app default flow")?]
+    } else {
+        targets
+    };
+
+    let mut routed = 0usize;
+    for flow in flows {
+        let input = build_event_flow_input(event, ctx);
+        let request = RunRequest {
+            root: bundle.to_path_buf(),
+            domain: Domain::Events,
+            pack_path: app_pack_path.clone(),
+            pack_label: pack_info.pack_id.clone(),
+            flow_id: flow.id.clone(),
+            tenant: ctx.tenant.clone(),
+            team: ctx.team.clone(),
+            input,
+            dist_offline: true,
+        };
+        runner_exec::run_provider_pack_flow(request)
+            .with_context(|| format!("route event {} -> {}", event.event_type, flow.id))?;
+        routed += 1;
+    }
+    operator_log::info(
+        module_path!(),
+        format!(
+            "event router delivered event to {} subscriber(s) pack={} event_type={}",
+            routed, pack_info.pack_id, event.event_type
+        ),
+    );
+    Ok(routed)
+}
+
 fn build_event_flow_input(event: &EventEnvelopeV1, ctx: &OperatorContext) -> JsonValue {
     json!({
         "event": event,
@@ -84,8 +132,32 @@ fn build_event_flow_input(event: &EventEnvelopeV1, ctx: &OperatorContext) -> Jso
 
 #[cfg(test)]
 mod tests {
-    use super::build_event_flow_input;
+    use super::{build_event_flow_input, select_target_flows};
+    use crate::messaging_app::{AppFlowInfo, AppPackInfo};
     use crate::runner_host::OperatorContext;
+
+    #[test]
+    fn subscriber_selection_prefers_matching_flows_over_default() {
+        let info = AppPackInfo {
+            pack_id: "p".into(),
+            flows: vec![
+                AppFlowInfo {
+                    id: "rent_flow".into(),
+                    kind: "event".into(),
+                    subscribes_to: vec!["tenancy.*".into()],
+                },
+                AppFlowInfo {
+                    id: "other".into(),
+                    kind: "event".into(),
+                    subscribes_to: vec![],
+                },
+            ],
+            capabilities: vec![],
+        };
+        let matched = select_target_flows(&info, "tenancy.rent");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, "rent_flow");
+    }
 
     #[test]
     fn build_event_flow_input_prefers_event_correlation_id() {
