@@ -71,7 +71,12 @@ enum RouteSegment {
 }
 
 /// Ordered table of pack-declared HTTP routes, sorted by specificity.
-#[derive(Default)]
+///
+/// `Clone` so a routing-only reload
+/// ([`crate::revision_boot::reactivate_routing_only`]) can carry the table over
+/// unchanged — it is derived from pack manifests, which such a reload by
+/// definition did not touch.
+#[derive(Clone, Default)]
 pub struct HttpRouteTable {
     routes: Vec<HttpRouteDescriptor>,
 }

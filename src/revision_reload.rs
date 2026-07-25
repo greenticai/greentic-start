@@ -119,9 +119,11 @@ impl Drop for WatcherHandle {
 /// runtime-config.json AND runtime.json together). Coalescing them onto one
 /// debouncer halves the inotify watches + worker threads vs spawning two.
 ///
-/// `rebuild` returns:
-/// - `Ok(Some(activation))` to swap the new activation into `server`,
-/// - `Ok(None)` to skip the swap (e.g. hash-skip on identical content),
+/// `rebuild` returns a [`ReloadOutcome`]:
+/// - `Full(activation)` to swap a rebuilt activation into `server`,
+/// - `RoutingOnly(env)` to swap only the env-derived routing, sharing the live
+///   host and dispatcher,
+/// - `Unchanged` to skip the swap (e.g. hash-skip on identical content),
 /// - `Err(_)` to log + keep the previous activation serving.
 ///
 /// The watcher takes ownership of every closure for the worker's lifetime;
@@ -143,7 +145,7 @@ pub(crate) fn spawn_runtime_config_watcher<R, P, S>(
     snapshot_reload: S,
 ) -> Result<WatcherHandle>
 where
-    R: FnMut() -> Result<Option<Activation>> + Send + 'static,
+    R: FnMut() -> Result<ReloadOutcome> + Send + 'static,
     P: FnMut(&Activation) + Send + 'static,
     S: FnMut() + Send + 'static,
 {
@@ -219,7 +221,7 @@ fn reload_worker<R, P, S>(
     mut post_reload: P,
     mut snapshot_reload: S,
 ) where
-    R: FnMut() -> Result<Option<Activation>> + Send + 'static,
+    R: FnMut() -> Result<ReloadOutcome> + Send + 'static,
     P: FnMut(&Activation) + Send + 'static,
     S: FnMut() + Send + 'static,
 {
@@ -262,35 +264,84 @@ fn reload_worker<R, P, S>(
         if !touches_activation {
             continue;
         }
-        match rebuild() {
-            Ok(Some(activation)) => {
-                // Clone (two Arc bumps) so the post-reload hook observes the
-                // SAME (host, routing) pair the server now serves; the hook
-                // fires only after the swap below.
-                let live = activation.clone();
-                let report = server.reload(activation, drain_window);
-                operator_log::info(
+        // Re-check after every rebuild. `rebuild()` snapshots the env files at
+        // the moment it runs, and a write that lands DURING that rebuild is not
+        // guaranteed to arrive as a separate debounced batch — notify can
+        // coalesce it into the batch already being drained. When that happens
+        // the rebuild publishes an activation derived from the PRE-write files
+        // and nothing re-reads them, so the write is silently lost until some
+        // unrelated event touches the directory again.
+        //
+        // Observed 2026-07-25: `op config set --default-bundle legal` landed
+        // while a prior rebuild was in flight; the reload that followed still
+        // carried `default_bundle=acct`, and the change only took effect 11s
+        // later when the next write happened to fire. On a quiet system there
+        // is no next write, so the loss is permanent, not merely delayed.
+        //
+        // The loop is cheap: `rebuild()` dedups on (rc, env) and returns
+        // Ok(None) the moment the inputs stop changing, so the steady state
+        // costs exactly one extra file read per batch. `MAX_RECHECKS` bounds a
+        // pathological writer that mutates the env faster than we can rebuild —
+        // we give up the tight loop and let the next batch carry it, rather
+        // than spinning here forever.
+        const MAX_RECHECKS: usize = 8;
+        for attempt in 0..=MAX_RECHECKS {
+            let outcome = match rebuild() {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    operator_log::error(
+                        module_path!(),
+                        format!("runtime-config reload failed: {err:#}"),
+                    );
+                    break;
+                }
+            };
+            let (report, live, kind) = match outcome {
+                ReloadOutcome::Unchanged => {
+                    // Inputs are stable — the activation now reflects the
+                    // latest bytes on disk. This is the only exit that
+                    // guarantees no write was lost.
+                    break;
+                }
+                ReloadOutcome::RoutingOnly(env) => {
+                    // No revision or pack moved, so the host and dispatcher are
+                    // carried forward: no WASM re-instantiation, no second host
+                    // resident for the drain window, and — because the host
+                    // owns every revision's session and state store — no
+                    // in-flight conversation loses its history across the swap.
+                    let (report, live) = server.reload_routing_only(|current| {
+                        revision_boot::reactivate_routing_only(&current.routing, &env)
+                    });
+                    (report, live, "routing")
+                }
+                ReloadOutcome::Full(activation) => {
+                    // Clone (two Arc bumps) so the post-reload hook observes the
+                    // SAME (host, routing) pair the server now serves; the hook
+                    // fires only after the swap below.
+                    let live = activation.clone();
+                    (server.reload(activation, drain_window), live, "full")
+                }
+            };
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "runtime-config reloaded ({kind}): {} → {} deployment(s), {} → {} revision(s)",
+                    report.prev_deployments,
+                    report.new_deployments,
+                    report.prev_revisions,
+                    report.new_revisions,
+                ),
+            );
+            post_reload(&live);
+            if attempt == MAX_RECHECKS {
+                operator_log::warn(
                     module_path!(),
-                    format!(
-                        "runtime-config reloaded: {} → {} deployment(s), {} → {} revision(s)",
-                        report.prev_deployments,
-                        report.new_deployments,
-                        report.prev_revisions,
-                        report.new_revisions,
-                    ),
-                );
-                post_reload(&live);
-            }
-            Ok(None) => {
-                // Identical-config write or otherwise no-op rebuild;
-                // skip the swap so cookies/pins aren't churned.
-            }
-            Err(err) => {
-                operator_log::error(
-                    module_path!(),
-                    format!("runtime-config reload failed: {err:#}"),
+                    "runtime-config still changing after MAX_RECHECKS rebuilds; \
+                     deferring to the next watcher batch",
                 );
             }
+            // Inputs changed, so go round again: another write may have landed
+            // while THIS rebuild was running.
         }
     }
 }
@@ -307,6 +358,29 @@ struct LastReloadInputs {
     env: Environment,
 }
 
+/// How the watched files changed, and therefore how much of the activation has
+/// to be rebuilt. Produced by [`rebuild_once`], consumed by [`reload_worker`].
+///
+/// The classification exists because [`crate::revision_boot::activate_runtime_config`]
+/// is expensive in a way that is invisible at three bundles and painful at
+/// twenty: it constructs a fresh `RunnerHost` with every revision's packs
+/// re-instantiated (WASM compile), and the superseded host stays resident for
+/// the whole drain window. Flipping `host_config.default_bundle` — one string —
+/// used to pay all of that.
+pub(crate) enum ReloadOutcome {
+    /// Inputs are byte-identical to what produced the live activation. Nothing
+    /// to publish; skip the swap so cookies and pins aren't churned.
+    Unchanged,
+    /// Only env-derived routing changed. Carries the freshly loaded
+    /// `Environment`; the worker turns it into routing against the live
+    /// activation inside
+    /// [`RevisionServer::reload_routing_only`](crate::revision_serve::RevisionServer::reload_routing_only),
+    /// so the host and dispatcher are shared rather than rebuilt.
+    RoutingOnly(Box<Environment>),
+    /// Something reached the revisions or the packs. Full swap, with drain.
+    Full(Activation),
+}
+
 /// Build the production rebuild closure: loads + dedupes + activates.
 /// The returned closure carries [`LastReloadInputs`] so identical-content
 /// writes (the deployer occasionally rewrites the same content on no-op
@@ -320,6 +394,7 @@ struct LastReloadInputs {
 /// `pin_store` is the SAME `Arc` the cold-start activation was built with, so
 /// every rebuilt dispatcher shares one session-pin store across reloads (B1a).
 /// A reweight rebuilds the dispatcher but must not drop live pins.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn default_rebuild(
     store_root: PathBuf,
     env_id: String,
@@ -328,8 +403,17 @@ pub(crate) fn default_rebuild(
     runtime_ref_resolver: Arc<dyn RuntimeRefResolver>,
     pin_store: Arc<dyn RevisionPinStore>,
     activation_rt: tokio::runtime::Handle,
-) -> impl FnMut() -> Result<Option<Activation>> + Send + 'static {
-    let mut last: Option<LastReloadInputs> = None;
+    revision_stores: revision_boot::RevisionStores,
+    initial: Option<(LoadedRuntimeConfig, Environment)>,
+) -> impl FnMut() -> Result<ReloadOutcome> + Send + 'static {
+    // Seed the dedup snapshot with the inputs the COLD-START activation was
+    // built from. Without it the first watched-file change after boot has
+    // nothing to diff against and is forced down the full path — so the very
+    // first `op config set --default-bundle` of a process rebuilt the whole
+    // host, which is exactly the reload most likely to land while someone is
+    // mid-conversation. Observed in `my_demos/multi-url-webchat-demo` Phase 7:
+    // the first flip lost a reply, the second (identical in kind) did not.
+    let mut last: Option<LastReloadInputs> = initial.map(|(rc, env)| LastReloadInputs { rc, env });
     move || {
         rebuild_once(
             &store_root,
@@ -339,9 +423,28 @@ pub(crate) fn default_rebuild(
             &runtime_ref_resolver,
             &pin_store,
             &activation_rt,
+            &revision_stores,
             &mut last,
         )
     }
+}
+
+/// Load the two files a reload activates from. Split out so the torn-write
+/// re-read in [`rebuild_once`] reads them the same way the first pass did.
+fn load_reload_inputs(
+    store_root: &Path,
+    env_id: &str,
+) -> Result<(LoadedRuntimeConfig, Environment)> {
+    let rc = runtime_config::load_in(store_root, env_id)?.unwrap_or_else(|| LoadedRuntimeConfig {
+        env_id: env_id.to_string(),
+        revisions: Vec::new(),
+    });
+    let store = LocalFsStore::new(store_root.to_path_buf());
+    let env_typed =
+        EnvId::new(env_id).with_context(|| format!("invalid environment id `{env_id}`"))?;
+    let environment = EnvironmentStore::load(&store, &env_typed)
+        .with_context(|| format!("loading environment `{env_id}` for reload"))?;
+    Ok((rc, environment))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -353,17 +456,43 @@ fn rebuild_once(
     runtime_ref_resolver: &Arc<dyn RuntimeRefResolver>,
     pin_store: &Arc<dyn RevisionPinStore>,
     activation_rt: &tokio::runtime::Handle,
+    revision_stores: &revision_boot::RevisionStores,
     last: &mut Option<LastReloadInputs>,
-) -> Result<Option<Activation>> {
-    let rc = runtime_config::load_in(store_root, env_id)?.unwrap_or_else(|| LoadedRuntimeConfig {
-        env_id: env_id.to_string(),
-        revisions: Vec::new(),
-    });
-    let store = LocalFsStore::new(store_root.to_path_buf());
-    let env_typed =
-        EnvId::new(env_id).with_context(|| format!("invalid environment id `{env_id}`"))?;
-    let environment = EnvironmentStore::load(&store, &env_typed)
-        .with_context(|| format!("loading environment `{env_id}` for reload"))?;
+) -> Result<ReloadOutcome> {
+    let (mut rc, mut environment) = load_reload_inputs(store_root, env_id)?;
+    // `environment.json` and `runtime-config.json` are two separate writes: the
+    // deployer's `env-deploy` adds the deployment to the environment and the
+    // revision block to the runtime-config in sequence, not atomically. A
+    // reload that reads between them sees an Active deployment with no revision
+    // to serve, and activating that publishes routing for a bundle the
+    // dispatcher cannot dispatch to — every request to it fails with
+    // `deployment ... not known to dispatcher`. It also burns a full activation
+    // (WASM re-instantiation for every revision) on a state that is superseded
+    // milliseconds later.
+    //
+    // This window has always existed; it was invisible only because every
+    // reload used to take seconds of WASM work, so the second write reliably
+    // landed before the files were read. Making the common reload cheap (D2)
+    // made it observable, and `my_demos/multi-url-webchat-demo` Phase 8 caught
+    // it: the hot-attached bundle 502'd because its routing went live a full
+    // activation ahead of its revision.
+    //
+    // So: if a deployment is newly Active-but-unbacked, wait one debounce
+    // window and read again. `newly` is what keeps this free in the steady
+    // state — `op bundles add` legitimately creates a deployment before
+    // `revisions stage` supplies its block, and once that state has been
+    // observed it is not a torn write and never waits again.
+    let previously_unbacked = last
+        .as_ref()
+        .map(|prev| revision_boot::unbacked_active_deployments(&prev.rc, &prev.env))
+        .unwrap_or_default();
+    if revision_boot::unbacked_active_deployments(&rc, &environment)
+        .iter()
+        .any(|id| !previously_unbacked.contains(id))
+    {
+        std::thread::sleep(DEFAULT_DEBOUNCE);
+        (rc, environment) = load_reload_inputs(store_root, env_id)?;
+    }
     // Dedup AFTER both reads — neither file alone is a sufficient key. An
     // env.json rewrite with no real change short-circuits here even though
     // the watcher fired, so cookies/pins aren't churned by no-op writes.
@@ -371,7 +500,24 @@ fn rebuild_once(
         && prev.rc == rc
         && prev.env == environment
     {
-        return Ok(None);
+        return Ok(ReloadOutcome::Unchanged);
+    }
+    // D2 fast path: the runtime-config is untouched and the environment changed
+    // only in ways that cannot reach the host or any pack manifest. Hand the
+    // environment back so the worker can rebuild the four env-derived routing
+    // tables against the live activation under the reload lock, skipping the
+    // WASM work entirely. Requires a previous snapshot to compare against — on
+    // the first rebuild after boot there is none, so that one takes the full
+    // path.
+    if let Some(prev) = last.as_ref()
+        && prev.rc == rc
+        && revision_boot::env_routing_only_delta(&prev.env, &environment)
+    {
+        *last = Some(LastReloadInputs {
+            rc,
+            env: environment.clone(),
+        });
+        return Ok(ReloadOutcome::RoutingOnly(Box::new(environment)));
     }
     // A reload can attach revisions of packs whose `generated` secrets were
     // never minted (the deployer stages packs, not secrets). Seed before
@@ -392,12 +538,13 @@ fn rebuild_once(
             &environment,
             Arc::clone(runtime_ref_resolver),
             Arc::clone(pin_store),
+            revision_stores,
         ))?;
     *last = Some(LastReloadInputs {
         rc,
         env: environment,
     });
-    Ok(Some(Activation {
+    Ok(ReloadOutcome::Full(Activation {
         host: Arc::new(host),
         routing: Arc::new(routing),
     }))
@@ -410,15 +557,15 @@ mod tests {
     use std::sync::mpsc as std_mpsc;
 
     /// A counting rebuild closure suitable for unit tests. Returns
-    /// `Ok(None)` always (no real activation is built) but increments a
+    /// `Unchanged` always (no real activation is built) but increments a
     /// counter so the test can assert how many rebuild attempts the
     /// watcher actually fired.
     fn counting_rebuild(
         counter: Arc<AtomicUsize>,
-    ) -> impl FnMut() -> Result<Option<Activation>> + Send + 'static {
+    ) -> impl FnMut() -> Result<ReloadOutcome> + Send + 'static {
         move || {
             counter.fetch_add(1, Ordering::SeqCst);
-            Ok(None)
+            Ok(ReloadOutcome::Unchanged)
         }
     }
 
@@ -426,10 +573,10 @@ mod tests {
     /// channel so the test can await the next firing deterministically.
     fn channel_rebuild(
         tx: std_mpsc::Sender<()>,
-    ) -> impl FnMut() -> Result<Option<Activation>> + Send + 'static {
+    ) -> impl FnMut() -> Result<ReloadOutcome> + Send + 'static {
         move || {
             let _ = tx.send(());
-            Ok(None)
+            Ok(ReloadOutcome::Unchanged)
         }
     }
 
@@ -460,6 +607,45 @@ mod tests {
     // counting rebuild that returns `Ok(None)` so `server.reload` is
     // never called — the only paths exercised are filter + dedup + error
     // isolation.
+    /// A minimal `Activation` for tests that only need the worker to observe
+    /// "the rebuild produced something". Shares the same construction path as
+    /// `placeholder_server`; neither the host nor the routing is exercised.
+    fn placeholder_activation() -> Activation {
+        use crate::deployment_routes::{DeploymentRouteTable, RevisionIngressRouting};
+        use crate::endpoint_admit::EndpointAdmit;
+        use crate::http_routes::HttpRouteTable;
+        use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
+        use greentic_runner_host::{HostBuilder, HostConfig, TenantBindings};
+
+        let host = Arc::new(
+            HostBuilder::new()
+                .with_config(HostConfig::from_gtbind(TenantBindings {
+                    tenant: "recheck-test".to_string(),
+                    packs: Vec::new(),
+                    env_passthrough: Vec::new(),
+                }))
+                .build()
+                .expect("build placeholder host"),
+        );
+        let dispatcher = Arc::new(RevisionDispatcher::new(RevisionDispatcherConfig::new(
+            "recheck-test",
+            [0u8; 32],
+        )));
+        Activation {
+            host,
+            routing: Arc::new(RevisionIngressRouting {
+                dispatcher,
+                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
+                deployment_routes: DeploymentRouteTable::default(),
+                endpoint_admit: Arc::new(EndpointAdmit::default()),
+                deployment_config_overrides: Arc::default(),
+                static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
+            }),
+        }
+    }
+
     fn placeholder_server() -> Arc<RevisionServer> {
         // RevisionServer doesn't expose a no-op test ctor publicly. Use
         // RevisionServer::start with a placeholder activation built via
@@ -511,6 +697,84 @@ mod tests {
             })
             .expect("placeholder server"),
         )
+    }
+
+    /// D1 regression: a write that lands DURING a rebuild must not be lost.
+    ///
+    /// `rebuild()` snapshots the env files when it runs. A write arriving while
+    /// it is in flight is not guaranteed to come back as a separate debounced
+    /// batch — notify can coalesce it into the batch already being drained. The
+    /// pre-fix worker called `rebuild()` exactly once per batch, so that write
+    /// was silently lost until some unrelated event touched the directory.
+    ///
+    /// Observed live 2026-07-25: `op config set --default-bundle legal` landed
+    /// during a prior rebuild; the reload that followed still carried
+    /// `default_bundle=acct`, and the change only took effect 11s later when an
+    /// unrelated write fired. On a quiet system there is no next write.
+    ///
+    /// The closure below models exactly that: the first call reports changed
+    /// inputs (Some), the second reports them stable (None). A worker that
+    /// re-checks calls it twice; one that trusts a single snapshot calls it once
+    /// and publishes the stale activation.
+    ///
+    /// MUTATION PROOF: replace the `for attempt in 0..=MAX_RECHECKS` loop in
+    /// `reload_worker` with a bare `match rebuild()` and this fails with
+    /// `rebuild called 1 time(s), want 2`.
+    #[test]
+    fn write_during_rebuild_is_not_lost() {
+        use std::sync::mpsc as std_mpsc;
+
+        let (tx, rx) = std_mpsc::channel::<DebounceEventResult>();
+        let env = fresh_env_dir();
+        let target = env.path().join(ENVIRONMENT_FILE);
+        write_environment_json(env.path(), r#"{"schema":"x"}"#);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = Arc::clone(&calls);
+        let rebuild = move || -> Result<ReloadOutcome> {
+            let n = calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // Inputs changed -> a real activation is published. The worker
+                // must now ask again, because another write may have landed
+                // while this rebuild was running.
+                Ok(ReloadOutcome::Full(placeholder_activation()))
+            } else {
+                // Inputs stable -> nothing left to pick up.
+                Ok(ReloadOutcome::Unchanged)
+            }
+        };
+
+        tx.send(Ok(vec![notify_debouncer_full::DebouncedEvent {
+            event: notify_debouncer_full::notify::Event::new(
+                notify_debouncer_full::notify::EventKind::Modify(
+                    notify_debouncer_full::notify::event::ModifyKind::Any,
+                ),
+            )
+            .add_path(target.clone()),
+            time: std::time::Instant::now(),
+        }]))
+        .expect("send batch");
+        drop(tx);
+
+        reload_worker(
+            rx,
+            vec![target],
+            Vec::new(),
+            Duration::ZERO,
+            placeholder_server(),
+            rebuild,
+            |_: &Activation| {},
+            || {},
+        );
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "rebuild called {} time(s), want 2 — the worker must re-check after \
+             a rebuild that changed the activation, or a write landing during \
+             that rebuild is lost",
+            calls.load(Ordering::SeqCst)
+        );
     }
 
     /// C5: runtime.json writes fire `snapshot_reload` and NOT `rebuild`.
@@ -809,7 +1073,7 @@ mod tests {
                 if n == 1 {
                     Err(anyhow::anyhow!("synthetic rebuild error"))
                 } else {
-                    Ok(None)
+                    Ok(ReloadOutcome::Unchanged)
                 }
             },
             |_: &Activation| {},

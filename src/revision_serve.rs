@@ -713,6 +713,73 @@ impl RevisionServer {
         self.state.slot.load().routing.dispatcher.counts()
     }
 
+    /// Swap in an activation that changed only env-derived routing, sharing the
+    /// live [`RunnerHost`] and dispatcher.
+    ///
+    /// This is the D2 fast path for changes that cannot touch revisions or
+    /// packs — `host_config.default_bundle`, messaging-endpoint ACLs, traffic
+    /// weights expressed purely in the environment. [`Self::reload`] would
+    /// rebuild the whole world for those: a fresh `RunnerHost` with every
+    /// revision's packs re-instantiated (WASM compile), plus a drain window in
+    /// which two complete hosts are resident.
+    ///
+    /// It is deliberately NOT a flag on [`Self::reload`]:
+    ///
+    /// - `reload` asserts every swap publishes a *fresh* dispatcher `Arc`,
+    ///   because `SlotLivenessProbe` uses `Arc::ptr_eq` to tell the old
+    ///   dispatcher from the live one while draining. This path wants the
+    ///   opposite — preserving the dispatcher is what keeps session pins and
+    ///   sticky cookies valid across the swap.
+    /// - No generation re-anchoring runs, for the same reason: no revision
+    ///   moved, so no deployment's stickiness may be invalidated.
+    /// - No drain is spawned and no drain window is needed. The superseded
+    ///   `Activation` shares both `Arc`s with the new one, so dropping it frees
+    ///   only the routing tables — the host is never duplicated.
+    ///
+    /// `build_routing` is handed the activation that is live *at swap time* and
+    /// returns the replacement routing. Taking a builder rather than a
+    /// pre-assembled `Activation` is what makes the fast path race-free: the
+    /// routing is derived, and the host carried forward, from one snapshot taken
+    /// under the reload lock, so there is no window in which a concurrent full
+    /// reload could leave the caller publishing routing bound to a host that is
+    /// already draining. `build_routing` runs under that lock, so it must stay
+    /// cheap — it is four table constructions, no I/O.
+    ///
+    /// Returns the report alongside the activation now serving, so the caller's
+    /// post-reload hook observes the same `(host, routing)` pair the server
+    /// does — matching [`Self::reload`], where the caller assembles it.
+    pub(crate) fn reload_routing_only(
+        &self,
+        build_routing: impl FnOnce(&Activation) -> RevisionIngressRouting,
+    ) -> (ReloadReport, Activation) {
+        // Same lock as `reload`, so a full reload cannot interleave between the
+        // snapshot below and the swap.
+        let _reload_guard = self.reload_lock.lock().expect("reload lock poisoned");
+        let prev = self.state.slot.load_full();
+        let new = Activation {
+            host: Arc::clone(&prev.host),
+            routing: Arc::new(build_routing(&prev)),
+        };
+        let published = new.clone();
+        let (new_deployments, new_revisions) = new.routing.dispatcher.counts();
+        let prev = self.state.slot.swap(Arc::new(new));
+        let (prev_deployments, prev_revisions) = prev.routing.dispatcher.counts();
+        // Dropping `prev` here is cheap and safe: it shares the host and the
+        // dispatcher with what is now live, so this releases the old routing
+        // tables only. In-flight requests hold their own `Arc<Activation>`
+        // snapshot and finish against it.
+        drop(prev);
+        (
+            ReloadReport {
+                prev_deployments,
+                prev_revisions,
+                new_deployments,
+                new_revisions,
+            },
+            published,
+        )
+    }
+
     /// Swap the live activation. Atomically replaces the slot so the next
     /// request reaches the new host + routing; every request that already
     /// snapshotted the previous activation (via [`ServeState::current`] at
@@ -1106,6 +1173,30 @@ async fn serve(
         &activation.routing.flow_index,
         &activation.routing.deployment_routes,
     );
+
+    // Which deployment did the classifier pick for this request, and off which
+    // activation? `activation_ptr` is the identity of the `Arc` the request was
+    // served from, so a run spanning a reload shows the exact request where the
+    // swap became visible — without it, "the routing is stale" and "the
+    // activation is stale" are indistinguishable from the outside, which is
+    // what made the reload defects in `plans/hot-reload-granularity.md` take
+    // three passes to pin down. `debug` because it is per-request.
+    if let Some(ref target) = webchat_target {
+        tracing::debug!(
+            path = %path,
+            tenant = %target.tenant,
+            bundle = %target.bundle_id,
+            flow = ?target.flow_id,
+            deployment = %target.deployment_id,
+            activation_ptr = ?Arc::as_ptr(&activation),
+            default_for_tenant = ?activation
+                .routing
+                .bundle_index
+                .default_for(&target.tenant)
+                .map(|(dep, bundle, reason)| format!("{bundle}/{dep} ({reason:?})")),
+            "webchat classify",
+        );
+    }
 
     // When the classifier matched, the deployment, tenant, and effective path
     // are pinned to the classified target. Otherwise the existing generic
@@ -4927,22 +5018,80 @@ fn rewrite_stream_url(
     }
 }
 
+/// Forward an upstream `429` to the client instead of collapsing it into the
+/// `502` used for genuine upstream breakage.
+///
+/// The webchat provider's token rate limiter answers with
+/// `{"error":"rate_limited","message":…,"retry_after":N}`. That is backpressure
+/// aimed at the CLIENT, and `429` is the one status every HTTP client already
+/// knows how to back off on — a browser handed `502` has no reason to retry at
+/// all, so a transient rate limit reads as a broken deployment.
+///
+/// `Retry-After` comes from the upstream header when it sets one, and otherwise
+/// from the body's `retry_after` (seconds), which is what the provider actually
+/// sends today. The upstream body is forwarded verbatim so the client keeps the
+/// machine-readable `error` code.
+fn rate_limited_response(response: &IngressHttpResponse) -> Response<Full<Bytes>> {
+    let header_value = |name: &str| {
+        response
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    let body = response.body.clone().unwrap_or_default();
+    let retry_after = header_value("retry-after").or_else(|| {
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()?
+            .get("retry_after")
+            .and_then(serde_json::Value::as_u64)
+            .map(|secs| secs.to_string())
+    });
+    let mut builder = Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(
+            header::CONTENT_TYPE,
+            header_value("content-type").unwrap_or_else(|| "application/json".to_string()),
+        );
+    if let Some(secs) = retry_after {
+        builder = builder.header(header::RETRY_AFTER, secs);
+    }
+    // Both forwarded header values are upstream data; an invalid one fails the
+    // builder rather than panicking, and the client still gets a 429.
+    builder
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_else(|_| {
+            error_response(StatusCode::TOO_MANY_REQUESTS, "token rate limit exceeded")
+        })
+}
+
 /// Validate a `POST /tokens/generate` response: the body must be JSON with a
 /// non-empty `token` field. Returns an error response on failure so the
-/// upstream gets a clear `502` instead of a malformed token.
+/// upstream gets a clear `502` instead of a malformed token — except for a
+/// `429`, which is forwarded (see [`rate_limited_response`]).
 #[allow(clippy::result_large_err)]
 fn validate_token_response(response: &IngressHttpResponse) -> Result<(), Response<Full<Bytes>>> {
     let body = response.body.as_deref().unwrap_or_default();
     if !(200..300).contains(&response.status) {
+        let preview = String::from_utf8_lossy(body)
+            .chars()
+            .take(500)
+            .collect::<String>();
+        // A rate limit is expected backpressure, not a failure: logging it at
+        // `error` turns one burst of concurrent conversations into hundreds of
+        // error lines that look like an outage.
+        if response.status == 429 {
+            operator_log::warn(
+                module_path!(),
+                format!("[webchat directline] token request rate limited: {preview}"),
+            );
+            return Err(rate_limited_response(response));
+        }
         operator_log::error(
             module_path!(),
             format!(
-                "[webchat directline] token request failed status={} body={}",
+                "[webchat directline] token request failed status={} body={preview}",
                 response.status,
-                String::from_utf8_lossy(body)
-                    .chars()
-                    .take(500)
-                    .collect::<String>()
             ),
         );
         return Err(error_response(
@@ -7622,6 +7771,86 @@ mod tests {
         );
     }
 
+    /// D4 regression: the provider's token rate limiter must reach the client
+    /// as a `429` with `Retry-After`, not as a `502`.
+    ///
+    /// Reproduced live 2026-07-25 on a 2-bundle env: 40 concurrent DirectLine
+    /// conversations tripped the webchat provider's token limiter, which
+    /// answered `429 {"error":"rate_limited","retry_after":38}`. Every one of
+    /// those was reported to the client as
+    /// `502 invalid directline token response` — a status no client retries —
+    /// so a recoverable 38-second backoff looked like a dead deployment. (The
+    /// runtime did recover on its own once the window elapsed; the wedge that
+    /// `plans/hot-reload-granularity.md` D4 describes was this, misread.)
+    ///
+    /// MUTATION PROOF: delete the `response.status == 429` branch in
+    /// `validate_token_response` and this fails with `status 502, want 429`.
+    #[test]
+    fn validate_token_response_forwards_rate_limit_with_retry_after() {
+        let response = IngressHttpResponse {
+            status: 429,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "error": "rate_limited",
+                    "message": "token rate limit exceeded",
+                    "retry_after": 38
+                }))
+                .unwrap(),
+            ),
+        };
+        let err = validate_token_response(&response)
+            .expect_err("a 429 is still not a usable token response");
+        assert_eq!(
+            err.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "status {}, want 429 — a rate limit is client backpressure, not a gateway failure",
+            err.status()
+        );
+        assert_eq!(
+            err.headers()
+                .get(header::RETRY_AFTER)
+                .map(|v| v.to_str().unwrap_or_default()),
+            Some("38"),
+            "Retry-After must carry the provider's `retry_after` so the client knows how long to wait"
+        );
+    }
+
+    /// An explicit upstream `Retry-After` header wins over the body field.
+    #[test]
+    fn validate_token_response_prefers_upstream_retry_after_header() {
+        let response = IngressHttpResponse {
+            status: 429,
+            headers: vec![("Retry-After".to_string(), "5".to_string())],
+            body: Some(serde_json::to_vec(&serde_json::json!({"retry_after": 38})).unwrap()),
+        };
+        let err = validate_token_response(&response).expect_err("429 is an error response");
+        assert_eq!(
+            err.headers()
+                .get(header::RETRY_AFTER)
+                .map(|v| v.to_str().unwrap_or_default()),
+            Some("5"),
+            "the upstream header is authoritative when present"
+        );
+    }
+
+    /// A 429 with no `retry_after` anywhere still forwards as a 429 — the
+    /// client just gets no hint. It must not fall back to 502.
+    #[test]
+    fn validate_token_response_forwards_rate_limit_without_retry_hint() {
+        let response = IngressHttpResponse {
+            status: 429,
+            headers: vec![],
+            body: Some(b"slow down".to_vec()),
+        };
+        let err = validate_token_response(&response).expect_err("429 is an error response");
+        assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            err.headers().get(header::RETRY_AFTER).is_none(),
+            "no hint available, so no header — not a fabricated one"
+        );
+    }
+
     // Category 7: CORS asymmetry — DirectLine paths get CORS,
     //              /workers/invoke does not (the existing test above
     //              `worker_invoke_is_not_exposed_cross_origin` covers
@@ -7977,6 +8206,112 @@ mod tests {
         // The next reader sees the new activation; counts come from the same
         // dispatcher `/status` reads.
         assert_eq!(server.counts(), (1, 2));
+    }
+
+    /// D2, the whole point: a routing-only reload replaces the routing tables
+    /// and keeps the *same* `RunnerHost` allocation.
+    ///
+    /// The host is not merely expensive to rebuild (every revision's packs get
+    /// re-instantiated, WASM compile included) — it OWNS every revision's
+    /// session and state store, which `activate_runtime_config` constructs
+    /// fresh. So a full reload silently discards every live conversation. That
+    /// is D1: reproduced 2026-07-25 by flipping `default_bundle` under load,
+    /// where a DirectLine turn whose `POST /activities` coincided with the swap
+    /// never received its reply and burned its whole poll budget. Preserving the
+    /// host allocation is what makes the flip invisible to conversations.
+    ///
+    /// The dispatcher must be preserved too: `reload` re-anchors per-deployment
+    /// generations, which invalidates sticky cookies and pins. Nothing moved, so
+    /// nothing may be invalidated.
+    ///
+    /// MUTATION PROOF: make the builder in `reload_routing_only` construct a
+    /// fresh dispatcher (or route the call through `reload`) and this fails on
+    /// the host or dispatcher assertion.
+    #[tokio::test]
+    async fn reload_routing_only_preserves_host_and_dispatcher() {
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(empty_state("env-1", bound));
+        let server = server_for_test(std::sync::Arc::clone(&state));
+        server.reload(populated_activation("env-1", 2), Duration::ZERO);
+
+        let before = state.current();
+
+        let (report, published) = server.reload_routing_only(|live| RevisionIngressRouting {
+            // Exactly what `revision_boot::reactivate_routing_only` does with
+            // the pack- and revision-derived half.
+            dispatcher: std::sync::Arc::clone(&live.routing.dispatcher),
+            http_routes: live.routing.http_routes.clone(),
+            static_routes: live.routing.static_routes.clone(),
+            flow_index: live.routing.flow_index.clone(),
+            // …and rebuilds the env-derived half.
+            deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+            endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+            deployment_config_overrides: std::sync::Arc::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+        });
+
+        let after = state.current();
+        assert!(
+            std::sync::Arc::ptr_eq(&before.host, &after.host),
+            "the RunnerHost must be the SAME allocation — rebuilding it drops \
+             every revision's session and state store, abandoning live conversations"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&before.routing.dispatcher, &after.routing.dispatcher),
+            "the dispatcher must be preserved so session pins and sticky cookies stay valid"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&before.routing, &after.routing),
+            "the routing tables must actually have been replaced"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&published.host, &after.host),
+            "the returned activation must be the one now serving, so the caller's \
+             post-reload hook observes what the server does"
+        );
+        // Nothing moved, so the counts are unchanged on both sides.
+        assert_eq!(
+            (report.prev_deployments, report.prev_revisions),
+            (report.new_deployments, report.new_revisions),
+            "a routing-only reload cannot change the deployment or revision count"
+        );
+        assert_eq!(server.counts(), (1, 2));
+    }
+
+    /// A request that snapshotted the activation before a routing-only swap
+    /// keeps serving against it, exactly as it does across a full reload.
+    #[tokio::test]
+    async fn reload_routing_only_leaves_inflight_snapshot_intact() {
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(empty_state("env-1", bound));
+        let server = server_for_test(std::sync::Arc::clone(&state));
+        server.reload(populated_activation("env-1", 1), Duration::ZERO);
+
+        let inflight = state.current();
+        let inflight_ptr = std::sync::Arc::as_ptr(&inflight) as usize;
+
+        server.reload_routing_only(|live| RevisionIngressRouting {
+            dispatcher: std::sync::Arc::clone(&live.routing.dispatcher),
+            http_routes: live.routing.http_routes.clone(),
+            static_routes: live.routing.static_routes.clone(),
+            flow_index: live.routing.flow_index.clone(),
+            deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+            endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+            deployment_config_overrides: std::sync::Arc::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+        });
+
+        assert_ne!(
+            std::sync::Arc::as_ptr(&state.current()) as usize,
+            inflight_ptr,
+            "the next reader must see the new activation"
+        );
+        // The in-flight snapshot still resolves through the host it started on
+        // — which is also the live one, since the swap shared it.
+        assert!(
+            std::sync::Arc::ptr_eq(&inflight.host, &state.current().host),
+            "sharing the host is what lets an in-flight turn finish across the swap"
+        );
     }
 
     #[tokio::test]

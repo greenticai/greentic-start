@@ -664,6 +664,12 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // `GREENTIC_REVISION_PIN_REDIS_URL` is configured (fail-open to
         // in-memory); see that fn for the rationale.
         let pin_store = revision_pin::resolve_pin_store(&activation_rt);
+        // Per-revision session/state stores, likewise shared between the
+        // cold-start activation and every reload-rebuilt one. A reload builds a
+        // whole new `RunnerHost`, and the host owns these stores; without the
+        // shared registry every reload would discard the live conversations of
+        // revisions the reload never touched. See `revision_boot::RevisionStores`.
+        let revision_stores = revision_boot::new_revision_stores();
         // Mint declared `generated` provider secrets (e.g. the webchat-gui
         // `jwt_signing_key`) before serving — the env path's counterpart to
         // the `--bundle` boot's `ensure_generated_provider_secrets`. Without
@@ -684,6 +690,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             &environment,
             std::sync::Arc::clone(&runtime_ref_resolver),
             std::sync::Arc::clone(&pin_store),
+            &revision_stores,
         ))?;
 
         // Execution bridge: serve the activated revisions over a slim HTTP
@@ -983,6 +990,9 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             Some(url) => Some(url.clone()),
             None => startup_contract::resolve_public_base_url(&environment)?,
         };
+        // Captured before `environment` is moved into the webhook-registration
+        // task below; consumed by the watcher's `default_rebuild` further down.
+        let reload_seed = Some((rc.clone(), environment.clone()));
         if revision_count > 0 {
             let boot_activation = std::sync::Arc::clone(&activation);
             let boot_url = public_base_url.clone();
@@ -1032,6 +1042,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 std::sync::Arc::clone(&runtime_ref_resolver),
                 std::sync::Arc::clone(&pin_store),
                 activation_rt.handle().clone(),
+                std::sync::Arc::clone(&revision_stores),
+                // Seed the reload dedup with what cold start activated, so the
+                // first config change of the process can take the cheap
+                // routing-only path instead of rebuilding the whole host.
+                reload_seed,
             ),
             // Each reload that actually changed config (hot-attached
             // deployment, new endpoint) re-registers webhooks against the
