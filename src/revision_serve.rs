@@ -1252,7 +1252,19 @@ async fn serve(
             .static_routes
             .match_request_for_revision(&path, &scope)
     {
-        let response = crate::static_handler::serve_static_route_from_pack(&route_match, &path);
+        // Prefer the bundle-overlay serve path (disk assets + synthesized
+        // per-tenant config from the provider envelope) when the revision's
+        // extracted bundle is present on disk; this matches the legacy
+        // `--bundle` path and ensures setup-written `config/tenants/<t>.json`
+        // (and the operator's chosen skin) are actually served instead of
+        // 404-falling to `index.html`. Fall back to pack-only serving when no
+        // overlay root is found.
+        let response = match crate::static_handler::revision_bundle_root(route_match.descriptor) {
+            Some(bundle_root) => {
+                crate::static_handler::serve_static_route(&route_match, &bundle_root, &path)
+            }
+            None => crate::static_handler::serve_static_route_from_pack(&route_match, &path),
+        };
         return Ok(with_cors(response));
     }
 

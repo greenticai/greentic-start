@@ -799,31 +799,33 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         };
         operator_log::info(module_path!(), banner.clone());
         println!("\n{banner}. Press Ctrl+C to stop.");
-        // Advertise the pack-provided webchat UI(s) — one URL per bound
+        // Advertise the pack-provided webchat UI(s) — one path per bound
         // tenant — instead of (or alongside, if explicitly forced) the
-        // built-in console.
+        // built-in console. Collected as path suffixes (e.g.
+        // `/v1/web/webchat/demo/`) so the same list can be printed against the
+        // local listener, rebased onto the tunnel URL below, and used to
+        // auto-open the browser.
+        let mut webchat_ui_paths: Vec<String> = Vec::new();
         if !pack_webchat_routes.is_empty() {
             let tenants: std::collections::BTreeSet<&str> = environment
                 .bundles
                 .iter()
                 .map(|dep| dep.route_binding.tenant_selector.tenant.as_str())
                 .collect();
-            let mut urls = std::collections::BTreeSet::new();
+            let mut paths = std::collections::BTreeSet::new();
             for route in &pack_webchat_routes {
                 let base = route.trim_end_matches('/');
                 if base.contains("{tenant}") {
                     for tenant in &tenants {
-                        urls.insert(format!(
-                            "http://{listen}{}/",
-                            base.replace("{tenant}", tenant)
-                        ));
+                        paths.insert(format!("{}/", base.replace("{tenant}", tenant)));
                     }
                 } else {
-                    urls.insert(format!("http://{listen}{base}/"));
+                    paths.insert(format!("{base}/"));
                 }
             }
-            for url in urls {
-                let line = format!("UI: {url}");
+            webchat_ui_paths = paths.into_iter().collect();
+            for path in &webchat_ui_paths {
+                let line = format!("UI: http://{listen}{path}");
                 operator_log::info(module_path!(), line.clone());
                 println!("{line}");
             }
@@ -862,8 +864,32 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             let line = format!("public URL: {} ({} tunnel)", t.url, t.service);
             operator_log::info(module_path!(), line.clone());
             println!("{line}");
+            // Rebase each local webchat UI path onto the public tunnel URL so
+            // the printed public link lands on the chat UI (parity with the
+            // legacy `--bundle` path), not the bare tunnel root.
+            let base = t.url.trim_end_matches('/');
+            for path in &webchat_ui_paths {
+                let line = format!("public UI: {base}{path}");
+                operator_log::info(module_path!(), line.clone());
+                println!("{line}");
+            }
             t.url
         });
+
+        // Auto-open the first webchat UI in the default browser (the local
+        // listener — always reachable regardless of tunnel state), unless
+        // suppressed with `--no-browser`. Mirrors the legacy `--bundle` runtime
+        // arm; only fires when the bundle actually ships a webchat UI, and an
+        // `open` failure is non-fatal (headless hosts, no DISPLAY, etc.).
+        if !request.no_browser
+            && let Some(path) = webchat_ui_paths.first()
+        {
+            let url = format!("http://{listen}{path}");
+            operator_log::info(module_path!(), format!("opening browser at {url}"));
+            if let Err(err) = open::that(&url) {
+                operator_log::warn(module_path!(), format!("failed to open browser: {err}"));
+            }
+        }
 
         // Phase D: auto-register provider webhooks for the served revisions.
         // Gated on a public_base_url — with none, registration is skipped
