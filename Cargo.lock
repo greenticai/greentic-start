@@ -3817,6 +3817,7 @@ dependencies = [
  "greentic-secrets-lib 1.3.0-research.1",
  "greentic-setup",
  "greentic-telemetry",
+ "greentic-triggers",
  "greentic-types",
  "greentic-update",
  "hmac 0.13.0",
@@ -3910,6 +3911,18 @@ dependencies = [
  "tracing-error",
  "tracing-opentelemetry 0.32.1",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "greentic-triggers"
+version = "0.1.0"
+source = "git+https://github.com/greentic-biz/greentic-triggers?rev=a5b9b18ba8d1cc83f93a8e2cf82ca615991abbcc#a5b9b18ba8d1cc83f93a8e2cf82ca615991abbcc"
+dependencies = [
+ "chrono",
+ "cron",
+ "greentic-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

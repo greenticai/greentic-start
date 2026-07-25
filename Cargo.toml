@@ -49,6 +49,10 @@ futures-util = "0.3"
 #   reqwest             -> src/lib.rs + src/runner_host/dispatch.rs
 #   tracing-*           -> src/otlp_telemetry + src/lib.rs
 greentic-llm = { version = "=1.3.0-research.0" }
+# Time-trigger schedule vocabulary + fire->business-event helper (SP3-slice1).
+# greentic-triggers pins greentic-types =1.3.0-research.1 to match this crate
+# (a single greentic-types resolves across the tree). Pinned to the merged main rev.
+greentic-triggers = { git = "https://github.com/greentic-biz/greentic-triggers", rev = "a5b9b18ba8d1cc83f93a8e2cf82ca615991abbcc" }
 hmac = "0.13"
 http-body-util = "0.1"
 hyper-tungstenite = "0.20"
