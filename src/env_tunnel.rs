@@ -94,7 +94,9 @@ pub(crate) fn gtunnel_config(
         .clone()
         .or_else(|| std::env::var("GREENTIC_TUNNEL_ID").ok())
         .unwrap_or_else(|| sanitize_tunnel_id(default_tunnel_id));
-    let secret = std::env::var("GREENTIC_TUNNEL_SECRET").unwrap_or_default();
+    // Prefer the per-tunnel secret greentic-setup provisioned (shared store),
+    // falling back to the GREENTIC_TUNNEL_SECRET env override.
+    let secret = crate::gtunnel::resolve_secret(&tunnel_id);
     crate::gtunnel::GtunnelConfig {
         worker_base_url,
         tunnel_id,

@@ -158,6 +158,37 @@ fn serving(public_url: &str) -> bool {
     }
 }
 
+/// Machine-wide per-tunnel secret file (shared on-disk format with
+/// greentic-setup, which provisions it): `<root>/secrets/<tunnelId>`.
+fn tunnel_secret_path(tunnel_id: &str) -> PathBuf {
+    let root = std::env::var_os("GREENTIC_TUNNEL_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+            std::env::var_os(var)
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".greentic")
+                .join("tunnel")
+        });
+    root.join("secrets").join(tunnel_id)
+}
+
+/// Resolve a tunnel's secret: explicit `GREENTIC_TUNNEL_SECRET` override, else
+/// the per-tunnel secret greentic-setup provisioned into the shared store.
+/// Empty when neither is set — the Worker's global fallback still applies during
+/// the auth-later phase. Start never generates; only setup provisions.
+pub(crate) fn resolve_secret(tunnel_id: &str) -> String {
+    if let Ok(secret) = std::env::var("GREENTIC_TUNNEL_SECRET")
+        && !secret.is_empty()
+    {
+        return secret;
+    }
+    std::fs::read_to_string(tunnel_secret_path(tunnel_id))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
 fn read_pid(path: &Path) -> anyhow::Result<Option<u32>> {
     if !path.exists() {
         return Ok(None);
