@@ -147,6 +147,11 @@ pub(crate) struct StartArgs {
     quiet: bool,
     #[arg(long, help = "Do not open the first web UI URL in the default browser")]
     no_browser: bool,
+    /// Open a webchat URL in the default browser after the listener starts.
+    /// `--open-webchat` opens the default bundle; `--open-webchat=BUNDLE_ID`
+    /// opens a specific bundle. `--no-browser` wins when both are given.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    open_webchat: Option<String>,
     #[arg(
         long,
         help = "Do not subscribe this runtime to its environment's update channel"
@@ -254,6 +259,11 @@ pub struct StartRequest {
     pub verbose: bool,
     pub quiet: bool,
     pub no_browser: bool,
+    /// Open a webchat URL in the default browser after the listener starts.
+    /// Empty string means the default bundle; a non-empty string targets a
+    /// specific bundle id. `None` means the flag was not passed at all.
+    /// `--no-browser` wins when both are given.
+    pub open_webchat: Option<String>,
     /// Kill switch for the updater, not a policy knob: skip the update poll
     /// loop and refuse `/v1/updates/notify` on this box. The environment's
     /// `update-channel.json` policy (`on_update` / `enabled`) is untouched, so
@@ -300,6 +310,7 @@ pub(crate) fn start_request_from_args(args: StartArgs, tunnel_explicit: bool) ->
         verbose: args.verbose,
         quiet: args.quiet,
         no_browser: args.no_browser,
+        open_webchat: args.open_webchat,
         no_updates: args.no_updates,
         no_auto_restart: args.no_auto_restart,
         admin: args.admin,
@@ -586,5 +597,36 @@ mod tests {
                 "--version".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn open_webchat_bare_flag_sets_empty_string() {
+        let cli = Cli::try_parse_from(["greentic-start", "start", "--open-webchat"]).unwrap();
+        let Command::Start(args) = cli.command else {
+            panic!("expected start");
+        };
+        let req = start_request_from_args(args, false);
+        assert_eq!(req.open_webchat.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn open_webchat_with_value_sets_bundle_id() {
+        let cli =
+            Cli::try_parse_from(["greentic-start", "start", "--open-webchat=my-bundle"]).unwrap();
+        let Command::Start(args) = cli.command else {
+            panic!("expected start");
+        };
+        let req = start_request_from_args(args, false);
+        assert_eq!(req.open_webchat.as_deref(), Some("my-bundle"));
+    }
+
+    #[test]
+    fn open_webchat_absent_is_none() {
+        let cli = Cli::try_parse_from(["greentic-start", "start"]).unwrap();
+        let Command::Start(args) = cli.command else {
+            panic!("expected start");
+        };
+        let req = start_request_from_args(args, false);
+        assert!(req.open_webchat.is_none());
     }
 }

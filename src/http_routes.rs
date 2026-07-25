@@ -5,6 +5,7 @@
 //! routes and dispatches matching requests to the provider's `ingest_http`
 //! operation through the generic ingress pipeline.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -733,7 +734,62 @@ pub fn discover_revision_routes(
             &manifest, pack_path, scope, prefixes,
         ));
     }
+    warn_on_cross_pack_route_collisions(&routes);
     routes
+}
+
+/// Log a warning for every URL pattern claimed by more than one pack in the
+/// same revision.
+///
+/// [`HttpRouteTable::from_descriptors`] sorts by segment count with a stable
+/// sort, so two packs declaring an identical pattern are resolved by pack
+/// enumeration order — the loser is unreachable and nothing says so. The
+/// canonical case is a bundle holding both `messaging-webchat` and
+/// `messaging-webchat-gui`: each ships a full DirectLine provider claiming
+/// `/v1/messaging/webchat/{tenant}/token` and friends, so one provider silently
+/// serves the whole conversation while the other's config and generated secrets
+/// go unused.
+///
+/// This warns rather than failing the boot: those two packs are interchangeable
+/// implementations of the same API, so the collision is redundancy rather than
+/// breakage, and a hard failure would take down deployments that work today.
+fn warn_on_cross_pack_route_collisions(routes: &[HttpRouteDescriptor]) {
+    for (pattern, packs) in cross_pack_route_collisions(routes) {
+        let winner = &packs[0];
+        let shadowed = packs[1..].join(", ");
+        crate::operator_log::warn(
+            module_path!(),
+            format!(
+                "route `{pattern}` is claimed by more than one pack in this bundle: `{winner}` \
+                 serves it, `{shadowed}` is shadowed. Keep one of these packs — the shadowed \
+                 pack's provider config and generated secrets are never used."
+            ),
+        );
+    }
+}
+
+/// `(pattern, pack_ids)` for each pattern claimed by two or more packs, the
+/// claiming pack in table order first. Patterns claimed by a single pack are
+/// omitted: one pack may legitimately declare a pattern in `http-routes.v1`
+/// that its own provider extension also synthesizes.
+fn cross_pack_route_collisions(routes: &[HttpRouteDescriptor]) -> Vec<(String, Vec<String>)> {
+    let mut by_pattern: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for route in routes {
+        let packs = by_pattern.entry(route.pattern.as_str()).or_default();
+        if !packs.contains(&route.pack_id.as_str()) {
+            packs.push(route.pack_id.as_str());
+        }
+    }
+    by_pattern
+        .into_iter()
+        .filter(|(_, packs)| packs.len() > 1)
+        .map(|(pattern, packs)| {
+            (
+                pattern.to_string(),
+                packs.into_iter().map(str::to_string).collect(),
+            )
+        })
+        .collect()
 }
 
 /// Derive a URL-safe provider-name from a `provider_type` like
@@ -785,6 +841,55 @@ pub(crate) mod tests {
         scope: Option<RevisionScope>,
     ) -> HttpRouteDescriptor {
         super::descriptor_for_test(pattern, methods, domain, scope)
+    }
+
+    fn make_pack_route(pack_id: &str, pattern: &str) -> HttpRouteDescriptor {
+        let mut route = make_route(pattern, &["POST"], Domain::Messaging);
+        route.pack_id = pack_id.to_string();
+        route
+    }
+
+    #[test]
+    fn reports_a_pattern_two_packs_claim() {
+        // The `messaging-webchat` + `messaging-webchat-gui` shape: both ship a
+        // full DirectLine provider claiming the same URLs. The table's sort is
+        // stable, so the first pack silently wins and the second is dead —
+        // detection is what makes that visible.
+        let collisions = cross_pack_route_collisions(&[
+            make_pack_route(
+                "messaging-webchat-gui",
+                "/v1/messaging/webchat/{tenant}/token",
+            ),
+            make_pack_route("messaging-webchat", "/v1/messaging/webchat/{tenant}/token"),
+        ]);
+        assert_eq!(
+            collisions,
+            vec![(
+                "/v1/messaging/webchat/{tenant}/token".to_string(),
+                vec![
+                    "messaging-webchat-gui".to_string(),
+                    "messaging-webchat".to_string(),
+                ],
+            )],
+            "the winning pack must come first so the warning can name who is shadowed",
+        );
+    }
+
+    #[test]
+    fn ignores_a_pattern_one_pack_claims_twice() {
+        // A pack that declares a route in `http-routes.v1` AND synthesizes the
+        // same one from its provider extension is not a collision — nothing is
+        // shadowed, and warning about it would train operators to ignore the
+        // warning that matters.
+        let collisions = cross_pack_route_collisions(&[
+            make_pack_route("messaging-webchat", "/v1/messaging/webchat/{tenant}/token"),
+            make_pack_route("messaging-webchat", "/v1/messaging/webchat/{tenant}/token"),
+            make_pack_route(
+                "messaging-webchat",
+                "/v1/messaging/webchat/{tenant}/auth/config",
+            ),
+        ]);
+        assert!(collisions.is_empty(), "got {collisions:?}");
     }
 
     #[test]

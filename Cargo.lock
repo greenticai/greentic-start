@@ -2628,9 +2628,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deploy-spec"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c1d02368c331342bca56ffd0d219c67122f66ca135a13cef742ff3ca35a7b2b"
+checksum = "9201a90bc9f590a95b50409dc42eff039f98ebe1ff8f9ebe8c7a10508b8570b2"
 dependencies = [
  "chrono",
  "greentic-config-types",
@@ -2649,9 +2649,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deployer"
-version = "1.1.26"
+version = "1.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb99db6b3845117cab72d5659ec6e95f3247015e832f31cdd870a1a7b545b375"
+checksum = "a4423922af13da898524f1b9d9452a8783c4c680d3751cb46459ee74fc08f751"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2663,7 +2663,7 @@ dependencies = [
  "greentic-bundle",
  "greentic-config",
  "greentic-config-types",
- "greentic-deploy-spec 0.2.4",
+ "greentic-deploy-spec 0.2.5",
  "greentic-distributor-client",
  "greentic-operator-trust",
  "greentic-secrets-lib",
@@ -3013,7 +3013,7 @@ checksum = "a031e3571c44d2aa0e1ee91c1bc18dc6393140aabfea9f73d53637cffb68d717"
 dependencies = [
  "chrono",
  "ed25519-dalek",
- "greentic-deploy-spec 0.2.4",
+ "greentic-deploy-spec 0.2.5",
  "greentic-distributor-client",
  "hex",
  "libc",
@@ -3115,7 +3115,7 @@ dependencies = [
  "greentic-aw-runtime",
  "greentic-config",
  "greentic-config-types",
- "greentic-deploy-spec 0.2.4",
+ "greentic-deploy-spec 0.2.5",
  "greentic-distributor-client",
  "greentic-ext-runtime",
  "greentic-flow",
@@ -3342,7 +3342,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "greentic-aw-runtime",
- "greentic-deploy-spec 0.2.4",
+ "greentic-deploy-spec 0.2.5",
  "greentic-deployer",
  "greentic-distributor-client",
  "greentic-llm",

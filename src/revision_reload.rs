@@ -493,6 +493,8 @@ mod tests {
             endpoint_admit: Arc::new(EndpointAdmit::default()),
             deployment_config_overrides: Arc::default(),
             static_routes: crate::static_routes::ActiveRouteTable::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+            flow_index: crate::webchat_routing::FlowIndex::default(),
         });
         let activation = Arc::new(Activation { host, routing });
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -730,14 +732,7 @@ mod tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: env_id.clone(),
             name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id,
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            host_config: EnvironmentHostConfig::new(env_id),
             packs: Vec::new(),
             messaging_endpoints: endpoints,
             extensions: Vec::new(),

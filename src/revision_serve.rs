@@ -1079,6 +1079,7 @@ async fn serve(
     let user_header = header_str(req.headers(), "x-greentic-user");
     let session_header = header_str(req.headers(), "x-greentic-session");
     let endpoint_header = header_str(req.headers(), "x-greentic-messaging-endpoint-id");
+    let flow_header = header_str(req.headers(), "x-greentic-flow");
     // M1 IID.4d wrapper: collect routing-relevant request headers BEFORE
     // `read_body_limited` consumes `req`. The resolver uses these to give
     // header-discriminated providers (Telegram via secret-token) the same
@@ -1092,19 +1093,46 @@ async fn serve(
     let request_headers = collect_forwarded_request_headers(req.headers());
     let query_string = req.uri().query().map(str::to_string);
 
-    // Resolve the bound deployment + tenant before touching the body, so an
-    // unroutable request is rejected cheaply.
-    let (deployment_id, tenant) = activation
-        .routing
-        .deployment_routes
-        .resolve(host_header.as_deref(), &path)
-        .map(|(deployment_id, tenant)| (deployment_id, tenant.to_string()))
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::NOT_FOUND,
-                "no deployment is bound to this host and path",
-            )
-        })?;
+    // Webchat bundle routing: classify the path against the bundle/flow
+    // indices BEFORE the generic deployment resolve. A classified request
+    // pins dispatch to the target's deployment, uses the stripped path for
+    // static-route and provider-route matching, and threads the
+    // stream_url_prefix to the DirectLine streamUrl rewrite. Non-webchat
+    // requests fall through to the existing longest-prefix resolve unchanged.
+    let webchat_target = crate::webchat_routing::classify_webchat_path(
+        &path,
+        host_header.as_deref(),
+        &activation.routing.bundle_index,
+        &activation.routing.flow_index,
+        &activation.routing.deployment_routes,
+    );
+
+    // When the classifier matched, the deployment, tenant, and effective path
+    // are pinned to the classified target. Otherwise the existing generic
+    // deployment resolve runs.
+    let (deployment_id, tenant, effective_path);
+    if let Some(ref target) = webchat_target {
+        deployment_id = target.deployment_id;
+        tenant = target.tenant.clone();
+        effective_path = target.stripped_path.clone();
+    } else {
+        // Resolve the bound deployment + tenant before touching the body, so
+        // an unroutable request is rejected cheaply.
+        let resolved = activation
+            .routing
+            .deployment_routes
+            .resolve(host_header.as_deref(), &path)
+            .map(|(dep_id, t)| (dep_id, t.to_string()))
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "no deployment is bound to this host and path",
+                )
+            })?;
+        deployment_id = resolved.0;
+        tenant = resolved.1;
+        effective_path = path.clone();
+    }
 
     let body_bytes = read_body_limited(req).await.map_err(|_| {
         error_response(
@@ -1177,7 +1205,7 @@ async fn serve(
             return Some(hint);
         }
         let provider_type = activation.routing.http_routes.provider_type_for(
-            &path,
+            &effective_path,
             method.as_str(),
             deployment_id,
         )?;
@@ -1250,9 +1278,10 @@ async fn serve(
         && let Some(route_match) = activation
             .routing
             .static_routes
-            .match_request_for_revision(&path, &scope)
+            .match_request_for_revision(&effective_path, &scope)
     {
-        let response = crate::static_handler::serve_static_route_from_pack(&route_match, &path);
+        let response =
+            crate::static_handler::serve_static_route_from_pack(&route_match, &effective_path);
         return Ok(with_cors(response));
     }
 
@@ -1263,14 +1292,19 @@ async fn serve(
     // provider component decodes itself; forcing JSON parse here would
     // turn every non-JSON webhook into a 400 even though the provider
     // would have handled it correctly.
-    match admit_request(&activation.routing.http_routes, &scope, &path, &method) {
+    match admit_request(
+        &activation.routing.http_routes,
+        &scope,
+        &effective_path,
+        &method,
+    ) {
         Admission::ProviderRoute => {
             return dispatch_provider_route(
                 Arc::clone(&activation),
                 Arc::clone(&state),
                 &tenant,
                 &scope,
-                &path,
+                &effective_path,
                 method.as_str(),
                 query_string.as_deref(),
                 &request_headers,
@@ -1279,6 +1313,8 @@ async fn serve(
                 &identify_headers,
                 header_endpoint_id.as_deref(),
                 session_hint.as_deref(),
+                webchat_target.as_ref(),
+                flow_header.as_deref(),
             )
             .await;
         }
@@ -3705,6 +3741,8 @@ async fn dispatch_provider_route(
     identify_headers: &[(String, String)],
     header_endpoint_id: Option<&str>,
     session_hint: Option<&str>,
+    webchat_target: Option<&crate::webchat_routing::WebchatTarget>,
+    flow_header: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
     let Some(route_match) = activation
         .routing
@@ -3783,9 +3821,13 @@ async fn dispatch_provider_route(
                 || norm_path.ends_with("/conversations"))
         {
             crate::conv_dedup::extract_user_id(body).map(|user_id| crate::conv_dedup::DedupKey {
+                deployment_id,
                 tenant: route_tenant.clone(),
                 team: route_team.clone(),
                 user_id,
+                flow_hint: webchat_target
+                    .and_then(|t| t.flow_id.clone())
+                    .or_else(|| flow_header.map(str::to_string)),
             })
         } else {
             None
@@ -3888,6 +3930,60 @@ async fn dispatch_provider_route(
         },
     )
     .await?;
+
+    // Flow targeting: a URL-derived flow_id (from the webchat classifier) or an
+    // `X-Greentic-Flow` header names the flow directly; with neither, a webchat
+    // request targets the bundle's default flow. Validate against the FlowIndex;
+    // an unknown flow id warns and falls back to normal selection (fail open).
+    //
+    // This target is stamped on the activity as `(pack_id, flow_id)` rather than
+    // carried only as a `WelcomeFlowHint`, because the runner resolves the flow
+    // BEFORE it consults the hint: a bundle with more than one messaging flow
+    // fails resolution with "flow type messaging is ambiguous" and never reaches
+    // the hint. See `dispatch_provider_events`.
+    let flow_target = {
+        let url_flow_id = webchat_target.and_then(|t| t.flow_id.as_deref());
+        let bundle_id_str = scope.bundle_id.as_str();
+        let named = url_flow_id.or(flow_header).and_then(|flow_id| {
+            activation
+                .routing
+                .flow_index
+                .pack_id_for_flow(bundle_id_str, flow_id)
+                .map(|pack_id| WelcomeFlowHint {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                })
+                .or_else(|| {
+                    tracing::warn!(
+                        flow_id,
+                        bundle_id = bundle_id_str,
+                        "URL/header flow hint does not match any known flow in this bundle; \
+                         falling back to the bundle's default flow",
+                    );
+                    None
+                })
+        });
+        // No flow named, or the named one is unknown: fall back to the bundle's
+        // default flow. "Fail open" has to mean the default flow, not "leave it
+        // to the runner" — the runner's own fallback matches on `flow_type`,
+        // which is ambiguous for exactly the multi-flow bundles this targeting
+        // exists for. Only the webchat classifier's own routes get this; a
+        // generic provider webhook keeps the runner's resolution untouched.
+        named.or_else(|| {
+            webchat_target?;
+            activation
+                .routing
+                .flow_index
+                .default_flow_for_bundle(bundle_id_str)
+                .map(|(pack_id, flow_id)| WelcomeFlowHint {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                })
+        })
+    };
+    // An explicitly targeted flow also overrides the endpoint's configured
+    // welcome_flow on first contact.
+    let welcome_hint = flow_target.clone().or(welcome_hint);
 
     let http_in = build_provider_http_in(
         &provider_type,
@@ -3995,6 +4091,7 @@ async fn dispatch_provider_route(
                 pipeline_provider,
                 ingress_envelopes,
                 endpoint_id,
+                flow_target,
                 welcome_hint,
                 pipeline_notifier,
             )
@@ -4033,7 +4130,11 @@ async fn dispatch_provider_route(
                     .await;
             }
 
-            rewrite_stream_url(&dl_headers, &mut response);
+            rewrite_stream_url(
+                &dl_headers,
+                &mut response,
+                webchat_target.and_then(super::webchat_routing::WebchatTarget::url_bundle_segment),
+            );
 
             // Cache the post-rewrite response for conversation dedup.
             if let Some(key) = dl_dedup_key {
@@ -4070,15 +4171,49 @@ async fn run_provider_inbound_pipeline(
     provider_type: String,
     envelopes: Vec<ChannelMessageEnvelope>,
     endpoint_id: Option<String>,
+    flow_target: Option<WelcomeFlowHint>,
     welcome_hint: Option<WelcomeFlowHint>,
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
 ) {
     for ingress in &envelopes {
+        // Per-envelope flow targeting: if the envelope carries a
+        // `flow_hint` metadata key (the provider echoing back the flow the
+        // conversation was opened against), validate it against the FlowIndex
+        // and override the request-level target. Unknown flow ids warn and
+        // fall back to the request-level target (fail open).
+        let envelope_target = ingress
+            .metadata
+            .get("flow_hint")
+            .and_then(|flow_id| {
+                let flow_id = flow_id.trim();
+                if flow_id.is_empty() {
+                    return None;
+                }
+                let bid = bundle_id.as_str();
+                if let Some(pid) = activation.routing.flow_index.pack_id_for_flow(bid, flow_id) {
+                    Some(WelcomeFlowHint {
+                        pack_id: pid.to_string(),
+                        flow_id: flow_id.to_string(),
+                    })
+                } else {
+                    tracing::warn!(
+                        flow_id,
+                        bundle_id = bid,
+                        "envelope flow_hint metadata does not match any known flow; \
+                         falling back to request-level hint",
+                    );
+                    None
+                }
+            })
+            .or_else(|| flow_target.clone());
+        let envelope_hint = envelope_target.clone().or_else(|| welcome_hint.clone());
+
         let activity = envelope_to_activity(
             ingress,
             &tenant,
             endpoint_id.as_deref(),
-            welcome_hint.clone(),
+            envelope_hint,
+            envelope_target,
         );
         let replies = match activation
             .host
@@ -4486,6 +4621,7 @@ fn envelope_to_activity(
     fallback_tenant: &str,
     endpoint_id: Option<&str>,
     welcome_hint: Option<WelcomeFlowHint>,
+    flow_target: Option<WelcomeFlowHint>,
 ) -> Activity {
     // Serialize the whole envelope as the activity payload so the flow engine
     // sees BOTH `entry.text` and `entry.metadata.*`. `build_routing_context`
@@ -4523,6 +4659,16 @@ fn envelope_to_activity(
     }
     if let Some(hint) = welcome_hint {
         activity = activity.with_welcome_flow_hint(hint);
+    }
+    // Resolve the flow by key, not by type. The runner picks the flow from
+    // `(pack_id, flow_id)` when both are set and only falls back to matching
+    // on `flow_type` — which is `messaging` for every flow here — when they
+    // are absent. A bundle whose app pack ships more than one messaging flow
+    // is unresolvable by type, so without this the request fails before the
+    // welcome hint is ever read. A resumed conversation still wins over this:
+    // the runner prefers its wait snapshot's flow.
+    if let Some(target) = flow_target {
+        activity = activity.with_pack(target.pack_id).with_flow(target.flow_id);
     }
     activity
 }
@@ -4724,7 +4870,20 @@ fn apply_directline_forward_plan_to_response(
 /// to an absolute `ws://` URL using the request's `Host` header. DirectLineJS
 /// requires an absolute URL on the WebSocket constructor; a relative path
 /// makes the SDK fall back to HTTP polling.
-fn rewrite_stream_url(headers: &[(String, String)], response: &mut IngressHttpResponse) {
+///
+/// When `bundle_segment` is `Some`, it is spliced in directly before
+/// `/v3/directline` so the resulting WS URL routes back through the same
+/// bundle on reconnect. The splice point matters: the provider composes this
+/// URL from the path it was handed, so it may already carry the tenant-scoped
+/// prefix (`/v1/messaging/webchat/{tenant}/v3/directline/...`) rather than the
+/// bare `/v3/directline/...` form. Prefixing the whole bundle-scoped path onto
+/// the former would double it. When `None` the output is byte-identical to the
+/// pre-bundle-routing behavior.
+fn rewrite_stream_url(
+    headers: &[(String, String)],
+    response: &mut IngressHttpResponse,
+    bundle_segment: Option<&str>,
+) {
     let Some(body_bytes) = response.body.as_ref() else {
         return;
     };
@@ -4751,7 +4910,17 @@ fn rewrite_stream_url(headers: &[(String, String)], response: &mut IngressHttpRe
     // the browser. Derive the scheme from X-Forwarded-Proto rather than the
     // container's own (always-plain-HTTP) listener.
     let scheme = crate::startup_contract::forwarded_ws_scheme(headers);
-    let absolute = format!("{scheme}://{host}{relative}");
+    let absolute = match bundle_segment {
+        Some(segment) => match relative.find("/v3/directline") {
+            Some(idx) => format!(
+                "{scheme}://{host}{}{segment}{}",
+                &relative[..idx],
+                &relative[idx..]
+            ),
+            None => format!("{scheme}://{host}{segment}{relative}"),
+        },
+        None => format!("{scheme}://{host}{relative}"),
+    };
     body_json["streamUrl"] = serde_json::Value::String(absolute);
     if let Ok(rewritten) = serde_json::to_vec(&body_json) {
         response.body = Some(rewritten);
@@ -4955,25 +5124,55 @@ async fn handle_websocket_upgrade(
     let activation = state.current();
     let host_header = header_str(req.headers(), header::HOST.as_str());
 
+    // Strip bundle/flow segments from the WebSocket path so the
+    // deployment resolve and provider-type lookup see the tenant-scoped
+    // form they expect. The stripped path is used for all downstream
+    // matching; the original path already yielded the conversation id
+    // above (position-independent extraction).
+    let stripped = crate::webchat_routing::strip_webchat_bundle_segments(
+        path,
+        &activation.routing.bundle_index,
+        &activation.routing.flow_index,
+    );
+    let effective_ws_path = stripped.as_deref().unwrap_or(path);
+
     // Resolve deployment + tenant from the path so we know which env's
     // secrets to read the signing key from.
-    let (deployment_id, tenant) = activation
-        .routing
-        .deployment_routes
-        .resolve(host_header.as_deref(), path)
-        .map(|(deployment_id, tenant)| (deployment_id, tenant.to_string()))
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::NOT_FOUND,
-                "no deployment is bound to this host and path",
-            )
-        })?;
+    //
+    // A bundle-scoped stream path must resolve to ITS OWN deployment, not
+    // whichever one the generic prefix match happens to return: the REST
+    // conversation-create pinned this conversation under the bundle's
+    // deployment id, and sibling bundles in one env share both the tenant and
+    // the `/` path prefix, so resolving the stripped path here would pick an
+    // arbitrary sibling and the pin lookup below would miss with a 404.
+    let (deployment_id, tenant) = match crate::webchat_routing::classify_webchat_path(
+        path,
+        host_header.as_deref(),
+        &activation.routing.bundle_index,
+        &activation.routing.flow_index,
+        &activation.routing.deployment_routes,
+    ) {
+        Some(target) => (target.deployment_id, target.tenant),
+        None => activation
+            .routing
+            .deployment_routes
+            .resolve(host_header.as_deref(), effective_ws_path)
+            .map(|(deployment_id, tenant)| (deployment_id, tenant.to_string()))
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "no deployment is bound to this host and path",
+                )
+            })?,
+    };
 
-    // Resolve the provider_type for this path so we can read its signing key.
+    // Resolve the provider_type using the stripped path so the lookup
+    // matches the tenant-scoped provider route pattern even when the
+    // original URL carried extra bundle/flow segments.
     let provider_type = activation
         .routing
         .http_routes
-        .provider_type_for(path, "GET", deployment_id)
+        .provider_type_for(effective_ws_path, "GET", deployment_id)
         .ok_or_else(|| {
             error_response(
                 StatusCode::NOT_FOUND,
@@ -5393,14 +5592,7 @@ mod tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: env_id.clone(),
             name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id,
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            host_config: EnvironmentHostConfig::new(env_id),
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
             extensions: Vec::new(),
@@ -5796,14 +5988,7 @@ mod tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: env_id.clone(),
             name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id,
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            host_config: EnvironmentHostConfig::new(env_id),
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
             extensions: Vec::new(),
@@ -6057,7 +6242,7 @@ mod tests {
             "metadata": {},
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback", None, None);
+        let activity = envelope_to_activity(&envelope, "fallback", None, None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.session_id(), Some("sess-1"));
         assert_eq!(activity.user(), Some("u1"));
@@ -6085,7 +6270,7 @@ mod tests {
             "metadata": {},
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback", None, None);
+        let activity = envelope_to_activity(&envelope, "fallback", None, None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.session_id(), None);
     }
@@ -6115,7 +6300,7 @@ mod tests {
             },
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback", None, None);
+        let activity = envelope_to_activity(&envelope, "fallback", None, None, None);
         let entry = activity.payload();
         // `response.action` resolves from `entry.metadata.action`.
         assert_eq!(
@@ -6156,10 +6341,60 @@ mod tests {
             pack_id: "welcome-pack".to_string(),
             flow_id: "welcome-flow".to_string(),
         };
-        let activity =
-            envelope_to_activity(&envelope, "fallback", Some("ep-legal"), Some(hint.clone()));
+        let activity = envelope_to_activity(
+            &envelope,
+            "fallback",
+            Some("ep-legal"),
+            Some(hint.clone()),
+            None,
+        );
         assert_eq!(activity.messaging_endpoint_id(), Some("ep-legal"));
         assert_eq!(activity.welcome_flow_hint(), Some(&hint));
+        assert_eq!(
+            (activity.pack_id(), activity.flow_id()),
+            (None, None),
+            "a welcome hint alone must NOT pin the activity's flow — the runner \
+             gates it on first contact, so pinning would route every turn to it",
+        );
+    }
+
+    #[test]
+    fn envelope_to_activity_pins_flow_by_key_for_an_explicit_target() {
+        // A URL-named flow (`/{tenant}/{bundle}/{flow}`) must reach the runner
+        // as `(pack_id, flow_id)`, not only as a welcome hint. `resolve_flow_id`
+        // runs BEFORE the hint is consulted and matches on `flow_type`, which is
+        // `messaging` for every flow in the bundle: a pack with two messaging
+        // flows fails with "flow type messaging is ambiguous" before the hint
+        // can select one.
+        let envelope: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-1",
+            "tenant": {
+                "env": "dev",
+                "tenant": "acme",
+                "tenant_id": "acme",
+                "attempt": 0,
+            },
+            "channel": "webchat",
+            "session_id": "sess-1",
+            "from": { "id": "u1", "kind": "user" },
+            "text": "hello",
+            "metadata": {},
+        }))
+        .expect("envelope");
+        let target = WelcomeFlowHint {
+            pack_id: "twoflow-demo".to_string(),
+            flow_id: "on_escalate".to_string(),
+        };
+        let activity = envelope_to_activity(
+            &envelope,
+            "fallback",
+            Some("ep-webchat"),
+            Some(target.clone()),
+            Some(target.clone()),
+        );
+        assert_eq!(activity.pack_id(), Some("twoflow-demo"));
+        assert_eq!(activity.flow_id(), Some("on_escalate"));
+        assert_eq!(activity.welcome_flow_hint(), Some(&target));
     }
 
     #[test]
@@ -6663,14 +6898,9 @@ mod tests {
     // they don't race the other listen-addr/env tests in the crate.
 
     fn host_cfg_with(addr: Option<SocketAddr>) -> EnvironmentHostConfig {
-        EnvironmentHostConfig {
-            env_id: greentic_types::EnvId::new("local").unwrap(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: addr,
-            public_base_url: None,
-            gui_enabled: None,
-        }
+        let mut hc = EnvironmentHostConfig::new(greentic_types::EnvId::new("local").unwrap());
+        hc.listen_addr = addr;
+        hc
     }
 
     struct EnvVarGuard {
@@ -6737,6 +6967,8 @@ mod tests {
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
             }),
         }
     }
@@ -7214,7 +7446,7 @@ mod tests {
                 .unwrap(),
             ),
         };
-        rewrite_stream_url(&headers, &mut response);
+        rewrite_stream_url(&headers, &mut response, None);
         let body: serde_json::Value =
             serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
         assert_eq!(
@@ -7243,7 +7475,7 @@ mod tests {
                 .unwrap(),
             ),
         };
-        rewrite_stream_url(&headers, &mut response);
+        rewrite_stream_url(&headers, &mut response, None);
         let body: serde_json::Value =
             serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
         assert_eq!(
@@ -7267,12 +7499,66 @@ mod tests {
                 .unwrap(),
             ),
         };
-        rewrite_stream_url(&headers, &mut response);
+        rewrite_stream_url(&headers, &mut response, None);
         let body: serde_json::Value =
             serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
         assert_eq!(
             body["streamUrl"], original_url,
             "already-absolute streamUrl must not be touched"
+        );
+    }
+
+    #[test]
+    fn rewrite_stream_url_with_bundle_prefix() {
+        let headers = vec![("Host".to_string(), "example.com".to_string())];
+        let mut response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "conversationId": "abc123",
+                    "streamUrl": "/v3/directline/conversations/abc123/stream?t=TOKEN"
+                }))
+                .unwrap(),
+            ),
+        };
+        rewrite_stream_url(&headers, &mut response, Some("/hr-chat"));
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["streamUrl"],
+            "ws://example.com/hr-chat/v3/directline/conversations/abc123/stream?t=TOKEN",
+            "bundle-scoped streamUrl must include the bundle segment"
+        );
+    }
+
+    #[test]
+    fn rewrite_stream_url_splices_bundle_into_tenant_scoped_path() {
+        // The shape the shipping webchat provider actually returns: already
+        // tenant-scoped, not the bare `/v3/directline/...` form. Prefixing the
+        // whole bundle-scoped path here would emit
+        // `/v1/messaging/webchat/default/legal/v1/messaging/webchat/default/v3/...`,
+        // a URL that resolves to no route and silently drops the SPA back to
+        // HTTP polling.
+        let headers = vec![("Host".to_string(), "127.0.0.1:8080".to_string())];
+        let mut response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "conversationId": "abc123",
+                    "streamUrl": "/v1/messaging/webchat/default/v3/directline/conversations/abc123/stream?watermark=-1&t=TOKEN"
+                }))
+                .unwrap(),
+            ),
+        };
+        rewrite_stream_url(&headers, &mut response, Some("/legal"));
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["streamUrl"],
+            "ws://127.0.0.1:8080/v1/messaging/webchat/default/legal/v3/directline/conversations/abc123/stream?watermark=-1&t=TOKEN",
+            "the bundle segment belongs before /v3/directline, not in front of an already tenant-scoped path"
         );
     }
 
@@ -8228,6 +8514,7 @@ mod tests {
             http_routes: HttpRouteTable::from_descriptors(Vec::new()),
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::from_parts(vec![(
                 deployment_id,
+                greentic_deploy_spec::BundleId::new("test"),
                 tenant.to_string(),
                 Vec::new(),
                 Vec::new(),
@@ -8235,6 +8522,8 @@ mod tests {
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: std::sync::Arc::default(),
             static_routes: crate::static_routes::ActiveRouteTable::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+            flow_index: crate::webchat_routing::FlowIndex::default(),
         });
         let activation = Activation {
             host: base.host,
@@ -9153,6 +9442,8 @@ mod binary_update_tests {
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
             }),
         }
     }
@@ -10047,6 +10338,7 @@ mod binary_update_tests {
 
         let deployment_routes = DeploymentRouteTable::from_parts(vec![(
             deployment_id,
+            greentic_deploy_spec::BundleId::new("test"),
             tenant.to_string(),
             Vec::new(),
             Vec::new(),
@@ -10101,6 +10393,8 @@ mod binary_update_tests {
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
             }),
         }
     }
