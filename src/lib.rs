@@ -716,6 +716,16 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let gui_enabled =
             resolve_console_enabled(&environment.host_config, !pack_webchat_routes.is_empty());
 
+        // The `--env` boot carries no `--tenant`, but the gtunnel id must match
+        // what greentic-setup keyed on (sanitized `<tenant>-<team>`). Derive the
+        // served tenant from the deployment route bindings so setup and runtime
+        // agree on the tunnel id (and thus the per-tunnel secret).
+        if request.tenant.is_none()
+            && let Some(dep) = environment.bundles.first()
+        {
+            request.tenant = Some(dep.route_binding.tenant_selector.tenant.clone());
+        }
+
         // Make messaging work out of the box: when the env has a messaging
         // provider that needs an inbound webhook (Webex, Telegram, …) and no
         // public URL is already configured, default to a cloudflared tunnel so
@@ -741,13 +751,27 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             needs_public_webhook,
             public_base_url_configured,
         ) {
-            operator_log::info(
-                module_path!(),
-                "a served provider needs an inbound webhook and no PUBLIC_BASE_URL is \
-                 configured; defaulting to a cloudflared tunnel so webhook auto-registration \
-                 can run (override with `--cloudflared off`)",
-            );
-            request.cloudflared = CloudflaredModeArg::On;
+            // Prefer the Greentic managed tunnel (the setup default) when a
+            // secret is resolvable — otherwise fall back to cloudflared, which
+            // needs no secret, so messaging still works out of the box.
+            let gtunnel_id = env_tunnel::resolve_gtunnel_tunnel_id(&request);
+            if !crate::gtunnel::resolve_secret(&gtunnel_id).is_empty() {
+                operator_log::info(
+                    module_path!(),
+                    "a served provider needs an inbound webhook and no PUBLIC_BASE_URL is \
+                     configured; defaulting to the Greentic managed tunnel (override with \
+                     `--gtunnel off`)",
+                );
+                request.gtunnel = GtunnelModeArg::On;
+            } else {
+                operator_log::info(
+                    module_path!(),
+                    "a served provider needs an inbound webhook and no PUBLIC_BASE_URL is \
+                     configured; defaulting to a cloudflared tunnel (no Greentic tunnel secret \
+                     configured — set GREENTIC_TUNNEL_SECRET to use the Greentic managed tunnel)",
+                );
+                request.cloudflared = CloudflaredModeArg::On;
+            }
             request.tunnel_explicit = true;
         }
 
@@ -1182,6 +1206,14 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 request.ngrok = NgrokModeArg::On;
                 request.tunnel_explicit = true;
             }
+            Some("gtunnel") => {
+                operator_log::info(
+                    module_path!(),
+                    "tunnel mode 'gtunnel' (Greentic managed tunnel) configured in setup answers",
+                );
+                request.gtunnel = GtunnelModeArg::On;
+                request.tunnel_explicit = true;
+            }
             Some("off") => {
                 operator_log::info(
                     module_path!(),
@@ -1262,7 +1294,6 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     let gtunnel = match tunnel_choice {
         env_tunnel::TunnelChoice::Gtunnel => Some(env_tunnel::gtunnel_config(
             &request,
-            &format!("{}-{}", demo_config.tenant, demo_config.team),
             demo_config.services.gateway.port,
             restart.contains("gtunnel") || restart.contains("all"),
         )),

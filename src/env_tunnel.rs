@@ -76,11 +76,27 @@ pub(crate) fn choose_tunnel(
     }
 }
 
+/// The tunnel id both binaries key on: explicit flag > `GREENTIC_TUNNEL_ID` >
+/// sanitized `<tenant>-<team>`. Single source of truth so the default-tunnel
+/// decision, the config, and greentic-setup all agree.
+pub(crate) fn resolve_gtunnel_tunnel_id(request: &StartRequest) -> String {
+    request
+        .gtunnel_tunnel_id
+        .clone()
+        .or_else(|| std::env::var("GREENTIC_TUNNEL_ID").ok())
+        .unwrap_or_else(|| {
+            sanitize_tunnel_id(&format!(
+                "{}-{}",
+                request.tenant.as_deref().unwrap_or("default"),
+                request.team.as_deref().unwrap_or("default"),
+            ))
+        })
+}
+
 /// Resolve the zero-config gtunnel settings for this request. Order for each
 /// field: explicit flag > env var > derived/default. Keeps setup input-free.
 pub(crate) fn gtunnel_config(
     request: &StartRequest,
-    default_tunnel_id: &str,
     local_port: u16,
     restart: bool,
 ) -> crate::gtunnel::GtunnelConfig {
@@ -89,11 +105,7 @@ pub(crate) fn gtunnel_config(
         .clone()
         .or_else(|| std::env::var("GREENTIC_TUNNEL_WORKER_URL").ok())
         .unwrap_or_else(|| crate::gtunnel::DEFAULT_WORKER_BASE_URL.to_string());
-    let tunnel_id = request
-        .gtunnel_tunnel_id
-        .clone()
-        .or_else(|| std::env::var("GREENTIC_TUNNEL_ID").ok())
-        .unwrap_or_else(|| sanitize_tunnel_id(default_tunnel_id));
+    let tunnel_id = resolve_gtunnel_tunnel_id(request);
     // Prefer the per-tunnel secret greentic-setup provisioned (shared store),
     // falling back to the GREENTIC_TUNNEL_SECRET env override.
     let secret = crate::gtunnel::resolve_secret(&tunnel_id);
@@ -154,14 +166,7 @@ pub(crate) fn start_env_tunnel(
     // takes a distinct, self-contained path (spawn the agent, report the URL).
     if let TunnelChoice::Gtunnel = choice {
         let restart_service = crate::runtime::should_restart(&restart, crate::gtunnel::SERVICE_ID);
-        // Derive the tunnel id from tenant/team (same rule setup uses) so both
-        // binaries compute the same id and share one agent — never from env_id.
-        let default_id = format!(
-            "{}-{}",
-            request.tenant.as_deref().unwrap_or("default"),
-            request.team.as_deref().unwrap_or("default"),
-        );
-        let config = gtunnel_config(request, &default_id, local_port, restart_service);
+        let config = gtunnel_config(request, local_port, restart_service);
         let handle = crate::gtunnel::start_agent(&config)?;
         match cloudflared::wait_tunnel_ready(&handle.url, TUNNEL_READY_TIMEOUT) {
             Ok(()) => operator_log::info(
