@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::DEMO_DEFAULT_TEAM;
-use crate::DEMO_DEFAULT_TENANT;
+use crate::DEFAULT_TEAM;
+use crate::DEFAULT_TENANT;
 use crate::runtime::NatsMode;
 
 #[derive(Parser)]
@@ -96,9 +96,9 @@ pub(crate) struct ResolveSecretArgs {
     /// Bundle root to resolve against.
     #[arg(long)]
     pub(crate) bundle: PathBuf,
-    #[arg(long, default_value = DEMO_DEFAULT_TENANT)]
+    #[arg(long, default_value = DEFAULT_TENANT)]
     pub(crate) tenant: String,
-    #[arg(long, default_value = DEMO_DEFAULT_TEAM)]
+    #[arg(long, default_value = DEFAULT_TEAM)]
     pub(crate) team: String,
     /// Canonical secrets:// URI to read.
     #[arg(long)]
@@ -191,9 +191,9 @@ pub(crate) struct StopArgs {
     env: Option<String>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
-    #[arg(long, default_value = DEMO_DEFAULT_TENANT)]
+    #[arg(long, default_value = DEFAULT_TENANT)]
     tenant: String,
-    #[arg(long, default_value = DEMO_DEFAULT_TEAM)]
+    #[arg(long, default_value = DEFAULT_TEAM)]
     team: String,
 }
 
@@ -464,6 +464,39 @@ pub(crate) fn restart_name(target: &RestartTarget) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `start` and `stop` must land in the same tenant every other tool in
+    /// the fleet defaults to. This was `demo` while greentic-deployer and
+    /// greentic-setup used `default`, so a bundle bound by one and served by
+    /// the other sat in two namespaces — tolerated on a dev store, refused by
+    /// the Vault activation gate.
+    /// `stop` must look for the runtime state that `start` wrote. Its
+    /// `--tenant` defaulted to `demo` while the start path's runtime config
+    /// defaulted to... also `demo`, so they agreed — but both disagreed with
+    /// greentic-deployer and greentic-setup, which use `default`. Both ends
+    /// move together here; `start` carries no clap default of its own (its
+    /// tenant is `Option<String>`, resolved in `bundle_config`), so this
+    /// covers the two args that do.
+    #[test]
+    fn stop_defaults_to_the_fleet_tenant_not_demo() {
+        let cli = Cli::try_parse_from(["greentic-start", "stop"]).expect("stop parses");
+        let Command::Stop(args) = cli.command else {
+            panic!("did not parse as stop");
+        };
+        assert_eq!(args.tenant, "default");
+        assert_ne!(args.tenant, "demo");
+        assert_eq!(args.team, "default");
+    }
+
+    /// [`DEFAULT_TENANT`] is duplicated from `greentic_types::DEFAULT_TENANT`
+    /// because this crate is transitively pinned to greentic-types `=1.1.2`
+    /// (via `greentic-aw-runtime` -> `greentic-mcp-exec`). Pin the literal so
+    /// the copy cannot drift from the original while it has to exist.
+    #[test]
+    fn default_tenant_agrees_with_the_rest_of_the_fleet() {
+        assert_eq!(DEFAULT_TENANT, "default");
+        assert_eq!(DEFAULT_TEAM, "default");
+    }
 
     #[test]
     fn normalize_args_inserts_start_for_short_form() {
