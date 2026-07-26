@@ -11,11 +11,12 @@ use crate::discovery::DiscoveryResult;
 use crate::operator_log;
 
 /// Parse valid `TriggerDef`s from a decoded pack manifest's
-/// `extensions."greentic.triggers.v1".triggers` array. Invalid defs are dropped
-/// with an error log (fail-soft: one bad trigger never blocks the others).
+/// `extensions."greentic.triggers.v1".inline.triggers` array (the `ExtensionRef`
+/// inline payload shape). Invalid defs are dropped with an error log (fail-soft:
+/// one bad trigger never blocks the others).
 pub fn trigger_defs_from_manifest(manifest: &JsonValue) -> Vec<TriggerDef> {
     let Some(array) = manifest
-        .pointer("/extensions/greentic.triggers.v1/triggers")
+        .pointer("/extensions/greentic.triggers.v1/inline/triggers")
         .and_then(JsonValue::as_array)
     else {
         return Vec::new();
@@ -66,15 +67,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_trigger_defs_from_manifest_extension() {
+    fn parses_trigger_defs_from_inline_extension() {
         let manifest = serde_json::json!({
             "extensions": {
                 "greentic.triggers.v1": {
-                    "triggers": [
+                    "kind": "greentic.triggers.v1", "version": "1",
+                    "inline": { "triggers": [
                         { "id": "daily_rent", "schedule": { "kind": "daily", "at": { "hour": 6, "minute": 0 } },
-                          "emits": "cap://greentic/events/tenancy/rent",
-                          "payload_template": { "at": "{{fire_time}}" } }
-                    ]
+                          "emits": "cap://greentic/events/tenancy/rent", "payload_template": {} }
+                    ] }
                 }
             }
         });
@@ -86,9 +87,12 @@ mod tests {
     #[test]
     fn skips_invalid_trigger_defs() {
         let manifest = serde_json::json!({
-            "extensions": { "greentic.triggers.v1": { "triggers": [
-                { "id": "", "schedule": { "kind": "hourly", "minute": 99 }, "emits": "bad" }
-            ] } }
+            "extensions": { "greentic.triggers.v1": {
+                "kind": "greentic.triggers.v1", "version": "1",
+                "inline": { "triggers": [
+                    { "id": "", "schedule": { "kind": "hourly", "minute": 99 }, "emits": "bad" }
+                ] }
+            } }
         });
         assert!(
             trigger_defs_from_manifest(&manifest).is_empty(),
@@ -128,11 +132,12 @@ mod tests {
         let manifest = serde_json::json!({
             "extensions": {
                 "greentic.triggers.v1": {
-                    "triggers": [
+                    "kind": "greentic.triggers.v1", "version": "1",
+                    "inline": { "triggers": [
                         { "id": "every_minute_tick", "schedule": { "kind": "every_minute" },
                           "emits": "cap://greentic/events/tenancy/tick",
                           "payload_template": {} }
-                    ]
+                    ] }
                 }
             }
         });
