@@ -2032,9 +2032,18 @@ mod tests {
         let body = json!({ "bundle_path": dir.path().join("bundle") });
 
         for (label, response) in [
-            ("deploy", runtime.block_on(handle_deploy(&state, body.clone()))),
-            ("update", runtime.block_on(handle_update(&state, body.clone()))),
-            ("remove", runtime.block_on(handle_remove(&state, body.clone()))),
+            (
+                "deploy",
+                runtime.block_on(handle_deploy(&state, body.clone())),
+            ),
+            (
+                "update",
+                runtime.block_on(handle_update(&state, body.clone())),
+            ),
+            (
+                "remove",
+                runtime.block_on(handle_remove(&state, body.clone())),
+            ),
         ] {
             let err = response
                 .err()

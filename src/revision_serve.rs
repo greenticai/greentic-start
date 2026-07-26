@@ -1206,6 +1206,23 @@ async fn serve(
         deployment_id = target.deployment_id;
         tenant = target.tenant.clone();
         effective_path = target.stripped_path.clone();
+    } else if crate::webchat_routing::is_webchat_path(&path) {
+        // A webchat path the classifier declined must NOT fall through to the
+        // generic resolve. That resolve matches on `(host, path_prefix)` alone
+        // and hands back the *deployment's* tenant, so with the usual `/`
+        // prefix binding every unknown tenant matched something: a POST to
+        // `/v1/messaging/webchat/<any string>/token` minted a working
+        // DirectLine token against whichever deployment won the prefix match,
+        // under that deployment's tenant and secrets. The tenant segment was
+        // dead — unknown tenants failed open. greentic-start#454.
+        //
+        // The classifier declines when the tenant has no Active deployment,
+        // when the named bundle is not the tenant's, or when host admission
+        // fails. None of those is routable, so this is a 404.
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "no bundle is bound to this tenant and path",
+        ));
     } else {
         // Resolve the bound deployment + tenant before touching the body, so
         // an unroutable request is rejected cheaply.
