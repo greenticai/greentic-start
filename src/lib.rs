@@ -136,8 +136,23 @@ pub use cli_args::{
     CloudflaredModeArg, NatsModeArg, NgrokModeArg, RestartTarget, StartRequest, StopRequest,
 };
 
-const DEMO_DEFAULT_TENANT: &str = "demo";
-const DEMO_DEFAULT_TEAM: &str = "default";
+/// Tenant assumed when the operator names none.
+///
+/// Must equal `greentic_types::DEFAULT_TENANT`. It is duplicated rather than
+/// imported because this crate is transitively pinned to greentic-types
+/// `=1.1.2`: `greentic-aw-runtime =1.1.6` pulls `greentic-mcp-exec =1.1.2`,
+/// which itself requires greentic-types `=1.1.2` exactly, so the pin cannot
+/// move until that agentic-worker graph is republished. `default_tenant_agrees
+/// _with_the_rest_of_the_fleet` guards the duplication; delete this constant in
+/// favour of the import once the pin is free.
+///
+/// Was `demo`, which disagreed with greentic-deployer and greentic-setup and
+/// produced environments serving deployments under two tenants — fine on a dev
+/// store, refused by the Vault activation gate.
+const DEFAULT_TENANT: &str = "default";
+/// Team assumed when the operator names none. See [`DEFAULT_TENANT`]; this half
+/// never diverged.
+const DEFAULT_TEAM: &str = "default";
 
 /// Default environment id when nothing is set. Flipped from `"dev"` to
 /// `"local"` as part of A4b — the `local` env is what `gtc setup` and
