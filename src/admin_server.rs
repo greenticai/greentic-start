@@ -494,13 +494,10 @@ async fn handle_deploy(_state: &AdminState, body: JsonValue) -> AdminHttpResult 
             ))
         })?;
 
+        let (tenant, team) = required_tenant(&req.tenants)?;
         let config = SetupConfig {
-            tenant: req
-                .tenants
-                .first()
-                .map(|t| t.tenant.clone())
-                .unwrap_or_else(|| "demo".into()),
-            team: req.tenants.first().and_then(|t| t.team.clone()),
+            tenant,
+            team,
             env: greentic_setup::resolve_env(None),
             offline: false,
             verbose: true,
@@ -576,13 +573,10 @@ async fn handle_update(_state: &AdminState, body: JsonValue) -> AdminHttpResult 
             ))
         })?;
 
+        let (tenant, team) = required_tenant(&req.tenants)?;
         let config = SetupConfig {
-            tenant: req
-                .tenants
-                .first()
-                .map(|t| t.tenant.clone())
-                .unwrap_or_else(|| "demo".into()),
-            team: req.tenants.first().and_then(|t| t.team.clone()),
+            tenant,
+            team,
             env: greentic_setup::resolve_env(None),
             offline: false,
             verbose: true,
@@ -659,13 +653,10 @@ async fn handle_remove(_state: &AdminState, body: JsonValue) -> AdminHttpResult 
             ))
         })?;
 
+        let (tenant, team) = required_tenant(&req.tenants)?;
         let config = SetupConfig {
-            tenant: req
-                .tenants
-                .first()
-                .map(|t| t.tenant.clone())
-                .unwrap_or_else(|| "demo".into()),
-            team: req.tenants.first().and_then(|t| t.team.clone()),
+            tenant,
+            team,
             env: greentic_setup::resolve_env(None),
             offline: false,
             verbose: true,
@@ -869,11 +860,8 @@ async fn handle_remove_admin_client(state: &AdminState, body: JsonValue) -> Admi
 async fn handle_setup(state: &AdminState, body: JsonValue) -> AdminHttpResult {
     let bundle_root = state.bundle_root.clone();
     tokio::task::spawn_blocking(move || {
-        // Accept: { "tenant": "demo", "team": "default", "answers": { "provider-id": { ... } } }
-        let tenant = body
-            .get("tenant")
-            .and_then(|v| v.as_str())
-            .unwrap_or("demo");
+        // Accept: { "tenant": "acme", "team": "default", "answers": { "provider-id": { ... } } }
+        let tenant = required_body_tenant(&body)?;
         let team = body.get("team").and_then(|v| v.as_str());
         let dry_run = body
             .get("dry_run")
@@ -973,10 +961,7 @@ async fn handle_qa_card(state: &AdminState, body: JsonValue) -> AdminHttpResult 
         .get("provider_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| bad_request_err("missing provider_id"))?;
-    let tenant = body
-        .get("tenant")
-        .and_then(|v| v.as_str())
-        .unwrap_or("demo");
+    let tenant = required_body_tenant(&body)?;
     let team = body.get("team").and_then(|v| v.as_str());
 
     let pack_path = find_provider_pack(&state.bundle_root, provider_id)?;
@@ -1271,6 +1256,31 @@ fn bad_request(msg: impl Into<String>) -> AdminHttpResponse {
 
 fn bad_request_err(msg: impl Into<String>) -> AdminHttpError {
     Box::new(bad_request(msg))
+}
+
+/// The tenant/team an admin bundle request operates on.
+///
+/// A request with an empty `tenants` list used to fall back to tenant `demo`,
+/// so a caller that omitted the field deployed, updated, or removed a bundle
+/// under a tenant it never named — and got `200 OK` back. These operations
+/// write tenant-scoped state, and the tenant decides which secrets the bundle
+/// resolves at runtime, so there is no safe guess to make. Say it or get a 400.
+fn required_tenant(tenants: &[TenantSelection]) -> AdminHttpResult<(String, Option<String>)> {
+    let first = tenants
+        .first()
+        .ok_or_else(|| bad_request_err("`tenants` must name at least one tenant"))?;
+    Ok((first.tenant.clone(), first.team.clone()))
+}
+
+/// The tenant named by a free-form admin JSON body.
+///
+/// Same defect as [`required_tenant`], on the endpoints that read the tenant
+/// straight off the body instead of a typed request.
+fn required_body_tenant(body: &JsonValue) -> AdminHttpResult<&str> {
+    body.get("tenant")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| bad_request_err("request body must name a `tenant`"))
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -2012,6 +2022,53 @@ mod tests {
     }
 
     #[test]
+    fn bundle_mutations_reject_a_request_that_names_no_tenant() {
+        // These three write tenant-scoped state. They used to fall back to
+        // tenant `demo` and answer 200, so a caller that omitted `tenants`
+        // mutated a tenant it never named.
+        let runtime = Runtime::new().unwrap();
+        let dir = tempdir().unwrap();
+        let state = test_admin_state(dir.path());
+        let body = json!({ "bundle_path": dir.path().join("bundle") });
+
+        for (label, response) in [
+            ("deploy", runtime.block_on(handle_deploy(&state, body.clone()))),
+            ("update", runtime.block_on(handle_update(&state, body.clone()))),
+            ("remove", runtime.block_on(handle_remove(&state, body.clone()))),
+        ] {
+            let err = response
+                .err()
+                .unwrap_or_else(|| panic!("{label} must reject a tenant-less request"));
+            assert_eq!(
+                err.status(),
+                StatusCode::BAD_REQUEST,
+                "{label} must answer 400, not deploy under a guessed tenant"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_and_qa_card_reject_a_body_that_names_no_tenant() {
+        let runtime = Runtime::new().unwrap();
+        let dir = tempdir().unwrap();
+        let state = test_admin_state(dir.path());
+
+        let setup = runtime
+            .block_on(handle_setup(&state, json!({ "answers": {} })))
+            .unwrap_err();
+        assert_eq!(setup.status(), StatusCode::BAD_REQUEST);
+
+        // An empty tenant string is as unusable as an absent one.
+        let card = runtime
+            .block_on(handle_qa_card(
+                &state,
+                json!({ "provider_id": "telegram", "tenant": "" }),
+            ))
+            .unwrap_err();
+        assert_eq!(card.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn qa_card_and_validate_require_provider_id() {
         let runtime = Runtime::new().unwrap();
         let dir = tempdir().unwrap();
@@ -2142,6 +2199,7 @@ questions:
                 &state,
                 json!({
                     "provider_id": "messaging-telegram",
+                    "tenant": "demo",
                     "session_id": session_id,
                     "answers": {"bot_token": "secret123"}
                 }),
@@ -2174,6 +2232,7 @@ questions:
                 &state,
                 json!({
                     "provider_id": "missing-provider",
+                    "tenant": "demo",
                     "answers": {}
                 }),
             ))
@@ -2203,6 +2262,7 @@ questions:
                 &state,
                 json!({
                     "provider_id": "provider-a",
+                    "tenant": "demo",
                     "session_id": session_id,
                     "answers": {"foo": "bar"}
                 }),
