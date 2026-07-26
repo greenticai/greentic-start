@@ -80,12 +80,93 @@ pub(crate) struct RuntimeConfigActivation {
     pub(crate) routing: RevisionIngressRouting,
 }
 
+/// Per-revision session + state stores, held across activations so a revision
+/// that did not change keeps the stores — and therefore the live conversations
+/// — it already had.
+///
+/// Every activation builds a brand-new `RunnerHost`, and the host owns each
+/// revision's session/state store. Without this registry a full reload silently
+/// discards every conversation in the environment, including on revisions the
+/// reload never touched: a DirectLine turn whose `POST /activities` coincides
+/// with the swap lands on a host that has no record of its conversation, so the
+/// reply is never produced and the client polls until its budget runs out with
+/// no reply and no error. Reproduced 2026-07-25 (1 of 60 conversations, with a
+/// reload landing on the POST timestamp).
+///
+/// Keyed by `(deployment_id, revision_id)` as they appear in the runtime-config
+/// blocks. That key is what makes reuse safe: the per-revision isolation this
+/// preserves is isolation *between* revisions — two live revisions of one pack
+/// must not share a session backend — not isolation across time for a single
+/// revision, which is exactly the continuity a reload should keep.
+///
+/// **Invariant:** stores are reused only when every identity field is unchanged.
+/// A reload can never hand one tenant's or customer's conversation state to
+/// another, because the key includes `tenant`, `team`, `customer_id`, and
+/// `bundle_id` alongside the deployment and revision ids.
+pub(crate) type RevisionStores = Arc<
+    std::sync::Mutex<
+        HashMap<
+            RevisionStoreKey,
+            (
+                greentic_runner_host::storage::DynSessionStore,
+                greentic_runner_host::storage::DynStateStore,
+            ),
+        >,
+    >,
+>;
+
+/// Composite key for the per-revision store registry. Stores are carried
+/// forward across reloads only when ALL identity fields match — so a tenant,
+/// team, or customer change on the same deployment/revision mints fresh stores
+/// rather than leaking the previous identity's sessions.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RevisionStoreKey {
+    pub deployment_id: String,
+    pub revision_id: String,
+    pub tenant: String,
+    pub team: String,
+    pub customer_id: String,
+    pub bundle_id: String,
+}
+
+/// Build the registry key for one revision from the deployment's identity and
+/// the runtime-config block.
+///
+/// Extracted so the key's *composition* is testable. Asserting that a `HashMap`
+/// distinguishes two hand-written [`RevisionStoreKey`] literals only exercises
+/// the derived `Hash`/`Eq` — it stays green if this function stops reading
+/// `customer_id` or `tenant`, which is precisely the regression the store key
+/// exists to prevent. The tests go through here instead.
+fn revision_store_key(
+    meta: &DeploymentMeta,
+    block: &crate::runtime_config::ResolvedRevisionBlock,
+) -> RevisionStoreKey {
+    RevisionStoreKey {
+        deployment_id: block.deployment_id.clone(),
+        revision_id: block.revision_id.clone(),
+        tenant: meta.tenant.clone(),
+        team: meta.team.clone(),
+        customer_id: meta.customer_id.clone(),
+        bundle_id: block.bundle_id.clone(),
+    }
+}
+
+/// A fresh, empty [`RevisionStores`] registry. One per running server, created
+/// at cold start and shared with the reload producer.
+pub(crate) fn new_revision_stores() -> RevisionStores {
+    Arc::new(std::sync::Mutex::new(HashMap::new()))
+}
+
 /// What a deployment in the `Environment` says about itself, used both to key
 /// revision runtimes under the right tenant and to fail closed on a stale
 /// runtime-config that no longer agrees with the environment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DeploymentMeta {
     tenant: String,
+    /// The team within the tenant. Drives `ensure_generated_secrets_for_activation`'s
+    /// secret scope (`SecretsSetup::new(…, Some(team))`), so a team change must
+    /// force the full activation path to re-materialize team-scoped secrets.
+    team: String,
     customer_id: String,
     status: BundleDeploymentStatus,
     /// The bundle the deployment is (immutably) bound to.
@@ -105,6 +186,7 @@ struct DeploymentMeta {
 /// re-reading from disk) avoids a duplicate file read AND the TOCTOU window
 /// between the caller's bind-address resolution and the activation's
 /// deployment/tenant resolution.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn activate_runtime_config(
     store_root: &Path,
     rc: &LoadedRuntimeConfig,
@@ -113,6 +195,7 @@ pub(crate) async fn activate_runtime_config(
     env: &Environment,
     runtime_ref_resolver: Arc<dyn RuntimeRefResolver>,
     pin_store: Arc<dyn RevisionPinStore>,
+    revision_stores: &RevisionStores,
 ) -> anyhow::Result<RuntimeConfigActivation> {
     // `env_dir_in` validates `rc.env_id` as a safe directory segment via
     // `EnvId::new`; no separate `EnvId::new` call is needed.
@@ -240,6 +323,18 @@ pub(crate) async fn activate_runtime_config(
     let mut flow_index = crate::webchat_routing::FlowIndex::default();
     let mut flow_indexed_bundles: HashSet<String> = HashSet::new();
 
+    // Snapshot the carried stores rather than draining the registry: if this
+    // activation fails partway, the registry must still hold what the LIVE host
+    // is using, or the next successful reload would mint fresh stores and lose
+    // the conversations this failed one never touched. `retained` is committed
+    // over the registry only on success, which also prunes stores whose
+    // revision is no longer in the runtime-config.
+    let carried = revision_stores
+        .lock()
+        .expect("revision store registry poisoned")
+        .clone();
+    let mut retained = HashMap::with_capacity(rc.revisions.len());
+
     let configs = host.tenant_configs();
     for block in &rc.revisions {
         // Both lookups are infallible: the validation loop above proved every
@@ -350,13 +445,26 @@ pub(crate) async fn activate_runtime_config(
         // on `(env, tenant, user)` plus pack/flow, NOT on the revision, so two
         // live revisions of the same pack for one tenant sharing a backend would
         // let a `wait`/resume snapshot created by revision A be fetched — or
-        // clobbered — by revision B during a traffic split. A fresh per-revision
-        // store namespaces snapshot + resume + working state in one move. This is
-        // the caller obligation documented on
+        // clobbered — by revision B during a traffic split. A per-revision store
+        // namespaces snapshot + resume + working state in one move. This is the
+        // caller obligation documented on
         // `RunnerHost::handle_activity_for_revision`.
-        let session_store = new_session_store();
+        //
+        // Carried over from the previous activation when this exact revision was
+        // already live, so a reload does not discard its conversations — see
+        // [`RevisionStores`]. Reuse keyed on the revision keeps the isolation
+        // above intact: it is isolation between revisions, not across reloads of
+        // one revision.
+        let store_key = revision_store_key(meta, block);
+        let (session_store, state_store) = carried
+            .get(&store_key)
+            .cloned()
+            .unwrap_or_else(|| (new_session_store(), new_state_store()));
+        retained.insert(
+            store_key,
+            (Arc::clone(&session_store), Arc::clone(&state_store)),
+        );
         let session_host = session_host_from(Arc::clone(&session_store));
-        let state_store = new_state_store();
         let state_host = state_host_from(Arc::clone(&state_store));
 
         let runtime = TenantRuntime::load_revision(
@@ -423,12 +531,121 @@ pub(crate) async fn activate_runtime_config(
         flow_index,
     };
 
+    // Commit only now that every revision loaded: `retained` holds exactly the
+    // revisions this activation serves, so stores for revisions that dropped out
+    // of the runtime-config are released here rather than accumulating.
+    *revision_stores
+        .lock()
+        .expect("revision store registry poisoned") = retained;
+
     Ok(RuntimeConfigActivation { host, routing })
+}
+
+/// Rebuild only the env-derived half of [`RevisionIngressRouting`], carrying the
+/// pack- and revision-derived half over from `prev` untouched.
+///
+/// The split this exploits is the one [`activate_runtime_config`] already has:
+///
+/// | field | derived from |
+/// |---|---|
+/// | `deployment_routes`, `bundle_index`, `endpoint_admit`, `deployment_config_overrides` | the `Environment` alone — rebuilt here |
+/// | `dispatcher` | the runtime-config + pin store — carried over |
+/// | `http_routes`, `static_routes`, `flow_index` | pack manifests on disk — carried over |
+///
+/// Carrying the `dispatcher` `Arc` over is not merely an optimization: it is
+/// what leaves session pins and sticky cookies valid across the swap, since no
+/// revision moved. The three carried tables are cloned rather than shared
+/// because they are plain owned collections; that clone is a handful of `Vec`s
+/// against the WASM re-instantiation a full activation would pay.
+///
+/// Only valid when [`env_routing_only_delta`] holds for the `Environment` that
+/// produced `prev` and `env`. The caller enforces that.
+pub(crate) fn reactivate_routing_only(
+    prev: &RevisionIngressRouting,
+    env: &Environment,
+) -> RevisionIngressRouting {
+    let deployment_routes = DeploymentRouteTable::from_environment(env);
+    let bundle_index =
+        crate::webchat_routing::BundleIndex::from_routes_and_env(&deployment_routes, env);
+    RevisionIngressRouting {
+        dispatcher: Arc::clone(&prev.dispatcher),
+        http_routes: prev.http_routes.clone(),
+        static_routes: prev.static_routes.clone(),
+        flow_index: prev.flow_index.clone(),
+        deployment_routes,
+        bundle_index,
+        endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),
+        deployment_config_overrides: Arc::new(deployment_config_overrides_from_environment(env)),
+    }
+}
+
+/// True when `next` differs from `prev` only in ways that cannot reach the
+/// host, the set of loaded revisions, or anything read from a pack manifest —
+/// so [`reactivate_routing_only`] may be used instead of a full activation.
+///
+/// **The projection below is load-bearing.** [`deployment_index`] is *exactly*
+/// the view of the `Environment` that [`activate_runtime_config`] feeds into the
+/// host/pack half of the activation:
+///
+/// - `tenant` → the set of `HostConfig`s the host is built with, and the
+///   secrets-scope gate
+/// - `team` → `ensure_generated_secrets_for_activation`'s secret scope
+///   (`SecretsSetup::new(…, Some(team))`); a team change must re-materialize
+///   team-scoped generated secrets
+/// - `status` → the `Active`-only admission gate
+/// - `bundle_id` → the cross-check against each runtime-config block
+/// - `path_prefixes` → `discover_revision_routes`, i.e. `http_routes`
+/// - `customer_id` → threaded into each `TenantRuntime`
+///
+/// Every other field of `Environment` reaches only the four env-derived routing
+/// fields. So equality of `(environment_id, deployment_index)` is sufficient for
+/// the fast path, and it fails closed: any change to a host-relevant field — or
+/// to the set of deployment ids — makes the maps unequal and forces a full
+/// activation.
+///
+/// **Obligation:** if `activate_runtime_config` ever reads an `Environment`
+/// field outside `deployment_index` on the host/pack path, that field must join
+/// [`DeploymentMeta`] (or this predicate must grow to cover it), or the fast
+/// path will silently serve a stale host. `routing_only_delta_rejects_*` in this
+/// module's tests pins each field currently in the projection — they prove the
+/// current set, not completeness. The tripwire for a NEW upstream field is the
+/// exhaustive `BundleDeployment` literal in this module's `make_deployment` test
+/// helper, which fails to compile when one is added; see its doc comment.
+pub(crate) fn env_routing_only_delta(prev: &Environment, next: &Environment) -> bool {
+    prev.environment_id == next.environment_id && deployment_index(prev) == deployment_index(next)
+}
+
+/// Deployment ids that the environment marks `Active` but the runtime-config
+/// has no revision block for — i.e. deployments the routing tables would
+/// advertise and the dispatcher would then refuse.
+///
+/// Transient during `env-deploy` (see the torn-write handling in
+/// [`rebuild_once`]) and legitimate after a bare `op bundles add`, which is why
+/// the caller compares against the previous set rather than treating any
+/// occurrence as torn.
+pub(crate) fn unbacked_active_deployments(
+    rc: &crate::runtime_config::LoadedRuntimeConfig,
+    env: &Environment,
+) -> std::collections::BTreeSet<String> {
+    let backed: std::collections::BTreeSet<&str> = rc
+        .revisions
+        .iter()
+        .map(|block| block.deployment_id.as_str())
+        .collect();
+    env.bundles
+        .iter()
+        .filter(|dep| dep.status == BundleDeploymentStatus::Active)
+        .map(|dep| dep.deployment_id.to_string())
+        .filter(|id| !backed.contains(id.as_str()))
+        .collect()
 }
 
 /// Index a deployment's tenant + customer by `deployment_id` string. The
 /// runtime-config blocks carry the deployment id; the tenant binding lives on
 /// the `Environment`'s `BundleDeployment.route_binding`.
+///
+/// Also the projection [`env_routing_only_delta`] compares; see its docs before
+/// changing what this captures.
 fn deployment_index(env: &Environment) -> HashMap<String, DeploymentMeta> {
     env.bundles
         .iter()
@@ -437,6 +654,7 @@ fn deployment_index(env: &Environment) -> HashMap<String, DeploymentMeta> {
                 dep.deployment_id.to_string(),
                 DeploymentMeta {
                     tenant: dep.route_binding.tenant_selector.tenant.clone(),
+                    team: dep.route_binding.tenant_selector.team.clone(),
                     customer_id: dep.customer_id.as_str().to_string(),
                     status: dep.status,
                     bundle_id: dep.bundle_id.as_str().to_string(),
@@ -660,6 +878,22 @@ mod tests {
         EnvId::try_from(ENV_ID).unwrap()
     }
 
+    /// **This literal is deliberately exhaustive — do not add `..Default::default()`.**
+    ///
+    /// It is the tripwire for [`env_routing_only_delta`]'s obligation. That
+    /// predicate is sound only while [`deployment_index`] captures every
+    /// `BundleDeployment` field the host/pack half of
+    /// [`activate_runtime_config`] reads; a field that reaches the host but not
+    /// the projection makes the routing-only fast path serve a stale host, and
+    /// no existing test would catch it (the `routing_only_delta_rejects_*` cases
+    /// prove the current set, they cannot prove completeness).
+    ///
+    /// Because this literal names every field, adding one upstream in
+    /// `greentic-deploy-spec` fails to compile HERE. If you are reading this
+    /// because of that error: decide whether the new field reaches the host or
+    /// the packs. If it does, add it to [`DeploymentMeta`] and add a
+    /// `routing_only_delta_rejects_*` case for it. If it does not, it is
+    /// routing-only by definition and just needs a value below.
     fn make_deployment(
         deployment_id: DeploymentId,
         tenant: &str,
@@ -714,6 +948,240 @@ mod tests {
         }
     }
 
+    // ---------------------------------------------------------------
+    // D2: `env_routing_only_delta` — the predicate that decides whether a
+    // reload may skip rebuilding the host (and every revision's WASM).
+    //
+    // It must fail CLOSED: a false positive serves stale packs against a
+    // changed environment. So there is one rejection test per field of the
+    // `deployment_index` projection, plus the set-membership cases. If a
+    // future field of `Environment` starts feeding the host/pack path and is
+    // not added to `DeploymentMeta`, none of these will fail — that is why the
+    // obligation is spelled out on `env_routing_only_delta`'s docs.
+    // ---------------------------------------------------------------
+
+    /// Two deployments so a change can be scoped to one of them.
+    fn routing_delta_env() -> Environment {
+        make_env(vec![
+            make_deployment(
+                DeploymentId::new(),
+                "acme",
+                "cust-1",
+                "acct",
+                BundleDeploymentStatus::Active,
+            ),
+            make_deployment(
+                DeploymentId::new(),
+                "acme",
+                "cust-1",
+                "legal",
+                BundleDeploymentStatus::Active,
+            ),
+        ])
+    }
+
+    /// The case the whole fast path exists for: flipping `default_bundle` moves
+    /// a routing pointer and touches nothing the host reads.
+    #[test]
+    fn routing_only_delta_accepts_default_bundle_flip() {
+        let prev = routing_delta_env();
+        let mut next = prev.clone();
+        next.host_config.default_bundle = Some(BundleId::new("legal"));
+        assert!(
+            env_routing_only_delta(&prev, &next),
+            "a default_bundle flip must not force a full activation — it is one \
+             string, and rebuilding the host for it costs every revision's WASM"
+        );
+    }
+
+    /// An identical environment is trivially routing-compatible (the caller
+    /// short-circuits earlier on content equality, but the predicate must not
+    /// claim otherwise).
+    #[test]
+    fn routing_only_delta_accepts_identical_environment() {
+        let prev = routing_delta_env();
+        assert!(env_routing_only_delta(&prev, &prev.clone()));
+    }
+
+    #[test]
+    fn routing_only_delta_rejects_added_deployment() {
+        let prev = routing_delta_env();
+        let mut next = prev.clone();
+        next.bundles.push(make_deployment(
+            DeploymentId::new(),
+            "acme",
+            "cust-1",
+            "support",
+            BundleDeploymentStatus::Active,
+        ));
+        assert!(
+            !env_routing_only_delta(&prev, &next),
+            "a new deployment brings packs the live host has never loaded"
+        );
+    }
+
+    #[test]
+    fn routing_only_delta_rejects_removed_deployment() {
+        let prev = routing_delta_env();
+        let mut next = prev.clone();
+        next.bundles.pop();
+        assert!(
+            !env_routing_only_delta(&prev, &next),
+            "a removed deployment must drain through the full reload path"
+        );
+    }
+
+    #[test]
+    fn routing_only_delta_rejects_status_change() {
+        let prev = routing_delta_env();
+        let mut next = prev.clone();
+        next.bundles[0].status = BundleDeploymentStatus::Paused;
+        assert!(
+            !env_routing_only_delta(&prev, &next),
+            "status gates admission in activate_runtime_config — only Active loads"
+        );
+    }
+
+    #[test]
+    fn routing_only_delta_rejects_tenant_change() {
+        let prev = routing_delta_env();
+        let mut next = prev.clone();
+        next.bundles[0].route_binding.tenant_selector.tenant = "other".to_string();
+        assert!(
+            !env_routing_only_delta(&prev, &next),
+            "the tenant set determines which HostConfigs the host is built with"
+        );
+    }
+
+    #[test]
+    fn routing_only_delta_rejects_bundle_id_change() {
+        let prev = routing_delta_env();
+        let mut next = prev.clone();
+        next.bundles[0].bundle_id = BundleId::new("renamed");
+        assert!(
+            !env_routing_only_delta(&prev, &next),
+            "bundle_id is cross-checked against each runtime-config block"
+        );
+    }
+
+    #[test]
+    fn routing_only_delta_rejects_customer_id_change() {
+        let prev = routing_delta_env();
+        let mut next = prev.clone();
+        next.bundles[0].customer_id = CustomerId::new("cust-2");
+        assert!(
+            !env_routing_only_delta(&prev, &next),
+            "customer_id is threaded into every TenantRuntime at load time"
+        );
+    }
+
+    #[test]
+    fn routing_only_delta_rejects_team_change() {
+        let prev = routing_delta_env();
+        let mut next = prev.clone();
+        next.bundles[0].route_binding.tenant_selector.team = "engineering".to_string();
+        assert!(
+            !env_routing_only_delta(&prev, &next),
+            "team drives ensure_generated_secrets_for_activation's secret scope — \
+             a team change must force a full activation to re-materialize secrets"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // `unbacked_active_deployments` — the torn-write detector. `env-deploy`
+    // writes environment.json and runtime-config.json separately; a reload
+    // landing between them would publish routing for a deployment the
+    // dispatcher cannot serve.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn no_unbacked_deployments_when_every_active_one_has_a_revision() {
+        let dep_id = DeploymentId::new();
+        let env = make_env(vec![make_deployment(
+            dep_id,
+            "acme",
+            "cust",
+            "acct",
+            BundleDeploymentStatus::Active,
+        )]);
+        let rc = single_revision_rc(&dep_id);
+        assert!(
+            unbacked_active_deployments(&rc, &env).is_empty(),
+            "a fully consistent pair has nothing pending"
+        );
+    }
+
+    /// The state `env-deploy` passes through: the environment already lists the
+    /// new deployment, the runtime-config has not caught up.
+    #[test]
+    fn active_deployment_without_a_revision_block_is_unbacked() {
+        let existing = DeploymentId::new();
+        let added = DeploymentId::new();
+        let env = make_env(vec![
+            make_deployment(
+                existing,
+                "acme",
+                "cust",
+                "acct",
+                BundleDeploymentStatus::Active,
+            ),
+            make_deployment(
+                added,
+                "acme",
+                "cust",
+                "hotadd",
+                BundleDeploymentStatus::Active,
+            ),
+        ]);
+        let rc = single_revision_rc(&existing); // only the pre-existing one
+        assert_eq!(
+            unbacked_active_deployments(&rc, &env),
+            std::collections::BTreeSet::from([added.to_string()]),
+            "the deployment whose revision block has not landed yet must be \
+             reported — activating it publishes routing the dispatcher will refuse"
+        );
+    }
+
+    /// Only `Active` deployments can be routed to, so a paused one without a
+    /// revision block is not a torn write and must not trigger a re-read.
+    #[test]
+    fn non_active_deployment_without_a_revision_block_is_not_unbacked() {
+        let existing = DeploymentId::new();
+        let paused = DeploymentId::new();
+        let env = make_env(vec![
+            make_deployment(
+                existing,
+                "acme",
+                "cust",
+                "acct",
+                BundleDeploymentStatus::Active,
+            ),
+            make_deployment(
+                paused,
+                "acme",
+                "cust",
+                "old",
+                BundleDeploymentStatus::Paused,
+            ),
+        ]);
+        let rc = single_revision_rc(&existing);
+        assert!(
+            unbacked_active_deployments(&rc, &env).is_empty(),
+            "a paused deployment is never dispatched to, so it is not pending"
+        );
+    }
+
+    #[test]
+    fn routing_only_delta_rejects_path_prefix_change() {
+        let prev = routing_delta_env();
+        let mut next = prev.clone();
+        next.bundles[0].route_binding.path_prefixes = vec!["/api".to_string()];
+        assert!(
+            !env_routing_only_delta(&prev, &next),
+            "path_prefixes feed discover_revision_routes, which reads pack manifests"
+        );
+    }
+
     fn write_lock(env_dir: &Path, rel: &str, lock: &PackListLock) -> PathBuf {
         let abs = env_dir.join(rel);
         std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
@@ -736,6 +1204,7 @@ mod tests {
         let index = deployment_index(&env);
         let meta = index.get(&key).expect("deployment present");
         assert_eq!(meta.tenant, "acme");
+        assert_eq!(meta.team, "default");
         assert_eq!(meta.customer_id, "cust-1");
         assert_eq!(meta.bundle_id, "fast2flow");
         assert_eq!(meta.status, BundleDeploymentStatus::Active);
@@ -1163,6 +1632,7 @@ mod tests {
             &mismatched,
             dummy_resolver(),
             dummy_pin_store(),
+            &new_revision_stores(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1189,6 +1659,7 @@ mod tests {
             &env,
             dummy_resolver(),
             dummy_pin_store(),
+            &new_revision_stores(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1221,6 +1692,7 @@ mod tests {
             &env,
             dummy_resolver(),
             dummy_pin_store(),
+            &new_revision_stores(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1251,6 +1723,7 @@ mod tests {
             &env,
             dummy_resolver(),
             dummy_pin_store(),
+            &new_revision_stores(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1284,6 +1757,7 @@ mod tests {
             &env,
             dummy_resolver(),
             dummy_pin_store(),
+            &new_revision_stores(),
         )) {
             Ok(_) => panic!("expected activation to fail at pack reading"),
             Err(e) => e,
@@ -1319,6 +1793,7 @@ mod tests {
             &env,
             dummy_resolver(),
             dummy_pin_store(),
+            &new_revision_stores(),
         ))
         .expect("empty rc activates");
         assert_eq!(activation.routing.dispatcher.deployment_count(), 0);
@@ -1326,6 +1801,251 @@ mod tests {
         assert_eq!(activation.routing.deployment_routes.len(), 0);
         // Placeholder tenant config keyed by env_id so `build()` succeeds.
         assert!(activation.host.tenant_configs().contains_key(ENV_ID));
+    }
+
+    // ---------------------------------------------------------------
+    // D1: the per-revision store registry. Its whole job is that a reload does
+    // not throw away the conversations of revisions it did not touch — every
+    // activation builds a new `RunnerHost`, and the host owns those stores.
+    // ---------------------------------------------------------------
+
+    /// A failed activation must leave the registry exactly as it found it.
+    ///
+    /// The registry is the only record of which stores the LIVE host is using.
+    /// If a failed activation cleared or half-wrote it, the next *successful*
+    /// reload would mint fresh stores for revisions that never changed and drop
+    /// their conversations — a failed reload silently arming a later one.
+    ///
+    /// MUTATION PROOF: change the `carried` snapshot in `activate_runtime_config`
+    /// to `std::mem::take(&mut *guard)` and this fails — the entry is gone.
+    #[test]
+    fn failed_activation_leaves_carried_stores_intact() {
+        let dir = tempdir().unwrap();
+        seed_env_dir(dir.path());
+        let dep_id = DeploymentId::new();
+        let env = make_env(vec![make_deployment(
+            dep_id,
+            "acme",
+            "cust",
+            "fast2flow",
+            BundleDeploymentStatus::Active,
+        )]);
+        let rc = single_revision_rc(&dep_id); // empty pack_list_refs -> fails
+
+        let stores = new_revision_stores();
+        let key = RevisionStoreKey {
+            deployment_id: "carried-dep".to_string(),
+            revision_id: "carried-rev".to_string(),
+            tenant: "t".to_string(),
+            team: "tm".to_string(),
+            customer_id: "c".to_string(),
+            bundle_id: "b".to_string(),
+        };
+        let seeded_session = new_session_store();
+        stores.lock().unwrap().insert(
+            key.clone(),
+            (Arc::clone(&seeded_session), new_state_store()),
+        );
+
+        assert!(
+            block_on(activate_runtime_config(
+                dir.path(),
+                &rc,
+                dummy_secrets(),
+                None,
+                &env,
+                dummy_resolver(),
+                dummy_pin_store(),
+                &stores,
+            ))
+            .is_err(),
+            "activation must fail at pack reading (the rc pins no packs)"
+        );
+
+        let guard = stores.lock().unwrap();
+        let (still_there, _) = guard
+            .get(&key)
+            .expect("a failed activation must not evict carried stores");
+        assert!(
+            Arc::ptr_eq(still_there, &seeded_session),
+            "the carried store must be the SAME allocation — replacing it drops \
+             every conversation the live host is serving on that revision"
+        );
+    }
+
+    /// A successful activation commits exactly the revisions it serves, so
+    /// stores for revisions that dropped out of the runtime-config are released
+    /// rather than accumulating for the life of the process.
+    #[test]
+    fn successful_activation_prunes_stores_for_unserved_revisions() {
+        let dir = tempdir().unwrap();
+        seed_env_dir(dir.path());
+        let env = make_env(Vec::new());
+        let rc = LoadedRuntimeConfig {
+            env_id: ENV_ID.to_string(),
+            revisions: Vec::new(),
+        };
+
+        let stores = new_revision_stores();
+        stores.lock().unwrap().insert(
+            RevisionStoreKey {
+                deployment_id: "gone-dep".to_string(),
+                revision_id: "gone-rev".to_string(),
+                tenant: "t".to_string(),
+                team: "tm".to_string(),
+                customer_id: "c".to_string(),
+                bundle_id: "b".to_string(),
+            },
+            (new_session_store(), new_state_store()),
+        );
+
+        block_on(activate_runtime_config(
+            dir.path(),
+            &rc,
+            dummy_secrets(),
+            None,
+            &env,
+            dummy_resolver(),
+            dummy_pin_store(),
+            &stores,
+        ))
+        .expect("empty rc activates");
+
+        assert!(
+            stores.lock().unwrap().is_empty(),
+            "a revision no longer in the runtime-config must not keep its stores \
+             alive — the registry would grow for the life of the process"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // D1 extension: the store key includes the full identity — tenant, team,
+    // customer, and bundle — so a reload cannot carry one identity's sessions
+    // into another's runtime.
+    // ---------------------------------------------------------------
+
+    /// The store key must be built FROM the deployment's identity, not merely be
+    /// capable of distinguishing two hand-written literals. These go through
+    /// `revision_store_key` so dropping a field at the construction site fails
+    /// them — asserting on literals would not.
+    fn store_key_meta(tenant: &str, team: &str, customer: &str) -> DeploymentMeta {
+        DeploymentMeta {
+            tenant: tenant.to_string(),
+            team: team.to_string(),
+            customer_id: customer.to_string(),
+            status: BundleDeploymentStatus::Active,
+            bundle_id: "fast2flow".to_string(),
+            path_prefixes: Vec::new(),
+        }
+    }
+
+    fn store_key_block() -> crate::runtime_config::ResolvedRevisionBlock {
+        crate::runtime_config::ResolvedRevisionBlock {
+            deployment_id: "dep-1".to_string(),
+            revision_id: "rev-1".to_string(),
+            bundle_id: "fast2flow".to_string(),
+            pack_list_refs: Vec::new(),
+            pack_config_refs: Vec::new(),
+            weight_bps: 10_000,
+        }
+    }
+
+    /// Same deployment, same revision, same identity → the registry hands back
+    /// the SAME store allocation, which is what keeps live conversations alive
+    /// across a full reload.
+    #[test]
+    fn store_key_unchanged_revision_carries_forward() {
+        let block = store_key_block();
+        let session = new_session_store();
+        let state = new_state_store();
+        let mut registry = HashMap::new();
+        registry.insert(
+            revision_store_key(&store_key_meta("acme", "default", "cust-1"), &block),
+            (Arc::clone(&session), Arc::clone(&state)),
+        );
+
+        let (found_session, found_state) = registry
+            .get(&revision_store_key(
+                &store_key_meta("acme", "default", "cust-1"),
+                &block,
+            ))
+            .cloned()
+            .expect("an unchanged revision must find its carried stores");
+        assert!(
+            Arc::ptr_eq(&found_session, &session),
+            "unchanged revision must reuse the SAME session store allocation"
+        );
+        assert!(
+            Arc::ptr_eq(&found_state, &state),
+            "unchanged revision must reuse the SAME state store allocation"
+        );
+    }
+
+    /// A `customer_id` change forces the Full path — which is where the
+    /// carry-forward runs — so the key must not match, or the replacement
+    /// customer inherits the previous one's sessions.
+    ///
+    /// MUTATION PROOF: drop `customer_id` from `revision_store_key` and this
+    /// fails.
+    #[test]
+    fn store_key_customer_change_mints_fresh_stores() {
+        let block = store_key_block();
+        let mut registry = HashMap::new();
+        registry.insert(
+            revision_store_key(&store_key_meta("acme", "default", "cust-1"), &block),
+            (new_session_store(), new_state_store()),
+        );
+        assert!(
+            !registry.contains_key(&revision_store_key(
+                &store_key_meta("acme", "default", "cust-2"),
+                &block
+            )),
+            "a customer_id change must NOT reuse the previous customer's stores — \
+             the new customer would inherit the old one's sessions"
+        );
+    }
+
+    /// Same argument for the tenant. `SessionKey` is an opaque generated id and
+    /// `get_session` resolves it with no tenant check, so a key still held by
+    /// the previous tenant's client would resolve against the new tenant.
+    ///
+    /// MUTATION PROOF: drop `tenant` from `revision_store_key` and this fails.
+    #[test]
+    fn store_key_tenant_change_mints_fresh_stores() {
+        let block = store_key_block();
+        let mut registry = HashMap::new();
+        registry.insert(
+            revision_store_key(&store_key_meta("acme", "default", "cust-1"), &block),
+            (new_session_store(), new_state_store()),
+        );
+        assert!(
+            !registry.contains_key(&revision_store_key(
+                &store_key_meta("globex", "default", "cust-1"),
+                &block
+            )),
+            "a tenant change must NOT reuse the previous tenant's stores"
+        );
+    }
+
+    /// The team is part of the secret scope, so it is part of the state
+    /// identity too.
+    ///
+    /// MUTATION PROOF: drop `team` from `revision_store_key` and this fails.
+    #[test]
+    fn store_key_team_change_mints_fresh_stores() {
+        let block = store_key_block();
+        let mut registry = HashMap::new();
+        registry.insert(
+            revision_store_key(&store_key_meta("acme", "default", "cust-1"), &block),
+            (new_session_store(), new_state_store()),
+        );
+        assert!(
+            !registry.contains_key(&revision_store_key(
+                &store_key_meta("acme", "support", "cust-1"),
+                &block
+            )),
+            "a team change must NOT reuse the previous team's stores"
+        );
     }
 
     #[test]
@@ -1368,6 +2088,7 @@ mod tests {
             &env,
             dummy_resolver(),
             dummy_pin_store(),
+            &new_revision_stores(),
         )) {
             Ok(_) => panic!("expected activation to fail closed on a foreign tenant"),
             Err(e) => e,
@@ -1403,6 +2124,7 @@ mod tests {
             &env,
             dummy_resolver(),
             dummy_pin_store(),
+            &new_revision_stores(),
         )) {
             Ok(_) => panic!("expected activation to pass the scope guard and reach pack reading"),
             Err(e) => e,
