@@ -7,7 +7,8 @@
 //! supervised by [`crate::gtunnel::start_agent`]. Reconnects with backoff so a
 //! transient Worker/edge blip does not strand the tunnel.
 
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -21,8 +22,15 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 /// Heartbeat cadence — must stay under the Worker's stale-eviction window (60s).
 const PING: Duration = Duration::from_secs(25);
-/// Backoff between reconnect attempts.
-const RECONNECT: Duration = Duration::from_secs(2);
+/// Reconnect backoff: starts here, doubles up to the cap, resets on a live connect.
+const RECONNECT_MIN: Duration = Duration::from_secs(2);
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// Liveness: if no frame arrives from the Worker for this long (~3 missed
+/// heartbeat pongs), the socket is treated as dead even without a close frame,
+/// and the agent force-reconnects. Guards against half-open connections.
+const STALE_AFTER: Duration = Duration::from_secs(75);
+/// How often the watchdog checks for staleness.
+const WATCHDOG_TICK: Duration = Duration::from_secs(15);
 /// Request headers we never forward to the origin.
 const DROP_HEADERS: [&str; 5] = [
     "host",
@@ -63,12 +71,19 @@ pub fn run(config: AgentConfig) -> Result<()> {
 }
 
 async fn run_loop(config: AgentConfig, client: reqwest::blocking::Client) {
+    let mut backoff = RECONNECT_MIN;
     loop {
-        if let Err(err) = connect_once(&config, &client).await {
-            eprintln!("[tunnel] {err:#}");
+        match connect_once(&config, &client).await {
+            // Connected (then dropped/stale): a live tunnel flapped — reset backoff.
+            Ok(()) => backoff = RECONNECT_MIN,
+            // Never connected: back off so a down Worker isn't hammered.
+            Err(err) => {
+                eprintln!("[tunnel] {err:#}");
+                backoff = (backoff * 2).min(RECONNECT_MAX);
+            }
         }
-        eprintln!("[tunnel] down, retry in {}s", RECONNECT.as_secs());
-        tokio::time::sleep(RECONNECT).await;
+        eprintln!("[tunnel] down, retry in {}s", backoff.as_secs());
+        tokio::time::sleep(backoff).await;
     }
 }
 
@@ -113,7 +128,31 @@ async fn connect_once(config: &AgentConfig, client: &reqwest::blocking::Client) 
         }
     });
 
-    let result = pump(&mut read, &tx, client, &config.target).await;
+    // Liveness: pump stamps `last_seen` on every frame; the watchdog forces a
+    // reconnect if the Worker goes silent (half-open socket with no close frame).
+    let last_seen = Arc::new(Mutex::new(Instant::now()));
+    let watchdog_seen = last_seen.clone();
+    let watchdog = async move {
+        let mut ticker = tokio::time::interval(WATCHDOG_TICK);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if watchdog_seen.lock().expect("last_seen lock").elapsed() > STALE_AFTER {
+                return;
+            }
+        }
+    };
+
+    let result = tokio::select! {
+        r = pump(&mut read, &tx, client, &config.target, &last_seen) => r,
+        _ = watchdog => {
+            eprintln!(
+                "[tunnel] no frames from Worker for {}s — reconnecting",
+                STALE_AFTER.as_secs()
+            );
+            Ok(())
+        }
+    };
 
     heartbeat.abort();
     writer.abort();
@@ -132,11 +171,14 @@ async fn pump<S>(
     tx: &mpsc::UnboundedSender<Message>,
     client: &reqwest::blocking::Client,
     target: &str,
+    last_seen: &Arc<Mutex<Instant>>,
 ) -> Result<()>
 where
     S: StreamExt<Item = WsFrame> + Unpin,
 {
     while let Some(msg) = read.next().await {
+        // Any frame (request or heartbeat pong) proves the socket is alive.
+        *last_seen.lock().expect("last_seen lock") = Instant::now();
         let text = match msg.context("read frame")? {
             Message::Text(t) => t.as_str().to_owned(),
             Message::Close(_) => break,
