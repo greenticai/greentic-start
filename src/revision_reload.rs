@@ -65,6 +65,13 @@ use crate::secrets_gate::DynSecretsManager;
 /// operator's interactive expectation of "the change took effect".
 pub(crate) const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// Maximum number of re-read attempts when the torn-write guard detects a
+/// newly-unbacked Active deployment. Each attempt sleeps `DEFAULT_DEBOUNCE`
+/// before re-reading. If all are exhausted and the pair is still torn, the
+/// rebuild proceeds with a warning (the state may be legitimate — see comment
+/// in `rebuild_once`).
+const TORN_WRITE_MAX_RETRIES: u32 = 3;
+
 /// Owned cleanup handle: dropping it shuts the debouncer (which closes the
 /// event channel) and joins the worker thread, so callers don't need to
 /// remember a separate `stop()` call.
@@ -447,6 +454,25 @@ fn load_reload_inputs(
     Ok((rc, environment))
 }
 
+/// Returns the set of deployment ids that are newly unbacked (Active in the
+/// environment with no revision block in the runtime-config) relative to a
+/// previously-observed set. An empty return means either no unbacked deployments
+/// exist or all of them were already known — i.e. the torn-write window has
+/// closed or the state is the legitimate `op bundles add` steady state.
+///
+/// Factored out as a pure function so the bounded-retry decision logic in
+/// `rebuild_once` is independently testable without real files or sleeps.
+fn torn_write_newly_unbacked(
+    current_unbacked: &std::collections::BTreeSet<String>,
+    previously_unbacked: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    current_unbacked
+        .iter()
+        .filter(|id| !previously_unbacked.contains(id.as_str()))
+        .cloned()
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rebuild_once(
     store_root: &Path,
@@ -477,21 +503,56 @@ fn rebuild_once(
     // it: the hot-attached bundle 502'd because its routing went live a full
     // activation ahead of its revision.
     //
-    // So: if a deployment is newly Active-but-unbacked, wait one debounce
-    // window and read again. `newly` is what keeps this free in the steady
-    // state — `op bundles add` legitimately creates a deployment before
-    // `revisions stage` supplies its block, and once that state has been
-    // observed it is not a torn write and never waits again.
+    // Bounded retry: if a deployment is newly Active-but-unbacked, wait one
+    // debounce window and re-read, up to `TORN_WRITE_MAX_RETRIES` times.
+    // `newly` is what keeps this free in the steady state — `op bundles add`
+    // legitimately creates a deployment before `revisions stage` supplies its
+    // block, and once that state has been observed in `previously_unbacked` it
+    // is not a torn write and never waits again.
+    //
+    // If all retries are exhausted and the pair is still torn, we proceed with
+    // a warning rather than returning early. An Active deployment with no
+    // revision block IS a legitimate steady state (`op bundles add` before
+    // `revisions stage`), and refusing to publish would silently drop a genuine
+    // environment change (e.g. a `default_bundle` flip) written in the same
+    // batch for as long as that deployment stays unstaged.
     let previously_unbacked = last
         .as_ref()
         .map(|prev| revision_boot::unbacked_active_deployments(&prev.rc, &prev.env))
         .unwrap_or_default();
-    if revision_boot::unbacked_active_deployments(&rc, &environment)
-        .iter()
-        .any(|id| !previously_unbacked.contains(id))
-    {
-        std::thread::sleep(DEFAULT_DEBOUNCE);
-        (rc, environment) = load_reload_inputs(store_root, env_id)?;
+    let newly_unbacked_ids = torn_write_newly_unbacked(
+        &revision_boot::unbacked_active_deployments(&rc, &environment),
+        &previously_unbacked,
+    );
+    if !newly_unbacked_ids.is_empty() {
+        let mut resolved = false;
+        for _ in 0..TORN_WRITE_MAX_RETRIES {
+            std::thread::sleep(DEFAULT_DEBOUNCE);
+            (rc, environment) = load_reload_inputs(store_root, env_id)?;
+            let still_unbacked = torn_write_newly_unbacked(
+                &revision_boot::unbacked_active_deployments(&rc, &environment),
+                &previously_unbacked,
+            );
+            if still_unbacked.is_empty() {
+                resolved = true;
+                break;
+            }
+        }
+        if !resolved {
+            let remaining = torn_write_newly_unbacked(
+                &revision_boot::unbacked_active_deployments(&rc, &environment),
+                &previously_unbacked,
+            );
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "torn-write guard exhausted {TORN_WRITE_MAX_RETRIES} retries; \
+                     deployment(s) {:?} are Active-but-unbacked — routing for them \
+                     will not be dispatchable until their revision block lands",
+                    remaining,
+                ),
+            );
+        }
     }
     // Dedup AFTER both reads — neither file alone is a sufficient key. An
     // env.json rewrite with no real change short-circuits here even though
@@ -1094,6 +1155,61 @@ mod tests {
         assert!(
             observed >= 2,
             "watcher must keep running after a rebuild error (rebuild fired {observed} times)"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Torn-write bounded retry: the `torn_write_newly_unbacked` helper
+    // decides whether the torn-write guard should re-read.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn torn_write_no_newly_unbacked_returns_empty() {
+        use std::collections::BTreeSet;
+        // All current unbacked ids were already known — nothing is "new".
+        let previously = BTreeSet::from(["dep-a".to_string()]);
+        let current = BTreeSet::from(["dep-a".to_string()]);
+        assert!(
+            torn_write_newly_unbacked(&current, &previously).is_empty(),
+            "a deployment already in previously_unbacked is not a torn write"
+        );
+    }
+
+    #[test]
+    fn torn_write_newly_unbacked_surfaces_new_ids() {
+        use std::collections::BTreeSet;
+        let previously = BTreeSet::from(["dep-a".to_string()]);
+        let current = BTreeSet::from(["dep-a".to_string(), "dep-b".to_string()]);
+        let newly = torn_write_newly_unbacked(&current, &previously);
+        assert_eq!(
+            newly,
+            vec!["dep-b".to_string()],
+            "a deployment not in previously_unbacked IS newly torn"
+        );
+    }
+
+    #[test]
+    fn torn_write_empty_current_returns_empty() {
+        use std::collections::BTreeSet;
+        let previously = BTreeSet::from(["dep-a".to_string()]);
+        let current = BTreeSet::new();
+        assert!(
+            torn_write_newly_unbacked(&current, &previously).is_empty(),
+            "no unbacked deployments means no torn write"
+        );
+    }
+
+    #[test]
+    fn torn_write_resolved_after_reread_returns_empty() {
+        use std::collections::BTreeSet;
+        // Simulates: initial read showed dep-b as newly unbacked, re-read
+        // shows it backed (disappeared from unbacked set) — the guard should
+        // stop retrying.
+        let previously = BTreeSet::new();
+        let after_reread = BTreeSet::new(); // dep-b no longer unbacked
+        assert!(
+            torn_write_newly_unbacked(&after_reread, &previously).is_empty(),
+            "once the unbacked deployment disappears, the guard must stop retrying"
         );
     }
 }

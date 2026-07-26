@@ -98,10 +98,15 @@ pub(crate) struct RuntimeConfigActivation {
 /// preserves is isolation *between* revisions — two live revisions of one pack
 /// must not share a session backend — not isolation across time for a single
 /// revision, which is exactly the continuity a reload should keep.
+///
+/// **Invariant:** stores are reused only when every identity field is unchanged.
+/// A reload can never hand one tenant's or customer's conversation state to
+/// another, because the key includes `tenant`, `team`, `customer_id`, and
+/// `bundle_id` alongside the deployment and revision ids.
 pub(crate) type RevisionStores = Arc<
     std::sync::Mutex<
         HashMap<
-            (String, String),
+            RevisionStoreKey,
             (
                 greentic_runner_host::storage::DynSessionStore,
                 greentic_runner_host::storage::DynStateStore,
@@ -109,6 +114,20 @@ pub(crate) type RevisionStores = Arc<
         >,
     >,
 >;
+
+/// Composite key for the per-revision store registry. Stores are carried
+/// forward across reloads only when ALL identity fields match — so a tenant,
+/// team, or customer change on the same deployment/revision mints fresh stores
+/// rather than leaking the previous identity's sessions.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RevisionStoreKey {
+    pub deployment_id: String,
+    pub revision_id: String,
+    pub tenant: String,
+    pub team: String,
+    pub customer_id: String,
+    pub bundle_id: String,
+}
 
 /// A fresh, empty [`RevisionStores`] registry. One per running server, created
 /// at cold start and shared with the reload producer.
@@ -122,6 +141,10 @@ pub(crate) fn new_revision_stores() -> RevisionStores {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DeploymentMeta {
     tenant: String,
+    /// The team within the tenant. Drives `ensure_generated_secrets_for_activation`'s
+    /// secret scope (`SecretsSetup::new(…, Some(team))`), so a team change must
+    /// force the full activation path to re-materialize team-scoped secrets.
+    team: String,
     customer_id: String,
     status: BundleDeploymentStatus,
     /// The bundle the deployment is (immutably) bound to.
@@ -410,12 +433,20 @@ pub(crate) async fn activate_runtime_config(
         // [`RevisionStores`]. Reuse keyed on the revision keeps the isolation
         // above intact: it is isolation between revisions, not across reloads of
         // one revision.
+        let store_key = RevisionStoreKey {
+            deployment_id: block.deployment_id.clone(),
+            revision_id: block.revision_id.clone(),
+            tenant: meta.tenant.clone(),
+            team: meta.team.clone(),
+            customer_id: meta.customer_id.clone(),
+            bundle_id: block.bundle_id.clone(),
+        };
         let (session_store, state_store) = carried
-            .get(&(block.deployment_id.clone(), block.revision_id.clone()))
+            .get(&store_key)
             .cloned()
             .unwrap_or_else(|| (new_session_store(), new_state_store()));
         retained.insert(
-            (block.deployment_id.clone(), block.revision_id.clone()),
+            store_key,
             (Arc::clone(&session_store), Arc::clone(&state_store)),
         );
         let session_host = session_host_from(Arc::clone(&session_store));
@@ -543,6 +574,9 @@ pub(crate) fn reactivate_routing_only(
 ///
 /// - `tenant` → the set of `HostConfig`s the host is built with, and the
 ///   secrets-scope gate
+/// - `team` → `ensure_generated_secrets_for_activation`'s secret scope
+///   (`SecretsSetup::new(…, Some(team))`); a team change must re-materialize
+///   team-scoped generated secrets
 /// - `status` → the `Active`-only admission gate
 /// - `bundle_id` → the cross-check against each runtime-config block
 /// - `path_prefixes` → `discover_revision_routes`, i.e. `http_routes`
@@ -602,6 +636,7 @@ fn deployment_index(env: &Environment) -> HashMap<String, DeploymentMeta> {
                 dep.deployment_id.to_string(),
                 DeploymentMeta {
                     tenant: dep.route_binding.tenant_selector.tenant.clone(),
+                    team: dep.route_binding.tenant_selector.team.clone(),
                     customer_id: dep.customer_id.as_str().to_string(),
                     status: dep.status,
                     bundle_id: dep.bundle_id.as_str().to_string(),
@@ -1006,6 +1041,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn routing_only_delta_rejects_team_change() {
+        let prev = routing_delta_env();
+        let mut next = prev.clone();
+        next.bundles[0].route_binding.tenant_selector.team = "engineering".to_string();
+        assert!(
+            !env_routing_only_delta(&prev, &next),
+            "team drives ensure_generated_secrets_for_activation's secret scope — \
+             a team change must force a full activation to re-materialize secrets"
+        );
+    }
+
     // ---------------------------------------------------------------
     // `unbacked_active_deployments` — the torn-write detector. `env-deploy`
     // writes environment.json and runtime-config.json separately; a reload
@@ -1123,6 +1170,7 @@ mod tests {
         let index = deployment_index(&env);
         let meta = index.get(&key).expect("deployment present");
         assert_eq!(meta.tenant, "acme");
+        assert_eq!(meta.team, "default");
         assert_eq!(meta.customer_id, "cust-1");
         assert_eq!(meta.bundle_id, "fast2flow");
         assert_eq!(meta.status, BundleDeploymentStatus::Active);
@@ -1751,7 +1799,14 @@ mod tests {
         let rc = single_revision_rc(&dep_id); // empty pack_list_refs -> fails
 
         let stores = new_revision_stores();
-        let key = ("carried-dep".to_string(), "carried-rev".to_string());
+        let key = RevisionStoreKey {
+            deployment_id: "carried-dep".to_string(),
+            revision_id: "carried-rev".to_string(),
+            tenant: "t".to_string(),
+            team: "tm".to_string(),
+            customer_id: "c".to_string(),
+            bundle_id: "b".to_string(),
+        };
         let seeded_session = new_session_store();
         stores.lock().unwrap().insert(
             key.clone(),
@@ -1799,7 +1854,14 @@ mod tests {
 
         let stores = new_revision_stores();
         stores.lock().unwrap().insert(
-            ("gone-dep".to_string(), "gone-rev".to_string()),
+            RevisionStoreKey {
+                deployment_id: "gone-dep".to_string(),
+                revision_id: "gone-rev".to_string(),
+                tenant: "t".to_string(),
+                team: "tm".to_string(),
+                customer_id: "c".to_string(),
+                bundle_id: "b".to_string(),
+            },
             (new_session_store(), new_state_store()),
         );
 
@@ -1819,6 +1881,107 @@ mod tests {
             stores.lock().unwrap().is_empty(),
             "a revision no longer in the runtime-config must not keep its stores \
              alive — the registry would grow for the life of the process"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // D1 extension: the store key includes the full identity — tenant, team,
+    // customer, and bundle — so a reload cannot carry one identity's sessions
+    // into another's runtime.
+    // ---------------------------------------------------------------
+
+    /// Unchanged revision carries its stores forward (same Arc allocation).
+    #[test]
+    fn store_key_unchanged_revision_carries_forward() {
+        let key = RevisionStoreKey {
+            deployment_id: "dep-1".to_string(),
+            revision_id: "rev-1".to_string(),
+            tenant: "acme".to_string(),
+            team: "default".to_string(),
+            customer_id: "cust-1".to_string(),
+            bundle_id: "fast2flow".to_string(),
+        };
+        let session = new_session_store();
+        let state = new_state_store();
+        let mut registry = HashMap::new();
+        registry.insert(key.clone(), (Arc::clone(&session), Arc::clone(&state)));
+
+        // Simulate the lookup with an identical key (same revision, same identity).
+        let (found_session, found_state) = registry
+            .get(&key)
+            .cloned()
+            .expect("identical key must find the entry");
+        assert!(
+            Arc::ptr_eq(&found_session, &session),
+            "unchanged revision must reuse the SAME session store allocation"
+        );
+        assert!(
+            Arc::ptr_eq(&found_state, &state),
+            "unchanged revision must reuse the SAME state store allocation"
+        );
+    }
+
+    /// A customer_id change on the same (deployment, revision) mints fresh stores.
+    #[test]
+    fn store_key_customer_change_mints_fresh_stores() {
+        let original_key = RevisionStoreKey {
+            deployment_id: "dep-1".to_string(),
+            revision_id: "rev-1".to_string(),
+            tenant: "acme".to_string(),
+            team: "default".to_string(),
+            customer_id: "cust-1".to_string(),
+            bundle_id: "fast2flow".to_string(),
+        };
+        let session = new_session_store();
+        let state = new_state_store();
+        let mut registry = HashMap::new();
+        registry.insert(original_key, (Arc::clone(&session), Arc::clone(&state)));
+
+        // Different customer_id — must NOT find the entry.
+        let changed_key = RevisionStoreKey {
+            deployment_id: "dep-1".to_string(),
+            revision_id: "rev-1".to_string(),
+            tenant: "acme".to_string(),
+            team: "default".to_string(),
+            customer_id: "cust-2".to_string(),
+            bundle_id: "fast2flow".to_string(),
+        };
+        assert!(
+            !registry.contains_key(&changed_key),
+            "a customer_id change must NOT reuse the previous customer's stores — \
+             the new customer would inherit the old one's sessions"
+        );
+    }
+
+    /// A tenant change on the same (deployment, revision) mints fresh stores.
+    #[test]
+    fn store_key_tenant_change_mints_fresh_stores() {
+        let original_key = RevisionStoreKey {
+            deployment_id: "dep-1".to_string(),
+            revision_id: "rev-1".to_string(),
+            tenant: "acme".to_string(),
+            team: "default".to_string(),
+            customer_id: "cust-1".to_string(),
+            bundle_id: "fast2flow".to_string(),
+        };
+        let session = new_session_store();
+        let state = new_state_store();
+        let mut registry = HashMap::new();
+        registry.insert(original_key, (Arc::clone(&session), Arc::clone(&state)));
+
+        // Different tenant — must NOT find the entry.
+        let changed_key = RevisionStoreKey {
+            deployment_id: "dep-1".to_string(),
+            revision_id: "rev-1".to_string(),
+            tenant: "globex".to_string(),
+            team: "default".to_string(),
+            customer_id: "cust-1".to_string(),
+            bundle_id: "fast2flow".to_string(),
+        };
+        assert!(
+            !registry.contains_key(&changed_key),
+            "a tenant change must NOT reuse the previous tenant's stores — \
+             the new tenant would inherit the old one's sessions"
         );
     }
 
