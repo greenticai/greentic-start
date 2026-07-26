@@ -377,6 +377,17 @@ impl WebchatTarget {
 const WEBCHAT_PREFIX_WEB: &str = "/v1/web/webchat/";
 const WEBCHAT_PREFIX_MSG: &str = "/v1/messaging/webchat/";
 
+/// Whether `path` addresses the webchat URL space at all.
+///
+/// A path in this space is addressed by `{tenant}[/{bundle}[/{flow}]]`, not by
+/// the `(host, path_prefix)` binding the generic deployment route table uses.
+/// Callers use this to tell "not a webchat request" apart from "a webchat
+/// request that resolved to nothing" — [`classify_webchat_path`] returns `None`
+/// for both, and they must not be handled the same way.
+pub(crate) fn is_webchat_path(path: &str) -> bool {
+    path.starts_with(WEBCHAT_PREFIX_WEB) || path.starts_with(WEBCHAT_PREFIX_MSG)
+}
+
 /// Classify a webchat URL path against the bundle and flow indices.
 ///
 /// Returns `None` when the path is not a webchat path (does not start with
@@ -785,6 +796,48 @@ mod tests {
         let (routes, bi, fi) = harness(&env);
 
         assert!(classify_webchat_path("/v1/web/webchat/acme", None, &bi, &fi, &routes).is_none());
+    }
+
+    #[test]
+    fn is_webchat_path_covers_both_domains_and_nothing_else() {
+        assert!(is_webchat_path("/v1/web/webchat/acme/token"));
+        assert!(is_webchat_path("/v1/messaging/webchat/acme/token"));
+        assert!(!is_webchat_path("/v1/messaging/telegram/ingress"));
+        // The bare prefix is in the space (and unroutable), not outside it.
+        assert!(is_webchat_path("/v1/messaging/webchat/"));
+    }
+
+    /// The reason `serve()` must 404 a declined webchat path instead of
+    /// falling through to `DeploymentRouteTable::resolve`.
+    ///
+    /// The classifier declines an unknown tenant, but the generic resolve
+    /// matches on `(host, path_prefix)` alone and answers with the
+    /// *deployment's* tenant — so the fallback served `acme`'s bundle to a URL
+    /// naming a tenant that does not exist. greentic-start#454.
+    #[test]
+    fn unknown_tenant_is_declined_but_the_generic_resolve_would_still_match() {
+        let dep_id = DeploymentId::new();
+        let env = make_env(vec![make_deployment(dep_id, "acme", "chat")]);
+        let (routes, bi, fi) = harness(&env);
+
+        for tenant in ["default", "totally-made-up", "zzz-nonsense-9999"] {
+            let path = format!("/v1/messaging/webchat/{tenant}/token");
+            assert!(is_webchat_path(&path));
+            assert!(
+                classify_webchat_path(&path, None, &bi, &fi, &routes).is_none(),
+                "tenant `{tenant}` has no deployment and must not classify"
+            );
+
+            let (fallback_dep, fallback_tenant) = routes
+                .resolve(None, &path)
+                .expect("the generic resolve matches any path under the `/` binding");
+            assert_eq!(fallback_dep, dep_id);
+            assert_eq!(
+                fallback_tenant, "acme",
+                "the fallback answers with the deployment's tenant, not `{tenant}` \
+                 — which is why the caller must reject instead of falling through"
+            );
+        }
     }
 
     // ── reserved literal after tenant (DirectLine API) ──────────────
