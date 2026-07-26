@@ -158,10 +158,9 @@ fn serving(public_url: &str) -> bool {
     }
 }
 
-/// Machine-wide per-tunnel secret file (shared on-disk format with
-/// greentic-setup, which provisions it): `<root>/secrets/<tunnelId>`.
-fn tunnel_secret_path(tunnel_id: &str) -> PathBuf {
-    let root = std::env::var_os("GREENTIC_TUNNEL_STATE_DIR")
+/// `~/.greentic/tunnel` (override: `GREENTIC_TUNNEL_STATE_DIR`).
+fn tunnel_state_root() -> PathBuf {
+    std::env::var_os("GREENTIC_TUNNEL_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
@@ -170,22 +169,41 @@ fn tunnel_secret_path(tunnel_id: &str) -> PathBuf {
                 .unwrap_or_else(std::env::temp_dir)
                 .join(".greentic")
                 .join("tunnel")
-        });
-    root.join("secrets").join(tunnel_id)
+        })
 }
 
-/// Resolve a tunnel's secret: explicit `GREENTIC_TUNNEL_SECRET` override, else
-/// the per-tunnel secret greentic-setup provisioned into the shared store.
-/// Empty when neither is set — the Worker's global fallback still applies during
-/// the auth-later phase. Start never generates; only setup provisions.
+/// Machine-wide per-tunnel secret file (shared on-disk format with
+/// greentic-setup, which provisions it): `<root>/secrets/<tunnelId>`.
+fn tunnel_secret_path(tunnel_id: &str) -> PathBuf {
+    tunnel_state_root().join("secrets").join(tunnel_id)
+}
+
+/// Operator's shared tunnel secret, set once so the managed tunnel works with no
+/// per-run env var: `<root>/secret`.
+fn operator_secret_path() -> PathBuf {
+    tunnel_state_root().join("secret")
+}
+
+fn read_secret_file(path: PathBuf) -> Option<String> {
+    let s = std::fs::read_to_string(path).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Resolve a tunnel's secret in precedence order:
+///   1. `GREENTIC_TUNNEL_SECRET` env override,
+///   2. the per-tunnel secret greentic-setup provisioned (`<root>/secrets/<id>`),
+///   3. the operator's shared secret (`<root>/secret`, set once — the zero-config
+///      path so the managed tunnel is used without exporting anything each run).
+///
+/// Empty when none is set; start never generates, only setup provisions.
 pub(crate) fn resolve_secret(tunnel_id: &str) -> String {
     if let Ok(secret) = std::env::var("GREENTIC_TUNNEL_SECRET")
         && !secret.is_empty()
     {
         return secret;
     }
-    std::fs::read_to_string(tunnel_secret_path(tunnel_id))
-        .map(|s| s.trim().to_string())
+    read_secret_file(tunnel_secret_path(tunnel_id))
+        .or_else(|| read_secret_file(operator_secret_path()))
         .unwrap_or_default()
 }
 
