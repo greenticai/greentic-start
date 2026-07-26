@@ -607,7 +607,10 @@ pub(crate) fn reactivate_routing_only(
 /// field outside `deployment_index` on the host/pack path, that field must join
 /// [`DeploymentMeta`] (or this predicate must grow to cover it), or the fast
 /// path will silently serve a stale host. `routing_only_delta_rejects_*` in this
-/// module's tests pins each field currently in the projection.
+/// module's tests pins each field currently in the projection — they prove the
+/// current set, not completeness. The tripwire for a NEW upstream field is the
+/// exhaustive `BundleDeployment` literal in this module's `make_deployment` test
+/// helper, which fails to compile when one is added; see its doc comment.
 pub(crate) fn env_routing_only_delta(prev: &Environment, next: &Environment) -> bool {
     prev.environment_id == next.environment_id && deployment_index(prev) == deployment_index(next)
 }
@@ -875,6 +878,22 @@ mod tests {
         EnvId::try_from(ENV_ID).unwrap()
     }
 
+    /// **This literal is deliberately exhaustive — do not add `..Default::default()`.**
+    ///
+    /// It is the tripwire for [`env_routing_only_delta`]'s obligation. That
+    /// predicate is sound only while [`deployment_index`] captures every
+    /// `BundleDeployment` field the host/pack half of
+    /// [`activate_runtime_config`] reads; a field that reaches the host but not
+    /// the projection makes the routing-only fast path serve a stale host, and
+    /// no existing test would catch it (the `routing_only_delta_rejects_*` cases
+    /// prove the current set, they cannot prove completeness).
+    ///
+    /// Because this literal names every field, adding one upstream in
+    /// `greentic-deploy-spec` fails to compile HERE. If you are reading this
+    /// because of that error: decide whether the new field reaches the host or
+    /// the packs. If it does, add it to [`DeploymentMeta`] and add a
+    /// `routing_only_delta_rejects_*` case for it. If it does not, it is
+    /// routing-only by definition and just needs a value below.
     fn make_deployment(
         deployment_id: DeploymentId,
         tenant: &str,

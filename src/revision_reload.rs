@@ -520,36 +520,31 @@ fn rebuild_once(
         .as_ref()
         .map(|prev| revision_boot::unbacked_active_deployments(&prev.rc, &prev.env))
         .unwrap_or_default();
-    let newly_unbacked_ids = torn_write_newly_unbacked(
+    let mut newly_unbacked = torn_write_newly_unbacked(
         &revision_boot::unbacked_active_deployments(&rc, &environment),
         &previously_unbacked,
     );
-    if !newly_unbacked_ids.is_empty() {
-        let mut resolved = false;
+    if !newly_unbacked.is_empty() {
         for _ in 0..TORN_WRITE_MAX_RETRIES {
             std::thread::sleep(DEFAULT_DEBOUNCE);
             (rc, environment) = load_reload_inputs(store_root, env_id)?;
-            let still_unbacked = torn_write_newly_unbacked(
+            newly_unbacked = torn_write_newly_unbacked(
                 &revision_boot::unbacked_active_deployments(&rc, &environment),
                 &previously_unbacked,
             );
-            if still_unbacked.is_empty() {
-                resolved = true;
+            if newly_unbacked.is_empty() {
                 break;
             }
         }
-        if !resolved {
-            let remaining = torn_write_newly_unbacked(
-                &revision_boot::unbacked_active_deployments(&rc, &environment),
-                &previously_unbacked,
-            );
+        // Non-empty here means every retry saw the same tear, so `newly_unbacked`
+        // already describes the final read — no need to recompute it.
+        if !newly_unbacked.is_empty() {
             operator_log::warn(
                 module_path!(),
                 format!(
                     "torn-write guard exhausted {TORN_WRITE_MAX_RETRIES} retries; \
-                     deployment(s) {:?} are Active-but-unbacked — routing for them \
-                     will not be dispatchable until their revision block lands",
-                    remaining,
+                     deployment(s) {newly_unbacked:?} are Active-but-unbacked — routing \
+                     for them will not be dispatchable until their revision block lands",
                 ),
             );
         }
@@ -681,7 +676,7 @@ mod tests {
         let host = Arc::new(
             HostBuilder::new()
                 .with_config(HostConfig::from_gtbind(TenantBindings {
-                    tenant: "recheck-test".to_string(),
+                    tenant: "watcher-test".to_string(),
                     packs: Vec::new(),
                     env_passthrough: Vec::new(),
                 }))
@@ -689,7 +684,7 @@ mod tests {
                 .expect("build placeholder host"),
         );
         let dispatcher = Arc::new(RevisionDispatcher::new(RevisionDispatcherConfig::new(
-            "recheck-test",
+            "watcher-test",
             [0u8; 32],
         )));
         Activation {
@@ -709,41 +704,12 @@ mod tests {
 
     fn placeholder_server() -> Arc<RevisionServer> {
         // RevisionServer doesn't expose a no-op test ctor publicly. Use
-        // RevisionServer::start with a placeholder activation built via
-        // the same construction path the cold-start uses.
-        use crate::deployment_routes::{DeploymentRouteTable, RevisionIngressRouting};
-        use crate::endpoint_admit::EndpointAdmit;
-        use crate::http_routes::HttpRouteTable;
-        use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
+        // RevisionServer::start with the same placeholder activation the
+        // rebuild-returning tests publish, so the two cannot drift.
         use crate::revision_serve::{RevisionServeConfig, RevisionServer};
-        use greentic_runner_host::{HostBuilder, HostConfig, TenantBindings};
         use std::net::SocketAddr;
 
-        let host = Arc::new(
-            HostBuilder::new()
-                .with_config(HostConfig::from_gtbind(TenantBindings {
-                    tenant: "watcher-test".to_string(),
-                    packs: Vec::new(),
-                    env_passthrough: Vec::new(),
-                }))
-                .build()
-                .expect("build placeholder host"),
-        );
-        let dispatcher = Arc::new(RevisionDispatcher::new(RevisionDispatcherConfig::new(
-            "watcher-test",
-            [0u8; 32],
-        )));
-        let routing = Arc::new(RevisionIngressRouting {
-            dispatcher,
-            http_routes: HttpRouteTable::from_descriptors(Vec::new()),
-            deployment_routes: DeploymentRouteTable::default(),
-            endpoint_admit: Arc::new(EndpointAdmit::default()),
-            deployment_config_overrides: Arc::default(),
-            static_routes: crate::static_routes::ActiveRouteTable::default(),
-            bundle_index: crate::webchat_routing::BundleIndex::empty(),
-            flow_index: crate::webchat_routing::FlowIndex::default(),
-        });
-        let activation = Arc::new(Activation { host, routing });
+        let activation = Arc::new(placeholder_activation());
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
         Arc::new(
             RevisionServer::start(RevisionServeConfig {
