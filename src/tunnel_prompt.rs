@@ -36,10 +36,7 @@ fn prompt_tunnel_with_io<R: BufRead, W: Write>(
         "Cloudflare Tunnel (cloudflared)",
     );
     let opt_ngrok = tr("cli.tunnel.option_ngrok", "ngrok");
-    let opt_gtunnel = tr(
-        "cli.tunnel.option_gtunnel",
-        "Greentic Tunnel (self-hosted, no setup)",
-    );
+    let opt_gtunnel = tr("cli.tunnel.option_gtunnel", "Greentic managed tunnel");
 
     let _ = writeln!(writer, "\n{prompt}");
     let _ = writeln!(writer, "1 ) {opt_none}");
