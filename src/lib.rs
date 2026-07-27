@@ -832,6 +832,25 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let mut webchat_open_url: Option<String> = None;
         let mut webchat_ui_paths: Vec<String> = Vec::new();
         if !pack_webchat_routes.is_empty() {
+            // A webchat static route serves ONLY the bundle it was discovered
+            // in — `revision_serve` matches it on the full (deployment, bundle,
+            // revision) scope. `pack_webchat_routes` answers "does this env
+            // have a webchat UI anywhere", which is the right question for
+            // suppressing the built-in console and the WRONG one for deciding
+            // which URLs exist. Advertising per-(tenant, bundle) off that
+            // global flag printed a `UI:` line for every bundle in the
+            // environment, including every bundle carrying no UI pack — and
+            // each of those answers `405 only POST is supported for the generic
+            // revision ingress`. Ask the per-bundle question here instead.
+            let webchat_ui_bundles: std::collections::BTreeSet<&str> = activation
+                .routing
+                .static_routes
+                .routes()
+                .iter()
+                .filter(|route| route.public_path.starts_with("/v1/web/webchat"))
+                .filter_map(|route| route.scope.as_ref())
+                .map(|scope| scope.bundle_id.as_str())
+                .collect();
             let tenant_bundles = activation.routing.bundle_index.tenants_and_bundles();
             if tenant_bundles.is_empty() {
                 // Fallback: no bundle index (pre-deploy-spec env), expand
@@ -868,35 +887,25 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                     }
                 }
             } else {
-                for (tenant, bundles, default_id) in &tenant_bundles {
-                    for bundle_id in bundles {
-                        let is_default = default_id.as_deref() == Some(*bundle_id);
-                        let path = if is_default {
-                            format!("/v1/web/webchat/{tenant}/")
-                        } else {
-                            format!("/v1/web/webchat/{tenant}/{bundle_id}/")
-                        };
-                        let url = format!("http://{listen}{path}");
-                        let tag = if is_default { " (default)" } else { "" };
-                        let line = format!("UI: {url}{tag}");
-                        operator_log::info(module_path!(), line.clone());
-                        println!("{line}");
-                        // Track the URL to open for --open-webchat.
-                        if webchat_open_url.is_none() && is_default {
-                            webchat_open_url = Some(url.clone());
-                        }
-                        webchat_ui_paths.push(path);
-                    }
+                let advert = advertise_webchat_urls(
+                    &listen.to_string(),
+                    &tenant_bundles,
+                    &webchat_ui_bundles,
+                );
+                for line in &advert.lines {
+                    operator_log::info(module_path!(), line.clone());
+                    println!("{line}");
                 }
-                // If no default was found, fall back to the first URL.
-                if webchat_open_url.is_none()
-                    && let Some((tenant, bundles, _)) = tenant_bundles.first()
-                    && let Some(bundle_id) = bundles.first()
-                {
-                    webchat_open_url = Some(format!(
-                        "http://{listen}/v1/web/webchat/{tenant}/{bundle_id}/"
-                    ));
+                // Say why a bundle has no URL. Silently printing fewer lines
+                // than there are bundles reads as a routing failure; the
+                // bundles are fine, they just ship no webchat UI pack and are
+                // reachable over `/v1/messaging/webchat/...` only.
+                if let Some(note) = advert.without_ui_note() {
+                    operator_log::info(module_path!(), note.clone());
+                    println!("{note}");
                 }
+                webchat_open_url = advert.open_url;
+                webchat_ui_paths.extend(advert.paths);
             }
         }
         if gui_enabled {
@@ -1892,6 +1901,85 @@ pub(crate) fn resolve_auto_restart(_no_flag: bool) -> bool {
     false
 }
 
+/// The webchat UI URLs a running environment can honestly advertise.
+///
+/// Split out of `run_start` so the "which bundles get a URL" rule is testable
+/// without booting a runtime — it was previously inline, unverified, and wrong.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct WebchatAdvert {
+    /// Ready-to-print `UI: <url>[ (default)]` lines.
+    pub(crate) lines: Vec<String>,
+    /// Path suffixes only, for rebasing onto a public tunnel base.
+    pub(crate) paths: Vec<String>,
+    /// URL `--open-webchat` should open.
+    pub(crate) open_url: Option<String>,
+    /// Bundles deliberately given no URL, in the order encountered.
+    pub(crate) without_ui: Vec<String>,
+}
+
+impl WebchatAdvert {
+    pub(crate) fn without_ui_note(&self) -> Option<String> {
+        if self.without_ui.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "no webchat UI pack in bundle(s) {} — messaging endpoints only, no browser URL",
+            self.without_ui.join(", ")
+        ))
+    }
+}
+
+/// Build the advertised webchat UI URLs for an environment.
+///
+/// `webchat_ui_bundles` is the set of bundle ids that own a `/v1/web/webchat`
+/// static route. A bundle outside it CANNOT serve a UI: `revision_serve` matches
+/// static routes on the full `(deployment, bundle, revision)` scope, so a request
+/// to its `/v1/web/webchat/<tenant>/<bundle>/` falls through to the generic
+/// ingress and comes back `405 only POST is supported…`. Advertising it anyway
+/// is what made the boot banner promise dead links.
+///
+/// An empty set means the env's webchat routes are legacy/unscoped, which
+/// predates per-bundle scoping — advertise everything, as before.
+pub(crate) fn advertise_webchat_urls(
+    listen: &str,
+    tenant_bundles: &[(&str, Vec<&str>, Option<&str>)],
+    webchat_ui_bundles: &std::collections::BTreeSet<&str>,
+) -> WebchatAdvert {
+    let mut advert = WebchatAdvert::default();
+    let mut first_url: Option<String> = None;
+    for (tenant, bundles, default_id) in tenant_bundles {
+        for bundle_id in bundles {
+            if !webchat_ui_bundles.is_empty() && !webchat_ui_bundles.contains(bundle_id) {
+                advert.without_ui.push((*bundle_id).to_string());
+                continue;
+            }
+            let is_default = default_id.as_deref() == Some(*bundle_id);
+            let path = if is_default {
+                format!("/v1/web/webchat/{tenant}/")
+            } else {
+                format!("/v1/web/webchat/{tenant}/{bundle_id}/")
+            };
+            let url = format!("http://{listen}{path}");
+            let tag = if is_default { " (default)" } else { "" };
+            advert.lines.push(format!("UI: {url}{tag}"));
+            if advert.open_url.is_none() && is_default {
+                advert.open_url = Some(url.clone());
+            }
+            if first_url.is_none() {
+                first_url = Some(url);
+            }
+            advert.paths.push(path);
+        }
+    }
+    // No servable DEFAULT bundle: open the first URL actually advertised.
+    // Re-deriving this from `bundles.first()` would reintroduce the bug at the
+    // browser — the alphabetically first bundle need not be one that can serve.
+    if advert.open_url.is_none() {
+        advert.open_url = first_url;
+    }
+    advert
+}
+
 enum ShutdownReason {
     CtrlC,
     AdminStop,
@@ -2029,6 +2117,130 @@ mod tests {
             &host_config_with_gui(Some(false)),
             false
         ));
+    }
+
+    // ── advertise_webchat_urls ──────────────────────────────────────────
+    //
+    // The demo environment that surfaced the bug: four bundles, only `gui`
+    // carries messaging-webchat-gui, and `acct` is the tenant default.
+
+    fn ui_set<'a>(ids: &[&'a str]) -> std::collections::BTreeSet<&'a str> {
+        ids.iter().copied().collect()
+    }
+
+    fn demo_env() -> Vec<(&'static str, Vec<&'static str>, Option<&'static str>)> {
+        vec![(
+            "default",
+            vec!["acct", "gui", "legal", "support"],
+            Some("acct"),
+        )]
+    }
+
+    #[test]
+    fn only_bundles_owning_a_webchat_route_are_advertised() {
+        let advert = advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &ui_set(&["gui"]));
+        // Exactly one URL, and it is the bundle that actually ships the SPA.
+        assert_eq!(
+            advert.lines,
+            vec!["UI: http://127.0.0.1:8080/v1/web/webchat/default/gui/"]
+        );
+        assert_eq!(advert.without_ui, vec!["acct", "legal", "support"]);
+    }
+
+    #[test]
+    fn a_default_bundle_with_no_ui_pack_gets_no_bare_url() {
+        // `acct` is the tenant default but ships no webchat UI, so the bare
+        // `/v1/web/webchat/default/` form must NOT be printed — it 405s.
+        //
+        // Assert against `paths`, not `lines`: the default line carries a
+        // trailing " (default)" tag, so an `ends_with` on the line silently
+        // never matches and the test passes against the BROKEN behaviour too.
+        let advert = advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &ui_set(&["gui"]));
+        assert!(
+            !advert
+                .paths
+                .iter()
+                .any(|path| path == "/v1/web/webchat/default/"),
+            "bare tenant URL advertised for a default bundle with no UI pack: {:?}",
+            advert.paths
+        );
+        assert_ne!(
+            advert.open_url.as_deref(),
+            Some("http://127.0.0.1:8080/v1/web/webchat/default/")
+        );
+    }
+
+    #[test]
+    fn open_url_falls_back_to_a_servable_bundle_not_the_first_one() {
+        // The regression this guards: `acct` sorts first AND is the default,
+        // so both the old `is_default` pick and the old `bundles.first()`
+        // fallback would have opened a browser on a 405.
+        let advert = advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &ui_set(&["gui"]));
+        assert_eq!(
+            advert.open_url.as_deref(),
+            Some("http://127.0.0.1:8080/v1/web/webchat/default/gui/")
+        );
+    }
+
+    #[test]
+    fn a_default_bundle_that_does_ship_a_ui_keeps_the_bare_url() {
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &[("default", vec!["gui", "legal"], Some("gui"))],
+            &ui_set(&["gui"]),
+        );
+        assert_eq!(
+            advert.lines,
+            vec!["UI: http://127.0.0.1:8080/v1/web/webchat/default/ (default)"]
+        );
+        assert_eq!(
+            advert.open_url.as_deref(),
+            Some("http://127.0.0.1:8080/v1/web/webchat/default/")
+        );
+        assert_eq!(advert.paths, vec!["/v1/web/webchat/default/"]);
+    }
+
+    #[test]
+    fn an_empty_scope_set_advertises_everything() {
+        // Legacy/unscoped routes carry no bundle id. Keep the pre-scoping
+        // behaviour rather than advertising nothing at all.
+        let advert = advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &ui_set(&[]));
+        assert_eq!(advert.lines.len(), 4);
+        assert!(advert.without_ui.is_empty());
+        assert!(advert.without_ui_note().is_none());
+    }
+
+    #[test]
+    fn every_advertised_path_has_a_matching_line_for_tunnel_rebasing() {
+        // `paths` is rebased onto the public tunnel URL, so a path with no
+        // corresponding line would republish a dead link publicly.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &[
+                ("acme", vec!["gui", "ops"], Some("ops")),
+                ("default", vec!["acct", "gui"], Some("acct")),
+            ],
+            &ui_set(&["gui"]),
+        );
+        assert_eq!(advert.lines.len(), advert.paths.len());
+        for path in &advert.paths {
+            assert!(
+                advert.lines.iter().any(|line| line.contains(path)),
+                "path {path} has no advertised line: {:?}",
+                advert.lines
+            );
+        }
+        assert_eq!(advert.without_ui, vec!["ops", "acct"]);
+    }
+
+    #[test]
+    fn without_ui_note_names_the_skipped_bundles() {
+        let advert = advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &ui_set(&["gui"]));
+        let note = advert
+            .without_ui_note()
+            .expect("a note for skipped bundles");
+        assert!(note.contains("acct, legal, support"), "{note}");
+        assert!(note.contains("messaging endpoints only"), "{note}");
     }
 
     #[test]
