@@ -40,9 +40,14 @@ const ENV_TARGET: &str = "GREENTIC_TUNNEL_TARGET";
 
 #[derive(Clone, Debug)]
 pub struct GtunnelConfig {
-    /// Worker base URL (http/https), e.g. `https://…workers.dev`.
+    /// Worker base URL (http/https), e.g. `https://…workers.dev`. Used for
+    /// path-prefix routing (`<worker>/<tunnelId>`).
     pub worker_base_url: String,
-    /// Tunnel id (first URL path segment), e.g. `<tenant>-<team>`.
+    /// When set (e.g. `hooks.greentic.dev`), use subdomain routing
+    /// (`https://<tunnelId>.<base_domain>`) so an app is served at the host root
+    /// — required for SPAs with root-absolute URLs (the WebChat UI).
+    pub base_domain: Option<String>,
+    /// Tunnel id (first URL path segment / subdomain label), e.g. `<tenant>-<team>`.
     pub tunnel_id: String,
     /// Shared secret the agent presents (global fallback for now).
     pub secret: String,
@@ -57,12 +62,24 @@ pub struct GtunnelHandle {
 }
 
 /// The public base URL callers hand out for a tunnel.
-pub fn public_url(worker_base_url: &str, tunnel_id: &str) -> String {
-    format!("{}/{}", worker_base_url.trim_end_matches('/'), tunnel_id)
+pub fn public_url(worker_base_url: &str, base_domain: Option<&str>, tunnel_id: &str) -> String {
+    match base_domain {
+        // Subdomain routing: the tunnel is served at its own host root.
+        Some(base) => format!("https://{}.{}", tunnel_id, base.trim_matches('.')),
+        // Path-prefix routing under the shared Worker host.
+        None => format!("{}/{}", worker_base_url.trim_end_matches('/'), tunnel_id),
+    }
 }
 
-/// The `ws(s)://…/_tunnel` registration URL derived from an `http(s)` base.
-pub fn registration_url(worker_base_url: &str, tunnel_id: &str) -> String {
+/// The `ws(s)://…/_tunnel` registration URL for the resolved routing mode.
+pub fn registration_url(
+    worker_base_url: &str,
+    base_domain: Option<&str>,
+    tunnel_id: &str,
+) -> String {
+    if let Some(base) = base_domain {
+        return format!("wss://{}.{}/_tunnel", tunnel_id, base.trim_matches('.'));
+    }
     let base = worker_base_url.trim_end_matches('/');
     let ws_base = if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
@@ -78,7 +95,11 @@ pub fn registration_url(worker_base_url: &str, tunnel_id: &str) -> String {
 /// record and return the public URL it exposes. Reuses a live agent — e.g. one
 /// started by `greentic-setup` — instead of spawning a duplicate.
 pub fn start_agent(config: &GtunnelConfig) -> anyhow::Result<GtunnelHandle> {
-    let url = public_url(&config.worker_base_url, &config.tunnel_id);
+    let url = public_url(
+        &config.worker_base_url,
+        config.base_domain.as_deref(),
+        &config.tunnel_id,
+    );
     let shared = tunnel_state::shared_runtime_paths(SERVICE_ID, config.local_port);
     let pid_path = shared.pid_path(SERVICE_ID);
     let url_path = cloudflared::public_url_path(&shared);
@@ -117,7 +138,11 @@ pub fn start_agent(config: &GtunnelConfig) -> anyhow::Result<GtunnelHandle> {
     let mut env = BTreeMap::new();
     env.insert(
         ENV_EDGE_URL.to_string(),
-        registration_url(&config.worker_base_url, &config.tunnel_id),
+        registration_url(
+            &config.worker_base_url,
+            config.base_domain.as_deref(),
+            &config.tunnel_id,
+        ),
     );
     env.insert(ENV_SECRET.to_string(), config.secret.clone());
     env.insert(
@@ -237,26 +262,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_url_joins_base_and_id_without_double_slash() {
+    fn public_url_path_mode_joins_base_and_id_without_double_slash() {
         assert_eq!(
-            public_url("https://x.workers.dev/", "acme-default"),
+            public_url("https://x.workers.dev/", None, "acme-default"),
             "https://x.workers.dev/acme-default"
         );
         assert_eq!(
-            public_url("https://x.workers.dev", "acme-default"),
+            public_url("https://x.workers.dev", None, "acme-default"),
             "https://x.workers.dev/acme-default"
+        );
+    }
+
+    #[test]
+    fn public_url_subdomain_mode_uses_host_root() {
+        assert_eq!(
+            public_url(
+                "https://x.workers.dev",
+                Some("hooks.greentic.dev"),
+                "acme-default"
+            ),
+            "https://acme-default.hooks.greentic.dev"
         );
     }
 
     #[test]
     fn registration_url_maps_scheme_to_websocket() {
         assert_eq!(
-            registration_url("https://x.workers.dev", "t1"),
+            registration_url("https://x.workers.dev", None, "t1"),
             "wss://x.workers.dev/t1/_tunnel"
         );
         assert_eq!(
-            registration_url("http://127.0.0.1:8790", "t1"),
+            registration_url("http://127.0.0.1:8790", None, "t1"),
             "ws://127.0.0.1:8790/t1/_tunnel"
+        );
+    }
+
+    #[test]
+    fn registration_url_subdomain_mode() {
+        assert_eq!(
+            registration_url("https://x.workers.dev", Some("hooks.greentic.dev"), "t1"),
+            "wss://t1.hooks.greentic.dev/_tunnel"
         );
     }
 }

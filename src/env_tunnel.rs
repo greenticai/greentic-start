@@ -109,8 +109,15 @@ pub(crate) fn gtunnel_config(
     // Prefer the per-tunnel secret greentic-setup provisioned (shared store),
     // falling back to the GREENTIC_TUNNEL_SECRET env override.
     let secret = crate::gtunnel::resolve_secret(&tunnel_id);
+    // When a base domain is configured, use subdomain routing so SPAs served at
+    // the host root (the WebChat UI) work; otherwise path-prefix under the Worker.
+    let base_domain = std::env::var("GREENTIC_TUNNEL_BASE_DOMAIN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     crate::gtunnel::GtunnelConfig {
         worker_base_url,
+        base_domain,
         tunnel_id,
         secret,
         local_port,
