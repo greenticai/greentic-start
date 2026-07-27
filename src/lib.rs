@@ -908,6 +908,18 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 webchat_ui_paths.extend(advert.paths);
             }
         }
+        // Suppressing a console the operator explicitly asked for is the kind of
+        // thing that must never happen silently: `gui_enabled: true` is in their
+        // manifest, and without this line the missing `/chat` reads as a bug.
+        if !gui_enabled
+            && environment.host_config.gui_enabled == Some(true)
+            && !pack_webchat_routes.is_empty()
+        {
+            let note = "gui_enabled is set and this environment's packs ship their own webchat \
+                        UI — serving that instead of the built-in /chat console";
+            operator_log::info(module_path!(), note);
+            println!("{note}");
+        }
         if gui_enabled {
             // With a tunnel up, the console lives on the loopback admin listener
             // (the public port serves provider webhooks only); point operators
@@ -1947,24 +1959,39 @@ pub(crate) fn advertise_webchat_urls(
 ) -> WebchatAdvert {
     let mut advert = WebchatAdvert::default();
     let mut first_url: Option<String> = None;
+    let servable = |id: &str| webchat_ui_bundles.is_empty() || webchat_ui_bundles.contains(&id);
     for (tenant, bundles, default_id) in tenant_bundles {
+        // The bare tenant URL is a SHORTHAND for the default bundle, not a
+        // bundle of its own. It used to be printed INSTEAD of that bundle's
+        // own URL, which left the default bundle as the one bundle in the
+        // environment whose `/{tenant}/{bundle_id}/` URL was never advertised —
+        // it works, it is simply never mentioned, so "which URL is my bundle
+        // on?" had no answer for exactly one bundle. Print both: the shorthand
+        // first (it is what `--open-webchat` opens), then one line per bundle.
+        if let Some(default_id) = default_id.as_deref()
+            && bundles.contains(&default_id)
+            && servable(default_id)
+        {
+            let path = format!("/v1/web/webchat/{tenant}/");
+            let url = format!("http://{listen}{path}");
+            advert
+                .lines
+                .push(format!("UI: {url} → default bundle `{default_id}`"));
+            if advert.open_url.is_none() {
+                advert.open_url = Some(url.clone());
+            }
+            advert.paths.push(path);
+        }
         for bundle_id in bundles {
-            if !webchat_ui_bundles.is_empty() && !webchat_ui_bundles.contains(bundle_id) {
+            if !servable(bundle_id) {
                 advert.without_ui.push((*bundle_id).to_string());
                 continue;
             }
             let is_default = default_id.as_deref() == Some(*bundle_id);
-            let path = if is_default {
-                format!("/v1/web/webchat/{tenant}/")
-            } else {
-                format!("/v1/web/webchat/{tenant}/{bundle_id}/")
-            };
+            let path = format!("/v1/web/webchat/{tenant}/{bundle_id}/");
             let url = format!("http://{listen}{path}");
             let tag = if is_default { " (default)" } else { "" };
             advert.lines.push(format!("UI: {url}{tag}"));
-            if advert.open_url.is_none() && is_default {
-                advert.open_url = Some(url.clone());
-            }
             if first_url.is_none() {
                 first_url = Some(url);
             }
@@ -2045,10 +2072,21 @@ fn resolve_console_enabled(
     host_config: &greentic_deploy_spec::EnvironmentHostConfig,
     has_pack_webchat_ui: bool,
 ) -> bool {
-    match host_config.gui_enabled {
-        Some(explicit) => explicit,
-        None => host_config.resolved_gui_enabled() && !has_pack_webchat_ui,
+    // A pack-provided webchat UI ALWAYS wins, explicit `gui_enabled: true`
+    // included. The flag means "this environment has a browser tier", not
+    // "serve the built-in console specifically" — and `/chat` is a hand-rolled
+    // single-page console that POSTs to the loopback `/workers/invoke`
+    // endpoint, bypassing the provider stack, the tenant/bundle routing and the
+    // per-bundle SPA entirely. Pointing an operator at it while a real
+    // `/v1/web/webchat/{tenant}/{bundle}/` UI is being served is offering the
+    // strictly worse of the two. The console stays as the FALLBACK for
+    // environments whose packs ship no UI at all, which is its actual job.
+    if has_pack_webchat_ui {
+        return false;
     }
+    host_config
+        .gui_enabled
+        .unwrap_or_else(|| host_config.resolved_gui_enabled())
 }
 
 #[cfg(test)]
@@ -2104,10 +2142,20 @@ mod tests {
     }
 
     #[test]
-    fn console_explicit_true_wins_over_pack_webchat_ui() {
-        assert!(resolve_console_enabled(
+    fn console_superseded_by_pack_webchat_ui_even_when_explicitly_enabled() {
+        // `gui_enabled: true` asks for a browser tier, and the pack's
+        // per-bundle SPA IS the browser tier. Honouring the flag as "serve
+        // /chat as well" pointed operators at a loopback console that bypasses
+        // the provider stack, alongside the real UI they had just deployed.
+        assert!(!resolve_console_enabled(
             &host_config_with_gui(Some(true)),
             true
+        ));
+        // …and with no pack UI anywhere the flag still turns the console on,
+        // which is the only case the console exists for.
+        assert!(resolve_console_enabled(
+            &host_config_with_gui(Some(true)),
+            false
         ));
     }
 
@@ -2189,15 +2237,66 @@ mod tests {
             &[("default", vec!["gui", "legal"], Some("gui"))],
             &ui_set(&["gui"]),
         );
+        // The bare alias comes FIRST (it is what `--open-webchat` opens), and
+        // `gui` still gets its own explicit URL — being the default must not
+        // cost a bundle its `/{tenant}/{bundle_id}/` line.
         assert_eq!(
             advert.lines,
-            vec!["UI: http://127.0.0.1:8080/v1/web/webchat/default/ (default)"]
+            vec![
+                "UI: http://127.0.0.1:8080/v1/web/webchat/default/ → default bundle `gui`",
+                "UI: http://127.0.0.1:8080/v1/web/webchat/default/gui/ (default)",
+            ]
         );
         assert_eq!(
             advert.open_url.as_deref(),
             Some("http://127.0.0.1:8080/v1/web/webchat/default/")
         );
-        assert_eq!(advert.paths, vec!["/v1/web/webchat/default/"]);
+        assert_eq!(
+            advert.paths,
+            vec!["/v1/web/webchat/default/", "/v1/web/webchat/default/gui/"]
+        );
+    }
+
+    #[test]
+    fn the_default_bundle_is_not_the_one_bundle_without_its_own_url() {
+        // The reported symptom: with `acct` as the default, every bundle but
+        // `acct` appeared in the banner. `/…/default/acct/` served a 200 the
+        // whole time — it was simply never advertised.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["acct", "gui", "legal", "support"]),
+        );
+        for bundle in ["acct", "gui", "legal", "support"] {
+            let url = format!("http://127.0.0.1:8080/v1/web/webchat/default/{bundle}/");
+            assert!(
+                advert
+                    .lines
+                    .iter()
+                    .any(|line| line.split_whitespace().nth(1) == Some(url.as_str())),
+                "no line advertises {url}: {:?}",
+                advert.lines
+            );
+        }
+        // Five lines for four bundles: one each, plus the bare alias.
+        assert_eq!(advert.lines.len(), 5);
+        assert!(advert.without_ui.is_empty());
+    }
+
+    #[test]
+    fn the_bare_alias_names_the_bundle_it_resolves_to() {
+        // A bare URL that does not say where it lands is the reason the missing
+        // `/acct/` line read as "acct is unreachable" rather than "acct is the
+        // thing this shorthand already points at".
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["acct", "gui", "legal", "support"]),
+        );
+        assert_eq!(
+            advert.lines[0],
+            "UI: http://127.0.0.1:8080/v1/web/webchat/default/ → default bundle `acct`"
+        );
     }
 
     #[test]
@@ -2205,7 +2304,7 @@ mod tests {
         // Legacy/unscoped routes carry no bundle id. Keep the pre-scoping
         // behaviour rather than advertising nothing at all.
         let advert = advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &ui_set(&[]));
-        assert_eq!(advert.lines.len(), 4);
+        assert_eq!(advert.lines.len(), 5); // 4 bundles + the bare alias
         assert!(advert.without_ui.is_empty());
         assert!(advert.without_ui_note().is_none());
     }
@@ -2213,7 +2312,10 @@ mod tests {
     #[test]
     fn every_advertised_path_has_a_matching_line_for_tunnel_rebasing() {
         // `paths` is rebased onto the public tunnel URL, so a path with no
-        // corresponding line would republish a dead link publicly.
+        // corresponding line would republish a dead link publicly. Match the
+        // line's URL token EXACTLY: a bare `/v1/web/webchat/default/` is a
+        // substring of every bundle-scoped line under that tenant, so a
+        // `contains` check here passes even when the alias is never printed.
         let advert = advertise_webchat_urls(
             "127.0.0.1:8080",
             &[
@@ -2224,13 +2326,22 @@ mod tests {
         );
         assert_eq!(advert.lines.len(), advert.paths.len());
         for path in &advert.paths {
+            let url = format!("http://127.0.0.1:8080{path}");
             assert!(
-                advert.lines.iter().any(|line| line.contains(path)),
+                advert
+                    .lines
+                    .iter()
+                    .any(|line| line.split_whitespace().nth(1) == Some(url.as_str())),
                 "path {path} has no advertised line: {:?}",
                 advert.lines
             );
         }
+        // Neither tenant's default can serve, so neither gets a bare alias.
         assert_eq!(advert.without_ui, vec!["ops", "acct"]);
+        assert_eq!(
+            advert.paths,
+            vec!["/v1/web/webchat/acme/gui/", "/v1/web/webchat/default/gui/"]
+        );
     }
 
     #[test]
