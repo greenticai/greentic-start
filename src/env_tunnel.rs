@@ -77,20 +77,19 @@ pub(crate) fn choose_tunnel(
 }
 
 /// The tunnel id both binaries key on: explicit flag > `GREENTIC_TUNNEL_ID` >
-/// sanitized `<tenant>-<team>`. Single source of truth so the default-tunnel
-/// decision, the config, and greentic-setup all agree.
+/// the sanitized `<tenant>`. It is deliberately the TENANT alone (not
+/// `<tenant>-<team>`) so it equals the `<tenant>` segment of the webchat URL
+/// space (`/v1/web/webchat/<tenant>/…`): the Worker routes the SPA's
+/// root-absolute calls by that tenant, so the id it registers under must match.
+/// Single source of truth so the default-tunnel decision, the config, and
+/// greentic-setup all agree. (One box per tenant; multiple teams of the same
+/// tenant would share a tunnel — override `GREENTIC_TUNNEL_ID` to separate them.)
 pub(crate) fn resolve_gtunnel_tunnel_id(request: &StartRequest) -> String {
     request
         .gtunnel_tunnel_id
         .clone()
         .or_else(|| std::env::var("GREENTIC_TUNNEL_ID").ok())
-        .unwrap_or_else(|| {
-            sanitize_tunnel_id(&format!(
-                "{}-{}",
-                request.tenant.as_deref().unwrap_or("default"),
-                request.team.as_deref().unwrap_or("default"),
-            ))
-        })
+        .unwrap_or_else(|| sanitize_tunnel_id(request.tenant.as_deref().unwrap_or("default")))
 }
 
 /// Resolve the zero-config gtunnel settings for this request. Order for each
