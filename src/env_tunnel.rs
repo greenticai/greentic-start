@@ -115,14 +115,28 @@ pub(crate) fn gtunnel_config(
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    // Root-map: the Worker hosts this one tunnel at its host root (workers.dev,
+    // no custom domain). base_domain (subdomain) takes precedence if both set.
+    let root_map = base_domain.is_none() && env_flag("GREENTIC_TUNNEL_ROOT_MAP");
     crate::gtunnel::GtunnelConfig {
         worker_base_url,
         base_domain,
+        root_map,
         tunnel_id,
         secret,
         local_port,
         restart,
     }
+}
+
+/// Whether an env var is set to a truthy value (`1` / `true` / `yes`, any case).
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
 }
 
 /// Normalize a derived tunnel id into a URL-path-safe slug.
