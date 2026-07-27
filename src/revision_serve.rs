@@ -713,6 +713,73 @@ impl RevisionServer {
         self.state.slot.load().routing.dispatcher.counts()
     }
 
+    /// Swap in an activation that changed only env-derived routing, sharing the
+    /// live [`RunnerHost`] and dispatcher.
+    ///
+    /// This is the D2 fast path for changes that cannot touch revisions or
+    /// packs — `host_config.default_bundle`, messaging-endpoint ACLs, traffic
+    /// weights expressed purely in the environment. [`Self::reload`] would
+    /// rebuild the whole world for those: a fresh `RunnerHost` with every
+    /// revision's packs re-instantiated (WASM compile), plus a drain window in
+    /// which two complete hosts are resident.
+    ///
+    /// It is deliberately NOT a flag on [`Self::reload`]:
+    ///
+    /// - `reload` asserts every swap publishes a *fresh* dispatcher `Arc`,
+    ///   because `SlotLivenessProbe` uses `Arc::ptr_eq` to tell the old
+    ///   dispatcher from the live one while draining. This path wants the
+    ///   opposite — preserving the dispatcher is what keeps session pins and
+    ///   sticky cookies valid across the swap.
+    /// - No generation re-anchoring runs, for the same reason: no revision
+    ///   moved, so no deployment's stickiness may be invalidated.
+    /// - No drain is spawned and no drain window is needed. The superseded
+    ///   `Activation` shares both `Arc`s with the new one, so dropping it frees
+    ///   only the routing tables — the host is never duplicated.
+    ///
+    /// `build_routing` is handed the activation that is live *at swap time* and
+    /// returns the replacement routing. Taking a builder rather than a
+    /// pre-assembled `Activation` is what makes the fast path race-free: the
+    /// routing is derived, and the host carried forward, from one snapshot taken
+    /// under the reload lock, so there is no window in which a concurrent full
+    /// reload could leave the caller publishing routing bound to a host that is
+    /// already draining. `build_routing` runs under that lock, so it must stay
+    /// cheap — it is four table constructions, no I/O.
+    ///
+    /// Returns the report alongside the activation now serving, so the caller's
+    /// post-reload hook observes the same `(host, routing)` pair the server
+    /// does — matching [`Self::reload`], where the caller assembles it.
+    pub(crate) fn reload_routing_only(
+        &self,
+        build_routing: impl FnOnce(&Activation) -> RevisionIngressRouting,
+    ) -> (ReloadReport, Activation) {
+        // Same lock as `reload`, so a full reload cannot interleave between the
+        // snapshot below and the swap.
+        let _reload_guard = self.reload_lock.lock().expect("reload lock poisoned");
+        let prev = self.state.slot.load_full();
+        let new = Activation {
+            host: Arc::clone(&prev.host),
+            routing: Arc::new(build_routing(&prev)),
+        };
+        let published = new.clone();
+        let (new_deployments, new_revisions) = new.routing.dispatcher.counts();
+        let prev = self.state.slot.swap(Arc::new(new));
+        let (prev_deployments, prev_revisions) = prev.routing.dispatcher.counts();
+        // Dropping `prev` here is cheap and safe: it shares the host and the
+        // dispatcher with what is now live, so this releases the old routing
+        // tables only. In-flight requests hold their own `Arc<Activation>`
+        // snapshot and finish against it.
+        drop(prev);
+        (
+            ReloadReport {
+                prev_deployments,
+                prev_revisions,
+                new_deployments,
+                new_revisions,
+            },
+            published,
+        )
+    }
+
     /// Swap the live activation. Atomically replaces the slot so the next
     /// request reaches the new host + routing; every request that already
     /// snapshotted the previous activation (via [`ServeState::current`] at
@@ -1079,6 +1146,7 @@ async fn serve(
     let user_header = header_str(req.headers(), "x-greentic-user");
     let session_header = header_str(req.headers(), "x-greentic-session");
     let endpoint_header = header_str(req.headers(), "x-greentic-messaging-endpoint-id");
+    let flow_header = header_str(req.headers(), "x-greentic-flow");
     // M1 IID.4d wrapper: collect routing-relevant request headers BEFORE
     // `read_body_limited` consumes `req`. The resolver uses these to give
     // header-discriminated providers (Telegram via secret-token) the same
@@ -1092,19 +1160,87 @@ async fn serve(
     let request_headers = collect_forwarded_request_headers(req.headers());
     let query_string = req.uri().query().map(str::to_string);
 
-    // Resolve the bound deployment + tenant before touching the body, so an
-    // unroutable request is rejected cheaply.
-    let (deployment_id, tenant) = activation
-        .routing
-        .deployment_routes
-        .resolve(host_header.as_deref(), &path)
-        .map(|(deployment_id, tenant)| (deployment_id, tenant.to_string()))
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::NOT_FOUND,
-                "no deployment is bound to this host and path",
-            )
-        })?;
+    // Webchat bundle routing: classify the path against the bundle/flow
+    // indices BEFORE the generic deployment resolve. A classified request
+    // pins dispatch to the target's deployment, uses the stripped path for
+    // static-route and provider-route matching, and threads the
+    // stream_url_prefix to the DirectLine streamUrl rewrite. Non-webchat
+    // requests fall through to the existing longest-prefix resolve unchanged.
+    let webchat_target = crate::webchat_routing::classify_webchat_path(
+        &path,
+        host_header.as_deref(),
+        &activation.routing.bundle_index,
+        &activation.routing.flow_index,
+        &activation.routing.deployment_routes,
+    );
+
+    // Which deployment did the classifier pick for this request, and off which
+    // activation? `activation_ptr` is the identity of the `Arc` the request was
+    // served from, so a run spanning a reload shows the exact request where the
+    // swap became visible — without it, "the routing is stale" and "the
+    // activation is stale" are indistinguishable from the outside, which is
+    // what made the reload defects in `plans/hot-reload-granularity.md` take
+    // three passes to pin down. `debug` because it is per-request.
+    if let Some(ref target) = webchat_target {
+        tracing::debug!(
+            path = %path,
+            tenant = %target.tenant,
+            bundle = %target.bundle_id,
+            flow = ?target.flow_id,
+            deployment = %target.deployment_id,
+            activation_ptr = ?Arc::as_ptr(&activation),
+            default_for_tenant = ?activation
+                .routing
+                .bundle_index
+                .default_for(&target.tenant)
+                .map(|(dep, bundle, reason)| format!("{bundle}/{dep} ({reason:?})")),
+            "webchat classify",
+        );
+    }
+
+    // When the classifier matched, the deployment, tenant, and effective path
+    // are pinned to the classified target. Otherwise the existing generic
+    // deployment resolve runs.
+    let (deployment_id, tenant, effective_path);
+    if let Some(ref target) = webchat_target {
+        deployment_id = target.deployment_id;
+        tenant = target.tenant.clone();
+        effective_path = target.stripped_path.clone();
+    } else if crate::webchat_routing::is_webchat_path(&path) {
+        // A webchat path the classifier declined must NOT fall through to the
+        // generic resolve. That resolve matches on `(host, path_prefix)` alone
+        // and hands back the *deployment's* tenant, so with the usual `/`
+        // prefix binding every unknown tenant matched something: a POST to
+        // `/v1/messaging/webchat/<any string>/token` minted a working
+        // DirectLine token against whichever deployment won the prefix match,
+        // under that deployment's tenant and secrets. The tenant segment was
+        // dead — unknown tenants failed open. greentic-start#454.
+        //
+        // The classifier declines when the tenant has no Active deployment,
+        // when the named bundle is not the tenant's, or when host admission
+        // fails. None of those is routable, so this is a 404.
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "no bundle is bound to this tenant and path",
+        ));
+    } else {
+        // Resolve the bound deployment + tenant before touching the body, so
+        // an unroutable request is rejected cheaply.
+        let resolved = activation
+            .routing
+            .deployment_routes
+            .resolve(host_header.as_deref(), &path)
+            .map(|(dep_id, t)| (dep_id, t.to_string()))
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "no deployment is bound to this host and path",
+                )
+            })?;
+        deployment_id = resolved.0;
+        tenant = resolved.1;
+        effective_path = path.clone();
+    }
 
     let body_bytes = read_body_limited(req).await.map_err(|_| {
         error_response(
@@ -1177,7 +1313,7 @@ async fn serve(
             return Some(hint);
         }
         let provider_type = activation.routing.http_routes.provider_type_for(
-            &path,
+            &effective_path,
             method.as_str(),
             deployment_id,
         )?;
@@ -1250,9 +1386,10 @@ async fn serve(
         && let Some(route_match) = activation
             .routing
             .static_routes
-            .match_request_for_revision(&path, &scope)
+            .match_request_for_revision(&effective_path, &scope)
     {
-        let response = crate::static_handler::serve_static_route_from_pack(&route_match, &path);
+        let response =
+            crate::static_handler::serve_static_route_from_pack(&route_match, &effective_path);
         return Ok(with_cors(response));
     }
 
@@ -1263,14 +1400,19 @@ async fn serve(
     // provider component decodes itself; forcing JSON parse here would
     // turn every non-JSON webhook into a 400 even though the provider
     // would have handled it correctly.
-    match admit_request(&activation.routing.http_routes, &scope, &path, &method) {
+    match admit_request(
+        &activation.routing.http_routes,
+        &scope,
+        &effective_path,
+        &method,
+    ) {
         Admission::ProviderRoute => {
             return dispatch_provider_route(
                 Arc::clone(&activation),
                 Arc::clone(&state),
                 &tenant,
                 &scope,
-                &path,
+                &effective_path,
                 method.as_str(),
                 query_string.as_deref(),
                 &request_headers,
@@ -1279,6 +1421,8 @@ async fn serve(
                 &identify_headers,
                 header_endpoint_id.as_deref(),
                 session_hint.as_deref(),
+                webchat_target.as_ref(),
+                flow_header.as_deref(),
             )
             .await;
         }
@@ -3705,6 +3849,8 @@ async fn dispatch_provider_route(
     identify_headers: &[(String, String)],
     header_endpoint_id: Option<&str>,
     session_hint: Option<&str>,
+    webchat_target: Option<&crate::webchat_routing::WebchatTarget>,
+    flow_header: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
     let Some(route_match) = activation
         .routing
@@ -3783,9 +3929,13 @@ async fn dispatch_provider_route(
                 || norm_path.ends_with("/conversations"))
         {
             crate::conv_dedup::extract_user_id(body).map(|user_id| crate::conv_dedup::DedupKey {
+                deployment_id,
                 tenant: route_tenant.clone(),
                 team: route_team.clone(),
                 user_id,
+                flow_hint: webchat_target
+                    .and_then(|t| t.flow_id.clone())
+                    .or_else(|| flow_header.map(str::to_string)),
             })
         } else {
             None
@@ -3888,6 +4038,60 @@ async fn dispatch_provider_route(
         },
     )
     .await?;
+
+    // Flow targeting: a URL-derived flow_id (from the webchat classifier) or an
+    // `X-Greentic-Flow` header names the flow directly; with neither, a webchat
+    // request targets the bundle's default flow. Validate against the FlowIndex;
+    // an unknown flow id warns and falls back to normal selection (fail open).
+    //
+    // This target is stamped on the activity as `(pack_id, flow_id)` rather than
+    // carried only as a `WelcomeFlowHint`, because the runner resolves the flow
+    // BEFORE it consults the hint: a bundle with more than one messaging flow
+    // fails resolution with "flow type messaging is ambiguous" and never reaches
+    // the hint. See `dispatch_provider_events`.
+    let flow_target = {
+        let url_flow_id = webchat_target.and_then(|t| t.flow_id.as_deref());
+        let bundle_id_str = scope.bundle_id.as_str();
+        let named = url_flow_id.or(flow_header).and_then(|flow_id| {
+            activation
+                .routing
+                .flow_index
+                .pack_id_for_flow(bundle_id_str, flow_id)
+                .map(|pack_id| WelcomeFlowHint {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                })
+                .or_else(|| {
+                    tracing::warn!(
+                        flow_id,
+                        bundle_id = bundle_id_str,
+                        "URL/header flow hint does not match any known flow in this bundle; \
+                         falling back to the bundle's default flow",
+                    );
+                    None
+                })
+        });
+        // No flow named, or the named one is unknown: fall back to the bundle's
+        // default flow. "Fail open" has to mean the default flow, not "leave it
+        // to the runner" — the runner's own fallback matches on `flow_type`,
+        // which is ambiguous for exactly the multi-flow bundles this targeting
+        // exists for. Only the webchat classifier's own routes get this; a
+        // generic provider webhook keeps the runner's resolution untouched.
+        named.or_else(|| {
+            webchat_target?;
+            activation
+                .routing
+                .flow_index
+                .default_flow_for_bundle(bundle_id_str)
+                .map(|(pack_id, flow_id)| WelcomeFlowHint {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                })
+        })
+    };
+    // An explicitly targeted flow also overrides the endpoint's configured
+    // welcome_flow on first contact.
+    let welcome_hint = flow_target.clone().or(welcome_hint);
 
     let http_in = build_provider_http_in(
         &provider_type,
@@ -3995,6 +4199,7 @@ async fn dispatch_provider_route(
                 pipeline_provider,
                 ingress_envelopes,
                 endpoint_id,
+                flow_target,
                 welcome_hint,
                 pipeline_notifier,
             )
@@ -4033,7 +4238,11 @@ async fn dispatch_provider_route(
                     .await;
             }
 
-            rewrite_stream_url(&dl_headers, &mut response);
+            rewrite_stream_url(
+                &dl_headers,
+                &mut response,
+                webchat_target.and_then(super::webchat_routing::WebchatTarget::url_bundle_segment),
+            );
 
             // Cache the post-rewrite response for conversation dedup.
             if let Some(key) = dl_dedup_key {
@@ -4070,15 +4279,49 @@ async fn run_provider_inbound_pipeline(
     provider_type: String,
     envelopes: Vec<ChannelMessageEnvelope>,
     endpoint_id: Option<String>,
+    flow_target: Option<WelcomeFlowHint>,
     welcome_hint: Option<WelcomeFlowHint>,
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
 ) {
     for ingress in &envelopes {
+        // Per-envelope flow targeting: if the envelope carries a
+        // `flow_hint` metadata key (the provider echoing back the flow the
+        // conversation was opened against), validate it against the FlowIndex
+        // and override the request-level target. Unknown flow ids warn and
+        // fall back to the request-level target (fail open).
+        let envelope_target = ingress
+            .metadata
+            .get("flow_hint")
+            .and_then(|flow_id| {
+                let flow_id = flow_id.trim();
+                if flow_id.is_empty() {
+                    return None;
+                }
+                let bid = bundle_id.as_str();
+                if let Some(pid) = activation.routing.flow_index.pack_id_for_flow(bid, flow_id) {
+                    Some(WelcomeFlowHint {
+                        pack_id: pid.to_string(),
+                        flow_id: flow_id.to_string(),
+                    })
+                } else {
+                    tracing::warn!(
+                        flow_id,
+                        bundle_id = bid,
+                        "envelope flow_hint metadata does not match any known flow; \
+                         falling back to request-level hint",
+                    );
+                    None
+                }
+            })
+            .or_else(|| flow_target.clone());
+        let envelope_hint = envelope_target.clone().or_else(|| welcome_hint.clone());
+
         let activity = envelope_to_activity(
             ingress,
             &tenant,
             endpoint_id.as_deref(),
-            welcome_hint.clone(),
+            envelope_hint,
+            envelope_target,
         );
         let replies = match activation
             .host
@@ -4486,6 +4729,7 @@ fn envelope_to_activity(
     fallback_tenant: &str,
     endpoint_id: Option<&str>,
     welcome_hint: Option<WelcomeFlowHint>,
+    flow_target: Option<WelcomeFlowHint>,
 ) -> Activity {
     // Serialize the whole envelope as the activity payload so the flow engine
     // sees BOTH `entry.text` and `entry.metadata.*`. `build_routing_context`
@@ -4523,6 +4767,16 @@ fn envelope_to_activity(
     }
     if let Some(hint) = welcome_hint {
         activity = activity.with_welcome_flow_hint(hint);
+    }
+    // Resolve the flow by key, not by type. The runner picks the flow from
+    // `(pack_id, flow_id)` when both are set and only falls back to matching
+    // on `flow_type` — which is `messaging` for every flow here — when they
+    // are absent. A bundle whose app pack ships more than one messaging flow
+    // is unresolvable by type, so without this the request fails before the
+    // welcome hint is ever read. A resumed conversation still wins over this:
+    // the runner prefers its wait snapshot's flow.
+    if let Some(target) = flow_target {
+        activity = activity.with_pack(target.pack_id).with_flow(target.flow_id);
     }
     activity
 }
@@ -4724,7 +4978,20 @@ fn apply_directline_forward_plan_to_response(
 /// to an absolute `ws://` URL using the request's `Host` header. DirectLineJS
 /// requires an absolute URL on the WebSocket constructor; a relative path
 /// makes the SDK fall back to HTTP polling.
-fn rewrite_stream_url(headers: &[(String, String)], response: &mut IngressHttpResponse) {
+///
+/// When `bundle_segment` is `Some`, it is spliced in directly before
+/// `/v3/directline` so the resulting WS URL routes back through the same
+/// bundle on reconnect. The splice point matters: the provider composes this
+/// URL from the path it was handed, so it may already carry the tenant-scoped
+/// prefix (`/v1/messaging/webchat/{tenant}/v3/directline/...`) rather than the
+/// bare `/v3/directline/...` form. Prefixing the whole bundle-scoped path onto
+/// the former would double it. When `None` the output is byte-identical to the
+/// pre-bundle-routing behavior.
+fn rewrite_stream_url(
+    headers: &[(String, String)],
+    response: &mut IngressHttpResponse,
+    bundle_segment: Option<&str>,
+) {
     let Some(body_bytes) = response.body.as_ref() else {
         return;
     };
@@ -4751,29 +5018,97 @@ fn rewrite_stream_url(headers: &[(String, String)], response: &mut IngressHttpRe
     // the browser. Derive the scheme from X-Forwarded-Proto rather than the
     // container's own (always-plain-HTTP) listener.
     let scheme = crate::startup_contract::forwarded_ws_scheme(headers);
-    let absolute = format!("{scheme}://{host}{relative}");
+    let absolute = match bundle_segment {
+        Some(segment) => match relative.find("/v3/directline") {
+            Some(idx) => format!(
+                "{scheme}://{host}{}{segment}{}",
+                &relative[..idx],
+                &relative[idx..]
+            ),
+            None => format!("{scheme}://{host}{segment}{relative}"),
+        },
+        None => format!("{scheme}://{host}{relative}"),
+    };
     body_json["streamUrl"] = serde_json::Value::String(absolute);
     if let Ok(rewritten) = serde_json::to_vec(&body_json) {
         response.body = Some(rewritten);
     }
 }
 
+/// Forward an upstream `429` to the client instead of collapsing it into the
+/// `502` used for genuine upstream breakage.
+///
+/// The webchat provider's token rate limiter answers with
+/// `{"error":"rate_limited","message":…,"retry_after":N}`. That is backpressure
+/// aimed at the CLIENT, and `429` is the one status every HTTP client already
+/// knows how to back off on — a browser handed `502` has no reason to retry at
+/// all, so a transient rate limit reads as a broken deployment.
+///
+/// `Retry-After` comes from the upstream header when it sets one, and otherwise
+/// from the body's `retry_after` (seconds), which is what the provider actually
+/// sends today. The upstream body is forwarded verbatim so the client keeps the
+/// machine-readable `error` code.
+fn rate_limited_response(response: &IngressHttpResponse) -> Response<Full<Bytes>> {
+    let header_value = |name: &str| {
+        response
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    let body = response.body.clone().unwrap_or_default();
+    let retry_after = header_value("retry-after").or_else(|| {
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()?
+            .get("retry_after")
+            .and_then(serde_json::Value::as_u64)
+            .map(|secs| secs.to_string())
+    });
+    let mut builder = Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(
+            header::CONTENT_TYPE,
+            header_value("content-type").unwrap_or_else(|| "application/json".to_string()),
+        );
+    if let Some(secs) = retry_after {
+        builder = builder.header(header::RETRY_AFTER, secs);
+    }
+    // Both forwarded header values are upstream data; an invalid one fails the
+    // builder rather than panicking, and the client still gets a 429.
+    builder
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_else(|_| {
+            error_response(StatusCode::TOO_MANY_REQUESTS, "token rate limit exceeded")
+        })
+}
+
 /// Validate a `POST /tokens/generate` response: the body must be JSON with a
 /// non-empty `token` field. Returns an error response on failure so the
-/// upstream gets a clear `502` instead of a malformed token.
+/// upstream gets a clear `502` instead of a malformed token — except for a
+/// `429`, which is forwarded (see [`rate_limited_response`]).
 #[allow(clippy::result_large_err)]
 fn validate_token_response(response: &IngressHttpResponse) -> Result<(), Response<Full<Bytes>>> {
     let body = response.body.as_deref().unwrap_or_default();
     if !(200..300).contains(&response.status) {
+        let preview = String::from_utf8_lossy(body)
+            .chars()
+            .take(500)
+            .collect::<String>();
+        // A rate limit is expected backpressure, not a failure: logging it at
+        // `error` turns one burst of concurrent conversations into hundreds of
+        // error lines that look like an outage.
+        if response.status == 429 {
+            operator_log::warn(
+                module_path!(),
+                format!("[webchat directline] token request rate limited: {preview}"),
+            );
+            return Err(rate_limited_response(response));
+        }
         operator_log::error(
             module_path!(),
             format!(
-                "[webchat directline] token request failed status={} body={}",
+                "[webchat directline] token request failed status={} body={preview}",
                 response.status,
-                String::from_utf8_lossy(body)
-                    .chars()
-                    .take(500)
-                    .collect::<String>()
             ),
         );
         return Err(error_response(
@@ -4955,25 +5290,55 @@ async fn handle_websocket_upgrade(
     let activation = state.current();
     let host_header = header_str(req.headers(), header::HOST.as_str());
 
+    // Strip bundle/flow segments from the WebSocket path so the
+    // deployment resolve and provider-type lookup see the tenant-scoped
+    // form they expect. The stripped path is used for all downstream
+    // matching; the original path already yielded the conversation id
+    // above (position-independent extraction).
+    let stripped = crate::webchat_routing::strip_webchat_bundle_segments(
+        path,
+        &activation.routing.bundle_index,
+        &activation.routing.flow_index,
+    );
+    let effective_ws_path = stripped.as_deref().unwrap_or(path);
+
     // Resolve deployment + tenant from the path so we know which env's
     // secrets to read the signing key from.
-    let (deployment_id, tenant) = activation
-        .routing
-        .deployment_routes
-        .resolve(host_header.as_deref(), path)
-        .map(|(deployment_id, tenant)| (deployment_id, tenant.to_string()))
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::NOT_FOUND,
-                "no deployment is bound to this host and path",
-            )
-        })?;
+    //
+    // A bundle-scoped stream path must resolve to ITS OWN deployment, not
+    // whichever one the generic prefix match happens to return: the REST
+    // conversation-create pinned this conversation under the bundle's
+    // deployment id, and sibling bundles in one env share both the tenant and
+    // the `/` path prefix, so resolving the stripped path here would pick an
+    // arbitrary sibling and the pin lookup below would miss with a 404.
+    let (deployment_id, tenant) = match crate::webchat_routing::classify_webchat_path(
+        path,
+        host_header.as_deref(),
+        &activation.routing.bundle_index,
+        &activation.routing.flow_index,
+        &activation.routing.deployment_routes,
+    ) {
+        Some(target) => (target.deployment_id, target.tenant),
+        None => activation
+            .routing
+            .deployment_routes
+            .resolve(host_header.as_deref(), effective_ws_path)
+            .map(|(deployment_id, tenant)| (deployment_id, tenant.to_string()))
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "no deployment is bound to this host and path",
+                )
+            })?,
+    };
 
-    // Resolve the provider_type for this path so we can read its signing key.
+    // Resolve the provider_type using the stripped path so the lookup
+    // matches the tenant-scoped provider route pattern even when the
+    // original URL carried extra bundle/flow segments.
     let provider_type = activation
         .routing
         .http_routes
-        .provider_type_for(path, "GET", deployment_id)
+        .provider_type_for(effective_ws_path, "GET", deployment_id)
         .ok_or_else(|| {
             error_response(
                 StatusCode::NOT_FOUND,
@@ -5393,14 +5758,7 @@ mod tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: env_id.clone(),
             name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id,
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            host_config: EnvironmentHostConfig::new(env_id),
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
             extensions: Vec::new(),
@@ -5796,14 +6154,7 @@ mod tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: env_id.clone(),
             name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id,
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            host_config: EnvironmentHostConfig::new(env_id),
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
             extensions: Vec::new(),
@@ -6057,7 +6408,7 @@ mod tests {
             "metadata": {},
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback", None, None);
+        let activity = envelope_to_activity(&envelope, "fallback", None, None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.session_id(), Some("sess-1"));
         assert_eq!(activity.user(), Some("u1"));
@@ -6085,7 +6436,7 @@ mod tests {
             "metadata": {},
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback", None, None);
+        let activity = envelope_to_activity(&envelope, "fallback", None, None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.session_id(), None);
     }
@@ -6115,7 +6466,7 @@ mod tests {
             },
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback", None, None);
+        let activity = envelope_to_activity(&envelope, "fallback", None, None, None);
         let entry = activity.payload();
         // `response.action` resolves from `entry.metadata.action`.
         assert_eq!(
@@ -6156,10 +6507,60 @@ mod tests {
             pack_id: "welcome-pack".to_string(),
             flow_id: "welcome-flow".to_string(),
         };
-        let activity =
-            envelope_to_activity(&envelope, "fallback", Some("ep-legal"), Some(hint.clone()));
+        let activity = envelope_to_activity(
+            &envelope,
+            "fallback",
+            Some("ep-legal"),
+            Some(hint.clone()),
+            None,
+        );
         assert_eq!(activity.messaging_endpoint_id(), Some("ep-legal"));
         assert_eq!(activity.welcome_flow_hint(), Some(&hint));
+        assert_eq!(
+            (activity.pack_id(), activity.flow_id()),
+            (None, None),
+            "a welcome hint alone must NOT pin the activity's flow — the runner \
+             gates it on first contact, so pinning would route every turn to it",
+        );
+    }
+
+    #[test]
+    fn envelope_to_activity_pins_flow_by_key_for_an_explicit_target() {
+        // A URL-named flow (`/{tenant}/{bundle}/{flow}`) must reach the runner
+        // as `(pack_id, flow_id)`, not only as a welcome hint. `resolve_flow_id`
+        // runs BEFORE the hint is consulted and matches on `flow_type`, which is
+        // `messaging` for every flow in the bundle: a pack with two messaging
+        // flows fails with "flow type messaging is ambiguous" before the hint
+        // can select one.
+        let envelope: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-1",
+            "tenant": {
+                "env": "dev",
+                "tenant": "acme",
+                "tenant_id": "acme",
+                "attempt": 0,
+            },
+            "channel": "webchat",
+            "session_id": "sess-1",
+            "from": { "id": "u1", "kind": "user" },
+            "text": "hello",
+            "metadata": {},
+        }))
+        .expect("envelope");
+        let target = WelcomeFlowHint {
+            pack_id: "twoflow-demo".to_string(),
+            flow_id: "on_escalate".to_string(),
+        };
+        let activity = envelope_to_activity(
+            &envelope,
+            "fallback",
+            Some("ep-webchat"),
+            Some(target.clone()),
+            Some(target.clone()),
+        );
+        assert_eq!(activity.pack_id(), Some("twoflow-demo"));
+        assert_eq!(activity.flow_id(), Some("on_escalate"));
+        assert_eq!(activity.welcome_flow_hint(), Some(&target));
     }
 
     #[test]
@@ -6663,14 +7064,9 @@ mod tests {
     // they don't race the other listen-addr/env tests in the crate.
 
     fn host_cfg_with(addr: Option<SocketAddr>) -> EnvironmentHostConfig {
-        EnvironmentHostConfig {
-            env_id: greentic_types::EnvId::new("local").unwrap(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: addr,
-            public_base_url: None,
-            gui_enabled: None,
-        }
+        let mut hc = EnvironmentHostConfig::new(greentic_types::EnvId::new("local").unwrap());
+        hc.listen_addr = addr;
+        hc
     }
 
     struct EnvVarGuard {
@@ -6737,6 +7133,8 @@ mod tests {
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
             }),
         }
     }
@@ -7214,7 +7612,7 @@ mod tests {
                 .unwrap(),
             ),
         };
-        rewrite_stream_url(&headers, &mut response);
+        rewrite_stream_url(&headers, &mut response, None);
         let body: serde_json::Value =
             serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
         assert_eq!(
@@ -7243,7 +7641,7 @@ mod tests {
                 .unwrap(),
             ),
         };
-        rewrite_stream_url(&headers, &mut response);
+        rewrite_stream_url(&headers, &mut response, None);
         let body: serde_json::Value =
             serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
         assert_eq!(
@@ -7267,12 +7665,66 @@ mod tests {
                 .unwrap(),
             ),
         };
-        rewrite_stream_url(&headers, &mut response);
+        rewrite_stream_url(&headers, &mut response, None);
         let body: serde_json::Value =
             serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
         assert_eq!(
             body["streamUrl"], original_url,
             "already-absolute streamUrl must not be touched"
+        );
+    }
+
+    #[test]
+    fn rewrite_stream_url_with_bundle_prefix() {
+        let headers = vec![("Host".to_string(), "example.com".to_string())];
+        let mut response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "conversationId": "abc123",
+                    "streamUrl": "/v3/directline/conversations/abc123/stream?t=TOKEN"
+                }))
+                .unwrap(),
+            ),
+        };
+        rewrite_stream_url(&headers, &mut response, Some("/hr-chat"));
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["streamUrl"],
+            "ws://example.com/hr-chat/v3/directline/conversations/abc123/stream?t=TOKEN",
+            "bundle-scoped streamUrl must include the bundle segment"
+        );
+    }
+
+    #[test]
+    fn rewrite_stream_url_splices_bundle_into_tenant_scoped_path() {
+        // The shape the shipping webchat provider actually returns: already
+        // tenant-scoped, not the bare `/v3/directline/...` form. Prefixing the
+        // whole bundle-scoped path here would emit
+        // `/v1/messaging/webchat/default/legal/v1/messaging/webchat/default/v3/...`,
+        // a URL that resolves to no route and silently drops the SPA back to
+        // HTTP polling.
+        let headers = vec![("Host".to_string(), "127.0.0.1:8080".to_string())];
+        let mut response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "conversationId": "abc123",
+                    "streamUrl": "/v1/messaging/webchat/default/v3/directline/conversations/abc123/stream?watermark=-1&t=TOKEN"
+                }))
+                .unwrap(),
+            ),
+        };
+        rewrite_stream_url(&headers, &mut response, Some("/legal"));
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["streamUrl"],
+            "ws://127.0.0.1:8080/v1/messaging/webchat/default/legal/v3/directline/conversations/abc123/stream?watermark=-1&t=TOKEN",
+            "the bundle segment belongs before /v3/directline, not in front of an already tenant-scoped path"
         );
     }
 
@@ -7333,6 +7785,86 @@ mod tests {
         assert!(
             validate_token_response(&response).is_err(),
             "a non-2xx status must be rejected even if the body has a token"
+        );
+    }
+
+    /// D4 regression: the provider's token rate limiter must reach the client
+    /// as a `429` with `Retry-After`, not as a `502`.
+    ///
+    /// Reproduced live 2026-07-25 on a 2-bundle env: 40 concurrent DirectLine
+    /// conversations tripped the webchat provider's token limiter, which
+    /// answered `429 {"error":"rate_limited","retry_after":38}`. Every one of
+    /// those was reported to the client as
+    /// `502 invalid directline token response` — a status no client retries —
+    /// so a recoverable 38-second backoff looked like a dead deployment. (The
+    /// runtime did recover on its own once the window elapsed; the wedge that
+    /// `plans/hot-reload-granularity.md` D4 describes was this, misread.)
+    ///
+    /// MUTATION PROOF: delete the `response.status == 429` branch in
+    /// `validate_token_response` and this fails with `status 502, want 429`.
+    #[test]
+    fn validate_token_response_forwards_rate_limit_with_retry_after() {
+        let response = IngressHttpResponse {
+            status: 429,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "error": "rate_limited",
+                    "message": "token rate limit exceeded",
+                    "retry_after": 38
+                }))
+                .unwrap(),
+            ),
+        };
+        let err = validate_token_response(&response)
+            .expect_err("a 429 is still not a usable token response");
+        assert_eq!(
+            err.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "status {}, want 429 — a rate limit is client backpressure, not a gateway failure",
+            err.status()
+        );
+        assert_eq!(
+            err.headers()
+                .get(header::RETRY_AFTER)
+                .map(|v| v.to_str().unwrap_or_default()),
+            Some("38"),
+            "Retry-After must carry the provider's `retry_after` so the client knows how long to wait"
+        );
+    }
+
+    /// An explicit upstream `Retry-After` header wins over the body field.
+    #[test]
+    fn validate_token_response_prefers_upstream_retry_after_header() {
+        let response = IngressHttpResponse {
+            status: 429,
+            headers: vec![("Retry-After".to_string(), "5".to_string())],
+            body: Some(serde_json::to_vec(&serde_json::json!({"retry_after": 38})).unwrap()),
+        };
+        let err = validate_token_response(&response).expect_err("429 is an error response");
+        assert_eq!(
+            err.headers()
+                .get(header::RETRY_AFTER)
+                .map(|v| v.to_str().unwrap_or_default()),
+            Some("5"),
+            "the upstream header is authoritative when present"
+        );
+    }
+
+    /// A 429 with no `retry_after` anywhere still forwards as a 429 — the
+    /// client just gets no hint. It must not fall back to 502.
+    #[test]
+    fn validate_token_response_forwards_rate_limit_without_retry_hint() {
+        let response = IngressHttpResponse {
+            status: 429,
+            headers: vec![],
+            body: Some(b"slow down".to_vec()),
+        };
+        let err = validate_token_response(&response).expect_err("429 is an error response");
+        assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            err.headers().get(header::RETRY_AFTER).is_none(),
+            "no hint available, so no header — not a fabricated one"
         );
     }
 
@@ -7691,6 +8223,112 @@ mod tests {
         // The next reader sees the new activation; counts come from the same
         // dispatcher `/status` reads.
         assert_eq!(server.counts(), (1, 2));
+    }
+
+    /// D2, the whole point: a routing-only reload replaces the routing tables
+    /// and keeps the *same* `RunnerHost` allocation.
+    ///
+    /// The host is not merely expensive to rebuild (every revision's packs get
+    /// re-instantiated, WASM compile included) — it OWNS every revision's
+    /// session and state store, which `activate_runtime_config` constructs
+    /// fresh. So a full reload silently discards every live conversation. That
+    /// is D1: reproduced 2026-07-25 by flipping `default_bundle` under load,
+    /// where a DirectLine turn whose `POST /activities` coincided with the swap
+    /// never received its reply and burned its whole poll budget. Preserving the
+    /// host allocation is what makes the flip invisible to conversations.
+    ///
+    /// The dispatcher must be preserved too: `reload` re-anchors per-deployment
+    /// generations, which invalidates sticky cookies and pins. Nothing moved, so
+    /// nothing may be invalidated.
+    ///
+    /// MUTATION PROOF: make the builder in `reload_routing_only` construct a
+    /// fresh dispatcher (or route the call through `reload`) and this fails on
+    /// the host or dispatcher assertion.
+    #[tokio::test]
+    async fn reload_routing_only_preserves_host_and_dispatcher() {
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(empty_state("env-1", bound));
+        let server = server_for_test(std::sync::Arc::clone(&state));
+        server.reload(populated_activation("env-1", 2), Duration::ZERO);
+
+        let before = state.current();
+
+        let (report, published) = server.reload_routing_only(|live| RevisionIngressRouting {
+            // Exactly what `revision_boot::reactivate_routing_only` does with
+            // the pack- and revision-derived half.
+            dispatcher: std::sync::Arc::clone(&live.routing.dispatcher),
+            http_routes: live.routing.http_routes.clone(),
+            static_routes: live.routing.static_routes.clone(),
+            flow_index: live.routing.flow_index.clone(),
+            // …and rebuilds the env-derived half.
+            deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+            endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+            deployment_config_overrides: std::sync::Arc::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+        });
+
+        let after = state.current();
+        assert!(
+            std::sync::Arc::ptr_eq(&before.host, &after.host),
+            "the RunnerHost must be the SAME allocation — rebuilding it drops \
+             every revision's session and state store, abandoning live conversations"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&before.routing.dispatcher, &after.routing.dispatcher),
+            "the dispatcher must be preserved so session pins and sticky cookies stay valid"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&before.routing, &after.routing),
+            "the routing tables must actually have been replaced"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&published.host, &after.host),
+            "the returned activation must be the one now serving, so the caller's \
+             post-reload hook observes what the server does"
+        );
+        // Nothing moved, so the counts are unchanged on both sides.
+        assert_eq!(
+            (report.prev_deployments, report.prev_revisions),
+            (report.new_deployments, report.new_revisions),
+            "a routing-only reload cannot change the deployment or revision count"
+        );
+        assert_eq!(server.counts(), (1, 2));
+    }
+
+    /// A request that snapshotted the activation before a routing-only swap
+    /// keeps serving against it, exactly as it does across a full reload.
+    #[tokio::test]
+    async fn reload_routing_only_leaves_inflight_snapshot_intact() {
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(empty_state("env-1", bound));
+        let server = server_for_test(std::sync::Arc::clone(&state));
+        server.reload(populated_activation("env-1", 1), Duration::ZERO);
+
+        let inflight = state.current();
+        let inflight_ptr = std::sync::Arc::as_ptr(&inflight) as usize;
+
+        server.reload_routing_only(|live| RevisionIngressRouting {
+            dispatcher: std::sync::Arc::clone(&live.routing.dispatcher),
+            http_routes: live.routing.http_routes.clone(),
+            static_routes: live.routing.static_routes.clone(),
+            flow_index: live.routing.flow_index.clone(),
+            deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+            endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+            deployment_config_overrides: std::sync::Arc::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+        });
+
+        assert_ne!(
+            std::sync::Arc::as_ptr(&state.current()) as usize,
+            inflight_ptr,
+            "the next reader must see the new activation"
+        );
+        // The in-flight snapshot still resolves through the host it started on
+        // — which is also the live one, since the swap shared it.
+        assert!(
+            std::sync::Arc::ptr_eq(&inflight.host, &state.current().host),
+            "sharing the host is what lets an in-flight turn finish across the swap"
+        );
     }
 
     #[tokio::test]
@@ -8228,6 +8866,7 @@ mod tests {
             http_routes: HttpRouteTable::from_descriptors(Vec::new()),
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::from_parts(vec![(
                 deployment_id,
+                greentic_deploy_spec::BundleId::new("test"),
                 tenant.to_string(),
                 Vec::new(),
                 Vec::new(),
@@ -8235,6 +8874,8 @@ mod tests {
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: std::sync::Arc::default(),
             static_routes: crate::static_routes::ActiveRouteTable::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+            flow_index: crate::webchat_routing::FlowIndex::default(),
         });
         let activation = Activation {
             host: base.host,
@@ -9153,6 +9794,8 @@ mod binary_update_tests {
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
             }),
         }
     }
@@ -10047,6 +10690,7 @@ mod binary_update_tests {
 
         let deployment_routes = DeploymentRouteTable::from_parts(vec![(
             deployment_id,
+            greentic_deploy_spec::BundleId::new("test"),
             tenant.to_string(),
             Vec::new(),
             Vec::new(),
@@ -10101,6 +10745,8 @@ mod binary_update_tests {
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
             }),
         }
     }

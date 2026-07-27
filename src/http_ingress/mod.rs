@@ -1752,9 +1752,11 @@ where
             || request.path.ends_with("/conversations"))
     {
         extract_user_id(&body).map(|user_id| DedupKey {
+            deployment_id: greentic_deploy_spec::DeploymentId::default(),
             tenant: request.tenant.to_string(),
             team: request.team.to_string(),
             user_id,
+            flow_hint: None,
         })
     } else {
         None
@@ -2534,6 +2536,7 @@ mod tests {
         // Empty-binding deployment route → matches any host/path.
         let deployment_routes = DeploymentRouteTable::from_parts(vec![(
             deployment_id,
+            greentic_deploy_spec::BundleId::new("test"),
             "default".to_string(),
             Vec::new(),
             Vec::new(),
@@ -2546,6 +2549,8 @@ mod tests {
             deployment_routes,
             deployment_config_overrides: Arc::default(),
             static_routes: ActiveRouteTable::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+            flow_index: crate::webchat_routing::FlowIndex::default(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
@@ -2578,6 +2583,7 @@ mod tests {
         let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new("demo", [7u8; 32]));
         let deployment_routes = DeploymentRouteTable::from_parts(vec![(
             DeploymentId::new(),
+            greentic_deploy_spec::BundleId::new("test"),
             "default".to_string(),
             vec!["only.example.com".to_string()],
             Vec::new(),
@@ -2589,6 +2595,8 @@ mod tests {
             deployment_routes,
             deployment_config_overrides: Arc::default(),
             static_routes: ActiveRouteTable::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+            flow_index: crate::webchat_routing::FlowIndex::default(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));

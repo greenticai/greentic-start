@@ -2,7 +2,7 @@ bench = [{ name = "perf", harness = false }]
 
 [package]
 name = "greentic-start"
-version = "1.1.29"
+version = "1.1.32"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -154,7 +154,15 @@ default-features = false
 # masks that with a path dep; resolving from crates.io picks 0.2.3 and fails to
 # compile `greentic-deployer`. Our floor is what actually constrains the shared
 # resolution, so raise it here rather than wait for their republish.
-version = ">=0.2.4, <0.3"
+# Floor raised to 0.2.5: `EnvironmentHostConfig` is now `#[non_exhaustive]` and
+# must be constructed via `EnvironmentHostConfig::new(env_id)` + builder setters.
+# The `new()` constructor and `#[non_exhaustive]` do not exist before 0.2.5.
+# Exact-pinned because a range upper-bounded at `<0.3` admits dev-lane
+# `0.2.<RUN_ID>` publishes (e.g. 0.2.29986812583), which transitively require
+# `greentic-types >=1.2.0-dev` and conflict with the stable `=1.1.2` pin above.
+# An exact pin also forces deploy-spec to unify with the copy `greentic-deployer`
+# (below) pulls transitively, avoiding a two-copy E0308 fork.
+version = "=0.2.5"
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
 # (per-env trust root + operator key, deployer #226). Floor bumped to the
@@ -202,7 +210,15 @@ version = ">=0.2.4, <0.3"
 # resume path here would otherwise wedge a plan resuming after a channel
 # migration against the other channel's applied sequence. Transitively pins
 # greentic-update >= 1.1.2 (the authoritative channel-scoped gate).
-version = ">=1.1.26, <1.2.0-0"
+#
+# Floor raised to 1.1.29 in lockstep with deploy-spec 0.2.5: that release adds
+# `EnvironmentHostConfig::default_bundle` and makes the struct
+# `#[non_exhaustive]`, and every deployer up to and including the published
+# 1.1.28 constructs it with literals, so resolving the new spec against an
+# older deployer fails inside the registry copy (E0639; E0063 before the
+# attribute). 1.1.29, not 1.1.28: main cut and published 1.1.28 from #520 while
+# this work was open, so that release predates the conversion.
+version = ">=1.1.29, <1.2.0-0"
 default-features = false
 
 # Lower bound pinned to the first dev build exposing the `signing` module

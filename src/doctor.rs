@@ -546,6 +546,7 @@ fn default_start_request(bundle: Option<String>) -> StartRequest {
         verbose: false,
         quiet: true,
         no_browser: true,
+        open_webchat: None,
         no_updates: true,
         no_auto_restart: false,
         admin: false,
