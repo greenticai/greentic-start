@@ -852,6 +852,27 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 .map(|scope| scope.bundle_id.as_str())
                 .collect();
             let tenant_bundles = activation.routing.bundle_index.tenants_and_bundles();
+            // Flows per bundle, so a bundle holding several can advertise each
+            // one's URL. `flow_index` is built from the same pack manifests the
+            // request path validates `X-Greentic-Flow` against, so a flow that
+            // is advertised here is a flow the runtime will actually dispatch.
+            let bundle_flows: std::collections::BTreeMap<&str, BundleFlows<'_>> = tenant_bundles
+                .iter()
+                .flat_map(|(_, bundles, _)| bundles.iter().copied())
+                .map(|bundle_id| {
+                    (
+                        bundle_id,
+                        BundleFlows {
+                            ids: activation.routing.flow_index.flow_ids_for_bundle(bundle_id),
+                            default_id: activation
+                                .routing
+                                .flow_index
+                                .default_flow_for_bundle(bundle_id)
+                                .map(|(_pack, flow)| flow),
+                        },
+                    )
+                })
+                .collect();
             if tenant_bundles.is_empty() {
                 // Fallback: no bundle index (pre-deploy-spec env), expand
                 // route templates the way the banner did before stage 1.
@@ -891,6 +912,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                     &listen.to_string(),
                     &tenant_bundles,
                     &webchat_ui_bundles,
+                    &bundle_flows,
                 );
                 for line in &advert.lines {
                     operator_log::info(module_path!(), line.clone());
@@ -1913,6 +1935,17 @@ pub(crate) fn resolve_auto_restart(_no_flag: bool) -> bool {
     false
 }
 
+/// A bundle's flows, for advertising `/{tenant}/{bundle}/{flow}/` URLs.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct BundleFlows<'a> {
+    /// Every flow id in the bundle, sorted.
+    pub(crate) ids: Vec<&'a str>,
+    /// The flow the bare `/{tenant}/{bundle}/` URL already reaches, when the
+    /// bundle has an unambiguous one. Tagged in the banner so two URLs landing
+    /// on the same flow read as a shorthand rather than a duplicate.
+    pub(crate) default_id: Option<&'a str>,
+}
+
 /// The webchat UI URLs a running environment can honestly advertise.
 ///
 /// Split out of `run_start` so the "which bundles get a URL" rule is testable
@@ -1952,10 +1985,18 @@ impl WebchatAdvert {
 ///
 /// An empty set means the env's webchat routes are legacy/unscoped, which
 /// predates per-bundle scoping — advertise everything, as before.
+///
+/// `bundle_flows` adds a `/{tenant}/{bundle}/{flow}/` line per flow, but only
+/// for bundles holding MORE THAN ONE. A single-flow bundle's flow URL is the
+/// bundle URL, so listing it would double every line to say nothing. Flow URLs
+/// are only emitted under a bundle-scoped URL, never under the bare tenant
+/// shorthand: `/{tenant}/{flow}/` is not a routing form — an unrecognized
+/// segment there resolves as an ASSET path under the default bundle.
 pub(crate) fn advertise_webchat_urls(
     listen: &str,
     tenant_bundles: &[(&str, Vec<&str>, Option<&str>)],
     webchat_ui_bundles: &std::collections::BTreeSet<&str>,
+    bundle_flows: &std::collections::BTreeMap<&str, BundleFlows<'_>>,
 ) -> WebchatAdvert {
     let mut advert = WebchatAdvert::default();
     let mut first_url: Option<String> = None;
@@ -1996,6 +2037,24 @@ pub(crate) fn advertise_webchat_urls(
                 first_url = Some(url);
             }
             advert.paths.push(path);
+
+            // One line per flow, for bundles that have a choice to offer.
+            let flows = bundle_flows.get(bundle_id);
+            let flow_ids = flows.map(|f| f.ids.as_slice()).unwrap_or_default();
+            if flow_ids.len() < 2 {
+                continue;
+            }
+            for flow_id in flow_ids {
+                let path = format!("/v1/web/webchat/{tenant}/{bundle_id}/{flow_id}/");
+                let url = format!("http://{listen}{path}");
+                let tag = if flows.and_then(|f| f.default_id) == Some(*flow_id) {
+                    " (default flow — same as the bundle URL above)"
+                } else {
+                    ""
+                };
+                advert.lines.push(format!("UI: {url}{tag}"));
+                advert.paths.push(path);
+            }
         }
     }
     // No servable DEFAULT bundle: open the first URL actually advertised.
@@ -2176,6 +2235,28 @@ mod tests {
         ids.iter().copied().collect()
     }
 
+    /// No flow index — every bundle advertises its bundle URL only.
+    fn no_flows() -> std::collections::BTreeMap<&'static str, BundleFlows<'static>> {
+        std::collections::BTreeMap::new()
+    }
+
+    fn flows<'a>(
+        entries: &[(&'a str, &[&'a str], Option<&'a str>)],
+    ) -> std::collections::BTreeMap<&'a str, BundleFlows<'a>> {
+        entries
+            .iter()
+            .map(|(bundle, ids, default_id)| {
+                (
+                    *bundle,
+                    BundleFlows {
+                        ids: ids.to_vec(),
+                        default_id: *default_id,
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn demo_env() -> Vec<(&'static str, Vec<&'static str>, Option<&'static str>)> {
         vec![(
             "default",
@@ -2186,7 +2267,12 @@ mod tests {
 
     #[test]
     fn only_bundles_owning_a_webchat_route_are_advertised() {
-        let advert = advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &ui_set(&["gui"]));
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["gui"]),
+            &no_flows(),
+        );
         // Exactly one URL, and it is the bundle that actually ships the SPA.
         assert_eq!(
             advert.lines,
@@ -2203,7 +2289,12 @@ mod tests {
         // Assert against `paths`, not `lines`: the default line carries a
         // trailing " (default)" tag, so an `ends_with` on the line silently
         // never matches and the test passes against the BROKEN behaviour too.
-        let advert = advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &ui_set(&["gui"]));
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["gui"]),
+            &no_flows(),
+        );
         assert!(
             !advert
                 .paths
@@ -2223,7 +2314,12 @@ mod tests {
         // The regression this guards: `acct` sorts first AND is the default,
         // so both the old `is_default` pick and the old `bundles.first()`
         // fallback would have opened a browser on a 405.
-        let advert = advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &ui_set(&["gui"]));
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["gui"]),
+            &no_flows(),
+        );
         assert_eq!(
             advert.open_url.as_deref(),
             Some("http://127.0.0.1:8080/v1/web/webchat/default/gui/")
@@ -2236,6 +2332,7 @@ mod tests {
             "127.0.0.1:8080",
             &[("default", vec!["gui", "legal"], Some("gui"))],
             &ui_set(&["gui"]),
+            &no_flows(),
         );
         // The bare alias comes FIRST (it is what `--open-webchat` opens), and
         // `gui` still gets its own explicit URL — being the default must not
@@ -2266,6 +2363,7 @@ mod tests {
             "127.0.0.1:8080",
             &demo_env(),
             &ui_set(&["acct", "gui", "legal", "support"]),
+            &no_flows(),
         );
         for bundle in ["acct", "gui", "legal", "support"] {
             let url = format!("http://127.0.0.1:8080/v1/web/webchat/default/{bundle}/");
@@ -2292,6 +2390,7 @@ mod tests {
             "127.0.0.1:8080",
             &demo_env(),
             &ui_set(&["acct", "gui", "legal", "support"]),
+            &no_flows(),
         );
         assert_eq!(
             advert.lines[0],
@@ -2300,10 +2399,126 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_flow_bundle_advertises_a_url_per_flow() {
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &[("default", vec!["support"], Some("support"))],
+            &ui_set(&["support"]),
+            &flows(&[("support", &["main", "on_escalate"], Some("main"))]),
+        );
+        assert_eq!(
+            advert.lines,
+            vec![
+                "UI: http://127.0.0.1:8080/v1/web/webchat/default/ → default bundle `support`",
+                "UI: http://127.0.0.1:8080/v1/web/webchat/default/support/ (default)",
+                "UI: http://127.0.0.1:8080/v1/web/webchat/default/support/main/ (default flow — same as the bundle URL above)",
+                "UI: http://127.0.0.1:8080/v1/web/webchat/default/support/on_escalate/",
+            ]
+        );
+        // Tunnel rebasing republishes the flow URLs too — a public visitor must
+        // not see a shorter list than a local one.
+        assert_eq!(advert.paths.len(), advert.lines.len());
+    }
+
+    #[test]
+    fn a_single_flow_bundle_gets_no_flow_url() {
+        // Its one flow URL IS the bundle URL. Printing both doubles the banner
+        // to say nothing, and the demo's four single-flow bundles are the
+        // common case.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &[("default", vec!["acct"], Some("acct"))],
+            &ui_set(&["acct"]),
+            &flows(&[("acct", &["on_message"], Some("on_message"))]),
+        );
+        assert_eq!(
+            advert.lines,
+            vec![
+                "UI: http://127.0.0.1:8080/v1/web/webchat/default/ → default bundle `acct`",
+                "UI: http://127.0.0.1:8080/v1/web/webchat/default/acct/ (default)",
+            ]
+        );
+    }
+
+    #[test]
+    fn flow_urls_are_never_advertised_under_the_bare_tenant_shorthand() {
+        // `/{tenant}/{flow}/` is not a routing form: an unrecognized segment
+        // right after the tenant resolves as an ASSET path under the default
+        // bundle, so advertising it would promise a link that returns the SPA's
+        // 404 handling rather than the flow.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &[("default", vec!["support"], Some("support"))],
+            &ui_set(&["support"]),
+            &flows(&[("support", &["main", "on_escalate"], Some("main"))]),
+        );
+        for bad in [
+            "/v1/web/webchat/default/main/",
+            "/v1/web/webchat/default/on_escalate/",
+        ] {
+            assert!(
+                !advert.paths.iter().any(|path| path == bad),
+                "flow advertised under the bare tenant: {bad} in {:?}",
+                advert.paths
+            );
+        }
+    }
+
+    #[test]
+    fn a_bundle_with_no_unambiguous_default_flow_tags_nothing() {
+        // Two packs claiming a default tombstone the entry (see
+        // `FlowIndex::register_bundle_default_flow`), so no flow may claim to
+        // be what the bare bundle URL reaches.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &[("default", vec!["support"], None)],
+            &ui_set(&["support"]),
+            &flows(&[("support", &["main", "on_escalate"], None)]),
+        );
+        assert!(
+            !advert
+                .lines
+                .iter()
+                .any(|line| line.contains("default flow")),
+            "{:?}",
+            advert.lines
+        );
+    }
+
+    #[test]
+    fn flow_urls_are_not_advertised_for_a_bundle_that_cannot_serve() {
+        // The #460 property, extended: a bundle with no UI pack gets no URL,
+        // so it must not get per-flow URLs either.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["gui"]),
+            &flows(&[
+                ("gui", &["main", "on_escalate"], Some("main")),
+                ("support", &["main", "on_escalate"], Some("main")),
+            ]),
+        );
+        assert!(
+            !advert.paths.iter().any(|path| path.contains("/support/")),
+            "{:?}",
+            advert.paths
+        );
+        assert_eq!(
+            advert.paths,
+            vec![
+                "/v1/web/webchat/default/gui/",
+                "/v1/web/webchat/default/gui/main/",
+                "/v1/web/webchat/default/gui/on_escalate/",
+            ]
+        );
+    }
+
+    #[test]
     fn an_empty_scope_set_advertises_everything() {
         // Legacy/unscoped routes carry no bundle id. Keep the pre-scoping
         // behaviour rather than advertising nothing at all.
-        let advert = advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &ui_set(&[]));
+        let advert =
+            advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &ui_set(&[]), &no_flows());
         assert_eq!(advert.lines.len(), 5); // 4 bundles + the bare alias
         assert!(advert.without_ui.is_empty());
         assert!(advert.without_ui_note().is_none());
@@ -2323,6 +2538,7 @@ mod tests {
                 ("default", vec!["acct", "gui"], Some("acct")),
             ],
             &ui_set(&["gui"]),
+            &no_flows(),
         );
         assert_eq!(advert.lines.len(), advert.paths.len());
         for path in &advert.paths {
@@ -2346,7 +2562,12 @@ mod tests {
 
     #[test]
     fn without_ui_note_names_the_skipped_bundles() {
-        let advert = advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &ui_set(&["gui"]));
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["gui"]),
+            &no_flows(),
+        );
         let note = advert
             .without_ui_note()
             .expect("a note for skipped bundles");
