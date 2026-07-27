@@ -7353,14 +7353,28 @@ mod tests {
     /// An `Activation` whose environment ships a pack webchat UI on
     /// `(tenant, bundle_id)` — the shape `/chat` must forward into.
     fn activation_with_pack_webchat_ui(tenant: &str, bundle_id: &str) -> Activation {
+        activation_with_indexed_bundle(tenant, bundle_id, true)
+    }
+
+    /// The same environment with its bundle INDEXED but shipping no webchat
+    /// static route — the shape `/chat` must NOT forward into.
+    fn activation_with_bundle_but_no_webchat_ui(tenant: &str, bundle_id: &str) -> Activation {
+        activation_with_indexed_bundle(tenant, bundle_id, false)
+    }
+
+    fn activation_with_indexed_bundle(
+        tenant: &str,
+        bundle_id: &str,
+        with_webchat_ui: bool,
+    ) -> Activation {
         let base = empty_activation(tenant);
         let (env, deployment_id) = crate::test_fixtures::env_with_active_bundle(tenant, bundle_id);
         let deployment_routes =
             crate::deployment_routes::DeploymentRouteTable::from_environment(&env);
         let bundle_index =
             crate::webchat_routing::BundleIndex::from_routes_and_env(&deployment_routes, &env);
-        let plan = crate::static_routes::StaticRoutePlan {
-            routes: vec![crate::static_routes::StaticRouteDescriptor {
+        let routes = if with_webchat_ui {
+            vec![crate::static_routes::StaticRouteDescriptor {
                 route_id: "webchat-gui".to_string(),
                 pack_id: "messaging-webchat-gui".to_string(),
                 pack_path: std::path::PathBuf::from("packs/messaging-webchat-gui.gtpack"),
@@ -7377,7 +7391,12 @@ mod tests {
                     bundle_id: greentic_deploy_spec::BundleId::new(bundle_id),
                     revision_id: greentic_deploy_spec::RevisionId::new(),
                 }),
-            }],
+            }]
+        } else {
+            Vec::new()
+        };
+        let plan = crate::static_routes::StaticRoutePlan {
+            routes,
             ..Default::default()
         };
         Activation {
@@ -7468,6 +7487,42 @@ mod tests {
         let state = empty_state("local", "127.0.0.1:8080".parse().unwrap());
         assert!(try_chat_redirect_response("/chat", &hyper::Method::GET, &state).is_none());
         // …and the console still answers on that same path.
+        let page = try_chat_asset_response("/chat", &hyper::Method::GET).expect("console page");
+        assert_eq!(page.status(), StatusCode::OK);
+    }
+
+    /// The case the test above only appeared to cover: it uses `empty_state`,
+    /// whose bundle index is EMPTY, so the forward declined because there was no
+    /// bundle to name — not because the env ships no UI. Index a bundle and keep
+    /// the static routes empty and the real rule is exercised: an environment
+    /// with deployments but no `/v1/web/webchat` route used to hand out a `302`
+    /// to `/v1/web/webchat/{tenant}/`, which no static route matches, so the
+    /// browser landed on the generic ingress and read
+    /// `405 only POST is supported for the generic revision ingress` — after the
+    /// boot banner told the operator to open `/chat`.
+    #[test]
+    fn chat_does_not_forward_when_bundles_are_indexed_but_ship_no_webchat_ui() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut state = empty_state("acme", bound);
+        state.gui_enabled = true;
+        state.slot.store(std::sync::Arc::new(
+            activation_with_bundle_but_no_webchat_ui("acme", "hr-chat"),
+        ));
+        // Sanity: the bundle IS indexed, so a `None` below cannot be the
+        // "nothing to name" escape the previous test relied on.
+        assert!(
+            !state
+                .current()
+                .routing
+                .bundle_index
+                .tenants_and_bundles()
+                .is_empty(),
+            "fixture must index a bundle or this proves nothing"
+        );
+        assert!(
+            try_chat_redirect_response("/chat", &hyper::Method::GET, &state).is_none(),
+            "no pack ships a webchat UI — /chat must fall through to the console"
+        );
         let page = try_chat_asset_response("/chat", &hyper::Method::GET).expect("console page");
         assert_eq!(page.status(), StatusCode::OK);
     }
