@@ -1066,6 +1066,21 @@ async fn serve(
         return Ok(response);
     }
 
+    // `/chat` is the operator's "just open the chat" shortcut. When this
+    // environment's packs ship a webchat UI, forward there: that SPA is the
+    // real client (DirectLine, adaptive cards, tenant skins, i18n), while the
+    // built-in console below is a hand-rolled page driving the loopback
+    // `/workers/invoke` endpoint — strictly the lesser of the two, and kept
+    // only for environments that ship no UI at all.
+    //
+    // Checked before the console so the pack UI wins even when the operator
+    // set `gui_enabled: true`, and before deployment-route resolution for the
+    // same reason the console is: a broad `/`-prefix route binding would
+    // otherwise shadow the path.
+    if let Some(response) = try_chat_redirect_response(&path, &method, &state) {
+        return Ok(response);
+    }
+
     // Built-in webchat console: serve the static `/chat` page and its renderer
     // when the env has the GUI enabled. Short-circuited here — after probes,
     // before deployment-route resolution — so a broad `/`-prefix route binding
@@ -1388,8 +1403,23 @@ async fn serve(
             .static_routes
             .match_request_for_revision(&effective_path, &scope)
     {
-        let response =
-            crate::static_handler::serve_static_route_from_pack(&route_match, &effective_path);
+        // Prefer the bundle-overlay serve path (disk assets + synthesized
+        // per-tenant config from the provider envelope) when the revision's
+        // extracted bundle is present on disk; this matches the legacy
+        // `--bundle` path and ensures setup-written `config/tenants/<t>.json`
+        // (and the operator's chosen skin) are actually served instead of
+        // 404-falling to `index.html`. Fall back to pack-only serving when no
+        // overlay root is found.
+        let response = match crate::static_handler::revision_bundle_root(route_match.descriptor) {
+            Some(bundle_root) => crate::static_handler::serve_static_route(
+                &route_match,
+                &bundle_root,
+                &effective_path,
+            ),
+            None => {
+                crate::static_handler::serve_static_route_from_pack(&route_match, &effective_path)
+            }
+        };
         return Ok(with_cors(response));
     }
 
@@ -3562,6 +3592,55 @@ pub(crate) fn error_response(
 const CHAT_HTML: &str = include_str!("../assets/chat.html");
 /// Vendored Adaptive Cards renderer the chat page loads from `/adaptivecards.min.js`.
 const ADAPTIVE_CARDS_JS: &str = include_str!("../assets/adaptivecards.min.js");
+
+/// `GET /chat` → `302` to the pack-provided webchat UI for the default bundle.
+///
+/// Returns `None` when `path` is not `/chat`, or when no pack in this
+/// environment ships a webchat UI — the caller then falls through to the
+/// built-in console, and past it to deployment routing, exactly as before.
+///
+/// **A redirect, not an internal rewrite.** The pack SPA locates itself from
+/// `window.location`: its bootstrap parses
+/// `/v1/web/webchat/{tenant}[/{bundle}[/{flow}]]` out of the path to pick its
+/// tenant, bundle, flow and DirectLine origin, and its `index.html` pulls
+/// scripts and styles by relative URL. Serving those bytes under `/chat` would
+/// hand the browser a page that can find neither its own assets nor its
+/// backend. The browser has to *be* at the webchat URL.
+///
+/// **`302` + `no-store`, never `301`.** The target is whichever bundle is the
+/// default right now, and a hot-reload can move it; a cached permanent
+/// redirect would pin browsers to a bundle the environment no longer serves.
+///
+/// **Not loopback-gated**, unlike the console it precedes. The console is
+/// gated because it drives the loopback-only `/workers/invoke` endpoint; this
+/// only points at a page the same listener already serves to any peer, so
+/// gating the alias would protect nothing the destination does not.
+fn try_chat_redirect_response(
+    path: &str,
+    method: &hyper::Method,
+    state: &ServeState,
+) -> Option<Response<Full<Bytes>>> {
+    if path != "/chat" {
+        return None;
+    }
+    // Resolved before the method check so a non-GET on an env with no pack UI
+    // still falls through to the console/routing behaviour it has today.
+    let target = crate::default_webchat_ui_path(&state.current().routing)?;
+    if *method != hyper::Method::GET {
+        return Some(error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "the webchat UI is served over GET",
+        ));
+    }
+    Some(
+        Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, target)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Full::new(Bytes::new()))
+            .expect("redirect response builder inputs are valid"),
+    )
+}
 
 /// Serve the built-in webchat console: `GET /chat` returns the HTML page and
 /// `GET /adaptivecards.min.js` returns the vendored renderer. A non-GET method
@@ -7269,6 +7348,249 @@ mod tests {
             Some("application/javascript; charset=utf-8"),
         );
         assert!(!body_string(js).is_empty());
+    }
+
+    /// An `Activation` whose environment ships a pack webchat UI on
+    /// `(tenant, bundle_id)` — the shape `/chat` must forward into.
+    fn activation_with_pack_webchat_ui(tenant: &str, bundle_id: &str) -> Activation {
+        activation_with_indexed_bundle(tenant, bundle_id, true)
+    }
+
+    /// The same environment with its bundle INDEXED but shipping no webchat
+    /// static route — the shape `/chat` must NOT forward into.
+    fn activation_with_bundle_but_no_webchat_ui(tenant: &str, bundle_id: &str) -> Activation {
+        activation_with_indexed_bundle(tenant, bundle_id, false)
+    }
+
+    fn activation_with_indexed_bundle(
+        tenant: &str,
+        bundle_id: &str,
+        with_webchat_ui: bool,
+    ) -> Activation {
+        let base = empty_activation(tenant);
+        let (env, deployment_id) = crate::test_fixtures::env_with_active_bundle(tenant, bundle_id);
+        let deployment_routes =
+            crate::deployment_routes::DeploymentRouteTable::from_environment(&env);
+        let bundle_index =
+            crate::webchat_routing::BundleIndex::from_routes_and_env(&deployment_routes, &env);
+        let routes = if with_webchat_ui {
+            vec![crate::static_routes::StaticRouteDescriptor {
+                route_id: "webchat-gui".to_string(),
+                pack_id: "messaging-webchat-gui".to_string(),
+                pack_path: std::path::PathBuf::from("packs/messaging-webchat-gui.gtpack"),
+                public_path: "/v1/web/webchat/{tenant}".to_string(),
+                source_root: "assets/webchat-gui".to_string(),
+                index_file: Some("index.html".to_string()),
+                spa_fallback: Some("index.html".to_string()),
+                tenant_scoped: true,
+                team_scoped: false,
+                cache_strategy: crate::static_routes::CacheStrategy::None,
+                route_segments: Vec::new(),
+                scope: Some(crate::http_routes::RevisionScope {
+                    deployment_id,
+                    bundle_id: greentic_deploy_spec::BundleId::new(bundle_id),
+                    revision_id: greentic_deploy_spec::RevisionId::new(),
+                }),
+            }]
+        } else {
+            Vec::new()
+        };
+        let plan = crate::static_routes::StaticRoutePlan {
+            routes,
+            ..Default::default()
+        };
+        Activation {
+            host: std::sync::Arc::clone(&base.host),
+            routing: std::sync::Arc::new(RevisionIngressRouting {
+                dispatcher: std::sync::Arc::clone(&base.routing.dispatcher),
+                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
+                deployment_routes,
+                endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+                deployment_config_overrides: std::sync::Arc::default(),
+                static_routes: crate::static_routes::ActiveRouteTable::from_plan(&plan),
+                bundle_index,
+                flow_index: crate::webchat_routing::FlowIndex::default(),
+            }),
+        }
+    }
+
+    fn state_with_pack_webchat_ui(tenant: &str, bundle_id: &str, gui_enabled: bool) -> ServeState {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut state = empty_state(tenant, bound);
+        state.gui_enabled = gui_enabled;
+        state
+            .slot
+            .store(std::sync::Arc::new(activation_with_pack_webchat_ui(
+                tenant, bundle_id,
+            )));
+        state
+    }
+
+    #[test]
+    fn chat_forwards_to_the_pack_webchat_ui_for_the_default_bundle() {
+        let state = state_with_pack_webchat_ui("acme", "hr-chat", false);
+        let response = try_chat_redirect_response("/chat", &hyper::Method::GET, &state)
+            .expect("a redirect when the env ships a webchat UI");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            // The bare tenant URL: default bundle, its default flow — the same
+            // target the boot banner advertises first.
+            Some("/v1/web/webchat/acme/"),
+        );
+        // The body must be empty; the page lives at the target, not here.
+        assert!(body_string(response).is_empty());
+    }
+
+    /// The regression that motivated the change: `gui_enabled: true` used to
+    /// mean "serve the hand-rolled console", so an operator who wanted a
+    /// browser tier got the lesser client even with a real SPA deployed.
+    #[test]
+    fn chat_forwards_to_the_pack_ui_even_when_the_console_is_enabled() {
+        let state = state_with_pack_webchat_ui("acme", "hr-chat", true);
+        let response = try_chat_redirect_response("/chat", &hyper::Method::GET, &state)
+            .expect("the pack UI must win over the built-in console");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/v1/web/webchat/acme/"),
+        );
+    }
+
+    /// `301` would be cached by the browser forever, pinning it to a bundle a
+    /// later hot-reload may no longer serve.
+    #[test]
+    fn chat_forward_is_temporary_and_uncached() {
+        let state = state_with_pack_webchat_ui("acme", "hr-chat", false);
+        let response =
+            try_chat_redirect_response("/chat", &hyper::Method::GET, &state).expect("a redirect");
+        assert_ne!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+        );
+    }
+
+    #[test]
+    fn chat_does_not_forward_when_no_pack_ships_a_webchat_ui() {
+        // No static routes at all: the built-in console is the only browser
+        // tier this env has, so the redirect must decline and let it serve.
+        let state = empty_state("local", "127.0.0.1:8080".parse().unwrap());
+        assert!(try_chat_redirect_response("/chat", &hyper::Method::GET, &state).is_none());
+        // …and the console still answers on that same path.
+        let page = try_chat_asset_response("/chat", &hyper::Method::GET).expect("console page");
+        assert_eq!(page.status(), StatusCode::OK);
+    }
+
+    /// The case the test above only appeared to cover: it uses `empty_state`,
+    /// whose bundle index is EMPTY, so the forward declined because there was no
+    /// bundle to name — not because the env ships no UI. Index a bundle and keep
+    /// the static routes empty and the real rule is exercised: an environment
+    /// with deployments but no `/v1/web/webchat` route used to hand out a `302`
+    /// to `/v1/web/webchat/{tenant}/`, which no static route matches, so the
+    /// browser landed on the generic ingress and read
+    /// `405 only POST is supported for the generic revision ingress` — after the
+    /// boot banner told the operator to open `/chat`.
+    #[test]
+    fn chat_does_not_forward_when_bundles_are_indexed_but_ship_no_webchat_ui() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut state = empty_state("acme", bound);
+        state.gui_enabled = true;
+        state.slot.store(std::sync::Arc::new(
+            activation_with_bundle_but_no_webchat_ui("acme", "hr-chat"),
+        ));
+        // Sanity: the bundle IS indexed, so a `None` below cannot be the
+        // "nothing to name" escape the previous test relied on.
+        assert!(
+            !state
+                .current()
+                .routing
+                .bundle_index
+                .tenants_and_bundles()
+                .is_empty(),
+            "fixture must index a bundle or this proves nothing"
+        );
+        assert!(
+            try_chat_redirect_response("/chat", &hyper::Method::GET, &state).is_none(),
+            "no pack ships a webchat UI — /chat must fall through to the console"
+        );
+        let page = try_chat_asset_response("/chat", &hyper::Method::GET).expect("console page");
+        assert_eq!(page.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn chat_forward_claims_no_other_path() {
+        let state = state_with_pack_webchat_ui("acme", "hr-chat", true);
+        for path in ["/", "/chat/", "/chatter", "/adaptivecards.min.js", "/livez"] {
+            assert!(
+                try_chat_redirect_response(path, &hyper::Method::GET, &state).is_none(),
+                "`{path}` must not be claimed by the /chat forward"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_forward_rejects_non_get() {
+        let state = state_with_pack_webchat_ui("acme", "hr-chat", false);
+        let response = try_chat_redirect_response("/chat", &hyper::Method::POST, &state)
+            .expect("405 for non-GET");
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// Wiring, not logic: the unit tests above call the forward directly, so
+    /// they pass just as well if `serve()` consults it AFTER the console. Drive
+    /// a real listener with BOTH the console enabled and a pack UI deployed —
+    /// the console would answer `200 text/html` on this exact path, so the
+    /// status alone separates "forward runs first" from "forward is dead code".
+    #[test]
+    fn chat_forward_runs_before_the_console_on_a_live_listener() {
+        use std::io::{Read, Write};
+
+        let server = RevisionServer::start(RevisionServeConfig {
+            bind_addr: "127.0.0.1:17820".parse::<SocketAddr>().unwrap(),
+            activation: std::sync::Arc::new(activation_with_pack_webchat_ui("acme", "hr-chat")),
+            gui_enabled: true,
+            trust_loopback_peers: true,
+            admin_bind_addr: None,
+            updates_enabled: false,
+            auto_restart_enabled: false,
+            exe_path: None,
+        })
+        .expect("start server");
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", server.actual_port()))
+            .expect("connect to listener");
+        stream
+            .write_all(b"GET /chat HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("write request");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).expect("read response");
+        let response = String::from_utf8_lossy(&buf);
+
+        assert!(
+            response.starts_with("HTTP/1.1 302"),
+            "expected a 302 forward, got: {}",
+            response.lines().next().unwrap_or_default()
+        );
+        assert!(
+            response
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("location: /v1/web/webchat/acme/")),
+            "no Location header for the pack UI in: {response}"
+        );
+        assert!(
+            !response.contains("<title>Greentic"),
+            "the built-in console page was served instead of the forward"
+        );
     }
 
     #[test]

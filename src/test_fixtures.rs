@@ -13,8 +13,9 @@
 use std::collections::HashMap;
 
 use greentic_deploy_spec::{
-    BundleId, Environment, EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId,
-    SchemaVersion, SecretRef,
+    BundleDeployment, BundleDeploymentStatus, BundleId, CustomerId, DeploymentId, Environment,
+    EnvironmentHostConfig, MessagingEndpoint, MessagingEndpointId, PartyId, RevenueShareEntry,
+    RouteBinding, SchemaVersion, SecretRef, TenantSelector,
 };
 use greentic_secrets_lib::{Result as SecretResult, SecretError, SecretsManager};
 use greentic_types::EnvId;
@@ -121,4 +122,42 @@ pub(crate) fn env_with(endpoints: Vec<MessagingEndpoint>) -> Environment {
         retention: Default::default(),
         health: Default::default(),
     }
+}
+
+/// Build an `Environment` holding one Active bundle deployment bound to
+/// `tenant`, for tests that exercise webchat bundle/default-bundle resolution.
+///
+/// Returns the `DeploymentId` too, so a caller can scope a static route to the
+/// same `(deployment, bundle)` the routing tables resolved — an unscoped route,
+/// or one scoped to a different deployment, is not the same test.
+pub(crate) fn env_with_active_bundle(tenant: &str, bundle_id: &str) -> (Environment, DeploymentId) {
+    let deployment_id = DeploymentId::new();
+    let mut env = env_with(Vec::new());
+    env.bundles = vec![BundleDeployment {
+        schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
+        deployment_id,
+        env_id: env_id(),
+        bundle_id: BundleId::new(bundle_id),
+        customer_id: CustomerId::new("cust"),
+        status: BundleDeploymentStatus::Active,
+        current_revisions: Vec::new(),
+        route_binding: RouteBinding {
+            hosts: Vec::new(),
+            path_prefixes: Vec::new(),
+            tenant_selector: TenantSelector {
+                tenant: tenant.to_string(),
+                team: "default".to_string(),
+            },
+        },
+        revenue_share: vec![RevenueShareEntry {
+            party_id: PartyId::new("greentic"),
+            basis_points: 10_000,
+        }],
+        revenue_policy_ref: std::path::PathBuf::from("revenue.json"),
+        usage: None,
+        created_at: chrono::Utc::now(),
+        authorization_ref: std::path::PathBuf::from("auth.json"),
+        config_overrides: std::collections::BTreeMap::new(),
+    }];
+    (env, deployment_id)
 }

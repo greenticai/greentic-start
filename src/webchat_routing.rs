@@ -308,6 +308,23 @@ impl FlowIndex {
             .is_some_and(|entries| entries.iter().any(|e| e.flow_id == segment))
     }
 
+    /// Every flow id registered for `bundle_id`, sorted and deduplicated.
+    ///
+    /// For the boot banner, which advertises one URL per flow on multi-flow
+    /// bundles. Deduplicated because a flow id can be registered by more than
+    /// one pack in the same bundle and `/{tenant}/{bundle}/{flow}/` is the same
+    /// URL either way; sorted so the banner is stable across boots (`flows` is
+    /// keyed by a `HashMap` and holds registration order within a bundle).
+    pub(crate) fn flow_ids_for_bundle(&self, bundle_id: &str) -> Vec<&str> {
+        let Some(entries) = self.flows.get(bundle_id) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<&str> = entries.iter().map(|e| e.flow_id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// Look up the pack id that owns `flow_id` within `bundle_id`.
     /// Returns `None` when the flow is unknown.
     pub(crate) fn pack_id_for_flow(&self, bundle_id: &str, flow_id: &str) -> Option<&str> {
