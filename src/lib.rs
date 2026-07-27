@@ -824,10 +824,13 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         println!("\n{banner}. Press Ctrl+C to stop.");
         // Advertise the pack-provided webchat UI(s) — one URL per
         // (tenant, bundle) pair. The default bundle keeps the bare tenant
-        // URL; non-default bundles get bundle-scoped URLs. Falls back to
-        // the old route-template expansion when no bundles are indexed
-        // (backwards compat with pre-deploy-spec environments).
+        // URL; non-default bundles get bundle-scoped URLs. Falls back to the
+        // old route-template expansion when no bundles are indexed (backwards
+        // compat with pre-deploy-spec environments). Each URL's path suffix is
+        // also collected into `webchat_ui_paths` so the same links can be
+        // rebased onto the public tunnel URL below (parity with `--bundle`).
         let mut webchat_open_url: Option<String> = None;
+        let mut webchat_ui_paths: Vec<String> = Vec::new();
         if !pack_webchat_routes.is_empty() {
             let tenant_bundles = activation.routing.bundle_index.tenants_and_bundles();
             if tenant_bundles.is_empty() {
@@ -842,34 +845,38 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                     let base = route.trim_end_matches('/');
                     if base.contains("{tenant}") {
                         for tenant in &tenants {
-                            let url =
-                                format!("http://{listen}{}/", base.replace("{tenant}", tenant));
+                            let path = format!("{}/", base.replace("{tenant}", tenant));
+                            let url = format!("http://{listen}{path}");
                             let line = format!("UI: {url}");
                             operator_log::info(module_path!(), line.clone());
                             println!("{line}");
                             if webchat_open_url.is_none() {
                                 webchat_open_url = Some(url);
                             }
+                            webchat_ui_paths.push(path);
                         }
                     } else {
-                        let url = format!("http://{listen}{base}/");
+                        let path = format!("{base}/");
+                        let url = format!("http://{listen}{path}");
                         let line = format!("UI: {url}");
                         operator_log::info(module_path!(), line.clone());
                         println!("{line}");
                         if webchat_open_url.is_none() {
                             webchat_open_url = Some(url);
                         }
+                        webchat_ui_paths.push(path);
                     }
                 }
             } else {
                 for (tenant, bundles, default_id) in &tenant_bundles {
                     for bundle_id in bundles {
                         let is_default = default_id.as_deref() == Some(*bundle_id);
-                        let url = if is_default {
-                            format!("http://{listen}/v1/web/webchat/{tenant}/")
+                        let path = if is_default {
+                            format!("/v1/web/webchat/{tenant}/")
                         } else {
-                            format!("http://{listen}/v1/web/webchat/{tenant}/{bundle_id}/")
+                            format!("/v1/web/webchat/{tenant}/{bundle_id}/")
                         };
+                        let url = format!("http://{listen}{path}");
                         let tag = if is_default { " (default)" } else { "" };
                         let line = format!("UI: {url}{tag}");
                         operator_log::info(module_path!(), line.clone());
@@ -878,6 +885,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                         if webchat_open_url.is_none() && is_default {
                             webchat_open_url = Some(url.clone());
                         }
+                        webchat_ui_paths.push(path);
                     }
                 }
                 // If no default was found, fall back to the first URL.
@@ -925,6 +933,15 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             let line = format!("public URL: {} ({} tunnel)", t.url, t.service);
             operator_log::info(module_path!(), line.clone());
             println!("{line}");
+            // Rebase each local webchat UI path onto the public tunnel URL so
+            // the printed public link lands on the chat UI (parity with the
+            // legacy `--bundle` path), not the bare tunnel root.
+            let base = t.url.trim_end_matches('/');
+            for path in &webchat_ui_paths {
+                let line = format!("public UI: {base}{path}");
+                operator_log::info(module_path!(), line.clone());
+                println!("{line}");
+            }
             t.url
         });
 

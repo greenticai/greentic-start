@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use http_body_util::Full;
 use hyper::{
@@ -17,8 +17,38 @@ use crate::static_routes::{
 
 use crate::http_helpers::error_response;
 
+/// Derive the on-disk revision bundle root for a pack-served route, when the
+/// extracted bundle assets sit alongside the pinned pack. Walks up from the
+/// pack file to the first ancestor that actually contains this route's
+/// `source_root` directory.
+///
+/// The revision-serve path pins packs under `<revision>/bundle/…`, and the same
+/// bundle root holds the extracted `assets/` overlay (where `greentic-setup`
+/// writes per-tenant `config/tenants/<t>.json`) and the `.providers/` config
+/// envelopes. Returning that root lets the revision path reuse the legacy
+/// `--bundle` overlay + synthesized-tenant-config serving instead of the
+/// pack-only path — closing the parity gap that otherwise renders the built-in
+/// fallback skin regardless of the operator's setup answers.
+///
+/// Returns `None` when the overlay directory is absent (e.g. tests or a
+/// pack with no extracted bundle), so the caller falls back to pack-only serving
+/// and behavior is unchanged.
+pub(crate) fn revision_bundle_root(descriptor: &StaticRouteDescriptor) -> Option<PathBuf> {
+    if descriptor.source_root.is_empty() {
+        return None;
+    }
+    let mut dir = descriptor.pack_path.parent();
+    while let Some(candidate) = dir {
+        if candidate.join(&descriptor.source_root).is_dir() {
+            return Some(candidate.to_path_buf());
+        }
+        dir = candidate.parent();
+    }
+    None
+}
+
 /// Serve a static route directly from the pack (no bundle-root overlay).
-/// Used by the revision-serve path where no bundle root exists.
+/// Used by the revision-serve path when no extracted bundle overlay exists.
 pub(crate) fn serve_static_route_from_pack(
     route_match: &StaticRouteMatch<'_>,
     request_path: &str,
@@ -725,6 +755,35 @@ mod tests {
         assert!(match_tenant_config_asset_path("config/tenants/.json").is_none());
         assert!(match_tenant_config_asset_path("config/tenants/nested/x.json").is_none());
         assert!(match_tenant_config_asset_path("skins/3aigent/skin.json").is_none());
+    }
+
+    #[test]
+    fn revision_bundle_root_finds_overlay_alongside_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Revision layout: pack pinned under <bundle>/providers/messaging/,
+        // extracted assets (the setup-writable overlay) under
+        // <bundle>/assets/webchat-gui/.
+        let bundle = tmp.path().join("revisions/r1/bundle");
+        let pack_dir = bundle.join("providers/messaging");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::create_dir_all(bundle.join("assets/webchat-gui/config/tenants")).unwrap();
+        let pack_path = pack_dir.join("messaging-webchat-gui.gtpack");
+        std::fs::write(&pack_path, b"PK").unwrap();
+        let desc = webchat_descriptor(&pack_path);
+        assert_eq!(revision_bundle_root(&desc), Some(bundle));
+    }
+
+    #[test]
+    fn revision_bundle_root_none_when_overlay_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Pack with no extracted `assets/webchat-gui/` overlay anywhere above
+        // it → fall back to pack-only serving (None).
+        let pack_dir = tmp.path().join("packs");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_path = pack_dir.join("messaging-webchat-gui.gtpack");
+        std::fs::write(&pack_path, b"PK").unwrap();
+        let desc = webchat_descriptor(&pack_path);
+        assert_eq!(revision_bundle_root(&desc), None);
     }
 
     #[test]
