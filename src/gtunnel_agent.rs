@@ -7,6 +7,7 @@
 //! supervised by [`crate::gtunnel::start_agent`]. Reconnects with backoff so a
 //! transient Worker/edge blip does not strand the tunnel.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -165,7 +166,17 @@ type WsFrame = Result<Message, tokio_tungstenite::tungstenite::Error>;
 /// An origin reply, ready to serialize back to the Worker: (status, headers, body).
 type OriginResponse = (u16, Vec<(String, String)>, Vec<u8>);
 
-/// Read forwarded requests until the socket closes, replaying each to the origin.
+/// A frame headed for one browser↔origin WebSocket, handed from the pump loop to
+/// that stream's relay task.
+enum WsOut {
+    Text(String),
+    Binary(Vec<u8>),
+    Close,
+}
+
+/// Read forwarded frames until the socket closes. Plain HTTP requests are
+/// replayed to the origin; `ws_*` control frames drive per-stream WebSocket
+/// relays (see [`ws_relay`]) so the browser's DirectLine socket rides the tunnel.
 async fn pump<S>(
     read: &mut S,
     tx: &mpsc::UnboundedSender<Message>,
@@ -176,6 +187,11 @@ async fn pump<S>(
 where
     S: StreamExt<Item = WsFrame> + Unpin,
 {
+    // Live browser WebSockets, keyed by the stream id the Worker assigned. The
+    // sender hands frames to that stream's relay task; dropping it tears the
+    // stream down. Owned by this single task, so no lock is needed.
+    let mut streams: HashMap<String, mpsc::UnboundedSender<WsOut>> = HashMap::new();
+
     while let Some(msg) = read.next().await {
         // Any frame (request or heartbeat pong) proves the socket is alive.
         *last_seen.lock().expect("last_seen lock") = Instant::now();
@@ -185,9 +201,60 @@ where
             _ => continue,
         };
         let req: Value = serde_json::from_str(&text).context("parse frame")?;
-        if req.get("t").and_then(Value::as_str) == Some("pong") {
-            continue; // heartbeat ack
+
+        match req.get("t").and_then(Value::as_str) {
+            Some("pong") => continue, // heartbeat ack
+            Some("ws_open") => {
+                let id = req
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let path = req
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("/")
+                    .to_owned();
+                let (stream_tx, stream_rx) = mpsc::unbounded_channel::<WsOut>();
+                streams.insert(id.clone(), stream_tx);
+                let control_tx = tx.clone();
+                let target = target.to_owned();
+                tokio::spawn(ws_relay(id, path, target, control_tx, stream_rx));
+                continue;
+            }
+            Some("ws_send") => {
+                let id = req.get("id").and_then(Value::as_str).unwrap_or_default();
+                if let Some(stream) = streams.get(id) {
+                    let out = if req.get("kind").and_then(Value::as_str) == Some("bin") {
+                        match B64.decode(req.get("data").and_then(Value::as_str).unwrap_or("")) {
+                            Ok(bytes) => WsOut::Binary(bytes),
+                            Err(_) => continue,
+                        }
+                    } else {
+                        WsOut::Text(
+                            req.get("data")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                        )
+                    };
+                    // Relay task gone (origin already closed) → forget the stream.
+                    if stream.send(out).is_err() {
+                        streams.remove(id);
+                    }
+                }
+                continue;
+            }
+            Some("ws_close") => {
+                let id = req.get("id").and_then(Value::as_str).unwrap_or_default();
+                if let Some(stream) = streams.remove(id) {
+                    let _ = stream.send(WsOut::Close);
+                }
+                continue;
+            }
+            _ => {}
         }
+
         let out_tx = tx.clone();
         let client = client.clone();
         let target = target.to_owned();
@@ -198,6 +265,99 @@ where
         });
     }
     Ok(())
+}
+
+/// Relay one browser WebSocket to the local origin for its whole lifetime.
+///
+/// Dials `ws://<origin><path>`, then pumps frames both ways: origin→Worker as
+/// `ws_recv` control frames (which the Worker replays to the browser), and
+/// Worker→origin from `from_worker` (fed by the pump loop's `ws_send` frames).
+/// Either side closing tears the stream down and tells the Worker with `ws_close`.
+async fn ws_relay(
+    id: String,
+    path: String,
+    target: String,
+    control_tx: mpsc::UnboundedSender<Message>,
+    mut from_worker: mpsc::UnboundedReceiver<WsOut>,
+) {
+    // `target` is an http(s) origin base; the WebSocket scheme is the ws(s) peer.
+    let ws_url = {
+        let trimmed = target.trim_end_matches('/');
+        let base = if let Some(rest) = trimmed.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = trimmed.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else {
+            trimmed.to_owned()
+        };
+        format!("{base}{path}")
+    };
+
+    let request = match ws_url.as_str().into_client_request() {
+        Ok(req) => req,
+        Err(err) => {
+            eprintln!("[tunnel] ws {id}: bad url {ws_url}: {err:#}");
+            let _ = control_tx.send(ws_close_frame(&id));
+            return;
+        }
+    };
+    let origin = match connect_async(request).await {
+        Ok((ws, _)) => ws,
+        Err(err) => {
+            eprintln!("[tunnel] ws {id}: origin dial failed: {err:#}");
+            let _ = control_tx.send(ws_close_frame(&id));
+            return;
+        }
+    };
+    let (mut origin_write, mut origin_read) = origin.split();
+
+    loop {
+        tokio::select! {
+            // Origin → Worker → browser.
+            frame = origin_read.next() => match frame {
+                Some(Ok(Message::Text(t))) => {
+                    let _ = control_tx.send(ws_recv_frame(&id, "text", t.as_str().as_bytes(), true));
+                }
+                Some(Ok(Message::Binary(b))) => {
+                    let _ = control_tx.send(ws_recv_frame(&id, "bin", &b, false));
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+                // Origin closed or errored → done.
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+            },
+            // Browser → Worker → origin.
+            out = from_worker.recv() => match out {
+                Some(WsOut::Text(t)) => {
+                    if origin_write.send(Message::Text(t.into())).await.is_err() { break; }
+                }
+                Some(WsOut::Binary(b)) => {
+                    if origin_write.send(Message::Binary(b.into())).await.is_err() { break; }
+                }
+                // Browser closed, or the pump dropped the sender.
+                Some(WsOut::Close) | None => {
+                    let _ = origin_write.send(Message::Close(None)).await;
+                    break;
+                }
+            },
+        }
+    }
+    let _ = control_tx.send(ws_close_frame(&id));
+}
+
+/// `ws_recv` control frame: one origin WebSocket frame headed for the browser.
+/// Text rides as-is; binary is base64 (JSON has no byte type).
+fn ws_recv_frame(id: &str, kind: &str, data: &[u8], is_text: bool) -> Message {
+    let payload = if is_text {
+        String::from_utf8_lossy(data).into_owned()
+    } else {
+        B64.encode(data)
+    };
+    text_frame(json!({ "t": "ws_recv", "id": id, "kind": kind, "data": payload }).to_string())
+}
+
+/// `ws_close` control frame: tell the Worker this stream is finished.
+fn ws_close_frame(id: &str) -> Message {
+    text_frame(json!({ "t": "ws_close", "id": id }).to_string())
 }
 
 /// Replay one forwarded request to the local origin and build the reply frame.
@@ -211,6 +371,13 @@ fn replay(client: &reqwest::blocking::Client, target: &str, req: &Value) -> Valu
         let method = reqwest::Method::from_bytes(method.as_bytes())?;
         let url = format!("{}{}", target.trim_end_matches('/'), path);
         let mut builder = client.request(method, &url);
+        // The origin builds absolute URLs (notably the DirectLine `streamUrl`)
+        // from the `Host` header and the `X-Forwarded-Proto` it sees. If we let
+        // reqwest default them to `127.0.0.1:<port>` / http, the browser is told
+        // to open its WebSocket at `ws://127.0.0.1:...` — unreachable. Replay the
+        // PUBLIC host the edge saw and mark the hop as https so the origin emits
+        // `wss://<public-host>/...`, which routes back through this tunnel.
+        let mut public_host: Option<String> = None;
         if let Some(arr) = req.get("headers").and_then(Value::as_array) {
             for pair in arr {
                 let (Some(k), Some(v)) = (
@@ -219,11 +386,18 @@ fn replay(client: &reqwest::blocking::Client, target: &str, req: &Value) -> Valu
                 ) else {
                     continue;
                 };
+                if k.eq_ignore_ascii_case("host") {
+                    public_host = Some(v.to_owned());
+                }
                 if !DROP_HEADERS.contains(&k.to_ascii_lowercase().as_str()) {
                     builder = builder.header(k, v);
                 }
             }
         }
+        if let Some(host) = public_host {
+            builder = builder.header("host", host);
+        }
+        builder = builder.header("x-forwarded-proto", "https");
         if !body_b64.is_empty() {
             builder = builder.body(B64.decode(body_b64).context("decode body")?);
         }
