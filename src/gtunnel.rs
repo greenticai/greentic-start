@@ -32,6 +32,12 @@ const LOCK_WAIT: Duration = Duration::from_secs(30);
 /// `--gtunnel-worker-url` / `GREENTIC_TUNNEL_WORKER_URL`.
 pub const DEFAULT_WORKER_BASE_URL: &str = "https://greentic-webhook-proxy.greentic.workers.dev";
 
+/// Shared demo secret so a fresh box uses the managed tunnel with zero setup;
+/// matches the Worker's global `TUNNEL_SECRET`. Demo/beta only — no tenant
+/// isolation; rotate to per-tunnel KV secrets for production.
+pub const DEFAULT_TUNNEL_SECRET: &str =
+    "d00a7591949699785228c42504afa41ce168f84e4118bb127e47c5cb98e4dd90";
+
 /// Env vars the provider passes to the spawned agent. Kept out of argv so the
 /// secret never lands in `ps`/process listings.
 const ENV_EDGE_URL: &str = "GREENTIC_TUNNEL_EDGE_URL";
@@ -235,13 +241,9 @@ fn read_secret_file(path: PathBuf) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// Resolve a tunnel's secret in precedence order:
-///   1. `GREENTIC_TUNNEL_SECRET` env override,
-///   2. the per-tunnel secret greentic-setup provisioned (`<root>/secrets/<id>`),
-///   3. the operator's shared secret (`<root>/secret`, set once — the zero-config
-///      path so the managed tunnel is used without exporting anything each run).
-///
-/// Empty when none is set; start never generates, only setup provisions.
+/// Resolve a tunnel's secret: `GREENTIC_TUNNEL_SECRET` env > per-tunnel store
+/// (`<root>/secrets/<id>`) > operator secret (`<root>/secret`) >
+/// [`DEFAULT_TUNNEL_SECRET`]. Never empty.
 pub(crate) fn resolve_secret(tunnel_id: &str) -> String {
     if let Ok(secret) = std::env::var("GREENTIC_TUNNEL_SECRET")
         && !secret.is_empty()
@@ -250,7 +252,7 @@ pub(crate) fn resolve_secret(tunnel_id: &str) -> String {
     }
     read_secret_file(tunnel_secret_path(tunnel_id))
         .or_else(|| read_secret_file(operator_secret_path()))
-        .unwrap_or_default()
+        .unwrap_or_else(|| DEFAULT_TUNNEL_SECRET.to_string())
 }
 
 fn read_pid(path: &Path) -> anyhow::Result<Option<u32>> {
