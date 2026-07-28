@@ -79,6 +79,14 @@ pub(crate) fn serve_static_route_from_pack(
             }
         }
     }
+    // Recover a spurious leading segment before falling back to the SPA index.
+    match retry_spa_asset_without_leading_segment(route_match, |p| {
+        serve_pack_asset(route_match.descriptor, p)
+    }) {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
     if let Some(asset_path) = fallback_asset_path(route_match) {
         match serve_pack_asset(route_match.descriptor, &asset_path) {
             Ok(Some(response)) => return response,
@@ -89,6 +97,41 @@ pub(crate) fn serve_static_route_from_pack(
         }
     }
     error_response(StatusCode::NOT_FOUND, "file not found")
+}
+
+/// SPA asset recovery. The webchat SPA is opened at a bundle-scoped,
+/// trailing-slash URL (`…/{bundle}/`) and references its assets relatively
+/// (`./runtime-bootstrap.js`), so the browser requests them one directory deeper
+/// than they live (`…/{bundle}/runtime-bootstrap.js`). Classify strips that
+/// segment only when it is a registered bundle for the tenant; any other leading
+/// segment (a stale tab, a wrong `--open-webchat`, a bundle/tenant mismatch)
+/// leaks through and the primary lookup misses. Rather than serve the SPA index
+/// as the asset (HTML parsed as JS → blank page), retry with the leading segment
+/// stripped, one segment at a time, until it resolves or none remain. Real
+/// first-level asset dirs (`assets/`, `config/`, `i18n/`, …) resolve on the
+/// first try, so this only ever rescues a spurious leading segment. Restricted
+/// to SPA routes (`spa_fallback` set) — elsewhere a miss is a genuine 404.
+fn retry_spa_asset_without_leading_segment(
+    route_match: &StaticRouteMatch<'_>,
+    mut serve: impl FnMut(&str) -> anyhow::Result<Option<Response<Full<Bytes>>>>,
+) -> anyhow::Result<Option<Response<Full<Bytes>>>> {
+    if fallback_asset_path(route_match).is_none() {
+        return Ok(None);
+    }
+    let Some(asset_path) = resolve_asset_path(route_match) else {
+        return Ok(None);
+    };
+    let mut rest = asset_path.as_str();
+    while let Some(idx) = rest.find('/') {
+        rest = &rest[idx + 1..];
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(response) = serve(rest)? {
+            return Ok(Some(response));
+        }
+    }
+    Ok(None)
 }
 
 /// Serve a single asset from the pack path only (no bundle-root overlay).
@@ -176,6 +219,14 @@ pub(crate) fn serve_static_route(
     // fallback even when wizard answers asked for something else.
     if let Some(response) = try_serve_synthesized_tenant_config(route_match, bundle_root) {
         return response;
+    }
+    // Recover a spurious leading segment before falling back to the SPA index.
+    match retry_spa_asset_without_leading_segment(route_match, |p| {
+        serve_static_asset(route_match.descriptor, p, bundle_root)
+    }) {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
     if let Some(asset_path) = fallback_asset_path(route_match) {
         match serve_static_asset(route_match.descriptor, &asset_path, bundle_root) {
@@ -532,6 +583,43 @@ mod tests {
                 .to_bytes()
         });
         assert!(String::from_utf8_lossy(&body).contains("<html>ok</html>"));
+    }
+
+    #[test]
+    fn serve_static_route_recovers_spurious_leading_segment() {
+        // The webchat SPA opened at `…/{bundle}/` requests `./app.js` as
+        // `…/{bundle}/app.js`, i.e. asset_path "koncar-demo/app.js" when the
+        // bundle segment was not stripped. The real asset lives at site/app.js.
+        // The retry must serve that JS, NOT the index.html SPA fallback.
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("site")).expect("mkdir");
+        std::fs::write(dir.path().join("site").join("app.js"), "console.log(1)").expect("app");
+        std::fs::write(
+            dir.path().join("site").join("index.html"),
+            "<html>fallback</html>",
+        )
+        .expect("index");
+
+        let descriptor = descriptor(dir.path());
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: "koncar-demo/app.js".to_string(),
+            request_is_directory: false,
+        };
+
+        let response = serve_static_route(&route_match, dir.path(), "/web/koncar-demo/app.js");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = runtime.block_on(async {
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+        });
+        // Served the real asset, not the SPA index (the blank-page bug).
+        assert_eq!(body, Bytes::from_static(b"console.log(1)"));
     }
 
     #[test]
