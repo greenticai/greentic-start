@@ -241,6 +241,50 @@ fn read_secret_file(path: PathBuf) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// Per-invocation random seed for deriving the managed-tunnel clash suffix.
+/// Fresh each process (each `gtc start`), mirroring cloudflared's quick-tunnel
+/// hostname which also rotates every start. Held in a `OnceLock` so every call
+/// within one invocation agrees — the alias is computed per-bundle and again
+/// when advertising URLs, and those must match.
+fn instance_seed() -> String {
+    static SEED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SEED.get_or_init(|| {
+        (0..32)
+            .map(|_| format!("{:02x}", rand::random::<u8>()))
+            .collect()
+    })
+    .clone()
+}
+
+/// Stable 5-hex clash suffix for `base_tenant`: last 5 hex of
+/// `sha256(instance-seed || 0x00 || base_tenant)`.
+fn tenant_clash_suffix(base_tenant: &str) -> String {
+    tenant_clash_suffix_from_seed(&instance_seed(), base_tenant)
+}
+
+/// Pure hashing core of [`tenant_clash_suffix`], seed passed explicitly so it is
+/// deterministically testable.
+fn tenant_clash_suffix_from_seed(seed: &str, base_tenant: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(seed.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(base_tenant.as_bytes());
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    hex[hex.len() - 5..].to_string()
+}
+
+/// The managed-tunnel public tenant alias `{base}-{suffix}` (gtunnel only).
+/// The per-invocation suffix keeps operators sharing a base tenant unique on the
+/// one shared Worker. cloudflared/ngrok keep the bare tenant.
+pub(crate) fn managed_tenant_alias(base_tenant: &str) -> String {
+    format!("{base_tenant}-{}", tenant_clash_suffix(base_tenant))
+}
+
 /// Resolve a tunnel's secret: `GREENTIC_TUNNEL_SECRET` env > per-tunnel store
 /// (`<root>/secrets/<id>`) > operator secret (`<root>/secret`) >
 /// [`DEFAULT_TUNNEL_SECRET`]. Never empty.
@@ -283,6 +327,19 @@ pub fn agent_config_from_env() -> anyhow::Result<crate::gtunnel_agent::AgentConf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tenant_clash_suffix_is_stable_5_hex_and_scoped() {
+        let a = tenant_clash_suffix_from_seed("seed-123", "default");
+        // Stable for the same (seed, tenant).
+        assert_eq!(a, tenant_clash_suffix_from_seed("seed-123", "default"));
+        // Exactly 5 lowercase-hex chars.
+        assert_eq!(a.len(), 5);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        // Distinct per tenant and per seed (so different operators/tenants differ).
+        assert_ne!(a, tenant_clash_suffix_from_seed("seed-123", "acme"));
+        assert_ne!(a, tenant_clash_suffix_from_seed("other-seed", "default"));
+    }
 
     #[test]
     fn public_url_path_mode_joins_base_and_id_without_double_slash() {

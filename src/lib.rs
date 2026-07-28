@@ -591,9 +591,55 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let env_store = greentic_deployer::environment::LocalFsStore::new(store_root.clone());
         let env_typed = greentic_types::EnvId::new(&env_id)
             .with_context(|| format!("invalid environment id `{env_id}`"))?;
-        let environment =
+        let mut environment =
             greentic_deployer::environment::EnvironmentStore::load(&env_store, &env_typed)
                 .with_context(|| format!("loading environment `{env_id}` for bundle-less boot"))?;
+
+        // Bundle-less env-serve carries no tunnel flags (gtc start drops them).
+        // Resolve: GREENTIC_TUNNEL_MODE, then the persisted setup choice (newest
+        // revision's .greentic/tunnel.json). CLI flag wins; no choice → OFF.
+        if !request.tunnel_explicit {
+            let mode = std::env::var("GREENTIC_TUNNEL_MODE")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| persisted_env_tunnel_mode(&env_dir));
+            match mode.as_deref() {
+                Some("gtunnel") => {
+                    request.gtunnel = GtunnelModeArg::On;
+                    request.tunnel_explicit = true;
+                }
+                Some("cloudflared") => {
+                    request.cloudflared = CloudflaredModeArg::On;
+                    request.tunnel_explicit = true;
+                }
+                Some("ngrok") => {
+                    request.ngrok = NgrokModeArg::On;
+                    request.tunnel_explicit = true;
+                }
+                Some("off") | Some("") | None => {}
+                Some(other) => operator_log::warn(
+                    module_path!(),
+                    format!("ignoring unknown persisted tunnel mode `{other}`"),
+                ),
+            }
+        }
+
+        // Managed-tunnel clash avoidance (gtunnel only): rewrite each bundle's
+        // served tenant to the alias `{tenant}-{id}` here — after load, before
+        // routing/secrets/tenant are derived — so every tenant-keyed surface moves
+        // together and the public webchat URL is unique per operator on the shared
+        // Worker. cloudflared/ngrok keep the bare tenant.
+        if matches!(
+            env_tunnel::choose_tunnel(request.cloudflared, request.ngrok, request.gtunnel),
+            env_tunnel::TunnelChoice::Gtunnel
+        ) {
+            for dep in &mut environment.bundles {
+                let base = dep.route_binding.tenant_selector.tenant.clone();
+                dep.route_binding.tenant_selector.tenant =
+                    crate::gtunnel::managed_tenant_alias(&base);
+            }
+        }
 
         // Select the runtime secrets backend the deployer rendered onto this
         // worker via `GREENTIC_SECRETS_BACKEND` (E.3b). Unset/`dev-store` keeps
@@ -1797,6 +1843,23 @@ fn load_tunnel_config(bundle_root: &std::path::Path) -> Option<TunnelConfig> {
     let path = bundle_root.join(".greentic").join("tunnel.json");
     let raw = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+/// Persisted setup tunnel choice for env-serve boot: `mode` from the newest
+/// staged revision's `.greentic/tunnel.json` (revision ids are ULIDs, so the
+/// lexically-last is newest). `None` when no revision persists a mode.
+fn persisted_env_tunnel_mode(env_dir: &std::path::Path) -> Option<String> {
+    let mut revisions: Vec<PathBuf> = std::fs::read_dir(env_dir.join("revisions"))
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    revisions.sort();
+    revisions.into_iter().rev().find_map(|rev| {
+        load_tunnel_config(&rev.join("bundle"))
+            .and_then(|cfg| cfg.mode)
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+    })
 }
 
 /// Guard that fires boot-fail rollback on drop if the new binary fails to
