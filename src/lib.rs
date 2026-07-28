@@ -774,28 +774,20 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             needs_public_webhook,
             public_base_url_configured,
         ) {
-            // Prefer the Greentic managed tunnel (the setup default) when a
-            // secret is resolvable — otherwise fall back to cloudflared, which
-            // needs no secret, so messaging still works out of the box.
-            let gtunnel_id = env_tunnel::resolve_gtunnel_tunnel_id(&request);
-            if !crate::gtunnel::resolve_secret(&gtunnel_id).is_empty() {
-                operator_log::info(
-                    module_path!(),
-                    "a served provider needs an inbound webhook and no PUBLIC_BASE_URL is \
-                     configured; defaulting to the Greentic managed tunnel (override with \
-                     `--gtunnel off`)",
-                );
-                request.gtunnel = GtunnelModeArg::On;
-            } else {
-                operator_log::info(
-                    module_path!(),
-                    "a served provider needs an inbound webhook and no PUBLIC_BASE_URL is \
-                     configured; defaulting to a cloudflared tunnel (no Greentic tunnel secret \
-                     configured — set GREENTIC_TUNNEL_SECRET to use the Greentic managed tunnel)",
-                );
-                request.cloudflared = CloudflaredModeArg::On;
-            }
-            request.tunnel_explicit = true;
+            // Tunnels are OPT-IN. A served provider needs an inbound webhook, but
+            // the operator chose no tunnel and configured no PUBLIC_BASE_URL — so
+            // we do NOT start one automatically. This box simply has no
+            // public-facing endpoint until a tunnel is explicitly enabled. (This
+            // deliberately reverts the earlier auto-default, which — once a demo
+            // secret was always resolvable — hijacked the managed tunnel even when
+            // the operator wanted cloudflared or nothing at all.)
+            operator_log::warn(
+                module_path!(),
+                "a served provider needs an inbound webhook, but no tunnel is \
+                 configured and no PUBLIC_BASE_URL is set — this box has no public \
+                 endpoint. Enable one with `--gtunnel on`, `--cloudflared on`, or \
+                 `--ngrok on` (or choose a tunnel during setup).",
+            );
         }
 
         // A public tunnel (`--cloudflared on` / `--ngrok on`) forwards external
@@ -2140,27 +2132,11 @@ pub(crate) fn advertise_webchat_urls(
         WebchatUiBundles::Scoped(ids) => ids.contains(&id),
     };
     for (tenant, bundles, default_id) in tenant_bundles {
-        // The bare tenant URL is a SHORTHAND for the default bundle, not a
-        // bundle of its own. It used to be printed INSTEAD of that bundle's
-        // own URL, which left the default bundle as the one bundle in the
-        // environment whose `/{tenant}/{bundle_id}/` URL was never advertised —
-        // it works, it is simply never mentioned, so "which URL is my bundle
-        // on?" had no answer for exactly one bundle. Print both: the shorthand
-        // first (it is what `--open-webchat` opens), then one line per bundle.
-        if let Some(default_id) = default_id.as_deref()
-            && bundles.contains(&default_id)
-            && servable(default_id)
-        {
-            let path = format!("/v1/web/webchat/{tenant}/");
-            let url = format!("http://{listen}{path}");
-            advert
-                .lines
-                .push(format!("UI: {url} → default bundle `{default_id}`"));
-            if advert.open_path.is_none() {
-                advert.open_path = Some(path.clone());
-            }
-            advert.paths.push(path);
-        }
+        // Advertise only bundle-SCOPED URLs (`/{tenant}/{bundle_id}/`). The bare
+        // `/{tenant}/` shorthand is intentionally NOT printed: it is ambiguous
+        // once more than one bundle — or, on the shared managed tunnel, more than
+        // one operator — can answer for a tenant. `--open-webchat` opens the
+        // default bundle's own scoped URL instead.
         for bundle_id in bundles {
             if !servable(bundle_id) {
                 advert.without_ui.push((*bundle_id).to_string());
@@ -2171,6 +2147,9 @@ pub(crate) fn advertise_webchat_urls(
             let url = format!("http://{listen}{path}");
             let tag = if is_default { " (default)" } else { "" };
             advert.lines.push(format!("UI: {url}{tag}"));
+            if is_default && advert.open_path.is_none() {
+                advert.open_path = Some(path.clone());
+            }
             if first_path.is_none() {
                 first_path = Some(path.clone());
             }
@@ -2808,9 +2787,11 @@ mod tests {
             "nothing is without a UI here: {:?}",
             banner.lines
         );
+        // Bundle-scoped, not the bare `/acme/` shorthand (Fix B): the default
+        // bundle's own URL is what `--open-webchat` opens now.
         assert_eq!(
             banner.open_url.as_deref(),
-            Some("http://127.0.0.1:8080/v1/web/webchat/acme/")
+            Some("http://127.0.0.1:8080/v1/web/webchat/acme/hr-chat/")
         );
     }
 

@@ -7437,9 +7437,10 @@ mod tests {
                 .headers()
                 .get(header::LOCATION)
                 .and_then(|v| v.to_str().ok()),
-            // The bare tenant URL: default bundle, its default flow — the same
-            // target the boot banner advertises first.
-            Some("/v1/web/webchat/acme/"),
+            // Bundle-scoped default-bundle URL (Fix B): `/chat` forwards to the
+            // same bundle-specific page the boot banner advertises, not the bare
+            // (now unadvertised, ambiguous) `/{tenant}/` shorthand.
+            Some("/v1/web/webchat/acme/hr-chat/"),
         );
         // The body must be empty; the page lives at the target, not here.
         assert!(body_string(response).is_empty());
