@@ -2521,31 +2521,25 @@ mod tests {
     }
 
     #[test]
-    fn a_default_bundle_that_does_ship_a_ui_keeps_the_bare_url() {
+    fn a_default_bundle_advertises_only_its_bundle_scoped_url() {
         let advert = advertise_webchat_urls(
             "127.0.0.1:8080",
             &[("default", vec!["gui", "legal"], Some("gui"))],
             &ui_set(&["gui"]),
             &no_flows(),
         );
-        // The bare alias comes FIRST (it is what `--open-webchat` opens), and
-        // `gui` still gets its own explicit URL — being the default must not
-        // cost a bundle its `/{tenant}/{bundle_id}/` line.
+        // Fix B: advertise ONLY the bundle-scoped URL. The bare `/{tenant}/`
+        // shorthand is not printed (ambiguous once tenants are aliased on the
+        // shared tunnel); `--open-webchat` opens the default bundle's scoped URL.
         assert_eq!(
             advert.lines,
-            vec![
-                "UI: http://127.0.0.1:8080/v1/web/webchat/default/ → default bundle `gui`",
-                "UI: http://127.0.0.1:8080/v1/web/webchat/default/gui/ (default)",
-            ]
+            vec!["UI: http://127.0.0.1:8080/v1/web/webchat/default/gui/ (default)"]
         );
         assert_eq!(
             advert.open_url.as_deref(),
-            Some("http://127.0.0.1:8080/v1/web/webchat/default/")
+            Some("http://127.0.0.1:8080/v1/web/webchat/default/gui/")
         );
-        assert_eq!(
-            advert.paths,
-            vec!["/v1/web/webchat/default/", "/v1/web/webchat/default/gui/"]
-        );
+        assert_eq!(advert.paths, vec!["/v1/web/webchat/default/gui/"]);
     }
 
     #[test]
@@ -2570,25 +2564,31 @@ mod tests {
                 advert.lines
             );
         }
-        // Five lines for four bundles: one each, plus the bare alias.
-        assert_eq!(advert.lines.len(), 5);
+        // Four lines for four bundles: one bundle-scoped URL each, no bare alias.
+        assert_eq!(advert.lines.len(), 4);
         assert!(advert.without_ui.is_empty());
     }
 
     #[test]
-    fn the_bare_alias_names_the_bundle_it_resolves_to() {
-        // A bare URL that does not say where it lands is the reason the missing
-        // `/acct/` line read as "acct is unreachable" rather than "acct is the
-        // thing this shorthand already points at".
+    fn the_bare_tenant_shorthand_is_not_advertised() {
+        // Fix B: the bare `/{tenant}/` URL is never advertised — it is ambiguous
+        // once more than one bundle, or more than one operator on the shared
+        // tunnel, can answer for a tenant. Only bundle-scoped URLs are printed.
         let advert = advertise_webchat_urls(
             "127.0.0.1:8080",
             &demo_env(),
             &ui_set(&["acct", "gui", "legal", "support"]),
             &no_flows(),
         );
-        assert_eq!(
-            advert.lines[0],
-            "UI: http://127.0.0.1:8080/v1/web/webchat/default/ → default bundle `acct`"
+        assert!(
+            !advert.lines.iter().any(|l| l.contains("→ default bundle")),
+            "bare alias advertised: {:?}",
+            advert.lines
+        );
+        assert!(
+            !advert.paths.iter().any(|p| p == "/v1/web/webchat/default/"),
+            "bare tenant path advertised: {:?}",
+            advert.paths
         );
     }
 
@@ -2603,7 +2603,6 @@ mod tests {
         assert_eq!(
             advert.lines,
             vec![
-                "UI: http://127.0.0.1:8080/v1/web/webchat/default/ → default bundle `support`",
                 "UI: http://127.0.0.1:8080/v1/web/webchat/default/support/ (default)",
                 "UI: http://127.0.0.1:8080/v1/web/webchat/default/support/main/ (default flow — same as the bundle URL above)",
                 "UI: http://127.0.0.1:8080/v1/web/webchat/default/support/on_escalate/",
@@ -2627,10 +2626,7 @@ mod tests {
         );
         assert_eq!(
             advert.lines,
-            vec![
-                "UI: http://127.0.0.1:8080/v1/web/webchat/default/ → default bundle `acct`",
-                "UI: http://127.0.0.1:8080/v1/web/webchat/default/acct/ (default)",
-            ]
+            vec!["UI: http://127.0.0.1:8080/v1/web/webchat/default/acct/ (default)"]
         );
     }
 
@@ -2713,7 +2709,7 @@ mod tests {
         // behaviour rather than advertising nothing at all.
         let advert =
             advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &unscoped(), &no_flows());
-        assert_eq!(advert.lines.len(), 5); // 4 bundles + the bare alias
+        assert_eq!(advert.lines.len(), 4); // 4 bundles, no bare alias
         assert!(advert.without_ui.is_empty());
         assert!(advert.without_ui_note().is_none());
     }
@@ -3013,10 +3009,10 @@ mod tests {
     }
 
     /// The `/chat` target for the demo environment: `acct` is the tenant
-    /// default and now ships a UI, so the shortcut lands on the bare tenant
-    /// URL — the default bundle, its default flow.
+    /// default and ships a UI, so the shortcut lands on its bundle-scoped URL
+    /// (Fix B: never the bare `/{tenant}/` shorthand).
     #[test]
-    fn open_path_is_the_bare_tenant_url_when_the_default_bundle_ships_a_ui() {
+    fn open_path_is_the_default_bundle_scoped_url_when_it_ships_a_ui() {
         let advert = advertise_webchat_urls(
             "127.0.0.1:8080",
             &demo_env(),
@@ -3025,7 +3021,7 @@ mod tests {
         );
         assert_eq!(
             advert.open_path.as_deref(),
-            Some("/v1/web/webchat/default/")
+            Some("/v1/web/webchat/default/acct/")
         );
     }
 

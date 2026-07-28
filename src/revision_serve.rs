@@ -7460,7 +7460,7 @@ mod tests {
                 .headers()
                 .get(header::LOCATION)
                 .and_then(|v| v.to_str().ok()),
-            Some("/v1/web/webchat/acme/"),
+            Some("/v1/web/webchat/acme/hr-chat/"),
         );
     }
 
@@ -7585,7 +7585,7 @@ mod tests {
         assert!(
             response
                 .lines()
-                .any(|line| line.eq_ignore_ascii_case("location: /v1/web/webchat/acme/")),
+                .any(|line| line.eq_ignore_ascii_case("location: /v1/web/webchat/acme/hr-chat/")),
             "no Location header for the pack UI in: {response}"
         );
         assert!(
