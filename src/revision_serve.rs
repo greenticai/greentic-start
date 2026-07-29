@@ -2297,6 +2297,14 @@ fn try_apply_binary_update(
                 ))
             })?;
 
+            // Size guard — parity with the URL-fetch path's archive cap.
+            if blob_bytes.len() as u64 > MAX_BINARY_ARCHIVE_BYTES {
+                return Err(NotifyError::Internal(format!(
+                    "binary-update: in-band binary exceeds {} byte cap",
+                    MAX_BINARY_ARCHIVE_BYTES,
+                )));
+            }
+
             // The blob IS the raw executable — no archive unpack. Copy it to a
             // temp file preserving permissions so `swap_binary` can read it.
             let tmp_dir = tempfile::TempDir::new().map_err(|err| {
@@ -9869,6 +9877,7 @@ mod binary_update_tests {
         // A Pending marker must exist with the right versions and digest.
         let marker = read_binary_update_marker(env_dir.path()).expect("marker must be written");
         assert_eq!(marker.phase, MarkerPhase::Pending);
+        assert_eq!(marker.from_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(marker.to_version, "99.0.0");
         assert_eq!(marker.digest.as_deref(), Some(bin.digest.as_str()));
 
@@ -9891,23 +9900,6 @@ mod binary_update_tests {
         assert!(
             msg.contains("mismatch"),
             "error must mention digest mismatch: {msg}"
-        );
-
-        // Target file must remain untouched — no swap attempted.
-        let target = tempfile::NamedTempFile::new().unwrap();
-        let original = b"original-content";
-        std::fs::write(target.path(), original).unwrap();
-        assert_eq!(
-            std::fs::read(target.path()).unwrap(),
-            original,
-            "target must be untouched after verification failure"
-        );
-
-        // No marker should exist (we never got to apply_binary_from_path).
-        let env_dir = tempfile::TempDir::new().unwrap();
-        assert!(
-            read_binary_update_marker(env_dir.path()).is_none(),
-            "no marker must be written on verification failure"
         );
     }
 
@@ -9946,12 +9938,13 @@ mod binary_update_tests {
     }
 
     #[test]
-    fn binary_update_source_url_unchanged() {
-        // A source=Some plan must NOT touch the staging root. Verify by checking
-        // that select_binary + source dispatch produces the URL-path branch,
-        // not the staging-read branch. We do this by constructing a binary with
-        // source=Some and asserting the source field is preserved (the guard
-        // would only strip it on the in-band path).
+    fn binary_artifact_source_field_construction() {
+        // Smoke test: BinaryArtifact with source=Some preserves the URL.
+        // This does NOT exercise the match dispatch in try_apply_binary_update —
+        // it only verifies the struct shape. The production dispatch at the
+        // `match &binary.source` in try_apply_binary_update is covered
+        // indirectly: in-band tests use source=None, and URL-path tests
+        // (pre-B3) use source=Some.
         let bin = BinaryArtifact {
             name: env!("CARGO_PKG_NAME").to_string(),
             version: "99.0.0".to_string(),
@@ -9963,37 +9956,22 @@ mod binary_update_tests {
             bin.source.is_some(),
             "URL-path binary must have source=Some"
         );
-        // The source match dispatches on binary.source — Some goes to URL path.
-        // Verify the dispatch branch: staging root does not need to exist for
-        // the URL path. A nonexistent staging root would error on the in-band
-        // path, so if we can get past the source check without a staging root,
-        // we're on the URL path.
-        match &bin.source {
-            Some(url) => {
-                assert!(
-                    url.starts_with("https://"),
-                    "URL-path binary carries an HTTPS source: {url}"
-                );
-            }
-            None => panic!("source=Some binary should not reach in-band path"),
-        }
+        assert_eq!(
+            bin.source.as_deref(),
+            Some("https://example.com/archive.tgz"),
+            "source URL must round-trip through construction"
+        );
     }
 
     #[test]
-    fn binary_update_inband_tombstone_blocks_retry() {
-        // A RolledBack marker for the same version+digest must block BOTH
-        // the URL and in-band paths (the hoisted guard). This tests the
-        // guard in isolation — the same guard runs before the source dispatch.
+    fn binary_update_tombstone_marker_roundtrips() {
+        // Verify that a RolledBack tombstone written to disk roundtrips
+        // through read_binary_update_marker with the expected fields.
+        // This does NOT exercise the guard 3e logic in try_apply_binary_update
+        // (which requires a trust root); it only proves the marker persists
+        // the phase, version, and digest needed for that guard.
         let env_dir = tempfile::TempDir::new().unwrap();
-        let bin = BinaryArtifact {
-            name: env!("CARGO_PKG_NAME").to_string(),
-            version: "99.0.0".to_string(),
-            target: binswap::current_target().to_string(),
-            digest: "sha256:deadbeef99".to_string(),
-            source: None,
-        };
 
-        // Write a RolledBack tombstone for the same version+digest.
         let tombstone = BinaryUpdateMarker {
             name: env!("CARGO_PKG_NAME").to_string(),
             from_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -10010,27 +9988,15 @@ mod binary_update_tests {
         )
         .unwrap();
 
-        // Read back the marker and simulate the hoisted guard check.
         let existing =
             read_binary_update_marker(env_dir.path()).expect("tombstone must be readable");
         assert_eq!(existing.phase, MarkerPhase::RolledBack);
-        assert_eq!(existing.to_version, bin.version);
-        let digest_matches = existing.digest.as_ref().is_none_or(|d| d == &bin.digest);
-        assert!(
-            digest_matches,
-            "tombstone digest must match (or be absent) to block retry"
-        );
-
-        // The guard logic: if phase == RolledBack && version matches &&
-        // digest matches, the function returns Ok(None) — no retry.
-        // This is the exact check from guard 3e, now hoisted above source
-        // dispatch. Both in-band and URL paths hit it.
-        let blocked = existing.phase == MarkerPhase::RolledBack
-            && existing.to_version == bin.version
-            && existing.digest.as_ref().is_none_or(|d| d == &bin.digest);
-        assert!(
-            blocked,
-            "tombstone must block retry for same version+digest"
+        assert_eq!(existing.to_version, "99.0.0");
+        assert_eq!(existing.from_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(existing.digest.as_deref(), Some("sha256:deadbeef99"));
+        assert_eq!(
+            existing.rolled_back_at.as_deref(),
+            Some("2026-07-28T01:00:00Z")
         );
     }
 
