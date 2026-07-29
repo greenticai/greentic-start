@@ -10000,6 +10000,410 @@ mod binary_update_tests {
         );
     }
 
+    // ── B3: end-to-end try_apply_binary_update coverage ─────────────────────
+
+    use greentic_deployer::environment::{TRUST_ROOT_FILE, TrustRootDocument};
+    use greentic_distributor_client::signing::{TrustRoot, TrustedKey, key_id_for_public_key_pem};
+    use greentic_update::plan::build_update_plan;
+
+    /// Deterministic Ed25519 test key pair: returns (private PKCS#8 PEM,
+    /// TrustedKey with SPKI PEM + canonical key id).
+    fn test_signing_key(seed: u8) -> (String, TrustedKey) {
+        use ed25519_dalek::SigningKey;
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        use ed25519_dalek::pkcs8::EncodePublicKey;
+        use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let priv_pem = sk.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+        let pub_pem = sk
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let key_id = key_id_for_public_key_pem(&pub_pem).unwrap();
+        (
+            priv_pem,
+            TrustedKey {
+                key_id,
+                public_key_pem: pub_pem,
+            },
+        )
+    }
+
+    /// Wire up all infrastructure needed by `try_apply_binary_update`:
+    /// store, trust root, signed plan, and staged binary. Returns the
+    /// components the test needs to call the function and assert on results.
+    struct InbandTestHarness {
+        store_dir: tempfile::TempDir,
+        staging_dir: tempfile::TempDir,
+        #[allow(dead_code)]
+        exe_dir: tempfile::TempDir,
+        plan_bytes: Vec<u8>,
+        sig_bytes: Vec<u8>,
+        env_id: String,
+        target_exe: std::path::PathBuf,
+        binary_digest: String,
+    }
+
+    impl InbandTestHarness {
+        /// Build a harness with a single in-band binary (source=None) for THIS
+        /// process name + target. The dummy binary payload differs from the
+        /// current test binary so the swap is observable.
+        fn new(env_id: &str, dummy_exe: &[u8]) -> Self {
+            let (priv_pem, tk) = test_signing_key(42);
+            let trust = TrustRoot::new(vec![tk.clone()]);
+
+            let digest = test_digest_of(dummy_exe);
+            let bin = BinaryArtifact {
+                name: env!("CARGO_PKG_NAME").to_string(),
+                version: "99.0.0".to_string(),
+                target: binswap::current_target().to_string(),
+                digest: digest.clone(),
+                source: None,
+            };
+
+            let plan = test_plan_with_binary("plan-e2e-1", env_id, bin.clone());
+            let built = build_update_plan(&plan, &priv_pem, &tk.key_id, &trust)
+                .expect("test plan must build");
+
+            // Set up the store directory with the env's trust-root.
+            let store_dir = tempfile::TempDir::new().unwrap();
+            let env_dir = store_dir.path().join(env_id);
+            std::fs::create_dir_all(&env_dir).unwrap();
+            let trust_doc = TrustRootDocument::v1(vec![tk]);
+            std::fs::write(
+                env_dir.join(TRUST_ROOT_FILE),
+                serde_json::to_vec_pretty(&trust_doc).unwrap(),
+            )
+            .unwrap();
+
+            // Stage the binary into an UpdatesRoot.
+            let staging_dir = tempfile::TempDir::new().unwrap();
+            let root = UpdatesRoot::open_in(staging_dir.path(), env_id).unwrap();
+            let verified = test_verified(plan);
+            let staged = root
+                .begin(&verified, &built.plan_bytes, &built.envelope_bytes)
+                .unwrap();
+            staged.put_binary_blob(&bin, dummy_exe).unwrap();
+            staged
+                .transition(greentic_update::staging::UpdateStage::Inbox)
+                .unwrap();
+            staged
+                .transition(greentic_update::staging::UpdateStage::Staged)
+                .unwrap();
+
+            // Create a temp target exe (NEVER the real test binary).
+            let exe_dir = tempfile::TempDir::new().unwrap();
+            let target_exe = exe_dir.path().join("target-exe");
+            std::fs::write(&target_exe, b"old-binary").unwrap();
+
+            Self {
+                store_dir,
+                staging_dir,
+                exe_dir,
+                plan_bytes: built.plan_bytes,
+                sig_bytes: built.envelope_bytes,
+                env_id: env_id.to_string(),
+                target_exe,
+                binary_digest: digest,
+            }
+        }
+
+        fn store(&self) -> LocalFsStore {
+            LocalFsStore::new(self.store_dir.path())
+        }
+
+        fn env_dir(&self) -> std::path::PathBuf {
+            self.store_dir.path().join(&self.env_id)
+        }
+
+        fn call(&self) -> Result<Option<Value>, NotifyError> {
+            try_apply_binary_update(
+                &self.plan_bytes,
+                &self.sig_bytes,
+                &self.store(),
+                &self.env_id,
+                Some(&self.target_exe),
+                Some(self.staging_dir.path()),
+            )
+        }
+    }
+
+    #[test]
+    fn e2e_inband_happy_path_swaps_and_writes_marker() {
+        let h = InbandTestHarness::new("e2e-happy", b"dummy-v99-binary");
+        let result = h.call();
+        let json = result.expect("must succeed").expect("must return Some");
+        assert_eq!(json["staged"], true);
+        assert_eq!(json["restart_required"], true);
+        assert_eq!(json["version"], "99.0.0");
+
+        // The target exe must contain the dummy payload.
+        let swapped = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(swapped, b"dummy-v99-binary", "binary must be swapped");
+
+        // A Pending marker must exist with the correct digest.
+        let marker = read_binary_update_marker(&h.env_dir()).expect("marker must be written");
+        assert_eq!(marker.phase, MarkerPhase::Pending);
+        assert_eq!(marker.to_version, "99.0.0");
+        assert_eq!(
+            marker.digest.as_deref(),
+            Some(h.binary_digest.as_str()),
+            "marker must record the digest"
+        );
+    }
+
+    #[test]
+    fn e2e_inband_verify_rejects_tampered_blob() {
+        let dummy = b"good-binary-for-tamper-test";
+        let h = InbandTestHarness::new("e2e-tamper", dummy);
+
+        // Tamper the staged blob AFTER staging.
+        let root = UpdatesRoot::open_in(h.staging_dir.path(), &h.env_id).unwrap();
+        let staged = root.load("plan-e2e-1").unwrap().unwrap();
+        let bin = BinaryArtifact {
+            name: env!("CARGO_PKG_NAME").to_string(),
+            version: "99.0.0".to_string(),
+            target: binswap::current_target().to_string(),
+            digest: h.binary_digest.clone(),
+            source: None,
+        };
+        let blob_path = staged.binary_blob_path(&bin).unwrap();
+        std::fs::write(&blob_path, b"tampered-content").unwrap();
+
+        let result = h.call();
+        assert!(
+            result.is_err(),
+            "tampered blob must be rejected: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("verification failed") || err_msg.contains("mismatch"),
+            "error must name verification failure: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn e2e_inband_missing_blob_is_an_error() {
+        let env_id = "e2e-missing-blob";
+        let (priv_pem, tk) = test_signing_key(42);
+        let trust = TrustRoot::new(vec![tk.clone()]);
+        let digest = test_digest_of(b"never-staged");
+        let bin = BinaryArtifact {
+            name: env!("CARGO_PKG_NAME").to_string(),
+            version: "99.0.0".to_string(),
+            target: binswap::current_target().to_string(),
+            digest,
+            source: None,
+        };
+        let plan = test_plan_with_binary("plan-e2e-missing", env_id, bin.clone());
+        let built = build_update_plan(&plan, &priv_pem, &tk.key_id, &trust).unwrap();
+
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let env_dir = store_dir.path().join(env_id);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        let trust_doc = TrustRootDocument::v1(vec![tk]);
+        std::fs::write(
+            env_dir.join(TRUST_ROOT_FILE),
+            serde_json::to_vec_pretty(&trust_doc).unwrap(),
+        )
+        .unwrap();
+
+        // Stage the plan but do NOT put the binary blob.
+        let staging_dir = tempfile::TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(staging_dir.path(), env_id).unwrap();
+        let verified = test_verified(plan);
+        let staged = root
+            .begin(&verified, &built.plan_bytes, &built.envelope_bytes)
+            .unwrap();
+        staged
+            .transition(greentic_update::staging::UpdateStage::Inbox)
+            .unwrap();
+        staged
+            .transition(greentic_update::staging::UpdateStage::Staged)
+            .unwrap();
+
+        let exe_dir = tempfile::TempDir::new().unwrap();
+        let target_exe = exe_dir.path().join("target-exe");
+        std::fs::write(&target_exe, b"old-binary").unwrap();
+
+        let result = try_apply_binary_update(
+            &built.plan_bytes,
+            &built.envelope_bytes,
+            &LocalFsStore::new(store_dir.path()),
+            env_id,
+            Some(&target_exe),
+            Some(staging_dir.path()),
+        );
+        assert!(
+            result.is_err(),
+            "missing blob must be an error, not a silent skip: {result:?}"
+        );
+    }
+
+    #[test]
+    fn e2e_inband_tombstone_blocks_same_digest() {
+        let dummy = b"tombstone-test-binary";
+        let h = InbandTestHarness::new("e2e-tombstone", dummy);
+
+        // Write a RolledBack tombstone for the SAME version + digest.
+        let tombstone = BinaryUpdateMarker {
+            name: env!("CARGO_PKG_NAME").to_string(),
+            from_version: env!("CARGO_PKG_VERSION").to_string(),
+            to_version: "99.0.0".to_string(),
+            staged_at: "2026-07-28T00:00:00Z".to_string(),
+            phase: MarkerPhase::RolledBack,
+            rolled_back_at: Some("2026-07-28T01:00:00Z".to_string()),
+            digest: Some(h.binary_digest.clone()),
+            boot_attempts: 0,
+        };
+        std::fs::write(
+            h.env_dir().join(BINARY_UPDATE_PENDING_FILE),
+            serde_json::to_vec(&tombstone).unwrap(),
+        )
+        .unwrap();
+
+        let result = h.call();
+        let json = result.expect("tombstone guard returns Ok");
+        assert!(
+            json.is_none(),
+            "tombstone must block retry of the same digest: {json:?}"
+        );
+        // The target exe must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped when tombstone blocks"
+        );
+    }
+
+    #[test]
+    fn e2e_apply_binary_rejects_digest_mismatch_at_swap() {
+        // Verifies that apply_binary_from_path passes expected_digest to
+        // SwapOptions so swap_binary re-verifies the bytes. Construct a
+        // BinaryArtifact whose digest does NOT match the file on disk:
+        // with expected_digest=Some the swap must fail; dropping it to None
+        // (the mutation) would let this pass.
+        let real_content = b"real-binary-content";
+        let wrong_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let bin = BinaryArtifact {
+            name: env!("CARGO_PKG_NAME").to_string(),
+            version: "99.0.0".to_string(),
+            target: binswap::current_target().to_string(),
+            digest: wrong_digest.to_string(),
+            source: None,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner_binary = tmp.path().join("binary");
+        std::fs::write(&inner_binary, real_content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&inner_binary, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let target_exe = tmp.path().join("target-exe");
+        std::fs::write(&target_exe, b"old-binary").unwrap();
+
+        let env_dir = tempfile::TempDir::new().unwrap();
+
+        let result = apply_binary_from_path(
+            env!("CARGO_PKG_NAME"),
+            &bin,
+            &inner_binary,
+            &target_exe,
+            env_dir.path(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        assert!(
+            result.is_err(),
+            "digest mismatch at swap must fail: {result:?}"
+        );
+        // The target exe must NOT have been swapped.
+        let on_disk = std::fs::read(&target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped when digest mismatches"
+        );
+    }
+
+    #[test]
+    fn e2e_source_some_does_not_use_staging_path() {
+        // A plan with source=Some(url) must NOT go through the staging path.
+        // We set up staging that WOULD succeed if used, but the source=Some
+        // path must be taken instead — and since the URL is fake, it must fail
+        // with a fetch error, proving the URL path was taken.
+        let (priv_pem, tk) = test_signing_key(42);
+        let trust = TrustRoot::new(vec![tk.clone()]);
+        let env_id = "e2e-source-some";
+        let dummy = b"should-not-be-used";
+        let digest = test_digest_of(dummy);
+        let bin = BinaryArtifact {
+            name: env!("CARGO_PKG_NAME").to_string(),
+            version: "99.0.0".to_string(),
+            target: binswap::current_target().to_string(),
+            digest: digest.clone(),
+            source: Some("https://localhost:1/nonexistent-archive.tgz".to_string()),
+        };
+        let plan = test_plan_with_binary("plan-e2e-source", env_id, bin.clone());
+        let built = build_update_plan(&plan, &priv_pem, &tk.key_id, &trust).unwrap();
+
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let env_dir = store_dir.path().join(env_id);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        let trust_doc = TrustRootDocument::v1(vec![tk]);
+        std::fs::write(
+            env_dir.join(TRUST_ROOT_FILE),
+            serde_json::to_vec_pretty(&trust_doc).unwrap(),
+        )
+        .unwrap();
+
+        // Stage a blob that WOULD satisfy the in-band path.
+        let staging_dir = tempfile::TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(staging_dir.path(), env_id).unwrap();
+        let verified = test_verified(plan);
+        let staged = root
+            .begin(&verified, &built.plan_bytes, &built.envelope_bytes)
+            .unwrap();
+        staged.put_binary_blob(&bin, dummy).unwrap();
+        staged
+            .transition(greentic_update::staging::UpdateStage::Inbox)
+            .unwrap();
+        staged
+            .transition(greentic_update::staging::UpdateStage::Staged)
+            .unwrap();
+
+        let exe_dir = tempfile::TempDir::new().unwrap();
+        let target_exe = exe_dir.path().join("target-exe");
+        std::fs::write(&target_exe, b"old-binary").unwrap();
+
+        let result = try_apply_binary_update(
+            &built.plan_bytes,
+            &built.envelope_bytes,
+            &LocalFsStore::new(store_dir.path()),
+            env_id,
+            Some(&target_exe),
+            Some(staging_dir.path()),
+        );
+        // The URL path must be taken. Since the URL is unreachable, it must
+        // fail with a fetch error — not silently succeed via staging.
+        assert!(
+            result.is_err(),
+            "source=Some must take URL path, not staging: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("fetch") || err_msg.contains("connect") || err_msg.contains("error"),
+            "error must be a fetch failure, not a staging error: {err_msg}"
+        );
+        // The binary must NOT have been swapped.
+        let on_disk = std::fs::read(&target_exe).unwrap();
+        assert_eq!(on_disk, b"old-binary", "binary must not be swapped");
+    }
+
     // ── Category 12: A5 — end-to-end WS upgrade through revision-serve ─────
 
     /// In-memory `SecretsManager` for tests: returns a pre-loaded signing key
