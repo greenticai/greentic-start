@@ -1957,6 +1957,11 @@ pub(crate) fn write_rollback_tombstone(env_dir: &std::path::Path, marker: &Binar
     }
 }
 
+/// Concurrent update notifies must not both pass the marker inspection before
+/// either writes. Coarse hold is fine: swaps are rare and the function is sync
+/// on blocking threads.
+static BINARY_UPDATE_SWAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Post-acquisition shared path: swap a verified binary into `current_exe`,
 /// build and persist the rollback marker, and return the staged-JSON fragment.
 /// Called by both the URL-fetch path and the in-band staging path so the
@@ -2124,13 +2129,27 @@ fn try_apply_binary_update(
         }
     }
 
-    // 3d. Idempotency: if a pending marker for this exact version already
-    //     exists, skip. Hoisted above the source dispatch so both URL and
-    //     in-band paths benefit.
+    // Serialize the marker-read → swap → marker-write critical section so
+    // concurrent notify requests cannot both pass the marker inspection
+    // before either writes. Held for the rest of the function.
+    let _swap_guard = BINARY_UPDATE_SWAP_LOCK
+        .lock()
+        .expect("binary update swap lock poisoned");
+
+    // 3d. Lineage protection: the `.prev` backup and pending marker form
+    //     the rollback lineage. A second different-version swap before
+    //     reboot would overwrite the only known-good backup with a
+    //     never-booted binary, destroying the ability to roll back. When a
+    //     Pending marker exists for the SAME version+digest, short-circuit
+    //     idempotently; for ANY other Pending marker, refuse fail-closed.
     let marker_path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
     if let Some(existing_marker) = read_binary_update_marker(&env_dir) {
         if existing_marker.phase == MarkerPhase::Pending
             && existing_marker.to_version == binary.version
+            && existing_marker
+                .digest
+                .as_ref()
+                .is_none_or(|d| d == &binary.digest)
         {
             operator_log::info(
                 module_path!(),
@@ -2143,6 +2162,26 @@ fn try_apply_binary_update(
                 "staged": true,
                 "restart_required": true,
                 "version": binary.version,
+            })));
+        }
+
+        if existing_marker.phase == MarkerPhase::Pending {
+            // A different version (or same version, different digest) is
+            // already staged. Refuse the swap to protect the rollback
+            // lineage — the caller must restart first.
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "binary-update: version {} blocked — version {} already staged \
+                     and awaiting restart; a second swap would destroy the rollback \
+                     backup. Restart first, then retry.",
+                    binary.version, existing_marker.to_version,
+                ),
+            );
+            return Ok(Some(serde_json::json!({
+                "staged": false,
+                "blocked_on_pending": existing_marker.to_version,
+                "restart_required": true,
             })));
         }
 
@@ -2290,34 +2329,63 @@ fn try_apply_binary_update(
                     ))
                 })?;
 
-            let blob_bytes = staged.verify_binary_on_disk(binary).map_err(|err| {
+            // Pre-read size guard: reject oversized blobs via stat before
+            // allocating the full read, catching sparse/inflated files cheaply.
+            let blob_path = staged.binary_blob_path(binary).map_err(|err| {
                 NotifyError::Internal(format!(
-                    "binary-update: in-band binary verification failed for `{}`: {err}",
+                    "binary-update: in-band binary blob path for `{}`: {err}",
                     binary.name,
                 ))
             })?;
-
-            // Size guard — parity with the URL-fetch path's archive cap.
-            if blob_bytes.len() as u64 > MAX_BINARY_ARCHIVE_BYTES {
+            let blob_len = std::fs::metadata(&blob_path)
+                .map_err(|err| {
+                    NotifyError::Internal(format!(
+                        "binary-update: in-band binary stat for `{}`: {err}",
+                        binary.name,
+                    ))
+                })?
+                .len();
+            if blob_len > MAX_BINARY_ARCHIVE_BYTES {
                 return Err(NotifyError::Internal(format!(
                     "binary-update: in-band binary exceeds {} byte cap",
                     MAX_BINARY_ARCHIVE_BYTES,
                 )));
             }
 
-            // The blob IS the raw executable — no archive unpack. Copy it to a
-            // temp file preserving permissions so `swap_binary` can read it.
+            // Scope blob_bytes so it is dropped after the temp-file write and
+            // before apply_binary_from_path, avoiding doubled peak memory.
             let tmp_dir = tempfile::TempDir::new().map_err(|err| {
                 NotifyError::Internal(format!(
                     "binary-update: failed to create temp dir for in-band binary: {err}"
                 ))
             })?;
             let tmp_binary = tmp_dir.path().join(own_name);
-            std::fs::write(&tmp_binary, &blob_bytes).map_err(|err| {
-                NotifyError::Internal(format!(
-                    "binary-update: failed to write in-band binary to temp: {err}"
-                ))
-            })?;
+            {
+                let blob_bytes = staged.verify_binary_on_disk(binary).map_err(|err| {
+                    NotifyError::Internal(format!(
+                        "binary-update: in-band binary verification failed for `{}`: {err}",
+                        binary.name,
+                    ))
+                })?;
+
+                // Defense-in-depth: post-read cap (the stat check above
+                // catches most cases; this covers TOCTOU or non-regular files).
+                if blob_bytes.len() as u64 > MAX_BINARY_ARCHIVE_BYTES {
+                    return Err(NotifyError::Internal(format!(
+                        "binary-update: in-band binary exceeds {} byte cap",
+                        MAX_BINARY_ARCHIVE_BYTES,
+                    )));
+                }
+
+                // The blob IS the raw executable — no archive unpack. Copy it
+                // to a temp file preserving permissions so `swap_binary` can
+                // read it.
+                std::fs::write(&tmp_binary, &blob_bytes).map_err(|err| {
+                    NotifyError::Internal(format!(
+                        "binary-update: failed to write in-band binary to temp: {err}"
+                    ))
+                })?;
+            } // blob_bytes dropped here, before the swap
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -10050,19 +10118,24 @@ mod binary_update_tests {
         /// process name + target. The dummy binary payload differs from the
         /// current test binary so the swap is observable.
         fn new(env_id: &str, dummy_exe: &[u8]) -> Self {
+            Self::new_with_version(env_id, dummy_exe, "99.0.0", "plan-e2e-1")
+        }
+
+        /// Like [`new`] but with a caller-chosen version and plan id.
+        fn new_with_version(env_id: &str, dummy_exe: &[u8], version: &str, plan_id: &str) -> Self {
             let (priv_pem, tk) = test_signing_key(42);
             let trust = TrustRoot::new(vec![tk.clone()]);
 
             let digest = test_digest_of(dummy_exe);
             let bin = BinaryArtifact {
                 name: env!("CARGO_PKG_NAME").to_string(),
-                version: "99.0.0".to_string(),
+                version: version.to_string(),
                 target: binswap::current_target().to_string(),
                 digest: digest.clone(),
                 source: None,
             };
 
-            let plan = test_plan_with_binary("plan-e2e-1", env_id, bin.clone());
+            let plan = test_plan_with_binary(plan_id, env_id, bin.clone());
             let built = build_update_plan(&plan, &priv_pem, &tk.key_id, &trust)
                 .expect("test plan must build");
 
@@ -10402,6 +10475,99 @@ mod binary_update_tests {
         // The binary must NOT have been swapped.
         let on_disk = std::fs::read(&target_exe).unwrap();
         assert_eq!(on_disk, b"old-binary", "binary must not be swapped");
+    }
+
+    #[test]
+    fn e2e_pending_different_version_blocks_swap() {
+        // First swap: stage v99 successfully.
+        let h = InbandTestHarness::new("e2e-lineage-block", b"dummy-v99");
+        let r1 = h.call().expect("first swap must succeed").unwrap();
+        assert_eq!(r1["staged"], true);
+        let swapped_v99 = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            swapped_v99, b"dummy-v99",
+            "binary must be v99 after first swap"
+        );
+
+        let marker_after_v99 =
+            read_binary_update_marker(&h.env_dir()).expect("marker must exist after first swap");
+        assert_eq!(marker_after_v99.to_version, "99.0.0");
+
+        // Second swap: try to stage v100 (different, higher version).
+        // Must be blocked by the lineage guard.
+        let h2 = InbandTestHarness::new_with_version(
+            "e2e-lineage-block",
+            b"dummy-v100",
+            "100.0.0",
+            "plan-e2e-lineage-v100",
+        );
+        // Reuse h's store/env_dir (which has the pending marker) but h2's
+        // staging has the v100 blob. Call through h2's staging + h's store.
+        let result = try_apply_binary_update(
+            &h2.plan_bytes,
+            &h2.sig_bytes,
+            &h.store(),
+            &h.env_id,
+            Some(&h.target_exe),
+            Some(h2.staging_dir.path()),
+        );
+        let json = result.expect("lineage guard returns Ok").unwrap();
+        assert_eq!(json["staged"], false, "second swap must be blocked");
+        assert_eq!(json["blocked_on_pending"], "99.0.0");
+        assert_eq!(json["restart_required"], true);
+
+        // The binary on disk must still be v99 (no second swap).
+        let still_v99 = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(still_v99, b"dummy-v99", "binary must not be overwritten");
+
+        // The marker must still name v99.
+        let marker_still =
+            read_binary_update_marker(&h.env_dir()).expect("marker must still exist");
+        assert_eq!(marker_still.to_version, "99.0.0");
+    }
+
+    #[test]
+    fn e2e_oversized_blob_rejected_before_read() {
+        let dummy = b"small-exe";
+        let h = InbandTestHarness::new("e2e-oversize", dummy);
+
+        // Inflate the staged blob to exceed MAX_BINARY_ARCHIVE_BYTES via
+        // set_len (sparse — cheap, no actual disk I/O).
+        let bin = BinaryArtifact {
+            name: env!("CARGO_PKG_NAME").to_string(),
+            version: "99.0.0".to_string(),
+            target: binswap::current_target().to_string(),
+            digest: h.binary_digest.clone(),
+            source: None,
+        };
+        let root = UpdatesRoot::open_in(h.staging_dir.path(), &h.env_id).unwrap();
+        let staged = root.load("plan-e2e-1").unwrap().unwrap();
+        let blob_path = staged.binary_blob_path(&bin).unwrap();
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&blob_path)
+                .unwrap();
+            f.set_len(MAX_BINARY_ARCHIVE_BYTES + 1).unwrap();
+        }
+
+        let result = h.call();
+        assert!(
+            result.is_err(),
+            "oversized blob must be rejected: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("byte cap"),
+            "error must mention byte cap: {err_msg}"
+        );
+
+        // The target exe must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped when blob is oversized"
+        );
     }
 
     // ── Category 12: A5 — end-to-end WS upgrade through revision-serve ─────
