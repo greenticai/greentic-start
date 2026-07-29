@@ -218,22 +218,36 @@ impl SecretsManager for LoggingSecretsManager {
                     }
                     candidates.push(retenanted);
                 }
+                let candidate_count = candidates.len();
                 for candidate in candidates {
                     operator_log::info(
                         module_path!(),
                         format!("WASM secrets read fallback: trying uri={candidate}"),
                     );
                     if let Ok(value) = self.inner.read(&candidate).await {
-                        operator_log::debug(
+                        // Redacted resolve (length only): proves write==read held.
+                        operator_log::info(
                             module_path!(),
                             format!(
-                                "WASM secrets read fallback resolved uri={candidate}; value={}",
-                                SecretValue::new(value.as_slice()),
+                                "WASM secrets read resolved (fallback) uri={candidate}; value_len={}",
+                                value.len(),
                             ),
                         );
                         return Ok(value);
                     }
                 }
+                // Redacted MISS summary: the "secret went missing" anchor — store
+                // path + count of URIs tried (compare against setup's WRITE log).
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "WASM secrets read MISS uri={path}: none of {} candidate uri(s) \
+                         resolved; store={} using_env_fallback={}",
+                        candidate_count + 1,
+                        self.dev_store_path_display,
+                        self.using_env_fallback,
+                    ),
+                );
                 Err(err)
             }
         }
@@ -1343,6 +1357,45 @@ mod tests {
         assert_eq!(
             stored,
             "secrets://dev/demo/_/messaging_webchat_gui/jwt_signing_key"
+        );
+    }
+
+    /// CROSS-SYSTEM SECRET CONTRACT — DO NOT CHANGE THIS TEST.
+    ///
+    /// greentic-setup WRITES a provider secret under the canonical uri
+    /// `secrets://local/<tenant>/_/messaging_webex/webex_bot_token` (see its
+    /// `canonical_secret_uri` test `webex_secret_uri_contract_do_not_change`).
+    /// The runtime READS with the RAW pack-stem provider (`messaging-webex`) and
+    /// relies on THIS canonicalization to land on the SAME stored uri. The golden
+    /// string below MUST equal setup's. If either side changes its derivation,
+    /// this breaks and a setup-provisioned secret silently goes "missing".
+    ///
+    /// Do NOT edit the expected value to make a build pass. Changing the
+    /// secret-uri scheme requires a NEW secrets plan verified end-to-end on BOTH
+    /// binaries (setup + start) and BOTH backends (local dev-store + cloud vault)
+    /// and public.
+    #[test]
+    fn webex_secret_read_uri_contract_do_not_change() {
+        assert_eq!(
+            canonicalize_provider_segment("secrets://local/demo/_/messaging-webex/webex_bot_token"),
+            Some("secrets://local/demo/_/messaging_webex/webex_bot_token".to_string()),
+            "runtime read uri must canonicalize to the exact uri greentic-setup writes",
+        );
+    }
+
+    /// Guards the gtunnel alias read path. The tunnel serves the alias tenant
+    /// `default-ba564` while setup provisioned the webex token under the base
+    /// tenant `default`; the read requested under the alias must reach the stored
+    /// base-tenant uri via the tenant + provider-canonicalization fallbacks (the
+    /// live "resolved (fallback)" path). Do NOT weaken without a new secrets plan.
+    #[test]
+    fn tenant_fallback_resolves_gtunnel_alias_to_base_tenant() {
+        let requested = "secrets://local/default-ba564/_/messaging-webex/webex_bot_token";
+        let retenanted = with_tenant(requested, "default").expect("retenant to base");
+        let canon = canonicalize_provider_segment(&retenanted).expect("canonicalize provider");
+        assert_eq!(
+            canon, "secrets://local/default/_/messaging_webex/webex_bot_token",
+            "alias→base tenant + provider canonicalization must land on the stored uri",
         );
     }
 

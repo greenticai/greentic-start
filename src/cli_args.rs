@@ -25,6 +25,10 @@ pub(crate) enum Command {
     Doctor(DoctorArgs),
     #[command(hide = true)]
     ResolveSecret(ResolveSecretArgs),
+    /// Internal: run the outbound tunnel agent. Spawned by the gtunnel provider;
+    /// reads its config (edge url, secret, target) from the environment.
+    #[command(name = "__tunnel-agent", hide = true)]
+    TunnelAgent,
 }
 
 #[derive(Parser, Clone)]
@@ -135,6 +139,18 @@ pub(crate) struct StartArgs {
     ngrok: NgrokModeArg,
     #[arg(long)]
     ngrok_binary: Option<PathBuf>,
+    /// Greentic self-hosted tunnel (Cloudflare Worker + agent). Zero-config:
+    /// the Worker URL, tunnel id, and secret are resolved from defaults/env.
+    #[arg(long, value_enum, default_value_t = GtunnelModeArg::Off)]
+    gtunnel: GtunnelModeArg,
+    /// Override the Greentic Worker tunnel base URL (else GREENTIC_TUNNEL_WORKER_URL
+    /// or the built-in default).
+    #[arg(long)]
+    gtunnel_worker_url: Option<String>,
+    /// Override the tunnel id (else GREENTIC_TUNNEL_ID or a value derived from
+    /// tenant/team).
+    #[arg(long)]
+    gtunnel_tunnel_id: Option<String>,
     #[arg(long)]
     runner_binary: Option<PathBuf>,
     #[arg(long, value_enum, value_delimiter = ',')]
@@ -227,10 +243,17 @@ pub enum NgrokModeArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum GtunnelModeArg {
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum RestartTarget {
     All,
     Cloudflared,
     Ngrok,
+    Gtunnel,
     Nats,
     Gateway,
     Egress,
@@ -253,6 +276,9 @@ pub struct StartRequest {
     pub cloudflared_binary: Option<PathBuf>,
     pub ngrok: NgrokModeArg,
     pub ngrok_binary: Option<PathBuf>,
+    pub gtunnel: GtunnelModeArg,
+    pub gtunnel_worker_url: Option<String>,
+    pub gtunnel_tunnel_id: Option<String>,
     pub runner_binary: Option<PathBuf>,
     pub restart: Vec<RestartTarget>,
     pub log_dir: Option<PathBuf>,
@@ -304,6 +330,9 @@ pub(crate) fn start_request_from_args(args: StartArgs, tunnel_explicit: bool) ->
         cloudflared_binary: args.cloudflared_binary,
         ngrok: args.ngrok,
         ngrok_binary: args.ngrok_binary,
+        gtunnel: args.gtunnel,
+        gtunnel_worker_url: args.gtunnel_worker_url,
+        gtunnel_tunnel_id: args.gtunnel_tunnel_id,
         runner_binary: args.runner_binary,
         restart: args.restart,
         log_dir: args.log_dir,
@@ -367,6 +396,7 @@ pub(crate) fn normalize_args(raw_tail: Vec<String>) -> Vec<String> {
         "warmup",
         "doctor",
         "resolve-secret",
+        "__tunnel-agent",
     ];
     let mut first_pos = None;
     let mut skip_next_value = false;
@@ -453,6 +483,7 @@ pub(crate) fn restart_name(target: &RestartTarget) -> String {
         RestartTarget::All => "all",
         RestartTarget::Cloudflared => "cloudflared",
         RestartTarget::Ngrok => "ngrok",
+        RestartTarget::Gtunnel => "gtunnel",
         RestartTarget::Nats => "nats",
         RestartTarget::Gateway => "gateway",
         RestartTarget::Egress => "egress",
