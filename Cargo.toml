@@ -146,8 +146,11 @@ default-features = false
 # line — the `0.1.x` cross-lane conflict that once blocked this (distributor-client
 # 1.2) is gone now that greentic-update publishes `1.2.0-dev.N` on the same lane.
 [dependencies.greentic-update]
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-dev.30347759036, <1.3.0-0"
 features = ["binswap", "stream"]
+# Floor bumped to 1.2.0-dev.30347759036: first publish carrying
+# StagedPlan::verify_binary_on_disk + the staging binary CAS (B3 in-band
+# binary consumption).
 
 # Lower bound pinned to the first dev build exposing the `signing` module
 # (verify_artifact_dsse / TrustRoot); earlier 1.1.0-dev builds lack it. Floor
