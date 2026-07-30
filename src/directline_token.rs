@@ -20,7 +20,7 @@ pub struct DirectLineTokenContext {
 
 /// DirectLine JWT claims as actually issued by the WASM provider.
 /// Mirror of `messaging_provider_webchat::directline::jwt::TokenClaims`:
-/// `{ iss, aud, sub: <user_id>, iat, nbf, exp, ctx: { env, tenant, team }, conv: <conv_id> }`.
+/// `{ iss, aud, sub: <user_id>, iat, nbf, exp, ctx: { env, tenant, team }, conv: <conv_id>, email, idp, verified }`.
 #[derive(Debug, Deserialize)]
 pub struct DirectLineTokenClaims {
     pub sub: String, // user_id (NOT conversation_id; conversation lives in `conv`)
