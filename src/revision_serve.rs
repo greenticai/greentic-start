@@ -2071,6 +2071,16 @@ fn validate_digest_hex(digest: &str) -> Result<&str, String> {
 /// scheme today (see `resolve_poll_cycle`). Adding a second altitude here would
 /// drift from C2.
 fn fetch_blob_from_mirror(base_url: &str, digest: &str) -> Result<Vec<u8>, String> {
+    fetch_blob_from_mirror_capped(base_url, digest, MAX_BINARY_ARCHIVE_BYTES)
+}
+
+/// Inner implementation with an explicit byte cap, so tests can exercise the
+/// cap-check branch without allocating 256 MiB.
+fn fetch_blob_from_mirror_capped(
+    base_url: &str,
+    digest: &str,
+    cap: u64,
+) -> Result<Vec<u8>, String> {
     let hex = validate_digest_hex(digest)?;
 
     let url = format!("{}/sha256-{hex}", base_url.trim_end_matches('/'));
@@ -2089,14 +2099,11 @@ fn fetch_blob_from_mirror(base_url: &str, digest: &str) -> Result<Vec<u8>, Strin
         .map_err(|err| format!("binary-update: mirror fetch status error for {url}: {err}"))?;
 
     let mut buf = Vec::new();
-    resp.take(MAX_BINARY_ARCHIVE_BYTES + 1)
+    resp.take(cap + 1)
         .read_to_end(&mut buf)
         .map_err(|err| format!("binary-update: mirror read error: {err}"))?;
-    if buf.len() as u64 > MAX_BINARY_ARCHIVE_BYTES {
-        return Err(format!(
-            "binary-update: mirror blob exceeds {} byte cap",
-            MAX_BINARY_ARCHIVE_BYTES,
-        ));
+    if buf.len() as u64 > cap {
+        return Err(format!("binary-update: mirror blob exceeds {cap} byte cap",));
     }
 
     // Digest verification: the plan is DSSE-verified, so the expected digest is
@@ -10965,55 +10972,84 @@ mod binary_update_tests {
 
     #[test]
     fn c4_mirror_oversized_response_rejected() {
-        // Mirror serves a response that exceeds MAX_BINARY_ARCHIVE_BYTES.
-        // We cannot allocate 256 MiB in a test, but we CAN test the cap logic
-        // through fetch_blob_from_mirror directly with a controlled server.
-        let dummy_exe = b"oversized-test";
+        // Exercise the cap-check branch in fetch_blob_from_mirror_capped.
+        // Allocating 256 MiB (the production cap) is impractical in a unit
+        // test, so we call the _capped variant with a small cap and spawn a
+        // server that sends more bytes than that cap.
+        const TEST_CAP: u64 = 128; // tiny cap for the test
+
+        // Build a payload that exceeds TEST_CAP. Content doesn't matter for
+        // the cap check — it fires before digest verification.
+        let oversized_body = vec![0u8; (TEST_CAP + 1) as usize];
+
+        // We still need a valid digest string to pass validate_digest_hex.
+        let dummy_exe = b"oversized-cap-test";
         let digest = test_digest_of(dummy_exe);
         let hex = digest.strip_prefix("sha256:").unwrap();
 
-        // Spawn a mirror that claims a massive Content-Length but actually sends
-        // MAX_BINARY_ARCHIVE_BYTES + 1 bytes. For the test we cheat: we send
-        // a large Content-Length header and enough bytes to exceed the cap check.
-        // Since fetch_blob_from_mirror uses `.take(MAX_BINARY_ARCHIVE_BYTES + 1)`,
-        // we only need to send slightly more than the cap. To avoid actually
-        // allocating 256 MiB, we test the function directly with a small cap
-        // by checking the digest mismatch path. Instead, let's verify the cap
-        // check via the function's error output.
-        //
-        // A practical test: spawn a server that streams more than the cap.
-        // This is expensive, so instead test `validate_digest_hex` and the cap
-        // check branch via the error messages.
-
-        // Direct unit test of validate_digest_hex:
-        assert!(validate_digest_hex(&digest).is_ok());
-        assert!(validate_digest_hex("md5:abc").is_err());
-        assert!(validate_digest_hex("sha256:AABB").is_err()); // too short
-        assert!(validate_digest_hex(&format!("sha256:{}", "g".repeat(64))).is_err()); // non-hex
-        assert!(validate_digest_hex(&format!("sha256:{}", "A".repeat(64))).is_err()); // uppercase
-
-        // For the cap check, test fetch_blob_from_mirror with a server that
-        // returns a payload much larger than the real binary. The cap is 256 MiB
-        // which is too expensive to allocate. Instead we verify the error path
-        // structurally: the response passes the cap only if len <= MAX, which
-        // is tested by the existing e2e_oversized_blob_rejected_before_read
-        // for the in-band path, and the mirror path uses the identical
-        // `.take(MAX + 1)` + length check pattern. We verify the cap message
-        // format is correct by checking the function's error branch with an
-        // intentionally wrong-digest payload:
-        let (base_url, server) = spawn_blob_mirror(hex, b"wrong-size-content", 200);
-        let result = fetch_blob_from_mirror(&base_url, &digest);
+        let (base_url, server) = spawn_blob_mirror(hex, &oversized_body, 200);
+        let result = fetch_blob_from_mirror_capped(&base_url, &digest, TEST_CAP);
         server.join().unwrap();
 
-        // This will fail with a digest mismatch (not a cap error) because the
-        // payload is small. That proves the function reached the digest check,
-        // meaning it passed the cap check. The cap branch is structurally
-        // identical to the URL-fetch arm already tested.
-        assert!(result.is_err());
+        assert!(
+            result.is_err(),
+            "oversized mirror response must be rejected: {result:?}"
+        );
         let err_msg = result.unwrap_err();
         assert!(
-            err_msg.contains("digest mismatch"),
-            "small wrong payload should fail at digest, not cap: {err_msg}"
+            err_msg.contains("byte cap"),
+            "error must mention byte cap, not digest mismatch: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn c4_non_notfound_metadata_error_is_hard_error() {
+        // When fs::metadata on the blob path fails with something OTHER than
+        // NotFound (e.g. PermissionDenied), the error must be a hard error
+        // that does NOT attempt a mirror fallback. This pins the
+        // ErrorKind::NotFound guard so it cannot be silently widened to a
+        // catch-all.
+        let dummy_exe = b"perm-denied-binary";
+        let h = InbandTestHarness::new("c4-perm-denied", dummy_exe);
+
+        // The blob IS staged (skip_blob defaults to false). Now remove
+        // permissions on the blob's parent directory so that fs::metadata
+        // returns PermissionDenied instead of NotFound.
+        let bin = test_inband_binary("99.0.0", h.binary_digest.clone());
+        let root = UpdatesRoot::open_in(h.staging_dir.path(), &h.env_id).unwrap();
+        let staged = root.load("plan-e2e-1").unwrap().unwrap();
+        let blob_path = staged.binary_blob_path(&bin).unwrap();
+        let blob_parent = blob_path.parent().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(blob_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Configure a mirror at an unroutable address — if the code
+        // incorrectly falls through to the mirror, it would produce a
+        // different error ("mirror fetch failed") instead of the expected
+        // "in-band binary stat" error.
+        write_blob_base_url(&h, "http://127.0.0.1:1");
+
+        let result = h.call();
+
+        // Restore permissions so the TempDir cleanup succeeds.
+        std::fs::set_permissions(blob_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "permission-denied on blob must be a hard error: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("in-band binary stat"),
+            "error must be the non-NotFound stat error, not a mirror fallback: {err_msg}"
+        );
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on permission denied"
         );
     }
 
