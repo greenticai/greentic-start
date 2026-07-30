@@ -78,25 +78,47 @@ pub(crate) fn lock_path(service: &str, port: u16) -> PathBuf {
 /// Every existing shared record for `service`, across all ports. Used by stop
 /// paths, which run without knowledge of the port the tunnel was keyed on.
 pub(crate) fn existing_shared_paths(service: &str) -> Vec<RuntimePaths> {
-    let root = tunnel_state_root();
-    let pids_root = state_dir(&root).join("pids");
+    existing_shared_records(service)
+        .into_iter()
+        .map(|(_, paths)| paths)
+        .collect()
+}
+
+/// Every existing shared record for `service`, paired with the local port it
+/// fronts, ordered by port. Callers that must reason across ports — rather than
+/// look one up — need the port back: a tunnel whose public identity is NOT its
+/// port (gtunnel, keyed by tunnel id) can be claimed by records under several
+/// ports at once, and only one of them may hold it. See
+/// `gtunnel::evict_foreign_claimants`.
+pub(crate) fn existing_shared_records(service: &str) -> Vec<(u16, RuntimePaths)> {
+    existing_shared_records_at(&tunnel_state_root(), service)
+}
+
+fn existing_shared_records_at(root: &Path, service: &str) -> Vec<(u16, RuntimePaths)> {
+    let pids_root = state_dir(root).join("pids");
     let prefix = format!("{SHARED_TENANT}.{service}-");
     let Ok(entries) = std::fs::read_dir(&pids_root) else {
         return Vec::new();
     };
-    let mut paths = Vec::new();
+    let mut records = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(team) = name.strip_prefix(&format!("{SHARED_TENANT}.")) else {
+        // Require the suffix to parse as a port. A bare prefix match would also
+        // accept a longer service name sharing this prefix (`gtunnel-agent-…`).
+        let Some(port) = name
+            .strip_prefix(&prefix)
+            .and_then(|port| port.parse::<u16>().ok())
+        else {
             continue;
         };
-        if !name.starts_with(&prefix) {
-            continue;
-        }
-        paths.push(RuntimePaths::new(state_dir(&root), SHARED_TENANT, team));
+        records.push((
+            port,
+            RuntimePaths::new(state_dir(root), SHARED_TENANT, shared_key(service, port)),
+        ));
     }
-    paths
+    records.sort_by_key(|(port, _)| *port);
+    records
 }
 
 /// Advisory file lock: exists while held, reclaimed when stale. Dropping
@@ -172,6 +194,34 @@ mod tests {
         assert_eq!(
             paths.log_path("cloudflared"),
             Path::new("/tunnel-root/logs/shared.cloudflared-8443/cloudflared.log")
+        );
+    }
+
+    #[test]
+    fn shared_records_return_ports_and_ignore_non_port_keys() {
+        let dir = tempdir().expect("tempdir");
+        let pids = dir.path().join("state").join("pids");
+        for key in [
+            "shared.gtunnel-8080",
+            "shared.gtunnel-55662",
+            // Not this service.
+            "shared.cloudflared-8080",
+            // Prefix-matches `gtunnel-` but is not a port.
+            "shared.gtunnel-agent",
+            // Not a shared record at all.
+            "default.default",
+        ] {
+            std::fs::create_dir_all(pids.join(key)).expect("mkdir");
+        }
+
+        let records = existing_shared_records_at(dir.path(), "gtunnel");
+
+        let ports: Vec<u16> = records.iter().map(|(port, _)| *port).collect();
+        assert_eq!(ports, vec![8080, 55662], "ports parsed and sorted");
+        assert_eq!(
+            records[0].1.pid_path("gtunnel"),
+            dir.path()
+                .join("state/pids/shared.gtunnel-8080/gtunnel.pid")
         );
     }
 

@@ -9,7 +9,16 @@
 //! The agent runs under the machine-wide shared record (`crate::tunnel_state`,
 //! keyed by `("gtunnel", port)`), the same protocol `greentic-setup` writes to.
 //! So if setup already started the agent for this port, `start` ADOPTS it rather
-//! than spawning a second one — the Worker allows only one socket per tunnel id.
+//! than spawning a second one.
+//!
+//! Port-keying alone is not enough here. It came from the quick-tunnel providers,
+//! where each tunnel mints its own hostname, so one-per-port is exactly
+//! one-per-public-identity. A gtunnel's public identity is its TUNNEL ID, and the
+//! Worker admits one socket per id — while setup and start deliberately share one
+//! id across two ports (setup fronts its own UI port, the runtime fronts ingress).
+//! Two records, one slot. So `start` additionally evicts any agent claiming this
+//! tunnel id under another port: the runtime is the authority on where an id
+//! points. See [`evict_foreign_claimants`].
 //!
 //! Zero-config by design — the Worker base URL, tunnel id, and secret all have
 //! defaults (see `crate::env_tunnel`), so selecting this tunnel needs no operator
@@ -19,7 +28,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::runtime_state::atomic_write;
+use crate::runtime_state::{RuntimePaths, atomic_write};
 use crate::supervisor::{self, ServiceId, ServiceSpec};
 use crate::{cloudflared, tunnel_state};
 
@@ -140,6 +149,12 @@ pub fn start_agent(config: &GtunnelConfig) -> anyhow::Result<GtunnelHandle> {
         let _ = std::fs::remove_file(&url_path);
     }
 
+    // Claim the tunnel id before judging our own record: the `serving()` probe
+    // below asks the Worker, which answers from whichever agent currently holds
+    // the slot. With a foreign agent still connected that probe reports someone
+    // else's tunnel as ours.
+    evict_foreign_claimants(&url, config.local_port);
+
     // Adopt a live agent (e.g. started by setup) — but only if it is actually
     // SERVING. A pid can be alive while its WebSocket to the Worker is dead
     // (evicted, network drop), so a bare pid check would reuse a tunnel that
@@ -192,6 +207,63 @@ pub fn start_agent(config: &GtunnelConfig) -> anyhow::Result<GtunnelHandle> {
         url,
         log_path: handle.log_path,
     })
+}
+
+/// Stop any agent under ANOTHER port's shared record that already claims `url`,
+/// so the agent for `keep_port` owns the tunnel id outright.
+///
+/// Without this the two agents livelock. The Worker admits one socket per tunnel
+/// id, so the second to connect evicts the first; the evicted agent reconnects
+/// and evicts the second, forever. Inbound webhooks then land on whichever agent
+/// won the last round — for a setup-started agent that means the Setup UI port,
+/// which serves no provider routes (and is usually gone by then, since setup
+/// leaves its agent running after exiting).
+///
+/// Records are matched on the stored public URL rather than a parsed tunnel id:
+/// the URL is what both binaries already write to `public_base_url.txt`, and
+/// comparing it whole keeps this correct across the path-prefix, subdomain, and
+/// root-map routing modes without re-deriving any of them.
+fn evict_foreign_claimants(url: &str, keep_port: u16) {
+    evict_claimants_in(
+        tunnel_state::existing_shared_records(SERVICE_ID),
+        url,
+        keep_port,
+    );
+}
+
+/// Body of [`evict_foreign_claimants`], over an explicit record set so tests can
+/// supply a temp state root instead of the process-wide one.
+fn evict_claimants_in(records: Vec<(u16, RuntimePaths)>, url: &str, keep_port: u16) {
+    for (port, shared) in records {
+        if port == keep_port {
+            continue;
+        }
+        let foreign_url_path = cloudflared::public_url_path(&shared);
+        // Compared verbatim (modulo trim): gtunnel writes this file itself, as
+        // the exact public URL. `cloudflared::parse_public_url` is not usable
+        // here — it only recognises `*.trycloudflare.com`.
+        let claims_url =
+            std::fs::read_to_string(&foreign_url_path).is_ok_and(|contents| contents.trim() == url);
+        if !claims_url {
+            continue;
+        }
+        let foreign_pid_path = shared.pid_path(SERVICE_ID);
+        if let Ok(Some(pid)) = read_pid(&foreign_pid_path)
+            && supervisor::is_running(pid)
+        {
+            crate::operator_log::info(
+                module_path!(),
+                format!(
+                    "gtunnel agent pid {pid} (port {port}) also claims {url}; stopping it so the \
+                     runtime on port {keep_port} owns the tunnel — the Worker admits one socket \
+                     per tunnel id, and two agents would evict each other indefinitely"
+                ),
+            );
+        }
+        let _ = supervisor::stop_pidfile(&foreign_pid_path, 2_000);
+        let _ = std::fs::remove_file(&foreign_pid_path);
+        let _ = std::fs::remove_file(&foreign_url_path);
+    }
 }
 
 /// Whether the tunnel actually serves end to end: a bounded GET to the public
@@ -382,6 +454,67 @@ mod tests {
         // Distinct per tenant and per seed (so different operators/tenants differ).
         assert_ne!(a, tenant_clash_suffix_from_seed("seed-123", "acme"));
         assert_ne!(a, tenant_clash_suffix_from_seed("other-seed", "default"));
+    }
+
+    /// Plant a shared gtunnel record for `port` claiming `url`, with `pid`.
+    fn plant_record(root: &Path, port: u16, url: &str, pid: u32) -> RuntimePaths {
+        let paths = RuntimePaths::new(root.join("state"), "shared", format!("gtunnel-{port}"));
+        let pid_path = paths.pid_path(SERVICE_ID);
+        let url_path = cloudflared::public_url_path(&paths);
+        for path in [&pid_path, &url_path] {
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        }
+        std::fs::write(&pid_path, pid.to_string()).expect("write pid");
+        std::fs::write(&url_path, url).expect("write url");
+        paths
+    }
+
+    /// The setup-vs-runtime collision: one tunnel id, two ports. Only the
+    /// runtime's record may survive, or the two agents evict each other on the
+    /// Worker forever and webhooks land on the Setup UI half the time.
+    #[test]
+    fn eviction_clears_other_ports_claiming_the_same_tunnel_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = "https://x.workers.dev/default-ba564";
+        // pid 0 never names a live process, so stop_pidfile just reaps the record.
+        let setup = plant_record(dir.path(), 55662, url, 0);
+        let runtime = plant_record(dir.path(), 8080, url, 0);
+        // A different tunnel id on a third port must be left completely alone.
+        let other = plant_record(dir.path(), 9090, "https://x.workers.dev/acme-77777", 0);
+
+        let records = vec![
+            (55662, setup.clone()),
+            (8080, runtime.clone()),
+            (9090, other.clone()),
+        ];
+        evict_claimants_in(records, url, 8080);
+
+        assert!(
+            !cloudflared::public_url_path(&setup).exists(),
+            "the setup-port record claiming our tunnel id must be cleared"
+        );
+        assert!(!setup.pid_path(SERVICE_ID).exists());
+        assert!(
+            cloudflared::public_url_path(&runtime).exists(),
+            "our own record must survive — start owns the tunnel id"
+        );
+        assert!(
+            cloudflared::public_url_path(&other).exists(),
+            "a record for a different tunnel id shares no slot and must be untouched"
+        );
+        assert!(other.pid_path(SERVICE_ID).exists());
+    }
+
+    #[test]
+    fn eviction_is_a_no_op_when_no_other_port_claims_the_tunnel_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = "https://x.workers.dev/default-ba564";
+        let runtime = plant_record(dir.path(), 8080, url, 0);
+
+        evict_claimants_in(vec![(8080, runtime.clone())], url, 8080);
+
+        assert!(cloudflared::public_url_path(&runtime).exists());
+        assert!(runtime.pid_path(SERVICE_ID).exists());
     }
 
     #[test]
