@@ -73,7 +73,7 @@ use greentic_deployer::cli::{OpError, OpFlags, OpOutcome};
 use greentic_deployer::environment::{LocalFsStore, load_trust_root};
 use greentic_types::EnvId;
 use greentic_update::binswap;
-use greentic_update::plan::{select_binary, verify_update_plan};
+use greentic_update::plan::{plan_targets_env, select_binary, verify_update_plan};
 use greentic_update::staging::UpdatesRoot;
 use greentic_update::stream::{StreamError, build_stream_client, run_stream};
 
@@ -2036,13 +2036,6 @@ fn verify_signed_plan(
 /// manifest for some other environment passes addressing, and without the second
 /// check would be recorded as verified while `updates::get` rejects it — exactly
 /// the path divergence this function exists to prevent.
-/// Broadcast env id (`_`) matches any local environment.
-/// Inlined from the stable `greentic_update::plan::plan_targets_env` which is
-/// not yet published on the dev lane.
-fn plan_targets_env(plan_env: &str, local_env: &str) -> bool {
-    plan_env == local_env || plan_env == "_"
-}
-
 fn check_plan_identity(plan_env: &str, target: &Value, local_env: &str) -> Result<(), NotifyError> {
     if !plan_targets_env(plan_env, local_env) {
         return Err(NotifyError::Op(OpError::InvalidArgument(format!(
@@ -6361,14 +6354,7 @@ mod tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: env_id.clone(),
             name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id,
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            host_config: EnvironmentHostConfig::new(env_id),
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
             extensions: Vec::new(),
@@ -6766,14 +6752,7 @@ mod tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: env_id.clone(),
             name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id,
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            host_config: EnvironmentHostConfig::new(env_id),
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
             extensions: Vec::new(),
@@ -7683,14 +7662,9 @@ mod tests {
     // they don't race the other listen-addr/env tests in the crate.
 
     fn host_cfg_with(addr: Option<SocketAddr>) -> EnvironmentHostConfig {
-        EnvironmentHostConfig {
-            env_id: greentic_types::EnvId::new("local").unwrap(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: addr,
-            public_base_url: None,
-            gui_enabled: None,
-        }
+        let mut hc = EnvironmentHostConfig::new(greentic_types::EnvId::new("local").unwrap());
+        hc.listen_addr = addr;
+        hc
     }
 
     struct EnvVarGuard {

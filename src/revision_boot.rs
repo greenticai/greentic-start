@@ -934,14 +934,7 @@ mod tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: env_id(),
             name: ENV_ID.to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id: env_id(),
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            host_config: EnvironmentHostConfig::new(env_id()),
             packs: Vec::new(),
             messaging_endpoints: Vec::new(),
             extensions: Vec::new(),
@@ -989,18 +982,11 @@ mod tests {
 
     /// The case the whole fast path exists for: flipping `default_bundle` moves
     /// a routing pointer and touches nothing the host reads.
-    ///
-    /// NOTE: `host_config.default_bundle` does not exist on the dev-lane
-    /// deploy-spec yet, so the test currently asserts the weaker invariant
-    /// that an identical environment is routing-only compatible. When
-    /// deploy-spec ships the field, this should be strengthened to actually
-    /// flip it.
     #[test]
     fn routing_only_delta_accepts_default_bundle_flip() {
         let prev = routing_delta_env();
-        let next = prev.clone();
-        // Without the `default_bundle` field we cannot flip it; the identity
-        // comparison still exercises the routing-only fast path.
+        let mut next = prev.clone();
+        next.host_config.default_bundle = Some(BundleId::new("legal"));
         assert!(
             env_routing_only_delta(&prev, &next),
             "a default_bundle flip must not force a full activation — it is one \

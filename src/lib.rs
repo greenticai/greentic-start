@@ -2920,14 +2920,11 @@ mod tests {
     fn host_config_with_gui(
         gui_enabled: Option<bool>,
     ) -> greentic_deploy_spec::EnvironmentHostConfig {
-        greentic_deploy_spec::EnvironmentHostConfig {
-            env_id: greentic_types::EnvId::try_from("local").unwrap(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: None,
-            public_base_url: None,
-            gui_enabled,
-        }
+        let mut hc = greentic_deploy_spec::EnvironmentHostConfig::new(
+            greentic_types::EnvId::try_from("local").unwrap(),
+        );
+        hc.gui_enabled = gui_enabled;
+        hc
     }
 
     #[test]

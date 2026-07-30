@@ -12,61 +12,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use greentic_deploy_spec::{BundleDeploymentStatus, BundleId, DeploymentId, Environment};
+use greentic_deploy_spec::{BundleId, DefaultBundleReason, DeploymentId, Environment};
 
 use crate::deployment_routes::DeploymentRouteTable;
-
-// ── local shims for deploy-spec 0.2.5 APIs not yet on the dev lane ──
-
-/// Why a particular bundle was chosen as the default. Mirrors
-/// `greentic_deploy_spec::DefaultBundleReason` from 0.2.5 (stable); inlined
-/// here because the dev-lane deploy-spec has not shipped it yet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DefaultBundleReason {
-    /// Exactly one Active deployment matched the tenant — unambiguous.
-    LoneActive,
-    /// Multiple Active deployments matched; the one with the newest
-    /// `created_at` (ties broken by largest `deployment_id`) was chosen.
-    NewestActive,
-}
-
-/// Local stand-in for `Environment::resolve_default_bundle` (deploy-spec 0.2.5).
-/// The stable version also checks `host_config.default_bundle` (ExplicitConfig),
-/// but that field does not exist on the dev-lane struct, so only the implicit
-/// heuristic (lone active / newest active) is available here.
-fn resolve_default_bundle<'a>(
-    env: &'a Environment,
-    tenant: &str,
-) -> Option<(
-    &'a greentic_deploy_spec::BundleDeployment,
-    DefaultBundleReason,
-)> {
-    let matches: Vec<_> = env
-        .bundles
-        .iter()
-        .filter(|b| {
-            b.status == BundleDeploymentStatus::Active
-                && b.route_binding.tenant_selector.tenant == tenant
-        })
-        .collect();
-
-    match matches.len() {
-        0 => None,
-        1 => Some((matches[0], DefaultBundleReason::LoneActive)),
-        _ => {
-            // Newest created_at, then largest deployment_id.
-            let newest = matches
-                .iter()
-                .max_by(|a, b| {
-                    a.created_at
-                        .cmp(&b.created_at)
-                        .then_with(|| a.deployment_id.cmp(&b.deployment_id))
-                })
-                .unwrap();
-            Some((newest, DefaultBundleReason::NewestActive))
-        }
-    }
-}
 
 // ── reserved path segments ──────────────────────────────────────────
 
@@ -143,13 +91,20 @@ impl BundleIndex {
         // Pre-resolve the default bundle for each tenant.
         let mut defaults = HashMap::new();
         for tenant in &tenants {
-            if let Some((dep, reason)) = resolve_default_bundle(env, tenant) {
+            if let Some((dep, reason)) = env.resolve_default_bundle(tenant) {
                 let resolution = DefaultResolution {
                     deployment_id: dep.deployment_id,
                     bundle_id: dep.bundle_id.clone(),
                     reason,
                 };
                 match reason {
+                    DefaultBundleReason::ExplicitConfig => {
+                        tracing::info!(
+                            tenant,
+                            bundle_id = %dep.bundle_id,
+                            "default bundle for tenant resolved via explicit config"
+                        );
+                    }
                     DefaultBundleReason::LoneActive => {
                         tracing::debug!(
                             tenant,
@@ -162,6 +117,14 @@ impl BundleIndex {
                             tenant,
                             bundle_id = %dep.bundle_id,
                             "default bundle for tenant resolved: newest active deployment"
+                        );
+                    }
+                    _ => {
+                        tracing::debug!(
+                            tenant,
+                            bundle_id = %dep.bundle_id,
+                            ?reason,
+                            "default bundle for tenant resolved"
                         );
                     }
                 }
@@ -770,14 +733,7 @@ mod tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: env_id(),
             name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id: env_id(),
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            host_config: EnvironmentHostConfig::new(env_id()),
             packs: Vec::new(),
             messaging_endpoints: Vec::new(),
             extensions: Vec::new(),
@@ -791,12 +747,10 @@ mod tests {
         }
     }
 
-    fn make_env_with_default(bundles: Vec<BundleDeployment>, _default: &str) -> Environment {
-        // NOTE: `host_config.default_bundle` does not exist on the dev-lane
-        // deploy-spec. The ExplicitConfig path is inert until deploy-spec
-        // ships the field. Tests that called this previously asserted
-        // ExplicitConfig; they now assert the implicit heuristic instead.
-        make_env(bundles)
+    fn make_env_with_default(bundles: Vec<BundleDeployment>, default: &str) -> Environment {
+        let mut env = make_env(bundles);
+        env.host_config.default_bundle = Some(BundleId::new(default));
+        env
     }
 
     /// Build a test harness: (routes, bundle_index, flow_index).
@@ -1203,14 +1157,10 @@ mod tests {
         assert_eq!(target.bundle_source, BundleSource::Url);
     }
 
-    // ── default_bundle config (ExplicitConfig inert on the dev lane) ─
+    // ── explicit default_bundle config ──────────────────────────────
 
     #[test]
-    fn default_bundle_resolves_via_heuristic_without_explicit_config() {
-        // On the stable lane `make_env_with_default("sales-chat")` would set
-        // `host_config.default_bundle` and this test would assert
-        // `ExplicitConfig`. On the dev lane the field does not exist yet, so
-        // the resolver falls through to the implicit heuristic (newest active).
+    fn explicit_default_bundle_config_wins() {
         let dep_hr = DeploymentId::new();
         let dep_sales = DeploymentId::new();
         let env = make_env_with_default(
@@ -1224,10 +1174,11 @@ mod tests {
 
         let target =
             classify_webchat_path("/v1/web/webchat/acme", None, &bi, &fi, &routes).unwrap();
-        // Without ExplicitConfig the heuristic picks the newest active.
+        assert_eq!(target.bundle_id.as_str(), "sales-chat");
+        assert_eq!(target.deployment_id, dep_sales);
         assert!(matches!(
             target.bundle_source,
-            BundleSource::Default(DefaultBundleReason::NewestActive)
+            BundleSource::Default(DefaultBundleReason::ExplicitConfig)
         ));
     }
 
