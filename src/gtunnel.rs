@@ -241,19 +241,62 @@ fn read_secret_file(path: PathBuf) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// Per-invocation random seed for deriving the managed-tunnel clash suffix.
-/// Fresh each process (each `gtc start`), mirroring cloudflared's quick-tunnel
-/// hostname which also rotates every start. Held in a `OnceLock` so every call
-/// within one invocation agrees — the alias is computed per-bundle and again
-/// when advertising URLs, and those must match.
+/// Per-INSTALL seed for deriving the managed-tunnel clash suffix, persisted at
+/// `<root>/instance-seed` (see [`tunnel_state_root`]).
+///
+/// This used to be a fresh per-process nonce "mirroring cloudflared's rotating
+/// hostname". That analogy does not hold: a cloudflared quick tunnel hands its
+/// new hostname to whatever reads the log, whereas this suffix lands in URLs
+/// already registered with third parties — Slack Event Subscriptions, Webex
+/// webhooks, OAuth redirect URIs — and in the tenant those providers' secrets
+/// are scoped under. Rotating it per process invalidated all of that on every
+/// `gtc start`, so a bundle that worked once broke on the next boot.
+///
+/// Persisting restores the pre-rotation behaviour and, because the file lives in
+/// the state root greentic-setup ALSO uses (it keeps `secret` and
+/// `secrets/<tunnelId>` there), lets both binaries derive the SAME suffix. That
+/// is what makes the id setup registers and the id start serves agree while
+/// still being unique per install on the shared Worker.
+///
+/// Still held in a `OnceLock` so every call within one invocation agrees. Falls
+/// back to an in-memory value if the file cannot be read or written, which keeps
+/// a read-only HOME working at the cost of stability.
 fn instance_seed() -> String {
     static SEED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SEED.get_or_init(|| {
-        (0..32)
-            .map(|_| format!("{:02x}", rand::random::<u8>()))
-            .collect()
-    })
-    .clone()
+    SEED.get_or_init(|| load_or_create_instance_seed(&tunnel_state_root()))
+        .clone()
+}
+
+/// Read `<root>/instance-seed`, creating it on first use. Root passed explicitly
+/// so tests never touch a developer's `~/.greentic/tunnel`.
+fn load_or_create_instance_seed(root: &Path) -> String {
+    let path = root.join("instance-seed");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        // 64 hex chars = the 256-bit seed we write. Anything else is corrupt or
+        // truncated; replace it rather than derive suffixes from garbage.
+        if existing.len() == 64 && existing.chars().all(|c| c.is_ascii_hexdigit()) {
+            return existing;
+        }
+    }
+    let seed: String = (0..32)
+        .map(|_| format!("{:02x}", rand::random::<u8>()))
+        .collect();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(err) = std::fs::write(&path, &seed) {
+        crate::operator_log::warn(
+            module_path!(),
+            format!(
+                "could not persist the managed-tunnel seed at {} ({err}); the clash suffix will \
+                 change on the next start, which invalidates URLs already registered with \
+                 providers",
+                path.display()
+            ),
+        );
+    }
+    seed
 }
 
 /// Stable 5-hex clash suffix for `base_tenant`: last 5 hex of
