@@ -1672,6 +1672,13 @@ enum NotifyAction {
 enum NotifyError {
     Op(OpError),
     Internal(String),
+    /// A configured blob-mirror fetch failed. Distinct from `Internal` because a
+    /// mirror is operator-declared infrastructure: a silent failure strands the
+    /// fleet's binary version on the old build permanently (the poll loop advances
+    /// `last_sequence` on a 2xx, so the plan is never retried). This variant must
+    /// NOT be swallowed — it propagates through `run_update_notify` after content
+    /// has converged and surfaces as a non-2xx to the caller.
+    BinaryMirror(String),
 }
 
 /// Parse + validate a `greentic.update-notify.v1` body into the raw plan and
@@ -2560,7 +2567,7 @@ fn try_apply_binary_update(
                     );
 
                     let blob_bytes = fetch_blob_from_mirror(&base_url, &binary.digest)
-                        .map_err(NotifyError::Internal)?;
+                        .map_err(NotifyError::BinaryMirror)?;
 
                     write_blob_and_apply(
                         blob_bytes,
@@ -2678,10 +2685,21 @@ fn run_update_notify(
             // and, if so, download + verify + swap it. The content path is
             // never regressed — a binary-step failure is logged and the
             // content-staged result still returns.
+            let mut mirror_failure: Option<String> = None;
             let binary_result = match try_apply_binary_update(
                 plan, sig, store, env_id, exe_path, None,
             ) {
                 Ok(info) => info,
+                Err(NotifyError::BinaryMirror(message)) => {
+                    // A configured mirror failed. Capture the error so content
+                    // staging can proceed, then surface it below.
+                    operator_log::error(
+                        module_path!(),
+                        format!("update-notify: blob-mirror failure for env `{env_id}`: {message}"),
+                    );
+                    mirror_failure = Some(message);
+                    None
+                }
                 Err(err) => {
                     // Log the error but do NOT fail the content staging.
                     operator_log::error(
@@ -2708,6 +2726,15 @@ fn run_update_notify(
             } else {
                 "staged"
             };
+
+            // Content has converged. Now surface the mirror failure so the
+            // caller sees a non-2xx and the poll loop leaves its sequence
+            // unadvanced and retries next cycle. This MUST come AFTER
+            // `apply_staged_plan` — moving it earlier would block content
+            // convergence on a binary-mirror problem.
+            if let Some(message) = mirror_failure {
+                return Err(NotifyError::BinaryMirror(message));
+            }
 
             let mut body = serde_json::json!({ "status": status });
             if let Some(binary_info) = binary_result {
@@ -2857,6 +2884,16 @@ async fn handle_update_notify(
             Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal error staging update plan",
+            ))
+        }
+        Err(NotifyError::BinaryMirror(message)) => {
+            operator_log::error(
+                module_path!(),
+                format!("update-notify: blob-mirror failure: {message}"),
+            );
+            Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                "blob mirror fetch failed",
             ))
         }
     }
@@ -3306,6 +3343,19 @@ fn poll_update_cycle(
             operator_log::error(
                 module_path!(),
                 format!("update-poll: internal failure staging plan for env `{env_id}`: {message}"),
+            );
+            (last_sequence, interval, false)
+        }
+        Err(NotifyError::BinaryMirror(message)) => {
+            // A configured blob mirror failed. The sequence is NOT advanced so
+            // the plan will be retried next poll cycle — fix the mirror and the
+            // fleet converges without republishing the plan.
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "update-poll: blob-mirror failure for env `{env_id}`, \
+                     plan will be retried next cycle: {message}"
+                ),
             );
             (last_sequence, interval, false)
         }
@@ -11114,6 +11164,317 @@ mod binary_update_tests {
         // Non-hex chars.
         let err = validate_digest_hex(&format!("sha256:{}z", "a".repeat(63))).unwrap_err();
         assert!(err.contains("non-lowercase-hex"), "{err}");
+    }
+
+    // ── C4-notify: tests through the production caller (run_update_notify) ──
+    //
+    // The B3/C4 tests above call `try_apply_binary_update` directly. These tests
+    // go through `run_update_notify` — the production caller — to verify that
+    // `BinaryMirror` errors are NOT swallowed and surface as `Err` to the HTTP
+    // handler and the poll loop.
+
+    /// Build a plan whose `target` is a valid `EnvManifest` so it passes the
+    /// deployer's `updates::get` target-parsing gate. The B3/C4
+    /// `test_plan_with_binary` uses `target: json!({})` which is fine when
+    /// calling `try_apply_binary_update` directly (it never parses `target`),
+    /// but `updates::get` requires a real `greentic.env-manifest.v1`.
+    fn test_plan_for_notify(plan_id: &str, env_id: &str, binary: BinaryArtifact) -> UpdatePlan {
+        UpdatePlan {
+            schema: UPDATE_PLAN_SCHEMA_V1.to_string(),
+            plan_id: plan_id.to_string(),
+            env_id: env_id.to_string(),
+            sequence: 1,
+            created_at: chrono::Utc::now(),
+            nonce: "test-nonce".to_string(),
+            target: serde_json::json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": { "id": env_id }
+            }),
+            artifacts: vec![],
+            binaries: vec![binary],
+            compat: CompatRequirements::default(),
+            rollback: RollbackPolicy {
+                policy: RollbackKind::Auto,
+                health_timeout_s: 60,
+                on_fail: OnFail::Restore,
+            },
+        }
+    }
+
+    /// Write a minimal `environment.json` so `updates::get` can
+    /// `store.load(&env_id)` without error.
+    fn write_environment_json(store_dir: &std::path::Path, env_id: &str) {
+        let env_dir = store_dir.join(env_id);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::write(
+            env_dir.join("environment.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "greentic.environment.v1",
+                "environment_id": env_id,
+                "name": "test",
+                "host_config": { "env_id": env_id },
+                "packs": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Remove the per-env staging directory that `updates::get` writes to via
+    /// the global `UpdatesRoot`. Without cleanup, every test run leaves debris
+    /// in `~/.greentic/updates/`.
+    fn cleanup_updates_root(env_id: &str) {
+        if let Some(dir) = std::env::var_os("GREENTIC_UPDATES_DIR") {
+            let _ = std::fs::remove_dir_all(std::path::PathBuf::from(dir).join(env_id));
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let _ = std::fs::remove_dir_all(
+                std::path::PathBuf::from(home)
+                    .join(".greentic")
+                    .join("updates")
+                    .join(env_id),
+            );
+        }
+    }
+
+    /// Test harness for `run_update_notify` — sets up everything the deployer's
+    /// `updates::get` needs (environment.json, trust root, update channel) plus
+    /// a signed plan with a valid `EnvManifest` target. Cleans up the global
+    /// staging root on drop.
+    struct NotifyTestHarness {
+        store_dir: tempfile::TempDir,
+        #[allow(dead_code)]
+        exe_dir: tempfile::TempDir,
+        plan_bytes: Vec<u8>,
+        sig_bytes: Vec<u8>,
+        env_id: String,
+        target_exe: std::path::PathBuf,
+        binary_digest: String,
+    }
+
+    impl NotifyTestHarness {
+        fn new(env_id: &str, dummy_exe: &[u8], blob_base_url: Option<&str>) -> Self {
+            let (priv_pem, tk) = test_signing_key(42);
+            let trust = TrustRoot::new(vec![tk.clone()]);
+
+            let digest = test_digest_of(dummy_exe);
+            let bin = test_inband_binary("99.0.0", digest.clone());
+
+            let plan = test_plan_for_notify("plan-notify-1", env_id, bin);
+            let built = build_update_plan(&plan, &priv_pem, &tk.key_id, &trust)
+                .expect("test plan must build");
+
+            let store_dir = tempfile::TempDir::new().unwrap();
+            let env_dir = store_dir.path().join(env_id);
+            std::fs::create_dir_all(&env_dir).unwrap();
+
+            // environment.json — minimal valid Environment for the deployer.
+            write_environment_json(store_dir.path(), env_id);
+
+            // trust-root.json — same key that signed the plan.
+            let trust_doc = TrustRootDocument::v1(vec![tk]);
+            std::fs::write(
+                env_dir.join(TRUST_ROOT_FILE),
+                serde_json::to_vec_pretty(&trust_doc).unwrap(),
+            )
+            .unwrap();
+
+            // update-channel.json — enabled, Stage mode.
+            let mut cfg = UpdateChannelConfig::disabled(EnvId::new(env_id).unwrap());
+            cfg.enabled = Some(true);
+            cfg.on_update = Some(UpdateAction::Stage);
+            if let Some(url) = blob_base_url {
+                cfg.blob_base_url = Some(url.to_string());
+            }
+            std::fs::write(
+                env_dir.join("update-channel.json"),
+                serde_json::to_vec_pretty(&cfg).unwrap(),
+            )
+            .unwrap();
+
+            // Target exe — NOT the real test binary.
+            let exe_dir = tempfile::TempDir::new().unwrap();
+            let target_exe = exe_dir.path().join("target-exe");
+            std::fs::write(&target_exe, b"old-binary").unwrap();
+
+            Self {
+                store_dir,
+                exe_dir,
+                plan_bytes: built.plan_bytes,
+                sig_bytes: built.envelope_bytes,
+                env_id: env_id.to_string(),
+                target_exe,
+                binary_digest: digest,
+            }
+        }
+
+        fn store(&self) -> LocalFsStore {
+            LocalFsStore::new(self.store_dir.path())
+        }
+
+        fn call_notify(&self) -> Result<(StatusCode, Value), NotifyError> {
+            run_update_notify(
+                &self.store(),
+                &self.env_id,
+                &self.plan_bytes,
+                &self.sig_bytes,
+                Some(&self.target_exe),
+            )
+        }
+    }
+
+    impl Drop for NotifyTestHarness {
+        fn drop(&mut self) {
+            cleanup_updates_root(&self.env_id);
+        }
+    }
+
+    #[test]
+    fn c4_notify_mirror_unreachable_returns_binary_mirror_error() {
+        // A configured mirror that is unreachable must surface as
+        // `Err(BinaryMirror)` from `run_update_notify`, NOT `Ok(200)`.
+        // This is the bug the finding identified: before the fix, the
+        // error was swallowed, HTTP 200 returned, and the poll loop
+        // advanced the sequence — stranding the binary version forever.
+        let h = NotifyTestHarness::new(
+            "c4-ntfy-mirror-down",
+            b"unreachable-binary",
+            Some("http://127.0.0.1:1"), // unroutable → connection refused
+        );
+
+        let result = h.call_notify();
+
+        match &result {
+            Err(NotifyError::BinaryMirror(msg)) => {
+                assert!(
+                    msg.contains("mirror fetch failed"),
+                    "BinaryMirror message must name the mirror fetch: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Err(BinaryMirror), got {other:?} — \
+                 a swallowed mirror failure would be Ok(200)"
+            ),
+        }
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on mirror failure"
+        );
+    }
+
+    #[test]
+    fn c4_notify_mirror_tampered_returns_binary_mirror_error() {
+        // A mirror serving tampered bytes (digest mismatch) must also
+        // surface as `Err(BinaryMirror)`, not `Ok(200)`.
+        let dummy_exe = b"good-notify-binary";
+        let h = NotifyTestHarness::new("c4-ntfy-mirror-tamper", dummy_exe, None);
+
+        let hex = h.binary_digest.strip_prefix("sha256:").unwrap();
+        // Serve WRONG bytes — digest will not match.
+        let (base_url, server) = spawn_blob_mirror(hex, b"tampered-payload", 200);
+
+        // Update the channel config with the mirror URL.
+        let mut cfg = UpdateChannelConfig::disabled(EnvId::new(&h.env_id).unwrap());
+        cfg.enabled = Some(true);
+        cfg.on_update = Some(UpdateAction::Stage);
+        cfg.blob_base_url = Some(base_url);
+        std::fs::write(
+            h.store_dir
+                .path()
+                .join(&h.env_id)
+                .join("update-channel.json"),
+            serde_json::to_vec_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        let result = h.call_notify();
+        server.join().unwrap();
+
+        match &result {
+            Err(NotifyError::BinaryMirror(msg)) => {
+                assert!(
+                    msg.contains("digest mismatch"),
+                    "BinaryMirror message must name digest mismatch: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Err(BinaryMirror), got {other:?} — \
+                 a swallowed digest-mismatch would be Ok(200)"
+            ),
+        }
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on tampered mirror"
+        );
+    }
+
+    #[test]
+    fn c4_notify_no_mirror_b3_regression_pin() {
+        // Regression pin: an in-band binary failure with NO mirror configured
+        // must still yield `Ok((200, ...))` with no `binary` key — the pre-C4
+        // best-effort behavior. This test stops someone later "fixing" all
+        // binary failures into hard errors.
+        let h = NotifyTestHarness::new(
+            "c4-ntfy-no-mirror",
+            b"never-staged-binary",
+            None, // no blob_base_url
+        );
+
+        let result = h.call_notify();
+
+        let (status, body) = result
+            .expect("missing blob + no mirror must be Ok (best-effort binary, content staged)");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "content staging must succeed even when binary blob is missing"
+        );
+        assert_eq!(body["status"], "staged");
+        assert!(
+            body.get("binary").is_none(),
+            "no `binary` key when binary step is best-effort-failed: {body}"
+        );
+    }
+
+    #[test]
+    fn c4_notify_content_staged_despite_mirror_failure() {
+        // Content must converge (plan staged by `updates::get`) even when the
+        // mirror fails. The call returns `Err(BinaryMirror)` — but the plan IS
+        // staged in the UpdatesRoot beforehand.
+        let h = NotifyTestHarness::new(
+            "c4-ntfy-content-conv",
+            b"content-convergence-binary",
+            Some("http://127.0.0.1:1"), // unroutable
+        );
+
+        let result = h.call_notify();
+
+        // The result must be a BinaryMirror error.
+        assert!(
+            matches!(&result, Err(NotifyError::BinaryMirror(_))),
+            "expected BinaryMirror error, got: {result:?}"
+        );
+
+        // But the plan WAS staged by `updates::get` before the mirror failure.
+        // Verify by opening the staging root and checking the plan exists.
+        let root = greentic_update::staging::UpdatesRoot::open(&h.env_id)
+            .expect("staging root must exist after updates::get");
+        let staged = root
+            .load("plan-notify-1")
+            .expect("load must not error")
+            .expect("plan must be staged despite the mirror failure");
+        let stage = staged.stage().expect("stage read");
+        assert_eq!(
+            stage,
+            greentic_update::staging::UpdateStage::Staged,
+            "plan must be in Staged state (content converged)"
+        );
     }
 
     // ── Category 12: A5 — end-to-end WS upgrade through revision-serve ─────
