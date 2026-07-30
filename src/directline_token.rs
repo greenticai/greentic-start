@@ -20,7 +20,7 @@ pub struct DirectLineTokenContext {
 
 /// DirectLine JWT claims as actually issued by the WASM provider.
 /// Mirror of `messaging_provider_webchat::directline::jwt::TokenClaims`:
-/// `{ iss, aud, sub: <user_id>, iat, nbf, exp, ctx: { env, tenant, team }, conv: <conv_id> }`.
+/// `{ iss, aud, sub: <user_id>, iat, nbf, exp, ctx: { env, tenant, team }, conv: <conv_id>, email, idp, verified }`.
 #[derive(Debug, Deserialize)]
 pub struct DirectLineTokenClaims {
     pub sub: String, // user_id (NOT conversation_id; conversation lives in `conv`)
@@ -28,6 +28,12 @@ pub struct DirectLineTokenClaims {
     pub ctx: DirectLineTokenContext,
     #[serde(default)]
     pub conv: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub idp: Option<String>,
+    #[serde(default)]
+    pub verified: bool,
 }
 
 // Variants are surfaced by the WS upgrade handler (Task 9). Until that lands
@@ -192,5 +198,29 @@ mod tests {
             verify_directline_token(&token, "conv1", "t1", b"different-key"),
             Err(TokenVerifyError::InvalidSignature)
         ));
+    }
+
+    #[test]
+    fn verify_reads_verified_identity_claims() {
+        let key = b"test-key";
+        let exp = chrono::Utc::now().timestamp() + 60;
+        let claims_json = format!(
+            r#"{{"sub":"user1","exp":{exp},"ctx":{{"env":"prod","tenant":"t1"}},"conv":"conv1","email":"u@acme.example","idp":"https://id.acme.example","verified":true}}"#
+        );
+        let token = make_token(&claims_json, key);
+        let claims = verify_directline_token(&token, "conv1", "t1", key).expect("verify ok");
+        assert!(claims.verified);
+        assert_eq!(claims.email.as_deref(), Some("u@acme.example"));
+        assert_eq!(claims.idp.as_deref(), Some("https://id.acme.example"));
+    }
+
+    #[test]
+    fn verify_defaults_unverified_when_absent() {
+        let key = b"test-key";
+        let exp = chrono::Utc::now().timestamp() + 60;
+        let token = make_token(&make_claims("conv1", "t1", exp), key); // legacy claims, no new fields
+        let claims = verify_directline_token(&token, "conv1", "t1", key).expect("verify ok");
+        assert!(!claims.verified);
+        assert!(claims.email.is_none());
     }
 }

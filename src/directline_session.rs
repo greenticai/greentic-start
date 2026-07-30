@@ -201,6 +201,12 @@ struct DlClaims {
     ctx: DlContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     conv: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idp: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    verified: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +259,9 @@ fn mint_token(template: &DlClaims, key: &[u8], ttl_secs: u64) -> String {
         exp: now + ttl_secs as i64,
         ctx: template.ctx.clone(),
         conv: template.conv.clone(),
+        email: template.email.clone(),
+        idp: template.idp.clone(),
+        verified: template.verified,
     };
     let header_enc = URL_SAFE_NO_PAD.encode(JOSE_HEADER);
     let payload_enc =
@@ -702,6 +711,9 @@ mod tests {
                 team: None,
             },
             conv: conv.map(str::to_string),
+            email: None,
+            idp: None,
+            verified: false,
         };
         let header_enc = URL_SAFE_NO_PAD.encode(JOSE_HEADER);
         let payload_enc = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
@@ -770,6 +782,67 @@ mod tests {
             parse_token("not-a-jwt", KEY),
             Err(TokenError::Malformed)
         ));
+    }
+
+    #[test]
+    fn renewal_preserves_verified_identity() {
+        // A verified token, when re-minted, keeps email/idp/verified.
+        let template = DlClaims {
+            iss: TOKEN_ISS.to_string(),
+            aud: TOKEN_AUD.to_string(),
+            sub: "user-1".to_string(),
+            iat: now_secs(),
+            nbf: now_secs(),
+            exp: now_secs() + 60,
+            ctx: DlContext {
+                env: "prod".to_string(),
+                tenant: "acme".to_string(),
+                team: None,
+            },
+            conv: Some("conv-1".into()),
+            email: Some("u@acme.example".into()),
+            idp: Some("https://id.acme.example".into()),
+            verified: true,
+        };
+        let key = b"k";
+        let token = mint_token(&template, key, 60);
+        // Re-parse the freshly minted token and confirm the fields survived.
+        let payload = token.split('.').nth(1).unwrap();
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let claims: DlClaims =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+        assert!(claims.verified);
+        assert_eq!(claims.email.as_deref(), Some("u@acme.example"));
+        assert_eq!(claims.idp.as_deref(), Some("https://id.acme.example"));
+    }
+
+    #[test]
+    fn renewal_cannot_upgrade_unverified() {
+        // A legacy/unverified template stays unverified after re-mint.
+        let template = DlClaims {
+            iss: TOKEN_ISS.to_string(),
+            aud: TOKEN_AUD.to_string(),
+            sub: "anon".to_string(),
+            iat: now_secs(),
+            nbf: now_secs(),
+            exp: now_secs() + 60,
+            ctx: DlContext {
+                env: "prod".to_string(),
+                tenant: "acme".to_string(),
+                team: None,
+            },
+            conv: Some("conv-1".into()),
+            email: None,
+            idp: None,
+            verified: false,
+        };
+        let token = mint_token(&template, b"k", 60);
+        let payload = token.split('.').nth(1).unwrap();
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let claims: DlClaims =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+        assert!(!claims.verified);
+        assert!(claims.email.is_none());
     }
 
     #[test]
