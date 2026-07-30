@@ -1,5 +1,6 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use greentic_runner_host::cache::{
@@ -35,6 +36,148 @@ pub(crate) fn adopt_bundle_cache_dir(bundle_root: &Path) {
         "greentic-start: using bundle-shipped component cache at {}",
         cache_root.display()
     );
+}
+
+/// Adopt a bundle-shipped component cache from materialized revisions in the
+/// env-serve path. Iterates the revision ids, probes
+/// `<env_dir>/revisions/<rev_id>/bundle/.cache/v1/`, and delegates to
+/// [`adopt_bundle_cache_dir`] (which is a no-op when the dir is absent or
+/// `GREENTIC_CACHE_DIR` is already set). First revision with a cache wins.
+///
+/// Returns the `.cache/v1/` paths that were probed and found absent. Empty when
+/// a cache was adopted, when `GREENTIC_CACHE_DIR` was already set, or when there
+/// are no revisions. The caller logs the outcome — naming the probed paths is
+/// what makes a miss diagnosable, since the whole mechanism rests on the
+/// `<env_dir>/revisions/<rev_id>/bundle/` layout being correct.
+///
+/// Reaches `set_var` via [`adopt_bundle_cache_dir`], so it inherits that
+/// function's single-threaded precondition. The env-serve caller in `lib.rs`
+/// does NOT satisfy it — `init_trace_log` has already spawned a
+/// `tracing_appender` worker thread by then. See the note at that call site;
+/// removing the env-var channel is tracked in #430.
+pub(crate) fn adopt_env_revision_cache(
+    env_dir: &Path,
+    revision_ids: &[impl AsRef<str>],
+) -> Vec<PathBuf> {
+    if std::env::var_os("GREENTIC_CACHE_DIR").is_some() {
+        return Vec::new();
+    }
+    let mut probed = Vec::new();
+    for rev_id in revision_ids {
+        let bundle_dir = env_dir
+            .join("revisions")
+            .join(rev_id.as_ref())
+            .join("bundle");
+        adopt_bundle_cache_dir(&bundle_dir);
+        if std::env::var_os("GREENTIC_CACHE_DIR").is_some() {
+            return Vec::new();
+        }
+        probed.push(bundle_dir.join(".cache").join("v1"));
+    }
+    probed
+}
+
+/// Return the runtime engine profile id, computing it at most once per process.
+/// `Engine::default()` is constructed only on the first call; subsequent calls
+/// return the cached id. The engine argument to `EngineProfile::from_engine` is
+/// ignored (the parameter is `_engine`), so this is safe to call at any point.
+fn runtime_engine_profile_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let engine = Engine::default();
+        let profile = warmup_engine_profile(&engine);
+        profile.id().to_string()
+    })
+}
+
+/// Result of checking whether a bundle-shipped cache matches the runtime's
+/// engine profile.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CacheProfileCheck {
+    /// No `v1/` directory under the cache root — nothing to check.
+    NoCacheDir,
+    /// `v1/` exists but contains no subdirectories (empty or files only).
+    EmptyV1,
+    /// The runtime's own profile directory exists under `v1/`.
+    Match,
+    /// `v1/` contains profile directories, but none matches the runtime's.
+    /// Fields: `(runtime_profile_id, shipped_profile_dirs)`.
+    Mismatch {
+        runtime_id: String,
+        shipped: Vec<String>,
+    },
+}
+
+/// Check whether a bundle-shipped cache at `cache_root` contains an engine
+/// profile directory that matches the runtime's profile. Pure and
+/// side-effect-free — logging is the caller's responsibility.
+pub(crate) fn check_cache_profile(cache_root: &Path) -> CacheProfileCheck {
+    let v1 = cache_root.join("v1");
+    if !v1.is_dir() {
+        return CacheProfileCheck::NoCacheDir;
+    }
+
+    let runtime_id = runtime_engine_profile_id();
+    let config = CacheConfig {
+        root: cache_root.to_path_buf(),
+        ..CacheConfig::default()
+    };
+    let expected_dir = config.disk_root(runtime_id);
+
+    if expected_dir.is_dir() {
+        return CacheProfileCheck::Match;
+    }
+
+    // List actual subdirectory names under v1/.
+    let shipped: Vec<String> = std::fs::read_dir(&v1)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+
+    if shipped.is_empty() {
+        CacheProfileCheck::EmptyV1
+    } else {
+        CacheProfileCheck::Mismatch {
+            runtime_id: runtime_id.to_string(),
+            shipped,
+        }
+    }
+}
+
+/// Log the result of a cache profile check using the crate's `operator_log`
+/// facility. Shared between the env-serve and demo/bundle adoption paths.
+pub(crate) fn log_cache_profile_check(check: &CacheProfileCheck) {
+    match check {
+        CacheProfileCheck::NoCacheDir | CacheProfileCheck::EmptyV1 => {
+            // No cache to match against — nothing to report.
+        }
+        CacheProfileCheck::Match => {
+            crate::operator_log::debug(
+                module_path!(),
+                "component cache: bundle-shipped profile matches the runtime engine profile",
+            );
+        }
+        CacheProfileCheck::Mismatch {
+            runtime_id,
+            shipped,
+        } => {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "component cache: engine-profile MISMATCH — the runtime expects profile \
+                     `{runtime_id}` but the bundle ships [{}]. Components will be recompiled \
+                     from WASM (~20s cold-start penalty). Re-warm the bundle with the same \
+                     Wasmtime version, target, and CPU policy as the runtime, or set \
+                     GREENTIC_CACHE_DIR to a matching cache.",
+                    shipped.join(", "),
+                ),
+            );
+        }
+    }
 }
 
 struct CollectedWasm {
@@ -282,5 +425,215 @@ mod tests {
             !profile.id().chars().any(is_windows_invalid_path_char),
             "warmup cache profile id must be valid as a Windows path segment"
         );
+    }
+
+    // --- adopt_env_revision_cache tests (F3 env-serve path) ---
+
+    #[test]
+    fn env_revision_cache_adopted_when_present() {
+        with_cache_env_lock(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let env_dir = tmp.path();
+            let rev_id = "rev-abc-123";
+            let cache_dir = env_dir
+                .join("revisions")
+                .join(rev_id)
+                .join("bundle")
+                .join(".cache")
+                .join("v1");
+            std::fs::create_dir_all(&cache_dir).unwrap();
+
+            adopt_env_revision_cache(env_dir, &[rev_id]);
+
+            let value = std::env::var("GREENTIC_CACHE_DIR").expect("env var should be set");
+            let expected = env_dir
+                .join("revisions")
+                .join(rev_id)
+                .join("bundle")
+                .join(".cache");
+            assert_eq!(PathBuf::from(value), expected);
+        });
+    }
+
+    #[test]
+    fn env_revision_cache_noop_when_no_cache_dir() {
+        with_cache_env_lock(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let env_dir = tmp.path();
+            // Create the revision's bundle dir but NOT `.cache/v1/`.
+            let bundle_dir = env_dir
+                .join("revisions")
+                .join("rev-no-cache")
+                .join("bundle");
+            std::fs::create_dir_all(&bundle_dir).unwrap();
+
+            adopt_env_revision_cache(env_dir, &["rev-no-cache"]);
+
+            assert!(
+                std::env::var("GREENTIC_CACHE_DIR").is_err(),
+                "env var must not be set when bundle has no cache"
+            );
+        });
+    }
+
+    #[test]
+    fn env_revision_cache_respects_existing_env_var() {
+        with_cache_env_lock(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let env_dir = tmp.path();
+            let rev_id = "rev-override";
+            let cache_dir = env_dir
+                .join("revisions")
+                .join(rev_id)
+                .join("bundle")
+                .join(".cache")
+                .join("v1");
+            std::fs::create_dir_all(&cache_dir).unwrap();
+
+            // SAFETY: protected by the env lock.
+            unsafe { std::env::set_var("GREENTIC_CACHE_DIR", "/user/explicit") };
+
+            adopt_env_revision_cache(env_dir, &[rev_id]);
+
+            assert_eq!(
+                std::env::var("GREENTIC_CACHE_DIR").unwrap(),
+                "/user/explicit",
+                "user-set GREENTIC_CACHE_DIR must not be overwritten"
+            );
+        });
+    }
+
+    #[test]
+    fn env_revision_cache_first_revision_wins() {
+        with_cache_env_lock(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let env_dir = tmp.path();
+            // Both revisions ship a cache.
+            for rev_id in &["rev-first", "rev-second"] {
+                let cache_dir = env_dir
+                    .join("revisions")
+                    .join(rev_id)
+                    .join("bundle")
+                    .join(".cache")
+                    .join("v1");
+                std::fs::create_dir_all(&cache_dir).unwrap();
+            }
+
+            adopt_env_revision_cache(env_dir, &["rev-first", "rev-second"]);
+
+            let value = std::env::var("GREENTIC_CACHE_DIR").expect("env var should be set");
+            let expected = env_dir
+                .join("revisions")
+                .join("rev-first")
+                .join("bundle")
+                .join(".cache");
+            assert_eq!(
+                PathBuf::from(value),
+                expected,
+                "first revision's cache must win"
+            );
+        });
+    }
+
+    #[test]
+    fn env_revision_cache_noop_when_no_revisions() {
+        with_cache_env_lock(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let empty: &[&str] = &[];
+            adopt_env_revision_cache(tmp.path(), empty);
+
+            assert!(
+                std::env::var("GREENTIC_CACHE_DIR").is_err(),
+                "empty revision list must not set the env var"
+            );
+        });
+    }
+
+    // --- check_cache_profile tests ---
+
+    #[test]
+    fn check_cache_profile_no_v1_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // cache_root exists but has no v1/ subdirectory.
+        assert_eq!(
+            check_cache_profile(tmp.path()),
+            CacheProfileCheck::NoCacheDir
+        );
+    }
+
+    #[test]
+    fn check_cache_profile_empty_v1() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("v1")).unwrap();
+        assert_eq!(check_cache_profile(tmp.path()), CacheProfileCheck::EmptyV1);
+    }
+
+    #[test]
+    fn check_cache_profile_v1_with_file_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let v1 = tmp.path().join("v1");
+        std::fs::create_dir_all(&v1).unwrap();
+        std::fs::write(v1.join("not-a-dir"), b"").unwrap();
+        assert_eq!(check_cache_profile(tmp.path()), CacheProfileCheck::EmptyV1,);
+    }
+
+    #[test]
+    fn check_cache_profile_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path();
+        // Build the expected directory using CacheConfig::disk_root so the test
+        // cannot drift from the implementation's path_safe transformation.
+        let runtime_id = runtime_engine_profile_id();
+        let config = CacheConfig {
+            root: cache_root.to_path_buf(),
+            ..CacheConfig::default()
+        };
+        let expected_dir = config.disk_root(runtime_id);
+        std::fs::create_dir_all(&expected_dir).unwrap();
+
+        assert_eq!(check_cache_profile(cache_root), CacheProfileCheck::Match);
+    }
+
+    #[test]
+    fn check_cache_profile_mismatch_single() {
+        let tmp = tempfile::tempdir().unwrap();
+        let v1 = tmp.path().join("v1");
+        let foreign = "sha256_aaaa";
+        std::fs::create_dir_all(v1.join(foreign)).unwrap();
+
+        match check_cache_profile(tmp.path()) {
+            CacheProfileCheck::Mismatch {
+                runtime_id,
+                shipped,
+            } => {
+                assert_eq!(runtime_id, runtime_engine_profile_id());
+                assert_eq!(shipped, vec![foreign.to_string()]);
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_cache_profile_mismatch_multiple() {
+        let tmp = tempfile::tempdir().unwrap();
+        let v1 = tmp.path().join("v1");
+        let foreign_a = "sha256_aaaa";
+        let foreign_b = "sha256_bbbb";
+        std::fs::create_dir_all(v1.join(foreign_a)).unwrap();
+        std::fs::create_dir_all(v1.join(foreign_b)).unwrap();
+
+        match check_cache_profile(tmp.path()) {
+            CacheProfileCheck::Mismatch {
+                runtime_id,
+                shipped,
+            } => {
+                assert_eq!(runtime_id, runtime_engine_profile_id());
+                assert_eq!(shipped.len(), 2);
+                let mut sorted = shipped.clone();
+                sorted.sort();
+                assert_eq!(sorted, vec![foreign_a.to_string(), foreign_b.to_string()]);
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
     }
 }

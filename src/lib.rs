@@ -101,6 +101,7 @@ mod secrets_gate;
 mod secrets_manager;
 mod secrets_provider_binding;
 mod secrets_setup;
+mod seed_copy;
 mod services;
 mod session_hint_extractor;
 mod setup_input;
@@ -138,6 +139,7 @@ pub use cli_args::{
     CloudflaredModeArg, GtunnelModeArg, NatsModeArg, NgrokModeArg, RestartTarget, StartRequest,
     StopRequest,
 };
+pub use seed_copy::seed_env_store_from;
 
 /// Tenant assumed when the operator names none.
 ///
@@ -469,6 +471,13 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         }
     }
 
+    // Init-container-less platforms (Cloud Run, ACA, Fargate) inject the
+    // env-store seed as a read-only mount; copy it into the writable,
+    // $HOME-rooted store before `bootstrap_local_environment` opens it
+    // write+flock. No-op unless GREENTIC_SEED_DIR is set. Must run before the
+    // first store access.
+    seed_copy::maybe_seed_env_store()?;
+
     bootstrap_local_environment()?;
 
     // N1.2: bundle-less cold start. When launched without `--bundle` / `--config`,
@@ -772,6 +781,60 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             rc
         };
 
+        // F3: adopt a bundle-shipped component cache from the first materialized
+        // revision that carries one, eliminating Cranelift recompilation on every
+        // cold start. A bundle without `.cache/v1/` is a silent no-op, and an
+        // explicitly-set `GREENTIC_CACHE_DIR` takes precedence.
+        //
+        // This runs before the multi-thread tokio runtime is built, but NOT
+        // before the process is multi-threaded: `init_trace_log` above installs
+        // a `tracing_appender::non_blocking` writer, which spawns a worker
+        // thread. `set_var` therefore does not meet its documented
+        // single-threaded precondition. The adoption cannot simply move earlier
+        // — it needs `rc.revisions`, which only exists after the revision pull
+        // above. Removing the env-var channel entirely (threading the resolved
+        // cache root into `CacheConfig`) is the real fix; tracked in #430.
+        {
+            let rev_ids: Vec<&str> = rc
+                .revisions
+                .iter()
+                .map(|r| r.revision_id.as_str())
+                .collect();
+            let probed = crate::warmup::adopt_env_revision_cache(&env_dir, &rev_ids);
+            // Log the resolved cache outcome so operators can tell whether the
+            // cache was found, pre-set, or absent. Hit/miss counters
+            // (`CacheManager::metrics()`) are not exposed here because the
+            // CacheManager lives inside PackRuntime as a private field —
+            // surfacing it would require changes to greentic-runner-host.
+            match std::env::var("GREENTIC_CACHE_DIR") {
+                Ok(dir) => {
+                    operator_log::info(
+                        module_path!(),
+                        format!("component cache: GREENTIC_CACHE_DIR={dir}"),
+                    );
+                    crate::warmup::log_cache_profile_check(&crate::warmup::check_cache_profile(
+                        dir.as_ref(),
+                    ));
+                }
+                Err(_) => operator_log::info(
+                    module_path!(),
+                    format!(
+                        "component cache: none (no bundle-shipped .cache/v1/ found; \
+                         components will be compiled from WASM on first use). Probed: {}",
+                        if probed.is_empty() {
+                            "no materialized revisions".to_string()
+                        } else {
+                            probed
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    ),
+                ),
+            }
+        }
+
         // C5: open the env's runtime.json snapshot once and share it across
         // every activation rebuild + the `runtime://` resolver every loaded
         // pack reaches. The store is `Arc`-shared so a single in-memory
@@ -941,6 +1004,25 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 bind_addr.port().saturating_add(1),
             )
         });
+        // Configured public base URL known WITHOUT a tunnel (env-store then
+        // `PUBLIC_BASE_URL`). Resolved before the server starts so it can gate
+        // capture arming; on Cloud Run there is no tunnel, so this is the whole
+        // boot-time URL. A tunnel (if any) is layered on top below.
+        let boot_configured_url = startup_contract::resolve_public_base_url(&environment)?;
+        // Cloud Run deferred public-URL capture: arm ONLY when revisions are
+        // loaded, K_SERVICE is set (Cloud Run), AND no URL is configured at
+        // boot. Gating on `is_none()` means an operator-configured URL (env-store
+        // / PUBLIC_BASE_URL) always wins and can never be overridden by a
+        // captured one (including on reload). Pinned to K_SERVICE so only this
+        // service's own `<service>-*.run.app` URL is ever captured.
+        let cloud_run_capture: Option<std::sync::Arc<revision_serve::PublicUrlCapture>> =
+            (boot_configured_url.is_none()
+                && !rc.revisions.is_empty()
+                && startup_contract::running_on_cloud_run())
+            .then(|| {
+                let service = std::env::var("K_SERVICE").unwrap_or_default();
+                std::sync::Arc::new(revision_serve::PublicUrlCapture::new(service))
+            });
         let server = revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
             bind_addr,
             activation: std::sync::Arc::clone(&activation),
@@ -950,6 +1032,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             updates_enabled: !request.no_updates,
             auto_restart_enabled: auto_restart,
             exe_path: Some(own_exe.clone()),
+            public_url_capture: cloud_run_capture.clone(),
         })
         .context("starting the revision ingress server")?;
         let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
@@ -1109,36 +1192,75 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         }
 
         // Phase D: auto-register provider webhooks for the served revisions.
-        // Gated on a public_base_url — with none, registration is skipped
-        // (register manually). Detached: the server is already listening, and
-        // a slow or stuck provider API call must not delay the watcher spawn
-        // or Ctrl+C handling; each invocation is bounded by
-        // `SETUP_WEBHOOK_TIMEOUT`.
+        // Detached: the server is already listening, and a slow or stuck
+        // provider API call must not delay the watcher spawn or Ctrl+C
+        // handling; each invocation is bounded by `SETUP_WEBHOOK_TIMEOUT`.
         //
         // Precedence: tunnel-discovered URL (always wins) > env-store > env
         // var — the same chain as the legacy bundle arm. The env-derived tail
         // is delegated to the canonical helper in `startup_contract` so this
         // path stays in lockstep with the reload path in
         // `revision_webhook_register`.
+        //
+        // Three-arm matrix:
+        //   Some(url)      → register immediately (unchanged).
+        //   None + capture → deferred: await the first GFE request, then register.
+        //   None + no cap  → skip + log (unchanged — no untrusted header trust).
         let public_base_url = match &tunnel_url {
             Some(url) => Some(url.clone()),
-            None => startup_contract::resolve_public_base_url(&environment)?,
+            None => boot_configured_url,
         };
         // Captured before `environment` is moved into the webhook-registration
         // task below; consumed by the watcher's `default_rebuild` further down.
         let reload_seed = Some((rc.clone(), environment.clone()));
         if revision_count > 0 {
             let boot_activation = std::sync::Arc::clone(&activation);
-            let boot_url = public_base_url.clone();
-            let boot_env = environment;
-            activation_rt.spawn(async move {
-                revision_webhook_register::register_new_model_webhooks(
-                    &boot_activation,
-                    &boot_env,
-                    boot_url.as_deref(),
-                )
-                .await;
-            });
+            let boot_env = environment.clone();
+            match (public_base_url.clone(), cloud_run_capture.clone()) {
+                (Some(url), _) => {
+                    activation_rt.spawn(async move {
+                        revision_webhook_register::register_new_model_webhooks(
+                            &boot_activation,
+                            &boot_env,
+                            Some(&url),
+                        )
+                        .await;
+                    });
+                }
+                (None, Some(cap)) => {
+                    // Deferred path: wait for the first GFE-fronted public
+                    // request to deliver the Host header, then register.
+                    // Uses the boot activation (decision 4 in the plan):
+                    // a hot-reload that lands before the first public
+                    // request self-heals via the reload path (decision 3).
+                    activation_rt.spawn(async move {
+                        let url = cap.captured().await;
+                        operator_log::info(
+                            module_path!(),
+                            format!(
+                                "captured public URL from Cloud Run request: {url}; \
+                                 registering webhooks"
+                            ),
+                        );
+                        revision_webhook_register::register_new_model_webhooks(
+                            &boot_activation,
+                            &boot_env,
+                            Some(&url),
+                        )
+                        .await;
+                    });
+                }
+                (None, None) => {
+                    activation_rt.spawn(async move {
+                        revision_webhook_register::register_new_model_webhooks(
+                            &boot_activation,
+                            &boot_env,
+                            None,
+                        )
+                        .await;
+                    });
+                }
+            }
         }
         // The server holds its own `Arc<Activation>`; release ours so a later
         // reload can free the superseded activation after its drain window.
@@ -1198,6 +1320,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 env_id.clone(),
                 activation_rt.handle().clone(),
                 tunnel_url,
+                cloud_run_capture,
             ),
             // C5 snapshot-reload arm: pure `store.reload()` call.
             move || snapshot_store_for_watcher.reload(),
@@ -1339,6 +1462,9 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     let state_dir = demo_paths.state_dir.clone();
 
     crate::warmup::adopt_bundle_cache_dir(&config_dir);
+    crate::warmup::log_cache_profile_check(&crate::warmup::check_cache_profile(
+        &config_dir.join(".cache"),
+    ));
 
     let resolved_log_dir = config_dir.join("logs");
     if request.log_dir.is_none() && resolved_log_dir != log_dir {

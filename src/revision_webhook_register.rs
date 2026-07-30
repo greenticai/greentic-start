@@ -487,9 +487,9 @@ fn plan_webhook_registrations(
 /// logged — the next config reload re-registers.
 ///
 /// URL precedence per reload: `tunnel_url` (a tunnel started by this boot —
-/// process-local, never persisted) wins; otherwise the URL is resolved
-/// freshly from the just-loaded `environment.json`, with a fallback to the
-/// `PUBLIC_BASE_URL` env var. The fresh resolve ensures that
+/// process-local, never persisted) wins; then the captured Cloud Run URL
+/// (in-memory only, never persisted — decision 3); then the freshly-loaded
+/// environment / env var. The fresh resolve ensures that
 /// `gtc op env set-public-url <NEW>` takes effect on the next reload without
 /// a process restart (when no tunnel is running).
 pub(crate) fn post_reload_registration(
@@ -497,6 +497,7 @@ pub(crate) fn post_reload_registration(
     env_id: String,
     rt: tokio::runtime::Handle,
     tunnel_url: Option<String>,
+    captured_url: Option<std::sync::Arc<crate::revision_serve::PublicUrlCapture>>,
 ) -> impl FnMut(&Activation) + Send + 'static {
     move |activation: &Activation| {
         let env = match load_environment(&store_root, &env_id) {
@@ -512,7 +513,9 @@ pub(crate) fn post_reload_registration(
                 return;
             }
         };
-        let public_base_url = reload_public_base_url(tunnel_url.as_deref(), &env);
+        let captured = captured_url.as_ref().and_then(|cap| cap.get().cloned());
+        let public_base_url =
+            reload_public_base_url(tunnel_url.as_deref(), captured.as_deref(), &env);
         let activation = activation.clone();
         rt.spawn(async move {
             register_new_model_webhooks(&activation, &env, public_base_url.as_deref()).await;
@@ -521,11 +524,17 @@ pub(crate) fn post_reload_registration(
 }
 
 /// Per-reload URL precedence: a boot-started tunnel (process-local) wins,
-/// else the freshly-loaded environment / env var via
-/// [`resolve_public_base_url_for_reload`].
-fn reload_public_base_url(tunnel_url: Option<&str>, env: &Environment) -> Option<String> {
+/// then the in-memory captured Cloud Run URL (decision 3: not persisted to
+/// environment.json / env-store to avoid triggering the file watcher), then
+/// the freshly-loaded environment / env var.
+fn reload_public_base_url(
+    tunnel_url: Option<&str>,
+    captured_url: Option<&str>,
+    env: &Environment,
+) -> Option<String> {
     tunnel_url
         .map(str::to_string)
+        .or_else(|| captured_url.map(str::to_string))
         .or_else(|| resolve_public_base_url_for_reload(env))
 }
 
@@ -847,14 +856,43 @@ mod tests {
         env.host_config.public_base_url = Some("https://persisted.example.com".to_string());
 
         assert_eq!(
-            reload_public_base_url(Some("https://live.trycloudflare.com"), &env),
+            reload_public_base_url(Some("https://live.trycloudflare.com"), None, &env),
             Some("https://live.trycloudflare.com".to_string()),
             "a boot-started tunnel must win over the persisted env-store URL",
         );
         assert_eq!(
-            reload_public_base_url(None, &env),
+            reload_public_base_url(None, None, &env),
             Some("https://persisted.example.com".to_string()),
             "without a tunnel the persisted env-store URL applies",
+        );
+    }
+
+    #[test]
+    fn reload_url_precedence_captured_url_between_tunnel_and_env() {
+        let mut env = env_with(vec![]);
+        env.host_config.public_base_url = Some("https://persisted.example.com".to_string());
+
+        // Captured URL wins over env-store.
+        assert_eq!(
+            reload_public_base_url(None, Some("https://captured.run.app"), &env,),
+            Some("https://captured.run.app".to_string()),
+            "captured Cloud Run URL must win over the env-store URL",
+        );
+        // Tunnel still wins over captured.
+        assert_eq!(
+            reload_public_base_url(
+                Some("https://tunnel.trycloudflare.com"),
+                Some("https://captured.run.app"),
+                &env,
+            ),
+            Some("https://tunnel.trycloudflare.com".to_string()),
+            "a boot-started tunnel must still win over the captured URL",
+        );
+        // No tunnel, no captured → falls through to env.
+        assert_eq!(
+            reload_public_base_url(None, None, &env),
+            Some("https://persisted.example.com".to_string()),
+            "without tunnel or captured URL the env-store URL applies",
         );
     }
 }

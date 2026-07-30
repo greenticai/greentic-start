@@ -74,6 +74,7 @@ use greentic_deployer::environment::{LocalFsStore, load_trust_root};
 use greentic_types::EnvId;
 use greentic_update::binswap;
 use greentic_update::plan::{plan_targets_env, select_binary, verify_update_plan};
+use greentic_update::staging::UpdatesRoot;
 use greentic_update::stream::{StreamError, build_stream_client, run_stream};
 
 use crate::deployment_routes::RevisionIngressRouting;
@@ -93,6 +94,73 @@ use crate::revision_drain::{
     DrainRequest, NoopRevisionTeardown, RevisionDrainCoordinator, RevisionLivenessProbe,
     RevisionTeardown,
 };
+
+/// Set-once latch for deferred public-URL capture on Cloud Run.
+///
+/// On Cloud Run, the runtime's own public URL is not known at boot time (no
+/// tunnel, no manifest `public_base_url`). The first inbound request through
+/// the Google Front End carries the real `Host` header, and this struct lets the
+/// request-path writer communicate the derived URL to the boot-side waiter
+/// (the deferred webhook-registration task).
+///
+/// - [`offer`](Self::offer): called from the hot request path; first writer
+///   wins (idempotent via `OnceLock`), then wakes the boot waiter.
+/// - [`captured`](Self::captured): awaited by the boot task; registers
+///   `notified()` before re-checking `get()` to avoid a missed notify.
+/// - [`get`](Self::get): non-async read for the reload path.
+#[derive(Debug, Default)]
+pub(crate) struct PublicUrlCapture {
+    url: std::sync::OnceLock<String>,
+    notify: tokio::sync::Notify,
+    /// K_SERVICE at boot. The derived `Host` must be this service's own
+    /// `<expected_service>-*.run.app` URL (see
+    /// [`crate::startup_contract::derive_public_base_url`]) — the anti-hijack
+    /// pin. Empty in the `Default` case (used only by tests that never
+    /// exercise derivation).
+    expected_service: String,
+}
+
+impl PublicUrlCapture {
+    /// Create an armed capture pinned to `expected_service` (the Cloud Run
+    /// `K_SERVICE`). Only a `Host` of the form `<expected_service>-*.run.app`
+    /// will be captured.
+    pub(crate) fn new(expected_service: String) -> Self {
+        Self {
+            url: std::sync::OnceLock::new(),
+            notify: tokio::sync::Notify::default(),
+            expected_service,
+        }
+    }
+
+    /// Offer a derived URL. Only the first call wins; subsequent calls are
+    /// no-ops (the `OnceLock` rejects them). After a successful set, wakes
+    /// the single boot waiter via `notify_one`.
+    pub(crate) fn offer(&self, url: String) {
+        if self.url.set(url).is_ok() {
+            self.notify.notify_one();
+        }
+    }
+
+    /// Non-async read of the captured URL. Used by the reload path to check
+    /// whether a URL was captured without awaiting.
+    pub(crate) fn get(&self) -> Option<&String> {
+        self.url.get()
+    }
+
+    /// Wait until a URL has been captured. The boot-side deferred registration
+    /// task calls this. Race-free for a single waiter: `notified()` is
+    /// registered BEFORE re-checking `get()`, so a concurrent `offer` between
+    /// the check and the await is not missed.
+    pub(crate) async fn captured(&self) -> String {
+        loop {
+            let waiting = self.notify.notified();
+            if let Some(u) = self.url.get() {
+                return u.clone();
+            }
+            waiting.await;
+        }
+    }
+}
 
 /// Largest request body the revision ingress accepts, in bytes. Even on the
 /// loopback / local posture a cap is required so one oversized POST cannot
@@ -151,6 +219,11 @@ pub(crate) struct RevisionServeConfig {
     pub auto_restart_enabled: bool,
     /// Executable path captured at boot, before any swap.
     pub exe_path: Option<std::path::PathBuf>,
+    /// Armed on Cloud Run when no boot-time `public_base_url` is available:
+    /// the first inbound request that passes the GFE trust gate sets the URL
+    /// via [`PublicUrlCapture::offer`], waking the deferred registration task.
+    /// `None` = not on Cloud Run, or a URL was already known at boot.
+    pub public_url_capture: Option<Arc<PublicUrlCapture>>,
 }
 
 /// Per-connection shared state. Holds the live activation behind an
@@ -205,6 +278,11 @@ struct ServeState {
     /// new activities. Shared across all revisions so a REST POST that writes
     /// an activity on one revision wakes the WS pump watching that conversation.
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
+    /// Deferred public-URL capture for Cloud Run. When armed, the first
+    /// inbound request that passes the GFE trust gate writes the URL here
+    /// via [`PublicUrlCapture::offer`], waking the deferred registration
+    /// task in `lib.rs`. `None` = not armed.
+    public_url_capture: Option<Arc<PublicUrlCapture>>,
     /// Test-only: override the activity source used by the WS pump. When
     /// `Some`, `handle_websocket_upgrade` substitutes this source instead of
     /// constructing a `RevisionActivitySource` that calls
@@ -505,6 +583,7 @@ impl RevisionServer {
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
             session_manager,
             notifier,
+            public_url_capture: config.public_url_capture,
             #[cfg(test)]
             activity_source_override: None,
         });
@@ -992,12 +1071,38 @@ fn spawn_revision_connection(
 }
 
 /// `service_fn` adapter: collapse the `Ok`/`Err` response halves into the single
+/// Cloud Run deferred public-URL capture, extracted from [`handle_connection`]
+/// so the decision is unit-testable without constructing a hyper
+/// `Request<Incoming>`. On the first inbound request whose headers pass the GFE
+/// trust gate AND match this service's own `<service>-*.run.app` URL, records
+/// the derived base URL and wakes the deferred webhook-registration task. A
+/// no-op once captured, and whenever the headers fail the gate.
+///
+/// NOTE: Cloud Run Host-forwarding is observed GFE behaviour, not a documented
+/// contract. See plan section 7 for the live acceptance test.
+fn try_capture_public_url(cap: &PublicUrlCapture, headers: &hyper::HeaderMap) {
+    if cap.get().is_none()
+        && let Some(url) =
+            crate::startup_contract::derive_public_base_url(headers, &cap.expected_service)
+    {
+        cap.offer(url);
+    }
+}
+
 /// infallible response hyper wants.
 async fn handle_connection(
     mut req: Request<Incoming>,
     state: Arc<ServeState>,
     peer_is_loopback: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    // Cloud Run deferred public-URL capture: on the first inbound request
+    // through the GFE, derive the public base URL from the Host header and
+    // wake the deferred webhook-registration task. Placed BEFORE the WS
+    // intercept so even WebSocket-first traffic triggers capture.
+    if let Some(cap) = state.public_url_capture.as_ref() {
+        try_capture_public_url(cap, req.headers());
+    }
+
     // A5: intercept WebSocket stream paths BEFORE `serve` so the upgrade
     // handshake can borrow the request mutably. The stream path is the WS
     // endpoint browsers open after creating a conversation over REST.
@@ -1745,6 +1850,79 @@ enum NotifyAction {
 enum NotifyError {
     Op(OpError),
     Internal(String),
+    /// A configured blob-mirror fetch failed. Distinct from `Internal` because a
+    /// mirror is operator-declared infrastructure: a silent failure strands the
+    /// fleet's binary version on the old build permanently (the poll loop advances
+    /// `last_sequence` on a 2xx, so the plan is never retried). This variant must
+    /// NOT be swallowed — it propagates through `run_update_notify` after content
+    /// has converged and surfaces as a non-2xx to the caller.
+    BinaryMirror(String),
+}
+
+/// Response status, opaque public body, and log detail for a notify failure that
+/// is not an [`NotifyError::Op`] (those go through [`map_op_error`]); `None` for
+/// `Op`.
+///
+/// Extracted from the handler so the mapping is unit-testable. A failed blob
+/// mirror must surface as 502, distinguishable from an opaque 500: otherwise an
+/// operator cannot tell "your in-gap mirror is misconfigured" from "this server
+/// is broken", and the two have completely different remedies.
+fn notify_failure_response(err: &NotifyError) -> Option<(StatusCode, &'static str, String)> {
+    match err {
+        NotifyError::Op(_) => None,
+        NotifyError::Internal(message) => Some((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error staging update plan",
+            format!("update-notify: internal failure: {message}"),
+        )),
+        NotifyError::BinaryMirror(message) => Some((
+            StatusCode::BAD_GATEWAY,
+            "blob mirror fetch failed",
+            format!("update-notify: blob-mirror failure: {message}"),
+        )),
+    }
+}
+
+/// Whether a completed notify attempt means the plan was ACTED ON, so
+/// [`poll_update_cycle`] may remember its sequence and stop re-fetching it.
+///
+/// Only a 2xx `Ok` qualifies. Every other outcome deliberately leaves the
+/// sequence unadvanced so the plan is retried next cycle:
+/// - a non-2xx `Ok` is the disabled-channel TOCTOU (403) — a re-enabled channel
+///   must still pick this plan up rather than skip it until a newer one exists;
+/// - `Op` / `Internal` mean the plan was not staged at all;
+/// - `BinaryMirror` is a configured blob mirror that failed, and NOT advancing is
+///   what makes the airgap path self-healing: fix the mirror and the fleet
+///   converges on the next poll with no republish.
+///
+/// This is deliberately ONE decision point. While each match arm built its own
+/// return tuple, the rule was duplicated four ways and a regression in any single
+/// arm was invisible to the test suite — a mutation that advanced the sequence on
+/// `BinaryMirror` (reintroducing permanent silent divergence: content converged,
+/// sequence moved on, binary stranded on the old version) passed the whole suite.
+fn notify_outcome_acted_on(outcome: &Result<(StatusCode, Value), NotifyError>) -> bool {
+    matches!(outcome, Ok((status, _)) if status.is_success())
+}
+
+/// Split a binary-update result into `(binary_info, mirror_failure)` for
+/// [`run_update_notify`]: what to report under the response's `binary` key, and
+/// the message of a configured-mirror failure that must be surfaced AFTER content
+/// convergence rather than swallowed.
+///
+/// This encodes the swallow-vs-surface policy in one testable place. Binary
+/// self-update is deliberately best-effort relative to content staging, so every
+/// failure is swallowed to `None` — EXCEPT [`NotifyError::BinaryMirror`], because
+/// a configured mirror is operator-declared infrastructure and swallowing it
+/// returns 200, advances the poll loop's sequence, and strands the fleet's binary
+/// version on the old build with no retry.
+fn classify_binary_step(
+    result: Result<Option<Value>, NotifyError>,
+) -> (Option<Value>, Option<String>) {
+    match result {
+        Ok(info) => (info, None),
+        Err(NotifyError::BinaryMirror(message)) => (None, Some(message)),
+        Err(_) => (None, None),
+    }
 }
 
 /// Parse + validate a `greentic.update-notify.v1` body into the raw plan and
@@ -2065,6 +2243,210 @@ pub(crate) fn write_rollback_tombstone(env_dir: &std::path::Path, marker: &Binar
     }
 }
 
+/// Concurrent update notifies must not both pass the marker inspection before
+/// either writes. Coarse hold is fine: swaps are rare and the function is sync
+/// on blocking threads.
+/// The process resolves a single env at startup, so a process-wide lock equals
+/// a per-env lock today; a per-env lock would be needed if multi-env-per-process
+/// ever lands.
+static BINARY_UPDATE_SWAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Post-acquisition shared path: swap a verified binary into `current_exe`,
+/// build and persist the rollback marker, and return the staged-JSON fragment.
+/// Called by both the URL-fetch path and the in-band staging path so the
+/// swap + marker logic is not duplicated.
+fn apply_binary_from_path(
+    own_name: &str,
+    binary: &greentic_update::plan::BinaryArtifact,
+    inner_binary: &std::path::Path,
+    current_exe: &std::path::Path,
+    env_dir: &std::path::Path,
+    current_version: &str,
+) -> Result<Option<Value>, NotifyError> {
+    let swap_opts = binswap::SwapOptions {
+        expected_digest: Some(binary.digest.clone()),
+    };
+    binswap::swap_binary(inner_binary, current_exe, &swap_opts).map_err(|err| {
+        // Fail-closed: the binary is NOT applied, content staging stays
+        // intact. Log the category, never leak the path.
+        operator_log::error(module_path!(), format!("binary-update: swap failed: {err}"));
+        NotifyError::Internal("binary update swap failed".to_string())
+    })?;
+
+    // Durably persist the rollback marker BEFORE reporting success. The
+    // marker is the rollback state — without it the boot-fail guard cannot
+    // arm, and a crash-looping new binary is never rolled back. If the
+    // write fails, undo the swap so we never exec into a binary that has
+    // no rollback coverage.
+    let marker = BinaryUpdateMarker {
+        name: own_name.to_string(),
+        from_version: current_version.to_string(),
+        to_version: binary.version.clone(),
+        staged_at: chrono::Utc::now().to_rfc3339(),
+        phase: MarkerPhase::Pending,
+        rolled_back_at: None,
+        digest: Some(binary.digest.clone()),
+        boot_attempts: 0,
+    };
+    persist_marker_or_undo_swap(env_dir, &marker, current_exe)?;
+
+    operator_log::warn(
+        module_path!(),
+        format!(
+            "binary-update: {own_name} {} installed; restart required to activate",
+            binary.version,
+        ),
+    );
+
+    Ok(Some(serde_json::json!({
+        "staged": true,
+        "restart_required": true,
+        "version": binary.version,
+    })))
+}
+
+/// Read `env_id`'s update channel off disk and return `blob_base_url` when set.
+/// An absent or unreadable channel, or an unset field, yields `None`.
+///
+/// No `resolved_enabled()` gate: reaching `try_apply_binary_update` already
+/// implies the channel was enabled (`notify_action` gated it upstream), so
+/// re-gating here would duplicate the check with no added safety.
+fn load_blob_base_url(store: &LocalFsStore, env_id: &str) -> Option<String> {
+    let env_typed = EnvId::new(env_id).ok()?;
+    let cfg = store.load_update_channel(&env_typed).ok()??;
+    cfg.resolved_blob_base_url().map(|s| s.to_owned())
+}
+
+/// Validate a `sha256:<hex>` digest string and return the bare hex if valid.
+/// Returns `Err` with a human-readable message if the digest is malformed
+/// (missing prefix, wrong length, non-hex chars). This is an URL-injection
+/// defense: we build a fetch URL from the hex so it must be tightly validated
+/// before any network call.
+fn validate_digest_hex(digest: &str) -> Result<&str, String> {
+    let hex = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| format!("binary-update: digest missing `sha256:` prefix: {digest}"))?;
+    if hex.len() != 64 {
+        return Err(format!(
+            "binary-update: digest hex must be 64 chars, got {}: {digest}",
+            hex.len(),
+        ));
+    }
+    if !hex
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "binary-update: digest contains non-lowercase-hex chars: {digest}",
+        ));
+    }
+    Ok(hex)
+}
+
+/// Fetch a binary blob from a blob-mirror HTTP endpoint.
+///
+/// The deployer's `import --push-to` (C3) writes blobs as `blobs/sha256-<hex>`,
+/// so the mirror URL is `{base_url}/sha256-{hex}` where the hex is extracted
+/// from the `sha256:<hex>` digest string (colon → hyphen in the URL).
+///
+/// The transport's scheme is NOT validated here: the blob is digest-verified
+/// against the DSSE-verified plan, so the mirror is a cache and never an
+/// authority — plaintext transport can cause a denial but never a compromise.
+/// The deployer's `config-set` (C2) is the single validation altitude for host
+/// policy, and `greentic-start` likewise does not validate `plan_endpoint`'s
+/// scheme today (see `resolve_poll_cycle`). Adding a second altitude here would
+/// drift from C2.
+fn fetch_blob_from_mirror(base_url: &str, digest: &str) -> Result<Vec<u8>, String> {
+    fetch_blob_from_mirror_capped(base_url, digest, MAX_BINARY_ARCHIVE_BYTES)
+}
+
+/// Inner implementation with an explicit byte cap, so tests can exercise the
+/// cap-check branch without allocating 256 MiB.
+fn fetch_blob_from_mirror_capped(
+    base_url: &str,
+    digest: &str,
+    cap: u64,
+) -> Result<Vec<u8>, String> {
+    let hex = validate_digest_hex(digest)?;
+
+    let url = format!("{}/sha256-{hex}", base_url.trim_end_matches('/'));
+
+    // A dedicated client, not the poll loop's: the binary transfer needs
+    // `BINARY_FETCH_TIMEOUT` (300s) rather than the poll client's short timeout.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(BINARY_FETCH_TIMEOUT)
+        .build()
+        .map_err(|err| format!("binary-update: mirror: failed to build HTTP client: {err}"))?;
+
+    // Reuse the plan path's cap-checked GET rather than repeating the
+    // `.take(cap + 1)` + length-check idiom. That idiom is security-relevant
+    // (detect an over-cap body instead of silently truncating), so it should
+    // exist once — a second copy is a place for the two to drift apart.
+    let buf = fetch_bytes(&client, &url, cap)
+        .map_err(|err| format!("binary-update: mirror fetch failed for {url}: {err}"))?;
+
+    // Digest verification: the plan is DSSE-verified, so the expected digest is
+    // authoritative. A mismatch means the mirror served wrong bytes.
+    let actual = sha256_hex(&buf);
+    if actual != hex {
+        return Err(format!(
+            "binary-update: mirror blob digest mismatch: expected sha256:{hex}, got sha256:{actual}",
+        ));
+    }
+
+    Ok(buf)
+}
+
+/// Shared tail for both in-band and mirror blob acquisition: write the raw
+/// binary bytes to a temp file, set executable permissions on Unix, then apply
+/// via `apply_binary_from_path`. The byte buffer is consumed (moved in) so it
+/// is dropped after the temp-file write and before the swap, avoiding doubled
+/// peak memory — the same property the original in-band path preserved.
+fn write_blob_and_apply(
+    blob_bytes: Vec<u8>,
+    own_name: &str,
+    binary: &greentic_update::plan::BinaryArtifact,
+    current_exe: &std::path::Path,
+    env_dir: &std::path::Path,
+    current_version: &str,
+) -> Result<Option<Value>, NotifyError> {
+    let tmp_dir = tempfile::TempDir::new().map_err(|err| {
+        NotifyError::Internal(format!(
+            "binary-update: failed to create temp dir for binary: {err}"
+        ))
+    })?;
+    let tmp_binary = tmp_dir.path().join(own_name);
+    std::fs::write(&tmp_binary, &blob_bytes).map_err(|err| {
+        NotifyError::Internal(format!(
+            "binary-update: failed to write binary to temp: {err}"
+        ))
+    })?;
+    // Release the buffer before the swap so peak memory holds one copy, not two.
+    // The caller moved it in, so this `drop` is what makes that guaranteed —
+    // the original in-band path got the same effect from a narrower scope.
+    drop(blob_bytes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_binary, std::fs::Permissions::from_mode(0o755)).map_err(
+            |err| {
+                NotifyError::Internal(format!(
+                    "binary-update: failed to set executable permissions: {err}"
+                ))
+            },
+        )?;
+    }
+
+    apply_binary_from_path(
+        own_name,
+        binary,
+        &tmp_binary,
+        current_exe,
+        env_dir,
+        current_version,
+    )
+}
+
 /// Attempt to apply a binary self-update for THIS process after content staging
 /// has succeeded. Returns a JSON fragment to merge into the notify response, or
 /// `None` when no binary update applies to this host (the normal case for plans
@@ -2079,6 +2461,7 @@ fn try_apply_binary_update(
     store: &LocalFsStore,
     env_id: &str,
     exe_path: Option<&std::path::Path>,
+    updates_root_override: Option<&std::path::Path>,
 ) -> Result<Option<Value>, NotifyError> {
     // 1. Verify the plan to get the VerifiedUpdatePlan (which has `binaries`).
     //    Content staging already verified via `updates::get`, but we need our own
@@ -2117,7 +2500,7 @@ fn try_apply_binary_update(
         }
     };
 
-    // 3. Guards (fail-safe / fail-closed), BEFORE any download.
+    // 3. Guards (fail-safe / fail-closed), BEFORE any download or staging read.
 
     // 3a. Container refuse: distroless/immutable images cannot (and should not)
     //     swap binaries on disk — update via image tag instead.
@@ -2177,24 +2560,27 @@ fn try_apply_binary_update(
         }
     }
 
-    // 3c. Airgap: if `source` is None, the binary is carried in-band (not
-    //     implemented in P7d).
-    let source_url = match &binary.source {
-        Some(url) => url.clone(),
-        None => {
-            operator_log::info(
-                module_path!(),
-                "binary-update: skipped — airgap in-band delivery (out of P7d scope)",
-            );
-            return Ok(None);
-        }
-    };
+    // Serialize the marker-read → swap → marker-write critical section so
+    // concurrent notify requests cannot both pass the marker inspection
+    // before either writes. Held for the rest of the function.
+    let _swap_guard = BINARY_UPDATE_SWAP_LOCK
+        .lock()
+        .expect("binary update swap lock poisoned");
 
-    // 3d. Idempotency: if a pending marker for this exact version already exists, skip.
+    // 3d. Lineage protection: the `.prev` backup and pending marker form
+    //     the rollback lineage. A second different-version swap before
+    //     reboot would overwrite the only known-good backup with a
+    //     never-booted binary, destroying the ability to roll back. When a
+    //     Pending marker exists for the SAME version+digest, short-circuit
+    //     idempotently; for ANY other Pending marker, refuse fail-closed.
     let marker_path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
     if let Some(existing_marker) = read_binary_update_marker(&env_dir) {
         if existing_marker.phase == MarkerPhase::Pending
             && existing_marker.to_version == binary.version
+            && existing_marker
+                .digest
+                .as_ref()
+                .is_none_or(|d| d == &binary.digest)
         {
             operator_log::info(
                 module_path!(),
@@ -2210,10 +2596,31 @@ fn try_apply_binary_update(
             })));
         }
 
+        if existing_marker.phase == MarkerPhase::Pending {
+            // A different version (or same version, different digest) is
+            // already staged. Refuse the swap to protect the rollback
+            // lineage — the caller must restart first.
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "binary-update: version {} blocked — version {} already staged \
+                     and awaiting restart; a second swap would destroy the rollback \
+                     backup. Restart first, then retry.",
+                    binary.version, existing_marker.to_version,
+                ),
+            );
+            return Ok(Some(serde_json::json!({
+                "staged": false,
+                "blocked_on_pending": existing_marker.to_version,
+                "restart_required": true,
+            })));
+        }
+
         // 3e. Anti-rollback tombstone: a previous attempt to run this version
         //     failed to boot and was rolled back. Do not retry the SAME build
         //     artifact. If the digest differs (a same-version re-release with
-        //     a fixed binary), allow the swap.
+        //     a fixed binary), allow the swap. Hoisted above the source
+        //     dispatch so a crash-looped in-band binary is not auto-retried.
         if existing_marker.phase == MarkerPhase::RolledBack
             && existing_marker.to_version == binary.version
             && existing_marker
@@ -2238,65 +2645,7 @@ fn try_apply_binary_update(
         }
     }
 
-    // 4. Fetch the archive from `source_url` with bounded size + timeout.
-    let archive_dir = tempfile::TempDir::new().map_err(|err| {
-        NotifyError::Internal(format!("binary-update: failed to create temp dir: {err}"))
-    })?;
-    let archive_ext = if source_url.ends_with(".zip") {
-        "archive.zip"
-    } else {
-        "archive.tgz"
-    };
-    let archive_path = archive_dir.path().join(archive_ext);
-
-    {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(BINARY_FETCH_TIMEOUT)
-            .build()
-            .map_err(|err| {
-                NotifyError::Internal(format!("binary-update: failed to build HTTP client: {err}"))
-            })?;
-
-        use std::io::Read as _;
-        let resp = client
-            .get(&source_url)
-            .send()
-            .map_err(|err| {
-                NotifyError::Internal(format!("binary-update: archive fetch failed: {err}"))
-            })?
-            .error_for_status()
-            .map_err(|err| {
-                NotifyError::Internal(format!("binary-update: archive fetch status error: {err}"))
-            })?;
-
-        let mut buf = Vec::new();
-        resp.take(MAX_BINARY_ARCHIVE_BYTES + 1)
-            .read_to_end(&mut buf)
-            .map_err(|err| {
-                NotifyError::Internal(format!("binary-update: archive read error: {err}"))
-            })?;
-        if buf.len() as u64 > MAX_BINARY_ARCHIVE_BYTES {
-            return Err(NotifyError::Internal(format!(
-                "binary-update: archive exceeds {} byte cap",
-                MAX_BINARY_ARCHIVE_BYTES,
-            )));
-        }
-        std::fs::write(&archive_path, &buf).map_err(|err| {
-            NotifyError::Internal(format!("binary-update: failed to write archive: {err}"))
-        })?;
-    }
-
-    // 5. Unpack + verify + swap.
-    let unpack_dir = tempfile::TempDir::new().map_err(|err| {
-        NotifyError::Internal(format!(
-            "binary-update: failed to create unpack temp dir: {err}"
-        ))
-    })?;
-    let inner_binary = binswap::unpack_release_binary(&archive_path, own_name, unpack_dir.path())
-        .map_err(|err| {
-        NotifyError::Internal(format!("binary-update: archive unpack failed: {err}"))
-    })?;
-
+    // Resolve the current exe once — shared by both acquisition paths.
     let current_exe = match exe_path {
         Some(p) => p.to_path_buf(),
         None => std::env::current_exe().map_err(|err| {
@@ -2304,47 +2653,208 @@ fn try_apply_binary_update(
         })?,
     };
 
-    let swap_opts = binswap::SwapOptions {
-        expected_digest: Some(binary.digest.clone()),
-    };
-    let _outcome =
-        binswap::swap_binary(&inner_binary, &current_exe, &swap_opts).map_err(|err| {
-            // Fail-closed: the binary is NOT applied, content staging stays
-            // intact. Log the category, never leak the path.
-            operator_log::error(module_path!(), format!("binary-update: swap failed: {err}"));
-            NotifyError::Internal("binary update swap failed".to_string())
-        })?;
+    // 4. Acquire the binary — URL-fetch or in-band staging read.
+    match &binary.source {
+        Some(source_url) => {
+            // URL path: fetch the archive, unpack, then apply.
+            let archive_dir = tempfile::TempDir::new().map_err(|err| {
+                NotifyError::Internal(format!("binary-update: failed to create temp dir: {err}"))
+            })?;
+            let archive_ext = if source_url.ends_with(".zip") {
+                "archive.zip"
+            } else {
+                "archive.tgz"
+            };
+            let archive_path = archive_dir.path().join(archive_ext);
 
-    // 6. Durably persist the rollback marker BEFORE reporting success. The
-    //    marker is the rollback state — without it the boot-fail guard cannot
-    //    arm, and a crash-looping new binary is never rolled back. If the
-    //    write fails, undo the swap so we never exec into a binary that has
-    //    no rollback coverage.
-    let marker = BinaryUpdateMarker {
-        name: own_name.to_string(),
-        from_version: current_version.to_string(),
-        to_version: binary.version.clone(),
-        staged_at: chrono::Utc::now().to_rfc3339(),
-        phase: MarkerPhase::Pending,
-        rolled_back_at: None,
-        digest: Some(binary.digest.clone()),
-        boot_attempts: 0,
-    };
-    persist_marker_or_undo_swap(&env_dir, &marker, &current_exe)?;
+            {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(BINARY_FETCH_TIMEOUT)
+                    .build()
+                    .map_err(|err| {
+                        NotifyError::Internal(format!(
+                            "binary-update: failed to build HTTP client: {err}"
+                        ))
+                    })?;
 
-    operator_log::warn(
-        module_path!(),
-        format!(
-            "binary-update: {own_name} {} installed; restart required to activate",
-            binary.version,
-        ),
-    );
+                use std::io::Read as _;
+                let resp = client
+                    .get(source_url)
+                    .send()
+                    .map_err(|err| {
+                        NotifyError::Internal(format!("binary-update: archive fetch failed: {err}"))
+                    })?
+                    .error_for_status()
+                    .map_err(|err| {
+                        NotifyError::Internal(format!(
+                            "binary-update: archive fetch status error: {err}"
+                        ))
+                    })?;
 
-    Ok(Some(serde_json::json!({
-        "staged": true,
-        "restart_required": true,
-        "version": binary.version,
-    })))
+                let mut buf = Vec::new();
+                resp.take(MAX_BINARY_ARCHIVE_BYTES + 1)
+                    .read_to_end(&mut buf)
+                    .map_err(|err| {
+                        NotifyError::Internal(format!("binary-update: archive read error: {err}"))
+                    })?;
+                if buf.len() as u64 > MAX_BINARY_ARCHIVE_BYTES {
+                    return Err(NotifyError::Internal(format!(
+                        "binary-update: archive exceeds {} byte cap",
+                        MAX_BINARY_ARCHIVE_BYTES,
+                    )));
+                }
+                std::fs::write(&archive_path, &buf).map_err(|err| {
+                    NotifyError::Internal(format!("binary-update: failed to write archive: {err}"))
+                })?;
+            }
+
+            let unpack_dir = tempfile::TempDir::new().map_err(|err| {
+                NotifyError::Internal(format!(
+                    "binary-update: failed to create unpack temp dir: {err}"
+                ))
+            })?;
+            let inner_binary =
+                binswap::unpack_release_binary(&archive_path, own_name, unpack_dir.path())
+                    .map_err(|err| {
+                        NotifyError::Internal(format!(
+                            "binary-update: archive unpack failed: {err}"
+                        ))
+                    })?;
+
+            apply_binary_from_path(
+                own_name,
+                binary,
+                &inner_binary,
+                &current_exe,
+                &env_dir,
+                current_version,
+            )
+        }
+        None => {
+            // In-band path: the binary blob was staged alongside the plan by
+            // `updates::get`. Open the same staging root, load the plan, verify
+            // the blob's digest on disk, then copy it to a temp file and apply.
+            //
+            // C4 extension: when the staged blob is MISSING (NotFound from
+            // `fs::metadata`) and a `blob_base_url` is configured on the env's
+            // update channel, fall back to fetching the blob from the mirror.
+            // This is the Tier 2 airgap path where the plan was served over
+            // plain HTTP from a static directory written by `op updates import
+            // --push-to`, which does not embed binary blobs in-band.
+            let root = match updates_root_override {
+                Some(r) => UpdatesRoot::open_in(r, env_id),
+                None => UpdatesRoot::open(env_id),
+            }
+            .map_err(|err| {
+                NotifyError::Internal(format!(
+                    "binary-update: open staging root for env `{env_id}`: {err}"
+                ))
+            })?;
+
+            let staged = root
+                .load(&verified.plan.plan_id)
+                .map_err(|err| {
+                    NotifyError::Internal(format!(
+                        "binary-update: load staged plan `{}`: {err}",
+                        verified.plan.plan_id,
+                    ))
+                })?
+                .ok_or_else(|| {
+                    NotifyError::Internal(format!(
+                        "binary-update: staged plan `{}` not found — \
+                         in-band binary requires a staged plan",
+                        verified.plan.plan_id,
+                    ))
+                })?;
+
+            // Pre-read size guard: reject oversized blobs via stat before
+            // allocating the full read, catching sparse/inflated files cheaply.
+            // When the blob file is absent (NotFound), try the mirror fallback
+            // instead of hard-erroring. Any OTHER metadata error (permission
+            // denied, etc.) keeps today's hard error — it signals a broken
+            // local install, not an absent blob.
+            let blob_path = staged.binary_blob_path(binary).map_err(|err| {
+                NotifyError::Internal(format!(
+                    "binary-update: in-band binary blob path for `{}`: {err}",
+                    binary.name,
+                ))
+            })?;
+            // Acquire the blob bytes from ONE of two sources, then hand both to
+            // the same tail. The three arms must stay behaviorally distinct:
+            // present → staged, absent + mirror → fetch, any other stat error →
+            // refuse (a broken local install is not an absent blob).
+            let blob_bytes = match std::fs::metadata(&blob_path) {
+                Ok(meta) => {
+                    // Staged blob exists — the original in-band path.
+                    let blob_len = meta.len();
+                    if blob_len > MAX_BINARY_ARCHIVE_BYTES {
+                        return Err(NotifyError::Internal(format!(
+                            "binary-update: in-band binary exceeds {} byte cap",
+                            MAX_BINARY_ARCHIVE_BYTES,
+                        )));
+                    }
+
+                    let blob_bytes = staged.verify_binary_on_disk(binary).map_err(|err| {
+                        NotifyError::Internal(format!(
+                            "binary-update: in-band binary verification failed for `{}`: {err}",
+                            binary.name,
+                        ))
+                    })?;
+
+                    // Defense-in-depth: post-read cap (the stat check above
+                    // catches most cases; this covers TOCTOU or non-regular
+                    // files).
+                    if blob_bytes.len() as u64 > MAX_BINARY_ARCHIVE_BYTES {
+                        return Err(NotifyError::Internal(format!(
+                            "binary-update: in-band binary exceeds {} byte cap",
+                            MAX_BINARY_ARCHIVE_BYTES,
+                        )));
+                    }
+
+                    blob_bytes
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    // Blob not on disk — try the blob-mirror fallback.
+                    let Some(base_url) = load_blob_base_url(store, env_id) else {
+                        // No mirror configured: reproduce the pre-C4 hard error
+                        // unchanged.
+                        return Err(NotifyError::Internal(format!(
+                            "binary-update: in-band binary stat for `{}`: {err}",
+                            binary.name,
+                        )));
+                    };
+
+                    operator_log::info(
+                        module_path!(),
+                        format!(
+                            "binary-update: env `{env_id}` blob not staged; \
+                             fetching {} from mirror",
+                            binary.digest,
+                        ),
+                    );
+
+                    fetch_blob_from_mirror(&base_url, &binary.digest)
+                        .map_err(NotifyError::BinaryMirror)?
+                }
+                Err(err) => {
+                    // Non-NotFound error: broken local install, hard error.
+                    return Err(NotifyError::Internal(format!(
+                        "binary-update: in-band binary stat for `{}`: {err}",
+                        binary.name,
+                    )));
+                }
+            };
+
+            write_blob_and_apply(
+                blob_bytes,
+                own_name,
+                binary,
+                &current_exe,
+                &env_dir,
+                current_version,
+            )
+        }
+    }
 }
 
 /// Core of the receiver: load the env's update-channel policy and act on a
@@ -2442,19 +2952,21 @@ fn run_update_notify(
             // and, if so, download + verify + swap it. The content path is
             // never regressed — a binary-step failure is logged and the
             // content-staged result still returns.
-            let binary_result = match try_apply_binary_update(plan, sig, store, env_id, exe_path) {
-                Ok(info) => info,
-                Err(err) => {
-                    // Log the error but do NOT fail the content staging.
-                    operator_log::error(
-                        module_path!(),
-                        format!(
-                            "update-notify: binary self-update failed for env `{env_id}`: {err:?}"
-                        ),
-                    );
-                    None
-                }
-            };
+            let binary_step = try_apply_binary_update(plan, sig, store, env_id, exe_path, None);
+            // Log before classifying — the message differs per failure kind, while
+            // the swallow-vs-surface POLICY lives in `classify_binary_step`.
+            match &binary_step {
+                Ok(_) => {}
+                Err(NotifyError::BinaryMirror(message)) => operator_log::error(
+                    module_path!(),
+                    format!("update-notify: blob-mirror failure for env `{env_id}`: {message}"),
+                ),
+                Err(err) => operator_log::error(
+                    module_path!(),
+                    format!("update-notify: binary self-update failed for env `{env_id}`: {err:?}"),
+                ),
+            }
+            let (binary_result, mirror_failure) = classify_binary_step(binary_step);
 
             // `Apply` converges on top of the staged content: snapshot → apply →
             // verify → rollback on failure, all inside the deployer's
@@ -2470,6 +2982,15 @@ fn run_update_notify(
             } else {
                 "staged"
             };
+
+            // Content has converged. Now surface the mirror failure so the
+            // caller sees a non-2xx and the poll loop leaves its sequence
+            // unadvanced and retries next cycle. This MUST come AFTER
+            // `apply_staged_plan` — moving it earlier would block content
+            // convergence on a binary-mirror problem.
+            if let Some(message) = mirror_failure {
+                return Err(NotifyError::BinaryMirror(message));
+            }
 
             let mut body = serde_json::json!({ "status": status });
             if let Some(binary_info) = binary_result {
@@ -2611,15 +3132,11 @@ async fn handle_update_notify(
             Ok(json_response(status, bytes))
         }
         Err(NotifyError::Op(err)) => Err(map_op_error(&err)),
-        Err(NotifyError::Internal(message)) => {
-            operator_log::error(
-                module_path!(),
-                format!("update-notify: internal failure: {message}"),
-            );
-            Err(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error staging update plan",
-            ))
+        Err(err) => {
+            let (status, public, detail) = notify_failure_response(&err)
+                .expect("only `Op` maps to None and it is matched above");
+            operator_log::error(module_path!(), detail);
+            Err(error_response(status, public))
         }
     }
 }
@@ -3028,49 +3545,49 @@ fn poll_update_cycle(
     }
 
     // 4. Verify + record/stage via the shared receiver core.
-    match run_update_notify(&store, env_id, &plan, &sig, exe_path) {
-        Ok((status, body)) => {
-            let restart = body
+    let outcome = run_update_notify(&store, env_id, &plan, &sig, exe_path);
+
+    // Logging only. The advance decision is made ONCE below, via
+    // `notify_outcome_acted_on` — do not return from these arms.
+    match &outcome {
+        Ok((status, body)) => operator_log::info(
+            module_path!(),
+            format!(
+                "update-poll: env `{env_id}` plan sequence {} -> {} ({})",
+                meta.sequence,
+                status.as_u16(),
+                body.get("status").and_then(|s| s.as_str()).unwrap_or("ok"),
+            ),
+        ),
+        Err(NotifyError::Op(err)) => operator_log::warn(
+            module_path!(),
+            format!("update-poll: plan rejected for env `{env_id}`: {err}"),
+        ),
+        Err(NotifyError::Internal(message)) => operator_log::error(
+            module_path!(),
+            format!("update-poll: internal failure staging plan for env `{env_id}`: {message}"),
+        ),
+        Err(NotifyError::BinaryMirror(message)) => operator_log::error(
+            module_path!(),
+            format!(
+                "update-poll: blob-mirror failure for env `{env_id}`, \
+                 plan will be retried next cycle: {message}"
+            ),
+        ),
+    }
+
+    if notify_outcome_acted_on(&outcome) {
+        let restart = matches!(
+            &outcome,
+            Ok((_, body)) if body
                 .get("binary")
                 .and_then(|b| b.get("restart_required"))
                 .and_then(Value::as_bool)
-                == Some(true);
-            operator_log::info(
-                module_path!(),
-                format!(
-                    "update-poll: env `{env_id}` plan sequence {} -> {} ({})",
-                    meta.sequence,
-                    status.as_u16(),
-                    body.get("status").and_then(|s| s.as_str()).unwrap_or("ok"),
-                ),
-            );
-            // Advance the remembered sequence ONLY when the plan was actually
-            // acted on (2xx = staged or recorded). A non-2xx `Ok` means the
-            // channel was disabled between this cycle's config read and the
-            // receiver's own re-read (a TOCTOU that yields 403 `disabled`);
-            // leaving the sequence unadvanced lets a re-enabled channel pick the
-            // plan up next cycle instead of skipping it until the server
-            // publishes a newer one.
-            if status.is_success() {
-                (Some(meta.sequence), interval, restart)
-            } else {
-                (last_sequence, interval, false)
-            }
-        }
-        Err(NotifyError::Op(err)) => {
-            operator_log::warn(
-                module_path!(),
-                format!("update-poll: plan rejected for env `{env_id}`: {err}"),
-            );
-            (last_sequence, interval, false)
-        }
-        Err(NotifyError::Internal(message)) => {
-            operator_log::error(
-                module_path!(),
-                format!("update-poll: internal failure staging plan for env `{env_id}`: {message}"),
-            );
-            (last_sequence, interval, false)
-        }
+                == Some(true)
+        );
+        (Some(meta.sequence), interval, restart)
+    } else {
+        (last_sequence, interval, false)
     }
 }
 
@@ -6019,6 +6536,7 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_url_capture: None,
         })
         .expect("start split server");
 
@@ -6068,6 +6586,7 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_url_capture: None,
         })
         .expect("start must succeed even when main bumps into admin range");
 
@@ -7254,6 +7773,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         }
     }
@@ -7619,6 +8139,7 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_url_capture: None,
         })
         .expect("start server");
         let port = server.actual_port();
@@ -8798,6 +9319,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -8904,6 +9426,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -9004,6 +9527,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -9077,6 +9601,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -9354,6 +9879,7 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         })
     }
@@ -9919,6 +10445,107 @@ mod update_notify_tests {
     }
 
     #[test]
+    fn poll_outcome_advances_sequence_only_on_a_2xx() {
+        // The single decision point behind `poll_update_cycle`'s sequence
+        // bookkeeping. ONLY a 2xx `Ok` means the plan was acted on; every other
+        // outcome must leave the sequence unadvanced so the next cycle retries.
+        //
+        // The `BinaryMirror` case is the one that had no coverage and allowed a
+        // real bug: advancing there means content converges, the sequence moves
+        // on, and the binary is stranded on the old build with NO retry until
+        // someone publishes a higher sequence — a permanent silent divergence
+        // whose only trace is one log line.
+        let body = serde_json::json!({ "status": "staged" });
+        assert!(notify_outcome_acted_on(&Ok((StatusCode::OK, body.clone()))));
+        assert!(notify_outcome_acted_on(&Ok((
+            StatusCode::ACCEPTED,
+            body.clone()
+        ))));
+        // Non-2xx `Ok` is the disabled-channel TOCTOU — a re-enabled channel must
+        // still pick this plan up rather than skip it.
+        assert!(!notify_outcome_acted_on(&Ok((
+            StatusCode::FORBIDDEN,
+            body.clone()
+        ))));
+        assert!(!notify_outcome_acted_on(&Err(NotifyError::Op(
+            OpError::Conflict("rejected".into())
+        ))));
+        assert!(!notify_outcome_acted_on(&Err(NotifyError::Internal(
+            "boom".into()
+        ))));
+        assert!(
+            !notify_outcome_acted_on(&Err(NotifyError::BinaryMirror("mirror down".into()))),
+            "a configured blob mirror that failed must NOT advance the sequence — \
+             not advancing is what makes the airgap path self-healing"
+        );
+    }
+
+    #[test]
+    fn classify_binary_step_surfaces_only_mirror_failures() {
+        // The swallow-vs-surface policy, pinned without touching `HOME`. Binary
+        // self-update is best-effort relative to content staging, so every
+        // failure is swallowed — except a configured blob mirror, which must be
+        // surfaced. Swallowing that one returns 200, advances the poll sequence,
+        // and strands the fleet's binary version with no retry.
+        let info = serde_json::json!({ "version": "99.0.0" });
+
+        let (binary, mirror) = classify_binary_step(Ok(Some(info.clone())));
+        assert_eq!(binary, Some(info), "a successful swap must be reported");
+        assert!(mirror.is_none());
+
+        // No binary for this host — the ordinary content-only plan.
+        let (binary, mirror) = classify_binary_step(Ok(None));
+        assert!(binary.is_none() && mirror.is_none());
+
+        // Best-effort: an internal binary failure stays swallowed, so content
+        // staging still reports success. This is the pre-C4 B3 contract.
+        let (binary, mirror) = classify_binary_step(Err(NotifyError::Internal("boom".into())));
+        assert!(
+            binary.is_none() && mirror.is_none(),
+            "an internal binary failure must stay best-effort"
+        );
+        let (binary, mirror) =
+            classify_binary_step(Err(NotifyError::Op(OpError::Conflict("x".into()))));
+        assert!(binary.is_none() && mirror.is_none());
+
+        // The one that must NOT be swallowed.
+        let (binary, mirror) =
+            classify_binary_step(Err(NotifyError::BinaryMirror("mirror down".into())));
+        assert!(binary.is_none());
+        assert_eq!(
+            mirror.as_deref(),
+            Some("mirror down"),
+            "a configured-mirror failure must be surfaced, not swallowed"
+        );
+    }
+
+    #[test]
+    fn notify_failure_response_separates_a_broken_mirror_from_a_broken_server() {
+        // An operator must be able to tell "your in-gap mirror is misconfigured"
+        // (502) from "this server is broken" (500) off the status alone; the two
+        // have completely different remedies. `Op` is routed via `map_op_error`.
+        let (status, public, detail) =
+            notify_failure_response(&NotifyError::BinaryMirror("404 from mirror".into()))
+                .expect("BinaryMirror maps");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(public.contains("mirror"), "public body: {public}");
+        assert!(
+            detail.contains("404 from mirror"),
+            "log detail must keep the cause: {detail}"
+        );
+
+        let (status, _, detail) =
+            notify_failure_response(&NotifyError::Internal("boom".into())).expect("Internal maps");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(detail.contains("boom"), "{detail}");
+
+        assert!(
+            notify_failure_response(&NotifyError::Op(OpError::Conflict("x".into()))).is_none(),
+            "`Op` must stay on the map_op_error path"
+        );
+    }
+
+    #[test]
     fn poll_cycle_disabled_channel_does_not_fetch() {
         // Deny-by-default: a disabled channel returns before any HTTP. The
         // endpoint points at an unroutable port, so a fetch attempt would error;
@@ -10289,6 +10916,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -10327,6 +10955,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
@@ -10360,6 +10989,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
@@ -10389,6 +11019,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -10607,6 +11238,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -10648,6 +11280,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         });
         state.mark_restart_required();
@@ -10684,6 +11317,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
             activity_source_override: None,
         });
         state.mark_restart_required();
@@ -10866,6 +11500,1441 @@ mod binary_update_tests {
         assert!(
             !prev_path.exists(),
             "restore_prev consumes the .prev copy it restores from"
+        );
+    }
+
+    // ── B3: in-band binary delivery tests ───────────────────────────────────
+
+    use greentic_update::plan::UPDATE_PLAN_SCHEMA_V1;
+    use greentic_update::plan::{
+        CompatRequirements, OnFail, RollbackKind, RollbackPolicy, UpdatePlan,
+    };
+    use greentic_update::staging::UpdatesRoot;
+
+    /// Compute `sha256:<hex>` digest for the given bytes, matching the staging
+    /// API's convention.
+    fn test_digest_of(bytes: &[u8]) -> String {
+        format!("sha256:{}", sha256_hex(bytes))
+    }
+
+    /// Build a minimal `UpdatePlan` carrying a single binary, no content
+    /// artifacts. `env_id` must match the staging root opened by the test.
+    fn test_plan_with_binary(plan_id: &str, env_id: &str, binary: BinaryArtifact) -> UpdatePlan {
+        UpdatePlan {
+            schema: UPDATE_PLAN_SCHEMA_V1.to_string(),
+            plan_id: plan_id.to_string(),
+            env_id: env_id.to_string(),
+            sequence: 1,
+            created_at: chrono::Utc::now(),
+            nonce: "test-nonce".to_string(),
+            target: serde_json::json!({}),
+            artifacts: vec![],
+            binaries: vec![binary],
+            compat: CompatRequirements::default(),
+            rollback: RollbackPolicy {
+                policy: RollbackKind::Auto,
+                health_timeout_s: 60,
+                on_fail: OnFail::Restore,
+            },
+        }
+    }
+
+    fn test_verified(plan: UpdatePlan) -> greentic_update::plan::VerifiedUpdatePlan {
+        greentic_update::plan::VerifiedUpdatePlan {
+            plan,
+            plan_sha256: "0".repeat(64),
+            verified_key_ids: vec!["k1".to_string()],
+        }
+    }
+
+    fn test_inband_binary(version: &str, digest: String) -> BinaryArtifact {
+        BinaryArtifact {
+            name: env!("CARGO_PKG_NAME").to_string(),
+            version: version.to_string(),
+            target: binswap::current_target().to_string(),
+            digest,
+            source: None,
+        }
+    }
+
+    /// Stage a plan into a fresh staging root and return the root path, the
+    /// `StagedPlan` handle, and the `BinaryArtifact`. When `skip_blob` is
+    /// true the binary blob is NOT written, simulating a missing-blob scenario.
+    fn stage_inband_binary(
+        dummy_exe: &[u8],
+        env_id: &str,
+        skip_blob: bool,
+    ) -> (
+        tempfile::TempDir,
+        greentic_update::staging::StagedPlan,
+        BinaryArtifact,
+    ) {
+        let staging_dir = tempfile::TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(staging_dir.path(), env_id).unwrap();
+        let bin = test_inband_binary("99.0.0", test_digest_of(dummy_exe));
+        let plan = test_plan_with_binary("plan-inband-1", env_id, bin.clone());
+        let verified = test_verified(plan);
+        let staged = root.begin(&verified, b"plan", b"sig").unwrap();
+        if !skip_blob {
+            staged.put_binary_blob(&bin, dummy_exe).unwrap();
+        }
+        staged
+            .transition(greentic_update::staging::UpdateStage::Inbox)
+            .unwrap();
+        staged
+            .transition(greentic_update::staging::UpdateStage::Staged)
+            .unwrap();
+        (staging_dir, staged, bin)
+    }
+
+    #[test]
+    fn binary_update_inband_swaps_from_staging() {
+        let dummy_exe = b"dummy-binary-payload-v99";
+        let env_id = "test-env-inband";
+        let (staging_dir, staged, bin) = stage_inband_binary(dummy_exe, env_id, false);
+
+        // Verify the blob is readable from staging.
+        let blob_bytes = staged.verify_binary_on_disk(&bin).unwrap();
+        assert_eq!(blob_bytes, dummy_exe, "staged blob must match");
+
+        // Write the blob to a temp file (the in-band path copies staged bytes
+        // to a temp before swap_binary).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp_binary = tmp.path().join(env!("CARGO_PKG_NAME"));
+        std::fs::write(&tmp_binary, &blob_bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Target exe is a TEMP file — never the real test binary.
+        let target_exe = tmp.path().join("target-exe");
+        std::fs::write(&target_exe, b"old-binary").unwrap();
+
+        let env_dir = tempfile::TempDir::new().unwrap();
+
+        let result = apply_binary_from_path(
+            env!("CARGO_PKG_NAME"),
+            &bin,
+            &tmp_binary,
+            &target_exe,
+            env_dir.path(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        assert!(result.is_ok(), "apply_binary_from_path should succeed");
+        let json = result.unwrap().expect("should return Some");
+        assert_eq!(json["staged"], true);
+        assert_eq!(json["restart_required"], true);
+        assert_eq!(json["version"], "99.0.0");
+
+        // The target exe must now contain the dummy payload (swap happened).
+        let swapped = std::fs::read(&target_exe).unwrap();
+        assert_eq!(
+            swapped, dummy_exe,
+            "target must be replaced by the new binary"
+        );
+
+        // A Pending marker must exist with the right versions and digest.
+        let marker = read_binary_update_marker(env_dir.path()).expect("marker must be written");
+        assert_eq!(marker.phase, MarkerPhase::Pending);
+        assert_eq!(marker.from_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(marker.to_version, "99.0.0");
+        assert_eq!(marker.digest.as_deref(), Some(bin.digest.as_str()));
+
+        drop(staging_dir); // keep alive until here
+    }
+
+    #[test]
+    fn binary_update_inband_verify_fails_tampered() {
+        let dummy_exe = b"good-binary-content";
+        let env_id = "test-env-tampered";
+        let (_staging_dir, staged, bin) = stage_inband_binary(dummy_exe, env_id, false);
+
+        // Tamper the blob on disk after staging.
+        let blob_path = staged.binary_blob_path(&bin).unwrap();
+        std::fs::write(&blob_path, b"corrupted-bytes").unwrap();
+
+        // verify_binary_on_disk must fail with a digest mismatch.
+        let err = staged.verify_binary_on_disk(&bin).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mismatch"),
+            "error must mention digest mismatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn binary_update_inband_missing_blob_errors() {
+        let dummy_exe = b"binary-content";
+        let (_staging_dir, staged, bin) = stage_inband_binary(dummy_exe, "test-env-missing", true);
+
+        // verify_binary_on_disk must fail with an IO error (file not found).
+        let err = staged.verify_binary_on_disk(&bin).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("io error") || msg.contains("not a regular file"),
+            "error must name the problem (IO or not-regular-file): {msg}"
+        );
+    }
+
+    // ── B3: end-to-end try_apply_binary_update coverage ─────────────────────
+
+    use greentic_deployer::environment::{TRUST_ROOT_FILE, TrustRootDocument};
+    use greentic_distributor_client::signing::{TrustRoot, TrustedKey, key_id_for_public_key_pem};
+    use greentic_update::plan::build_update_plan;
+
+    /// Deterministic Ed25519 test key pair: returns (private PKCS#8 PEM,
+    /// TrustedKey with SPKI PEM + canonical key id).
+    fn test_signing_key(seed: u8) -> (String, TrustedKey) {
+        use ed25519_dalek::SigningKey;
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        use ed25519_dalek::pkcs8::EncodePublicKey;
+        use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let priv_pem = sk.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+        let pub_pem = sk
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let key_id = key_id_for_public_key_pem(&pub_pem).unwrap();
+        (
+            priv_pem,
+            TrustedKey {
+                key_id,
+                public_key_pem: pub_pem,
+            },
+        )
+    }
+
+    struct InbandHarnessOpts {
+        version: &'static str,
+        plan_id: &'static str,
+        skip_blob: bool,
+        source: Option<String>,
+        /// Override the plan's recorded binary digest. `None` derives it from
+        /// `dummy_exe`, which is what every ordinary test wants; `Some` exists so
+        /// a test can plant a deliberately malformed digest without hand-rolling
+        /// the whole signing-key / trust-root / staging setup.
+        digest: Option<String>,
+    }
+
+    impl Default for InbandHarnessOpts {
+        fn default() -> Self {
+            Self {
+                version: "99.0.0",
+                plan_id: "plan-e2e-1",
+                skip_blob: false,
+                source: None,
+                digest: None,
+            }
+        }
+    }
+
+    /// Wire up all infrastructure needed by `try_apply_binary_update`:
+    /// store, trust root, signed plan, and staged binary. Returns the
+    /// components the test needs to call the function and assert on results.
+    struct InbandTestHarness {
+        store_dir: tempfile::TempDir,
+        staging_dir: tempfile::TempDir,
+        #[allow(dead_code)]
+        exe_dir: tempfile::TempDir,
+        plan_bytes: Vec<u8>,
+        sig_bytes: Vec<u8>,
+        env_id: String,
+        target_exe: std::path::PathBuf,
+        binary_digest: String,
+    }
+
+    fn stage_plan(
+        plan_id: &str,
+        env_id: &str,
+        bin: &BinaryArtifact,
+        dummy_exe: &[u8],
+        plan_bytes: &[u8],
+        envelope_bytes: &[u8],
+        skip_blob: bool,
+    ) -> tempfile::TempDir {
+        let staging_dir = tempfile::TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(staging_dir.path(), env_id).unwrap();
+        let verified = test_verified(test_plan_with_binary(plan_id, env_id, bin.clone()));
+        let staged = root.begin(&verified, plan_bytes, envelope_bytes).unwrap();
+        if !skip_blob {
+            staged.put_binary_blob(bin, dummy_exe).unwrap();
+        }
+        staged
+            .transition(greentic_update::staging::UpdateStage::Inbox)
+            .unwrap();
+        staged
+            .transition(greentic_update::staging::UpdateStage::Staged)
+            .unwrap();
+        staging_dir
+    }
+
+    impl InbandTestHarness {
+        /// Build a harness with a single in-band binary (source=None) for THIS
+        /// process name + target. The dummy binary payload differs from the
+        /// current test binary so the swap is observable.
+        fn new(env_id: &str, dummy_exe: &[u8]) -> Self {
+            Self::with_opts(env_id, dummy_exe, InbandHarnessOpts::default())
+        }
+
+        /// Like [`new`] but with a caller-chosen version and plan id.
+        fn new_with_version(
+            env_id: &str,
+            dummy_exe: &[u8],
+            version: &'static str,
+            plan_id: &'static str,
+        ) -> Self {
+            Self::with_opts(
+                env_id,
+                dummy_exe,
+                InbandHarnessOpts {
+                    version,
+                    plan_id,
+                    ..Default::default()
+                },
+            )
+        }
+
+        fn with_opts(env_id: &str, dummy_exe: &[u8], opts: InbandHarnessOpts) -> Self {
+            let (priv_pem, tk) = test_signing_key(42);
+            let trust = TrustRoot::new(vec![tk.clone()]);
+
+            let digest = opts
+                .digest
+                .clone()
+                .unwrap_or_else(|| test_digest_of(dummy_exe));
+            let mut bin = test_inband_binary(opts.version, digest.clone());
+            bin.source = opts.source;
+
+            let plan = test_plan_with_binary(opts.plan_id, env_id, bin.clone());
+            let built = build_update_plan(&plan, &priv_pem, &tk.key_id, &trust)
+                .expect("test plan must build");
+
+            // Set up the store directory with the env's trust-root.
+            let store_dir = tempfile::TempDir::new().unwrap();
+            let env_dir = store_dir.path().join(env_id);
+            std::fs::create_dir_all(&env_dir).unwrap();
+            let trust_doc = TrustRootDocument::v1(vec![tk]);
+            std::fs::write(
+                env_dir.join(TRUST_ROOT_FILE),
+                serde_json::to_vec_pretty(&trust_doc).unwrap(),
+            )
+            .unwrap();
+
+            let staging_dir = stage_plan(
+                opts.plan_id,
+                env_id,
+                &bin,
+                dummy_exe,
+                &built.plan_bytes,
+                &built.envelope_bytes,
+                opts.skip_blob,
+            );
+
+            // Create a temp target exe (NEVER the real test binary).
+            let exe_dir = tempfile::TempDir::new().unwrap();
+            let target_exe = exe_dir.path().join("target-exe");
+            std::fs::write(&target_exe, b"old-binary").unwrap();
+
+            Self {
+                store_dir,
+                staging_dir,
+                exe_dir,
+                plan_bytes: built.plan_bytes,
+                sig_bytes: built.envelope_bytes,
+                env_id: env_id.to_string(),
+                target_exe,
+                binary_digest: digest,
+            }
+        }
+
+        fn store(&self) -> LocalFsStore {
+            LocalFsStore::new(self.store_dir.path())
+        }
+
+        fn env_dir(&self) -> std::path::PathBuf {
+            self.store_dir.path().join(&self.env_id)
+        }
+
+        fn call(&self) -> Result<Option<Value>, NotifyError> {
+            try_apply_binary_update(
+                &self.plan_bytes,
+                &self.sig_bytes,
+                &self.store(),
+                &self.env_id,
+                Some(&self.target_exe),
+                Some(self.staging_dir.path()),
+            )
+        }
+    }
+
+    #[test]
+    fn e2e_inband_happy_path_swaps_and_writes_marker() {
+        let h = InbandTestHarness::new("e2e-happy", b"dummy-v99-binary");
+        let result = h.call();
+        let json = result.expect("must succeed").expect("must return Some");
+        assert_eq!(json["staged"], true);
+        assert_eq!(json["restart_required"], true);
+        assert_eq!(json["version"], "99.0.0");
+
+        // The target exe must contain the dummy payload.
+        let swapped = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(swapped, b"dummy-v99-binary", "binary must be swapped");
+
+        // A Pending marker must exist with the correct digest.
+        let marker = read_binary_update_marker(&h.env_dir()).expect("marker must be written");
+        assert_eq!(marker.phase, MarkerPhase::Pending);
+        assert_eq!(marker.to_version, "99.0.0");
+        assert_eq!(
+            marker.digest.as_deref(),
+            Some(h.binary_digest.as_str()),
+            "marker must record the digest"
+        );
+    }
+
+    #[test]
+    fn e2e_inband_verify_rejects_tampered_blob() {
+        let dummy = b"good-binary-for-tamper-test";
+        let h = InbandTestHarness::new("e2e-tamper", dummy);
+
+        // Tamper the staged blob AFTER staging.
+        let root = UpdatesRoot::open_in(h.staging_dir.path(), &h.env_id).unwrap();
+        let staged = root.load("plan-e2e-1").unwrap().unwrap();
+        let bin = test_inband_binary("99.0.0", h.binary_digest.clone());
+        let blob_path = staged.binary_blob_path(&bin).unwrap();
+        std::fs::write(&blob_path, b"tampered-content").unwrap();
+
+        let result = h.call();
+        assert!(
+            result.is_err(),
+            "tampered blob must be rejected: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("verification failed") || err_msg.contains("mismatch"),
+            "error must name verification failure: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn e2e_inband_missing_blob_is_an_error() {
+        let h = InbandTestHarness::with_opts(
+            "e2e-missing-blob",
+            b"never-staged",
+            InbandHarnessOpts {
+                skip_blob: true,
+                ..Default::default()
+            },
+        );
+        let result = h.call();
+        assert!(
+            result.is_err(),
+            "missing blob must be an error, not a silent skip: {result:?}"
+        );
+    }
+
+    #[test]
+    fn e2e_inband_tombstone_blocks_same_digest() {
+        let dummy = b"tombstone-test-binary";
+        let h = InbandTestHarness::new("e2e-tombstone", dummy);
+
+        // Write a RolledBack tombstone for the SAME version + digest.
+        let tombstone = BinaryUpdateMarker {
+            name: env!("CARGO_PKG_NAME").to_string(),
+            from_version: env!("CARGO_PKG_VERSION").to_string(),
+            to_version: "99.0.0".to_string(),
+            staged_at: "2026-07-28T00:00:00Z".to_string(),
+            phase: MarkerPhase::RolledBack,
+            rolled_back_at: Some("2026-07-28T01:00:00Z".to_string()),
+            digest: Some(h.binary_digest.clone()),
+            boot_attempts: 0,
+        };
+        std::fs::write(
+            h.env_dir().join(BINARY_UPDATE_PENDING_FILE),
+            serde_json::to_vec(&tombstone).unwrap(),
+        )
+        .unwrap();
+
+        let result = h.call();
+        let json = result.expect("tombstone guard returns Ok");
+        assert!(
+            json.is_none(),
+            "tombstone must block retry of the same digest: {json:?}"
+        );
+        // The target exe must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped when tombstone blocks"
+        );
+    }
+
+    #[test]
+    fn e2e_apply_binary_rejects_digest_mismatch_at_swap() {
+        // Verifies that apply_binary_from_path passes expected_digest to
+        // SwapOptions so swap_binary re-verifies the bytes. Construct a
+        // BinaryArtifact whose digest does NOT match the file on disk:
+        // with expected_digest=Some the swap must fail; dropping it to None
+        // (the mutation) would let this pass.
+        let real_content = b"real-binary-content";
+        let wrong_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let bin = test_inband_binary("99.0.0", wrong_digest.to_string());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner_binary = tmp.path().join("binary");
+        std::fs::write(&inner_binary, real_content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&inner_binary, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let target_exe = tmp.path().join("target-exe");
+        std::fs::write(&target_exe, b"old-binary").unwrap();
+
+        let env_dir = tempfile::TempDir::new().unwrap();
+
+        let result = apply_binary_from_path(
+            env!("CARGO_PKG_NAME"),
+            &bin,
+            &inner_binary,
+            &target_exe,
+            env_dir.path(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        assert!(
+            result.is_err(),
+            "digest mismatch at swap must fail: {result:?}"
+        );
+        // The target exe must NOT have been swapped.
+        let on_disk = std::fs::read(&target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped when digest mismatches"
+        );
+    }
+
+    #[test]
+    fn e2e_source_some_does_not_use_staging_path() {
+        // A plan with source=Some(url) must NOT go through the staging path.
+        // We set up staging that WOULD succeed if used, but the source=Some
+        // path must be taken instead — and since the URL is fake, it must fail
+        // with a fetch error, proving the URL path was taken.
+        let h = InbandTestHarness::with_opts(
+            "e2e-source-some",
+            b"should-not-be-used",
+            InbandHarnessOpts {
+                plan_id: "plan-e2e-source",
+                source: Some("https://localhost:1/nonexistent-archive.tgz".to_string()),
+                ..Default::default()
+            },
+        );
+        let result = h.call();
+        assert!(
+            result.is_err(),
+            "source=Some must take URL path, not staging: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("fetch") || err_msg.contains("connect") || err_msg.contains("error"),
+            "error must be a fetch failure, not a staging error: {err_msg}"
+        );
+        // The binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(on_disk, b"old-binary", "binary must not be swapped");
+    }
+
+    #[test]
+    fn e2e_pending_different_version_blocks_swap() {
+        // First swap: stage v99 successfully.
+        let h = InbandTestHarness::new("e2e-lineage-block", b"dummy-v99");
+        let r1 = h.call().expect("first swap must succeed").unwrap();
+        assert_eq!(r1["staged"], true);
+        let swapped_v99 = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            swapped_v99, b"dummy-v99",
+            "binary must be v99 after first swap"
+        );
+
+        let marker_after_v99 =
+            read_binary_update_marker(&h.env_dir()).expect("marker must exist after first swap");
+        assert_eq!(marker_after_v99.to_version, "99.0.0");
+
+        // Second swap: try to stage v100 (different, higher version).
+        // Must be blocked by the lineage guard.
+        let h2 = InbandTestHarness::new_with_version(
+            "e2e-lineage-block",
+            b"dummy-v100",
+            "100.0.0",
+            "plan-e2e-lineage-v100",
+        );
+        // Reuse h's store/env_dir (which has the pending marker) but h2's
+        // staging has the v100 blob. Call through h2's staging + h's store.
+        let result = try_apply_binary_update(
+            &h2.plan_bytes,
+            &h2.sig_bytes,
+            &h.store(),
+            &h.env_id,
+            Some(&h.target_exe),
+            Some(h2.staging_dir.path()),
+        );
+        let json = result.expect("lineage guard returns Ok").unwrap();
+        assert_eq!(json["staged"], false, "second swap must be blocked");
+        assert_eq!(json["blocked_on_pending"], "99.0.0");
+        assert_eq!(json["restart_required"], true);
+
+        // The binary on disk must still be v99 (no second swap).
+        let still_v99 = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(still_v99, b"dummy-v99", "binary must not be overwritten");
+
+        // The marker must still name v99.
+        let marker_still =
+            read_binary_update_marker(&h.env_dir()).expect("marker must still exist");
+        assert_eq!(marker_still.to_version, "99.0.0");
+    }
+
+    #[test]
+    fn e2e_oversized_blob_rejected_before_read() {
+        let dummy = b"small-exe";
+        let h = InbandTestHarness::new("e2e-oversize", dummy);
+
+        // Inflate the staged blob to exceed MAX_BINARY_ARCHIVE_BYTES via
+        // set_len (sparse — cheap, no actual disk I/O).
+        let bin = test_inband_binary("99.0.0", h.binary_digest.clone());
+        let root = UpdatesRoot::open_in(h.staging_dir.path(), &h.env_id).unwrap();
+        let staged = root.load("plan-e2e-1").unwrap().unwrap();
+        let blob_path = staged.binary_blob_path(&bin).unwrap();
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&blob_path)
+                .unwrap();
+            f.set_len(MAX_BINARY_ARCHIVE_BYTES + 1).unwrap();
+        }
+
+        let result = h.call();
+        assert!(
+            result.is_err(),
+            "oversized blob must be rejected: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("byte cap"),
+            "error must mention byte cap: {err_msg}"
+        );
+
+        // The target exe must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped when blob is oversized"
+        );
+    }
+
+    // ── C4: blob-mirror fallback tests ───────────────────────────────────────
+
+    /// Write `update-channel.json` into the harness's store so
+    /// `load_blob_base_url` returns the given base URL.
+    fn write_blob_base_url(harness: &InbandTestHarness, base_url: &str) {
+        let mut cfg = UpdateChannelConfig::disabled(EnvId::new(&harness.env_id).unwrap());
+        cfg.enabled = Some(true);
+        cfg.on_update = Some(UpdateAction::Stage);
+        cfg.blob_base_url = Some(base_url.to_string());
+        let env_dir = harness.env_dir();
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::write(
+            env_dir.join("update-channel.json"),
+            serde_json::to_vec_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Spawn a minimal HTTP/1.1 server on a random port that serves exactly one
+    /// blob at `/sha256-<hex>`. Returns `(base_url, join_handle)`. The server
+    /// accepts one connection, serves the response, then shuts down.
+    fn spawn_blob_mirror(
+        blob_hex: &str,
+        body: &[u8],
+        status: u16,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let expected_path = format!("/sha256-{blob_hex}");
+        let body = body.to_vec();
+        let handle = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            // Bounded accept. A plain blocking `accept()` deadlocks the caller's
+            // `join()` whenever the client never connects — which is exactly what
+            // a "the mirror must not be contacted" regression looks like. That
+            // turns a clean assertion failure into a CI job timeout carrying no
+            // diagnostic, so give up after a deadline and let the test's own
+            // assertions report the real problem.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break Some(stream),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            break None;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let Some(stream) = stream else {
+                return;
+            };
+            // The accepted socket can inherit the listener's non-blocking flag;
+            // the request/response exchange below wants blocking semantics.
+            stream.set_nonblocking(false).unwrap();
+            let mut reader = std::io::BufReader::new(&stream);
+            // Read the request line and headers (up to blank line).
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            // Drain remaining headers.
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line == "\n" || line.is_empty() {
+                    break;
+                }
+            }
+            // Verify the request path.
+            let path = request_line.split_whitespace().nth(1).unwrap_or("");
+            let mut writer = reader.into_inner();
+            if path != expected_path {
+                let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string();
+                let _ = writer.write_all(resp.as_bytes());
+                return;
+            }
+            let resp = format!(
+                "HTTP/1.1 {status} {}\r\nContent-Length: {}\r\n\r\n",
+                if status == 200 { "OK" } else { "Error" },
+                body.len(),
+            );
+            let _ = writer.write_all(resp.as_bytes());
+            let _ = writer.write_all(&body);
+        });
+        (base_url, handle)
+    }
+
+    #[test]
+    fn c4_mirror_fallback_swaps_from_mirror() {
+        let dummy_exe = b"mirror-binary-v99";
+        let h = InbandTestHarness::with_opts(
+            "c4-mirror-happy",
+            dummy_exe,
+            InbandHarnessOpts {
+                skip_blob: true,
+                ..Default::default()
+            },
+        );
+
+        // Extract the bare hex from the digest.
+        let hex = h.binary_digest.strip_prefix("sha256:").unwrap();
+        let (base_url, server) = spawn_blob_mirror(hex, dummy_exe, 200);
+        write_blob_base_url(&h, &base_url);
+
+        let result = h.call();
+        server.join().unwrap();
+
+        let json = result.expect("must succeed").expect("must return Some");
+        assert_eq!(json["staged"], true);
+        assert_eq!(json["restart_required"], true);
+        assert_eq!(json["version"], "99.0.0");
+
+        // The target exe must contain the mirror payload.
+        let swapped = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(swapped, dummy_exe, "binary must be swapped from mirror");
+
+        // A Pending marker must exist.
+        let marker = read_binary_update_marker(&h.env_dir()).expect("marker must be written");
+        assert_eq!(marker.phase, MarkerPhase::Pending);
+        assert_eq!(marker.to_version, "99.0.0");
+        assert_eq!(marker.digest.as_deref(), Some(h.binary_digest.as_str()),);
+    }
+
+    #[test]
+    fn c4_mirror_tampered_bytes_hard_error() {
+        let dummy_exe = b"good-mirror-binary";
+        let h = InbandTestHarness::with_opts(
+            "c4-mirror-tamper",
+            dummy_exe,
+            InbandHarnessOpts {
+                skip_blob: true,
+                ..Default::default()
+            },
+        );
+
+        let hex = h.binary_digest.strip_prefix("sha256:").unwrap();
+        // Serve WRONG bytes — the digest will not match.
+        let (base_url, server) = spawn_blob_mirror(hex, b"tampered-payload", 200);
+        write_blob_base_url(&h, &base_url);
+
+        let result = h.call();
+        server.join().unwrap();
+
+        assert!(
+            result.is_err(),
+            "tampered mirror blob must be rejected: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("digest mismatch"),
+            "error must mention digest mismatch: {err_msg}"
+        );
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on tamper"
+        );
+
+        // No pending marker.
+        assert!(
+            read_binary_update_marker(&h.env_dir()).is_none(),
+            "no marker must be written on mirror digest mismatch"
+        );
+    }
+
+    #[test]
+    fn c4_no_mirror_configured_reproduces_pre_c4_error() {
+        // Staged blob is missing AND no mirror configured → the pre-C4 hard
+        // error, byte-for-byte (regression pin).
+        let h = InbandTestHarness::with_opts(
+            "c4-no-mirror",
+            b"never-staged",
+            InbandHarnessOpts {
+                skip_blob: true,
+                ..Default::default()
+            },
+        );
+        // Do NOT write_blob_base_url → load_blob_base_url returns None.
+
+        let result = h.call();
+        assert!(
+            result.is_err(),
+            "missing blob + no mirror must error: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("in-band binary stat"),
+            "error must be the pre-C4 stat error, not a new message: {err_msg}"
+        );
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(on_disk, b"old-binary", "binary must not be swapped");
+    }
+
+    #[test]
+    fn c4_blob_present_ignores_mirror() {
+        // Staged blob IS present, mirror is configured at an unroutable address.
+        // Must succeed from the staged blob, proving the mirror was never contacted.
+        let dummy_exe = b"local-blob-binary";
+        let h = InbandTestHarness::new("c4-blob-present", dummy_exe);
+
+        // Point the mirror at an unroutable address — if contacted, it would fail.
+        write_blob_base_url(&h, "http://127.0.0.1:1");
+
+        let result = h.call();
+        let json = result.expect("must succeed").expect("must return Some");
+        assert_eq!(json["staged"], true);
+        assert_eq!(json["version"], "99.0.0");
+
+        // The target exe must contain the STAGED payload, not anything from a mirror.
+        let swapped = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            swapped, dummy_exe,
+            "binary must come from staging, not mirror"
+        );
+    }
+
+    #[test]
+    fn c4_mirror_fetch_failure_is_hard_error() {
+        // Mirror configured at an unroutable address, blob missing → hard error
+        // from the fetch failure, not a silent skip.
+        let h = InbandTestHarness::with_opts(
+            "c4-fetch-fail",
+            b"unreachable-binary",
+            InbandHarnessOpts {
+                skip_blob: true,
+                ..Default::default()
+            },
+        );
+        write_blob_base_url(&h, "http://127.0.0.1:1");
+
+        let result = h.call();
+        assert!(
+            result.is_err(),
+            "mirror fetch failure must be a hard error: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("mirror fetch failed"),
+            "error must name the mirror fetch failure: {err_msg}"
+        );
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on fetch failure"
+        );
+
+        // No pending marker.
+        assert!(
+            read_binary_update_marker(&h.env_dir()).is_none(),
+            "no marker on mirror fetch failure"
+        );
+    }
+
+    #[test]
+    fn c4_mirror_500_is_hard_error() {
+        // Mirror serves a 500 Internal Server Error → hard error.
+        let dummy_exe = b"server-error-binary";
+        let h = InbandTestHarness::with_opts(
+            "c4-mirror-500",
+            dummy_exe,
+            InbandHarnessOpts {
+                skip_blob: true,
+                ..Default::default()
+            },
+        );
+        let hex = h.binary_digest.strip_prefix("sha256:").unwrap();
+        let (base_url, server) = spawn_blob_mirror(hex, b"", 500);
+        write_blob_base_url(&h, &base_url);
+
+        let result = h.call();
+        server.join().unwrap();
+
+        assert!(
+            result.is_err(),
+            "mirror 500 must be a hard error: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("mirror fetch failed") && err_msg.contains("status error"),
+            "error must name BOTH the mirror and the HTTP status failure: {err_msg}"
+        );
+
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(on_disk, b"old-binary", "binary must not be swapped on 500");
+    }
+
+    #[test]
+    fn c4_malformed_digest_rejected_upstream_of_the_mirror() {
+        // A binary whose digest is NOT `sha256:<64 hex>` must fail BEFORE any
+        // network call. The gate that actually fires is UPSTREAM of C4:
+        // `staged.binary_blob_path()` validates the digest inside
+        // greentic-update (`staging.rs`: "malformed artifact digest") before the
+        // metadata match that dispatches to the mirror, so a bad digest can
+        // never reach URL construction. Assert that specific error rather than
+        // accepting `validate_digest_hex`'s message too — an `||` over both
+        // would hide which gate fired, and would keep passing if the ordering
+        // regressed so that the mirror ran first. `validate_digest_hex` is the
+        // second, defense-in-depth gate and is pinned directly by
+        // `c4_validate_digest_hex_rejects_bad_inputs`.
+        let h = InbandTestHarness::with_opts(
+            "c4-malformed",
+            b"malformed-digest-binary",
+            InbandHarnessOpts {
+                plan_id: "plan-c4-malformed",
+                digest: Some("md5:abc123".to_string()),
+                skip_blob: true,
+                ..Default::default()
+            },
+        );
+        // Mirror configured at an unroutable address: if the digest gate ever
+        // stopped firing first, the fetch attempt would surface a DIFFERENT
+        // error, so this address is part of the assertion.
+        write_blob_base_url(&h, "http://127.0.0.1:1/blobs");
+
+        let result = h.call();
+
+        assert!(
+            result.is_err(),
+            "malformed digest must be a hard error: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("malformed artifact digest"),
+            "the upstream blob-path gate must reject the digest before the \
+             mirror dispatch is reached: {err_msg}"
+        );
+
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on malformed digest"
+        );
+    }
+
+    #[test]
+    fn c4_mirror_oversized_response_rejected() {
+        // Exercise the cap-check branch in fetch_blob_from_mirror_capped.
+        // Allocating 256 MiB (the production cap) is impractical in a unit
+        // test, so we call the _capped variant with a small cap and spawn a
+        // server that sends more bytes than that cap.
+        const TEST_CAP: u64 = 128; // tiny cap for the test
+
+        // Build a payload that exceeds TEST_CAP. Content doesn't matter for
+        // the cap check — it fires before digest verification.
+        let oversized_body = vec![0u8; (TEST_CAP + 1) as usize];
+
+        // We still need a valid digest string to pass validate_digest_hex.
+        let dummy_exe = b"oversized-cap-test";
+        let digest = test_digest_of(dummy_exe);
+        let hex = digest.strip_prefix("sha256:").unwrap();
+
+        let (base_url, server) = spawn_blob_mirror(hex, &oversized_body, 200);
+        let result = fetch_blob_from_mirror_capped(&base_url, &digest, TEST_CAP);
+        server.join().unwrap();
+
+        assert!(
+            result.is_err(),
+            "oversized mirror response must be rejected: {result:?}"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("exceeds") && err_msg.contains("bytes"),
+            "error must be the byte-cap rejection, not a digest mismatch: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn c4_non_notfound_metadata_error_is_hard_error() {
+        // When fs::metadata on the blob path fails with something OTHER than
+        // NotFound (e.g. PermissionDenied), the error must be a hard error
+        // that does NOT attempt a mirror fallback. This pins the
+        // ErrorKind::NotFound guard so it cannot be silently widened to a
+        // catch-all.
+        let dummy_exe = b"perm-denied-binary";
+        let h = InbandTestHarness::new("c4-perm-denied", dummy_exe);
+
+        // The blob IS staged (skip_blob defaults to false). Now remove
+        // permissions on the blob's parent directory so that fs::metadata
+        // returns PermissionDenied instead of NotFound.
+        let bin = test_inband_binary("99.0.0", h.binary_digest.clone());
+        let root = UpdatesRoot::open_in(h.staging_dir.path(), &h.env_id).unwrap();
+        let staged = root.load("plan-e2e-1").unwrap().unwrap();
+        let blob_path = staged.binary_blob_path(&bin).unwrap();
+        let blob_parent = blob_path.parent().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(blob_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Configure a mirror at an unroutable address — if the code
+        // incorrectly falls through to the mirror, it would produce a
+        // different error ("mirror fetch failed") instead of the expected
+        // "in-band binary stat" error.
+        write_blob_base_url(&h, "http://127.0.0.1:1");
+
+        let result = h.call();
+
+        // Restore permissions so the TempDir cleanup succeeds.
+        std::fs::set_permissions(blob_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "permission-denied on blob must be a hard error: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("in-band binary stat"),
+            "error must be the non-NotFound stat error, not a mirror fallback: {err_msg}"
+        );
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on permission denied"
+        );
+    }
+
+    #[test]
+    fn c4_validate_digest_hex_rejects_bad_inputs() {
+        // Comprehensive unit tests for validate_digest_hex.
+        assert!(validate_digest_hex(&format!("sha256:{}", "a".repeat(64))).is_ok());
+        assert!(validate_digest_hex(&format!("sha256:{}", "0123456789abcdef".repeat(4))).is_ok());
+
+        // Missing prefix.
+        let err = validate_digest_hex("abcd").unwrap_err();
+        assert!(err.contains("missing `sha256:` prefix"), "{err}");
+
+        // Wrong prefix.
+        let err = validate_digest_hex(&format!("sha512:{}", "a".repeat(64))).unwrap_err();
+        assert!(err.contains("missing `sha256:` prefix"), "{err}");
+
+        // Too short.
+        let err = validate_digest_hex("sha256:abcd").unwrap_err();
+        assert!(err.contains("64 chars"), "{err}");
+
+        // Too long.
+        let err = validate_digest_hex(&format!("sha256:{}", "a".repeat(65))).unwrap_err();
+        assert!(err.contains("64 chars"), "{err}");
+
+        // Uppercase hex.
+        let err = validate_digest_hex(&format!("sha256:{}", "A".repeat(64))).unwrap_err();
+        assert!(err.contains("non-lowercase-hex"), "{err}");
+
+        // Non-hex chars.
+        let err = validate_digest_hex(&format!("sha256:{}z", "a".repeat(63))).unwrap_err();
+        assert!(err.contains("non-lowercase-hex"), "{err}");
+    }
+
+    // ── C4-notify: tests through the production caller (run_update_notify) ──
+    //
+    // The B3/C4 tests above call `try_apply_binary_update` directly. These tests
+    // go through `run_update_notify` — the production caller — to verify that
+    // `BinaryMirror` errors are NOT swallowed and surface as `Err` to the HTTP
+    // handler and the poll loop.
+
+    /// Build a plan whose `target` is a valid `EnvManifest` so it passes the
+    /// deployer's `updates::get` target-parsing gate. The B3/C4
+    /// `test_plan_with_binary` uses `target: json!({})` which is fine when
+    /// calling `try_apply_binary_update` directly (it never parses `target`),
+    /// but `updates::get` requires a real `greentic.env-manifest.v1`.
+    fn test_plan_for_notify(plan_id: &str, env_id: &str, binary: BinaryArtifact) -> UpdatePlan {
+        UpdatePlan {
+            schema: UPDATE_PLAN_SCHEMA_V1.to_string(),
+            plan_id: plan_id.to_string(),
+            env_id: env_id.to_string(),
+            sequence: 1,
+            created_at: chrono::Utc::now(),
+            nonce: "test-nonce".to_string(),
+            target: serde_json::json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": { "id": env_id }
+            }),
+            artifacts: vec![],
+            binaries: vec![binary],
+            compat: CompatRequirements::default(),
+            rollback: RollbackPolicy {
+                policy: RollbackKind::Auto,
+                health_timeout_s: 60,
+                on_fail: OnFail::Restore,
+            },
+        }
+    }
+
+    /// Write a minimal `environment.json` so `updates::get` can
+    /// `store.load(&env_id)` without error.
+    fn write_environment_json(store_dir: &std::path::Path, env_id: &str) {
+        let env_dir = store_dir.join(env_id);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::write(
+            env_dir.join("environment.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "greentic.environment.v1",
+                "environment_id": env_id,
+                "name": "test",
+                "host_config": { "env_id": env_id },
+                "packs": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Remove the per-env staging directory that `updates::get` writes to via
+    /// the global `UpdatesRoot`. Without cleanup, every test run leaves debris
+    /// in `~/.greentic/updates/`.
+    fn cleanup_updates_root(env_id: &str) {
+        if let Some(dir) = std::env::var_os("GREENTIC_UPDATES_DIR") {
+            let _ = std::fs::remove_dir_all(std::path::PathBuf::from(dir).join(env_id));
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let _ = std::fs::remove_dir_all(
+                std::path::PathBuf::from(home)
+                    .join(".greentic")
+                    .join("updates")
+                    .join(env_id),
+            );
+        }
+    }
+
+    /// Test harness for `run_update_notify` — sets up everything the deployer's
+    /// `updates::get` needs (environment.json, trust root, update channel) plus
+    /// a signed plan with a valid `EnvManifest` target. Cleans up the global
+    /// staging root on drop.
+    struct NotifyTestHarness {
+        store_dir: tempfile::TempDir,
+        #[allow(dead_code)]
+        exe_dir: tempfile::TempDir,
+        plan_bytes: Vec<u8>,
+        sig_bytes: Vec<u8>,
+        env_id: String,
+        target_exe: std::path::PathBuf,
+        binary_digest: String,
+    }
+
+    impl NotifyTestHarness {
+        fn new(env_id: &str, dummy_exe: &[u8], blob_base_url: Option<&str>) -> Self {
+            // Pre-clean, not just the `Drop` clean. `updates::get` resolves its
+            // staging root internally from `HOME`/`GREENTIC_UPDATES_DIR` — there
+            // is no override parameter — so these tests necessarily stage under
+            // the real updates root. Cleaning only on `Drop` makes them flaky:
+            // any run killed mid-test (a `timeout`, a Ctrl-C, a panic in the
+            // harness itself) leaves a staged plan behind, and the next run gets
+            // `Conflict("a different plan is already staged under id ...")`
+            // because the plan bytes differ. Each test uses a distinct `env_id`,
+            // so pre-cleaning its own subtree cannot disturb a sibling.
+            cleanup_updates_root(env_id);
+
+            let (priv_pem, tk) = test_signing_key(42);
+            let trust = TrustRoot::new(vec![tk.clone()]);
+
+            let digest = test_digest_of(dummy_exe);
+            let bin = test_inband_binary("99.0.0", digest.clone());
+
+            let plan = test_plan_for_notify("plan-notify-1", env_id, bin);
+            let built = build_update_plan(&plan, &priv_pem, &tk.key_id, &trust)
+                .expect("test plan must build");
+
+            let store_dir = tempfile::TempDir::new().unwrap();
+            let env_dir = store_dir.path().join(env_id);
+            std::fs::create_dir_all(&env_dir).unwrap();
+
+            // environment.json — minimal valid Environment for the deployer.
+            write_environment_json(store_dir.path(), env_id);
+
+            // trust-root.json — same key that signed the plan.
+            let trust_doc = TrustRootDocument::v1(vec![tk]);
+            std::fs::write(
+                env_dir.join(TRUST_ROOT_FILE),
+                serde_json::to_vec_pretty(&trust_doc).unwrap(),
+            )
+            .unwrap();
+
+            // update-channel.json — enabled, Stage mode.
+            let mut cfg = UpdateChannelConfig::disabled(EnvId::new(env_id).unwrap());
+            cfg.enabled = Some(true);
+            cfg.on_update = Some(UpdateAction::Stage);
+            if let Some(url) = blob_base_url {
+                cfg.blob_base_url = Some(url.to_string());
+            }
+            std::fs::write(
+                env_dir.join("update-channel.json"),
+                serde_json::to_vec_pretty(&cfg).unwrap(),
+            )
+            .unwrap();
+
+            // Target exe — NOT the real test binary.
+            let exe_dir = tempfile::TempDir::new().unwrap();
+            let target_exe = exe_dir.path().join("target-exe");
+            std::fs::write(&target_exe, b"old-binary").unwrap();
+
+            Self {
+                store_dir,
+                exe_dir,
+                plan_bytes: built.plan_bytes,
+                sig_bytes: built.envelope_bytes,
+                env_id: env_id.to_string(),
+                target_exe,
+                binary_digest: digest,
+            }
+        }
+
+        fn store(&self) -> LocalFsStore {
+            LocalFsStore::new(self.store_dir.path())
+        }
+
+        fn call_notify(&self) -> Result<(StatusCode, Value), NotifyError> {
+            run_update_notify(
+                &self.store(),
+                &self.env_id,
+                &self.plan_bytes,
+                &self.sig_bytes,
+                Some(&self.target_exe),
+            )
+        }
+    }
+
+    impl Drop for NotifyTestHarness {
+        fn drop(&mut self) {
+            cleanup_updates_root(&self.env_id);
+        }
+    }
+
+    // The four `c4_notify_*` tests below drive the real `run_update_notify`, which
+    // means the deployer's `updates::get` resolves its staging root from the
+    // process-global `HOME` (there is no override parameter). Unrelated tests in
+    // this crate mutate `HOME` with `std::env::set_var` (`src/lib.rs`,
+    // `src/seed_copy.rs`, `src/startup_contract.rs`), and cargo runs tests as
+    // threads in ONE process — so a concurrent `set_var` can move `HOME` between
+    // `updates::get` staging the plan and `UpdatesRoot::open` looking it up,
+    // yielding a spurious "staged plan not found". That is a race against foreign
+    // tests, not something these tests can defend against.
+    //
+    // They are therefore `#[ignore]`d: run them deliberately and isolated with
+    //   cargo test -p greentic-start --lib -- --ignored c4_notify_
+    // where they pass consistently. The swallow-vs-surface policy they cover is
+    // ALSO pinned deterministically, without any `HOME` dependency, by
+    // `classify_binary_step_surfaces_only_mirror_failures`,
+    // `poll_outcome_advances_sequence_only_on_a_2xx`, and
+    // `notify_failure_response_separates_a_broken_mirror_from_a_broken_server`.
+    // End-to-end proof through the real notify path belongs in the Tier 2 E2E
+    // (phase C6), which runs in its own process.
+    #[test]
+    #[ignore = "drives real updates::get; races foreign set_var(\"HOME\") — see note above"]
+    fn c4_notify_mirror_unreachable_returns_binary_mirror_error() {
+        // A configured mirror that is unreachable must surface as
+        // `Err(BinaryMirror)` from `run_update_notify`, NOT `Ok(200)`.
+        // This is the bug the finding identified: before the fix, the
+        // error was swallowed, HTTP 200 returned, and the poll loop
+        // advanced the sequence — stranding the binary version forever.
+        let h = NotifyTestHarness::new(
+            "c4-ntfy-mirror-down",
+            b"unreachable-binary",
+            Some("http://127.0.0.1:1"), // unroutable → connection refused
+        );
+
+        let result = h.call_notify();
+
+        match &result {
+            Err(NotifyError::BinaryMirror(msg)) => {
+                assert!(
+                    msg.contains("mirror fetch failed"),
+                    "BinaryMirror message must name the mirror fetch: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Err(BinaryMirror), got {other:?} — \
+                 a swallowed mirror failure would be Ok(200)"
+            ),
+        }
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on mirror failure"
+        );
+    }
+
+    #[test]
+    #[ignore = "drives real updates::get; races foreign set_var(\"HOME\") — see note above"]
+    fn c4_notify_mirror_tampered_returns_binary_mirror_error() {
+        // A mirror serving tampered bytes (digest mismatch) must also
+        // surface as `Err(BinaryMirror)`, not `Ok(200)`.
+        let dummy_exe = b"good-notify-binary";
+        let h = NotifyTestHarness::new("c4-ntfy-mirror-tamper", dummy_exe, None);
+
+        let hex = h.binary_digest.strip_prefix("sha256:").unwrap();
+        // Serve WRONG bytes — digest will not match.
+        let (base_url, server) = spawn_blob_mirror(hex, b"tampered-payload", 200);
+
+        // Update the channel config with the mirror URL.
+        let mut cfg = UpdateChannelConfig::disabled(EnvId::new(&h.env_id).unwrap());
+        cfg.enabled = Some(true);
+        cfg.on_update = Some(UpdateAction::Stage);
+        cfg.blob_base_url = Some(base_url);
+        std::fs::write(
+            h.store_dir
+                .path()
+                .join(&h.env_id)
+                .join("update-channel.json"),
+            serde_json::to_vec_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        let result = h.call_notify();
+        server.join().unwrap();
+
+        match &result {
+            Err(NotifyError::BinaryMirror(msg)) => {
+                assert!(
+                    msg.contains("digest mismatch"),
+                    "BinaryMirror message must name digest mismatch: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Err(BinaryMirror), got {other:?} — \
+                 a swallowed digest-mismatch would be Ok(200)"
+            ),
+        }
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on tampered mirror"
+        );
+    }
+
+    #[test]
+    #[ignore = "drives real updates::get; races foreign set_var(\"HOME\") — see note above"]
+    fn c4_notify_no_mirror_b3_regression_pin() {
+        // Regression pin: an in-band binary failure with NO mirror configured
+        // must still yield `Ok((200, ...))` with no `binary` key — the pre-C4
+        // best-effort behavior. This test stops someone later "fixing" all
+        // binary failures into hard errors.
+        let h = NotifyTestHarness::new(
+            "c4-ntfy-no-mirror",
+            b"never-staged-binary",
+            None, // no blob_base_url
+        );
+
+        let result = h.call_notify();
+
+        let (status, body) = result
+            .expect("missing blob + no mirror must be Ok (best-effort binary, content staged)");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "content staging must succeed even when binary blob is missing"
+        );
+        assert_eq!(body["status"], "staged");
+        assert!(
+            body.get("binary").is_none(),
+            "no `binary` key when binary step is best-effort-failed: {body}"
+        );
+    }
+
+    #[test]
+    #[ignore = "drives real updates::get; races foreign set_var(\"HOME\") — see note above"]
+    fn c4_notify_content_staged_despite_mirror_failure() {
+        // Content must converge (plan staged by `updates::get`) even when the
+        // mirror fails. The call returns `Err(BinaryMirror)` — but the plan IS
+        // staged in the UpdatesRoot beforehand.
+        let h = NotifyTestHarness::new(
+            "c4-ntfy-content-conv",
+            b"content-convergence-binary",
+            Some("http://127.0.0.1:1"), // unroutable
+        );
+
+        let result = h.call_notify();
+
+        // The result must be a BinaryMirror error.
+        assert!(
+            matches!(&result, Err(NotifyError::BinaryMirror(_))),
+            "expected BinaryMirror error, got: {result:?}"
+        );
+
+        // But the plan WAS staged by `updates::get` before the mirror failure.
+        // Verify by opening the staging root and checking the plan exists.
+        let root = greentic_update::staging::UpdatesRoot::open(&h.env_id)
+            .expect("staging root must exist after updates::get");
+        let staged = root
+            .load("plan-notify-1")
+            .expect("load must not error")
+            .expect("plan must be staged despite the mirror failure");
+        let stage = staged.stage().expect("stage read");
+        assert_eq!(
+            stage,
+            greentic_update::staging::UpdateStage::Staged,
+            "plan must be in Staged state (content converged)"
         );
     }
 
@@ -11136,6 +13205,7 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::clone(&notifier),
+            public_url_capture: None,
             activity_source_override: Some(
                 test_source.clone() as Arc<dyn crate::websocket::pump::ActivitySource>
             ),
@@ -11294,5 +13364,121 @@ mod binary_update_tests {
             .await
             .expect("hyphenated self-read URI must resolve the underscore-keyed store");
         assert_eq!(value, b"signing-key");
+    }
+}
+
+#[cfg(test)]
+mod public_url_capture_tests {
+    use super::{PublicUrlCapture, try_capture_public_url};
+
+    /// Build a Cloud-Run-shaped request header map.
+    fn cr_headers(host: &str, trace: bool) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(hyper::header::HOST, host.parse().unwrap());
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        if trace {
+            h.insert("x-cloud-trace-context", "abc/1;o=1".parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn try_capture_fires_for_own_service_host() {
+        // Exercises the actual handle_connection hook logic: a GFE-fronted
+        // request to this service's own run.app URL captures the base URL.
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-uc.a.run.app", true));
+        assert_eq!(
+            cap.get().map(String::as_str),
+            Some("https://gtc-svc-abc-uc.a.run.app"),
+        );
+    }
+
+    #[test]
+    fn try_capture_ignores_request_without_trace_context() {
+        // No X-Cloud-Trace-Context → not a GFE-fronted request → no capture.
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-uc.a.run.app", false));
+        assert_eq!(cap.get(), None);
+    }
+
+    #[test]
+    fn try_capture_ignores_foreign_host_hijack() {
+        // Attacker-supplied Host that is not this service's own URL — the
+        // service-name pin must reject it (webhook-hijack defense).
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("evil.attacker.com", true));
+        try_capture_public_url(&cap, &cr_headers("othersvc-1.a.run.app", true));
+        assert_eq!(cap.get(), None);
+    }
+
+    #[test]
+    fn try_capture_is_noop_once_captured() {
+        // First valid capture wins; a later request cannot overwrite it, even
+        // one that would otherwise be valid.
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-uc.a.run.app", true));
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-zz.a.run.app", true));
+        assert_eq!(
+            cap.get().map(String::as_str),
+            Some("https://gtc-svc-abc-uc.a.run.app"),
+        );
+    }
+
+    #[test]
+    fn offer_sets_once_and_second_offer_is_ignored() {
+        let cap = PublicUrlCapture::default();
+        cap.offer("https://first.run.app".to_string());
+        cap.offer("https://second.run.app".to_string());
+        assert_eq!(
+            cap.get().map(String::as_str),
+            Some("https://first.run.app"),
+            "only the first offer should win",
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_resolves_after_offer() {
+        let cap = std::sync::Arc::new(PublicUrlCapture::default());
+        let cap2 = std::sync::Arc::clone(&cap);
+
+        let handle = tokio::spawn(async move { cap2.captured().await });
+
+        // Small yield to let the waiter register before the offer.
+        tokio::task::yield_now().await;
+        cap.offer("https://test.run.app".to_string());
+
+        let url = handle.await.expect("task should not panic");
+        assert_eq!(url, "https://test.run.app");
+    }
+
+    #[tokio::test]
+    async fn captured_returns_immediately_when_already_set() {
+        let cap = PublicUrlCapture::default();
+        cap.offer("https://already.run.app".to_string());
+
+        // Should return immediately — no waiting.
+        let url = cap.captured().await;
+        assert_eq!(url, "https://already.run.app");
+    }
+
+    #[tokio::test]
+    async fn captured_wakes_waiter_registered_before_offer() {
+        // Reproduces the race condition the plan warns about:
+        // the waiter registers notified() before re-checking get().
+        let cap = std::sync::Arc::new(PublicUrlCapture::default());
+        let cap2 = std::sync::Arc::clone(&cap);
+
+        let handle = tokio::spawn(async move { cap2.captured().await });
+
+        // Give the spawned task time to enter the loop and register notified().
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        cap.offer("https://race.run.app".to_string());
+
+        let url = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("should not time out")
+            .expect("task should not panic");
+        assert_eq!(url, "https://race.run.app");
     }
 }
