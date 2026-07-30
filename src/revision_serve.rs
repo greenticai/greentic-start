@@ -10641,13 +10641,38 @@ mod binary_update_tests {
         status: u16,
     ) -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let base_url = format!("http://127.0.0.1:{port}");
         let expected_path = format!("/sha256-{blob_hex}");
         let body = body.to_vec();
         let handle = std::thread::spawn(move || {
             use std::io::{BufRead, Write};
-            let (stream, _) = listener.accept().unwrap();
+            // Bounded accept. A plain blocking `accept()` deadlocks the caller's
+            // `join()` whenever the client never connects — which is exactly what
+            // a "the mirror must not be contacted" regression looks like. That
+            // turns a clean assertion failure into a CI job timeout carrying no
+            // diagnostic, so give up after a deadline and let the test's own
+            // assertions report the real problem.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break Some(stream),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            break None;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let Some(stream) = stream else {
+                return;
+            };
+            // The accepted socket can inherit the listener's non-blocking flag;
+            // the request/response exchange below wants blocking semantics.
+            stream.set_nonblocking(false).unwrap();
             let mut reader = std::io::BufReader::new(&stream);
             // Read the request line and headers (up to blank line).
             let mut request_line = String::new();

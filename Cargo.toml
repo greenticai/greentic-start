@@ -123,8 +123,17 @@ features = ["derive"]
 # build (greenticai/greentic-deployer#444). Matches the floor main already runs.
 # The dev lane publishes 0.2.<runid>, which this range admits — do not rewrite it
 # into a ">=1.2.0-dev"-style lane range.
+#
+# Floor bumped from 0.2.3 to the airgap-C1 publish (deployer #531): the blob-mirror
+# fallback in `revision_serve.rs` consumes `UpdateChannelConfig::blob_base_url` and
+# `resolved_blob_base_url()`, which first exist in 0.2.30514305131. A >=0.2.3 floor
+# still RESOLVES today only because Cargo.lock happens to hold a newer publish — a
+# fresh resolve, or `--precise 0.2.3`, would pick a deploy-spec without the field
+# and fail to compile. Note for a forward-port to main: this is a dev-lane runid
+# floor and stable 0.2.x releases sort BELOW it, so main must instead floor at
+# whichever stable release carries `blob_base_url`, not at this value.
 [dependencies.greentic-deploy-spec]
-version = ">=0.2.3, <0.3"
+version = ">=0.2.30514305131, <0.3"
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
 # (per-env trust root + operator key, deployer #226). Floor bumped to the
