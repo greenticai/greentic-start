@@ -2,6 +2,14 @@ name: CI
 on:
   workflow_call:
   pull_request:
+  # Populate the Actions cache on main. Without this, `Swatinem/rust-cache` never
+  # has a base-branch cache to restore from: GitHub scopes caches by ref, a PR can
+  # only read its base branch's entries, and this workflow previously ran on
+  # `pull_request` only — so every PR compiled the whole dependency graph from
+  # scratch ("No cache found." in the restore step) and its own save was scoped to
+  # a ref nothing else reads. One run per merge gives every later PR a warm cache.
+  push:
+    branches: [main]
 
 permissions:
   contents: read
