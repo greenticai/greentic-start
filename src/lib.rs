@@ -597,13 +597,44 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
 
         // Bundle-less env-serve carries no tunnel flags (gtc start drops them).
         // Resolve: GREENTIC_TUNNEL_MODE, then the persisted setup choice (newest
-        // revision's .greentic/tunnel.json). CLI flag wins; no choice → OFF.
-        if !request.tunnel_explicit {
-            let mode = std::env::var("GREENTIC_TUNNEL_MODE")
+        // revision's .greentic/tunnel.json). No choice → OFF.
+        //
+        // The tunnel greentic-setup chose is AUTHORITATIVE for a configured
+        // environment: provider public base URLs, third-party webhook
+        // registrations (Slack Event Subscriptions, Webex webhooks, OAuth
+        // redirect URIs) and secrets scoping were all established against it.
+        // Booting on a different tunnel would serve a public URL nothing was
+        // registered against, so a mismatch is a hard error instead of the
+        // silent switch it used to be. An explicit request now has to AGREE
+        // with setup rather than override it.
+        let persisted_mode = persisted_env_tunnel_mode(&env_dir);
+        if request.tunnel_explicit {
+            let requested =
+                env_tunnel::choose_tunnel(request.cloudflared, request.ngrok, request.gtunnel);
+            ensure_tunnel_matches_setup(
+                persisted_mode.as_deref(),
+                requested,
+                "a command-line tunnel flag",
+            )?;
+        } else {
+            let env_mode = std::env::var("GREENTIC_TUNNEL_MODE")
                 .ok()
                 .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .or_else(|| persisted_env_tunnel_mode(&env_dir));
+                .filter(|s| !s.is_empty());
+            // GREENTIC_TUNNEL_MODE takes precedence over the persisted choice,
+            // so it can mix tunnels exactly like an explicit flag can. Hold it
+            // to the same check rather than treating it as a privileged escape
+            // hatch — the failure mode is identical.
+            if let Some(mode) = env_mode.as_deref()
+                && let Some(requested) = tunnel_choice_for_mode(mode)
+            {
+                ensure_tunnel_matches_setup(
+                    persisted_mode.as_deref(),
+                    requested,
+                    "GREENTIC_TUNNEL_MODE",
+                )?;
+            }
+            let mode = env_mode.or(persisted_mode);
             match mode.as_deref() {
                 Some("gtunnel") => {
                     request.gtunnel = GtunnelModeArg::On;
@@ -630,14 +661,41 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // routing/secrets/tenant are derived — so every tenant-keyed surface moves
         // together and the public webchat URL is unique per operator on the shared
         // Worker. cloudflared/ngrok keep the bare tenant.
+        //
+        // SKIPPED when setup recorded a tunnel id. That id is already the first
+        // path segment of the URL setup handed to Slack/Webex/OIDC, and it is the
+        // tenant those providers' secrets were written under. Aliasing on top of
+        // it would move BOTH — appending a per-process suffix that changes the
+        // served path segment and the secrets scope on every boot. Since setup
+        // owns the id, adopt it verbatim.
         if matches!(
             env_tunnel::choose_tunnel(request.cloudflared, request.ngrok, request.gtunnel),
             env_tunnel::TunnelChoice::Gtunnel
         ) {
-            for dep in &mut environment.bundles {
-                let base = dep.route_binding.tenant_selector.tenant.clone();
-                dep.route_binding.tenant_selector.tenant =
-                    crate::gtunnel::managed_tenant_alias(&base);
+            match persisted_env_tunnel_id(&env_dir) {
+                Some(tunnel_id) => {
+                    // An explicit --gtunnel-tunnel-id still wins; this only fills
+                    // the gap where the caller said nothing.
+                    if request.gtunnel_tunnel_id.is_none() {
+                        request.gtunnel_tunnel_id = Some(tunnel_id.clone());
+                    }
+                    operator_log::info(
+                        module_path!(),
+                        format!(
+                            "adopting the tunnel id `{tunnel_id}` recorded by greentic-setup; \
+                             skipping the managed-tenant alias so the served tenant keeps \
+                             matching the URL providers were registered against and the scope \
+                             their secrets were written under"
+                        ),
+                    );
+                }
+                None => {
+                    for dep in &mut environment.bundles {
+                        let base = dep.route_binding.tenant_selector.tenant.clone();
+                        dep.route_binding.tenant_selector.tenant =
+                            crate::gtunnel::managed_tenant_alias(&base);
+                    }
+                }
             }
         }
 
@@ -1837,6 +1895,14 @@ fn default_operator_log_dir(log_dir: Option<PathBuf>, bundle: Option<&str>) -> P
 #[derive(serde::Deserialize)]
 struct TunnelConfig {
     mode: Option<String>,
+    /// The managed-tunnel id `greentic-setup` actually used, when it recorded
+    /// one. Setup owns this value because it is the party that both registered
+    /// the resulting public URL with providers (Slack Event Subscriptions, Webex
+    /// webhooks, OAuth redirect URIs) and wrote their secrets under the matching
+    /// tenant scope. Deriving our own id here instead would serve a different
+    /// path segment than those registrations point at, under a tenant their
+    /// secrets were never written to.
+    tunnel_id: Option<String>,
 }
 
 fn load_tunnel_config(bundle_root: &std::path::Path) -> Option<TunnelConfig> {
@@ -1849,6 +1915,24 @@ fn load_tunnel_config(bundle_root: &std::path::Path) -> Option<TunnelConfig> {
 /// staged revision's `.greentic/tunnel.json` (revision ids are ULIDs, so the
 /// lexically-last is newest). `None` when no revision persists a mode.
 fn persisted_env_tunnel_mode(env_dir: &std::path::Path) -> Option<String> {
+    persisted_env_tunnel_field(env_dir, |cfg| cfg.mode.clone())
+}
+
+/// Persisted managed-tunnel id from the newest staged revision, when setup
+/// recorded one. Absent for non-gtunnel modes and for bundles configured before
+/// setup started writing the field — callers fall back to deriving it.
+fn persisted_env_tunnel_id(env_dir: &std::path::Path) -> Option<String> {
+    persisted_env_tunnel_field(env_dir, |cfg| cfg.tunnel_id.clone())
+}
+
+/// Scan staged revisions newest-first (revision ids are ULIDs, so the
+/// lexically-last is newest) and return the first `tunnel.json` value `pick`
+/// accepts. Shared by the mode and id lookups so they can never disagree about
+/// which revision they read from.
+fn persisted_env_tunnel_field<F>(env_dir: &std::path::Path, pick: F) -> Option<String>
+where
+    F: Fn(&TunnelConfig) -> Option<String>,
+{
     let mut revisions: Vec<PathBuf> = std::fs::read_dir(env_dir.join("revisions"))
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -1856,10 +1940,86 @@ fn persisted_env_tunnel_mode(env_dir: &std::path::Path) -> Option<String> {
     revisions.sort();
     revisions.into_iter().rev().find_map(|rev| {
         load_tunnel_config(&rev.join("bundle"))
-            .and_then(|cfg| cfg.mode)
-            .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty())
+            .and_then(|cfg| pick(&cfg))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
     })
+}
+
+/// Map a persisted or `GREENTIC_TUNNEL_MODE` mode string onto the tunnel it
+/// selects. `None` for a mode this binary does not recognise — the caller warns
+/// and ignores it, so it establishes no tunnel to reconcile against.
+fn tunnel_choice_for_mode(mode: &str) -> Option<env_tunnel::TunnelChoice> {
+    match mode {
+        "gtunnel" => Some(env_tunnel::TunnelChoice::Gtunnel),
+        "cloudflared" => Some(env_tunnel::TunnelChoice::Cloudflared),
+        "ngrok" => Some(env_tunnel::TunnelChoice::Ngrok),
+        "off" | "" => Some(env_tunnel::TunnelChoice::Off),
+        _ => None,
+    }
+}
+
+/// Operator-facing name of a tunnel choice. Matches both the `--cloudflared` /
+/// `--ngrok` / `--gtunnel` flag spellings and the `tunnel.json` `mode` values,
+/// so an error naming one is directly actionable as the other.
+fn tunnel_choice_name(choice: env_tunnel::TunnelChoice) -> &'static str {
+    match choice {
+        env_tunnel::TunnelChoice::Off => "off",
+        env_tunnel::TunnelChoice::Cloudflared => "cloudflared",
+        env_tunnel::TunnelChoice::Ngrok => "ngrok",
+        env_tunnel::TunnelChoice::Gtunnel => "gtunnel",
+    }
+}
+
+/// Refuse to boot a configured environment on a different tunnel service than
+/// `greentic-setup` recorded for it. The setup choice is authoritative because
+/// provider public base URLs, third-party webhook registrations and secrets
+/// scoping are all established against it during setup; switching tunnels
+/// afterwards produces a runtime whose public URL nothing was registered
+/// against. `source` names where the conflicting request came from.
+///
+/// Permissive in four cases, all of which contradict no registration:
+/// turning tunnels OFF (disabling, not mixing), no persisted choice at all,
+/// an unrecognised persisted mode, and a persisted mode of `off`.
+fn ensure_tunnel_matches_setup(
+    persisted: Option<&str>,
+    requested: env_tunnel::TunnelChoice,
+    source: &str,
+) -> anyhow::Result<()> {
+    // Turning tunnels off is disabling, not mixing — an operator can always
+    // fall back to a local-only boot. Nothing is served publicly, so no
+    // existing registration is contradicted.
+    if matches!(requested, env_tunnel::TunnelChoice::Off) {
+        return Ok(());
+    }
+    // No persisted choice: the environment was never configured with a tunnel
+    // (or predates setup persisting one), so the request applies unconstrained.
+    let Some(persisted) = persisted else {
+        return Ok(());
+    };
+    // Unrecognised mode: warned about and ignored during resolution.
+    let Some(persisted_choice) = tunnel_choice_for_mode(persisted) else {
+        return Ok(());
+    };
+    // Setup deliberately recorded no tunnel, so nothing was registered.
+    if matches!(persisted_choice, env_tunnel::TunnelChoice::Off) {
+        return Ok(());
+    }
+    if persisted_choice == requested {
+        return Ok(());
+    }
+    let persisted_name = tunnel_choice_name(persisted_choice);
+    let requested_name = tunnel_choice_name(requested);
+    anyhow::bail!(
+        "tunnel mismatch: this environment was set up with the `{persisted_name}` tunnel, \
+         but `{requested_name}` was requested via {source}. The tunnel chosen during setup \
+         is authoritative — provider public base URLs, webhook registrations (Slack Event \
+         Subscriptions, Webex webhooks, OAuth redirect URIs) and secrets scoping were all \
+         established against `{persisted_name}`, so booting on `{requested_name}` would \
+         serve a public URL nothing was registered against. Either start with \
+         `{persisted_name}`, or re-run greentic-setup to change this environment's tunnel. \
+         To boot with no tunnel at all, pass `--{requested_name} off`.",
+    );
 }
 
 /// Guard that fires boot-fail rollback on drop if the new binary fails to
@@ -2344,6 +2504,254 @@ mod tests {
     use std::path::Path;
     use std::thread;
     use std::time::Duration;
+
+    /// Stage `tunnel.json` under a revision id, as the env store lays it out.
+    fn stage_tunnel_json(env_dir: &Path, revision: &str, body: &str) {
+        let bundle = env_dir.join("revisions").join(revision).join("bundle");
+        std::fs::create_dir_all(bundle.join(".greentic")).expect("mkdir");
+        std::fs::write(bundle.join(".greentic").join("tunnel.json"), body).expect("write");
+    }
+
+    // ---- persisted tunnel id (setup owns the id) ----
+
+    #[test]
+    fn persisted_tunnel_id_is_read_and_prefers_the_newest_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Revision ids are ULIDs, so lexical order is chronological.
+        stage_tunnel_json(
+            dir.path(),
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            r#"{"mode":"gtunnel","tunnel_id":"old-tenant"}"#,
+        );
+        stage_tunnel_json(
+            dir.path(),
+            "01ZZZZZZZZZZZZZZZZZZZZZZZZ",
+            r#"{"mode":"gtunnel","tunnel_id":"demo"}"#,
+        );
+        assert_eq!(
+            persisted_env_tunnel_id(dir.path()).as_deref(),
+            Some("demo"),
+            "newest revision wins, matching persisted_env_tunnel_mode"
+        );
+        assert_eq!(
+            persisted_env_tunnel_mode(dir.path()).as_deref(),
+            Some("gtunnel"),
+            "reading the id must not disturb mode resolution"
+        );
+    }
+
+    #[test]
+    fn persisted_tunnel_id_absent_for_legacy_and_non_gtunnel_artifacts() {
+        // Configured before setup recorded the id: mode still resolves, id is
+        // None, so the caller falls back to deriving + aliasing as before.
+        let legacy = tempfile::tempdir().expect("tempdir");
+        stage_tunnel_json(
+            legacy.path(),
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            r#"{"mode":"gtunnel"}"#,
+        );
+        assert_eq!(
+            persisted_env_tunnel_mode(legacy.path()).as_deref(),
+            Some("gtunnel")
+        );
+        assert_eq!(persisted_env_tunnel_id(legacy.path()), None);
+
+        // cloudflared bundles never carry a gtunnel id.
+        let cf = tempfile::tempdir().expect("tempdir");
+        stage_tunnel_json(
+            cf.path(),
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            r#"{"mode":"cloudflared"}"#,
+        );
+        assert_eq!(persisted_env_tunnel_id(cf.path()), None);
+
+        // No env store at all.
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(persisted_env_tunnel_id(empty.path()), None);
+    }
+
+    #[test]
+    fn persisted_tunnel_id_ignores_blank_and_unparseable_artifacts() {
+        let blank = tempfile::tempdir().expect("tempdir");
+        stage_tunnel_json(
+            blank.path(),
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            r#"{"mode":"gtunnel","tunnel_id":"   "}"#,
+        );
+        assert_eq!(
+            persisted_env_tunnel_id(blank.path()),
+            None,
+            "whitespace-only id must not be adopted as a path segment"
+        );
+
+        // A newer unparseable file must not mask an older good one.
+        let mixed = tempfile::tempdir().expect("tempdir");
+        stage_tunnel_json(
+            mixed.path(),
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            r#"{"mode":"gtunnel","tunnel_id":"demo"}"#,
+        );
+        stage_tunnel_json(mixed.path(), "01ZZZZZZZZZZZZZZZZZZZZZZZZ", "{not json");
+        assert_eq!(
+            persisted_env_tunnel_id(mixed.path()).as_deref(),
+            Some("demo")
+        );
+    }
+
+    /// An env the given setup mode was recorded against.
+    fn env_with_persisted_mode(mode: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        stage_tunnel_json(
+            dir.path(),
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            &format!(r#"{{"mode":"{mode}"}}"#),
+        );
+        dir
+    }
+
+    #[test]
+    fn explicit_tunnel_conflicting_with_the_setup_choice_is_rejected() {
+        let dir = env_with_persisted_mode("gtunnel");
+        let persisted = persisted_env_tunnel_mode(dir.path());
+        assert_eq!(
+            persisted.as_deref(),
+            Some("gtunnel"),
+            "staged mode reads back"
+        );
+
+        // `--cloudflared on` against a gtunnel-configured environment: the
+        // providers were registered against the gtunnel URL, so proceeding
+        // would serve a URL nothing points at.
+        let requested = env_tunnel::choose_tunnel(
+            CloudflaredModeArg::On,
+            NgrokModeArg::Off,
+            GtunnelModeArg::Off,
+        );
+        let err = ensure_tunnel_matches_setup(
+            persisted.as_deref(),
+            requested,
+            "a command-line tunnel flag",
+        )
+        .expect_err("a different tunnel than setup recorded must not boot");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gtunnel"),
+            "error must name the tunnel setup chose: {msg}"
+        );
+        assert!(
+            msg.contains("cloudflared"),
+            "error must name the tunnel that was requested: {msg}"
+        );
+        assert!(
+            msg.contains("greentic-setup"),
+            "error must point at the remedy: {msg}"
+        );
+    }
+
+    #[test]
+    fn explicit_tunnel_agreeing_with_the_setup_choice_proceeds() {
+        let dir = env_with_persisted_mode("gtunnel");
+        let persisted = persisted_env_tunnel_mode(dir.path());
+        let requested = env_tunnel::choose_tunnel(
+            CloudflaredModeArg::Off,
+            NgrokModeArg::Off,
+            GtunnelModeArg::On,
+        );
+        assert!(
+            ensure_tunnel_matches_setup(
+                persisted.as_deref(),
+                requested,
+                "a command-line tunnel flag"
+            )
+            .is_ok(),
+            "asking for the tunnel setup already chose is not mixing"
+        );
+    }
+
+    #[test]
+    fn explicit_tunnel_without_a_persisted_choice_is_unconstrained() {
+        // No env store at all, and a staged revision that records no mode:
+        // both leave the explicit flag free, exactly as before this check.
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(persisted_env_tunnel_mode(empty.path()), None);
+
+        let legacy = tempfile::tempdir().expect("tempdir");
+        stage_tunnel_json(legacy.path(), "01AAAAAAAAAAAAAAAAAAAAAAAA", r#"{}"#);
+        assert_eq!(persisted_env_tunnel_mode(legacy.path()), None);
+
+        for requested in [
+            env_tunnel::TunnelChoice::Cloudflared,
+            env_tunnel::TunnelChoice::Ngrok,
+            env_tunnel::TunnelChoice::Gtunnel,
+        ] {
+            for dir in [empty.path(), legacy.path()] {
+                assert!(
+                    ensure_tunnel_matches_setup(
+                        persisted_env_tunnel_mode(dir).as_deref(),
+                        requested,
+                        "a command-line tunnel flag",
+                    )
+                    .is_ok(),
+                    "no persisted choice must not constrain {requested:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn turning_tunnels_off_is_allowed_against_any_setup_choice() {
+        // The documented exception: `off` is disabling, not mixing. Nothing is
+        // served publicly, so no registration is contradicted and an operator
+        // can still boot local-only.
+        let dir = env_with_persisted_mode("gtunnel");
+        let persisted = persisted_env_tunnel_mode(dir.path());
+        let requested = env_tunnel::choose_tunnel(
+            CloudflaredModeArg::Off,
+            NgrokModeArg::Off,
+            GtunnelModeArg::Off,
+        );
+        assert_eq!(requested, env_tunnel::TunnelChoice::Off);
+        assert!(
+            ensure_tunnel_matches_setup(
+                persisted.as_deref(),
+                requested,
+                "a command-line tunnel flag"
+            )
+            .is_ok(),
+            "`--gtunnel off` must still boot a gtunnel-configured env local-only"
+        );
+
+        // Symmetrically, a setup that recorded `off` constrains nothing.
+        let off = env_with_persisted_mode("off");
+        assert!(
+            ensure_tunnel_matches_setup(
+                persisted_env_tunnel_mode(off.path()).as_deref(),
+                env_tunnel::TunnelChoice::Gtunnel,
+                "a command-line tunnel flag",
+            )
+            .is_ok(),
+            "setup recorded no tunnel, so nothing was registered to protect"
+        );
+    }
+
+    #[test]
+    fn env_tunnel_mode_is_held_to_the_same_check_as_a_flag() {
+        // GREENTIC_TUNNEL_MODE overrides the persisted choice, so it has the
+        // identical failure mode and is not a privileged escape hatch.
+        let dir = env_with_persisted_mode("gtunnel");
+        let persisted = persisted_env_tunnel_mode(dir.path());
+        let requested = tunnel_choice_for_mode("ngrok").expect("known mode");
+        let err =
+            ensure_tunnel_matches_setup(persisted.as_deref(), requested, "GREENTIC_TUNNEL_MODE")
+                .expect_err("env-var mixing must fail like flag mixing");
+        assert!(
+            err.to_string().contains("GREENTIC_TUNNEL_MODE"),
+            "error must name the source of the conflicting request: {err}"
+        );
+
+        // An unrecognised mode selects no tunnel, so it cannot conflict.
+        assert_eq!(tunnel_choice_for_mode("banana"), None);
+    }
 
     #[test]
     fn messaging_tunnel_default_needs_endpoint_and_no_configured_url() {
