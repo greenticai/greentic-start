@@ -2137,15 +2137,14 @@ fn write_blob_and_apply(
         ))
     })?;
     let tmp_binary = tmp_dir.path().join(own_name);
-    {
-        std::fs::write(&tmp_binary, &blob_bytes).map_err(|err| {
-            NotifyError::Internal(format!(
-                "binary-update: failed to write binary to temp: {err}"
-            ))
-        })?;
-    } // blob_bytes is moved into this function, and the write consumes the ref;
-    // the Vec is dropped at the end of this scope (or earlier if the compiler
-    // can prove it — either way, before the swap below).
+    std::fs::write(&tmp_binary, &blob_bytes).map_err(|err| {
+        NotifyError::Internal(format!(
+            "binary-update: failed to write binary to temp: {err}"
+        ))
+    })?;
+    // Release the buffer before the swap so peak memory holds one copy, not two.
+    // The caller moved it in, so this `drop` is what makes that guaranteed —
+    // the original in-band path got the same effect from a narrower scope.
     drop(blob_bytes);
     #[cfg(unix)]
     {
@@ -10886,10 +10885,18 @@ mod binary_update_tests {
     }
 
     #[test]
-    fn c4_malformed_digest_hard_error_no_http() {
+    fn c4_malformed_digest_rejected_upstream_of_the_mirror() {
         // A binary whose digest is NOT `sha256:<64 hex>` must fail BEFORE any
-        // network call. We prove this by having no mirror at all (skip_blob=true
-        // + mirror at unroutable) — if it tried HTTP, it would fail differently.
+        // network call. The gate that actually fires is UPSTREAM of C4:
+        // `staged.binary_blob_path()` validates the digest inside
+        // greentic-update (`staging.rs`: "malformed artifact digest") before the
+        // metadata match that dispatches to the mirror, so a bad digest can
+        // never reach URL construction. Assert that specific error rather than
+        // accepting `validate_digest_hex`'s message too — an `||` over both
+        // would hide which gate fired, and would keep passing if the ordering
+        // regressed so that the mirror ran first. `validate_digest_hex` is the
+        // second, defense-in-depth gate and is pinned directly by
+        // `c4_validate_digest_hex_rejects_bad_inputs`.
         let dummy_exe = b"malformed-digest-binary";
         let digest = "md5:abc123".to_string();
 
@@ -10958,9 +10965,9 @@ mod binary_update_tests {
         );
         let err_msg = format!("{:?}", result.unwrap_err());
         assert!(
-            err_msg.contains("malformed artifact digest")
-                || err_msg.contains("missing `sha256:` prefix"),
-            "error must reject the malformed digest before any HTTP: {err_msg}"
+            err_msg.contains("malformed artifact digest"),
+            "the upstream blob-path gate must reject the digest before the \
+             mirror dispatch is reached: {err_msg}"
         );
 
         let on_disk = std::fs::read(&target_exe).unwrap();
