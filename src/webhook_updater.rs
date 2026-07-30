@@ -595,6 +595,33 @@ mod tests {
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
+    /// Resolve a secrets manager with the dev store pinned under `tmp`.
+    ///
+    /// Unrelated tests set `$GREENTIC_ENV` without a lock; with the env-store
+    /// gating (`selected_env`) that would route these tests' secret resolution to
+    /// the shared real env store and cross-contaminate. Pin
+    /// `$GREENTIC_DEV_SECRETS_PATH` to a *touched* file under `tmp` so
+    /// `find_existing` returns it ahead of any env-store candidate (immune to a
+    /// leaked `$GREENTIC_ENV`), serialized via the crate-wide env lock.
+    fn isolated_secrets_handle(tmp: &Path) -> SecretsManagerHandle {
+        let _guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let store = tmp.join(".greentic").join("dev").join(".dev.secrets.env");
+        std::fs::create_dir_all(store.parent().expect("store parent")).expect("dev store dir");
+        std::fs::File::create(&store).expect("touch dev store");
+        let prev = std::env::var_os("GREENTIC_DEV_SECRETS_PATH");
+        // SAFETY: serialized by the crate-wide test env lock held above.
+        unsafe { std::env::set_var("GREENTIC_DEV_SECRETS_PATH", &store) };
+        let handle =
+            secrets_gate::resolve_secrets_manager(tmp, "demo", Some("default")).expect("secrets");
+        match prev {
+            Some(value) => unsafe { std::env::set_var("GREENTIC_DEV_SECRETS_PATH", value) },
+            None => unsafe { std::env::remove_var("GREENTIC_DEV_SECRETS_PATH") },
+        }
+        handle
+    }
+
     #[test]
     fn read_previous_public_url_missing_file() {
         let tmp = TempDir::new().unwrap();
@@ -640,9 +667,7 @@ mod tests {
     #[test]
     fn update_webhooks_if_url_changed_skips_non_https_unchanged_and_non_messaging_discovery() {
         let tmp = TempDir::new().unwrap();
-        let secrets_handle =
-            secrets_gate::resolve_secrets_manager(tmp.path(), "demo", Some("default"))
-                .expect("secrets");
+        let secrets_handle = isolated_secrets_handle(tmp.path());
 
         let empty = DiscoveryResult {
             domains: DetectedDomains {
@@ -682,9 +707,7 @@ mod tests {
     #[test]
     fn build_provider_config_returns_public_url_when_pack_has_no_secret_requirements() {
         let tmp = TempDir::new().unwrap();
-        let secrets_handle =
-            secrets_gate::resolve_secrets_manager(tmp.path(), "demo", Some("default"))
-                .expect("secrets");
+        let secrets_handle = isolated_secrets_handle(tmp.path());
         let pack_path = tmp.path().join("provider.gtpack");
         let file = std::fs::File::create(&pack_path).expect("pack");
         let mut zip = zip::ZipWriter::new(file);
@@ -736,9 +759,7 @@ mod tests {
         )
         .expect("setup answers");
 
-        let secrets_handle =
-            secrets_gate::resolve_secrets_manager(tmp.path(), "demo", Some("default"))
-                .expect("secrets");
+        let secrets_handle = isolated_secrets_handle(tmp.path());
         let pack_path = tmp.path().join("provider.gtpack");
         let file = std::fs::File::create(&pack_path).expect("pack");
         let mut zip = zip::ZipWriter::new(file);
@@ -775,8 +796,7 @@ mod tests {
     #[test]
     fn update_provider_public_url_secret_writes_then_detects_unchanged_value() {
         let tmp = TempDir::new().unwrap();
-        let secrets_handle =
-            secrets_gate::resolve_secrets_manager(tmp.path(), "demo", Some("default")).unwrap();
+        let secrets_handle = isolated_secrets_handle(tmp.path());
         let env = resolve_env(None);
         let uri = secrets_gate::canonical_secret_uri(
             &env,
@@ -816,8 +836,7 @@ mod tests {
     #[test]
     fn build_provider_config_reads_text_and_binary_secret_values() {
         let tmp = TempDir::new().unwrap();
-        let secrets_handle =
-            secrets_gate::resolve_secrets_manager(tmp.path(), "demo", Some("default")).unwrap();
+        let secrets_handle = isolated_secrets_handle(tmp.path());
         let env = resolve_env(None);
         let runtime = Runtime::new().unwrap();
 
@@ -899,8 +918,7 @@ mod tests {
         )
         .expect("setup answers");
 
-        let secrets_handle =
-            secrets_gate::resolve_secrets_manager(tmp.path(), "demo", Some("default")).unwrap();
+        let secrets_handle = isolated_secrets_handle(tmp.path());
         let pack_path = tmp.path().join("provider.gtpack");
         let file = std::fs::File::create(&pack_path).expect("pack");
         let mut zip = zip::ZipWriter::new(file);
@@ -954,8 +972,7 @@ mod tests {
         )
         .expect("setup answers");
 
-        let secrets_handle =
-            secrets_gate::resolve_secrets_manager(tmp.path(), "demo", Some("default")).unwrap();
+        let secrets_handle = isolated_secrets_handle(tmp.path());
         let env = resolve_env(None);
         let runtime = Runtime::new().unwrap();
         let token_uri = secrets_gate::canonical_secret_uri(

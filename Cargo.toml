@@ -80,7 +80,7 @@ sysinfo = "0.39"
 tar = "0.4"
 thiserror = "2"
 tokio-rustls = "0.26"
-tokio-tungstenite = "0.29"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-opentelemetry = "0.33"
@@ -132,8 +132,15 @@ features = ["derive"]
 # and fail to compile. Note for a forward-port to main: this is a dev-lane runid
 # floor and stable 0.2.x releases sort BELOW it, so main must instead floor at
 # whichever stable release carries `blob_base_url`, not at this value.
+#
+# Floor bumped again to 0.2.30561430155 — the forward-port publish
+# (greentic-deployer#535) that first carries `EnvironmentHostConfig::new` +
+# `#[non_exhaustive]`, `host_config.default_bundle`, `DefaultBundleReason` and
+# `Environment::resolve_default_bundle`. `webchat_routing.rs` and every
+# `EnvironmentHostConfig` construction site in this crate consume them; the
+# previous floor admits publishes with none of them.
 [dependencies.greentic-deploy-spec]
-version = ">=0.2.30514305131, <0.3"
+version = ">=0.2.30561430155, <0.3"
 
 # Lower bound pinned to the first dev build re-exporting `load_trust_root`
 # (per-env trust root + operator key, deployer #226). Floor bumped to the
@@ -155,11 +162,14 @@ default-features = false
 # line — the `0.1.x` cross-lane conflict that once blocked this (distributor-client
 # 1.2) is gone now that greentic-update publishes `1.2.0-dev.N` on the same lane.
 [dependencies.greentic-update]
-version = ">=1.2.0-dev.30347759036, <1.3.0-0"
+version = ">=1.2.0-dev.30553549034, <1.3.0-0"
 features = ["binswap", "stream"]
 # Floor bumped to 1.2.0-dev.30347759036: first publish carrying
 # StagedPlan::verify_binary_on_disk + the staging binary CAS (B3 in-band
-# binary consumption).
+# binary consumption). Floor bumped again to 1.2.0-dev.30553549034 — the
+# forward-port publish that exports `plan::plan_targets_env` (fleet broadcast
+# env id `_`); `revision_serve::check_plan_identity` calls it instead of the
+# local copy it carried while the dev lane lacked the export.
 
 # Lower bound pinned to the first dev build exposing the `signing` module
 # (verify_artifact_dsse / TrustRoot); earlier 1.1.0-dev builds lack it. Floor

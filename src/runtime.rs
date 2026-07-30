@@ -30,6 +30,7 @@ use anyhow::Context;
 
 use crate::cloudflared::{self, CloudflaredConfig};
 use crate::config::{DemoConfig, DemoSubscriptionsMode};
+use crate::gtunnel::{self, GtunnelConfig};
 use crate::ngrok::{self, NgrokConfig};
 
 use crate::subscriptions_universal::{
@@ -768,6 +769,7 @@ pub fn demo_up_services(
     env_store_public_base_url: Option<String>,
     cloudflared: Option<CloudflaredConfig>,
     ngrok: Option<NgrokConfig>,
+    gtunnel: Option<GtunnelConfig>,
     restart: &BTreeSet<String>,
     runner_binary: Option<PathBuf>,
     log_dir: &Path,
@@ -1213,6 +1215,39 @@ pub fn demo_up_services(
                 );
             }
             service_tracker.record_with_log("ngrok", "ngrok", Some(&handle.log_path))?;
+            Some(handle.url)
+        }
+    } else if let Some(mut cfg) = gtunnel {
+        if ingress_server.is_none() {
+            operator_log::warn(
+                module_path!(),
+                "gtunnel requested but no local HTTP ingress listener is enabled; skipping tunnel startup",
+            );
+            None
+        } else {
+            if let Some(ref server) = ingress_server {
+                cfg.local_port = server.actual_port;
+            }
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "starting gtunnel agent tunnel_id={} base={}",
+                    cfg.tunnel_id, cfg.worker_base_url
+                ),
+            );
+            let handle = gtunnel::start_agent(&cfg)?;
+            match cloudflared::wait_tunnel_ready(&handle.url, std::time::Duration::from_secs(30)) {
+                Ok(()) => operator_log::info(module_path!(), "gtunnel verified reachable"),
+                Err(err) => operator_log::warn(
+                    module_path!(),
+                    format!("gtunnel not yet reachable, continuing anyway: {err}"),
+                ),
+            }
+            service_tracker.record_with_log(
+                gtunnel::SERVICE_ID,
+                gtunnel::SERVICE_ID,
+                Some(&handle.log_path),
+            )?;
             Some(handle.url)
         }
     } else {
@@ -2599,6 +2634,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &restart,
             None,
             &log_dir,
@@ -2666,6 +2702,7 @@ mod tests {
             &config_path,
             &config,
             &static_routes,
+            None,
             None,
             None,
             None,

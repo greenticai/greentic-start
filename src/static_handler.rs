@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use http_body_util::Full;
 use hyper::{
@@ -17,8 +17,38 @@ use crate::static_routes::{
 
 use crate::http_helpers::error_response;
 
+/// Derive the on-disk revision bundle root for a pack-served route, when the
+/// extracted bundle assets sit alongside the pinned pack. Walks up from the
+/// pack file to the first ancestor that actually contains this route's
+/// `source_root` directory.
+///
+/// The revision-serve path pins packs under `<revision>/bundle/…`, and the same
+/// bundle root holds the extracted `assets/` overlay (where `greentic-setup`
+/// writes per-tenant `config/tenants/<t>.json`) and the `.providers/` config
+/// envelopes. Returning that root lets the revision path reuse the legacy
+/// `--bundle` overlay + synthesized-tenant-config serving instead of the
+/// pack-only path — closing the parity gap that otherwise renders the built-in
+/// fallback skin regardless of the operator's setup answers.
+///
+/// Returns `None` when the overlay directory is absent (e.g. tests or a
+/// pack with no extracted bundle), so the caller falls back to pack-only serving
+/// and behavior is unchanged.
+pub(crate) fn revision_bundle_root(descriptor: &StaticRouteDescriptor) -> Option<PathBuf> {
+    if descriptor.source_root.is_empty() {
+        return None;
+    }
+    let mut dir = descriptor.pack_path.parent();
+    while let Some(candidate) = dir {
+        if candidate.join(&descriptor.source_root).is_dir() {
+            return Some(candidate.to_path_buf());
+        }
+        dir = candidate.parent();
+    }
+    None
+}
+
 /// Serve a static route directly from the pack (no bundle-root overlay).
-/// Used by the revision-serve path where no bundle root exists.
+/// Used by the revision-serve path when no extracted bundle overlay exists.
 pub(crate) fn serve_static_route_from_pack(
     route_match: &StaticRouteMatch<'_>,
     request_path: &str,
@@ -49,6 +79,14 @@ pub(crate) fn serve_static_route_from_pack(
             }
         }
     }
+    // Recover a spurious leading segment before falling back to the SPA index.
+    match retry_spa_asset_without_leading_segment(route_match, |p| {
+        serve_pack_asset(route_match.descriptor, p)
+    }) {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
     if let Some(asset_path) = fallback_asset_path(route_match) {
         match serve_pack_asset(route_match.descriptor, &asset_path) {
             Ok(Some(response)) => return response,
@@ -59,6 +97,41 @@ pub(crate) fn serve_static_route_from_pack(
         }
     }
     error_response(StatusCode::NOT_FOUND, "file not found")
+}
+
+/// SPA asset recovery. The webchat SPA is opened at a bundle-scoped,
+/// trailing-slash URL (`…/{bundle}/`) and references its assets relatively
+/// (`./runtime-bootstrap.js`), so the browser requests them one directory deeper
+/// than they live (`…/{bundle}/runtime-bootstrap.js`). Classify strips that
+/// segment only when it is a registered bundle for the tenant; any other leading
+/// segment (a stale tab, a wrong `--open-webchat`, a bundle/tenant mismatch)
+/// leaks through and the primary lookup misses. Rather than serve the SPA index
+/// as the asset (HTML parsed as JS → blank page), retry with the leading segment
+/// stripped, one segment at a time, until it resolves or none remain. Real
+/// first-level asset dirs (`assets/`, `config/`, `i18n/`, …) resolve on the
+/// first try, so this only ever rescues a spurious leading segment. Restricted
+/// to SPA routes (`spa_fallback` set) — elsewhere a miss is a genuine 404.
+fn retry_spa_asset_without_leading_segment(
+    route_match: &StaticRouteMatch<'_>,
+    mut serve: impl FnMut(&str) -> anyhow::Result<Option<Response<Full<Bytes>>>>,
+) -> anyhow::Result<Option<Response<Full<Bytes>>>> {
+    if fallback_asset_path(route_match).is_none() {
+        return Ok(None);
+    }
+    let Some(asset_path) = resolve_asset_path(route_match) else {
+        return Ok(None);
+    };
+    let mut rest = asset_path.as_str();
+    while let Some(idx) = rest.find('/') {
+        rest = &rest[idx + 1..];
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(response) = serve(rest)? {
+            return Ok(Some(response));
+        }
+    }
+    Ok(None)
 }
 
 /// Serve a single asset from the pack path only (no bundle-root overlay).
@@ -146,6 +219,14 @@ pub(crate) fn serve_static_route(
     // fallback even when wizard answers asked for something else.
     if let Some(response) = try_serve_synthesized_tenant_config(route_match, bundle_root) {
         return response;
+    }
+    // Recover a spurious leading segment before falling back to the SPA index.
+    match retry_spa_asset_without_leading_segment(route_match, |p| {
+        serve_static_asset(route_match.descriptor, p, bundle_root)
+    }) {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
     if let Some(asset_path) = fallback_asset_path(route_match) {
         match serve_static_asset(route_match.descriptor, &asset_path, bundle_root) {
@@ -505,6 +586,43 @@ mod tests {
     }
 
     #[test]
+    fn serve_static_route_recovers_spurious_leading_segment() {
+        // The webchat SPA opened at `…/{bundle}/` requests `./app.js` as
+        // `…/{bundle}/app.js`, i.e. asset_path "koncar-demo/app.js" when the
+        // bundle segment was not stripped. The real asset lives at site/app.js.
+        // The retry must serve that JS, NOT the index.html SPA fallback.
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("site")).expect("mkdir");
+        std::fs::write(dir.path().join("site").join("app.js"), "console.log(1)").expect("app");
+        std::fs::write(
+            dir.path().join("site").join("index.html"),
+            "<html>fallback</html>",
+        )
+        .expect("index");
+
+        let descriptor = descriptor(dir.path());
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: "koncar-demo/app.js".to_string(),
+            request_is_directory: false,
+        };
+
+        let response = serve_static_route(&route_match, dir.path(), "/web/koncar-demo/app.js");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = runtime.block_on(async {
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+        });
+        // Served the real asset, not the SPA index (the blank-page bug).
+        assert_eq!(body, Bytes::from_static(b"console.log(1)"));
+    }
+
+    #[test]
     fn serve_static_route_rejects_missing_assets() {
         let dir = tempdir().expect("tempdir");
         let descriptor = descriptor(dir.path());
@@ -725,6 +843,35 @@ mod tests {
         assert!(match_tenant_config_asset_path("config/tenants/.json").is_none());
         assert!(match_tenant_config_asset_path("config/tenants/nested/x.json").is_none());
         assert!(match_tenant_config_asset_path("skins/3aigent/skin.json").is_none());
+    }
+
+    #[test]
+    fn revision_bundle_root_finds_overlay_alongside_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Revision layout: pack pinned under <bundle>/providers/messaging/,
+        // extracted assets (the setup-writable overlay) under
+        // <bundle>/assets/webchat-gui/.
+        let bundle = tmp.path().join("revisions/r1/bundle");
+        let pack_dir = bundle.join("providers/messaging");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::create_dir_all(bundle.join("assets/webchat-gui/config/tenants")).unwrap();
+        let pack_path = pack_dir.join("messaging-webchat-gui.gtpack");
+        std::fs::write(&pack_path, b"PK").unwrap();
+        let desc = webchat_descriptor(&pack_path);
+        assert_eq!(revision_bundle_root(&desc), Some(bundle));
+    }
+
+    #[test]
+    fn revision_bundle_root_none_when_overlay_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Pack with no extracted `assets/webchat-gui/` overlay anywhere above
+        // it → fall back to pack-only serving (None).
+        let pack_dir = tmp.path().join("packs");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_path = pack_dir.join("messaging-webchat-gui.gtpack");
+        std::fs::write(&pack_path, b"PK").unwrap();
+        let desc = webchat_descriptor(&pack_path);
+        assert_eq!(revision_bundle_root(&desc), None);
     }
 
     #[test]

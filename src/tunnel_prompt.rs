@@ -1,7 +1,7 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use crate::operator_i18n::tr;
-use crate::{CloudflaredModeArg, NgrokModeArg, StartRequest};
+use crate::{CloudflaredModeArg, GtunnelModeArg, NgrokModeArg, StartRequest};
 
 pub(crate) fn maybe_prompt_tunnel(request: &mut StartRequest) {
     if request.tunnel_explicit {
@@ -36,11 +36,13 @@ fn prompt_tunnel_with_io<R: BufRead, W: Write>(
         "Cloudflare Tunnel (cloudflared)",
     );
     let opt_ngrok = tr("cli.tunnel.option_ngrok", "ngrok");
+    let opt_gtunnel = tr("cli.tunnel.option_gtunnel", "Greentic managed tunnel");
 
     let _ = writeln!(writer, "\n{prompt}");
     let _ = writeln!(writer, "1 ) {opt_none}");
     let _ = writeln!(writer, "2 ) {opt_cloudflared}");
     let _ = writeln!(writer, "3 ) {opt_ngrok}");
+    let _ = writeln!(writer, "4 ) {opt_gtunnel}");
     let _ = write!(writer, "> ");
     let _ = writer.flush();
 
@@ -55,6 +57,9 @@ fn prompt_tunnel_with_io<R: BufRead, W: Write>(
         }
         "3" => {
             request.ngrok = NgrokModeArg::On;
+        }
+        "4" => {
+            request.gtunnel = GtunnelModeArg::On;
         }
         "1" | "" => {
             let msg = tr("cli.tunnel.selected_none", "Running without tunnel.");
@@ -89,12 +94,16 @@ mod tests {
             cloudflared_binary: None,
             ngrok: NgrokModeArg::Off,
             ngrok_binary: None,
+            gtunnel: GtunnelModeArg::Off,
+            gtunnel_worker_url: None,
+            gtunnel_tunnel_id: None,
             runner_binary: None,
             restart: Vec::new(),
             log_dir: None,
             verbose: false,
             quiet: false,
             no_browser: false,
+            open_webchat: None,
             no_updates: false,
             no_auto_restart: false,
             admin: false,
@@ -133,6 +142,17 @@ mod tests {
         prompt_tunnel_with_io(&mut input, &mut output, &mut request);
         assert_eq!(request.cloudflared, CloudflaredModeArg::Off);
         assert_eq!(request.ngrok, NgrokModeArg::On);
+    }
+
+    #[test]
+    fn selects_gtunnel_on_option_4() {
+        let mut input = Cursor::new(b"4\n".to_vec());
+        let mut output = Vec::new();
+        let mut request = make_request();
+        prompt_tunnel_with_io(&mut input, &mut output, &mut request);
+        assert_eq!(request.gtunnel, GtunnelModeArg::On);
+        assert_eq!(request.cloudflared, CloudflaredModeArg::Off);
+        assert_eq!(request.ngrok, NgrokModeArg::Off);
     }
 
     #[test]

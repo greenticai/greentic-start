@@ -23,7 +23,9 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::cli_args::{CloudflaredModeArg, NgrokModeArg, StartRequest, restart_name};
+use crate::cli_args::{
+    CloudflaredModeArg, GtunnelModeArg, NgrokModeArg, StartRequest, restart_name,
+};
 use crate::runtime_state::RuntimePaths;
 use crate::{bin_resolver, cloudflared, ngrok, operator_log, supervisor};
 
@@ -51,20 +53,108 @@ pub(crate) enum TunnelChoice {
     Off,
     Cloudflared,
     Ngrok,
+    Gtunnel,
 }
 
-pub(crate) fn choose_tunnel(cloudflared: CloudflaredModeArg, ngrok: NgrokModeArg) -> TunnelChoice {
-    match (cloudflared, ngrok) {
-        (CloudflaredModeArg::On, NgrokModeArg::On) => {
+pub(crate) fn choose_tunnel(
+    cloudflared: CloudflaredModeArg,
+    ngrok: NgrokModeArg,
+    gtunnel: GtunnelModeArg,
+) -> TunnelChoice {
+    match (cloudflared, ngrok, gtunnel) {
+        (CloudflaredModeArg::On, NgrokModeArg::On, _) => {
             operator_log::info(
                 module_path!(),
                 "ngrok enabled, disabling cloudflared (use --cloudflared on --ngrok off to override)",
             );
             TunnelChoice::Ngrok
         }
-        (_, NgrokModeArg::On) => TunnelChoice::Ngrok,
-        (CloudflaredModeArg::On, NgrokModeArg::Off) => TunnelChoice::Cloudflared,
-        (CloudflaredModeArg::Off, NgrokModeArg::Off) => TunnelChoice::Off,
+        (_, NgrokModeArg::On, _) => TunnelChoice::Ngrok,
+        (CloudflaredModeArg::On, NgrokModeArg::Off, _) => TunnelChoice::Cloudflared,
+        (CloudflaredModeArg::Off, NgrokModeArg::Off, GtunnelModeArg::On) => TunnelChoice::Gtunnel,
+        (CloudflaredModeArg::Off, NgrokModeArg::Off, GtunnelModeArg::Off) => TunnelChoice::Off,
+    }
+}
+
+/// The tunnel id both binaries key on: explicit flag > `GREENTIC_TUNNEL_ID` >
+/// the sanitized `<tenant>`. It is deliberately the TENANT alone (not
+/// `<tenant>-<team>`) so it equals the `<tenant>` segment of the webchat URL
+/// space (`/v1/web/webchat/<tenant>/…`): the Worker routes the SPA's
+/// root-absolute calls by that tenant, so the id it registers under must match.
+/// Single source of truth so the default-tunnel decision, the config, and
+/// greentic-setup all agree. (One box per tenant; multiple teams of the same
+/// tenant would share a tunnel — override `GREENTIC_TUNNEL_ID` to separate them.)
+pub(crate) fn resolve_gtunnel_tunnel_id(request: &StartRequest) -> String {
+    request
+        .gtunnel_tunnel_id
+        .clone()
+        .or_else(|| std::env::var("GREENTIC_TUNNEL_ID").ok())
+        .unwrap_or_else(|| sanitize_tunnel_id(request.tenant.as_deref().unwrap_or("default")))
+}
+
+/// Resolve the zero-config gtunnel settings for this request. Order for each
+/// field: explicit flag > env var > derived/default. Keeps setup input-free.
+pub(crate) fn gtunnel_config(
+    request: &StartRequest,
+    local_port: u16,
+    restart: bool,
+) -> crate::gtunnel::GtunnelConfig {
+    let worker_base_url = request
+        .gtunnel_worker_url
+        .clone()
+        .or_else(|| std::env::var("GREENTIC_TUNNEL_WORKER_URL").ok())
+        .unwrap_or_else(|| crate::gtunnel::DEFAULT_WORKER_BASE_URL.to_string());
+    let tunnel_id = resolve_gtunnel_tunnel_id(request);
+    // Prefer the per-tunnel secret greentic-setup provisioned (shared store),
+    // falling back to the GREENTIC_TUNNEL_SECRET env override.
+    let secret = crate::gtunnel::resolve_secret(&tunnel_id);
+    // When a base domain is configured, use subdomain routing so SPAs served at
+    // the host root (the WebChat UI) work; otherwise path-prefix under the Worker.
+    let base_domain = std::env::var("GREENTIC_TUNNEL_BASE_DOMAIN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // Root-map: the Worker hosts this one tunnel at its host root (workers.dev,
+    // no custom domain). base_domain (subdomain) takes precedence if both set.
+    let root_map = base_domain.is_none() && env_flag("GREENTIC_TUNNEL_ROOT_MAP");
+    crate::gtunnel::GtunnelConfig {
+        worker_base_url,
+        base_domain,
+        root_map,
+        tunnel_id,
+        secret,
+        local_port,
+        restart,
+    }
+}
+
+/// Whether an env var is set to a truthy value (`1` / `true` / `yes`, any case).
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
+/// Normalize a derived tunnel id into a URL-path-safe slug.
+fn sanitize_tunnel_id(raw: &str) -> String {
+    let slug: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = slug.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed
     }
 }
 
@@ -86,14 +176,40 @@ pub(crate) fn start_env_tunnel(
     local_port: u16,
     log_dir: &Path,
 ) -> anyhow::Result<Option<EnvTunnelHandle>> {
-    let choice = choose_tunnel(request.cloudflared, request.ngrok);
-    let (service, explicit_binary) = match choice {
-        TunnelChoice::Off => return Ok(None),
-        TunnelChoice::Cloudflared => ("cloudflared", request.cloudflared_binary.clone()),
-        TunnelChoice::Ngrok => ("ngrok", request.ngrok_binary.clone()),
-    };
+    let choice = choose_tunnel(request.cloudflared, request.ngrok, request.gtunnel);
+    if let TunnelChoice::Off = choice {
+        return Ok(None);
+    }
     let restart: BTreeSet<String> = request.restart.iter().map(restart_name).collect();
     let paths = env_runtime_paths(env_dir, env_id);
+    // gtunnel has no external binary — the agent is this same executable, so it
+    // takes a distinct, self-contained path (spawn the agent, report the URL).
+    if let TunnelChoice::Gtunnel = choice {
+        let restart_service = crate::runtime::should_restart(&restart, crate::gtunnel::SERVICE_ID);
+        let config = gtunnel_config(request, local_port, restart_service);
+        let handle = crate::gtunnel::start_agent(&config)?;
+        match cloudflared::wait_tunnel_ready(&handle.url, TUNNEL_READY_TIMEOUT) {
+            Ok(()) => operator_log::info(
+                module_path!(),
+                format!("gtunnel reachable url={}", handle.url),
+            ),
+            Err(err) => operator_log::warn(
+                module_path!(),
+                format!("gtunnel not yet reachable, continuing anyway: {err}"),
+            ),
+        }
+        return Ok(Some(EnvTunnelHandle {
+            service: crate::gtunnel::SERVICE_ID,
+            url: handle.url,
+        }));
+    }
+    let (service, explicit_binary) = match choice {
+        TunnelChoice::Cloudflared => ("cloudflared", request.cloudflared_binary.clone()),
+        TunnelChoice::Ngrok => ("ngrok", request.ngrok_binary.clone()),
+        TunnelChoice::Off | TunnelChoice::Gtunnel => {
+            unreachable!("Off and Gtunnel handled above")
+        }
+    };
     let binary = bin_resolver::resolve_binary(
         service,
         &bin_resolver::ResolveCtx {
@@ -103,7 +219,9 @@ pub(crate) fn start_env_tunnel(
     )?;
     let restart_service = crate::runtime::should_restart(&restart, service);
     let url = match choice {
-        TunnelChoice::Off => unreachable!("Off returned above"),
+        TunnelChoice::Off | TunnelChoice::Gtunnel => {
+            unreachable!("Off and Gtunnel handled above")
+        }
         TunnelChoice::Cloudflared => {
             // Logs live under the shared tunnel record, not this env's log
             // dir — the tunnel is machine-wide and may outlive this boot.
@@ -209,20 +327,48 @@ mod tests {
     #[test]
     fn choose_tunnel_ngrok_wins_over_cloudflared() {
         assert_eq!(
-            choose_tunnel(CloudflaredModeArg::Off, NgrokModeArg::Off),
+            choose_tunnel(
+                CloudflaredModeArg::Off,
+                NgrokModeArg::Off,
+                GtunnelModeArg::Off
+            ),
             TunnelChoice::Off
         );
         assert_eq!(
-            choose_tunnel(CloudflaredModeArg::On, NgrokModeArg::Off),
+            choose_tunnel(
+                CloudflaredModeArg::On,
+                NgrokModeArg::Off,
+                GtunnelModeArg::Off
+            ),
             TunnelChoice::Cloudflared
         );
         assert_eq!(
-            choose_tunnel(CloudflaredModeArg::Off, NgrokModeArg::On),
+            choose_tunnel(
+                CloudflaredModeArg::Off,
+                NgrokModeArg::On,
+                GtunnelModeArg::Off
+            ),
             TunnelChoice::Ngrok
         );
         assert_eq!(
-            choose_tunnel(CloudflaredModeArg::On, NgrokModeArg::On),
+            choose_tunnel(
+                CloudflaredModeArg::On,
+                NgrokModeArg::On,
+                GtunnelModeArg::Off
+            ),
             TunnelChoice::Ngrok
+        );
+    }
+
+    #[test]
+    fn choose_tunnel_selects_gtunnel_when_only_it_is_on() {
+        assert_eq!(
+            choose_tunnel(
+                CloudflaredModeArg::Off,
+                NgrokModeArg::Off,
+                GtunnelModeArg::On
+            ),
+            TunnelChoice::Gtunnel
         );
     }
 

@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::DEMO_DEFAULT_TEAM;
-use crate::DEMO_DEFAULT_TENANT;
+use crate::DEFAULT_TEAM;
+use crate::DEFAULT_TENANT;
 use crate::runtime::NatsMode;
 
 #[derive(Parser)]
@@ -25,6 +25,10 @@ pub(crate) enum Command {
     Doctor(DoctorArgs),
     #[command(hide = true)]
     ResolveSecret(ResolveSecretArgs),
+    /// Internal: run the outbound tunnel agent. Spawned by the gtunnel provider;
+    /// reads its config (edge url, secret, target) from the environment.
+    #[command(name = "__tunnel-agent", hide = true)]
+    TunnelAgent,
 }
 
 #[derive(Parser, Clone)]
@@ -96,9 +100,9 @@ pub(crate) struct ResolveSecretArgs {
     /// Bundle root to resolve against.
     #[arg(long)]
     pub(crate) bundle: PathBuf,
-    #[arg(long, default_value = DEMO_DEFAULT_TENANT)]
+    #[arg(long, default_value = DEFAULT_TENANT)]
     pub(crate) tenant: String,
-    #[arg(long, default_value = DEMO_DEFAULT_TEAM)]
+    #[arg(long, default_value = DEFAULT_TEAM)]
     pub(crate) team: String,
     /// Canonical secrets:// URI to read.
     #[arg(long)]
@@ -135,6 +139,18 @@ pub(crate) struct StartArgs {
     ngrok: NgrokModeArg,
     #[arg(long)]
     ngrok_binary: Option<PathBuf>,
+    /// Greentic self-hosted tunnel (Cloudflare Worker + agent). Zero-config:
+    /// the Worker URL, tunnel id, and secret are resolved from defaults/env.
+    #[arg(long, value_enum, default_value_t = GtunnelModeArg::Off)]
+    gtunnel: GtunnelModeArg,
+    /// Override the Greentic Worker tunnel base URL (else GREENTIC_TUNNEL_WORKER_URL
+    /// or the built-in default).
+    #[arg(long)]
+    gtunnel_worker_url: Option<String>,
+    /// Override the tunnel id (else GREENTIC_TUNNEL_ID or a value derived from
+    /// tenant/team).
+    #[arg(long)]
+    gtunnel_tunnel_id: Option<String>,
     #[arg(long)]
     runner_binary: Option<PathBuf>,
     #[arg(long, value_enum, value_delimiter = ',')]
@@ -147,6 +163,11 @@ pub(crate) struct StartArgs {
     quiet: bool,
     #[arg(long, help = "Do not open the first web UI URL in the default browser")]
     no_browser: bool,
+    /// Open a webchat URL in the default browser after the listener starts.
+    /// `--open-webchat` opens the default bundle; `--open-webchat=BUNDLE_ID`
+    /// opens a specific bundle. `--no-browser` wins when both are given.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    open_webchat: Option<String>,
     #[arg(
         long,
         help = "Do not subscribe this runtime to its environment's update channel"
@@ -186,9 +207,9 @@ pub(crate) struct StopArgs {
     env: Option<String>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
-    #[arg(long, default_value = DEMO_DEFAULT_TENANT)]
+    #[arg(long, default_value = DEFAULT_TENANT)]
     tenant: String,
-    #[arg(long, default_value = DEMO_DEFAULT_TEAM)]
+    #[arg(long, default_value = DEFAULT_TEAM)]
     team: String,
 }
 
@@ -222,10 +243,17 @@ pub enum NgrokModeArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum GtunnelModeArg {
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum RestartTarget {
     All,
     Cloudflared,
     Ngrok,
+    Gtunnel,
     Nats,
     Gateway,
     Egress,
@@ -248,12 +276,20 @@ pub struct StartRequest {
     pub cloudflared_binary: Option<PathBuf>,
     pub ngrok: NgrokModeArg,
     pub ngrok_binary: Option<PathBuf>,
+    pub gtunnel: GtunnelModeArg,
+    pub gtunnel_worker_url: Option<String>,
+    pub gtunnel_tunnel_id: Option<String>,
     pub runner_binary: Option<PathBuf>,
     pub restart: Vec<RestartTarget>,
     pub log_dir: Option<PathBuf>,
     pub verbose: bool,
     pub quiet: bool,
     pub no_browser: bool,
+    /// Open a webchat URL in the default browser after the listener starts.
+    /// Empty string means the default bundle; a non-empty string targets a
+    /// specific bundle id. `None` means the flag was not passed at all.
+    /// `--no-browser` wins when both are given.
+    pub open_webchat: Option<String>,
     /// Kill switch for the updater, not a policy knob: skip the update poll
     /// loop and refuse `/v1/updates/notify` on this box. The environment's
     /// `update-channel.json` policy (`on_update` / `enabled`) is untouched, so
@@ -294,12 +330,16 @@ pub(crate) fn start_request_from_args(args: StartArgs, tunnel_explicit: bool) ->
         cloudflared_binary: args.cloudflared_binary,
         ngrok: args.ngrok,
         ngrok_binary: args.ngrok_binary,
+        gtunnel: args.gtunnel,
+        gtunnel_worker_url: args.gtunnel_worker_url,
+        gtunnel_tunnel_id: args.gtunnel_tunnel_id,
         runner_binary: args.runner_binary,
         restart: args.restart,
         log_dir: args.log_dir,
         verbose: args.verbose,
         quiet: args.quiet,
         no_browser: args.no_browser,
+        open_webchat: args.open_webchat,
         no_updates: args.no_updates,
         no_auto_restart: args.no_auto_restart,
         admin: args.admin,
@@ -356,6 +396,7 @@ pub(crate) fn normalize_args(raw_tail: Vec<String>) -> Vec<String> {
         "warmup",
         "doctor",
         "resolve-secret",
+        "__tunnel-agent",
     ];
     let mut first_pos = None;
     let mut skip_next_value = false;
@@ -442,6 +483,7 @@ pub(crate) fn restart_name(target: &RestartTarget) -> String {
         RestartTarget::All => "all",
         RestartTarget::Cloudflared => "cloudflared",
         RestartTarget::Ngrok => "ngrok",
+        RestartTarget::Gtunnel => "gtunnel",
         RestartTarget::Nats => "nats",
         RestartTarget::Gateway => "gateway",
         RestartTarget::Egress => "egress",
@@ -453,6 +495,39 @@ pub(crate) fn restart_name(target: &RestartTarget) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `start` and `stop` must land in the same tenant every other tool in
+    /// the fleet defaults to. This was `demo` while greentic-deployer and
+    /// greentic-setup used `default`, so a bundle bound by one and served by
+    /// the other sat in two namespaces — tolerated on a dev store, refused by
+    /// the Vault activation gate.
+    /// `stop` must look for the runtime state that `start` wrote. Its
+    /// `--tenant` defaulted to `demo` while the start path's runtime config
+    /// defaulted to... also `demo`, so they agreed — but both disagreed with
+    /// greentic-deployer and greentic-setup, which use `default`. Both ends
+    /// move together here; `start` carries no clap default of its own (its
+    /// tenant is `Option<String>`, resolved in `bundle_config`), so this
+    /// covers the two args that do.
+    #[test]
+    fn stop_defaults_to_the_fleet_tenant_not_demo() {
+        let cli = Cli::try_parse_from(["greentic-start", "stop"]).expect("stop parses");
+        let Command::Stop(args) = cli.command else {
+            panic!("did not parse as stop");
+        };
+        assert_eq!(args.tenant, "default");
+        assert_ne!(args.tenant, "demo");
+        assert_eq!(args.team, "default");
+    }
+
+    /// [`DEFAULT_TENANT`] is duplicated from `greentic_types::DEFAULT_TENANT`
+    /// because this crate is transitively pinned to greentic-types `=1.1.2`
+    /// (via `greentic-aw-runtime` -> `greentic-mcp-exec`). Pin the literal so
+    /// the copy cannot drift from the original while it has to exist.
+    #[test]
+    fn default_tenant_agrees_with_the_rest_of_the_fleet() {
+        assert_eq!(DEFAULT_TENANT, "default");
+        assert_eq!(DEFAULT_TEAM, "default");
+    }
 
     #[test]
     fn normalize_args_inserts_start_for_short_form() {
@@ -586,5 +661,36 @@ mod tests {
                 "--version".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn open_webchat_bare_flag_sets_empty_string() {
+        let cli = Cli::try_parse_from(["greentic-start", "start", "--open-webchat"]).unwrap();
+        let Command::Start(args) = cli.command else {
+            panic!("expected start");
+        };
+        let req = start_request_from_args(args, false);
+        assert_eq!(req.open_webchat.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn open_webchat_with_value_sets_bundle_id() {
+        let cli =
+            Cli::try_parse_from(["greentic-start", "start", "--open-webchat=my-bundle"]).unwrap();
+        let Command::Start(args) = cli.command else {
+            panic!("expected start");
+        };
+        let req = start_request_from_args(args, false);
+        assert_eq!(req.open_webchat.as_deref(), Some("my-bundle"));
+    }
+
+    #[test]
+    fn open_webchat_absent_is_none() {
+        let cli = Cli::try_parse_from(["greentic-start", "start"]).unwrap();
+        let Command::Start(args) = cli.command else {
+            panic!("expected start");
+        };
+        let req = start_request_from_args(args, false);
+        assert!(req.open_webchat.is_none());
     }
 }

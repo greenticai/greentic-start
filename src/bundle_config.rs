@@ -495,7 +495,7 @@ fn infer_target_from_resolved_file(path: &Path) -> anyhow::Result<Option<Resolve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CloudflaredModeArg, DEMO_DEFAULT_TEAM, NatsModeArg, NgrokModeArg};
+    use crate::{CloudflaredModeArg, DEFAULT_TEAM, NatsModeArg, NgrokModeArg};
 
     fn make_test_request(bundle: Option<&str>) -> StartRequest {
         StartRequest {
@@ -511,12 +511,16 @@ mod tests {
             cloudflared_binary: None,
             ngrok: NgrokModeArg::Off,
             ngrok_binary: None,
+            gtunnel: crate::GtunnelModeArg::Off,
+            gtunnel_worker_url: None,
+            gtunnel_tunnel_id: None,
             runner_binary: None,
             restart: Vec::new(),
             log_dir: None,
             verbose: false,
             quiet: false,
             no_browser: false,
+            open_webchat: None,
             no_updates: false,
             no_auto_restart: false,
             admin: false,
@@ -634,7 +638,7 @@ mod tests {
 
         let config = load_runtime_demo_config(&paths, &request).expect("config");
         assert_eq!(config.tenant, "default");
-        assert_eq!(config.team, DEMO_DEFAULT_TEAM);
+        assert_eq!(config.team, DEFAULT_TEAM);
     }
 
     #[test]

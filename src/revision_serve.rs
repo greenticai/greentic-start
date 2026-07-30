@@ -47,6 +47,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
 use greentic_types::ChannelMessageEnvelope;
+// Reply-shaping now delegates to `messaging_app::parse_envelopes`, which owns
+// the `ext_keys` writes; the constants are only referenced by tests here.
+#[cfg(test)]
 use greentic_types::messaging::extensions::ext_keys;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
@@ -64,12 +67,13 @@ use greentic_runner_host::{Activity, RunnerHost, WelcomeFlowHint};
 use greentic_deploy_spec::{
     DEFAULT_LISTEN_ADDR, EnvironmentHostConfig, UpdateAction, UpdateChannelConfig,
 };
+use greentic_deployer::cli::env_manifest::EnvManifest;
 use greentic_deployer::cli::updates::{self, ApplyUpdatesPayload, UpdatesGetPayload};
 use greentic_deployer::cli::{OpError, OpFlags, OpOutcome};
 use greentic_deployer::environment::{LocalFsStore, load_trust_root};
 use greentic_types::EnvId;
 use greentic_update::binswap;
-use greentic_update::plan::{select_binary, verify_update_plan};
+use greentic_update::plan::{plan_targets_env, select_binary, verify_update_plan};
 use greentic_update::staging::UpdatesRoot;
 use greentic_update::stream::{StreamError, build_stream_client, run_stream};
 
@@ -788,6 +792,73 @@ impl RevisionServer {
         self.state.slot.load().routing.dispatcher.counts()
     }
 
+    /// Swap in an activation that changed only env-derived routing, sharing the
+    /// live [`RunnerHost`] and dispatcher.
+    ///
+    /// This is the D2 fast path for changes that cannot touch revisions or
+    /// packs — `host_config.default_bundle`, messaging-endpoint ACLs, traffic
+    /// weights expressed purely in the environment. [`Self::reload`] would
+    /// rebuild the whole world for those: a fresh `RunnerHost` with every
+    /// revision's packs re-instantiated (WASM compile), plus a drain window in
+    /// which two complete hosts are resident.
+    ///
+    /// It is deliberately NOT a flag on [`Self::reload`]:
+    ///
+    /// - `reload` asserts every swap publishes a *fresh* dispatcher `Arc`,
+    ///   because `SlotLivenessProbe` uses `Arc::ptr_eq` to tell the old
+    ///   dispatcher from the live one while draining. This path wants the
+    ///   opposite — preserving the dispatcher is what keeps session pins and
+    ///   sticky cookies valid across the swap.
+    /// - No generation re-anchoring runs, for the same reason: no revision
+    ///   moved, so no deployment's stickiness may be invalidated.
+    /// - No drain is spawned and no drain window is needed. The superseded
+    ///   `Activation` shares both `Arc`s with the new one, so dropping it frees
+    ///   only the routing tables — the host is never duplicated.
+    ///
+    /// `build_routing` is handed the activation that is live *at swap time* and
+    /// returns the replacement routing. Taking a builder rather than a
+    /// pre-assembled `Activation` is what makes the fast path race-free: the
+    /// routing is derived, and the host carried forward, from one snapshot taken
+    /// under the reload lock, so there is no window in which a concurrent full
+    /// reload could leave the caller publishing routing bound to a host that is
+    /// already draining. `build_routing` runs under that lock, so it must stay
+    /// cheap — it is four table constructions, no I/O.
+    ///
+    /// Returns the report alongside the activation now serving, so the caller's
+    /// post-reload hook observes the same `(host, routing)` pair the server
+    /// does — matching [`Self::reload`], where the caller assembles it.
+    pub(crate) fn reload_routing_only(
+        &self,
+        build_routing: impl FnOnce(&Activation) -> RevisionIngressRouting,
+    ) -> (ReloadReport, Activation) {
+        // Same lock as `reload`, so a full reload cannot interleave between the
+        // snapshot below and the swap.
+        let _reload_guard = self.reload_lock.lock().expect("reload lock poisoned");
+        let prev = self.state.slot.load_full();
+        let new = Activation {
+            host: Arc::clone(&prev.host),
+            routing: Arc::new(build_routing(&prev)),
+        };
+        let published = new.clone();
+        let (new_deployments, new_revisions) = new.routing.dispatcher.counts();
+        let prev = self.state.slot.swap(Arc::new(new));
+        let (prev_deployments, prev_revisions) = prev.routing.dispatcher.counts();
+        // Dropping `prev` here is cheap and safe: it shares the host and the
+        // dispatcher with what is now live, so this releases the old routing
+        // tables only. In-flight requests hold their own `Arc<Activation>`
+        // snapshot and finish against it.
+        drop(prev);
+        (
+            ReloadReport {
+                prev_deployments,
+                prev_revisions,
+                new_deployments,
+                new_revisions,
+            },
+            published,
+        )
+    }
+
     /// Swap the live activation. Atomically replaces the slot so the next
     /// request reaches the new host + routing; every request that already
     /// snapshotted the previous activation (via [`ServeState::current`] at
@@ -1100,6 +1171,21 @@ async fn serve(
         return Ok(response);
     }
 
+    // `/chat` is the operator's "just open the chat" shortcut. When this
+    // environment's packs ship a webchat UI, forward there: that SPA is the
+    // real client (DirectLine, adaptive cards, tenant skins, i18n), while the
+    // built-in console below is a hand-rolled page driving the loopback
+    // `/workers/invoke` endpoint — strictly the lesser of the two, and kept
+    // only for environments that ship no UI at all.
+    //
+    // Checked before the console so the pack UI wins even when the operator
+    // set `gui_enabled: true`, and before deployment-route resolution for the
+    // same reason the console is: a broad `/`-prefix route binding would
+    // otherwise shadow the path.
+    if let Some(response) = try_chat_redirect_response(&path, &method, &state) {
+        return Ok(response);
+    }
+
     // Built-in webchat console: serve the static `/chat` page and its renderer
     // when the env has the GUI enabled. Short-circuited here — after probes,
     // before deployment-route resolution — so a broad `/`-prefix route binding
@@ -1180,6 +1266,7 @@ async fn serve(
     let user_header = header_str(req.headers(), "x-greentic-user");
     let session_header = header_str(req.headers(), "x-greentic-session");
     let endpoint_header = header_str(req.headers(), "x-greentic-messaging-endpoint-id");
+    let flow_header = header_str(req.headers(), "x-greentic-flow");
     // M1 IID.4d wrapper: collect routing-relevant request headers BEFORE
     // `read_body_limited` consumes `req`. The resolver uses these to give
     // header-discriminated providers (Telegram via secret-token) the same
@@ -1193,19 +1280,87 @@ async fn serve(
     let request_headers = collect_forwarded_request_headers(req.headers());
     let query_string = req.uri().query().map(str::to_string);
 
-    // Resolve the bound deployment + tenant before touching the body, so an
-    // unroutable request is rejected cheaply.
-    let (deployment_id, tenant) = activation
-        .routing
-        .deployment_routes
-        .resolve(host_header.as_deref(), &path)
-        .map(|(deployment_id, tenant)| (deployment_id, tenant.to_string()))
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::NOT_FOUND,
-                "no deployment is bound to this host and path",
-            )
-        })?;
+    // Webchat bundle routing: classify the path against the bundle/flow
+    // indices BEFORE the generic deployment resolve. A classified request
+    // pins dispatch to the target's deployment, uses the stripped path for
+    // static-route and provider-route matching, and threads the
+    // stream_url_prefix to the DirectLine streamUrl rewrite. Non-webchat
+    // requests fall through to the existing longest-prefix resolve unchanged.
+    let webchat_target = crate::webchat_routing::classify_webchat_path(
+        &path,
+        host_header.as_deref(),
+        &activation.routing.bundle_index,
+        &activation.routing.flow_index,
+        &activation.routing.deployment_routes,
+    );
+
+    // Which deployment did the classifier pick for this request, and off which
+    // activation? `activation_ptr` is the identity of the `Arc` the request was
+    // served from, so a run spanning a reload shows the exact request where the
+    // swap became visible — without it, "the routing is stale" and "the
+    // activation is stale" are indistinguishable from the outside, which is
+    // what made the reload defects in `plans/hot-reload-granularity.md` take
+    // three passes to pin down. `debug` because it is per-request.
+    if let Some(ref target) = webchat_target {
+        tracing::debug!(
+            path = %path,
+            tenant = %target.tenant,
+            bundle = %target.bundle_id,
+            flow = ?target.flow_id,
+            deployment = %target.deployment_id,
+            activation_ptr = ?Arc::as_ptr(&activation),
+            default_for_tenant = ?activation
+                .routing
+                .bundle_index
+                .default_for(&target.tenant)
+                .map(|(dep, bundle, reason)| format!("{bundle}/{dep} ({reason:?})")),
+            "webchat classify",
+        );
+    }
+
+    // When the classifier matched, the deployment, tenant, and effective path
+    // are pinned to the classified target. Otherwise the existing generic
+    // deployment resolve runs.
+    let (deployment_id, tenant, effective_path);
+    if let Some(ref target) = webchat_target {
+        deployment_id = target.deployment_id;
+        tenant = target.tenant.clone();
+        effective_path = target.stripped_path.clone();
+    } else if crate::webchat_routing::is_webchat_path(&path) {
+        // A webchat path the classifier declined must NOT fall through to the
+        // generic resolve. That resolve matches on `(host, path_prefix)` alone
+        // and hands back the *deployment's* tenant, so with the usual `/`
+        // prefix binding every unknown tenant matched something: a POST to
+        // `/v1/messaging/webchat/<any string>/token` minted a working
+        // DirectLine token against whichever deployment won the prefix match,
+        // under that deployment's tenant and secrets. The tenant segment was
+        // dead — unknown tenants failed open. greentic-start#454.
+        //
+        // The classifier declines when the tenant has no Active deployment,
+        // when the named bundle is not the tenant's, or when host admission
+        // fails. None of those is routable, so this is a 404.
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "no bundle is bound to this tenant and path",
+        ));
+    } else {
+        // Resolve the bound deployment + tenant before touching the body, so
+        // an unroutable request is rejected cheaply.
+        let resolved = activation
+            .routing
+            .deployment_routes
+            .resolve(host_header.as_deref(), &path)
+            .map(|(dep_id, t)| (dep_id, t.to_string()))
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "no deployment is bound to this host and path",
+                )
+            })?;
+        deployment_id = resolved.0;
+        tenant = resolved.1;
+        effective_path = path.clone();
+    }
 
     let body_bytes = read_body_limited(req).await.map_err(|_| {
         error_response(
@@ -1278,7 +1433,7 @@ async fn serve(
             return Some(hint);
         }
         let provider_type = activation.routing.http_routes.provider_type_for(
-            &path,
+            &effective_path,
             method.as_str(),
             deployment_id,
         )?;
@@ -1351,9 +1506,25 @@ async fn serve(
         && let Some(route_match) = activation
             .routing
             .static_routes
-            .match_request_for_revision(&path, &scope)
+            .match_request_for_revision(&effective_path, &scope)
     {
-        let response = crate::static_handler::serve_static_route_from_pack(&route_match, &path);
+        // Prefer the bundle-overlay serve path (disk assets + synthesized
+        // per-tenant config from the provider envelope) when the revision's
+        // extracted bundle is present on disk; this matches the legacy
+        // `--bundle` path and ensures setup-written `config/tenants/<t>.json`
+        // (and the operator's chosen skin) are actually served instead of
+        // 404-falling to `index.html`. Fall back to pack-only serving when no
+        // overlay root is found.
+        let response = match crate::static_handler::revision_bundle_root(route_match.descriptor) {
+            Some(bundle_root) => crate::static_handler::serve_static_route(
+                &route_match,
+                &bundle_root,
+                &effective_path,
+            ),
+            None => {
+                crate::static_handler::serve_static_route_from_pack(&route_match, &effective_path)
+            }
+        };
         return Ok(with_cors(response));
     }
 
@@ -1364,14 +1535,19 @@ async fn serve(
     // provider component decodes itself; forcing JSON parse here would
     // turn every non-JSON webhook into a 400 even though the provider
     // would have handled it correctly.
-    match admit_request(&activation.routing.http_routes, &scope, &path, &method) {
+    match admit_request(
+        &activation.routing.http_routes,
+        &scope,
+        &effective_path,
+        &method,
+    ) {
         Admission::ProviderRoute => {
             return dispatch_provider_route(
                 Arc::clone(&activation),
                 Arc::clone(&state),
                 &tenant,
                 &scope,
-                &path,
+                &effective_path,
                 method.as_str(),
                 query_string.as_deref(),
                 &request_headers,
@@ -1380,6 +1556,8 @@ async fn serve(
                 &identify_headers,
                 header_endpoint_id.as_deref(),
                 session_hint.as_deref(),
+                webchat_target.as_ref(),
+                flow_header.as_deref(),
             )
             .await;
         }
@@ -1835,10 +2013,45 @@ fn verify_signed_plan(
             "record-only verify: plan verification failed: {err}"
         )))
     })?;
-    if verified.plan.env_id.as_str() != env_id.as_str() {
+    check_plan_identity(
+        verified.plan.env_id.as_str(),
+        &verified.plan.target,
+        env_id.as_str(),
+    )
+}
+
+/// Both identity checks the stage path runs, in the same order: the plan must be
+/// addressed to this environment (exact match or the broadcast channel), and the
+/// signed target manifest must name the same environment as the plan header.
+///
+/// Split out of [`verify_signed_plan`] because it is the whole of the logic that
+/// can be tested without standing up a trust root and a DSSE-signed plan — the
+/// signature check above is the part that needs the scaffolding, and it is not
+/// what this change touches.
+///
+/// **Both checks are required, and the second only became so with `_`.** While
+/// addressing was exact equality, a plan whose header and manifest disagreed
+/// could never pass the first check, so the second was implied for free.
+/// Accepting the broadcast id breaks that implication: a `_` header carrying a
+/// manifest for some other environment passes addressing, and without the second
+/// check would be recorded as verified while `updates::get` rejects it — exactly
+/// the path divergence this function exists to prevent.
+fn check_plan_identity(plan_env: &str, target: &Value, local_env: &str) -> Result<(), NotifyError> {
+    if !plan_targets_env(plan_env, local_env) {
         return Err(NotifyError::Op(OpError::InvalidArgument(format!(
-            "record-only verify: plan targets env `{}`, not this environment",
-            verified.plan.env_id
+            "record-only verify: plan targets env `{plan_env}`, not this environment"
+        ))));
+    }
+    let manifest: EnvManifest = serde_json::from_value(target.clone()).map_err(|err| {
+        NotifyError::Op(OpError::InvalidArgument(format!(
+            "record-only verify: plan target is not a valid env-manifest: {err}"
+        )))
+    })?;
+    if manifest.environment.id != plan_env {
+        return Err(NotifyError::Op(OpError::InvalidArgument(format!(
+            "record-only verify: plan target manifest names env `{}`, but the plan header \
+             targets `{plan_env}`",
+            manifest.environment.id
         ))));
     }
     Ok(())
@@ -3468,22 +3681,118 @@ fn unwrap_pending_response(raw: &Value) -> &Value {
 
 fn activity_to_worker_message(activity: &Activity) -> WorkerInvokeMessage {
     let payload = unwrap_pending_response(activity.payload());
-    if let Some(card) = payload.get("renderedCard") {
+    // A rendered adaptive card can arrive nested rather than at the top level:
+    // a terminal `emit.response` node emits `{renderedCard: …}` directly, but a
+    // terminal node that is the adaptive-card component's `card` op (or any
+    // provider whose output is MCP/`result`-wrapped) nests it under
+    // `outputs`/`result`/`structured_content`/`payload`, or inside an array of
+    // per-node outputs. The legacy messaging path finds it by selecting the
+    // terminal envelope-compatible node output (`collect_transcript_outputs`)
+    // before `parse_envelopes`; the env/revision path has no transcript, so
+    // deep-walk the in-process reply for it here. Checking only the top level
+    // (the previous behaviour) dropped these cards to a generic `"activity"`
+    // with no card and no text, which the webchat encoder then renders as the
+    // "webchat universal payload" placeholder.
+    if let Some(card) = find_rendered_card(payload) {
         WorkerInvokeMessage {
             kind: "adaptive-card".to_string(),
-            payload: card.clone(),
+            payload: card,
         }
     } else if payload.get("text").is_some() {
         WorkerInvokeMessage {
             kind: "text".to_string(),
             payload: payload.clone(),
         }
+    } else if let Some(text) = flow_error_reply_text(payload) {
+        // A failed flow lifts `metadata.error_kind`/`error_message` onto the
+        // reply. Surface a categorized, user-safe message (the same classifier
+        // the legacy messaging path uses) as text, instead of dropping the raw
+        // error envelope to a generic activity — which is what rendered the
+        // WeatherAPI "API key is invalid" failure as a blank "universal payload"
+        // rather than telling the user their credentials need attention.
+        WorkerInvokeMessage {
+            kind: "text".to_string(),
+            payload: serde_json::json!({ "text": text }),
+        }
     } else {
+        // Nothing recognizable — log the shape so a future drop of this class is
+        // diagnosable from the operator log rather than only visible as a blank
+        // "universal payload" reply in the channel.
+        operator_log::info(
+            module_path!(),
+            format!(
+                "env-path reply carried no card/text; forwarding as generic activity. \
+                 top-level keys: [{}]; payload={}",
+                match payload {
+                    Value::Object(map) => map.keys().cloned().collect::<Vec<_>>().join(", "),
+                    other => other.to_string().chars().take(80).collect(),
+                },
+                payload.to_string().chars().take(2000).collect::<String>(),
+            ),
+        );
         WorkerInvokeMessage {
             kind: "activity".to_string(),
             payload: payload.clone(),
         }
     }
+}
+
+/// Deep-search a flow reply for a rendered adaptive card, preferring the
+/// terminal (last) one when several are present.
+///
+/// The runner may hand the env/revision path a card at the top level (an
+/// `emit.response` node), nested under a node-output wrapper
+/// (`outputs`/`result`/`structured_content`/`payload`/`response` — e.g. the
+/// adaptive-card component's `card` op or an MCP-`result`-wrapped provider), or
+/// as one element of an array of per-node outputs. Recursion is confined to
+/// those known wrapper keys (and arrays) so an unrelated `renderedCard`-shaped
+/// value elsewhere in the payload is not mistaken for the reply card. Mirrors
+/// the legacy `messaging_app::parse_envelopes` renderedCard handling so the two
+/// reply paths stay in parity.
+fn find_rendered_card(value: &Value) -> Option<Value> {
+    const WRAPPER_KEYS: &[&str] = &[
+        "outputs",
+        "result",
+        "structured_content",
+        "payload",
+        "response",
+    ];
+    match value {
+        Value::Object(map) => {
+            if let Some(card) = map.get("renderedCard").filter(|c| !c.is_null()) {
+                return Some(card.clone());
+            }
+            WRAPPER_KEYS
+                .iter()
+                .find_map(|key| map.get(*key).and_then(find_rendered_card))
+        }
+        // Prefer the LAST array element that yields a card: the runner appends
+        // node outputs in execution order, so the terminal node's card wins.
+        Value::Array(items) => items.iter().rev().find_map(find_rendered_card),
+        _ => None,
+    }
+}
+
+/// A user-safe reply text for a failed flow, or `None` when the payload carries
+/// no flow error.
+///
+/// The runner ends a user-facing flow at its failure point by lifting
+/// `error_kind`/`error_message` onto the reply's `metadata`. Without this, the
+/// env/revision path dropped that envelope to a generic activity that the
+/// channel rendered as "universal payload" — hiding the real cause (e.g.
+/// WeatherAPI's `2006 "API key is invalid"`). Delegates categorization to the
+/// legacy messaging classifier so both paths return the same message.
+fn flow_error_reply_text(payload: &Value) -> Option<String> {
+    let metadata = payload.get("metadata").and_then(Value::as_object)?;
+    let kind = metadata
+        .get("error_kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message = metadata
+        .get("error_message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    crate::messaging_app::flow_error_user_message(kind, message)
 }
 
 /// Shape a worker-invoke payload for the flow engine's routing context.
@@ -3801,6 +4110,55 @@ const CHAT_HTML: &str = include_str!("../assets/chat.html");
 /// Vendored Adaptive Cards renderer the chat page loads from `/adaptivecards.min.js`.
 const ADAPTIVE_CARDS_JS: &str = include_str!("../assets/adaptivecards.min.js");
 
+/// `GET /chat` → `302` to the pack-provided webchat UI for the default bundle.
+///
+/// Returns `None` when `path` is not `/chat`, or when no pack in this
+/// environment ships a webchat UI — the caller then falls through to the
+/// built-in console, and past it to deployment routing, exactly as before.
+///
+/// **A redirect, not an internal rewrite.** The pack SPA locates itself from
+/// `window.location`: its bootstrap parses
+/// `/v1/web/webchat/{tenant}[/{bundle}[/{flow}]]` out of the path to pick its
+/// tenant, bundle, flow and DirectLine origin, and its `index.html` pulls
+/// scripts and styles by relative URL. Serving those bytes under `/chat` would
+/// hand the browser a page that can find neither its own assets nor its
+/// backend. The browser has to *be* at the webchat URL.
+///
+/// **`302` + `no-store`, never `301`.** The target is whichever bundle is the
+/// default right now, and a hot-reload can move it; a cached permanent
+/// redirect would pin browsers to a bundle the environment no longer serves.
+///
+/// **Not loopback-gated**, unlike the console it precedes. The console is
+/// gated because it drives the loopback-only `/workers/invoke` endpoint; this
+/// only points at a page the same listener already serves to any peer, so
+/// gating the alias would protect nothing the destination does not.
+fn try_chat_redirect_response(
+    path: &str,
+    method: &hyper::Method,
+    state: &ServeState,
+) -> Option<Response<Full<Bytes>>> {
+    if path != "/chat" {
+        return None;
+    }
+    // Resolved before the method check so a non-GET on an env with no pack UI
+    // still falls through to the console/routing behaviour it has today.
+    let target = crate::default_webchat_ui_path(&state.current().routing)?;
+    if *method != hyper::Method::GET {
+        return Some(error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "the webchat UI is served over GET",
+        ));
+    }
+    Some(
+        Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, target)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Full::new(Bytes::new()))
+            .expect("redirect response builder inputs are valid"),
+    )
+}
+
 /// Serve the built-in webchat console: `GET /chat` returns the HTML page and
 /// `GET /adaptivecards.min.js` returns the vendored renderer. A non-GET method
 /// on either path is a `405`. Returns `None` for any other path so the caller
@@ -4087,6 +4445,8 @@ async fn dispatch_provider_route(
     identify_headers: &[(String, String)],
     header_endpoint_id: Option<&str>,
     session_hint: Option<&str>,
+    webchat_target: Option<&crate::webchat_routing::WebchatTarget>,
+    flow_header: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
     let Some(route_match) = activation
         .routing
@@ -4165,9 +4525,13 @@ async fn dispatch_provider_route(
                 || norm_path.ends_with("/conversations"))
         {
             crate::conv_dedup::extract_user_id(body).map(|user_id| crate::conv_dedup::DedupKey {
+                deployment_id,
                 tenant: route_tenant.clone(),
                 team: route_team.clone(),
                 user_id,
+                flow_hint: webchat_target
+                    .and_then(|t| t.flow_id.clone())
+                    .or_else(|| flow_header.map(str::to_string)),
             })
         } else {
             None
@@ -4270,6 +4634,60 @@ async fn dispatch_provider_route(
         },
     )
     .await?;
+
+    // Flow targeting: a URL-derived flow_id (from the webchat classifier) or an
+    // `X-Greentic-Flow` header names the flow directly; with neither, a webchat
+    // request targets the bundle's default flow. Validate against the FlowIndex;
+    // an unknown flow id warns and falls back to normal selection (fail open).
+    //
+    // This target is stamped on the activity as `(pack_id, flow_id)` rather than
+    // carried only as a `WelcomeFlowHint`, because the runner resolves the flow
+    // BEFORE it consults the hint: a bundle with more than one messaging flow
+    // fails resolution with "flow type messaging is ambiguous" and never reaches
+    // the hint. See `dispatch_provider_events`.
+    let flow_target = {
+        let url_flow_id = webchat_target.and_then(|t| t.flow_id.as_deref());
+        let bundle_id_str = scope.bundle_id.as_str();
+        let named = url_flow_id.or(flow_header).and_then(|flow_id| {
+            activation
+                .routing
+                .flow_index
+                .pack_id_for_flow(bundle_id_str, flow_id)
+                .map(|pack_id| WelcomeFlowHint {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                })
+                .or_else(|| {
+                    tracing::warn!(
+                        flow_id,
+                        bundle_id = bundle_id_str,
+                        "URL/header flow hint does not match any known flow in this bundle; \
+                         falling back to the bundle's default flow",
+                    );
+                    None
+                })
+        });
+        // No flow named, or the named one is unknown: fall back to the bundle's
+        // default flow. "Fail open" has to mean the default flow, not "leave it
+        // to the runner" — the runner's own fallback matches on `flow_type`,
+        // which is ambiguous for exactly the multi-flow bundles this targeting
+        // exists for. Only the webchat classifier's own routes get this; a
+        // generic provider webhook keeps the runner's resolution untouched.
+        named.or_else(|| {
+            webchat_target?;
+            activation
+                .routing
+                .flow_index
+                .default_flow_for_bundle(bundle_id_str)
+                .map(|(pack_id, flow_id)| WelcomeFlowHint {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                })
+        })
+    };
+    // An explicitly targeted flow also overrides the endpoint's configured
+    // welcome_flow on first contact.
+    let welcome_hint = flow_target.clone().or(welcome_hint);
 
     let http_in = build_provider_http_in(
         &provider_type,
@@ -4377,6 +4795,7 @@ async fn dispatch_provider_route(
                 pipeline_provider,
                 ingress_envelopes,
                 endpoint_id,
+                flow_target,
                 welcome_hint,
                 pipeline_notifier,
             )
@@ -4415,7 +4834,11 @@ async fn dispatch_provider_route(
                     .await;
             }
 
-            rewrite_stream_url(&dl_headers, &mut response);
+            rewrite_stream_url(
+                &dl_headers,
+                &mut response,
+                webchat_target.and_then(super::webchat_routing::WebchatTarget::url_bundle_segment),
+            );
 
             // Cache the post-rewrite response for conversation dedup.
             if let Some(key) = dl_dedup_key {
@@ -4452,15 +4875,49 @@ async fn run_provider_inbound_pipeline(
     provider_type: String,
     envelopes: Vec<ChannelMessageEnvelope>,
     endpoint_id: Option<String>,
+    flow_target: Option<WelcomeFlowHint>,
     welcome_hint: Option<WelcomeFlowHint>,
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
 ) {
     for ingress in &envelopes {
+        // Per-envelope flow targeting: if the envelope carries a
+        // `flow_hint` metadata key (the provider echoing back the flow the
+        // conversation was opened against), validate it against the FlowIndex
+        // and override the request-level target. Unknown flow ids warn and
+        // fall back to the request-level target (fail open).
+        let envelope_target = ingress
+            .metadata
+            .get("flow_hint")
+            .and_then(|flow_id| {
+                let flow_id = flow_id.trim();
+                if flow_id.is_empty() {
+                    return None;
+                }
+                let bid = bundle_id.as_str();
+                if let Some(pid) = activation.routing.flow_index.pack_id_for_flow(bid, flow_id) {
+                    Some(WelcomeFlowHint {
+                        pack_id: pid.to_string(),
+                        flow_id: flow_id.to_string(),
+                    })
+                } else {
+                    tracing::warn!(
+                        flow_id,
+                        bundle_id = bid,
+                        "envelope flow_hint metadata does not match any known flow; \
+                         falling back to request-level hint",
+                    );
+                    None
+                }
+            })
+            .or_else(|| flow_target.clone());
+        let envelope_hint = envelope_target.clone().or_else(|| welcome_hint.clone());
+
         let activity = envelope_to_activity(
             ingress,
             &tenant,
             endpoint_id.as_deref(),
-            welcome_hint.clone(),
+            envelope_hint,
+            envelope_target,
         );
         let replies = match activation
             .host
@@ -4487,31 +4944,34 @@ async fn run_provider_inbound_pipeline(
         };
 
         for reply in replies {
-            let reply_envelope = build_reply_envelope(ingress, &reply);
-            match run_reply_egress(
-                &activation,
-                &tenant,
-                deployment_id,
-                bundle_id.clone(),
-                revision_id,
-                &pack_id,
-                &provider_type,
-                &reply_envelope,
-            )
-            .await
-            {
-                Ok(send_outcome) => {
-                    try_notify_webchat_activity(notifier.as_ref(), &send_outcome).await;
-                }
-                Err(err) => {
-                    operator_log::error(
-                        module_path!(),
-                        format!(
-                            "provider {provider_type} egress failed for deployment \
-                             {deployment_id} revision {revision_id} (reply id={}): {err:#}",
-                            reply_envelope.id
-                        ),
-                    );
+            // One reply payload can fan out to several envelopes (e.g.
+            // `messages[]`), so ship each shaped envelope in turn.
+            for reply_envelope in build_reply_envelopes(ingress, &reply, &pack_id, &tenant) {
+                match run_reply_egress(
+                    &activation,
+                    &tenant,
+                    deployment_id,
+                    bundle_id.clone(),
+                    revision_id,
+                    &pack_id,
+                    &provider_type,
+                    &reply_envelope,
+                )
+                .await
+                {
+                    Ok(send_outcome) => {
+                        try_notify_webchat_activity(notifier.as_ref(), &send_outcome).await;
+                    }
+                    Err(err) => {
+                        operator_log::error(
+                            module_path!(),
+                            format!(
+                                "provider {provider_type} egress failed for deployment \
+                                 {deployment_id} revision {revision_id} (reply id={}): {err:#}",
+                                reply_envelope.id
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -4694,23 +5154,16 @@ async fn try_notify_webchat_activity(
 /// (channel/session/to) from the ingress. Otherwise treat the payload as
 /// the reply text or wholesale `metadata` carrier and start from a
 /// clone of the ingress envelope.
-fn build_reply_envelope(
+fn build_reply_envelopes(
     ingress: &ChannelMessageEnvelope,
     reply: &Activity,
-) -> ChannelMessageEnvelope {
-    // Keys carried forward from the ingress envelope's metadata when the
-    // reply doesn't supply its own. Kept in sync with the legacy
-    // `messaging_app::base_reply_envelope` reset list.
-    const REPLY_METADATA_KEYS: &[&str] = &[
-        "env",
-        "tenant",
-        "team",
-        "route",
-        "locale",
-        "universal",
-        "autoStart",
-    ];
-
+    pack_id: &str,
+    tenant: &str,
+) -> Vec<ChannelMessageEnvelope> {
+    // A reply that is already a full envelope (some flows emit one directly) is
+    // passed through, repairing only the route fields from the ingress.
+    // `parse_envelopes` does not reconstruct a bare envelope, so keep this ahead
+    // of the shared shaper.
     if let Ok(mut envelope) =
         serde_json::from_value::<ChannelMessageEnvelope>(reply.payload().clone())
     {
@@ -4726,72 +5179,79 @@ fn build_reply_envelope(
         if envelope.id.is_empty() {
             envelope.id = uuid::Uuid::new_v4().to_string();
         }
-        return envelope;
+        return vec![envelope];
     }
 
-    let mut envelope = ingress.clone();
-    envelope.id = uuid::Uuid::new_v4().to_string();
-    envelope.from = None;
-    envelope.correlation_id = None;
-    envelope.reply_scope = None;
-    envelope.text = None;
-    envelope.attachments.clear();
-
-    let mut clean = std::collections::BTreeMap::new();
-    for key in REPLY_METADATA_KEYS {
-        if let Some(value) = envelope.metadata.remove(*key) {
-            clean.insert((*key).to_string(), value);
-        }
-    }
-    envelope.metadata = clean;
-
-    // Lift the flow reply's content via the same extractor the worker/chat
-    // path uses (`activity_to_worker_message`), so it handles the `session.wait`
-    // "pending" wrapper and `renderedCard` shape uniformly. An adaptive card
-    // goes into `metadata["adaptive_card"]` — where every provider's
-    // `resolve_adaptive_card` reads it — plus `extensions[ADAPTIVE_CARD]` for
-    // the typed pipeline; otherwise carry the reply text. Without the card lift,
-    // TierD providers (Telegram/Slack/WhatsApp/...) fall back to their
-    // "universal <provider> payload" placeholder instead of the card.
-    let message = activity_to_worker_message(reply);
-    match message.kind.as_str() {
-        "adaptive-card" => {
-            if let Ok(ac_json) = serde_json::to_string(&message.payload) {
-                envelope
-                    .metadata
-                    .insert("adaptive_card".to_string(), ac_json);
-            }
-            envelope
-                .extensions
-                .insert(ext_keys::ADAPTIVE_CARD.to_string(), message.payload);
-        }
-        "text" => {
-            if let Some(text) = message
-                .payload
-                .get("text")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                envelope.text = Some(text.to_string());
-            }
-        }
-        _ => {}
-    }
-
-    // Forward the reply's DirectLine passthrough fields (attachments /
-    // channelData / entities / suggestedActions / speak / inputHint / rag) into
-    // the outbound envelope's extensions, using the exact same mapping the
-    // legacy `messaging_app` path applies. The egress chain
-    // (`render_plan` → `encode` → `send_payload`) reads these from
-    // `extensions`; without this copy a rich reply reaches the provider as
-    // text only and attachments/channelData/entities are dropped. Operates on
-    // the pending-unwrapped payload so it matches the content lift above.
-    crate::messaging_app::copy_directline_passthrough(
-        unwrap_pending_response(reply.payload()),
-        &mut envelope,
+    // Unwrap the `session.wait` "pending" wrapper, then sign any OAuth Connect
+    // card `state` (the host knows pack/tenant/team) so /oauth/callback can
+    // resolve pack-scoped creds — the legacy messaging path does both before
+    // shaping.
+    let mut value = unwrap_pending_response(reply.payload()).clone();
+    let team = ingress
+        .metadata
+        .get("team")
+        .map(String::as_str)
+        .unwrap_or("default");
+    crate::messaging_app::augment_oauth_connect_state(
+        &mut value,
+        pack_id,
+        tenant,
+        team,
+        (!ingress.session_id.is_empty()).then_some(ingress.session_id.as_str()),
     );
 
-    envelope
+    // The legacy path selects the terminal node's output — which carries
+    // `renderedCard` at its top level — from the transcript via
+    // `collect_transcript_outputs` BEFORE calling `parse_envelopes`. The
+    // in-process reply has no transcript, and the adaptive-card `card` op nests
+    // its `renderedCard` under the runner's output wrapper
+    // (`outputs`/`result`/`structured_content`/…). `parse_envelopes` only reads
+    // a TOP-LEVEL `renderedCard`, so without this the nested card would be
+    // shaped as a JSON text dump. Hoist it — this is the env-path analog of the
+    // legacy transcript selection.
+    if value.get("renderedCard").is_none_or(|c| c.is_null())
+        && let Some(card) = find_rendered_card(&value)
+        && let Value::Object(map) = &mut value
+    {
+        map.insert("renderedCard".to_string(), card);
+    }
+
+    // Delegate content shaping to the SINGLE shared shaper. This is the whole
+    // point of the consolidation: the env/revision path now handles exactly the
+    // shapes the legacy path does (typed/nested adaptive cards,
+    // `messages[]`/`events[]` multi-reply, `result` text, flow-error
+    // categorization, DirectLine passthrough) instead of a hand-rolled subset
+    // that dropped unrecognised shapes to a "universal payload" placeholder.
+    match crate::messaging_app::parse_envelopes(&value, ingress) {
+        Ok(envelopes) if !envelopes.is_empty() => envelopes
+            .into_iter()
+            .map(|mut envelope| {
+                // Give each reply its own id — some `parse_envelopes` branches
+                // clone the ingress, whose id is the inbound request's.
+                if envelope.id.is_empty() || envelope.id == ingress.id {
+                    envelope.id = uuid::Uuid::new_v4().to_string();
+                }
+                envelope
+            })
+            .collect(),
+        // Nothing shapeable → deliver nothing, exactly as the legacy messaging
+        // path does (`run_app_flow` returns the `parse_envelopes` error and no
+        // reply is sent). Logged so a genuinely-dropped reply is diagnosable.
+        Ok(_) => {
+            operator_log::info(
+                module_path!(),
+                "flow reply produced no deliverable envelope",
+            );
+            Vec::new()
+        }
+        Err(err) => {
+            operator_log::info(
+                module_path!(),
+                format!("flow reply could not be shaped into an envelope: {err:#}"),
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Collect every request header into `(name_lowercase, value_utf8)` pairs
@@ -4865,6 +5325,7 @@ fn envelope_to_activity(
     fallback_tenant: &str,
     endpoint_id: Option<&str>,
     welcome_hint: Option<WelcomeFlowHint>,
+    flow_target: Option<WelcomeFlowHint>,
 ) -> Activity {
     // Serialize the whole envelope as the activity payload so the flow engine
     // sees BOTH `entry.text` and `entry.metadata.*`. `build_routing_context`
@@ -4902,6 +5363,16 @@ fn envelope_to_activity(
     }
     if let Some(hint) = welcome_hint {
         activity = activity.with_welcome_flow_hint(hint);
+    }
+    // Resolve the flow by key, not by type. The runner picks the flow from
+    // `(pack_id, flow_id)` when both are set and only falls back to matching
+    // on `flow_type` — which is `messaging` for every flow here — when they
+    // are absent. A bundle whose app pack ships more than one messaging flow
+    // is unresolvable by type, so without this the request fails before the
+    // welcome hint is ever read. A resumed conversation still wins over this:
+    // the runner prefers its wait snapshot's flow.
+    if let Some(target) = flow_target {
+        activity = activity.with_pack(target.pack_id).with_flow(target.flow_id);
     }
     activity
 }
@@ -5103,7 +5574,20 @@ fn apply_directline_forward_plan_to_response(
 /// to an absolute `ws://` URL using the request's `Host` header. DirectLineJS
 /// requires an absolute URL on the WebSocket constructor; a relative path
 /// makes the SDK fall back to HTTP polling.
-fn rewrite_stream_url(headers: &[(String, String)], response: &mut IngressHttpResponse) {
+///
+/// When `bundle_segment` is `Some`, it is spliced in directly before
+/// `/v3/directline` so the resulting WS URL routes back through the same
+/// bundle on reconnect. The splice point matters: the provider composes this
+/// URL from the path it was handed, so it may already carry the tenant-scoped
+/// prefix (`/v1/messaging/webchat/{tenant}/v3/directline/...`) rather than the
+/// bare `/v3/directline/...` form. Prefixing the whole bundle-scoped path onto
+/// the former would double it. When `None` the output is byte-identical to the
+/// pre-bundle-routing behavior.
+fn rewrite_stream_url(
+    headers: &[(String, String)],
+    response: &mut IngressHttpResponse,
+    bundle_segment: Option<&str>,
+) {
     let Some(body_bytes) = response.body.as_ref() else {
         return;
     };
@@ -5130,29 +5614,97 @@ fn rewrite_stream_url(headers: &[(String, String)], response: &mut IngressHttpRe
     // the browser. Derive the scheme from X-Forwarded-Proto rather than the
     // container's own (always-plain-HTTP) listener.
     let scheme = crate::startup_contract::forwarded_ws_scheme(headers);
-    let absolute = format!("{scheme}://{host}{relative}");
+    let absolute = match bundle_segment {
+        Some(segment) => match relative.find("/v3/directline") {
+            Some(idx) => format!(
+                "{scheme}://{host}{}{segment}{}",
+                &relative[..idx],
+                &relative[idx..]
+            ),
+            None => format!("{scheme}://{host}{segment}{relative}"),
+        },
+        None => format!("{scheme}://{host}{relative}"),
+    };
     body_json["streamUrl"] = serde_json::Value::String(absolute);
     if let Ok(rewritten) = serde_json::to_vec(&body_json) {
         response.body = Some(rewritten);
     }
 }
 
+/// Forward an upstream `429` to the client instead of collapsing it into the
+/// `502` used for genuine upstream breakage.
+///
+/// The webchat provider's token rate limiter answers with
+/// `{"error":"rate_limited","message":…,"retry_after":N}`. That is backpressure
+/// aimed at the CLIENT, and `429` is the one status every HTTP client already
+/// knows how to back off on — a browser handed `502` has no reason to retry at
+/// all, so a transient rate limit reads as a broken deployment.
+///
+/// `Retry-After` comes from the upstream header when it sets one, and otherwise
+/// from the body's `retry_after` (seconds), which is what the provider actually
+/// sends today. The upstream body is forwarded verbatim so the client keeps the
+/// machine-readable `error` code.
+fn rate_limited_response(response: &IngressHttpResponse) -> Response<Full<Bytes>> {
+    let header_value = |name: &str| {
+        response
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    let body = response.body.clone().unwrap_or_default();
+    let retry_after = header_value("retry-after").or_else(|| {
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()?
+            .get("retry_after")
+            .and_then(serde_json::Value::as_u64)
+            .map(|secs| secs.to_string())
+    });
+    let mut builder = Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(
+            header::CONTENT_TYPE,
+            header_value("content-type").unwrap_or_else(|| "application/json".to_string()),
+        );
+    if let Some(secs) = retry_after {
+        builder = builder.header(header::RETRY_AFTER, secs);
+    }
+    // Both forwarded header values are upstream data; an invalid one fails the
+    // builder rather than panicking, and the client still gets a 429.
+    builder
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_else(|_| {
+            error_response(StatusCode::TOO_MANY_REQUESTS, "token rate limit exceeded")
+        })
+}
+
 /// Validate a `POST /tokens/generate` response: the body must be JSON with a
 /// non-empty `token` field. Returns an error response on failure so the
-/// upstream gets a clear `502` instead of a malformed token.
+/// upstream gets a clear `502` instead of a malformed token — except for a
+/// `429`, which is forwarded (see [`rate_limited_response`]).
 #[allow(clippy::result_large_err)]
 fn validate_token_response(response: &IngressHttpResponse) -> Result<(), Response<Full<Bytes>>> {
     let body = response.body.as_deref().unwrap_or_default();
     if !(200..300).contains(&response.status) {
+        let preview = String::from_utf8_lossy(body)
+            .chars()
+            .take(500)
+            .collect::<String>();
+        // A rate limit is expected backpressure, not a failure: logging it at
+        // `error` turns one burst of concurrent conversations into hundreds of
+        // error lines that look like an outage.
+        if response.status == 429 {
+            operator_log::warn(
+                module_path!(),
+                format!("[webchat directline] token request rate limited: {preview}"),
+            );
+            return Err(rate_limited_response(response));
+        }
         operator_log::error(
             module_path!(),
             format!(
-                "[webchat directline] token request failed status={} body={}",
+                "[webchat directline] token request failed status={} body={preview}",
                 response.status,
-                String::from_utf8_lossy(body)
-                    .chars()
-                    .take(500)
-                    .collect::<String>()
             ),
         );
         return Err(error_response(
@@ -5334,25 +5886,55 @@ async fn handle_websocket_upgrade(
     let activation = state.current();
     let host_header = header_str(req.headers(), header::HOST.as_str());
 
+    // Strip bundle/flow segments from the WebSocket path so the
+    // deployment resolve and provider-type lookup see the tenant-scoped
+    // form they expect. The stripped path is used for all downstream
+    // matching; the original path already yielded the conversation id
+    // above (position-independent extraction).
+    let stripped = crate::webchat_routing::strip_webchat_bundle_segments(
+        path,
+        &activation.routing.bundle_index,
+        &activation.routing.flow_index,
+    );
+    let effective_ws_path = stripped.as_deref().unwrap_or(path);
+
     // Resolve deployment + tenant from the path so we know which env's
     // secrets to read the signing key from.
-    let (deployment_id, tenant) = activation
-        .routing
-        .deployment_routes
-        .resolve(host_header.as_deref(), path)
-        .map(|(deployment_id, tenant)| (deployment_id, tenant.to_string()))
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::NOT_FOUND,
-                "no deployment is bound to this host and path",
-            )
-        })?;
+    //
+    // A bundle-scoped stream path must resolve to ITS OWN deployment, not
+    // whichever one the generic prefix match happens to return: the REST
+    // conversation-create pinned this conversation under the bundle's
+    // deployment id, and sibling bundles in one env share both the tenant and
+    // the `/` path prefix, so resolving the stripped path here would pick an
+    // arbitrary sibling and the pin lookup below would miss with a 404.
+    let (deployment_id, tenant) = match crate::webchat_routing::classify_webchat_path(
+        path,
+        host_header.as_deref(),
+        &activation.routing.bundle_index,
+        &activation.routing.flow_index,
+        &activation.routing.deployment_routes,
+    ) {
+        Some(target) => (target.deployment_id, target.tenant),
+        None => activation
+            .routing
+            .deployment_routes
+            .resolve(host_header.as_deref(), effective_ws_path)
+            .map(|(deployment_id, tenant)| (deployment_id, tenant.to_string()))
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "no deployment is bound to this host and path",
+                )
+            })?,
+    };
 
-    // Resolve the provider_type for this path so we can read its signing key.
+    // Resolve the provider_type using the stripped path so the lookup
+    // matches the tenant-scoped provider route pattern even when the
+    // original URL carried extra bundle/flow segments.
     let provider_type = activation
         .routing
         .http_routes
-        .provider_type_for(path, "GET", deployment_id)
+        .provider_type_for(effective_ws_path, "GET", deployment_id)
         .ok_or_else(|| {
             error_response(
                 StatusCode::NOT_FOUND,
@@ -5613,6 +6195,86 @@ mod tests {
     }
 
     #[test]
+    fn activity_to_worker_message_finds_nested_rendered_card() {
+        // Regression for the "webchat universal payload" bug: a terminal node
+        // that is the adaptive-card component's `card` op (not `emit.response`)
+        // nests `renderedCard` under the runner's output wrapper. The previous
+        // top-level-only check dropped it to a generic `"activity"`, so the
+        // webchat encoder rendered the placeholder instead of the card. Each of
+        // these shapes must resolve back to the card.
+        let card = json!({ "type": "AdaptiveCard", "version": "1.6" });
+
+        // Nested under `outputs`.
+        let a = Activity::custom(
+            "response",
+            json!({ "outputs": { "renderedCard": card.clone() } }),
+        );
+        assert_eq!(activity_to_worker_message(&a).kind, "adaptive-card");
+        assert_eq!(activity_to_worker_message(&a).payload, card);
+
+        // Nested under the MCP `result.structured_content` wrapper.
+        let b = Activity::custom(
+            "response",
+            json!({ "result": { "structured_content": { "renderedCard": card.clone() } } }),
+        );
+        assert_eq!(activity_to_worker_message(&b).payload, card);
+
+        // An array of per-node outputs — the terminal (last) card wins.
+        let earlier = json!({ "type": "AdaptiveCard", "version": "1.0" });
+        let c = Activity::custom(
+            "response",
+            json!([
+                { "outputs": { "renderedCard": earlier } },
+                { "outputs": { "renderedCard": card.clone() } },
+            ]),
+        );
+        assert_eq!(activity_to_worker_message(&c).payload, card);
+    }
+
+    #[test]
+    fn activity_to_worker_message_surfaces_flow_errors_as_text() {
+        // A failed flow lifts `metadata.error_kind`/`error_message` onto the
+        // reply. It must surface as a categorized user message (text), not fall
+        // through to a generic "activity" that the channel renders as the blank
+        // "universal payload" placeholder. The WeatherAPI "API key is invalid"
+        // case is the regression: an `api key` signal → the auth-category
+        // message, so the user learns their credentials need attention.
+        let reply = Activity::custom(
+            "response",
+            json!({
+                "metadata": {
+                    "error_kind": "flow_execution_failed",
+                    "error_message": "component weatherapi_current failed: MCP_TOOL_ERROR: {\"error\":{\"code\":2006,\"message\":\"API key is invalid.\"}}",
+                    "flow_id": "flow_get_weather"
+                }
+            }),
+        );
+        let msg = activity_to_worker_message(&reply);
+        assert_eq!(msg.kind, "text");
+        let text = msg
+            .payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            text.to_ascii_lowercase().contains("authentication"),
+            "an invalid-API-key failure must surface as an auth message, got: {text}"
+        );
+        assert_ne!(text, "webchat universal payload");
+    }
+
+    #[test]
+    fn find_rendered_card_ignores_unrelated_keys() {
+        // A reply with no card anywhere stays cardless (falls through to text or
+        // generic activity), and recursion doesn't invent a card from unrelated
+        // keys that merely nest objects.
+        let no_card = json!({ "meta": { "foo": { "bar": 1 } }, "n": 7 });
+        assert!(find_rendered_card(&no_card).is_none());
+        // A null renderedCard is treated as absent.
+        assert!(find_rendered_card(&json!({ "renderedCard": null })).is_none());
+    }
+
+    #[test]
     fn build_activity_plumbs_messaging_endpoint_id() {
         let payload = json!({ "text": "hello" });
         let activity = build_activity(
@@ -5692,14 +6354,7 @@ mod tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: env_id.clone(),
             name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id,
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            host_config: EnvironmentHostConfig::new(env_id),
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
             extensions: Vec::new(),
@@ -6097,14 +6752,7 @@ mod tests {
             schema: SchemaVersion::new(SchemaVersion::ENVIRONMENT_V1),
             environment_id: env_id.clone(),
             name: "local".to_string(),
-            host_config: EnvironmentHostConfig {
-                env_id,
-                region: None,
-                tenant_org_id: None,
-                listen_addr: None,
-                public_base_url: None,
-                gui_enabled: None,
-            },
+            host_config: EnvironmentHostConfig::new(env_id),
             packs: Vec::new(),
             messaging_endpoints: vec![endpoint],
             extensions: Vec::new(),
@@ -6358,7 +7006,7 @@ mod tests {
             "metadata": {},
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback", None, None);
+        let activity = envelope_to_activity(&envelope, "fallback", None, None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.session_id(), Some("sess-1"));
         assert_eq!(activity.user(), Some("u1"));
@@ -6386,7 +7034,7 @@ mod tests {
             "metadata": {},
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback", None, None);
+        let activity = envelope_to_activity(&envelope, "fallback", None, None, None);
         assert_eq!(activity.tenant(), Some("acme"));
         assert_eq!(activity.session_id(), None);
     }
@@ -6416,7 +7064,7 @@ mod tests {
             },
         }))
         .expect("envelope");
-        let activity = envelope_to_activity(&envelope, "fallback", None, None);
+        let activity = envelope_to_activity(&envelope, "fallback", None, None, None);
         let entry = activity.payload();
         // `response.action` resolves from `entry.metadata.action`.
         assert_eq!(
@@ -6457,10 +7105,60 @@ mod tests {
             pack_id: "welcome-pack".to_string(),
             flow_id: "welcome-flow".to_string(),
         };
-        let activity =
-            envelope_to_activity(&envelope, "fallback", Some("ep-legal"), Some(hint.clone()));
+        let activity = envelope_to_activity(
+            &envelope,
+            "fallback",
+            Some("ep-legal"),
+            Some(hint.clone()),
+            None,
+        );
         assert_eq!(activity.messaging_endpoint_id(), Some("ep-legal"));
         assert_eq!(activity.welcome_flow_hint(), Some(&hint));
+        assert_eq!(
+            (activity.pack_id(), activity.flow_id()),
+            (None, None),
+            "a welcome hint alone must NOT pin the activity's flow — the runner \
+             gates it on first contact, so pinning would route every turn to it",
+        );
+    }
+
+    #[test]
+    fn envelope_to_activity_pins_flow_by_key_for_an_explicit_target() {
+        // A URL-named flow (`/{tenant}/{bundle}/{flow}`) must reach the runner
+        // as `(pack_id, flow_id)`, not only as a welcome hint. `resolve_flow_id`
+        // runs BEFORE the hint is consulted and matches on `flow_type`, which is
+        // `messaging` for every flow in the bundle: a pack with two messaging
+        // flows fails with "flow type messaging is ambiguous" before the hint
+        // can select one.
+        let envelope: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-1",
+            "tenant": {
+                "env": "dev",
+                "tenant": "acme",
+                "tenant_id": "acme",
+                "attempt": 0,
+            },
+            "channel": "webchat",
+            "session_id": "sess-1",
+            "from": { "id": "u1", "kind": "user" },
+            "text": "hello",
+            "metadata": {},
+        }))
+        .expect("envelope");
+        let target = WelcomeFlowHint {
+            pack_id: "twoflow-demo".to_string(),
+            flow_id: "on_escalate".to_string(),
+        };
+        let activity = envelope_to_activity(
+            &envelope,
+            "fallback",
+            Some("ep-webchat"),
+            Some(target.clone()),
+            Some(target.clone()),
+        );
+        assert_eq!(activity.pack_id(), Some("twoflow-demo"));
+        assert_eq!(activity.flow_id(), Some("on_escalate"));
+        assert_eq!(activity.welcome_flow_hint(), Some(&target));
     }
 
     #[test]
@@ -6486,7 +7184,10 @@ mod tests {
         .expect("ingress envelope");
 
         let reply = Activity::text("hello back");
-        let envelope = build_reply_envelope(&ingress, &reply);
+        let envelope = build_reply_envelopes(&ingress, &reply, "pack", "acme")
+            .into_iter()
+            .next()
+            .expect("one reply envelope");
 
         // Route fields preserved.
         assert_eq!(envelope.session_id, "chat-42");
@@ -6527,7 +7228,10 @@ mod tests {
 
         // Direct `renderedCard` shape.
         let reply = Activity::custom("response", json!({ "renderedCard": card.clone() }));
-        let envelope = build_reply_envelope(&ingress, &reply);
+        let envelope = build_reply_envelopes(&ingress, &reply, "pack", "acme")
+            .into_iter()
+            .next()
+            .expect("one reply envelope");
         let stored: Value = serde_json::from_str(
             envelope
                 .metadata
@@ -6551,7 +7255,10 @@ mod tests {
             "response",
             json!({ "status": "pending", "response": { "renderedCard": card.clone() } }),
         );
-        let envelope = build_reply_envelope(&ingress, &pending);
+        let envelope = build_reply_envelopes(&ingress, &pending, "pack", "acme")
+            .into_iter()
+            .next()
+            .expect("one reply envelope");
         let stored: Value = serde_json::from_str(
             envelope
                 .metadata
@@ -6601,7 +7308,10 @@ mod tests {
         });
         let reply = Activity::custom("messaging", reply_payload);
 
-        let envelope = build_reply_envelope(&ingress, &reply);
+        let envelope = build_reply_envelopes(&ingress, &reply, "pack", "acme")
+            .into_iter()
+            .next()
+            .expect("one reply envelope");
         assert_eq!(envelope.session_id, "chat-7");
         assert_eq!(envelope.channel, "telegram");
         assert_eq!(envelope.to.len(), 1);
@@ -6645,7 +7355,10 @@ mod tests {
             }),
         );
 
-        let envelope = build_reply_envelope(&ingress, &reply);
+        let envelope = build_reply_envelopes(&ingress, &reply, "pack", "acme")
+            .into_iter()
+            .next()
+            .expect("one reply envelope");
 
         // Text still lifted.
         assert_eq!(
@@ -6671,6 +7384,99 @@ mod tests {
         assert!(
             !envelope.extensions.contains_key(ext_keys::ADAPTIVE_CARD),
             "card rides inside forwarded attachments; no separate lift"
+        );
+    }
+
+    #[test]
+    fn build_reply_envelopes_delegates_to_shared_shaper_and_fans_out_multi_reply() {
+        // The env/revision path now delegates to `messaging_app::parse_envelopes`
+        // — the same shaper the legacy `--bundle` path uses — so it gains the
+        // shapes the old hand-rolled env-path dropped to "universal payload":
+        // typed adaptive cards and `messages[]` multi-reply. Parity guard: if a
+        // bespoke shortcut is ever reintroduced that bypasses the shared shaper,
+        // this fails.
+        let ingress: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-in-parity",
+            "tenant": { "env": "dev", "tenant": "acme", "tenant_id": "acme", "attempt": 0 },
+            "channel": "webchat-gui",
+            "session_id": "conv-p",
+            "to": [{ "id": "room-1", "kind": "room" }],
+            "text": "hi",
+        }))
+        .expect("ingress envelope");
+        let card = json!({ "type": "AdaptiveCard", "version": "1.6" });
+
+        // (a) Typed `{type:"adaptive_card"}` — previously dropped by the env-path.
+        let typed = Activity::custom(
+            "response",
+            json!({ "type": "adaptive_card", "card": card.clone() }),
+        );
+        let envs = build_reply_envelopes(&ingress, &typed, "pack", "acme");
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].extensions.get(ext_keys::ADAPTIVE_CARD), Some(&card));
+
+        // (b) `messages[]` multi-reply — previously collapsed to a single reply.
+        let multi = Activity::custom(
+            "response",
+            json!({ "messages": [ { "text": "first" }, { "text": "second" } ] }),
+        );
+        let envs = build_reply_envelopes(&ingress, &multi, "pack", "acme");
+        assert_eq!(
+            envs.len(),
+            2,
+            "messages[] must fan out to one envelope each"
+        );
+        let texts: Vec<_> = envs.iter().filter_map(|e| e.text.as_deref()).collect();
+        assert!(texts.contains(&"first") && texts.contains(&"second"));
+
+        // (c) Parity: the env-path result equals calling the shared shaper
+        // directly, modulo the fresh reply id the env-path assigns.
+        let value = json!({ "renderedCard": card.clone() });
+        let direct = crate::messaging_app::parse_envelopes(&value, &ingress).expect("parse");
+        let via_env = build_reply_envelopes(
+            &ingress,
+            &Activity::custom("response", value.clone()),
+            "pack",
+            "acme",
+        );
+        assert_eq!(direct.len(), via_env.len());
+        assert_eq!(
+            direct[0].metadata.get("adaptive_card"),
+            via_env[0].metadata.get("adaptive_card"),
+        );
+    }
+
+    #[test]
+    fn build_reply_envelopes_hoists_nested_card_before_shaping() {
+        // Regression guard for the consolidation: the adaptive-card `card` op
+        // nests `renderedCard` under the runner's output wrapper, and
+        // `parse_envelopes` only reads a TOP-LEVEL `renderedCard`. Without the
+        // hoist the nested card would be shaped as a JSON text dump instead of
+        // an adaptive card — the exact failure the deep-walk selection prevents.
+        let ingress: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-in-nested",
+            "tenant": { "env": "dev", "tenant": "acme", "tenant_id": "acme", "attempt": 0 },
+            "channel": "webchat-gui",
+            "session_id": "conv-n",
+            "to": [{ "id": "room-1", "kind": "room" }],
+            "text": "hi",
+        }))
+        .expect("ingress envelope");
+        let card = json!({ "type": "AdaptiveCard", "version": "1.5" });
+        let reply = Activity::custom(
+            "response",
+            json!({ "result": { "structured_content": { "renderedCard": card.clone() } } }),
+        );
+        let envs = build_reply_envelopes(&ingress, &reply, "pack", "acme");
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].extensions.get(ext_keys::ADAPTIVE_CARD),
+            Some(&card),
+            "a nested renderedCard must be shaped as an adaptive card, not text"
+        );
+        assert!(
+            envs[0].text.is_none(),
+            "no text bubble when a card is present"
         );
     }
 
@@ -6856,14 +7662,9 @@ mod tests {
     // they don't race the other listen-addr/env tests in the crate.
 
     fn host_cfg_with(addr: Option<SocketAddr>) -> EnvironmentHostConfig {
-        EnvironmentHostConfig {
-            env_id: greentic_types::EnvId::new("local").unwrap(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: addr,
-            public_base_url: None,
-            gui_enabled: None,
-        }
+        let mut hc = EnvironmentHostConfig::new(greentic_types::EnvId::new("local").unwrap());
+        hc.listen_addr = addr;
+        hc
     }
 
     struct EnvVarGuard {
@@ -6930,6 +7731,8 @@ mod tests {
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
             }),
         }
     }
@@ -7065,6 +7868,251 @@ mod tests {
             Some("application/javascript; charset=utf-8"),
         );
         assert!(!body_string(js).is_empty());
+    }
+
+    /// An `Activation` whose environment ships a pack webchat UI on
+    /// `(tenant, bundle_id)` — the shape `/chat` must forward into.
+    fn activation_with_pack_webchat_ui(tenant: &str, bundle_id: &str) -> Activation {
+        activation_with_indexed_bundle(tenant, bundle_id, true)
+    }
+
+    /// The same environment with its bundle INDEXED but shipping no webchat
+    /// static route — the shape `/chat` must NOT forward into.
+    fn activation_with_bundle_but_no_webchat_ui(tenant: &str, bundle_id: &str) -> Activation {
+        activation_with_indexed_bundle(tenant, bundle_id, false)
+    }
+
+    fn activation_with_indexed_bundle(
+        tenant: &str,
+        bundle_id: &str,
+        with_webchat_ui: bool,
+    ) -> Activation {
+        let base = empty_activation(tenant);
+        let (env, deployment_id) = crate::test_fixtures::env_with_active_bundle(tenant, bundle_id);
+        let deployment_routes =
+            crate::deployment_routes::DeploymentRouteTable::from_environment(&env);
+        let bundle_index =
+            crate::webchat_routing::BundleIndex::from_routes_and_env(&deployment_routes, &env);
+        let routes = if with_webchat_ui {
+            vec![crate::static_routes::StaticRouteDescriptor {
+                route_id: "webchat-gui".to_string(),
+                pack_id: "messaging-webchat-gui".to_string(),
+                pack_path: std::path::PathBuf::from("packs/messaging-webchat-gui.gtpack"),
+                public_path: "/v1/web/webchat/{tenant}".to_string(),
+                source_root: "assets/webchat-gui".to_string(),
+                index_file: Some("index.html".to_string()),
+                spa_fallback: Some("index.html".to_string()),
+                tenant_scoped: true,
+                team_scoped: false,
+                cache_strategy: crate::static_routes::CacheStrategy::None,
+                route_segments: Vec::new(),
+                scope: Some(crate::http_routes::RevisionScope {
+                    deployment_id,
+                    bundle_id: greentic_deploy_spec::BundleId::new(bundle_id),
+                    revision_id: greentic_deploy_spec::RevisionId::new(),
+                }),
+            }]
+        } else {
+            Vec::new()
+        };
+        let plan = crate::static_routes::StaticRoutePlan {
+            routes,
+            ..Default::default()
+        };
+        Activation {
+            host: std::sync::Arc::clone(&base.host),
+            routing: std::sync::Arc::new(RevisionIngressRouting {
+                dispatcher: std::sync::Arc::clone(&base.routing.dispatcher),
+                http_routes: HttpRouteTable::from_descriptors(Vec::new()),
+                deployment_routes,
+                endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+                deployment_config_overrides: std::sync::Arc::default(),
+                static_routes: crate::static_routes::ActiveRouteTable::from_plan(&plan),
+                bundle_index,
+                flow_index: crate::webchat_routing::FlowIndex::default(),
+            }),
+        }
+    }
+
+    fn state_with_pack_webchat_ui(tenant: &str, bundle_id: &str, gui_enabled: bool) -> ServeState {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut state = empty_state(tenant, bound);
+        state.gui_enabled = gui_enabled;
+        state
+            .slot
+            .store(std::sync::Arc::new(activation_with_pack_webchat_ui(
+                tenant, bundle_id,
+            )));
+        state
+    }
+
+    #[test]
+    fn chat_forwards_to_the_pack_webchat_ui_for_the_default_bundle() {
+        let state = state_with_pack_webchat_ui("acme", "hr-chat", false);
+        let response = try_chat_redirect_response("/chat", &hyper::Method::GET, &state)
+            .expect("a redirect when the env ships a webchat UI");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            // Bundle-scoped default-bundle URL (Fix B): `/chat` forwards to the
+            // same bundle-specific page the boot banner advertises, not the bare
+            // (now unadvertised, ambiguous) `/{tenant}/` shorthand.
+            Some("/v1/web/webchat/acme/hr-chat/"),
+        );
+        // The body must be empty; the page lives at the target, not here.
+        assert!(body_string(response).is_empty());
+    }
+
+    /// The regression that motivated the change: `gui_enabled: true` used to
+    /// mean "serve the hand-rolled console", so an operator who wanted a
+    /// browser tier got the lesser client even with a real SPA deployed.
+    #[test]
+    fn chat_forwards_to_the_pack_ui_even_when_the_console_is_enabled() {
+        let state = state_with_pack_webchat_ui("acme", "hr-chat", true);
+        let response = try_chat_redirect_response("/chat", &hyper::Method::GET, &state)
+            .expect("the pack UI must win over the built-in console");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/v1/web/webchat/acme/hr-chat/"),
+        );
+    }
+
+    /// `301` would be cached by the browser forever, pinning it to a bundle a
+    /// later hot-reload may no longer serve.
+    #[test]
+    fn chat_forward_is_temporary_and_uncached() {
+        let state = state_with_pack_webchat_ui("acme", "hr-chat", false);
+        let response =
+            try_chat_redirect_response("/chat", &hyper::Method::GET, &state).expect("a redirect");
+        assert_ne!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+        );
+    }
+
+    #[test]
+    fn chat_does_not_forward_when_no_pack_ships_a_webchat_ui() {
+        // No static routes at all: the built-in console is the only browser
+        // tier this env has, so the redirect must decline and let it serve.
+        let state = empty_state("local", "127.0.0.1:8080".parse().unwrap());
+        assert!(try_chat_redirect_response("/chat", &hyper::Method::GET, &state).is_none());
+        // …and the console still answers on that same path.
+        let page = try_chat_asset_response("/chat", &hyper::Method::GET).expect("console page");
+        assert_eq!(page.status(), StatusCode::OK);
+    }
+
+    /// The case the test above only appeared to cover: it uses `empty_state`,
+    /// whose bundle index is EMPTY, so the forward declined because there was no
+    /// bundle to name — not because the env ships no UI. Index a bundle and keep
+    /// the static routes empty and the real rule is exercised: an environment
+    /// with deployments but no `/v1/web/webchat` route used to hand out a `302`
+    /// to `/v1/web/webchat/{tenant}/`, which no static route matches, so the
+    /// browser landed on the generic ingress and read
+    /// `405 only POST is supported for the generic revision ingress` — after the
+    /// boot banner told the operator to open `/chat`.
+    #[test]
+    fn chat_does_not_forward_when_bundles_are_indexed_but_ship_no_webchat_ui() {
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let mut state = empty_state("acme", bound);
+        state.gui_enabled = true;
+        state.slot.store(std::sync::Arc::new(
+            activation_with_bundle_but_no_webchat_ui("acme", "hr-chat"),
+        ));
+        // Sanity: the bundle IS indexed, so a `None` below cannot be the
+        // "nothing to name" escape the previous test relied on.
+        assert!(
+            !state
+                .current()
+                .routing
+                .bundle_index
+                .tenants_and_bundles()
+                .is_empty(),
+            "fixture must index a bundle or this proves nothing"
+        );
+        assert!(
+            try_chat_redirect_response("/chat", &hyper::Method::GET, &state).is_none(),
+            "no pack ships a webchat UI — /chat must fall through to the console"
+        );
+        let page = try_chat_asset_response("/chat", &hyper::Method::GET).expect("console page");
+        assert_eq!(page.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn chat_forward_claims_no_other_path() {
+        let state = state_with_pack_webchat_ui("acme", "hr-chat", true);
+        for path in ["/", "/chat/", "/chatter", "/adaptivecards.min.js", "/livez"] {
+            assert!(
+                try_chat_redirect_response(path, &hyper::Method::GET, &state).is_none(),
+                "`{path}` must not be claimed by the /chat forward"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_forward_rejects_non_get() {
+        let state = state_with_pack_webchat_ui("acme", "hr-chat", false);
+        let response = try_chat_redirect_response("/chat", &hyper::Method::POST, &state)
+            .expect("405 for non-GET");
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// Wiring, not logic: the unit tests above call the forward directly, so
+    /// they pass just as well if `serve()` consults it AFTER the console. Drive
+    /// a real listener with BOTH the console enabled and a pack UI deployed —
+    /// the console would answer `200 text/html` on this exact path, so the
+    /// status alone separates "forward runs first" from "forward is dead code".
+    #[test]
+    fn chat_forward_runs_before_the_console_on_a_live_listener() {
+        use std::io::{Read, Write};
+
+        let server = RevisionServer::start(RevisionServeConfig {
+            bind_addr: "127.0.0.1:17820".parse::<SocketAddr>().unwrap(),
+            activation: std::sync::Arc::new(activation_with_pack_webchat_ui("acme", "hr-chat")),
+            gui_enabled: true,
+            trust_loopback_peers: true,
+            admin_bind_addr: None,
+            updates_enabled: false,
+            auto_restart_enabled: false,
+            exe_path: None,
+            public_url_capture: None,
+        })
+        .expect("start server");
+
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", server.actual_port()))
+            .expect("connect to listener");
+        stream
+            .write_all(b"GET /chat HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("write request");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).expect("read response");
+        let response = String::from_utf8_lossy(&buf);
+
+        assert!(
+            response.starts_with("HTTP/1.1 302"),
+            "expected a 302 forward, got: {}",
+            response.lines().next().unwrap_or_default()
+        );
+        assert!(
+            response
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("location: /v1/web/webchat/acme/hr-chat/")),
+            "no Location header for the pack UI in: {response}"
+        );
+        assert!(
+            !response.contains("<title>Greentic"),
+            "the built-in console page was served instead of the forward"
+        );
     }
 
     #[test]
@@ -7409,7 +8457,7 @@ mod tests {
                 .unwrap(),
             ),
         };
-        rewrite_stream_url(&headers, &mut response);
+        rewrite_stream_url(&headers, &mut response, None);
         let body: serde_json::Value =
             serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
         assert_eq!(
@@ -7438,7 +8486,7 @@ mod tests {
                 .unwrap(),
             ),
         };
-        rewrite_stream_url(&headers, &mut response);
+        rewrite_stream_url(&headers, &mut response, None);
         let body: serde_json::Value =
             serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
         assert_eq!(
@@ -7462,12 +8510,66 @@ mod tests {
                 .unwrap(),
             ),
         };
-        rewrite_stream_url(&headers, &mut response);
+        rewrite_stream_url(&headers, &mut response, None);
         let body: serde_json::Value =
             serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
         assert_eq!(
             body["streamUrl"], original_url,
             "already-absolute streamUrl must not be touched"
+        );
+    }
+
+    #[test]
+    fn rewrite_stream_url_with_bundle_prefix() {
+        let headers = vec![("Host".to_string(), "example.com".to_string())];
+        let mut response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "conversationId": "abc123",
+                    "streamUrl": "/v3/directline/conversations/abc123/stream?t=TOKEN"
+                }))
+                .unwrap(),
+            ),
+        };
+        rewrite_stream_url(&headers, &mut response, Some("/hr-chat"));
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["streamUrl"],
+            "ws://example.com/hr-chat/v3/directline/conversations/abc123/stream?t=TOKEN",
+            "bundle-scoped streamUrl must include the bundle segment"
+        );
+    }
+
+    #[test]
+    fn rewrite_stream_url_splices_bundle_into_tenant_scoped_path() {
+        // The shape the shipping webchat provider actually returns: already
+        // tenant-scoped, not the bare `/v3/directline/...` form. Prefixing the
+        // whole bundle-scoped path here would emit
+        // `/v1/messaging/webchat/default/legal/v1/messaging/webchat/default/v3/...`,
+        // a URL that resolves to no route and silently drops the SPA back to
+        // HTTP polling.
+        let headers = vec![("Host".to_string(), "127.0.0.1:8080".to_string())];
+        let mut response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "conversationId": "abc123",
+                    "streamUrl": "/v1/messaging/webchat/default/v3/directline/conversations/abc123/stream?watermark=-1&t=TOKEN"
+                }))
+                .unwrap(),
+            ),
+        };
+        rewrite_stream_url(&headers, &mut response, Some("/legal"));
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["streamUrl"],
+            "ws://127.0.0.1:8080/v1/messaging/webchat/default/legal/v3/directline/conversations/abc123/stream?watermark=-1&t=TOKEN",
+            "the bundle segment belongs before /v3/directline, not in front of an already tenant-scoped path"
         );
     }
 
@@ -7528,6 +8630,86 @@ mod tests {
         assert!(
             validate_token_response(&response).is_err(),
             "a non-2xx status must be rejected even if the body has a token"
+        );
+    }
+
+    /// D4 regression: the provider's token rate limiter must reach the client
+    /// as a `429` with `Retry-After`, not as a `502`.
+    ///
+    /// Reproduced live 2026-07-25 on a 2-bundle env: 40 concurrent DirectLine
+    /// conversations tripped the webchat provider's token limiter, which
+    /// answered `429 {"error":"rate_limited","retry_after":38}`. Every one of
+    /// those was reported to the client as
+    /// `502 invalid directline token response` — a status no client retries —
+    /// so a recoverable 38-second backoff looked like a dead deployment. (The
+    /// runtime did recover on its own once the window elapsed; the wedge that
+    /// `plans/hot-reload-granularity.md` D4 describes was this, misread.)
+    ///
+    /// MUTATION PROOF: delete the `response.status == 429` branch in
+    /// `validate_token_response` and this fails with `status 502, want 429`.
+    #[test]
+    fn validate_token_response_forwards_rate_limit_with_retry_after() {
+        let response = IngressHttpResponse {
+            status: 429,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "error": "rate_limited",
+                    "message": "token rate limit exceeded",
+                    "retry_after": 38
+                }))
+                .unwrap(),
+            ),
+        };
+        let err = validate_token_response(&response)
+            .expect_err("a 429 is still not a usable token response");
+        assert_eq!(
+            err.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "status {}, want 429 — a rate limit is client backpressure, not a gateway failure",
+            err.status()
+        );
+        assert_eq!(
+            err.headers()
+                .get(header::RETRY_AFTER)
+                .map(|v| v.to_str().unwrap_or_default()),
+            Some("38"),
+            "Retry-After must carry the provider's `retry_after` so the client knows how long to wait"
+        );
+    }
+
+    /// An explicit upstream `Retry-After` header wins over the body field.
+    #[test]
+    fn validate_token_response_prefers_upstream_retry_after_header() {
+        let response = IngressHttpResponse {
+            status: 429,
+            headers: vec![("Retry-After".to_string(), "5".to_string())],
+            body: Some(serde_json::to_vec(&serde_json::json!({"retry_after": 38})).unwrap()),
+        };
+        let err = validate_token_response(&response).expect_err("429 is an error response");
+        assert_eq!(
+            err.headers()
+                .get(header::RETRY_AFTER)
+                .map(|v| v.to_str().unwrap_or_default()),
+            Some("5"),
+            "the upstream header is authoritative when present"
+        );
+    }
+
+    /// A 429 with no `retry_after` anywhere still forwards as a 429 — the
+    /// client just gets no hint. It must not fall back to 502.
+    #[test]
+    fn validate_token_response_forwards_rate_limit_without_retry_hint() {
+        let response = IngressHttpResponse {
+            status: 429,
+            headers: vec![],
+            body: Some(b"slow down".to_vec()),
+        };
+        let err = validate_token_response(&response).expect_err("429 is an error response");
+        assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            err.headers().get(header::RETRY_AFTER).is_none(),
+            "no hint available, so no header — not a fabricated one"
         );
     }
 
@@ -7886,6 +9068,112 @@ mod tests {
         // The next reader sees the new activation; counts come from the same
         // dispatcher `/status` reads.
         assert_eq!(server.counts(), (1, 2));
+    }
+
+    /// D2, the whole point: a routing-only reload replaces the routing tables
+    /// and keeps the *same* `RunnerHost` allocation.
+    ///
+    /// The host is not merely expensive to rebuild (every revision's packs get
+    /// re-instantiated, WASM compile included) — it OWNS every revision's
+    /// session and state store, which `activate_runtime_config` constructs
+    /// fresh. So a full reload silently discards every live conversation. That
+    /// is D1: reproduced 2026-07-25 by flipping `default_bundle` under load,
+    /// where a DirectLine turn whose `POST /activities` coincided with the swap
+    /// never received its reply and burned its whole poll budget. Preserving the
+    /// host allocation is what makes the flip invisible to conversations.
+    ///
+    /// The dispatcher must be preserved too: `reload` re-anchors per-deployment
+    /// generations, which invalidates sticky cookies and pins. Nothing moved, so
+    /// nothing may be invalidated.
+    ///
+    /// MUTATION PROOF: make the builder in `reload_routing_only` construct a
+    /// fresh dispatcher (or route the call through `reload`) and this fails on
+    /// the host or dispatcher assertion.
+    #[tokio::test]
+    async fn reload_routing_only_preserves_host_and_dispatcher() {
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(empty_state("env-1", bound));
+        let server = server_for_test(std::sync::Arc::clone(&state));
+        server.reload(populated_activation("env-1", 2), Duration::ZERO);
+
+        let before = state.current();
+
+        let (report, published) = server.reload_routing_only(|live| RevisionIngressRouting {
+            // Exactly what `revision_boot::reactivate_routing_only` does with
+            // the pack- and revision-derived half.
+            dispatcher: std::sync::Arc::clone(&live.routing.dispatcher),
+            http_routes: live.routing.http_routes.clone(),
+            static_routes: live.routing.static_routes.clone(),
+            flow_index: live.routing.flow_index.clone(),
+            // …and rebuilds the env-derived half.
+            deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+            endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+            deployment_config_overrides: std::sync::Arc::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+        });
+
+        let after = state.current();
+        assert!(
+            std::sync::Arc::ptr_eq(&before.host, &after.host),
+            "the RunnerHost must be the SAME allocation — rebuilding it drops \
+             every revision's session and state store, abandoning live conversations"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&before.routing.dispatcher, &after.routing.dispatcher),
+            "the dispatcher must be preserved so session pins and sticky cookies stay valid"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&before.routing, &after.routing),
+            "the routing tables must actually have been replaced"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&published.host, &after.host),
+            "the returned activation must be the one now serving, so the caller's \
+             post-reload hook observes what the server does"
+        );
+        // Nothing moved, so the counts are unchanged on both sides.
+        assert_eq!(
+            (report.prev_deployments, report.prev_revisions),
+            (report.new_deployments, report.new_revisions),
+            "a routing-only reload cannot change the deployment or revision count"
+        );
+        assert_eq!(server.counts(), (1, 2));
+    }
+
+    /// A request that snapshotted the activation before a routing-only swap
+    /// keeps serving against it, exactly as it does across a full reload.
+    #[tokio::test]
+    async fn reload_routing_only_leaves_inflight_snapshot_intact() {
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(empty_state("env-1", bound));
+        let server = server_for_test(std::sync::Arc::clone(&state));
+        server.reload(populated_activation("env-1", 1), Duration::ZERO);
+
+        let inflight = state.current();
+        let inflight_ptr = std::sync::Arc::as_ptr(&inflight) as usize;
+
+        server.reload_routing_only(|live| RevisionIngressRouting {
+            dispatcher: std::sync::Arc::clone(&live.routing.dispatcher),
+            http_routes: live.routing.http_routes.clone(),
+            static_routes: live.routing.static_routes.clone(),
+            flow_index: live.routing.flow_index.clone(),
+            deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+            endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+            deployment_config_overrides: std::sync::Arc::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+        });
+
+        assert_ne!(
+            std::sync::Arc::as_ptr(&state.current()) as usize,
+            inflight_ptr,
+            "the next reader must see the new activation"
+        );
+        // The in-flight snapshot still resolves through the host it started on
+        // — which is also the live one, since the swap shared it.
+        assert!(
+            std::sync::Arc::ptr_eq(&inflight.host, &state.current().host),
+            "sharing the host is what lets an in-flight turn finish across the swap"
+        );
     }
 
     #[tokio::test]
@@ -8427,6 +9715,7 @@ mod tests {
             http_routes: HttpRouteTable::from_descriptors(Vec::new()),
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::from_parts(vec![(
                 deployment_id,
+                greentic_deploy_spec::BundleId::new("test"),
                 tenant.to_string(),
                 Vec::new(),
                 Vec::new(),
@@ -8434,6 +9723,8 @@ mod tests {
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: std::sync::Arc::default(),
             static_routes: crate::static_routes::ActiveRouteTable::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+            flow_index: crate::webchat_routing::FlowIndex::default(),
         });
         let activation = Activation {
             host: base.host,
@@ -9350,6 +10641,60 @@ mod update_notify_tests {
         }
     }
 
+    fn manifest_for(id: &str) -> serde_json::Value {
+        serde_json::json!({"schema": "greentic.env-manifest.v1", "environment": {"id": id}})
+    }
+
+    #[test]
+    fn record_only_accepts_a_broadcast_plan() {
+        // Plan addressed to the fleet channel, manifest agreeing: accepted by an
+        // environment with a different name. This is the point of the change.
+        check_plan_identity("_", &manifest_for("_"), "local").expect("broadcast plan is accepted");
+    }
+
+    #[test]
+    fn record_only_accepts_an_exactly_matching_plan() {
+        check_plan_identity("local", &manifest_for("local"), "local").expect("exact match");
+    }
+
+    #[test]
+    fn record_only_rejects_a_plan_for_another_env() {
+        // Widening to `_` must not widen to "any env id".
+        let err = check_plan_identity("other", &manifest_for("other"), "local")
+            .expect_err("foreign plan must be rejected");
+        assert!(format!("{err:?}").contains("other"), "got {err:?}");
+    }
+
+    #[test]
+    fn record_only_rejects_a_broadcast_header_with_a_named_manifest() {
+        // The divergence accepting `_` introduces: this passes addressing, and
+        // WITHOUT the manifest check would be recorded as verified here while
+        // `updates::get` rejects it. Regression guard for exactly that.
+        let err = check_plan_identity("_", &manifest_for("victim-env"), "local")
+            .expect_err("header/manifest disagreement must be rejected");
+        assert!(format!("{err:?}").contains("victim-env"), "got {err:?}");
+    }
+
+    #[test]
+    fn record_only_rejects_a_named_header_with_a_broadcast_manifest() {
+        let err = check_plan_identity("local", &manifest_for("_"), "local")
+            .expect_err("mirror-image disagreement must be rejected");
+        assert!(
+            format!("{err:?}").contains("manifest names env"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn record_only_rejects_a_malformed_target() {
+        let err = check_plan_identity("local", &serde_json::json!({"nope": 1}), "local")
+            .expect_err("malformed target must be rejected");
+        assert!(
+            format!("{err:?}").contains("not a valid env-manifest"),
+            "got {err:?}"
+        );
+    }
+
     #[test]
     fn update_channel_present_reflects_the_sidecar() {
         // The route only reserves `/v1/updates/notify` on envs that have run
@@ -9400,6 +10745,8 @@ mod binary_update_tests {
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
             }),
         }
     }
@@ -11736,6 +13083,7 @@ mod binary_update_tests {
 
         let deployment_routes = DeploymentRouteTable::from_parts(vec![(
             deployment_id,
+            greentic_deploy_spec::BundleId::new("test"),
             tenant.to_string(),
             Vec::new(),
             Vec::new(),
@@ -11790,6 +13138,8 @@ mod binary_update_tests {
                 endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
                 deployment_config_overrides: std::sync::Arc::default(),
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
             }),
         }
     }

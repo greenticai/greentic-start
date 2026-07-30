@@ -65,7 +65,7 @@ Crate version 1.2.0-dev.0, edition 2024, Rust 1.95.0 (pinned via `rust-toolchain
 | Runner host | `runner_host/`, `runner_exec.rs`, `runner_integration.rs` | Builds DemoRunnerHost over discovered packs, secrets, state stores. Supports in-process and external runner execution |
 | Startup contract | `startup_contract.rs` | Launch gating for bundles declaring `greentic.static-routes.v1`; resolves `PUBLIC_BASE_URL`, persists `startup_contract.json` |
 | Onboarding | `onboard/` | Provider listing, tenants/teams, deployment status, QA submit/spec/validate, webhook setup |
-| Secrets | `secrets_*.rs`, `secret_*.rs` | Backend selection (pack vs dev-store), secret URI handling, missing secret seeding |
+| Secrets | `secrets_*.rs`, `secret_*.rs` | Backend selection (pack vs dev-store), secret URI handling, missing secret seeding. **Read side of the setup↔start secret contract — see [docs/secrets-flow.md](docs/secrets-flow.md).** |
 | Services | `services/` | Individual service components: NATS, runner, components |
 | Subscriptions | `subscriptions_universal/` | Universal subscription runtime and persistence (e.g., Microsoft Graph) |
 | Revision engine | `revision_boot.rs`, `revision_serve.rs`, `revision_dispatcher.rs`, `revision_drain.rs`, `revision_pull.rs`, `revision_reload.rs`, `revision_pin.rs`, `revision_webhook_register.rs`, `revision_health_gate.rs` | Multi-revision hot-reload runtime (~20k LOC): boots revisions from env-store, dispatches ingress traffic to the active revision, drains old revisions, pulls remote bundles at startup, registers webhooks, and gates readiness |

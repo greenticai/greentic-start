@@ -252,6 +252,7 @@
   "cli.tunnel.option_none": "No tunnel (local only)",
   "cli.tunnel.option_cloudflared": "Cloudflare Tunnel (cloudflared)",
   "cli.tunnel.option_ngrok": "ngrok",
+  "cli.tunnel.option_gtunnel": "Greentic managed tunnel",
   "cli.tunnel.invalid_selection": "Invalid selection. Running without tunnel.",
   "cli.tunnel.selected_none": "Running without tunnel."
 }

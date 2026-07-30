@@ -31,6 +31,8 @@ mod domains;
 mod endpoint_admit;
 mod endpoint_resolver;
 mod env_tunnel;
+mod gtunnel;
+mod gtunnel_agent;
 // `pub` (doc-hidden) so `tests/threshold_watcher.rs` can drive
 // `select_target_flows` and the event-routing types directly.
 #[doc(hidden)]
@@ -123,6 +125,7 @@ mod topic_match;
 mod tunnel_prompt;
 mod tunnel_state;
 mod warmup;
+mod webchat_routing;
 mod webhook_secret_resolver;
 mod webhook_updater;
 mod websocket;
@@ -133,12 +136,28 @@ use cli_args::{
     Cli, Command, normalize_args, restart_name, start_request_from_args, stop_request_from_args,
 };
 pub use cli_args::{
-    CloudflaredModeArg, NatsModeArg, NgrokModeArg, RestartTarget, StartRequest, StopRequest,
+    CloudflaredModeArg, GtunnelModeArg, NatsModeArg, NgrokModeArg, RestartTarget, StartRequest,
+    StopRequest,
 };
 pub use seed_copy::seed_env_store_from;
 
-const DEMO_DEFAULT_TENANT: &str = "demo";
-const DEMO_DEFAULT_TEAM: &str = "default";
+/// Tenant assumed when the operator names none.
+///
+/// Must equal `greentic_types::DEFAULT_TENANT`. It is duplicated rather than
+/// imported because this crate is transitively pinned to greentic-types
+/// `=1.1.2`: `greentic-aw-runtime =1.1.6` pulls `greentic-mcp-exec =1.1.2`,
+/// which itself requires greentic-types `=1.1.2` exactly, so the pin cannot
+/// move until that agentic-worker graph is republished. `default_tenant_agrees
+/// _with_the_rest_of_the_fleet` guards the duplication; delete this constant in
+/// favour of the import once the pin is free.
+///
+/// Was `demo`, which disagreed with greentic-deployer and greentic-setup and
+/// produced environments serving deployments under two tenants — fine on a dev
+/// store, refused by the Vault activation gate.
+const DEFAULT_TENANT: &str = "default";
+/// Team assumed when the operator names none. See [`DEFAULT_TENANT`]; this half
+/// never diverged.
+const DEFAULT_TEAM: &str = "default";
 
 /// Default environment id when nothing is set. Flipped from `"dev"` to
 /// `"local"` as part of A4b — the `local` env is what `gtc setup` and
@@ -322,9 +341,9 @@ fn stop_env_runtime(env_dir: &std::path::Path, env_id: &str) -> anyhow::Result<(
 
 pub fn run_from_env() -> anyhow::Result<()> {
     let raw_tail: Vec<String> = std::env::args().skip(1).collect();
-    let tunnel_explicit = raw_tail
-        .iter()
-        .any(|a| a.starts_with("--cloudflared") || a.starts_with("--ngrok"));
+    let tunnel_explicit = raw_tail.iter().any(|a| {
+        a.starts_with("--cloudflared") || a.starts_with("--ngrok") || a.starts_with("--gtunnel")
+    });
     let args = normalize_args(raw_tail);
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
@@ -357,6 +376,9 @@ pub fn run_from_env() -> anyhow::Result<()> {
             strict: args.strict,
         }),
         Command::ResolveSecret(args) => run_resolve_secret(args),
+        Command::TunnelAgent => {
+            crate::gtunnel::agent_config_from_env().and_then(crate::gtunnel_agent::run)
+        }
         Command::Doctor(args) => {
             let has_errors = crate::doctor::run_doctor(args)?;
             if has_errors {
@@ -386,6 +408,24 @@ fn run_resolve_secret(args: cli_args::ResolveSecretArgs) -> anyhow::Result<()> {
         .block_on(async { handle.manager().read(&args.uri).await })
         .map_err(|err| anyhow!("resolve secret {}: {err}", args.uri))?;
     Ok(())
+}
+
+/// Whether the env-serve boot should default to a cloudflared tunnel so a
+/// messaging provider's inbound webhook can be auto-registered.
+///
+/// True only when the operator hasn't decided the tunnel themselves
+/// (`tunnel_explicit`, which also covers an explicit `--cloudflared off`),
+/// ngrok isn't already the chosen tunnel, a served provider needs an inbound
+/// webhook, and no public URL is already configured (a cloud env carries the
+/// deployer's `public_base_url`, so it never spawns a redundant quick tunnel).
+/// Pure so the policy is unit-tested without booting a server.
+fn should_default_messaging_tunnel(
+    tunnel_explicit: bool,
+    ngrok_on: bool,
+    needs_public_webhook: bool,
+    public_base_url_configured: bool,
+) -> bool {
+    !tunnel_explicit && !ngrok_on && needs_public_webhook && !public_base_url_configured
 }
 
 fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
@@ -560,9 +600,134 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let env_store = greentic_deployer::environment::LocalFsStore::new(store_root.clone());
         let env_typed = greentic_types::EnvId::new(&env_id)
             .with_context(|| format!("invalid environment id `{env_id}`"))?;
-        let environment =
+        let mut environment =
             greentic_deployer::environment::EnvironmentStore::load(&env_store, &env_typed)
                 .with_context(|| format!("loading environment `{env_id}` for bundle-less boot"))?;
+
+        // Bundle-less env-serve carries no tunnel flags (gtc start drops them).
+        // Resolve: GREENTIC_TUNNEL_MODE, then the persisted setup choice (newest
+        // revision's .greentic/tunnel.json). No choice → OFF.
+        //
+        // The tunnel greentic-setup chose is AUTHORITATIVE for a configured
+        // environment: provider public base URLs, third-party webhook
+        // registrations (Slack Event Subscriptions, Webex webhooks, OAuth
+        // redirect URIs) and secrets scoping were all established against it.
+        // Booting on a different tunnel would serve a public URL nothing was
+        // registered against, so a mismatch is a hard error instead of the
+        // silent switch it used to be. An explicit request now has to AGREE
+        // with setup rather than override it.
+        let persisted_mode = persisted_env_tunnel_mode(&env_dir);
+        if request.tunnel_explicit {
+            let requested =
+                env_tunnel::choose_tunnel(request.cloudflared, request.ngrok, request.gtunnel);
+            ensure_tunnel_matches_setup(
+                persisted_mode.as_deref(),
+                requested,
+                "a command-line tunnel flag",
+            )?;
+        } else {
+            let env_mode = std::env::var("GREENTIC_TUNNEL_MODE")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            // GREENTIC_TUNNEL_MODE takes precedence over the persisted choice,
+            // so it can mix tunnels exactly like an explicit flag can. Hold it
+            // to the same check rather than treating it as a privileged escape
+            // hatch — the failure mode is identical.
+            if let Some(mode) = env_mode.as_deref()
+                && let Some(requested) = tunnel_choice_for_mode(mode)
+            {
+                ensure_tunnel_matches_setup(
+                    persisted_mode.as_deref(),
+                    requested,
+                    "GREENTIC_TUNNEL_MODE",
+                )?;
+            }
+            let mode = env_mode.or(persisted_mode);
+            match mode.as_deref() {
+                Some("gtunnel") => {
+                    request.gtunnel = GtunnelModeArg::On;
+                    request.tunnel_explicit = true;
+                }
+                Some("cloudflared") => {
+                    request.cloudflared = CloudflaredModeArg::On;
+                    request.tunnel_explicit = true;
+                }
+                Some("ngrok") => {
+                    request.ngrok = NgrokModeArg::On;
+                    request.tunnel_explicit = true;
+                }
+                Some("off") | Some("") | None => {}
+                Some(other) => operator_log::warn(
+                    module_path!(),
+                    format!("ignoring unknown persisted tunnel mode `{other}`"),
+                ),
+            }
+        }
+
+        // Managed-tunnel clash avoidance (gtunnel only): rewrite each bundle's
+        // served tenant to the alias `{tenant}-{id}` here — after load, before
+        // routing/secrets/tenant are derived — so every tenant-keyed surface moves
+        // together and the public webchat URL is unique per operator on the shared
+        // Worker. cloudflared/ngrok keep the bare tenant.
+        //
+        // SKIPPED when setup recorded a tunnel id. That id is already the first
+        // path segment of the URL setup handed to Slack/Webex/OIDC, and it is the
+        // tenant those providers' secrets were written under. Aliasing on top of
+        // it would move BOTH — appending a per-process suffix that changes the
+        // served path segment and the secrets scope on every boot. Since setup
+        // owns the id, adopt it verbatim.
+        if matches!(
+            env_tunnel::choose_tunnel(request.cloudflared, request.ngrok, request.gtunnel),
+            env_tunnel::TunnelChoice::Gtunnel
+        ) {
+            match persisted_env_tunnel_id(&env_dir) {
+                Some(tunnel_id) => {
+                    // An explicit --gtunnel-tunnel-id still wins; this only fills
+                    // the gap where the caller said nothing.
+                    if request.gtunnel_tunnel_id.is_none() {
+                        request.gtunnel_tunnel_id = Some(tunnel_id.clone());
+                    }
+                    // Serve the tenant the id names, so the EXTERNAL identity is
+                    // the unique one while internal resolution stays on the base
+                    // tenant.
+                    //
+                    // Why the external segment must carry the suffix: the Worker
+                    // routes `/v1/web/webchat/<tenant>/…` by that tenant segment
+                    // and forwards it unchanged (path-prefix mode strips the id,
+                    // but the SPA's root-absolute calls carry no prefix to strip).
+                    // So the id the agent registers under has to equal the tenant
+                    // in that URL, or those calls address a tunnel that does not
+                    // exist. Setup derived this id from the same per-install seed,
+                    // so re-aliasing here would append a SECOND suffix and break
+                    // the URL setup already registered with providers.
+                    //
+                    // Internal resolution is unaffected: secrets stay written
+                    // under the base tenant and resolve through the alias→base
+                    // fallback (`secrets_gate`, candidates from the bundle's
+                    // `tenants/` dir). Non-gtunnel runs never reach this branch,
+                    // so cloudflared/ngrok/tunnel-less keep the bare tenant.
+                    for dep in &mut environment.bundles {
+                        dep.route_binding.tenant_selector.tenant = tunnel_id.clone();
+                    }
+                    operator_log::info(
+                        module_path!(),
+                        format!(
+                            "adopting the tunnel id `{tunnel_id}` recorded by greentic-setup and \
+                             serving it as the public tenant; secrets and state stay scoped to the \
+                             base tenant via the alias→base fallback"
+                        ),
+                    );
+                }
+                None => {
+                    for dep in &mut environment.bundles {
+                        let base = dep.route_binding.tenant_selector.tenant.clone();
+                        dep.route_binding.tenant_selector.tenant =
+                            crate::gtunnel::managed_tenant_alias(&base);
+                    }
+                }
+            }
+        }
 
         // Select the runtime secrets backend the deployer rendered onto this
         // worker via `GREENTIC_SECRETS_BACKEND` (E.3b). Unset/`dev-store` keeps
@@ -708,6 +873,12 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // `GREENTIC_REVISION_PIN_REDIS_URL` is configured (fail-open to
         // in-memory); see that fn for the rationale.
         let pin_store = revision_pin::resolve_pin_store(&activation_rt);
+        // Per-revision session/state stores, likewise shared between the
+        // cold-start activation and every reload-rebuilt one. A reload builds a
+        // whole new `RunnerHost`, and the host owns these stores; without the
+        // shared registry every reload would discard the live conversations of
+        // revisions the reload never touched. See `revision_boot::RevisionStores`.
+        let revision_stores = revision_boot::new_revision_stores();
         // Mint declared `generated` provider secrets (e.g. the webchat-gui
         // `jwt_signing_key`) before serving — the env path's counterpart to
         // the `--bundle` boot's `ensure_generated_provider_secrets`. Without
@@ -728,6 +899,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             &environment,
             std::sync::Arc::clone(&runtime_ref_resolver),
             std::sync::Arc::clone(&pin_store),
+            &revision_stores,
         ))?;
 
         // Execution bridge: serve the activated revisions over a slim HTTP
@@ -742,18 +914,70 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // opted in (`op config set gui_enabled` / env-manifest). When on, the
         // server serves the built-in webchat console at `/chat`. A deployed
         // pack that ships its own webchat UI (a `/v1/web/webchat/...` static
-        // route, e.g. messaging-webchat-gui) supersedes the console: the
-        // default turns it off so only the pack's qualified UI is exposed,
-        // while an explicit `gui_enabled: true` still forces the console on.
+        // route, e.g. messaging-webchat-gui) supersedes the console entirely —
+        // `/chat` forwards to that UI instead (see `try_chat_redirect_response`),
+        // so the console is only ever built for an env that ships no UI at all.
         let pack_webchat_routes: Vec<String> = routing
             .static_routes
             .routes()
             .iter()
-            .filter(|route| route.public_path.starts_with("/v1/web/webchat"))
+            .filter(|route| route.public_path.starts_with(WEBCHAT_STATIC_ROUTE_PREFIX))
             .map(|route| route.public_path.clone())
             .collect();
         let gui_enabled =
             resolve_console_enabled(&environment.host_config, !pack_webchat_routes.is_empty());
+
+        // The `--env` boot carries no `--tenant`, but the gtunnel id must match
+        // what greentic-setup keyed on (sanitized `<tenant>-<team>`). Derive the
+        // served tenant from the deployment route bindings so setup and runtime
+        // agree on the tunnel id (and thus the per-tunnel secret).
+        if request.tenant.is_none()
+            && let Some(dep) = environment.bundles.first()
+        {
+            request.tenant = Some(dep.route_binding.tenant_selector.tenant.clone());
+        }
+
+        // Make messaging work out of the box: when the env has a messaging
+        // provider that needs an inbound webhook (Webex, Telegram, …) and no
+        // public URL is already configured, default to a cloudflared tunnel so
+        // `gtc start <bundle>` registers the webhook without an explicit
+        // `--cloudflared on`. This mirrors the legacy bundle arm's "no deployer
+        // pack -> default cloudflared", but scoped to *needs a webhook*:
+        //   - an explicit `--cloudflared/--ngrok` (or `off`) wins (`tunnel_explicit`);
+        //   - a cloud env already carries `host_config.public_base_url` (the
+        //     deployer's ingress), so `resolve_public_base_url` is `Some` and we
+        //     do NOT spawn a redundant quick tunnel;
+        //   - webchat-only bundles have no `messaging_endpoints`, so nothing spawns.
+        let public_base_url_configured = startup_contract::resolve_public_base_url(&environment)
+            .ok()
+            .flatten()
+            .is_some();
+        let needs_public_webhook = revision_webhook_register::env_needs_public_webhook(
+            routing.http_routes.routes(),
+            &environment,
+        );
+        if should_default_messaging_tunnel(
+            request.tunnel_explicit,
+            matches!(request.ngrok, NgrokModeArg::On),
+            needs_public_webhook,
+            public_base_url_configured,
+        ) {
+            // Tunnels are OPT-IN. A served provider needs an inbound webhook, but
+            // the operator chose no tunnel and configured no PUBLIC_BASE_URL — so
+            // we do NOT start one automatically. This box simply has no
+            // public-facing endpoint until a tunnel is explicitly enabled. (This
+            // deliberately reverts the earlier auto-default, which — once a demo
+            // secret was always resolvable — hijacked the managed tunnel even when
+            // the operator wanted cloudflared or nothing at all.)
+            operator_log::warn(
+                module_path!(),
+                "a served provider needs an inbound webhook, but no tunnel is \
+                 configured and no PUBLIC_BASE_URL is set — this box has no public \
+                 endpoint. Enable one with `--gtunnel on`, `--cloudflared on`, or \
+                 `--ngrok on` (or choose a tunnel during setup).",
+            );
+        }
+
         // A public tunnel (`--cloudflared on` / `--ngrok on`) forwards external
         // traffic to this listener over loopback, so a tunneled request's TCP
         // peer reads as 127.0.0.1 and would defeat the loopback trust gate on
@@ -828,34 +1052,37 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         };
         operator_log::info(module_path!(), banner.clone());
         println!("\n{banner}. Press Ctrl+C to stop.");
-        // Advertise the pack-provided webchat UI(s) — one URL per bound
-        // tenant — instead of (or alongside, if explicitly forced) the
-        // built-in console.
-        if !pack_webchat_routes.is_empty() {
-            let tenants: std::collections::BTreeSet<&str> = environment
-                .bundles
-                .iter()
-                .map(|dep| dep.route_binding.tenant_selector.tenant.as_str())
-                .collect();
-            let mut urls = std::collections::BTreeSet::new();
-            for route in &pack_webchat_routes {
-                let base = route.trim_end_matches('/');
-                if base.contains("{tenant}") {
-                    for tenant in &tenants {
-                        urls.insert(format!(
-                            "http://{listen}{}/",
-                            base.replace("{tenant}", tenant)
-                        ));
-                    }
-                } else {
-                    urls.insert(format!("http://{listen}{base}/"));
-                }
-            }
-            for url in urls {
-                let line = format!("UI: {url}");
-                operator_log::info(module_path!(), line.clone());
-                println!("{line}");
-            }
+        // Advertise the pack-provided webchat UI(s), and say so when there are
+        // none. Every path suffix is collected so the same links can be rebased
+        // onto the public tunnel URL below (parity with `--bundle`).
+        let fallback_tenants: std::collections::BTreeSet<&str> = environment
+            .bundles
+            .iter()
+            .map(|dep| dep.route_binding.tenant_selector.tenant.as_str())
+            .collect();
+        let webchat = webchat_banner(
+            &activation.routing,
+            &pack_webchat_routes,
+            &fallback_tenants,
+            &listen.to_string(),
+        );
+        for line in &webchat.lines {
+            operator_log::info(module_path!(), line.clone());
+            println!("{line}");
+        }
+        let webchat_open_url = webchat.open_url;
+        let webchat_ui_paths = webchat.paths;
+        // Replacing a console the operator explicitly asked for is the kind of
+        // thing that must never happen silently: `gui_enabled: true` is in their
+        // manifest, and without this line the changed `/chat` reads as a bug.
+        if !gui_enabled
+            && environment.host_config.gui_enabled == Some(true)
+            && !pack_webchat_routes.is_empty()
+        {
+            let note = "gui_enabled is set and this environment's packs ship their own webchat \
+                        UI — /chat forwards to it instead of the built-in console";
+            operator_log::info(module_path!(), note);
+            println!("{note}");
         }
         if gui_enabled {
             // With a tunnel up, the console lives on the loopback admin listener
@@ -891,8 +1118,78 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             let line = format!("public URL: {} ({} tunnel)", t.url, t.service);
             operator_log::info(module_path!(), line.clone());
             println!("{line}");
+            // Rebase each local webchat UI path onto the public tunnel URL so
+            // the printed public link lands on the chat UI (parity with the
+            // legacy `--bundle` path), not the bare tunnel root.
+            let base = t.url.trim_end_matches('/');
+            for path in &webchat_ui_paths {
+                let line = format!("public UI: {base}{path}");
+                operator_log::info(module_path!(), line.clone());
+                println!("{line}");
+            }
             t.url
         });
+
+        // --open-webchat: open the webchat URL after the listener (and any
+        // tunnel) is up. --no-browser wins when both are given. Strictly
+        // opt-in: the env-serve path must not open a browser by default
+        // (it also runs in containers and on servers).
+        if !request.no_browser
+            && let Some(ref target) = request.open_webchat
+        {
+            let url = if target.is_empty() {
+                // Bare --open-webchat: use the default-bundle URL we
+                // collected during banner printing.
+                webchat_open_url.clone()
+            } else {
+                // --open-webchat=BUNDLE_ID: build the URL for that
+                // specific bundle. When --tenant narrows the search,
+                // only that tenant is considered; otherwise all tenants
+                // are candidates.
+                match activation
+                    .routing
+                    .bundle_index
+                    .resolve_open_webchat_bundle(target, request.tenant.as_deref())
+                {
+                    Some((tenant, ambiguous)) => {
+                        if ambiguous {
+                            operator_log::warn(
+                                module_path!(),
+                                format!(
+                                    "--open-webchat: bundle `{target}` exists under multiple \
+                                     tenants; opening `{tenant}` — pass --tenant to disambiguate",
+                                ),
+                            );
+                        }
+                        Some(format!("http://{listen}/v1/web/webchat/{tenant}/{target}/"))
+                    }
+                    None => None,
+                }
+            };
+            match url {
+                Some(u) => {
+                    if let Err(err) = open::that(&u) {
+                        operator_log::warn(
+                            module_path!(),
+                            format!("failed to open browser for {u}: {err}"),
+                        );
+                    }
+                }
+                None => {
+                    let detail = if target.is_empty() {
+                        String::new()
+                    } else if let Some(ref t) = request.tenant {
+                        format!(" for bundle `{target}` under tenant `{t}`")
+                    } else {
+                        format!(" for bundle `{target}`")
+                    };
+                    operator_log::warn(
+                        module_path!(),
+                        format!("--open-webchat: no matching webchat URL found{detail}"),
+                    );
+                }
+            }
+        }
 
         // Phase D: auto-register provider webhooks for the served revisions.
         // Detached: the server is already listening, and a slow or stuck
@@ -913,6 +1210,9 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             Some(url) => Some(url.clone()),
             None => boot_configured_url,
         };
+        // Captured before `environment` is moved into the webhook-registration
+        // task below; consumed by the watcher's `default_rebuild` further down.
+        let reload_seed = Some((rc.clone(), environment.clone()));
         if revision_count > 0 {
             let boot_activation = std::sync::Arc::clone(&activation);
             let boot_env = environment.clone();
@@ -998,6 +1298,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 std::sync::Arc::clone(&runtime_ref_resolver),
                 std::sync::Arc::clone(&pin_store),
                 activation_rt.handle().clone(),
+                std::sync::Arc::clone(&revision_stores),
+                // Seed the reload dedup with what cold start activated, so the
+                // first config change of the process can take the cheap
+                // routing-only path instead of rebuilding the whole host.
+                reload_seed,
             ),
             // Each reload that actually changed config (hot-attached
             // deployment, new endpoint) re-registers webhooks against the
@@ -1248,6 +1553,14 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 request.ngrok = NgrokModeArg::On;
                 request.tunnel_explicit = true;
             }
+            Some("gtunnel") => {
+                operator_log::info(
+                    module_path!(),
+                    "tunnel mode 'gtunnel' (Greentic managed tunnel) configured in setup answers",
+                );
+                request.gtunnel = GtunnelModeArg::On;
+                request.tunnel_explicit = true;
+            }
             Some("off") => {
                 operator_log::info(
                     module_path!(),
@@ -1282,7 +1595,8 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
 
     // Mutual exclusivity (ngrok wins over cloudflared): single shared policy
     // with the bundle-less arm, owned by `env_tunnel::choose_tunnel`.
-    let tunnel_choice = env_tunnel::choose_tunnel(request.cloudflared, request.ngrok);
+    let tunnel_choice =
+        env_tunnel::choose_tunnel(request.cloudflared, request.ngrok, request.gtunnel);
 
     let cloudflared = match tunnel_choice {
         env_tunnel::TunnelChoice::Cloudflared => {
@@ -1324,6 +1638,15 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         _ => None,
     };
 
+    let gtunnel = match tunnel_choice {
+        env_tunnel::TunnelChoice::Gtunnel => Some(env_tunnel::gtunnel_config(
+            &request,
+            demo_config.services.gateway.port,
+            restart.contains("gtunnel") || restart.contains("all"),
+        )),
+        _ => None,
+    };
+
     let handles = runtime::demo_up_services(
         &config_path,
         &demo_config,
@@ -1332,6 +1655,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         env_store_public_base_url,
         cloudflared,
         ngrok,
+        gtunnel,
         &restart,
         request.runner_binary.clone(),
         &log_dir,
@@ -1718,12 +2042,131 @@ fn default_operator_log_dir(log_dir: Option<PathBuf>, bundle: Option<&str>) -> P
 #[derive(serde::Deserialize)]
 struct TunnelConfig {
     mode: Option<String>,
+    /// The managed-tunnel id `greentic-setup` actually used, when it recorded
+    /// one. Setup owns this value because it is the party that both registered
+    /// the resulting public URL with providers (Slack Event Subscriptions, Webex
+    /// webhooks, OAuth redirect URIs) and wrote their secrets under the matching
+    /// tenant scope. Deriving our own id here instead would serve a different
+    /// path segment than those registrations point at, under a tenant their
+    /// secrets were never written to.
+    tunnel_id: Option<String>,
 }
 
 fn load_tunnel_config(bundle_root: &std::path::Path) -> Option<TunnelConfig> {
     let path = bundle_root.join(".greentic").join("tunnel.json");
     let raw = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+/// Persisted setup tunnel choice for env-serve boot: `mode` from the newest
+/// staged revision's `.greentic/tunnel.json` (revision ids are ULIDs, so the
+/// lexically-last is newest). `None` when no revision persists a mode.
+fn persisted_env_tunnel_mode(env_dir: &std::path::Path) -> Option<String> {
+    persisted_env_tunnel_field(env_dir, |cfg| cfg.mode.clone())
+}
+
+/// Persisted managed-tunnel id from the newest staged revision, when setup
+/// recorded one. Absent for non-gtunnel modes and for bundles configured before
+/// setup started writing the field — callers fall back to deriving it.
+fn persisted_env_tunnel_id(env_dir: &std::path::Path) -> Option<String> {
+    persisted_env_tunnel_field(env_dir, |cfg| cfg.tunnel_id.clone())
+}
+
+/// Scan staged revisions newest-first (revision ids are ULIDs, so the
+/// lexically-last is newest) and return the first `tunnel.json` value `pick`
+/// accepts. Shared by the mode and id lookups so they can never disagree about
+/// which revision they read from.
+fn persisted_env_tunnel_field<F>(env_dir: &std::path::Path, pick: F) -> Option<String>
+where
+    F: Fn(&TunnelConfig) -> Option<String>,
+{
+    let mut revisions: Vec<PathBuf> = std::fs::read_dir(env_dir.join("revisions"))
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    revisions.sort();
+    revisions.into_iter().rev().find_map(|rev| {
+        load_tunnel_config(&rev.join("bundle"))
+            .and_then(|cfg| pick(&cfg))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+/// Map a persisted or `GREENTIC_TUNNEL_MODE` mode string onto the tunnel it
+/// selects. `None` for a mode this binary does not recognise — the caller warns
+/// and ignores it, so it establishes no tunnel to reconcile against.
+fn tunnel_choice_for_mode(mode: &str) -> Option<env_tunnel::TunnelChoice> {
+    match mode {
+        "gtunnel" => Some(env_tunnel::TunnelChoice::Gtunnel),
+        "cloudflared" => Some(env_tunnel::TunnelChoice::Cloudflared),
+        "ngrok" => Some(env_tunnel::TunnelChoice::Ngrok),
+        "off" | "" => Some(env_tunnel::TunnelChoice::Off),
+        _ => None,
+    }
+}
+
+/// Operator-facing name of a tunnel choice. Matches both the `--cloudflared` /
+/// `--ngrok` / `--gtunnel` flag spellings and the `tunnel.json` `mode` values,
+/// so an error naming one is directly actionable as the other.
+fn tunnel_choice_name(choice: env_tunnel::TunnelChoice) -> &'static str {
+    match choice {
+        env_tunnel::TunnelChoice::Off => "off",
+        env_tunnel::TunnelChoice::Cloudflared => "cloudflared",
+        env_tunnel::TunnelChoice::Ngrok => "ngrok",
+        env_tunnel::TunnelChoice::Gtunnel => "gtunnel",
+    }
+}
+
+/// Refuse to boot a configured environment on a different tunnel service than
+/// `greentic-setup` recorded for it. The setup choice is authoritative because
+/// provider public base URLs, third-party webhook registrations and secrets
+/// scoping are all established against it during setup; switching tunnels
+/// afterwards produces a runtime whose public URL nothing was registered
+/// against. `source` names where the conflicting request came from.
+///
+/// Permissive in four cases, all of which contradict no registration:
+/// turning tunnels OFF (disabling, not mixing), no persisted choice at all,
+/// an unrecognised persisted mode, and a persisted mode of `off`.
+fn ensure_tunnel_matches_setup(
+    persisted: Option<&str>,
+    requested: env_tunnel::TunnelChoice,
+    source: &str,
+) -> anyhow::Result<()> {
+    // Turning tunnels off is disabling, not mixing — an operator can always
+    // fall back to a local-only boot. Nothing is served publicly, so no
+    // existing registration is contradicted.
+    if matches!(requested, env_tunnel::TunnelChoice::Off) {
+        return Ok(());
+    }
+    // No persisted choice: the environment was never configured with a tunnel
+    // (or predates setup persisting one), so the request applies unconstrained.
+    let Some(persisted) = persisted else {
+        return Ok(());
+    };
+    // Unrecognised mode: warned about and ignored during resolution.
+    let Some(persisted_choice) = tunnel_choice_for_mode(persisted) else {
+        return Ok(());
+    };
+    // Setup deliberately recorded no tunnel, so nothing was registered.
+    if matches!(persisted_choice, env_tunnel::TunnelChoice::Off) {
+        return Ok(());
+    }
+    if persisted_choice == requested {
+        return Ok(());
+    }
+    let persisted_name = tunnel_choice_name(persisted_choice);
+    let requested_name = tunnel_choice_name(requested);
+    anyhow::bail!(
+        "tunnel mismatch: this environment was set up with the `{persisted_name}` tunnel, \
+         but `{requested_name}` was requested via {source}. The tunnel chosen during setup \
+         is authoritative — provider public base URLs, webhook registrations (Slack Event \
+         Subscriptions, Webex webhooks, OAuth redirect URIs) and secrets scoping were all \
+         established against `{persisted_name}`, so booting on `{requested_name}` would \
+         serve a public URL nothing was registered against. Either start with \
+         `{persisted_name}`, or re-run greentic-setup to change this environment's tunnel. \
+         To boot with no tunnel at all, pass `--{requested_name} off`.",
+    );
 }
 
 /// Guard that fires boot-fail rollback on drop if the new binary fails to
@@ -1815,6 +2258,305 @@ pub(crate) fn resolve_auto_restart(_no_flag: bool) -> bool {
     false
 }
 
+/// A bundle's flows, for advertising `/{tenant}/{bundle}/{flow}/` URLs.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct BundleFlows<'a> {
+    /// Every flow id in the bundle, sorted.
+    pub(crate) ids: Vec<&'a str>,
+    /// The flow the bare `/{tenant}/{bundle}/` URL already reaches, when the
+    /// bundle has an unambiguous one. Tagged in the banner so two URLs landing
+    /// on the same flow read as a shorthand rather than a duplicate.
+    pub(crate) default_id: Option<&'a str>,
+}
+
+/// The webchat UI URLs a running environment can honestly advertise.
+///
+/// Split out of `run_start` so the "which bundles get a URL" rule is testable
+/// without booting a runtime — it was previously inline, unverified, and wrong.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct WebchatAdvert {
+    /// Ready-to-print `UI: <url>[ (default)]` lines.
+    pub(crate) lines: Vec<String>,
+    /// Path suffixes only, for rebasing onto a public tunnel base.
+    pub(crate) paths: Vec<String>,
+    /// URL `--open-webchat` should open. Derived from [`Self::open_path`].
+    pub(crate) open_url: Option<String>,
+    /// Path of [`Self::open_url`], and the target `GET /chat` forwards to.
+    /// The path is the primitive and the URL is built from it, so the browser
+    /// shortcut and the advertised link can never name different pages.
+    pub(crate) open_path: Option<String>,
+    /// Bundles deliberately given no URL, in the order encountered.
+    pub(crate) without_ui: Vec<String>,
+}
+
+/// Public-path prefix that marks a static route as a pack-provided webchat UI.
+pub(crate) const WEBCHAT_STATIC_ROUTE_PREFIX: &str = "/v1/web/webchat";
+
+/// Which bundles own a pack-provided webchat UI.
+///
+/// A set cannot carry this: "no webchat route anywhere" and "webchat routes that
+/// predate per-bundle scoping" are both empty, and they want OPPOSITE answers —
+/// advertise nothing versus advertise everything. Conflating them in an empty
+/// `BTreeSet` produced two bugs at once. The banner suppressed the
+/// [`WebchatAdvert::without_ui_note`] explaining the silence (its caller had to
+/// guard on "are there any webchat routes" separately, and did so around the
+/// note as well), and `GET /chat` handed out a `302` to
+/// `/v1/web/webchat/{tenant}/` in an environment that serves no UI there at all
+/// — a path that falls through to the generic ingress as
+/// `405 only POST is supported`. Keep the three states distinct.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WebchatUiBundles<'a> {
+    /// No `/v1/web/webchat` static route in the environment. No bundle can
+    /// serve a UI, so none gets a URL.
+    NoneAnywhere,
+    /// Webchat routes exist but carry no per-bundle scope. Pre-scoping
+    /// behaviour: assume every bundle is servable.
+    Unscoped,
+    /// Bundle ids owning a scoped webchat route — the only ones that can serve.
+    Scoped(std::collections::BTreeSet<&'a str>),
+}
+
+impl WebchatAdvert {
+    pub(crate) fn without_ui_note(&self) -> Option<String> {
+        if self.without_ui.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "no webchat UI pack in bundle(s) {} — messaging endpoints only, no browser URL",
+            self.without_ui.join(", ")
+        ))
+    }
+
+    /// Build the advert from live routing tables.
+    ///
+    /// The same derivation the boot banner runs, reachable from the serve path
+    /// so `GET /chat` can forward to the very URL the banner advertises. Reads
+    /// only `routing`, so a hot-reload that moves the default bundle moves the
+    /// `/chat` target with it.
+    ///
+    /// Returns an empty advert for a pre-deploy-spec environment whose bundles
+    /// are not indexed; the banner keeps its own route-template fallback for
+    /// that case, which needs the `Environment` this does not have.
+    pub(crate) fn from_routing(
+        routing: &deployment_routes::RevisionIngressRouting,
+        listen: &str,
+    ) -> Self {
+        let has_webchat_route = routing
+            .static_routes
+            .routes()
+            .iter()
+            .any(|route| route.public_path.starts_with(WEBCHAT_STATIC_ROUTE_PREFIX));
+        let scoped: std::collections::BTreeSet<&str> = routing
+            .static_routes
+            .routes()
+            .iter()
+            .filter(|route| route.public_path.starts_with(WEBCHAT_STATIC_ROUTE_PREFIX))
+            .filter_map(|route| route.scope.as_ref())
+            .map(|scope| scope.bundle_id.as_str())
+            .collect();
+        let webchat_ui_bundles = match (has_webchat_route, scoped.is_empty()) {
+            (false, _) => WebchatUiBundles::NoneAnywhere,
+            (true, true) => WebchatUiBundles::Unscoped,
+            (true, false) => WebchatUiBundles::Scoped(scoped),
+        };
+        let tenant_bundles = routing.bundle_index.tenants_and_bundles();
+        // Flows per bundle, so a bundle holding several can advertise each
+        // one's URL. `flow_index` is built from the same pack manifests the
+        // request path validates `X-Greentic-Flow` against, so a flow that is
+        // advertised here is a flow the runtime will actually dispatch.
+        let bundle_flows: std::collections::BTreeMap<&str, BundleFlows<'_>> = tenant_bundles
+            .iter()
+            .flat_map(|(_, bundles, _)| bundles.iter().copied())
+            .map(|bundle_id| {
+                (
+                    bundle_id,
+                    BundleFlows {
+                        ids: routing.flow_index.flow_ids_for_bundle(bundle_id),
+                        default_id: routing
+                            .flow_index
+                            .default_flow_for_bundle(bundle_id)
+                            .map(|(_pack, flow)| flow),
+                    },
+                )
+            })
+            .collect();
+        advertise_webchat_urls(listen, &tenant_bundles, &webchat_ui_bundles, &bundle_flows)
+    }
+}
+
+/// The webchat section of the boot banner.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct WebchatBanner {
+    /// Lines to print, in order: the `UI:` URLs, then the without-UI note.
+    pub(crate) lines: Vec<String>,
+    /// What `--open-webchat` opens, if anything can be opened.
+    pub(crate) open_url: Option<String>,
+    /// Path suffixes only, for rebasing onto a public tunnel base.
+    pub(crate) paths: Vec<String>,
+}
+
+/// Build the banner's webchat lines from live routing tables.
+///
+/// A pure function so the whole "which URL, and what to say when there is none"
+/// rule is testable without booting a runtime. It used to be inline in
+/// `run_start`, split between a `pack_webchat_routes.is_empty()` guard there and
+/// [`advertise_webchat_urls`] here — and a rule living in two places is how the
+/// [`WebchatAdvert::without_ui_note`] came to be unreachable for the one
+/// environment shape that needed it most: bundles deployed, none of them
+/// shipping a webchat UI. That printed a revision count and nothing else, so an
+/// operator saw no URL and no reason for its absence.
+///
+/// `fallback_tenants` is only read on the pre-deploy-spec path, where there is
+/// no bundle index to enumerate.
+pub(crate) fn webchat_banner(
+    routing: &deployment_routes::RevisionIngressRouting,
+    pack_webchat_routes: &[String],
+    fallback_tenants: &std::collections::BTreeSet<&str>,
+    listen: &str,
+) -> WebchatBanner {
+    if !routing.bundle_index.tenants_and_bundles().is_empty() {
+        let advert = WebchatAdvert::from_routing(routing, listen);
+        // Say why a bundle has no URL. The bundles are fine, they just ship no
+        // webchat UI pack and are reachable over `/v1/messaging/webchat/...`
+        // only. Printing fewer lines than there are bundles — or none at all —
+        // otherwise reads as a routing failure.
+        let note = advert.without_ui_note();
+        let mut lines = advert.lines;
+        lines.extend(note);
+        return WebchatBanner {
+            lines,
+            open_url: advert.open_url,
+            paths: advert.paths,
+        };
+    }
+    // Pre-deploy-spec environment: no bundle index, so expand the route
+    // templates the way the banner did before per-bundle scoping. There are no
+    // bundle names here to explain a silence with either, so an env with no
+    // webchat route simply prints nothing.
+    let mut banner = WebchatBanner::default();
+    let push = |banner: &mut WebchatBanner, path: String| {
+        let url = format!("http://{listen}{path}");
+        banner.lines.push(format!("UI: {url}"));
+        if banner.open_url.is_none() {
+            banner.open_url = Some(url);
+        }
+        banner.paths.push(path);
+    };
+    for route in pack_webchat_routes {
+        let base = route.trim_end_matches('/');
+        if base.contains("{tenant}") {
+            for tenant in fallback_tenants {
+                push(
+                    &mut banner,
+                    format!("{}/", base.replace("{tenant}", tenant)),
+                );
+            }
+        } else {
+            push(&mut banner, format!("{base}/"));
+        }
+    }
+    banner
+}
+
+/// The webchat UI path `GET /chat` forwards to — the page the boot banner
+/// tells the operator to open.
+///
+/// Goes through [`WebchatAdvert::from_routing`] instead of re-deriving "which
+/// bundle is the default, and can it actually serve a UI": a second copy of
+/// that rule is how `/chat` and the banner would come to name different pages.
+/// The discarded line formatting costs a few allocations on a path a human
+/// types by hand.
+pub(crate) fn default_webchat_ui_path(
+    routing: &deployment_routes::RevisionIngressRouting,
+) -> Option<String> {
+    WebchatAdvert::from_routing(routing, "").open_path
+}
+
+/// Build the advertised webchat UI URLs for an environment.
+///
+/// `webchat_ui_bundles` says which bundles own a `/v1/web/webchat` static route.
+/// A bundle outside it CANNOT serve a UI: `revision_serve` matches static routes
+/// on the full `(deployment, bundle, revision)` scope, so a request to its
+/// `/v1/web/webchat/<tenant>/<bundle>/` falls through to the generic ingress and
+/// comes back `405 only POST is supported…`. Advertising it anyway is what made
+/// the boot banner promise dead links. See [`WebchatUiBundles`] for why the
+/// "no route at all" case must not be spelled as an empty set.
+///
+/// `bundle_flows` adds a `/{tenant}/{bundle}/{flow}/` line per flow, but only
+/// for bundles holding MORE THAN ONE. A single-flow bundle's flow URL is the
+/// bundle URL, so listing it would double every line to say nothing. Flow URLs
+/// are only emitted under a bundle-scoped URL, never under the bare tenant
+/// shorthand: `/{tenant}/{flow}/` is not a routing form — an unrecognized
+/// segment there resolves as an ASSET path under the default bundle.
+pub(crate) fn advertise_webchat_urls(
+    listen: &str,
+    tenant_bundles: &[(&str, Vec<&str>, Option<&str>)],
+    webchat_ui_bundles: &WebchatUiBundles<'_>,
+    bundle_flows: &std::collections::BTreeMap<&str, BundleFlows<'_>>,
+) -> WebchatAdvert {
+    let mut advert = WebchatAdvert::default();
+    let mut first_path: Option<String> = None;
+    let servable = |id: &str| match webchat_ui_bundles {
+        WebchatUiBundles::NoneAnywhere => false,
+        WebchatUiBundles::Unscoped => true,
+        WebchatUiBundles::Scoped(ids) => ids.contains(&id),
+    };
+    for (tenant, bundles, default_id) in tenant_bundles {
+        // Advertise only bundle-SCOPED URLs (`/{tenant}/{bundle_id}/`). The bare
+        // `/{tenant}/` shorthand is intentionally NOT printed: it is ambiguous
+        // once more than one bundle — or, on the shared managed tunnel, more than
+        // one operator — can answer for a tenant. `--open-webchat` opens the
+        // default bundle's own scoped URL instead.
+        for bundle_id in bundles {
+            if !servable(bundle_id) {
+                advert.without_ui.push((*bundle_id).to_string());
+                continue;
+            }
+            let is_default = default_id.as_deref() == Some(*bundle_id);
+            let path = format!("/v1/web/webchat/{tenant}/{bundle_id}/");
+            let url = format!("http://{listen}{path}");
+            let tag = if is_default { " (default)" } else { "" };
+            advert.lines.push(format!("UI: {url}{tag}"));
+            if is_default && advert.open_path.is_none() {
+                advert.open_path = Some(path.clone());
+            }
+            if first_path.is_none() {
+                first_path = Some(path.clone());
+            }
+            advert.paths.push(path);
+
+            // One line per flow, for bundles that have a choice to offer.
+            let flows = bundle_flows.get(bundle_id);
+            let flow_ids = flows.map(|f| f.ids.as_slice()).unwrap_or_default();
+            if flow_ids.len() < 2 {
+                continue;
+            }
+            for flow_id in flow_ids {
+                let path = format!("/v1/web/webchat/{tenant}/{bundle_id}/{flow_id}/");
+                let url = format!("http://{listen}{path}");
+                let tag = if flows.and_then(|f| f.default_id) == Some(*flow_id) {
+                    " (default flow — same as the bundle URL above)"
+                } else {
+                    ""
+                };
+                advert.lines.push(format!("UI: {url}{tag}"));
+                advert.paths.push(path);
+            }
+        }
+    }
+    // No servable DEFAULT bundle: open the first URL actually advertised.
+    // Re-deriving this from `bundles.first()` would reintroduce the bug at the
+    // browser — the alphabetically first bundle need not be one that can serve.
+    if advert.open_path.is_none() {
+        advert.open_path = first_path;
+    }
+    advert.open_url = advert
+        .open_path
+        .as_ref()
+        .map(|path| format!("http://{listen}{path}"));
+    advert
+}
+
 enum ShutdownReason {
     CtrlC,
     AdminStop,
@@ -1880,10 +2622,21 @@ fn resolve_console_enabled(
     host_config: &greentic_deploy_spec::EnvironmentHostConfig,
     has_pack_webchat_ui: bool,
 ) -> bool {
-    match host_config.gui_enabled {
-        Some(explicit) => explicit,
-        None => host_config.resolved_gui_enabled() && !has_pack_webchat_ui,
+    // A pack-provided webchat UI ALWAYS wins, explicit `gui_enabled: true`
+    // included. The flag means "this environment has a browser tier", not
+    // "serve the built-in console specifically" — and `/chat` is a hand-rolled
+    // single-page console that POSTs to the loopback `/workers/invoke`
+    // endpoint, bypassing the provider stack, the tenant/bundle routing and the
+    // per-bundle SPA entirely. Pointing an operator at it while a real
+    // `/v1/web/webchat/{tenant}/{bundle}/` UI is being served is offering the
+    // strictly worse of the two. The console stays as the FALLBACK for
+    // environments whose packs ship no UI at all, which is its actual job.
+    if has_pack_webchat_ui {
+        return false;
     }
+    host_config
+        .gui_enabled
+        .unwrap_or_else(|| host_config.resolved_gui_enabled())
 }
 
 #[cfg(test)]
@@ -1899,17 +2652,279 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    /// Stage `tunnel.json` under a revision id, as the env store lays it out.
+    fn stage_tunnel_json(env_dir: &Path, revision: &str, body: &str) {
+        let bundle = env_dir.join("revisions").join(revision).join("bundle");
+        std::fs::create_dir_all(bundle.join(".greentic")).expect("mkdir");
+        std::fs::write(bundle.join(".greentic").join("tunnel.json"), body).expect("write");
+    }
+
+    // ---- persisted tunnel id (setup owns the id) ----
+
+    #[test]
+    fn persisted_tunnel_id_is_read_and_prefers_the_newest_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Revision ids are ULIDs, so lexical order is chronological.
+        stage_tunnel_json(
+            dir.path(),
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            r#"{"mode":"gtunnel","tunnel_id":"old-tenant"}"#,
+        );
+        stage_tunnel_json(
+            dir.path(),
+            "01ZZZZZZZZZZZZZZZZZZZZZZZZ",
+            r#"{"mode":"gtunnel","tunnel_id":"demo"}"#,
+        );
+        assert_eq!(
+            persisted_env_tunnel_id(dir.path()).as_deref(),
+            Some("demo"),
+            "newest revision wins, matching persisted_env_tunnel_mode"
+        );
+        assert_eq!(
+            persisted_env_tunnel_mode(dir.path()).as_deref(),
+            Some("gtunnel"),
+            "reading the id must not disturb mode resolution"
+        );
+    }
+
+    #[test]
+    fn persisted_tunnel_id_absent_for_legacy_and_non_gtunnel_artifacts() {
+        // Configured before setup recorded the id: mode still resolves, id is
+        // None, so the caller falls back to deriving + aliasing as before.
+        let legacy = tempfile::tempdir().expect("tempdir");
+        stage_tunnel_json(
+            legacy.path(),
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            r#"{"mode":"gtunnel"}"#,
+        );
+        assert_eq!(
+            persisted_env_tunnel_mode(legacy.path()).as_deref(),
+            Some("gtunnel")
+        );
+        assert_eq!(persisted_env_tunnel_id(legacy.path()), None);
+
+        // cloudflared bundles never carry a gtunnel id.
+        let cf = tempfile::tempdir().expect("tempdir");
+        stage_tunnel_json(
+            cf.path(),
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            r#"{"mode":"cloudflared"}"#,
+        );
+        assert_eq!(persisted_env_tunnel_id(cf.path()), None);
+
+        // No env store at all.
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(persisted_env_tunnel_id(empty.path()), None);
+    }
+
+    #[test]
+    fn persisted_tunnel_id_ignores_blank_and_unparseable_artifacts() {
+        let blank = tempfile::tempdir().expect("tempdir");
+        stage_tunnel_json(
+            blank.path(),
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            r#"{"mode":"gtunnel","tunnel_id":"   "}"#,
+        );
+        assert_eq!(
+            persisted_env_tunnel_id(blank.path()),
+            None,
+            "whitespace-only id must not be adopted as a path segment"
+        );
+
+        // A newer unparseable file must not mask an older good one.
+        let mixed = tempfile::tempdir().expect("tempdir");
+        stage_tunnel_json(
+            mixed.path(),
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            r#"{"mode":"gtunnel","tunnel_id":"demo"}"#,
+        );
+        stage_tunnel_json(mixed.path(), "01ZZZZZZZZZZZZZZZZZZZZZZZZ", "{not json");
+        assert_eq!(
+            persisted_env_tunnel_id(mixed.path()).as_deref(),
+            Some("demo")
+        );
+    }
+
+    /// An env the given setup mode was recorded against.
+    fn env_with_persisted_mode(mode: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        stage_tunnel_json(
+            dir.path(),
+            "01AAAAAAAAAAAAAAAAAAAAAAAA",
+            &format!(r#"{{"mode":"{mode}"}}"#),
+        );
+        dir
+    }
+
+    #[test]
+    fn explicit_tunnel_conflicting_with_the_setup_choice_is_rejected() {
+        let dir = env_with_persisted_mode("gtunnel");
+        let persisted = persisted_env_tunnel_mode(dir.path());
+        assert_eq!(
+            persisted.as_deref(),
+            Some("gtunnel"),
+            "staged mode reads back"
+        );
+
+        // `--cloudflared on` against a gtunnel-configured environment: the
+        // providers were registered against the gtunnel URL, so proceeding
+        // would serve a URL nothing points at.
+        let requested = env_tunnel::choose_tunnel(
+            CloudflaredModeArg::On,
+            NgrokModeArg::Off,
+            GtunnelModeArg::Off,
+        );
+        let err = ensure_tunnel_matches_setup(
+            persisted.as_deref(),
+            requested,
+            "a command-line tunnel flag",
+        )
+        .expect_err("a different tunnel than setup recorded must not boot");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gtunnel"),
+            "error must name the tunnel setup chose: {msg}"
+        );
+        assert!(
+            msg.contains("cloudflared"),
+            "error must name the tunnel that was requested: {msg}"
+        );
+        assert!(
+            msg.contains("greentic-setup"),
+            "error must point at the remedy: {msg}"
+        );
+    }
+
+    #[test]
+    fn explicit_tunnel_agreeing_with_the_setup_choice_proceeds() {
+        let dir = env_with_persisted_mode("gtunnel");
+        let persisted = persisted_env_tunnel_mode(dir.path());
+        let requested = env_tunnel::choose_tunnel(
+            CloudflaredModeArg::Off,
+            NgrokModeArg::Off,
+            GtunnelModeArg::On,
+        );
+        assert!(
+            ensure_tunnel_matches_setup(
+                persisted.as_deref(),
+                requested,
+                "a command-line tunnel flag"
+            )
+            .is_ok(),
+            "asking for the tunnel setup already chose is not mixing"
+        );
+    }
+
+    #[test]
+    fn explicit_tunnel_without_a_persisted_choice_is_unconstrained() {
+        // No env store at all, and a staged revision that records no mode:
+        // both leave the explicit flag free, exactly as before this check.
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(persisted_env_tunnel_mode(empty.path()), None);
+
+        let legacy = tempfile::tempdir().expect("tempdir");
+        stage_tunnel_json(legacy.path(), "01AAAAAAAAAAAAAAAAAAAAAAAA", r#"{}"#);
+        assert_eq!(persisted_env_tunnel_mode(legacy.path()), None);
+
+        for requested in [
+            env_tunnel::TunnelChoice::Cloudflared,
+            env_tunnel::TunnelChoice::Ngrok,
+            env_tunnel::TunnelChoice::Gtunnel,
+        ] {
+            for dir in [empty.path(), legacy.path()] {
+                assert!(
+                    ensure_tunnel_matches_setup(
+                        persisted_env_tunnel_mode(dir).as_deref(),
+                        requested,
+                        "a command-line tunnel flag",
+                    )
+                    .is_ok(),
+                    "no persisted choice must not constrain {requested:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn turning_tunnels_off_is_allowed_against_any_setup_choice() {
+        // The documented exception: `off` is disabling, not mixing. Nothing is
+        // served publicly, so no registration is contradicted and an operator
+        // can still boot local-only.
+        let dir = env_with_persisted_mode("gtunnel");
+        let persisted = persisted_env_tunnel_mode(dir.path());
+        let requested = env_tunnel::choose_tunnel(
+            CloudflaredModeArg::Off,
+            NgrokModeArg::Off,
+            GtunnelModeArg::Off,
+        );
+        assert_eq!(requested, env_tunnel::TunnelChoice::Off);
+        assert!(
+            ensure_tunnel_matches_setup(
+                persisted.as_deref(),
+                requested,
+                "a command-line tunnel flag"
+            )
+            .is_ok(),
+            "`--gtunnel off` must still boot a gtunnel-configured env local-only"
+        );
+
+        // Symmetrically, a setup that recorded `off` constrains nothing.
+        let off = env_with_persisted_mode("off");
+        assert!(
+            ensure_tunnel_matches_setup(
+                persisted_env_tunnel_mode(off.path()).as_deref(),
+                env_tunnel::TunnelChoice::Gtunnel,
+                "a command-line tunnel flag",
+            )
+            .is_ok(),
+            "setup recorded no tunnel, so nothing was registered to protect"
+        );
+    }
+
+    #[test]
+    fn env_tunnel_mode_is_held_to_the_same_check_as_a_flag() {
+        // GREENTIC_TUNNEL_MODE overrides the persisted choice, so it has the
+        // identical failure mode and is not a privileged escape hatch.
+        let dir = env_with_persisted_mode("gtunnel");
+        let persisted = persisted_env_tunnel_mode(dir.path());
+        let requested = tunnel_choice_for_mode("ngrok").expect("known mode");
+        let err =
+            ensure_tunnel_matches_setup(persisted.as_deref(), requested, "GREENTIC_TUNNEL_MODE")
+                .expect_err("env-var mixing must fail like flag mixing");
+        assert!(
+            err.to_string().contains("GREENTIC_TUNNEL_MODE"),
+            "error must name the source of the conflicting request: {err}"
+        );
+
+        // An unrecognised mode selects no tunnel, so it cannot conflict.
+        assert_eq!(tunnel_choice_for_mode("banana"), None);
+    }
+
+    #[test]
+    fn messaging_tunnel_default_needs_endpoint_and_no_configured_url() {
+        // The out-of-the-box case: a provider needs a webhook, no URL is
+        // configured, and the operator didn't decide the tunnel → default on.
+        assert!(should_default_messaging_tunnel(false, false, true, false));
+
+        // Explicit tunnel choice (incl. `--cloudflared off`) always wins.
+        assert!(!should_default_messaging_tunnel(true, false, true, false));
+        // ngrok already chosen → don't also force cloudflared.
+        assert!(!should_default_messaging_tunnel(false, true, true, false));
+        // No provider needs a webhook (e.g. a webchat-only bundle) → nothing to register.
+        assert!(!should_default_messaging_tunnel(false, false, false, false));
+        // A public URL is already configured (a cloud env's deployer ingress) →
+        // no redundant quick tunnel.
+        assert!(!should_default_messaging_tunnel(false, false, true, true));
+    }
+
     fn host_config_with_gui(
         gui_enabled: Option<bool>,
     ) -> greentic_deploy_spec::EnvironmentHostConfig {
-        greentic_deploy_spec::EnvironmentHostConfig {
-            env_id: greentic_types::EnvId::try_from("local").unwrap(),
-            region: None,
-            tenant_org_id: None,
-            listen_addr: None,
-            public_base_url: None,
-            gui_enabled,
-        }
+        let mut hc = greentic_deploy_spec::EnvironmentHostConfig::new(
+            greentic_types::EnvId::try_from("local").unwrap(),
+        );
+        hc.gui_enabled = gui_enabled;
+        hc
     }
 
     #[test]
@@ -1925,10 +2940,20 @@ mod tests {
     }
 
     #[test]
-    fn console_explicit_true_wins_over_pack_webchat_ui() {
-        assert!(resolve_console_enabled(
+    fn console_superseded_by_pack_webchat_ui_even_when_explicitly_enabled() {
+        // `gui_enabled: true` asks for a browser tier, and the pack's
+        // per-bundle SPA IS the browser tier. Honouring the flag as "serve
+        // /chat as well" pointed operators at a loopback console that bypasses
+        // the provider stack, alongside the real UI they had just deployed.
+        assert!(!resolve_console_enabled(
             &host_config_with_gui(Some(true)),
             true
+        ));
+        // …and with no pack UI anywhere the flag still turns the console on,
+        // which is the only case the console exists for.
+        assert!(resolve_console_enabled(
+            &host_config_with_gui(Some(true)),
+            false
         ));
     }
 
@@ -1938,6 +2963,621 @@ mod tests {
             &host_config_with_gui(Some(false)),
             false
         ));
+    }
+
+    // ── advertise_webchat_urls ──────────────────────────────────────────
+    //
+    // The demo environment that surfaced the bug: four bundles, only `gui`
+    // carries messaging-webchat-gui, and `acct` is the tenant default.
+
+    fn ui_set<'a>(ids: &[&'a str]) -> WebchatUiBundles<'a> {
+        WebchatUiBundles::Scoped(ids.iter().copied().collect())
+    }
+
+    /// Webchat routes that carry no bundle scope — every bundle is servable.
+    fn unscoped() -> WebchatUiBundles<'static> {
+        WebchatUiBundles::Unscoped
+    }
+
+    /// No webchat route in the environment at all — nothing is servable.
+    fn no_ui_anywhere() -> WebchatUiBundles<'static> {
+        WebchatUiBundles::NoneAnywhere
+    }
+
+    /// No flow index — every bundle advertises its bundle URL only.
+    fn no_flows() -> std::collections::BTreeMap<&'static str, BundleFlows<'static>> {
+        std::collections::BTreeMap::new()
+    }
+
+    fn flows<'a>(
+        entries: &[(&'a str, &[&'a str], Option<&'a str>)],
+    ) -> std::collections::BTreeMap<&'a str, BundleFlows<'a>> {
+        entries
+            .iter()
+            .map(|(bundle, ids, default_id)| {
+                (
+                    *bundle,
+                    BundleFlows {
+                        ids: ids.to_vec(),
+                        default_id: *default_id,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn demo_env() -> Vec<(&'static str, Vec<&'static str>, Option<&'static str>)> {
+        vec![(
+            "default",
+            vec!["acct", "gui", "legal", "support"],
+            Some("acct"),
+        )]
+    }
+
+    #[test]
+    fn only_bundles_owning_a_webchat_route_are_advertised() {
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["gui"]),
+            &no_flows(),
+        );
+        // Exactly one URL, and it is the bundle that actually ships the SPA.
+        assert_eq!(
+            advert.lines,
+            vec!["UI: http://127.0.0.1:8080/v1/web/webchat/default/gui/"]
+        );
+        assert_eq!(advert.without_ui, vec!["acct", "legal", "support"]);
+    }
+
+    #[test]
+    fn a_default_bundle_with_no_ui_pack_gets_no_bare_url() {
+        // `acct` is the tenant default but ships no webchat UI, so the bare
+        // `/v1/web/webchat/default/` form must NOT be printed — it 405s.
+        //
+        // Assert against `paths`, not `lines`: the default line carries a
+        // trailing " (default)" tag, so an `ends_with` on the line silently
+        // never matches and the test passes against the BROKEN behaviour too.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["gui"]),
+            &no_flows(),
+        );
+        assert!(
+            !advert
+                .paths
+                .iter()
+                .any(|path| path == "/v1/web/webchat/default/"),
+            "bare tenant URL advertised for a default bundle with no UI pack: {:?}",
+            advert.paths
+        );
+        assert_ne!(
+            advert.open_url.as_deref(),
+            Some("http://127.0.0.1:8080/v1/web/webchat/default/")
+        );
+    }
+
+    #[test]
+    fn open_url_falls_back_to_a_servable_bundle_not_the_first_one() {
+        // The regression this guards: `acct` sorts first AND is the default,
+        // so both the old `is_default` pick and the old `bundles.first()`
+        // fallback would have opened a browser on a 405.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["gui"]),
+            &no_flows(),
+        );
+        assert_eq!(
+            advert.open_url.as_deref(),
+            Some("http://127.0.0.1:8080/v1/web/webchat/default/gui/")
+        );
+    }
+
+    #[test]
+    fn a_default_bundle_advertises_only_its_bundle_scoped_url() {
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &[("default", vec!["gui", "legal"], Some("gui"))],
+            &ui_set(&["gui"]),
+            &no_flows(),
+        );
+        // Fix B: advertise ONLY the bundle-scoped URL. The bare `/{tenant}/`
+        // shorthand is not printed (ambiguous once tenants are aliased on the
+        // shared tunnel); `--open-webchat` opens the default bundle's scoped URL.
+        assert_eq!(
+            advert.lines,
+            vec!["UI: http://127.0.0.1:8080/v1/web/webchat/default/gui/ (default)"]
+        );
+        assert_eq!(
+            advert.open_url.as_deref(),
+            Some("http://127.0.0.1:8080/v1/web/webchat/default/gui/")
+        );
+        assert_eq!(advert.paths, vec!["/v1/web/webchat/default/gui/"]);
+    }
+
+    #[test]
+    fn the_default_bundle_is_not_the_one_bundle_without_its_own_url() {
+        // The reported symptom: with `acct` as the default, every bundle but
+        // `acct` appeared in the banner. `/…/default/acct/` served a 200 the
+        // whole time — it was simply never advertised.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["acct", "gui", "legal", "support"]),
+            &no_flows(),
+        );
+        for bundle in ["acct", "gui", "legal", "support"] {
+            let url = format!("http://127.0.0.1:8080/v1/web/webchat/default/{bundle}/");
+            assert!(
+                advert
+                    .lines
+                    .iter()
+                    .any(|line| line.split_whitespace().nth(1) == Some(url.as_str())),
+                "no line advertises {url}: {:?}",
+                advert.lines
+            );
+        }
+        // Four lines for four bundles: one bundle-scoped URL each, no bare alias.
+        assert_eq!(advert.lines.len(), 4);
+        assert!(advert.without_ui.is_empty());
+    }
+
+    #[test]
+    fn the_bare_tenant_shorthand_is_not_advertised() {
+        // Fix B: the bare `/{tenant}/` URL is never advertised — it is ambiguous
+        // once more than one bundle, or more than one operator on the shared
+        // tunnel, can answer for a tenant. Only bundle-scoped URLs are printed.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["acct", "gui", "legal", "support"]),
+            &no_flows(),
+        );
+        assert!(
+            !advert.lines.iter().any(|l| l.contains("→ default bundle")),
+            "bare alias advertised: {:?}",
+            advert.lines
+        );
+        assert!(
+            !advert.paths.iter().any(|p| p == "/v1/web/webchat/default/"),
+            "bare tenant path advertised: {:?}",
+            advert.paths
+        );
+    }
+
+    #[test]
+    fn a_multi_flow_bundle_advertises_a_url_per_flow() {
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &[("default", vec!["support"], Some("support"))],
+            &ui_set(&["support"]),
+            &flows(&[("support", &["main", "on_escalate"], Some("main"))]),
+        );
+        assert_eq!(
+            advert.lines,
+            vec![
+                "UI: http://127.0.0.1:8080/v1/web/webchat/default/support/ (default)",
+                "UI: http://127.0.0.1:8080/v1/web/webchat/default/support/main/ (default flow — same as the bundle URL above)",
+                "UI: http://127.0.0.1:8080/v1/web/webchat/default/support/on_escalate/",
+            ]
+        );
+        // Tunnel rebasing republishes the flow URLs too — a public visitor must
+        // not see a shorter list than a local one.
+        assert_eq!(advert.paths.len(), advert.lines.len());
+    }
+
+    #[test]
+    fn a_single_flow_bundle_gets_no_flow_url() {
+        // Its one flow URL IS the bundle URL. Printing both doubles the banner
+        // to say nothing, and the demo's four single-flow bundles are the
+        // common case.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &[("default", vec!["acct"], Some("acct"))],
+            &ui_set(&["acct"]),
+            &flows(&[("acct", &["on_message"], Some("on_message"))]),
+        );
+        assert_eq!(
+            advert.lines,
+            vec!["UI: http://127.0.0.1:8080/v1/web/webchat/default/acct/ (default)"]
+        );
+    }
+
+    #[test]
+    fn flow_urls_are_never_advertised_under_the_bare_tenant_shorthand() {
+        // `/{tenant}/{flow}/` is not a routing form: an unrecognized segment
+        // right after the tenant resolves as an ASSET path under the default
+        // bundle, so advertising it would promise a link that returns the SPA's
+        // 404 handling rather than the flow.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &[("default", vec!["support"], Some("support"))],
+            &ui_set(&["support"]),
+            &flows(&[("support", &["main", "on_escalate"], Some("main"))]),
+        );
+        for bad in [
+            "/v1/web/webchat/default/main/",
+            "/v1/web/webchat/default/on_escalate/",
+        ] {
+            assert!(
+                !advert.paths.iter().any(|path| path == bad),
+                "flow advertised under the bare tenant: {bad} in {:?}",
+                advert.paths
+            );
+        }
+    }
+
+    #[test]
+    fn a_bundle_with_no_unambiguous_default_flow_tags_nothing() {
+        // Two packs claiming a default tombstone the entry (see
+        // `FlowIndex::register_bundle_default_flow`), so no flow may claim to
+        // be what the bare bundle URL reaches.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &[("default", vec!["support"], None)],
+            &ui_set(&["support"]),
+            &flows(&[("support", &["main", "on_escalate"], None)]),
+        );
+        assert!(
+            !advert
+                .lines
+                .iter()
+                .any(|line| line.contains("default flow")),
+            "{:?}",
+            advert.lines
+        );
+    }
+
+    #[test]
+    fn flow_urls_are_not_advertised_for_a_bundle_that_cannot_serve() {
+        // The #460 property, extended: a bundle with no UI pack gets no URL,
+        // so it must not get per-flow URLs either.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["gui"]),
+            &flows(&[
+                ("gui", &["main", "on_escalate"], Some("main")),
+                ("support", &["main", "on_escalate"], Some("main")),
+            ]),
+        );
+        assert!(
+            !advert.paths.iter().any(|path| path.contains("/support/")),
+            "{:?}",
+            advert.paths
+        );
+        assert_eq!(
+            advert.paths,
+            vec![
+                "/v1/web/webchat/default/gui/",
+                "/v1/web/webchat/default/gui/main/",
+                "/v1/web/webchat/default/gui/on_escalate/",
+            ]
+        );
+    }
+
+    #[test]
+    fn unscoped_routes_advertise_everything() {
+        // Legacy/unscoped routes carry no bundle id. Keep the pre-scoping
+        // behaviour rather than advertising nothing at all.
+        let advert =
+            advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &unscoped(), &no_flows());
+        assert_eq!(advert.lines.len(), 4); // 4 bundles, no bare alias
+        assert!(advert.without_ui.is_empty());
+        assert!(advert.without_ui_note().is_none());
+    }
+
+    /// The other empty case, and the opposite answer: an environment with no
+    /// `/v1/web/webchat` route at all can serve NO bundle. Spelling this as an
+    /// empty scope set made it indistinguishable from `Unscoped` above, so every
+    /// bundle was advertised on a URL that answers `405 only POST is supported`.
+    #[test]
+    fn no_webchat_route_anywhere_advertises_nothing_and_explains_why() {
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &no_ui_anywhere(),
+            &no_flows(),
+        );
+        assert!(
+            advert.lines.is_empty(),
+            "nothing can serve a UI: {:?}",
+            advert.lines
+        );
+        assert!(advert.paths.is_empty(), "no path to rebase onto a tunnel");
+        assert_eq!(
+            advert.open_path, None,
+            "`/chat` must not forward into an env with no UI"
+        );
+        assert_eq!(advert.open_url, None);
+        // Every bundle accounted for, so the banner can say why it printed no URL.
+        assert_eq!(advert.without_ui, vec!["acct", "gui", "legal", "support"]);
+        let note = advert
+            .without_ui_note()
+            .expect("a note naming every bundle");
+        assert!(note.contains("acct, gui, legal, support"), "{note}");
+    }
+
+    // ── webchat_banner ──────────────────────────────────────────────────
+
+    fn routing_for_test(
+        tenant: &str,
+        bundle_id: Option<&str>,
+        with_webchat_ui: bool,
+    ) -> deployment_routes::RevisionIngressRouting {
+        use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
+        let (env, deployment_id) = match bundle_id {
+            Some(bundle_id) => {
+                let (env, id) = crate::test_fixtures::env_with_active_bundle(tenant, bundle_id);
+                (env, Some(id))
+            }
+            None => (crate::test_fixtures::env_with(Vec::new()), None),
+        };
+        let deployment_routes =
+            crate::deployment_routes::DeploymentRouteTable::from_environment(&env);
+        let bundle_index =
+            crate::webchat_routing::BundleIndex::from_routes_and_env(&deployment_routes, &env);
+        let routes = match (with_webchat_ui, bundle_id, deployment_id) {
+            (true, Some(bundle_id), Some(deployment_id)) => {
+                vec![crate::static_routes::StaticRouteDescriptor {
+                    route_id: "webchat-gui".to_string(),
+                    pack_id: "messaging-webchat-gui".to_string(),
+                    pack_path: std::path::PathBuf::from("packs/messaging-webchat-gui.gtpack"),
+                    public_path: "/v1/web/webchat/{tenant}".to_string(),
+                    source_root: "assets/webchat-gui".to_string(),
+                    index_file: Some("index.html".to_string()),
+                    spa_fallback: Some("index.html".to_string()),
+                    tenant_scoped: true,
+                    team_scoped: false,
+                    cache_strategy: crate::static_routes::CacheStrategy::None,
+                    route_segments: Vec::new(),
+                    scope: Some(crate::http_routes::RevisionScope {
+                        deployment_id,
+                        bundle_id: greentic_deploy_spec::BundleId::new(bundle_id),
+                        revision_id: greentic_deploy_spec::RevisionId::new(),
+                    }),
+                }]
+            }
+            _ => Vec::new(),
+        };
+        let plan = crate::static_routes::StaticRoutePlan {
+            routes,
+            ..Default::default()
+        };
+        deployment_routes::RevisionIngressRouting {
+            dispatcher: std::sync::Arc::new(RevisionDispatcher::new(
+                RevisionDispatcherConfig::new(tenant, [0u8; 32]),
+            )),
+            http_routes: crate::http_routes::HttpRouteTable::from_descriptors(Vec::new()),
+            deployment_routes,
+            endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+            deployment_config_overrides: std::sync::Arc::default(),
+            static_routes: crate::static_routes::ActiveRouteTable::from_plan(&plan),
+            bundle_index,
+            flow_index: crate::webchat_routing::FlowIndex::default(),
+        }
+    }
+
+    /// The regression this module exists for. A deployed bundle that ships no
+    /// webchat UI printed NOTHING — the operator got a revision count, no URL,
+    /// and no reason, then guessed a path and got `405 only POST is supported`.
+    /// The note was already written and unit-tested; the call site just never
+    /// reached it, because it also gated on "does this env have a UI anywhere".
+    #[test]
+    fn banner_explains_a_deployed_bundle_that_ships_no_webchat_ui() {
+        let routing = routing_for_test("acme", Some("hr-chat"), false);
+        let banner = webchat_banner(&routing, &[], &Default::default(), "127.0.0.1:8080");
+        assert_eq!(
+            banner.lines,
+            vec![
+                "no webchat UI pack in bundle(s) hr-chat — messaging endpoints only, \
+                 no browser URL"
+            ],
+            "the banner must say why it printed no URL"
+        );
+        assert_eq!(banner.open_url, None, "nothing to open");
+        assert!(banner.paths.is_empty(), "no path to rebase onto a tunnel");
+    }
+
+    #[test]
+    fn banner_advertises_a_bundle_that_ships_a_webchat_ui() {
+        let routing = routing_for_test("acme", Some("hr-chat"), true);
+        let banner = webchat_banner(&routing, &[], &Default::default(), "127.0.0.1:8080");
+        assert!(
+            banner
+                .lines
+                .iter()
+                .any(|line| line.contains("http://127.0.0.1:8080/v1/web/webchat/acme/")),
+            "{:?}",
+            banner.lines
+        );
+        assert!(
+            !banner
+                .lines
+                .iter()
+                .any(|line| line.contains("no webchat UI")),
+            "nothing is without a UI here: {:?}",
+            banner.lines
+        );
+        // Bundle-scoped, not the bare `/acme/` shorthand (Fix B): the default
+        // bundle's own URL is what `--open-webchat` opens now.
+        assert_eq!(
+            banner.open_url.as_deref(),
+            Some("http://127.0.0.1:8080/v1/web/webchat/acme/hr-chat/")
+        );
+    }
+
+    /// Pre-deploy-spec environments have no bundle index, so the templates are
+    /// all there is to expand. Guarding the regression fix from taking the
+    /// backwards-compatible path down with it.
+    #[test]
+    fn banner_expands_route_templates_without_a_bundle_index() {
+        let routing = routing_for_test("acme", None, false);
+        assert!(
+            routing.bundle_index.tenants_and_bundles().is_empty(),
+            "fixture must have no bundle index or this tests the wrong branch"
+        );
+        let tenants: std::collections::BTreeSet<&str> = ["acme", "beta"].into_iter().collect();
+        let banner = webchat_banner(
+            &routing,
+            &["/v1/web/webchat/{tenant}".to_string()],
+            &tenants,
+            "127.0.0.1:8080",
+        );
+        assert_eq!(
+            banner.paths,
+            vec!["/v1/web/webchat/acme/", "/v1/web/webchat/beta/"]
+        );
+        assert_eq!(
+            banner.open_url.as_deref(),
+            Some("http://127.0.0.1:8080/v1/web/webchat/acme/")
+        );
+        // No bundle names exist on this path, so silence is all it can offer.
+        let silent = webchat_banner(&routing, &[], &tenants, "127.0.0.1:8080");
+        assert_eq!(silent, WebchatBanner::default());
+    }
+
+    #[test]
+    fn every_advertised_path_has_a_matching_line_for_tunnel_rebasing() {
+        // `paths` is rebased onto the public tunnel URL, so a path with no
+        // corresponding line would republish a dead link publicly. Match the
+        // line's URL token EXACTLY: a bare `/v1/web/webchat/default/` is a
+        // substring of every bundle-scoped line under that tenant, so a
+        // `contains` check here passes even when the alias is never printed.
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &[
+                ("acme", vec!["gui", "ops"], Some("ops")),
+                ("default", vec!["acct", "gui"], Some("acct")),
+            ],
+            &ui_set(&["gui"]),
+            &no_flows(),
+        );
+        assert_eq!(advert.lines.len(), advert.paths.len());
+        for path in &advert.paths {
+            let url = format!("http://127.0.0.1:8080{path}");
+            assert!(
+                advert
+                    .lines
+                    .iter()
+                    .any(|line| line.split_whitespace().nth(1) == Some(url.as_str())),
+                "path {path} has no advertised line: {:?}",
+                advert.lines
+            );
+        }
+        // Neither tenant's default can serve, so neither gets a bare alias.
+        assert_eq!(advert.without_ui, vec!["ops", "acct"]);
+        assert_eq!(
+            advert.paths,
+            vec!["/v1/web/webchat/acme/gui/", "/v1/web/webchat/default/gui/"]
+        );
+    }
+
+    #[test]
+    fn without_ui_note_names_the_skipped_bundles() {
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["gui"]),
+            &no_flows(),
+        );
+        let note = advert
+            .without_ui_note()
+            .expect("a note for skipped bundles");
+        assert!(note.contains("acct, legal, support"), "{note}");
+        assert!(note.contains("messaging endpoints only"), "{note}");
+    }
+
+    /// `GET /chat` forwards to `open_path`, and the banner prints `open_url`.
+    /// If those two ever name different pages, the shortcut lands somewhere the
+    /// operator was never told about — so pin them together across every shape
+    /// the advert can take, not just the happy one.
+    #[test]
+    fn open_path_is_always_the_path_of_open_url() {
+        let agree = |name: &str, advert: WebchatAdvert| {
+            match (&advert.open_url, &advert.open_path) {
+                (Some(url), Some(path)) => assert_eq!(
+                    *url,
+                    format!("http://127.0.0.1:8080{path}"),
+                    "{name}: open_url and open_path disagree"
+                ),
+                (None, None) => {}
+                other => panic!("{name}: open_url/open_path must be set together, got {other:?}"),
+            }
+            // Whatever it opens must be a URL the banner actually advertised.
+            if let Some(path) = &advert.open_path {
+                assert!(
+                    advert.paths.contains(path),
+                    "{name}: opens `{path}`, which is not among {:?}",
+                    advert.paths
+                );
+            }
+        };
+
+        // Default bundle ships a UI: the bare tenant alias.
+        agree(
+            "default ships a ui",
+            advertise_webchat_urls(
+                "127.0.0.1:8080",
+                &[("default", vec!["gui", "legal"], Some("gui"))],
+                &ui_set(&["gui"]),
+                &no_flows(),
+            ),
+        );
+        // Default ships none: falls back to a servable bundle's own URL.
+        agree(
+            "default ships none",
+            advertise_webchat_urls(
+                "127.0.0.1:8080",
+                &demo_env(),
+                &ui_set(&["gui"]),
+                &no_flows(),
+            ),
+        );
+        // No bundle can serve: nothing to open.
+        agree(
+            "nothing servable",
+            advertise_webchat_urls(
+                "127.0.0.1:8080",
+                &demo_env(),
+                &ui_set(&["absent"]),
+                &no_flows(),
+            ),
+        );
+        // Legacy unscoped routes: every bundle counts as servable.
+        agree(
+            "legacy unscoped",
+            advertise_webchat_urls("127.0.0.1:8080", &demo_env(), &unscoped(), &no_flows()),
+        );
+        // No webchat route anywhere: both must be `None` together.
+        agree(
+            "no ui anywhere",
+            advertise_webchat_urls(
+                "127.0.0.1:8080",
+                &demo_env(),
+                &no_ui_anywhere(),
+                &no_flows(),
+            ),
+        );
+    }
+
+    /// The `/chat` target for the demo environment: `acct` is the tenant
+    /// default and ships a UI, so the shortcut lands on its bundle-scoped URL
+    /// (Fix B: never the bare `/{tenant}/` shorthand).
+    #[test]
+    fn open_path_is_the_default_bundle_scoped_url_when_it_ships_a_ui() {
+        let advert = advertise_webchat_urls(
+            "127.0.0.1:8080",
+            &demo_env(),
+            &ui_set(&["acct", "gui", "legal", "support"]),
+            &no_flows(),
+        );
+        assert_eq!(
+            advert.open_path.as_deref(),
+            Some("/v1/web/webchat/default/acct/")
+        );
     }
 
     #[test]
@@ -2023,12 +3663,16 @@ mod tests {
             cloudflared_binary: None,
             ngrok: NgrokModeArg::Off,
             ngrok_binary: None,
+            gtunnel: GtunnelModeArg::Off,
+            gtunnel_worker_url: None,
+            gtunnel_tunnel_id: None,
             runner_binary: None,
             restart: Vec::new(),
             log_dir: None,
             verbose: false,
             quiet: false,
             no_browser: false,
+            open_webchat: None,
             no_updates: false,
             no_auto_restart: false,
             admin: false,
@@ -2058,12 +3702,16 @@ mod tests {
             cloudflared_binary: None,
             ngrok: NgrokModeArg::Off,
             ngrok_binary: None,
+            gtunnel: GtunnelModeArg::Off,
+            gtunnel_worker_url: None,
+            gtunnel_tunnel_id: None,
             runner_binary: None,
             restart: Vec::new(),
             log_dir: None,
             verbose: false,
             quiet: false,
             no_browser: false,
+            open_webchat: None,
             no_updates: false,
             no_auto_restart: false,
             admin: false,
@@ -2162,12 +3810,16 @@ mod tests {
             cloudflared_binary: None,
             ngrok: NgrokModeArg::Off,
             ngrok_binary: None,
+            gtunnel: GtunnelModeArg::Off,
+            gtunnel_worker_url: None,
+            gtunnel_tunnel_id: None,
             runner_binary: None,
             restart: Vec::new(),
             log_dir: None,
             verbose: false,
             quiet: false,
             no_browser: false,
+            open_webchat: None,
             no_updates: false,
             no_auto_restart: false,
             admin: false,

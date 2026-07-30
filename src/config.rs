@@ -368,12 +368,15 @@ fn resolve_path(base: &Path, value: &str) -> PathBuf {
     }
 }
 
+/// Tenant a runtime config assumes when neither `demo.yaml` nor the CLI names
+/// one. Was `demo`; see [`crate::DEFAULT_TENANT`] for why it is now `default`
+/// and why the constant is duplicated rather than imported from greentic-types.
 fn default_demo_tenant() -> String {
-    "demo".to_string()
+    crate::DEFAULT_TENANT.to_string()
 }
 
 fn default_demo_team() -> String {
-    "default".to_string()
+    crate::DEFAULT_TEAM.to_string()
 }
 
 fn default_true() -> bool {
@@ -422,6 +425,36 @@ fn default_msgraph_mode() -> String {
 
 pub(crate) fn default_events_components() -> Vec<ServiceComponentConfig> {
     Vec::new()
+}
+
+#[cfg(test)]
+mod tenant_default_tests {
+    use super::*;
+
+    /// The tenant the runtime uses when neither `demo.yaml` nor the CLI names
+    /// one. This is the value that ends up in `state/runtime/<tenant.team>/`,
+    /// in `GREENTIC_TENANT`, and in every `secrets://` URI the run resolves.
+    /// It was `demo` while greentic-deployer and greentic-setup bound bundles
+    /// under `default`, so the server ran in one namespace and served
+    /// deployments from another.
+    #[test]
+    fn runtime_config_defaults_to_the_fleet_tenant_not_demo() {
+        let config = DemoConfig::default();
+        assert_eq!(config.tenant, "default");
+        assert_ne!(config.tenant, "demo");
+        assert_eq!(config.team, "default");
+    }
+
+    /// The same defaults have to apply when a `demo.yaml` simply omits the
+    /// keys — they are `#[serde(default = "...")]`, a separate code path from
+    /// `Default::default()`.
+    #[test]
+    fn a_demo_yaml_without_tenant_keys_gets_the_same_defaults() {
+        let config: DemoConfig =
+            serde_yaml_bw::from_str("services: {}\n").expect("minimal demo.yaml parses");
+        assert_eq!(config.tenant, "default");
+        assert_eq!(config.team, "default");
+    }
 }
 
 #[cfg(test)]

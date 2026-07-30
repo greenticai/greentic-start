@@ -170,6 +170,36 @@ pub(crate) async fn register_new_model_webhooks(
     .await;
 }
 
+/// Whether the served revisions declare any provider webhook that *would* be
+/// registered given a public URL — i.e. whether this env-serve boot needs a
+/// public URL at all. Reuses the exact planner [`register_new_model_webhooks`]
+/// uses (provider-ingest routes + messaging endpoints), so the signal can't
+/// drift from what actually registers. Lets the boot decide to default a tunnel
+/// on *before* a URL exists; the plan count is independent of the base URL, so a
+/// placeholder is fine here.
+pub(crate) fn env_needs_public_webhook(
+    routes: &[HttpRouteDescriptor],
+    environment: &Environment,
+) -> bool {
+    let tenant_by_deployment: HashMap<DeploymentId, String> = environment
+        .bundles
+        .iter()
+        .map(|d| {
+            (
+                d.deployment_id,
+                d.route_binding.tenant_selector.tenant.clone(),
+            )
+        })
+        .collect();
+    !plan_webhook_registrations(
+        routes,
+        &environment.messaging_endpoints,
+        &tenant_by_deployment,
+        "https://placeholder.invalid",
+    )
+    .is_empty()
+}
+
 /// Resolve + invoke `setup_webhook` for a single plan. Errors are logged here
 /// and never bubble out — registration is best-effort, the next reload retries.
 async fn register_one(

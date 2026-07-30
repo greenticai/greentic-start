@@ -432,7 +432,6 @@ fn is_own_cloud_run_host(host: &str, expected_service: &str) -> bool {
     let prefix = format!("{}-", expected_service.to_ascii_lowercase());
     name.ends_with(".run.app") && name.starts_with(&prefix)
 }
-
 /// Choose the WebSocket scheme (`ws` / `wss`) for a DirectLine `streamUrl`
 /// advertised to the browser, based on the forwarded protocol of the inbound
 /// request.
