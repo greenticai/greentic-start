@@ -1681,6 +1681,51 @@ enum NotifyError {
     BinaryMirror(String),
 }
 
+/// Response status, opaque public body, and log detail for a notify failure that
+/// is not an [`NotifyError::Op`] (those go through [`map_op_error`]); `None` for
+/// `Op`.
+///
+/// Extracted from the handler so the mapping is unit-testable. A failed blob
+/// mirror must surface as 502, distinguishable from an opaque 500: otherwise an
+/// operator cannot tell "your in-gap mirror is misconfigured" from "this server
+/// is broken", and the two have completely different remedies.
+fn notify_failure_response(err: &NotifyError) -> Option<(StatusCode, &'static str, String)> {
+    match err {
+        NotifyError::Op(_) => None,
+        NotifyError::Internal(message) => Some((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error staging update plan",
+            format!("update-notify: internal failure: {message}"),
+        )),
+        NotifyError::BinaryMirror(message) => Some((
+            StatusCode::BAD_GATEWAY,
+            "blob mirror fetch failed",
+            format!("update-notify: blob-mirror failure: {message}"),
+        )),
+    }
+}
+
+/// Whether a completed notify attempt means the plan was ACTED ON, so
+/// [`poll_update_cycle`] may remember its sequence and stop re-fetching it.
+///
+/// Only a 2xx `Ok` qualifies. Every other outcome deliberately leaves the
+/// sequence unadvanced so the plan is retried next cycle:
+/// - a non-2xx `Ok` is the disabled-channel TOCTOU (403) — a re-enabled channel
+///   must still pick this plan up rather than skip it until a newer one exists;
+/// - `Op` / `Internal` mean the plan was not staged at all;
+/// - `BinaryMirror` is a configured blob mirror that failed, and NOT advancing is
+///   what makes the airgap path self-healing: fix the mirror and the fleet
+///   converges on the next poll with no republish.
+///
+/// This is deliberately ONE decision point. While each match arm built its own
+/// return tuple, the rule was duplicated four ways and a regression in any single
+/// arm was invisible to the test suite — a mutation that advanced the sequence on
+/// `BinaryMirror` (reintroducing permanent silent divergence: content converged,
+/// sequence moved on, binary stranded on the old version) passed the whole suite.
+fn notify_outcome_acted_on(outcome: &Result<(StatusCode, Value), NotifyError>) -> bool {
+    matches!(outcome, Ok((status, _)) if status.is_success())
+}
+
 /// Parse + validate a `greentic.update-notify.v1` body into the raw plan and
 /// signature bytes. `Err((status, message))` is a ready 4xx (all client faults:
 /// malformed JSON, unknown schema, non-base64 payloads).
@@ -2876,25 +2921,11 @@ async fn handle_update_notify(
             Ok(json_response(status, bytes))
         }
         Err(NotifyError::Op(err)) => Err(map_op_error(&err)),
-        Err(NotifyError::Internal(message)) => {
-            operator_log::error(
-                module_path!(),
-                format!("update-notify: internal failure: {message}"),
-            );
-            Err(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error staging update plan",
-            ))
-        }
-        Err(NotifyError::BinaryMirror(message)) => {
-            operator_log::error(
-                module_path!(),
-                format!("update-notify: blob-mirror failure: {message}"),
-            );
-            Err(error_response(
-                StatusCode::BAD_GATEWAY,
-                "blob mirror fetch failed",
-            ))
+        Err(err) => {
+            let (status, public, detail) = notify_failure_response(&err)
+                .expect("only `Op` maps to None and it is matched above");
+            operator_log::error(module_path!(), detail);
+            Err(error_response(status, public))
         }
     }
 }
@@ -3303,62 +3334,49 @@ fn poll_update_cycle(
     }
 
     // 4. Verify + record/stage via the shared receiver core.
-    match run_update_notify(&store, env_id, &plan, &sig, exe_path) {
-        Ok((status, body)) => {
-            let restart = body
+    let outcome = run_update_notify(&store, env_id, &plan, &sig, exe_path);
+
+    // Logging only. The advance decision is made ONCE below, via
+    // `notify_outcome_acted_on` — do not return from these arms.
+    match &outcome {
+        Ok((status, body)) => operator_log::info(
+            module_path!(),
+            format!(
+                "update-poll: env `{env_id}` plan sequence {} -> {} ({})",
+                meta.sequence,
+                status.as_u16(),
+                body.get("status").and_then(|s| s.as_str()).unwrap_or("ok"),
+            ),
+        ),
+        Err(NotifyError::Op(err)) => operator_log::warn(
+            module_path!(),
+            format!("update-poll: plan rejected for env `{env_id}`: {err}"),
+        ),
+        Err(NotifyError::Internal(message)) => operator_log::error(
+            module_path!(),
+            format!("update-poll: internal failure staging plan for env `{env_id}`: {message}"),
+        ),
+        Err(NotifyError::BinaryMirror(message)) => operator_log::error(
+            module_path!(),
+            format!(
+                "update-poll: blob-mirror failure for env `{env_id}`, \
+                 plan will be retried next cycle: {message}"
+            ),
+        ),
+    }
+
+    if notify_outcome_acted_on(&outcome) {
+        let restart = matches!(
+            &outcome,
+            Ok((_, body)) if body
                 .get("binary")
                 .and_then(|b| b.get("restart_required"))
                 .and_then(Value::as_bool)
-                == Some(true);
-            operator_log::info(
-                module_path!(),
-                format!(
-                    "update-poll: env `{env_id}` plan sequence {} -> {} ({})",
-                    meta.sequence,
-                    status.as_u16(),
-                    body.get("status").and_then(|s| s.as_str()).unwrap_or("ok"),
-                ),
-            );
-            // Advance the remembered sequence ONLY when the plan was actually
-            // acted on (2xx = staged or recorded). A non-2xx `Ok` means the
-            // channel was disabled between this cycle's config read and the
-            // receiver's own re-read (a TOCTOU that yields 403 `disabled`);
-            // leaving the sequence unadvanced lets a re-enabled channel pick the
-            // plan up next cycle instead of skipping it until the server
-            // publishes a newer one.
-            if status.is_success() {
-                (Some(meta.sequence), interval, restart)
-            } else {
-                (last_sequence, interval, false)
-            }
-        }
-        Err(NotifyError::Op(err)) => {
-            operator_log::warn(
-                module_path!(),
-                format!("update-poll: plan rejected for env `{env_id}`: {err}"),
-            );
-            (last_sequence, interval, false)
-        }
-        Err(NotifyError::Internal(message)) => {
-            operator_log::error(
-                module_path!(),
-                format!("update-poll: internal failure staging plan for env `{env_id}`: {message}"),
-            );
-            (last_sequence, interval, false)
-        }
-        Err(NotifyError::BinaryMirror(message)) => {
-            // A configured blob mirror failed. The sequence is NOT advanced so
-            // the plan will be retried next poll cycle — fix the mirror and the
-            // fleet converges without republishing the plan.
-            operator_log::error(
-                module_path!(),
-                format!(
-                    "update-poll: blob-mirror failure for env `{env_id}`, \
-                     plan will be retried next cycle: {message}"
-                ),
-            );
-            (last_sequence, interval, false)
-        }
+                == Some(true)
+        );
+        (Some(meta.sequence), interval, restart)
+    } else {
+        (last_sequence, interval, false)
     }
 }
 
@@ -9135,6 +9153,68 @@ mod update_notify_tests {
         assert_eq!(
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn poll_outcome_advances_sequence_only_on_a_2xx() {
+        // The single decision point behind `poll_update_cycle`'s sequence
+        // bookkeeping. ONLY a 2xx `Ok` means the plan was acted on; every other
+        // outcome must leave the sequence unadvanced so the next cycle retries.
+        //
+        // The `BinaryMirror` case is the one that had no coverage and allowed a
+        // real bug: advancing there means content converges, the sequence moves
+        // on, and the binary is stranded on the old build with NO retry until
+        // someone publishes a higher sequence — a permanent silent divergence
+        // whose only trace is one log line.
+        let body = serde_json::json!({ "status": "staged" });
+        assert!(notify_outcome_acted_on(&Ok((StatusCode::OK, body.clone()))));
+        assert!(notify_outcome_acted_on(&Ok((
+            StatusCode::ACCEPTED,
+            body.clone()
+        ))));
+        // Non-2xx `Ok` is the disabled-channel TOCTOU — a re-enabled channel must
+        // still pick this plan up rather than skip it.
+        assert!(!notify_outcome_acted_on(&Ok((
+            StatusCode::FORBIDDEN,
+            body.clone()
+        ))));
+        assert!(!notify_outcome_acted_on(&Err(NotifyError::Op(
+            OpError::Conflict("rejected".into())
+        ))));
+        assert!(!notify_outcome_acted_on(&Err(NotifyError::Internal(
+            "boom".into()
+        ))));
+        assert!(
+            !notify_outcome_acted_on(&Err(NotifyError::BinaryMirror("mirror down".into()))),
+            "a configured blob mirror that failed must NOT advance the sequence — \
+             not advancing is what makes the airgap path self-healing"
+        );
+    }
+
+    #[test]
+    fn notify_failure_response_separates_a_broken_mirror_from_a_broken_server() {
+        // An operator must be able to tell "your in-gap mirror is misconfigured"
+        // (502) from "this server is broken" (500) off the status alone; the two
+        // have completely different remedies. `Op` is routed via `map_op_error`.
+        let (status, public, detail) =
+            notify_failure_response(&NotifyError::BinaryMirror("404 from mirror".into()))
+                .expect("BinaryMirror maps");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(public.contains("mirror"), "public body: {public}");
+        assert!(
+            detail.contains("404 from mirror"),
+            "log detail must keep the cause: {detail}"
+        );
+
+        let (status, _, detail) =
+            notify_failure_response(&NotifyError::Internal("boom".into())).expect("Internal maps");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(detail.contains("boom"), "{detail}");
+
+        assert!(
+            notify_failure_response(&NotifyError::Op(OpError::Conflict("x".into()))).is_none(),
+            "`Op` must stay on the map_op_error path"
         );
     }
 
