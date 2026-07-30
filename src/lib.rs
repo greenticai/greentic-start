@@ -679,13 +679,34 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                     if request.gtunnel_tunnel_id.is_none() {
                         request.gtunnel_tunnel_id = Some(tunnel_id.clone());
                     }
+                    // Serve the tenant the id names, so the EXTERNAL identity is
+                    // the unique one while internal resolution stays on the base
+                    // tenant.
+                    //
+                    // Why the external segment must carry the suffix: the Worker
+                    // routes `/v1/web/webchat/<tenant>/…` by that tenant segment
+                    // and forwards it unchanged (path-prefix mode strips the id,
+                    // but the SPA's root-absolute calls carry no prefix to strip).
+                    // So the id the agent registers under has to equal the tenant
+                    // in that URL, or those calls address a tunnel that does not
+                    // exist. Setup derived this id from the same per-install seed,
+                    // so re-aliasing here would append a SECOND suffix and break
+                    // the URL setup already registered with providers.
+                    //
+                    // Internal resolution is unaffected: secrets stay written
+                    // under the base tenant and resolve through the alias→base
+                    // fallback (`secrets_gate`, candidates from the bundle's
+                    // `tenants/` dir). Non-gtunnel runs never reach this branch,
+                    // so cloudflared/ngrok/tunnel-less keep the bare tenant.
+                    for dep in &mut environment.bundles {
+                        dep.route_binding.tenant_selector.tenant = tunnel_id.clone();
+                    }
                     operator_log::info(
                         module_path!(),
                         format!(
-                            "adopting the tunnel id `{tunnel_id}` recorded by greentic-setup; \
-                             skipping the managed-tenant alias so the served tenant keeps \
-                             matching the URL providers were registered against and the scope \
-                             their secrets were written under"
+                            "adopting the tunnel id `{tunnel_id}` recorded by greentic-setup and \
+                             serving it as the public tenant; secrets and state stay scoped to the \
+                             base tenant via the alias→base fallback"
                         ),
                     );
                 }
