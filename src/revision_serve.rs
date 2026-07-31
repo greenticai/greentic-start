@@ -12768,25 +12768,28 @@ mod binary_update_tests {
         }
     }
 
-    // The four `c4_notify_*` tests below drive the real `run_update_notify`, which
-    // means the deployer's `updates::get` resolves its staging root from the
-    // process-global `HOME` (there is no override parameter). Unrelated tests in
-    // this crate mutate `HOME` with `std::env::set_var` (`src/lib.rs`,
+    // The `c4_notify_*` and `c6_poll_*` scenarios below drive the real
+    // `run_update_notify` / `poll_update_cycle`, which resolve their staging root
+    // from the process-global `HOME` (there is no override parameter). Unrelated
+    // tests in this crate mutate `HOME` with `std::env::set_var` (`src/lib.rs`,
     // `src/seed_copy.rs`, `src/startup_contract.rs`), and cargo runs tests as
     // threads in ONE process — so a concurrent `set_var` can move `HOME` between
-    // `updates::get` staging the plan and `UpdatesRoot::open` looking it up,
-    // yielding a spurious "staged plan not found". That is a race against foreign
-    // tests, not something these tests can defend against.
+    // staging and lookup, yielding a spurious "staged plan not found". That is a
+    // race against foreign tests, not something these scenarios can defend against.
     //
-    // They are therefore `#[ignore]`d: run them deliberately and isolated with
-    //   cargo test -p greentic-start --lib -- --ignored c4_notify_
-    // where they pass consistently. The swallow-vs-surface policy they cover is
-    // ALSO pinned deterministically, without any `HOME` dependency, by
-    // `classify_binary_step_surfaces_only_mirror_failures`,
+    // They are therefore `#[ignore]`d: each has a companion `driver_*` test (not
+    // ignored) that spawns `std::env::current_exe()` as a CHILD PROCESS with
+    // per-command `HOME` and `GREENTIC_UPDATES_DIR` env, runs the scenario in
+    // isolation via `--exact --ignored --test-threads=1`, and asserts both exit
+    // success AND "1 passed" in stdout (so a renamed scenario is caught, not
+    // silently skipped). CI therefore exercises every scenario through its driver
+    // on every default `cargo test` run — the `#[ignore]` only prevents the
+    // scenario from racing other threads inside the parent process.
+    //
+    // The swallow-vs-surface policy is ALSO pinned deterministically, without any
+    // `HOME` dependency, by `classify_binary_step_surfaces_only_mirror_failures`,
     // `poll_outcome_advances_sequence_only_on_a_2xx`, and
     // `notify_failure_response_separates_a_broken_mirror_from_a_broken_server`.
-    // End-to-end proof through the real notify path belongs in the Tier 2 E2E
-    // (phase C6), which runs in its own process.
     #[test]
     #[ignore = "drives real updates::get; races foreign set_var(\"HOME\") — see note above"]
     fn c4_notify_mirror_unreachable_returns_binary_mirror_error() {
@@ -12936,6 +12939,319 @@ mod binary_update_tests {
             stage,
             greentic_update::staging::UpdateStage::Staged,
             "plan must be in Staged state (content converged)"
+        );
+    }
+
+    // ── C6 driver infrastructure ─────────────────────────────────────────────
+    //
+    // `run_scenario_in_child` is the shared core for every `driver_*` test.
+    // It spawns this same test binary as a child process with isolated `HOME`
+    // and `GREENTIC_UPDATES_DIR`, runs the named `--ignored` scenario, and
+    // asserts BOTH exit-0 AND "1 passed" in stdout. The "1 passed" guard is
+    // mandatory: without it a renamed scenario would match nothing and the
+    // driver would silently pass (libtest exits 0 with "0 passed" when the
+    // filter matches nothing).
+
+    /// Wall-clock ceiling for a scenario child. Generous next to the 10s
+    /// deadlines inside the scenarios themselves, but bounded: without it a
+    /// wedged child turns into a CI job that hangs until the platform timeout
+    /// kills it with no diagnostic at all.
+    const SCENARIO_CHILD_TIMEOUT: Duration = Duration::from_secs(120);
+
+    fn run_scenario_in_child(scenario_filter: &str) {
+        let home = tempfile::TempDir::new().expect("HOME tempdir");
+        let updates_dir = tempfile::TempDir::new().expect("GREENTIC_UPDATES_DIR tempdir");
+        let io_dir = tempfile::TempDir::new().expect("child stdio tempdir");
+        let stdout_path = io_dir.path().join("stdout");
+        let stderr_path = io_dir.path().join("stderr");
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                scenario_filter,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("HOME", home.path())
+            .env("GREENTIC_UPDATES_DIR", updates_dir.path())
+            // Pin container detection OFF. `is_container_environment()` (the
+            // `GREENTIC_CONTAINER` override, `/.dockerenv`, `/run/.containerenv`,
+            // cgroup markers) makes `try_apply_binary_update` return `Ok(None)`
+            // before it ever downloads a blob. Left to autodetect, every
+            // binary-swap assertion below would depend on whether the CI runner
+            // happens to be containerized. Per-`Command` so no `set_var` is needed.
+            .env("GREENTIC_CONTAINER", "0")
+            // Redirect to files rather than pipes: a piped child that outfills
+            // the pipe buffer blocks on write while the parent blocks on wait.
+            .stdout(std::fs::File::create(&stdout_path).expect("create child stdout"))
+            .stderr(std::fs::File::create(&stderr_path).expect("create child stderr"))
+            .spawn()
+            .expect("failed to spawn child test process");
+
+        let deadline = std::time::Instant::now() + SCENARIO_CHILD_TIMEOUT;
+        let status = loop {
+            match child.try_wait().expect("try_wait on scenario child") {
+                Some(status) => break Some(status),
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+
+        let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+
+        let status = status.unwrap_or_else(|| {
+            panic!(
+                "child process for `{scenario_filter}` did not finish within {}s and was killed \
+                 (a hang, not a failure)\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                SCENARIO_CHILD_TIMEOUT.as_secs(),
+            )
+        });
+
+        assert!(
+            status.success(),
+            "child process for `{scenario_filter}` exited with {status}\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        );
+
+        // THE most important assertion in the driver: a misnamed filter
+        // matches nothing, libtest exits 0 with "0 passed", and the driver
+        // silently becomes a no-op. This line catches that.
+        assert!(
+            stdout.contains("1 passed"),
+            "child stdout must prove exactly 1 scenario ran \
+             (guard against silent no-op on a renamed filter).\n\
+             filter: `{scenario_filter}`\n--- stdout ---\n{stdout}",
+        );
+    }
+
+    // ── C6 drivers for the four C4 notify scenarios ───────────────────────
+
+    #[test]
+    fn driver_c4_notify_mirror_unreachable() {
+        run_scenario_in_child(
+            "revision_serve::binary_update_tests::c4_notify_mirror_unreachable_returns_binary_mirror_error",
+        );
+    }
+
+    #[test]
+    fn driver_c4_notify_mirror_tampered() {
+        run_scenario_in_child(
+            "revision_serve::binary_update_tests::c4_notify_mirror_tampered_returns_binary_mirror_error",
+        );
+    }
+
+    #[test]
+    fn driver_c4_notify_no_mirror_b3_regression() {
+        run_scenario_in_child(
+            "revision_serve::binary_update_tests::c4_notify_no_mirror_b3_regression_pin",
+        );
+    }
+
+    #[test]
+    fn driver_c4_notify_content_staged_despite_mirror_failure() {
+        run_scenario_in_child(
+            "revision_serve::binary_update_tests::c4_notify_content_staged_despite_mirror_failure",
+        );
+    }
+
+    // ── C6 positive poll: poll_update_cycle stages + swaps ─────────────────
+    //
+    // This is the positive-path proof the task requires: a real
+    // `poll_update_cycle` call against a local HTTP server that serves the
+    // exact Tier 2 wire layout (`/meta`, plan bytes, `.sig`, blob).
+
+    /// Spawn a minimal HTTP/1.1 server that serves the Tier 2 poll endpoints:
+    ///   GET <base>/plan/meta  -> `{"sequence": N, "plan_sha256": "<hex>"}`
+    ///   GET <base>/plan       -> raw plan bytes
+    ///   GET <base>/plan.sig   -> DSSE envelope bytes
+    ///   GET <base>/sha256-<hex> -> binary blob bytes
+    ///
+    /// Accepts up to 4 connections (one per endpoint) with a 10-second
+    /// deadline, then shuts down. The deadline prevents `join()` from
+    /// hanging when fewer than 4 connections arrive (e.g. the container
+    /// guard skips the blob download in Docker CI).
+    /// Returns `(base_url, join_handle)`.
+    fn spawn_tier2_server(
+        plan_bytes: &[u8],
+        sig_bytes: &[u8],
+        blob_hex: &str,
+        blob_body: &[u8],
+        sequence: u64,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let plan_sha256 = sha256_hex(plan_bytes);
+        let meta_body = serde_json::to_vec(&serde_json::json!({
+            "sequence": sequence,
+            "plan_sha256": plan_sha256,
+        }))
+        .unwrap();
+        let plan_bytes = plan_bytes.to_vec();
+        let sig_bytes = sig_bytes.to_vec();
+        let blob_path = format!("/sha256-{blob_hex}");
+        let blob_body = blob_body.to_vec();
+
+        let handle = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+
+            // Bounded accept. A plain blocking `accept()` deadlocks the caller's
+            // `join()` whenever the client makes fewer connections than expected —
+            // e.g. `is_container_environment()` returns true in Docker CI, skipping
+            // the blob download. That turns a clean assertion failure into a CI job
+            // timeout with no diagnostic. Give up after a deadline and let the
+            // test's own assertions report the real problem.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+            // Serve up to 4 requests (meta, plan, sig, blob).
+            for _ in 0..4 {
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((s, _)) => break Some(s),
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                break None;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break None,
+                    }
+                };
+                let Some(stream) = stream else {
+                    break;
+                };
+                // The accepted socket can inherit the listener's non-blocking
+                // flag; the request/response exchange below wants blocking
+                // semantics.
+                stream.set_nonblocking(false).unwrap();
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                // Drain headers.
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line == "\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                let mut writer = reader.into_inner();
+
+                let response_body: &[u8] = if path == "/plan/meta" {
+                    &meta_body
+                } else if path == "/plan" {
+                    &plan_bytes
+                } else if path == "/plan.sig" {
+                    &sig_bytes
+                } else if path == blob_path {
+                    &blob_body
+                } else {
+                    let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                    let _ = writer.write_all(resp.as_bytes());
+                    continue;
+                };
+
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    response_body.len(),
+                );
+                let _ = writer.write_all(resp.as_bytes());
+                let _ = writer.write_all(response_body);
+            }
+        });
+
+        (base_url, handle)
+    }
+
+    #[test]
+    #[ignore = "drives real updates::get via poll_update_cycle; races foreign set_var(\"HOME\")"]
+    fn c6_poll_cycle_stages_plan_and_swaps_binary() {
+        // Positive poll proof: a poll cycle against a local Tier 2 server
+        // must stage the plan, swap the binary, advance the sequence, and
+        // set the restart flag.
+        let dummy_exe = b"new-poll-binary-v99";
+        let env_id = "c6-poll-happy";
+
+        let h = NotifyTestHarness::new(env_id, dummy_exe, None);
+
+        let blob_hex = h.binary_digest.strip_prefix("sha256:").unwrap();
+
+        // Spin up the Tier 2 server. The meta sequence must match the plan's
+        // embedded `sequence` field (the deployer always writes them equal);
+        // `test_plan_for_notify` hardcodes sequence 1.
+        let plan_sequence = 1;
+        let (base_url, server) = spawn_tier2_server(
+            &h.plan_bytes,
+            &h.sig_bytes,
+            blob_hex,
+            dummy_exe,
+            plan_sequence,
+        );
+
+        // Configure the update channel with the poll endpoint and blob base URL.
+        let mut cfg = UpdateChannelConfig::disabled(EnvId::new(env_id).unwrap());
+        cfg.enabled = Some(true);
+        cfg.on_update = Some(UpdateAction::Stage);
+        cfg.plan_endpoint = Some(format!("{base_url}/plan"));
+        cfg.blob_base_url = Some(base_url.clone());
+        std::fs::write(
+            h.store_dir.path().join(env_id).join("update-channel.json"),
+            serde_json::to_vec_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("client");
+
+        let (seq, _interval, restart) = poll_update_cycle(
+            env_id,
+            h.store_dir.path(),
+            &client,
+            None, // no previous sequence
+            Some(&h.target_exe),
+        );
+        server.join().unwrap();
+
+        // Sequence must have advanced to the plan's sequence (1).
+        assert_eq!(
+            seq,
+            Some(plan_sequence),
+            "poll cycle must advance the sequence on a successful stage"
+        );
+
+        // Restart flag must be set (binary was swapped).
+        assert!(
+            restart,
+            "poll cycle must set the restart flag after a binary swap"
+        );
+
+        // Binary must have been swapped to the new bytes.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, dummy_exe,
+            "target binary must be replaced by the new binary after poll"
+        );
+    }
+
+    #[test]
+    fn driver_c6_poll_cycle_stages_and_swaps() {
+        run_scenario_in_child(
+            "revision_serve::binary_update_tests::c6_poll_cycle_stages_plan_and_swaps_binary",
         );
     }
 
