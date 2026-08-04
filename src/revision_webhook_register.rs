@@ -119,6 +119,7 @@ pub(crate) async fn register_new_model_webhooks(
     activation: &Activation,
     environment: &Environment,
     public_base_url: Option<&str>,
+    primary_tunnel_id: Option<&str>,
 ) {
     let Some(base) = public_base_url else {
         operator_log::info(
@@ -145,6 +146,7 @@ pub(crate) async fn register_new_model_webhooks(
         &environment.messaging_endpoints,
         &tenant_by_deployment,
         base,
+        primary_tunnel_id,
     );
 
     if plans.is_empty() {
@@ -196,6 +198,7 @@ pub(crate) fn env_needs_public_webhook(
         &environment.messaging_endpoints,
         &tenant_by_deployment,
         "https://placeholder.invalid",
+        None,
     )
     .is_empty()
 }
@@ -387,23 +390,77 @@ async fn resolve_secret_token_source(
     }
 }
 
+/// The public base a *specific* deployment's webhooks must be registered
+/// against, given the env-wide `base` and the id of the tunnel that base points
+/// at (`None` = the base carries no tunnel segment).
+///
+/// Under the managed `gtunnel` the public URL is path-prefixed with the tunnel
+/// id (`https://<worker>/<tunnel-id>`) and a deployment's tenant IS its tunnel
+/// id — one agent per served tenant (see `env_tunnel::start_env_tunnel`). A
+/// single env-wide base would therefore register every co-tenant's provider
+/// against the primary tenant's tunnel, misrouting their live traffic.
+///
+/// Rewrites ONLY a final path segment already known to be the primary tunnel
+/// id. cloudflared/ngrok mint a bare hostname, and an operator-supplied
+/// `PUBLIC_BASE_URL` (permanent host, reverse proxy) has a path of its own —
+/// neither carries a tunnel segment, and a wrong URL written into a provider
+/// fails silently and needs manual repair in the provider's console, so
+/// anything unrecognized passes through untouched.
+fn webhook_base_for_tenant(base: &str, tenant: &str, primary_tunnel_id: Option<&str>) -> String {
+    let base = base.trim_end_matches('/');
+    let Some(primary) = primary_tunnel_id else {
+        return base.to_string();
+    };
+    if tenant == primary {
+        return base.to_string();
+    }
+    // Skip the authority so a bare `https://host` (or a host that happens to
+    // read like an id) can never be mistaken for a trailing path segment.
+    let after_scheme = base.find("://").map_or(0, |i| i + 3);
+    if !base[after_scheme..].contains('/') {
+        return base.to_string();
+    }
+    match base.rsplit_once('/') {
+        Some((prefix, last)) if last == primary => format!("{prefix}/{tenant}"),
+        _ => base.to_string(),
+    }
+}
+
 /// Pure join: served routes × endpoints × deployment-tenant map → registrations.
 ///
 /// One registration per `(deployment, revision, provider-name)`: a deployment
 /// with multiple `path_prefixes` synthesizes multiple routes, but a bot has a
 /// single webhook, so we register the first prefix and drop the rest.
+///
+/// `primary_tunnel_id` is the id `base` points at, when it points at a tunnel
+/// with one; each plan's base is re-tenanted from it (see
+/// [`webhook_base_for_tenant`]).
+///
+/// Tenant-qualified ingress routes (`/v1/{domain}/ingress/{provider}/{tenant}/{team}`)
+/// are considered first so a provider is pointed at the URL that names its
+/// tenant, which is the grammar greentic-setup already writes and the only one
+/// that discriminates tenants sharing a public base. The tenant-less
+/// `{prefix}/webhook/{provider}` route stays served for anything already
+/// registered against it, and is still what a deployment with no
+/// tenant-qualified route falls back to.
 fn plan_webhook_registrations(
     routes: &[HttpRouteDescriptor],
     endpoints: &[MessagingEndpoint],
     tenant_by_deployment: &HashMap<DeploymentId, String>,
     base: &str,
+    primary_tunnel_id: Option<&str>,
 ) -> Vec<WebhookRegistration> {
     let base = base.trim_end_matches('/');
     let mut seen: HashSet<(DeploymentId, greentic_deploy_spec::RevisionId, String)> =
         HashSet::new();
     let mut plans = Vec::new();
 
-    for route in routes {
+    let ordered = routes
+        .iter()
+        .filter(|r| r.is_tenant_qualified())
+        .chain(routes.iter().filter(|r| !r.is_tenant_qualified()));
+
+    for route in ordered {
         if route.provider_op != INGEST_HTTP_OP {
             continue;
         }
@@ -458,6 +515,7 @@ fn plan_webhook_registrations(
             .map(|e| e.endpoint_id.to_string())
             .unwrap_or_else(|| scope.deployment_id.to_string());
         let extra_endpoints = matching.len().saturating_sub(1);
+        let deployment_base = webhook_base_for_tenant(base, tenant, primary_tunnel_id);
 
         plans.push(WebhookRegistration {
             tenant: tenant.clone(),
@@ -466,7 +524,7 @@ fn plan_webhook_registrations(
             revision_id: scope.revision_id,
             provider_type: provider_type.to_string(),
             provider_name: name,
-            webhook_url: format!("{base}{}", route.pattern),
+            webhook_url: format!("{deployment_base}{}", route.pattern),
             secret_token_source,
             instance_id,
             extra_endpoints,
@@ -497,6 +555,9 @@ pub(crate) fn post_reload_registration(
     env_id: String,
     rt: tokio::runtime::Handle,
     tunnel_url: Option<String>,
+    // Id of the boot-started tunnel (gtunnel only); process-local like
+    // `tunnel_url`, so it is captured once rather than re-resolved per reload.
+    primary_tunnel_id: Option<String>,
 ) -> impl FnMut(&Activation) + Send + 'static {
     move |activation: &Activation| {
         let env = match load_environment(&store_root, &env_id) {
@@ -513,9 +574,18 @@ pub(crate) fn post_reload_registration(
             }
         };
         let public_base_url = reload_public_base_url(tunnel_url.as_deref(), &env);
+        // The id describes the tunnel's own URL only: when the base came from
+        // the env store instead, there is no tunnel segment to re-tenant.
+        let primary_tunnel_id = tunnel_url.as_ref().and_then(|_| primary_tunnel_id.clone());
         let activation = activation.clone();
         rt.spawn(async move {
-            register_new_model_webhooks(&activation, &env, public_base_url.as_deref()).await;
+            register_new_model_webhooks(
+                &activation,
+                &env,
+                public_base_url.as_deref(),
+                primary_tunnel_id.as_deref(),
+            )
+            .await;
         });
     }
 }
@@ -553,9 +623,12 @@ fn load_environment(store_root: &Path, env_id: &str) -> Result<Environment> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http_routes::{RevisionScope, provider_descriptor_for_test};
+    use crate::http_routes::{
+        RevisionScope, ingress_descriptor_for_test, provider_descriptor_for_test,
+    };
     use crate::test_fixtures::{
-        FakeSecrets, endpoint_typed as endpoint, env_with, telegram_endpoint_with_webhook_secret,
+        FakeSecrets, endpoint_typed as endpoint, env_with, env_with_active_bundle,
+        telegram_endpoint_with_webhook_secret,
     };
     use greentic_deploy_spec::{BundleId, DeploymentId, RevisionId};
 
@@ -582,7 +655,8 @@ mod tests {
         let eid = endpoints[0].endpoint_id.to_string();
         let tenants = HashMap::from([(dep, "default".to_string())]);
 
-        let plans = plan_webhook_registrations(&routes, &endpoints, &tenants, "https://host/");
+        let plans =
+            plan_webhook_registrations(&routes, &endpoints, &tenants, "https://host/", None);
         assert_eq!(plans.len(), 1);
         let p = &plans[0];
         assert_eq!(p.webhook_url, "https://host/bot/webhook/telegram");
@@ -616,7 +690,7 @@ mod tests {
         let endpoints = vec![endpoint("telegram", "tg-secret-token", &["other-pack"])];
         let tenants = HashMap::from([(dep, "default".to_string())]);
 
-        let plans = plan_webhook_registrations(&routes, &endpoints, &tenants, "https://host");
+        let plans = plan_webhook_registrations(&routes, &endpoints, &tenants, "https://host", None);
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].secret_token_source, SecretTokenSource::None);
         let body: Value = serde_json::from_slice(&plans[0].payload(None)).unwrap();
@@ -639,7 +713,7 @@ mod tests {
             endpoint("telegram", "tok-b", &["realbot-pack"]),
         ];
         let tenants = HashMap::from([(dep, "default".to_string())]);
-        let plans = plan_webhook_registrations(&routes, &endpoints, &tenants, "https://host");
+        let plans = plan_webhook_registrations(&routes, &endpoints, &tenants, "https://host", None);
         assert_eq!(plans.len(), 1, "one webhook per provider route");
         assert!(matches!(
             &plans[0].secret_token_source,
@@ -771,7 +845,7 @@ mod tests {
         )];
         let tenants = HashMap::from([(dep, "default".to_string())]);
 
-        let plans = plan_webhook_registrations(&routes, &endpoints, &tenants, "https://host");
+        let plans = plan_webhook_registrations(&routes, &endpoints, &tenants, "https://host", None);
         assert_eq!(plans.len(), 1);
         assert!(matches!(
             &plans[0].secret_token_source,
@@ -796,7 +870,7 @@ mod tests {
             ),
         ];
         let tenants = HashMap::from([(dep, "default".to_string())]);
-        let plans = plan_webhook_registrations(&routes, &[], &tenants, "https://host");
+        let plans = plan_webhook_registrations(&routes, &[], &tenants, "https://host", None);
         assert_eq!(
             plans.len(),
             1,
@@ -814,8 +888,283 @@ mod tests {
             scope(dep, "p", rev),
         )];
         // tenant map does NOT contain `dep` → skipped (no tenant to run under)
-        let plans = plan_webhook_registrations(&routes, &[], &HashMap::new(), "https://host");
+        let plans = plan_webhook_registrations(&routes, &[], &HashMap::new(), "https://host", None);
         assert!(plans.is_empty());
+    }
+
+    const WORKER: &str = "https://greentic-webhook-proxy.greentic.workers.dev";
+
+    #[test]
+    fn gtunnel_base_re_tenants_the_final_segment_for_a_co_tenant() {
+        // The bug: every deployment got the PRIMARY tenant's tunnel, so a
+        // co-tenant's Slack events arrived at the primary tenant's runtime.
+        assert_eq!(
+            webhook_base_for_tenant(
+                &format!("{WORKER}/default-ba564"),
+                "stating-81015",
+                Some("default-ba564"),
+            ),
+            format!("{WORKER}/stating-81015"),
+        );
+        // Only the LAST segment moves — host and any worker-side path prefix stay.
+        assert_eq!(
+            webhook_base_for_tenant(
+                "https://worker.example/hooks/default-ba564",
+                "stating-81015",
+                Some("default-ba564"),
+            ),
+            "https://worker.example/hooks/stating-81015",
+        );
+    }
+
+    #[test]
+    fn gtunnel_base_unchanged_for_the_primary_tenant() {
+        assert_eq!(
+            webhook_base_for_tenant(
+                &format!("{WORKER}/default-ba564"),
+                "default-ba564",
+                Some("default-ba564"),
+            ),
+            format!("{WORKER}/default-ba564"),
+        );
+    }
+
+    #[test]
+    fn quick_tunnel_bases_pass_through_untouched() {
+        // cloudflared/ngrok mint a bare hostname: no tunnel segment to swap,
+        // and rewriting the host would break a webhook that works today.
+        for base in [
+            "https://sunny-fox-1234.trycloudflare.com",
+            "https://a1b2c3.ngrok-free.app",
+        ] {
+            assert_eq!(
+                webhook_base_for_tenant(base, "stating-81015", Some("default-ba564")),
+                base,
+            );
+        }
+    }
+
+    #[test]
+    fn operator_base_without_the_primary_id_passes_through_untouched() {
+        // A permanent hostname or reverse proxy carries a path of its own. A
+        // wrong URL written into Slack fails silently and needs manual repair,
+        // so an unrecognized final segment is left exactly as configured.
+        assert_eq!(
+            webhook_base_for_tenant(
+                "https://bot.example.com/hooks",
+                "stating-81015",
+                Some("default-ba564"),
+            ),
+            "https://bot.example.com/hooks",
+        );
+        assert_eq!(
+            webhook_base_for_tenant("https://bot.example.com", "stating-81015", None),
+            "https://bot.example.com",
+        );
+    }
+
+    #[test]
+    fn planner_registers_each_deployment_against_its_own_tunnel() {
+        let primary_dep = DeploymentId::new();
+        let co_dep = DeploymentId::new();
+        let rev = RevisionId::new();
+        let routes = vec![
+            provider_descriptor_for_test(
+                "/bot/webhook/slack",
+                "messaging.slack",
+                scope(primary_dep, "primary-pack", rev),
+            ),
+            provider_descriptor_for_test(
+                "/bot/webhook/slack",
+                "messaging.slack",
+                scope(co_dep, "co-pack", rev),
+            ),
+        ];
+        let tenants = HashMap::from([
+            (primary_dep, "default-ba564".to_string()),
+            (co_dep, "stating-81015".to_string()),
+        ]);
+
+        let plans = plan_webhook_registrations(
+            &routes,
+            &[],
+            &tenants,
+            &format!("{WORKER}/default-ba564"),
+            Some("default-ba564"),
+        );
+
+        assert_eq!(plans.len(), 2);
+        let url_for = |dep: DeploymentId| {
+            plans
+                .iter()
+                .find(|p| p.deployment_id == dep)
+                .map(|p| p.webhook_url.clone())
+                .expect("plan for deployment")
+        };
+        assert_eq!(
+            url_for(primary_dep),
+            format!("{WORKER}/default-ba564/bot/webhook/slack"),
+        );
+        assert_eq!(
+            url_for(co_dep),
+            format!("{WORKER}/stating-81015/bot/webhook/slack"),
+            "a co-tenant must register against its own tunnel id",
+        );
+    }
+
+    #[test]
+    fn registers_the_tenant_qualified_url_in_preference_to_the_tenant_less_one() {
+        let dep = DeploymentId::new();
+        let rev = RevisionId::new();
+        let routes = vec![
+            provider_descriptor_for_test(
+                "/webhook/slack-api",
+                "messaging.slack.api",
+                scope(dep, "acme-pack", rev),
+            ),
+            ingress_descriptor_for_test(
+                "messaging-slack",
+                "messaging.slack.api",
+                scope(dep, "acme-pack", rev),
+                "acme",
+                "support",
+            ),
+        ];
+        let tenants = HashMap::from([(dep, "acme".to_string())]);
+
+        let plans = plan_webhook_registrations(&routes, &[], &tenants, "https://host", None);
+        assert_eq!(plans.len(), 1, "one webhook per provider per deployment");
+        assert_eq!(
+            plans[0].webhook_url,
+            "https://host/v1/messaging/ingress/messaging-slack/acme/support",
+        );
+    }
+
+    #[test]
+    fn two_tenants_sharing_a_base_get_different_webhook_urls() {
+        // The whole point: with one public base and one shared path prefix, the
+        // path is what tells the two deployments apart.
+        let acme_dep = DeploymentId::new();
+        let globex_dep = DeploymentId::new();
+        let rev = RevisionId::new();
+        let routes = vec![
+            ingress_descriptor_for_test(
+                "messaging-slack",
+                "messaging.slack.api",
+                scope(acme_dep, "acme-pack", rev),
+                "acme",
+                "support",
+            ),
+            ingress_descriptor_for_test(
+                "messaging-slack",
+                "messaging.slack.api",
+                scope(globex_dep, "globex-pack", rev),
+                "globex",
+                "default",
+            ),
+        ];
+        let tenants = HashMap::from([
+            (acme_dep, "acme".to_string()),
+            (globex_dep, "globex".to_string()),
+        ]);
+
+        let plans =
+            plan_webhook_registrations(&routes, &[], &tenants, "https://bot.example.com", None);
+        let url_for = |dep: DeploymentId| {
+            plans
+                .iter()
+                .find(|p| p.deployment_id == dep)
+                .map(|p| p.webhook_url.clone())
+                .expect("plan for deployment")
+        };
+        assert_eq!(
+            url_for(acme_dep),
+            "https://bot.example.com/v1/messaging/ingress/messaging-slack/acme/support",
+        );
+        assert_eq!(
+            url_for(globex_dep),
+            "https://bot.example.com/v1/messaging/ingress/messaging-slack/globex/default",
+        );
+    }
+
+    #[test]
+    fn a_non_gtunnel_base_is_left_alone_by_the_tenant_qualified_url() {
+        // cloudflared/ngrok/operator bases carry no tunnel segment, so only the
+        // path changes — the base must survive verbatim, trailing slash trimmed.
+        let dep = DeploymentId::new();
+        let rev = RevisionId::new();
+        let routes = vec![ingress_descriptor_for_test(
+            "messaging-slack",
+            "messaging.slack.api",
+            scope(dep, "acme-pack", rev),
+            "acme",
+            "support",
+        )];
+        let tenants = HashMap::from([(dep, "acme".to_string())]);
+
+        for base in [
+            "https://blue-fox-42.trycloudflare.com",
+            "https://blue-fox-42.trycloudflare.com/",
+            "https://bot.example.com/hooks",
+        ] {
+            let plans = plan_webhook_registrations(&routes, &[], &tenants, base, None);
+            assert_eq!(
+                plans[0].webhook_url,
+                format!(
+                    "{}/v1/messaging/ingress/messaging-slack/acme/support",
+                    base.trim_end_matches('/')
+                ),
+                "base {base} must pass through untouched",
+            );
+        }
+    }
+
+    #[test]
+    fn env_needs_public_webhook_count_is_independent_of_the_base() {
+        // The pre-URL gate plans against a placeholder base with no tunnel id;
+        // per-deployment re-tenanting must not change WHICH routes register.
+        let (mut env, primary_dep) = env_with_active_bundle("default-ba564", "primary-pack");
+        let mut co = env.bundles[0].clone();
+        let co_dep = DeploymentId::new();
+        co.deployment_id = co_dep;
+        co.bundle_id = greentic_deploy_spec::BundleId::new("co-pack");
+        co.route_binding.tenant_selector.tenant = "stating-81015".to_string();
+        env.bundles.push(co);
+        let rev = RevisionId::new();
+        let routes = vec![
+            provider_descriptor_for_test(
+                "/bot/webhook/slack",
+                "messaging.slack",
+                scope(primary_dep, "primary-pack", rev),
+            ),
+            provider_descriptor_for_test(
+                "/bot/webhook/slack",
+                "messaging.slack",
+                scope(co_dep, "co-pack", rev),
+            ),
+        ];
+
+        assert!(env_needs_public_webhook(&routes, &env));
+        let tenants: HashMap<DeploymentId, String> = env
+            .bundles
+            .iter()
+            .map(|d| {
+                (
+                    d.deployment_id,
+                    d.route_binding.tenant_selector.tenant.clone(),
+                )
+            })
+            .collect();
+        let placeholder =
+            plan_webhook_registrations(&routes, &[], &tenants, "https://placeholder.invalid", None);
+        let tunneled = plan_webhook_registrations(
+            &routes,
+            &[],
+            &tenants,
+            &format!("{WORKER}/default-ba564"),
+            Some("default-ba564"),
+        );
+        assert_eq!(placeholder.len(), tunneled.len());
     }
 
     #[test]

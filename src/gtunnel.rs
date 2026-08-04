@@ -135,12 +135,15 @@ pub fn start_agent(config: &GtunnelConfig) -> anyhow::Result<GtunnelHandle> {
         config.root_map,
         &config.tunnel_id,
     );
-    let shared = tunnel_state::shared_runtime_paths(SERVICE_ID, config.local_port);
+    // Keyed by tunnel id, not port: a multi-tenant env runs several agents on
+    // ONE port, and a port-keyed record would make them share a pidfile, URL
+    // cache and lock — each boot stopping its predecessor.
+    let shared = tunnel_state::instance_runtime_paths(SERVICE_ID, &config.tunnel_id);
     let pid_path = shared.pid_path(SERVICE_ID);
     let url_path = cloudflared::public_url_path(&shared);
     let log_path = shared.log_path(SERVICE_ID);
     let _lock = tunnel_state::TunnelLock::acquire(
-        &tunnel_state::lock_path(SERVICE_ID, config.local_port),
+        &tunnel_state::instance_lock_path(SERVICE_ID, &config.tunnel_id),
         LOCK_WAIT,
     )?;
 
@@ -153,7 +156,7 @@ pub fn start_agent(config: &GtunnelConfig) -> anyhow::Result<GtunnelHandle> {
     // below asks the Worker, which answers from whichever agent currently holds
     // the slot. With a foreign agent still connected that probe reports someone
     // else's tunnel as ours.
-    evict_foreign_claimants(&url, config.local_port);
+    evict_foreign_claimants(&url, &config.tunnel_id);
 
     // Adopt a live agent (e.g. started by setup) — but only if it is actually
     // SERVING. A pid can be alive while its WebSocket to the Worker is dead
@@ -223,19 +226,19 @@ pub fn start_agent(config: &GtunnelConfig) -> anyhow::Result<GtunnelHandle> {
 /// the URL is what both binaries already write to `public_base_url.txt`, and
 /// comparing it whole keeps this correct across the path-prefix, subdomain, and
 /// root-map routing modes without re-deriving any of them.
-fn evict_foreign_claimants(url: &str, keep_port: u16) {
+fn evict_foreign_claimants(url: &str, keep_instance: &str) {
     evict_claimants_in(
-        tunnel_state::existing_shared_records(SERVICE_ID),
+        tunnel_state::existing_instance_records(SERVICE_ID),
         url,
-        keep_port,
+        keep_instance,
     );
 }
 
 /// Body of [`evict_foreign_claimants`], over an explicit record set so tests can
 /// supply a temp state root instead of the process-wide one.
-fn evict_claimants_in(records: Vec<(u16, RuntimePaths)>, url: &str, keep_port: u16) {
-    for (port, shared) in records {
-        if port == keep_port {
+fn evict_claimants_in(records: Vec<(String, RuntimePaths)>, url: &str, keep_instance: &str) {
+    for (instance, shared) in records {
+        if instance == keep_instance {
             continue;
         }
         let foreign_url_path = cloudflared::public_url_path(&shared);
@@ -254,8 +257,8 @@ fn evict_claimants_in(records: Vec<(u16, RuntimePaths)>, url: &str, keep_port: u
             crate::operator_log::info(
                 module_path!(),
                 format!(
-                    "gtunnel agent pid {pid} (port {port}) also claims {url}; stopping it so the \
-                     runtime on port {keep_port} owns the tunnel — the Worker admits one socket \
+                    "gtunnel agent pid {pid} (tunnel {instance}) also claims {url}; stopping it so the \
+                     runtime on tunnel {keep_instance} owns it — the Worker admits one socket \
                      per tunnel id, and two agents would evict each other indefinitely"
                 ),
             );
@@ -443,6 +446,23 @@ pub fn agent_config_from_env() -> anyhow::Result<crate::gtunnel_agent::AgentConf
 mod tests {
     use super::*;
 
+    /// Known-answer vectors for the FALLBACK derivation, pinning the exact
+    /// bytes fed to sha256. greentic-setup carries the identical test against
+    /// the identical constants (`setup_tunnel::tests::
+    /// clash_suffix_known_answers_match_greentic_start`). The two crates cannot
+    /// share the rule through `greentic-types` (exact-pinned at `=1.1.2` across
+    /// this graph), so this pair of tests is what keeps them byte-identical:
+    /// change one side's hashing and the other side's assertion fails. That
+    /// matters because the derivation is what BOTH binaries fall back to for a
+    /// bundle with no recorded tunnel id — if they disagree, setup registers a
+    /// webhook URL on an id this runtime never serves.
+    #[test]
+    fn clash_suffix_known_answers_match_greentic_setup() {
+        const SEED: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(tenant_clash_suffix_from_seed(SEED, "acme"), "0c7fe");
+        assert_eq!(tenant_clash_suffix_from_seed(SEED, "default"), "871fd");
+    }
+
     #[test]
     fn tenant_clash_suffix_is_stable_5_hex_and_scoped() {
         let a = tenant_clash_suffix_from_seed("seed-123", "default");
@@ -473,7 +493,7 @@ mod tests {
     /// runtime's record may survive, or the two agents evict each other on the
     /// Worker forever and webhooks land on the Setup UI half the time.
     #[test]
-    fn eviction_clears_other_ports_claiming_the_same_tunnel_id() {
+    fn eviction_clears_other_records_claiming_the_same_tunnel_id() {
         let dir = tempfile::tempdir().expect("tempdir");
         let url = "https://x.workers.dev/default-ba564";
         // pid 0 never names a live process, so stop_pidfile just reaps the record.
@@ -482,12 +502,14 @@ mod tests {
         // A different tunnel id on a third port must be left completely alone.
         let other = plant_record(dir.path(), 9090, "https://x.workers.dev/acme-77777", 0);
 
+        // Instance-keyed now: a stale record for the SAME tunnel id under a
+        // different instance key still claims the Worker's single socket.
         let records = vec![
-            (55662, setup.clone()),
-            (8080, runtime.clone()),
-            (9090, other.clone()),
+            ("stale-setup".to_string(), setup.clone()),
+            ("default-ba564".to_string(), runtime.clone()),
+            ("acme-77777".to_string(), other.clone()),
         ];
-        evict_claimants_in(records, url, 8080);
+        evict_claimants_in(records, url, "default-ba564");
 
         assert!(
             !cloudflared::public_url_path(&setup).exists(),
@@ -506,12 +528,16 @@ mod tests {
     }
 
     #[test]
-    fn eviction_is_a_no_op_when_no_other_port_claims_the_tunnel_id() {
+    fn eviction_is_a_no_op_when_no_other_record_claims_the_tunnel_id() {
         let dir = tempfile::tempdir().expect("tempdir");
         let url = "https://x.workers.dev/default-ba564";
         let runtime = plant_record(dir.path(), 8080, url, 0);
 
-        evict_claimants_in(vec![(8080, runtime.clone())], url, 8080);
+        evict_claimants_in(
+            vec![("default-ba564".to_string(), runtime.clone())],
+            url,
+            "default-ba564",
+        );
 
         assert!(cloudflared::public_url_path(&runtime).exists());
         assert!(runtime.pid_path(SERVICE_ID).exists());
