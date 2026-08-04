@@ -341,15 +341,18 @@ fn instance_seed() -> String {
 
 /// Read `<root>/instance-seed`, creating it on first use. Root passed explicitly
 /// so tests never touch a developer's `~/.greentic/tunnel`.
+///
+/// First use is a race: on a fresh install `gtc start` and greentic-setup (which
+/// derives the same suffix from this same file) can both find it absent, and so
+/// can two starts. A plain write let each install its own seed, last write
+/// winning, so whoever had already derived an id kept a suffix nobody else
+/// reproduces — the exact breakage the doc above says persisting exists to
+/// prevent. Publishing is therefore exclusive, and a loser adopts the winner's
+/// seed. Mirrors greentic-setup's `load_or_create_instance_seed`.
 fn load_or_create_instance_seed(root: &Path) -> String {
     let path = root.join("instance-seed");
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let existing = existing.trim().to_string();
-        // 64 hex chars = the 256-bit seed we write. Anything else is corrupt or
-        // truncated; replace it rather than derive suffixes from garbage.
-        if existing.len() == 64 && existing.chars().all(|c| c.is_ascii_hexdigit()) {
-            return existing;
-        }
+    if let Some(existing) = read_instance_seed(&path) {
+        return existing;
     }
     let seed: String = (0..32)
         .map(|_| format!("{:02x}", rand::random::<u8>()))
@@ -357,18 +360,60 @@ fn load_or_create_instance_seed(root: &Path) -> String {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(err) = std::fs::write(&path, &seed) {
-        crate::operator_log::warn(
-            module_path!(),
-            format!(
-                "could not persist the managed-tunnel seed at {} ({err}); the clash suffix will \
-                 change on the next start, which invalidates URLs already registered with \
-                 providers",
-                path.display()
-            ),
-        );
+    match publish_instance_seed(&path, &seed) {
+        Ok(published) => published,
+        Err(err) => {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "could not persist the managed-tunnel seed at {} ({err}); the clash suffix \
+                     will change on the next start, which invalidates URLs already registered \
+                     with providers",
+                    path.display()
+                ),
+            );
+            seed
+        }
     }
-    seed
+}
+
+/// The seed at `path`, or `None` when it is absent or not 64 hex chars.
+///
+/// 64 hex chars = the 256-bit seed we write. Anything else is corrupt or
+/// truncated; callers replace it rather than derive suffixes from garbage.
+fn read_instance_seed(path: &Path) -> Option<String> {
+    let existing = std::fs::read_to_string(path).ok()?.trim().to_string();
+    (existing.len() == 64 && existing.chars().all(|c| c.is_ascii_hexdigit())).then_some(existing)
+}
+
+/// Install `seed` at `path`, returning whichever seed ends up published there.
+///
+/// The seed is staged in full and then published with a link, so the file only
+/// ever becomes visible complete. Creating it empty and filling it after would
+/// not do: a concurrent caller re-reading the winner's file would find it still
+/// empty, judge it unusable and overwrite it — the same last-write-wins outcome
+/// in a narrower window.
+fn publish_instance_seed(path: &Path, seed: &str) -> std::io::Result<String> {
+    let staged = path.with_file_name(format!("instance-seed.{:016x}.tmp", rand::random::<u64>()));
+    std::fs::write(&staged, seed)?;
+    let outcome = match std::fs::hard_link(&staged, path) {
+        Ok(()) => Ok(seed.to_string()),
+        // Someone else published first: theirs wins, because they may already
+        // have handed the derived id to a provider.
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            match read_instance_seed(path) {
+                Some(existing) => Ok(existing),
+                // Present but unusable: no id anyone registered can have come
+                // from it, so replace it atomically with ours.
+                None => std::fs::rename(&staged, path).map(|()| seed.to_string()),
+            }
+        }
+        // No link support (some network/removable filesystems): fall back to a
+        // rename, which is still atomic — it just cannot detect a loser.
+        Err(_) => std::fs::rename(&staged, path).map(|()| seed.to_string()),
+    };
+    let _ = std::fs::remove_file(&staged);
+    outcome
 }
 
 /// Stable 5-hex clash suffix for `base_tenant`: last 5 hex of
@@ -454,6 +499,63 @@ mod tests {
         // Distinct per tenant and per seed (so different operators/tenants differ).
         assert_ne!(a, tenant_clash_suffix_from_seed("seed-123", "acme"));
         assert_ne!(a, tenant_clash_suffix_from_seed("other-seed", "default"));
+    }
+
+    #[test]
+    fn concurrent_first_use_settles_on_one_instance_seed() {
+        // The failure this guards: on a fresh install several callers reach an
+        // absent `instance-seed` at once — two starts, or a start racing
+        // greentic-setup, which derives the same suffix from this same file.
+        // With a plain write each installed its own seed and the last write won,
+        // so a caller that had already derived an id kept a suffix nobody else
+        // reproduces, and the URLs registered with Slack, Webex and OAuth
+        // providers point at a tunnel id nothing serves.
+        let root = tempfile::tempdir().expect("tempdir");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let seeds: std::collections::BTreeSet<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let path = root.path().to_path_buf();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        load_or_create_instance_seed(&path)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("thread"))
+                .collect()
+        });
+        assert_eq!(
+            seeds.len(),
+            1,
+            "concurrent first use must settle on one seed: {seeds:?}"
+        );
+        // And the settled seed is the one on disk, so the next process — and
+        // greentic-setup — derive the suffix callers already handed out.
+        assert_eq!(
+            Some(&load_or_create_instance_seed(root.path())),
+            seeds.iter().next(),
+            "the persisted seed must reproduce the suffix callers already used"
+        );
+    }
+
+    #[test]
+    fn instance_seed_is_healed_when_the_file_is_unusable() {
+        // A truncated or hand-edited seed cannot have produced any registered
+        // id, so it is replaced rather than propagated as garbage.
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join("instance-seed"), "not-a-seed").expect("write");
+        let seed = load_or_create_instance_seed(root.path());
+        assert_eq!(seed.len(), 64, "{seed}");
+        assert!(seed.chars().all(|c| c.is_ascii_hexdigit()), "{seed}");
+        assert_eq!(
+            load_or_create_instance_seed(root.path()),
+            seed,
+            "the healed seed must be stable across calls"
+        );
     }
 
     /// Plant a shared gtunnel record for `port` claiming `url`, with `pid`.
