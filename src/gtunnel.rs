@@ -6,19 +6,12 @@
 //! public URL is `<worker_base_url>/<tunnel_id>`, known up front, so start-up is
 //! just "adopt or spawn the agent and report the URL".
 //!
-//! The agent runs under the machine-wide shared record (`crate::tunnel_state`,
-//! keyed by `("gtunnel", port)`), the same protocol `greentic-setup` writes to.
-//! So if setup already started the agent for this port, `start` ADOPTS it rather
-//! than spawning a second one.
-//!
-//! Port-keying alone is not enough here. It came from the quick-tunnel providers,
-//! where each tunnel mints its own hostname, so one-per-port is exactly
-//! one-per-public-identity. A gtunnel's public identity is its TUNNEL ID, and the
-//! Worker admits one socket per id — while setup and start deliberately share one
-//! id across two ports (setup fronts its own UI port, the runtime fronts ingress).
-//! Two records, one slot. So `start` additionally evicts any agent claiming this
-//! tunnel id under another port: the runtime is the authority on where an id
-//! points. See [`evict_foreign_claimants`].
+//! The primary agent runs under the machine-wide shared record
+//! (`crate::tunnel_state`, keyed by `("gtunnel", port)`), the same protocol
+//! `greentic-setup` writes to. So if setup already started the agent for this
+//! port, `start` ADOPTS it rather than spawning a second one. Extra agents for
+//! co-tenants on the same port are keyed by tunnel id instead — one port cannot
+//! identify several of them. Eviction scans both keyspaces.
 //!
 //! Zero-config by design — the Worker base URL, tunnel id, and secret all have
 //! defaults (see `crate::env_tunnel`), so selecting this tunnel needs no operator
@@ -73,6 +66,20 @@ pub struct GtunnelConfig {
     /// Local origin port the agent forwards to.
     pub local_port: u16,
     pub restart: bool,
+    /// Whether this call owns the port-keyed shared record (`crate::tunnel_state`,
+    /// keyed by `("gtunnel", port)`) — the same protocol `greentic-setup` writes
+    /// to — or must use an instance-keyed record of its own.
+    ///
+    /// Only one agent may hold the port-keyed record: several agents sharing a
+    /// port there would share a pidfile, URL cache and lock, and each boot would
+    /// stop its predecessor (the collision `("start", "one tunnel agent per
+    /// tenant")` fixed by moving everything to instance keying — which in turn
+    /// broke setup adoption, the bug this field exists to resolve). So exactly
+    /// one `GtunnelConfig` per port may set this `true`: the primary agent,
+    /// built by `env_tunnel::gtunnel_config`. Every extra per-co-tenant agent
+    /// (`env_tunnel`'s `extra_tunnel_ids` loop) must set it `false` and stays
+    /// instance-keyed.
+    pub primary: bool,
 }
 
 pub struct GtunnelHandle {
@@ -135,17 +142,27 @@ pub fn start_agent(config: &GtunnelConfig) -> anyhow::Result<GtunnelHandle> {
         config.root_map,
         &config.tunnel_id,
     );
-    // Keyed by tunnel id, not port: a multi-tenant env runs several agents on
-    // ONE port, and a port-keyed record would make them share a pidfile, URL
-    // cache and lock — each boot stopping its predecessor.
-    let shared = tunnel_state::instance_runtime_paths(SERVICE_ID, &config.tunnel_id);
+    // The primary agent keeps the port-keyed record `greentic-setup` also writes
+    // (its src/shared_tunnel.rs:71), so start ADOPTS a setup-started agent rather
+    // than spawning a rival. The extra per-co-tenant agents are instance-keyed —
+    // see `env_tunnel`'s extra_tunnel_ids loop — because several of them front one
+    // port and would otherwise share a pidfile: `config.primary` is how the two
+    // cases tell `start_agent` apart, since both call it with the same port.
+    let (shared, lock_path) = if config.primary {
+        (
+            tunnel_state::shared_runtime_paths(SERVICE_ID, config.local_port),
+            tunnel_state::lock_path(SERVICE_ID, config.local_port),
+        )
+    } else {
+        (
+            tunnel_state::instance_runtime_paths(SERVICE_ID, &config.tunnel_id),
+            tunnel_state::instance_lock_path(SERVICE_ID, &config.tunnel_id),
+        )
+    };
     let pid_path = shared.pid_path(SERVICE_ID);
     let url_path = cloudflared::public_url_path(&shared);
     let log_path = shared.log_path(SERVICE_ID);
-    let _lock = tunnel_state::TunnelLock::acquire(
-        &tunnel_state::instance_lock_path(SERVICE_ID, &config.tunnel_id),
-        LOCK_WAIT,
-    )?;
+    let _lock = tunnel_state::TunnelLock::acquire(&lock_path, LOCK_WAIT)?;
 
     if config.restart {
         let _ = supervisor::stop_pidfile(&pid_path, 2_000);
@@ -156,7 +173,7 @@ pub fn start_agent(config: &GtunnelConfig) -> anyhow::Result<GtunnelHandle> {
     // below asks the Worker, which answers from whichever agent currently holds
     // the slot. With a foreign agent still connected that probe reports someone
     // else's tunnel as ours.
-    evict_foreign_claimants(&url, &config.tunnel_id);
+    evict_foreign_claimants(&url, &shared);
 
     // Adopt a live agent (e.g. started by setup) — but only if it is actually
     // SERVING. A pid can be alive while its WebSocket to the Worker is dead
@@ -212,33 +229,36 @@ pub fn start_agent(config: &GtunnelConfig) -> anyhow::Result<GtunnelHandle> {
     })
 }
 
-/// Stop any agent under ANOTHER port's shared record that already claims `url`,
-/// so the agent for `keep_port` owns the tunnel id outright.
+/// Stop any OTHER agent — in either keyspace — that already claims `url`, so the
+/// agent owning `keep` holds the tunnel id outright.
 ///
-/// Without this the two agents livelock. The Worker admits one socket per tunnel
-/// id, so the second to connect evicts the first; the evicted agent reconnects
-/// and evicts the second, forever. Inbound webhooks then land on whichever agent
-/// won the last round — for a setup-started agent that means the Setup UI port,
-/// which serves no provider routes (and is usually gone by then, since setup
-/// leaves its agent running after exiting).
-///
-/// Records are matched on the stored public URL rather than a parsed tunnel id:
-/// the URL is what both binaries already write to `public_base_url.txt`, and
-/// comparing it whole keeps this correct across the path-prefix, subdomain, and
-/// root-map routing modes without re-deriving any of them.
-fn evict_foreign_claimants(url: &str, keep_instance: &str) {
-    evict_claimants_in(
-        tunnel_state::existing_instance_records(SERVICE_ID),
-        url,
-        keep_instance,
+/// Both keyspaces must be scanned. The primary agent keeps the port-keyed record
+/// `greentic-setup` also writes, while the extra per-co-tenant agents are
+/// instance-keyed; a claimant left standing in the unscanned keyspace reopens the
+/// livelock in a narrower form.
+fn evict_foreign_claimants(url: &str, keep: &RuntimePaths) {
+    let mut records: Vec<RuntimePaths> = tunnel_state::existing_shared_records(SERVICE_ID)
+        .into_iter()
+        .map(|(_, paths)| paths)
+        .collect();
+    records.extend(
+        tunnel_state::existing_instance_records(SERVICE_ID)
+            .into_iter()
+            .map(|(_, paths)| paths),
     );
+    evict_claimants_in(records, url, keep);
 }
 
 /// Body of [`evict_foreign_claimants`], over an explicit record set so tests can
 /// supply a temp state root instead of the process-wide one.
-fn evict_claimants_in(records: Vec<(String, RuntimePaths)>, url: &str, keep_instance: &str) {
-    for (instance, shared) in records {
-        if instance == keep_instance {
+///
+/// Identity is the record's own pid path rather than its key: the port keyspace
+/// keys by `u16` and the instance keyspace by `String`, and comparing the paths
+/// keeps one code path over the union.
+fn evict_claimants_in(records: Vec<RuntimePaths>, url: &str, keep: &RuntimePaths) {
+    let keep_pid = keep.pid_path(SERVICE_ID);
+    for shared in records {
+        if shared.pid_path(SERVICE_ID) == keep_pid {
             continue;
         }
         let foreign_url_path = cloudflared::public_url_path(&shared);
@@ -257,9 +277,9 @@ fn evict_claimants_in(records: Vec<(String, RuntimePaths)>, url: &str, keep_inst
             crate::operator_log::info(
                 module_path!(),
                 format!(
-                    "gtunnel agent pid {pid} (tunnel {instance}) also claims {url}; stopping it so the \
-                     runtime on tunnel {keep_instance} owns it — the Worker admits one socket \
-                     per tunnel id, and two agents would evict each other indefinitely"
+                    "gtunnel agent pid {pid} also claims {url}; stopping it so the runtime owns \
+                     it — the Worker admits one socket per tunnel id, and two agents would evict \
+                     each other indefinitely"
                 ),
             );
         }
@@ -489,6 +509,75 @@ mod tests {
         paths
     }
 
+    /// Points `GREENTIC_TUNNEL_STATE_DIR` at a tempdir for the duration of a
+    /// test, so the real discovery path (`tunnel_state::existing_*_records`)
+    /// scans a temp root instead of a developer's `~/.greentic`. Mirrors
+    /// `env_tunnel::tests::TunnelStateOverride`.
+    struct TunnelStateRootGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TunnelStateRootGuard {
+        fn set(dir: &Path) -> Self {
+            let guard = crate::test_env_lock()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let previous = std::env::var_os("GREENTIC_TUNNEL_STATE_DIR");
+            // SAFETY: process-global env mutation serialized by test_env_lock.
+            unsafe { std::env::set_var("GREENTIC_TUNNEL_STATE_DIR", dir) };
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for TunnelStateRootGuard {
+        fn drop(&mut self) {
+            // SAFETY: still serialized by the held test_env_lock guard.
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var("GREENTIC_TUNNEL_STATE_DIR", value),
+                    None => std::env::remove_var("GREENTIC_TUNNEL_STATE_DIR"),
+                }
+            }
+        }
+    }
+
+    /// Drives the REAL discovery path (`evict_foreign_claimants`, not the
+    /// hand-built `evict_claimants_in` fixture below), so this catches what the
+    /// other eviction tests structurally cannot: a setup-written port record
+    /// that the scan itself fails to find.
+    #[test]
+    fn a_setup_written_port_record_is_discovered_and_evicted() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let _env = TunnelStateRootGuard::set(root.path());
+
+        let url = "https://edge.example/acme-77777/_tunnel";
+        // greentic-setup's exact on-disk layout: tenant `shared`, team
+        // `<service>-<port>` (src/shared_tunnel.rs:71).
+        let setup = RuntimePaths::new(
+            root.path().join("state"),
+            "shared",
+            format!("{SERVICE_ID}-8080"),
+        );
+        std::fs::create_dir_all(setup.pid_path(SERVICE_ID).parent().expect("pid dir"))
+            .expect("create setup pid dir");
+        let setup_url_path = cloudflared::public_url_path(&setup);
+        std::fs::create_dir_all(setup_url_path.parent().expect("url dir")).expect("create url dir");
+        std::fs::write(&setup_url_path, url).expect("write setup url");
+
+        // Our own record is a DIFFERENT one, so setup's must be evicted.
+        let ours = tunnel_state::instance_runtime_paths(SERVICE_ID, "acme-77777");
+        evict_foreign_claimants(url, &ours);
+
+        assert!(
+            !setup_url_path.exists(),
+            "setup's port-keyed record must be discovered by the real scan, not skipped",
+        );
+    }
+
     /// The setup-vs-runtime collision: one tunnel id, two ports. Only the
     /// runtime's record may survive, or the two agents evict each other on the
     /// Worker forever and webhooks land on the Setup UI half the time.
@@ -502,14 +591,11 @@ mod tests {
         // A different tunnel id on a third port must be left completely alone.
         let other = plant_record(dir.path(), 9090, "https://x.workers.dev/acme-77777", 0);
 
-        // Instance-keyed now: a stale record for the SAME tunnel id under a
-        // different instance key still claims the Worker's single socket.
-        let records = vec![
-            ("stale-setup".to_string(), setup.clone()),
-            ("default-ba564".to_string(), runtime.clone()),
-            ("acme-77777".to_string(), other.clone()),
-        ];
-        evict_claimants_in(records, url, "default-ba564");
+        // A stale record for the SAME tunnel id under a different key still
+        // claims the Worker's single socket, regardless of which keyspace it
+        // lives in.
+        let records = vec![setup.clone(), runtime.clone(), other.clone()];
+        evict_claimants_in(records, url, &runtime);
 
         assert!(
             !cloudflared::public_url_path(&setup).exists(),
@@ -533,11 +619,7 @@ mod tests {
         let url = "https://x.workers.dev/default-ba564";
         let runtime = plant_record(dir.path(), 8080, url, 0);
 
-        evict_claimants_in(
-            vec![("default-ba564".to_string(), runtime.clone())],
-            url,
-            "default-ba564",
-        );
+        evict_claimants_in(vec![runtime.clone()], url, &runtime);
 
         assert!(cloudflared::public_url_path(&runtime).exists());
         assert!(runtime.pid_path(SERVICE_ID).exists());

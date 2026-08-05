@@ -137,6 +137,11 @@ pub(crate) fn gtunnel_config(
         secret,
         local_port,
         restart,
+        // The sole config this function returns is always the primary agent
+        // for its port: the single-tunnel boot path (`runtime.rs`, via
+        // `lib.rs`) and this module's own pre-loop call are the only callers.
+        // Only the `extra_tunnel_ids` loop below builds a non-primary config.
+        primary: true,
     }
 }
 
@@ -227,6 +232,10 @@ pub(crate) fn start_env_tunnel(
             let extra = crate::gtunnel::GtunnelConfig {
                 tunnel_id: tunnel_id.clone(),
                 secret: crate::gtunnel::resolve_secret(tunnel_id),
+                // Never the port-keyed primary: it already belongs to
+                // `config.tunnel_id`, and several extras sharing the port
+                // must not collide on that one record either.
+                primary: false,
                 ..config.clone()
             };
             match crate::gtunnel::start_agent(&extra) {
