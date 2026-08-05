@@ -4953,22 +4953,20 @@ async fn read_provider_signing_key(
 ) -> Option<Vec<u8>> {
     let secrets = activation.host.secrets_manager();
     let env = crate::resolve_env(None);
-    let team_segment = crate::secrets_manager::canonical_team(team);
     // The provider type uses dots (`messaging.webchat.gui`) while secrets
     // are stored under the hyphenated form (`messaging-webchat-gui`).
-    // Build both raw-hyphenated and canonical-underscored URIs, matching
-    // the resolution order in `DemoRunnerHost::get_secret`.
     let provider_hyphen = provider_type.replace('.', "-");
-    let raw_uri =
-        format!("secrets://{env}/{tenant}/{team_segment}/{provider_hyphen}/jwt_signing_key");
-    let canonical_uri = crate::secrets_gate::canonical_secret_uri(
+    // Bundle-less runtime-config path: no bundle root in scope, so this keeps
+    // the legacy raw/canonical pair rather than a recorded bundle ref.
+    let uris = crate::secret_resolve::secret_candidates(
+        None,
         &env,
         tenant,
         team,
         &provider_hyphen,
         "jwt_signing_key",
     );
-    for uri in [&raw_uri, &canonical_uri] {
+    for uri in &uris {
         match secrets.read(uri).await {
             Ok(bytes) => return Some(bytes),
             Err(_) => continue,

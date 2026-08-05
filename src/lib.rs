@@ -95,6 +95,7 @@ mod runtime_refs_store;
 pub mod runtime_state;
 mod secret_name;
 mod secret_requirements;
+mod secret_resolve;
 mod secret_value;
 mod secrets_backend;
 mod secrets_client;

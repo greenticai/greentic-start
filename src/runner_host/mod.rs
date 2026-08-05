@@ -95,7 +95,14 @@ impl DemoRunnerHost {
         use crate::secrets_setup::resolve_env;
 
         let env = resolve_env(None);
-        let uris = secret_read_uris(&env, &ctx.tenant, ctx.team.as_deref(), provider, key);
+        let uris = crate::secret_resolve::secret_candidates(
+            Some(self.bundle_root()),
+            &env,
+            &ctx.tenant,
+            ctx.team.as_deref(),
+            provider,
+            key,
+        );
 
         make_runtime_or_thread_scope(|rt| {
             rt.block_on(async {
@@ -434,28 +441,6 @@ impl DemoRunnerHost {
                     || pack_supports_provider_op(&pack.path, op_id).unwrap_or(false)
             })
             .unwrap_or(false)
-    }
-}
-
-fn secret_read_uris(
-    env: &str,
-    tenant: &str,
-    team: Option<&str>,
-    provider: &str,
-    key: &str,
-) -> Vec<String> {
-    let team_segment = crate::secrets_manager::canonical_team(team);
-    let raw_provider = if provider.is_empty() {
-        "messaging"
-    } else {
-        provider
-    };
-    let raw_uri = format!("secrets://{env}/{tenant}/{team_segment}/{raw_provider}/{key}");
-    let canonical_uri = crate::secrets_gate::canonical_secret_uri(env, tenant, team, provider, key);
-    if raw_uri == canonical_uri {
-        vec![raw_uri]
-    } else {
-        vec![raw_uri, canonical_uri]
     }
 }
 

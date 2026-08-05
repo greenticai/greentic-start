@@ -255,13 +255,27 @@ fn update_provider_public_url_secret(
     new_url: &str,
 ) -> Result<bool> {
     let env = resolve_env(None);
+    // Written exclusively at the canonical address, matching every other
+    // writer in this codebase (greentic-setup included). Checked for
+    // staleness via the full candidate chain — no bundle root is in scope
+    // here, so that chain is the legacy raw/canonical pair — so a value a
+    // prior release left under the raw form is still recognized as current.
     let uri = canonical_secret_uri(&env, tenant, Some(team), provider_id, "public_base_url");
+    let read_candidates = crate::secret_resolve::secret_candidates(
+        None,
+        &env,
+        tenant,
+        Some(team),
+        provider_id,
+        "public_base_url",
+    );
 
     // Check if current value is different
-    let current_value = read_secret_bytes(secrets_handle, &uri).ok();
-    let current_url = current_value
-        .as_ref()
-        .and_then(|v| String::from_utf8(v.clone()).ok());
+    let current_url = read_candidates.iter().find_map(|candidate| {
+        read_secret_bytes(secrets_handle, candidate)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    });
 
     if current_url.as_deref() == Some(new_url) {
         // Already up to date
@@ -502,9 +516,32 @@ pub(crate) fn build_provider_config(
     let env = resolve_env(None);
 
     for key in &secret_keys {
-        let uri = canonical_secret_uri(&env, tenant, Some(team), provider_id, key);
+        // `config_dir` is the bundle root, so a ref the bundle recorded in its
+        // own answers file is honored alone; absent that, the legacy
+        // raw/canonical pair is tried in order.
+        let candidates = crate::secret_resolve::secret_candidates(
+            Some(config_dir),
+            &env,
+            tenant,
+            Some(team),
+            provider_id,
+            key,
+        );
+        let mut last_err = None;
+        let read_result = candidates
+            .iter()
+            .find_map(
+                |candidate| match read_secret_bytes(secrets_handle, candidate) {
+                    Ok(bytes) => Some(bytes),
+                    Err(err) => {
+                        last_err = Some(err);
+                        None
+                    }
+                },
+            )
+            .ok_or_else(|| last_err.unwrap_or_else(|| anyhow::anyhow!("secret not found")));
 
-        match read_secret_bytes(secrets_handle, &uri) {
+        match read_result {
             Ok(bytes) => {
                 // Try to decode as UTF-8 string first
                 if let Ok(value_str) = String::from_utf8(bytes.clone()) {
