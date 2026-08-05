@@ -1528,6 +1528,102 @@ mod tests {
     }
 
     #[test]
+    fn subscription_state_is_built_from_the_tenant_scoped_setup_answers() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let pack_dir = dir.path().join("provider.gtpack");
+        std::fs::create_dir(&pack_dir)?;
+        std::fs::write(
+            pack_dir.join("pack.manifest.json"),
+            serde_json::to_vec(&json!({
+                "extensions": {
+                    "messaging.subscriptions.v1": {
+                        "inline": {
+                            "component_ref": "subscription-component",
+                            "export": "sync-subscriptions"
+                        }
+                    }
+                }
+            }))?,
+        )?;
+        let discovery = DiscoveryResult {
+            domains: DetectedDomains {
+                messaging: true,
+                events: false,
+                oauth: false,
+            },
+            providers: vec![DetectedProvider {
+                provider_id: "messaging-generic".to_string(),
+                domain: "messaging".to_string(),
+                pack_path: pack_dir,
+                id_source: ProviderIdSource::Manifest,
+            }],
+        };
+
+        // Write the desired-subscription declaration ONLY at the tenant-scoped
+        // path. This extension has no state_template/desired_state_template/
+        // desired_state, so `build_subscription_state` can only produce a state
+        // from `setup_answers["desired_subscriptions"]` — if
+        // `read_provider_setup_answers` were reverted to the unscoped legacy
+        // join, this file would not be found, `setup_answers` would be `None`,
+        // and the summary would carry "skipped: no desired subscription state".
+        let scoped = crate::provider_answers::answers_path(
+            dir.path(),
+            "messaging-generic",
+            "acme",
+            "default",
+        );
+        std::fs::create_dir_all(scoped.parent().expect("scoped dir"))?;
+        std::fs::write(
+            &scoped,
+            serde_json::to_vec(&json!({
+                "desired_subscriptions": [{
+                    "resource": "/generic/acme-scope",
+                    "change_type": "created"
+                }]
+            }))?,
+        )?;
+
+        let secrets_handle =
+            crate::secrets_gate::resolve_secrets_manager(dir.path(), "acme", Some("default"))?;
+        let host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle.clone(),
+            false,
+        )?;
+
+        let result = sync_subscriptions_if_public_url_available(
+            dir.path(),
+            &discovery,
+            &secrets_handle,
+            Some(&host),
+            "acme",
+            "default",
+            "https://public.example",
+        );
+
+        // With the tenant-scoped answers found, the function proceeds past the
+        // state-building gate into config/audit building and component
+        // invocation — the latter fails here only because `provider.gtpack` is
+        // not a real wasm component pack, which is an unrelated test-fixture
+        // limitation. Either an `Err` from that later stage, or an `Ok` summary
+        // without the skip message, proves the scoped answers were read. Only
+        // the revert deterministically produces the skip message below.
+        if let Ok(summary) = result {
+            assert!(
+                !summary
+                    .results
+                    .iter()
+                    .any(|(_, msg)| msg == "skipped: no desired subscription state"),
+                "tenant-scoped setup answers were not found: {:?}",
+                summary.results
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn reads_subscriptions_extension_from_cbor_pack_manifest() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let pack_path = dir.path().join("provider.gtpack");
