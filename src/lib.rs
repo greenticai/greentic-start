@@ -70,6 +70,7 @@ pub mod perf_harness;
 mod port_utils;
 mod post_ingress_hooks;
 mod project;
+mod provider_answers;
 mod provider_auth;
 pub mod provider_config_envelope;
 mod qa_persist;
