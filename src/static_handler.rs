@@ -390,7 +390,12 @@ fn try_serve_synthesized_tenant_config(
             .flatten()
             .map(|envelope| envelope.config)
             .or_else(|| {
-                read_provider_setup_answers(bundle_root, &route_match.descriptor.pack_id)
+                read_provider_setup_answers(
+                    bundle_root,
+                    &route_match.descriptor.pack_id,
+                    tenant_id,
+                    "default",
+                )
             })?;
 
     apply_envelope_tenant_overrides(&mut template, tenant_id, &provider_config);
@@ -412,12 +417,14 @@ fn try_serve_synthesized_tenant_config(
         .ok()
 }
 
-fn read_provider_setup_answers(bundle_root: &Path, provider_id: &str) -> Option<JsonValue> {
-    let path = bundle_root
-        .join("state")
-        .join("config")
-        .join(provider_id)
-        .join("setup-answers.json");
+fn read_provider_setup_answers(
+    bundle_root: &Path,
+    provider_id: &str,
+    tenant: &str,
+    team: &str,
+) -> Option<JsonValue> {
+    let path =
+        crate::provider_answers::answers_path_for_read(bundle_root, provider_id, tenant, team);
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }

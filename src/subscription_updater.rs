@@ -191,7 +191,8 @@ pub fn sync_subscriptions_if_public_url_available(
             continue;
         };
 
-        let setup_answers = read_provider_setup_answers(config_dir, &provider.provider_id)?;
+        let setup_answers =
+            read_provider_setup_answers(config_dir, &provider.provider_id, tenant, team)?;
         let Some(state) = build_subscription_state(
             &extension,
             setup_answers.as_ref(),
@@ -836,12 +837,14 @@ fn read_pack_manifest_json(pack_path: &Path) -> Result<Option<Value>> {
         .with_context(|| format!("failed to parse pack manifest in {}", pack_path.display()))
 }
 
-fn read_provider_setup_answers(config_dir: &Path, provider_id: &str) -> Result<Option<Value>> {
-    let path = config_dir
-        .join("state")
-        .join("config")
-        .join(provider_id)
-        .join("setup-answers.json");
+fn read_provider_setup_answers(
+    config_dir: &Path,
+    provider_id: &str,
+    tenant: &str,
+    team: &str,
+) -> Result<Option<Value>> {
+    let path =
+        crate::provider_answers::answers_path_for_read(config_dir, provider_id, tenant, team);
     if !path.exists() {
         return Ok(None);
     }

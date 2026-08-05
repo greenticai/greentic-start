@@ -474,7 +474,7 @@ pub(crate) fn build_provider_config(
 ) -> Result<Value> {
     let mut config = Map::new();
 
-    merge_provider_setup_answers(config_dir, provider_id, &mut config)?;
+    merge_provider_setup_answers(config_dir, provider_id, tenant, team, &mut config)?;
 
     // Add new public_base_url and tenant/team so provider can build
     // the correct webhook URL (e.g. /v1/messaging/ingress/{provider}/{tenant}/{team})
@@ -547,13 +547,12 @@ fn remove_declared_secret_values_from_setup_answers(
 fn merge_provider_setup_answers(
     config_dir: &Path,
     provider_id: &str,
+    tenant: &str,
+    team: &str,
     config: &mut Map<String, Value>,
 ) -> Result<()> {
-    let setup_answers_path = config_dir
-        .join("state")
-        .join("config")
-        .join(provider_id)
-        .join("setup-answers.json");
+    let setup_answers_path =
+        crate::provider_answers::answers_path_for_read(config_dir, provider_id, tenant, team);
 
     if !setup_answers_path.exists() {
         return Ok(());

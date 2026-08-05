@@ -531,11 +531,12 @@ fn inject_pack_setup_answers(
 
     let mut injected: Vec<String> = Vec::new();
 
-    let answers_path = bundle
-        .join("state")
-        .join("config")
-        .join(pack_id)
-        .join("setup-answers.json");
+    let answers_path = crate::provider_answers::answers_path_for_read(
+        bundle,
+        pack_id,
+        &ctx.tenant,
+        ctx.team.as_deref().unwrap_or("default"),
+    );
     if let Ok(bytes) = std::fs::read(&answers_path)
         && let Ok(JsonValue::Object(answers)) = serde_json::from_slice::<JsonValue>(&bytes)
     {

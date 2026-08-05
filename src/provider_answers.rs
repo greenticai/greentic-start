@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Where a provider's `setup-answers.json` lives.
 //!
 //! The twin of `greentic-setup/src/provider_answers.rs`. Answers are scoped

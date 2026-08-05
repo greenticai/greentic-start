@@ -220,7 +220,12 @@ pub(crate) fn build_injected_config(
     // This keeps hot ingress paths off the dev-store for cloud targets like AWS.
     let mut envelope_config =
         load_provider_config_from_envelope(runner_host.bundle_root(), provider);
-    let mut setup_answers = load_provider_setup_answers(runner_host.bundle_root(), provider);
+    let mut setup_answers = load_provider_setup_answers(
+        runner_host.bundle_root(),
+        provider,
+        &ctx.tenant,
+        ctx.team.as_deref().unwrap_or("default"),
+    );
 
     // Path 3: substitute any `ext://<path>[/<instance>]` config value with the
     // bound extension's resolved config/answers blob before it is encoded for
@@ -373,12 +378,13 @@ fn load_provider_config_from_envelope(bundle_root: &Path, provider: &str) -> Opt
 /// Secret material is fetched from `SecretsManager` in `build_injected_config`
 /// via `runner_host.get_secret`. The file remains a transitional sink for
 /// non-secret runtime config until `pack-config.v1` ships.
-fn load_provider_setup_answers(bundle_root: &Path, provider: &str) -> Option<JsonValue> {
-    let path = bundle_root
-        .join("state")
-        .join("config")
-        .join(provider)
-        .join("setup-answers.json");
+fn load_provider_setup_answers(
+    bundle_root: &Path,
+    provider: &str,
+    tenant: &str,
+    team: &str,
+) -> Option<JsonValue> {
+    let path = crate::provider_answers::answers_path_for_read(bundle_root, provider, tenant, team);
     let bytes = fs::read(&path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -690,6 +696,21 @@ pub fn log_invalid_event_warning(err: &anyhow::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_answers_are_read_from_the_tenant_scoped_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let scoped =
+            crate::provider_answers::answers_path(root, "messaging-telegram", "acme", "default");
+        std::fs::create_dir_all(scoped.parent().expect("scoped dir")).expect("dir");
+        std::fs::write(&scoped, r#"{"channel":"acme-channel"}"#).expect("write scoped");
+
+        let answers = load_provider_setup_answers(root, "messaging-telegram", "acme", "default")
+            .expect("scoped answers must be found");
+
+        assert_eq!(answers["channel"], "acme-channel");
+    }
 
     fn messaging_envelope() -> JsonValue {
         json!({
