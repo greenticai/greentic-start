@@ -239,4 +239,43 @@ mod tests {
 
         assert_eq!(candidates.len(), 2);
     }
+
+    /// CROSS-SYSTEM SECRET CONTRACT — DO NOT CHANGE THIS TEST.
+    ///
+    /// greentic-setup WRITES a bundle's secret under the address it records in
+    /// that bundle's answers file (via `secret_ref::resolve_secret_uri`). The
+    /// runtime READS that address back verbatim. If either side starts deriving
+    /// the address instead of recording/reading it, two bundles under one tenant
+    /// silently share a token again.
+    ///
+    /// The golden string below MUST exactly match what greentic-setup writes in
+    /// the answers file. Do NOT edit the expected value to make a build pass.
+    /// Changing the secret-uri scheme requires a NEW secrets plan verified
+    /// end-to-end on BOTH binaries (setup + start) and BOTH backends (local
+    /// dev-store + cloud vault) and public.
+    #[test]
+    fn recorded_secret_ref_contract_do_not_change() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let scoped =
+            crate::provider_answers::answers_path(root, "messaging-telegram", "demo", "default");
+        std::fs::create_dir_all(scoped.parent().expect("dir")).expect("dir");
+        std::fs::write(
+            &scoped,
+            r#"{"bot_token":"secrets://dev/demo/_/messaging_telegram_a7f3c/bot_token"}"#,
+        )
+        .expect("write answers");
+
+        assert_eq!(
+            secret_candidates(
+                Some(root),
+                "dev",
+                "demo",
+                None,
+                "messaging-telegram",
+                "bot_token"
+            ),
+            vec!["secrets://dev/demo/_/messaging_telegram_a7f3c/bot_token".to_string()],
+        );
+    }
 }
