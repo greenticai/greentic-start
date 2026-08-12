@@ -700,79 +700,40 @@ impl DemoRunnerHost {
         let Some(extension) = read_provider_ingress_extension(&pack.path)? else {
             return Ok(None);
         };
-        let component_bytes = read_pack_component_wasm(&pack.path, &extension.component_ref)?;
-        let tenant = ctx.tenant.clone();
-        let team = ctx.team.clone();
-        let correlation_id = ctx.correlation_id.clone();
-        let secrets_manager = self.secrets_handle.runtime_manager(Some(&pack.pack_id));
-        let state_store = self.state_store.clone();
-        let pack_id = pack.pack_id.clone();
-        let result = make_runtime_or_thread_scope(|_| {
-            let exec_ctx = ComponentExecCtx {
-                tenant: ComponentTenantCtx {
-                    tenant: tenant.clone(),
-                    team: team.clone(),
-                    i18n_id: None,
-                    user: None,
-                    trace_id: None,
-                    correlation_id: correlation_id.clone(),
-                    deadline_unix_ms: None,
-                    attempt: 1,
-                    idempotency_key: None,
+        let outcome = match invoke_pack_ingress_extension(
+            &pack.path,
+            &pack.pack_id,
+            &extension,
+            self.secrets_handle.runtime_manager(Some(&pack.pack_id)),
+            Some(self.state_store.clone()),
+            &ctx.tenant,
+            ctx.team.clone(),
+            ctx.correlation_id.clone(),
+            &[IngressExtensionCall {
+                headers_json,
+                body_json,
+            }],
+        ) {
+            // One call in, one result out — but take it without indexing, so a
+            // future change to the batch contract degrades to an error rather
+            // than a panic on the ingress path.
+            Ok(results) => match results.into_iter().next().unwrap_or_else(|| {
+                Err("provider ingress returned no result for the request".to_string())
+            }) {
+                Ok(value) => FlowOutcome {
+                    success: true,
+                    output: Some(value),
+                    raw: None,
+                    error: None,
+                    mode: RunnerExecutionMode::Exec,
                 },
-                i18n_id: None,
-                flow_id: extension.export_name.clone(),
-                node_id: Some(extension.export_name.clone()),
-            };
-            let http_client = Arc::new(reqwest::blocking::Client::new());
-            let host_config = Arc::new(build_demo_host_config(&tenant));
-            let engine = Engine::default();
-            let component = Component::from_binary(&engine, &component_bytes)?;
-            let mut linker = Linker::new(&engine);
-            register_all(&mut linker, true)?;
-            let host_state = HostState::new(
-                pack_id,
-                host_config,
-                http_client,
-                None,
-                None::<DynSessionStore>,
-                Some(state_store),
-                secrets_manager,
-                None,
-                Some(exec_ctx),
-                Some(extension.component_ref.clone()),
-                true,
-                None,
-                None,
-            )?;
-            let store_state =
-                ComponentState::new(host_state, Arc::new(RunnerWasiPolicy::default()))?;
-            let mut store = Store::new(&engine, store_state);
-            let instance = linker.instantiate(&mut store, &component)?;
-            let ingress_index = instance
-                .get_export_index(&mut store, None, "provider:common/ingress@0.0.2")
-                .context("get provider-common ingress export")?;
-            let handle_index = instance
-                .get_export_index(&mut store, Some(&ingress_index), &extension.export_name)
-                .with_context(|| format!("get {} export", extension.export_name))?;
-            let handle: TypedFunc<(String, String), (Result<String, String>,)> = instance
-                .get_typed_func(&mut store, handle_index)
-                .map_err(|err| anyhow!("get typed handle-webhook function: {err}"))?;
-            let (result,) = handle
-                .call(&mut store, (headers_json, body_json))
-                .map_err(|err| anyhow!("call provider-common handle-webhook: {err}"))?;
-            let output = result.map_err(anyhow::Error::msg)?;
-            let value = serde_json::from_str(&output).unwrap_or(JsonValue::String(output));
-            anyhow::Ok(value)
-        });
-
-        let outcome = match result {
-            Ok(value) => FlowOutcome {
-                success: true,
-                output: Some(value),
-                raw: None,
-                error: None,
-                mode: RunnerExecutionMode::Exec,
+                Err(message) => FlowOutcome {
+                    success: false,
+                    output: None,
+                    raw: None,
+                    error: Some(message),
+                    mode: RunnerExecutionMode::Exec,
+                },
             },
             Err(err) => FlowOutcome {
                 success: false,
@@ -784,6 +745,115 @@ impl DemoRunnerHost {
         };
         Ok(Some(outcome))
     }
+}
+
+/// One `handle-webhook` invocation: the headers/body JSON pair the component
+/// receives.
+#[derive(Clone, Debug)]
+pub(crate) struct IngressExtensionCall {
+    pub headers_json: String,
+    pub body_json: String,
+}
+
+/// Instantiate a pack's `messaging.provider_ingress.v1` component once and run
+/// every call in `calls` against that single instance.
+///
+/// Extracted from [`DemoRunnerHost::invoke_provider_ingress_extension`] so the
+/// revision path ([`crate::provider_webhook_verify`]) can reach the SAME
+/// component — and therefore the same signature-verification code — without a
+/// `DemoRunnerHost`. There must never be a second implementation of a provider's
+/// webhook verification: two HMAC comparisons drift, and the one that drifts is
+/// the one nobody is looking at.
+///
+/// Batching matters: instantiating the component compiles the wasm, which is by
+/// far the dominant cost. The verifier issues two calls per webhook (a tampered
+/// probe and the real request) and both must share one instantiation to stay
+/// inside Slack's 3-second ack budget.
+///
+/// The outer `Err` is a structural failure (missing component, instantiation
+/// failed, export absent) — nothing was executed. Each inner `Err(String)` is
+/// the component's own error message for that call, verbatim.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn invoke_pack_ingress_extension(
+    pack_path: &Path,
+    pack_id: &str,
+    extension: &ProviderIngressExtension,
+    secrets_manager: crate::secrets_gate::DynSecretsManager,
+    state_store: Option<greentic_runner_host::storage::DynStateStore>,
+    tenant: &str,
+    team: Option<String>,
+    correlation_id: Option<String>,
+    calls: &[IngressExtensionCall],
+) -> anyhow::Result<Vec<Result<JsonValue, String>>> {
+    let component_bytes = read_pack_component_wasm(pack_path, &extension.component_ref)?;
+    let tenant = tenant.to_string();
+    let pack_id = pack_id.to_string();
+    make_runtime_or_thread_scope(|_| {
+        let exec_ctx = ComponentExecCtx {
+            tenant: ComponentTenantCtx {
+                tenant: tenant.clone(),
+                team,
+                i18n_id: None,
+                user: None,
+                trace_id: None,
+                correlation_id,
+                deadline_unix_ms: None,
+                attempt: 1,
+                idempotency_key: None,
+            },
+            i18n_id: None,
+            flow_id: extension.export_name.clone(),
+            node_id: Some(extension.export_name.clone()),
+        };
+        let http_client = Arc::new(reqwest::blocking::Client::new());
+        let host_config = Arc::new(build_demo_host_config(&tenant));
+        let engine = Engine::default();
+        let component = Component::from_binary(&engine, &component_bytes)?;
+        let mut linker = Linker::new(&engine);
+        register_all(&mut linker, true)?;
+        let host_state = HostState::new(
+            pack_id,
+            host_config,
+            http_client,
+            None,
+            None::<DynSessionStore>,
+            state_store,
+            secrets_manager,
+            None,
+            Some(exec_ctx),
+            Some(extension.component_ref.clone()),
+            true,
+            None,
+            None,
+        )?;
+        let store_state = ComponentState::new(host_state, Arc::new(RunnerWasiPolicy::default()))?;
+        let mut store = Store::new(&engine, store_state);
+        let instance = linker.instantiate(&mut store, &component)?;
+        let ingress_index = instance
+            .get_export_index(&mut store, None, "provider:common/ingress@0.0.2")
+            .context("get provider-common ingress export")?;
+        let handle_index = instance
+            .get_export_index(&mut store, Some(&ingress_index), &extension.export_name)
+            .with_context(|| format!("get {} export", extension.export_name))?;
+        let handle: TypedFunc<(String, String), (Result<String, String>,)> = instance
+            .get_typed_func(&mut store, handle_index)
+            .map_err(|err| anyhow!("get typed handle-webhook function: {err}"))?;
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
+            let (result,) = handle
+                .call(
+                    &mut store,
+                    (call.headers_json.clone(), call.body_json.clone()),
+                )
+                .map_err(|err| anyhow!("call provider-common handle-webhook: {err}"))?;
+            results.push(
+                result.map(|output| {
+                    serde_json::from_str(&output).unwrap_or(JsonValue::String(output))
+                }),
+            );
+        }
+        anyhow::Ok(results)
+    })
 }
 
 fn operation_is_provider_common_subscription(op_id: &str) -> bool {
@@ -883,7 +953,7 @@ fn component_source_wasm_path(inline: &ExtensionInline, component_ref: &str) -> 
         })
 }
 
-fn read_provider_ingress_extension(
+pub(crate) fn read_provider_ingress_extension(
     pack_path: &Path,
 ) -> anyhow::Result<Option<ProviderIngressExtension>> {
     if let Some(bytes) = read_pack_manifest_cbor_bytes(pack_path)? {
@@ -927,10 +997,10 @@ fn read_provider_ingress_extension(
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct ProviderIngressExtension {
-    component_ref: String,
+pub(crate) struct ProviderIngressExtension {
+    pub component_ref: String,
     #[serde(rename = "export")]
-    export_name: String,
+    pub export_name: String,
 }
 
 fn read_pack_manifest_cbor_bytes(pack_path: &Path) -> anyhow::Result<Option<Vec<u8>>> {

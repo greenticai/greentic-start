@@ -76,6 +76,7 @@ mod post_ingress_hooks;
 mod project;
 mod provider_auth;
 pub mod provider_config_envelope;
+mod provider_webhook_verify;
 mod qa_persist;
 mod redis_tls;
 mod revision_boot;

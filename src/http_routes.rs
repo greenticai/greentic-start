@@ -54,6 +54,12 @@ pub struct HttpRouteDescriptor {
     #[allow(dead_code)]
     pub provider_type: Option<String>,
     pub domain: Domain,
+    /// The `.gtpack` this route was read from. Carried on the descriptor
+    /// because dispatch needs to reach back into the pack for the
+    /// `messaging.provider_ingress.v1` component that verifies the inbound
+    /// webhook's signature (see [`crate::provider_webhook_verify`]) — the
+    /// revision path has no other handle on the pack file.
+    pub pack_path: PathBuf,
     /// Deployment/bundle/revision this route belongs to, or `None` for a
     /// legacy single-bundle route (every route discovered today).
     pub scope: Option<RevisionScope>,
@@ -104,6 +110,7 @@ pub(crate) fn descriptor_for_test(
         provider_op: INGEST_HTTP_OP.to_string(),
         provider_type: None,
         domain,
+        pack_path: PathBuf::from("<test-pack>"),
         scope,
         segments: parse_route_pattern(pattern),
     }
@@ -126,6 +133,7 @@ pub(crate) fn provider_descriptor_for_test(
         provider_op: INGEST_HTTP_OP.to_string(),
         provider_type: Some(provider_type.to_string()),
         domain: Domain::Messaging,
+        pack_path: PathBuf::from("<test-pack>"),
         scope: Some(scope),
         segments: parse_route_pattern(pattern),
     }
@@ -511,6 +519,7 @@ fn parse_http_routes_v1(
             provider_op: record.provider_op,
             provider_type: None,
             domain,
+            pack_path: pack_path.to_path_buf(),
             // Single-bundle discovery: no deployment provenance. B4's
             // runtime-config-backed discovery stamps `Some(..)`.
             scope: None,
@@ -664,6 +673,7 @@ fn synthesize_provider_routes_from_manifest(
                 provider_op: INGEST_HTTP_OP.to_string(),
                 provider_type: Some(provider.provider_type.clone()),
                 domain: Domain::Messaging,
+                pack_path: pack_path.to_path_buf(),
                 scope: Some(scope.clone()),
                 segments,
             });
