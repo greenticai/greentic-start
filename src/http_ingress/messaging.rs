@@ -335,7 +335,7 @@ pub(super) fn route_messaging_envelopes(
     Ok(())
 }
 
-fn decode_injected_config_for_provider(config: serde_json::Value) -> serde_json::Value {
+pub(crate) fn decode_injected_config_for_provider(config: serde_json::Value) -> serde_json::Value {
     let Some(obj) = config.as_object() else {
         return config;
     };

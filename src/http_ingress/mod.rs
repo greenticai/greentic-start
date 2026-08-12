@@ -3,6 +3,7 @@ mod conv_dedup;
 mod directline_session;
 mod helpers;
 mod messaging;
+pub(crate) use messaging::decode_injected_config_for_provider;
 pub mod websocket;
 
 use std::{

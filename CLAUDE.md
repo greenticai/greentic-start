@@ -111,6 +111,8 @@ Crate version 1.2.0-dev.0, edition 2024, Rust 1.95.0 (pinned via `rust-toolchain
 | `PORT` | HTTP listen port for the revision-serve path |
 | `PUBLIC_BASE_URL` | Public URL for webhook auto-registration (tunnel > env-store > this) |
 | `GREENTIC_EVENTS_NATS_URL` | NATS bus URL; enables SoRX event subscriptions |
+| `GREENTIC_APPROVAL_NATS_URL` | NATS bus URL for the approval rail; enables the approval bridge. Deliberately separate from the events bus — the approval subjects need their own per-tenant read authorization. See [docs/approval-rail-bridge.md](docs/approval-rail-bridge.md) |
+| `GREENTIC_APPROVAL_DESTINATION` | Conversation approval requests are delivered to (a DM or a private approver channel). No default: the bridge fails closed without one |
 | `GREENTIC_LLM_API_KEY` | LLM provider key for fast2flow routing; keyless for Ollama |
 | `GREENTIC_CACHE_DIR` | Component cache root (set automatically by warmup) |
 | `GREENTIC_DEV_SECRETS_PATH` | Override path for dev-mode secrets store |

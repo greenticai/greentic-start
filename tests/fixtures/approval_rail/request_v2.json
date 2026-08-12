@@ -1,0 +1,24 @@
+{
+  "target": "default::run=RUN-1::node=gate",
+  "operation": "request",
+  "input": {
+    "title": "Refund 1200 USD",
+    "risk": 0.8
+  },
+  "routing": {
+    "policy_id": "refunds",
+    "tier": {
+      "level": 1,
+      "position": null,
+      "chain_len": 2,
+      "min_approvals": 2,
+      "deadline_ms": 3600000
+    },
+    "approvers": {
+      "role": "admin",
+      "emails": ["boss@acme.test"]
+    },
+    "channels": ["slack"],
+    "decision_token": "EXAMPLE-TOKEN-NOT-A-REAL-SECRET"
+  }
+}

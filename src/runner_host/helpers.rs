@@ -199,6 +199,34 @@ fn runner_binary_is_executable(_: &fs::Metadata) -> bool {
     true
 }
 
+/// Ops whose input and output must never be previewed into a log line.
+///
+/// The generic dispatcher logs a truncated preview of every op's payload (at
+/// debug) and of every component op's result (at debug, or info for a startup
+/// diagnostic). That is fine for ordinary messaging traffic and wrong for an op
+/// that carries a credential, because truncation is not redaction — where a
+/// secret falls relative to a 256- or 500-character cut is an accident of how
+/// long the fields before it happened to be.
+///
+/// `approval_request` is one such op. Its **input** carries the approval rail's
+/// `decision_token` in cleartext at `request.routing.decision_token`, and its
+/// **output** carries the rendered Slack message whose buttons hold the same
+/// token, base64-encoded in `payload.body_b64`. The approval rail contract
+/// (`greentic-designer/docs/approval-rail-contract-v2.md` §4) forbids that value
+/// reaching a log line "at any level, in any form — including on failure paths",
+/// and base64 inside a truncated preview is still a form.
+///
+/// This is deliberately keyed on the OP, not on the provider: any channel that
+/// grows an approval affordance later (Teams, WebChat) exposes the same op name
+/// and gets the same suppression without anyone remembering to add it.
+pub(super) fn op_payload_is_credential_bearing(op_id: &str) -> bool {
+    op_id == crate::approval_rail::delivery::APPROVAL_REQUEST_OP
+}
+
+/// What to log in place of a suppressed preview, so the line still shows the op
+/// ran rather than looking like a preview that failed to render.
+pub(super) const REDACTED_PREVIEW: &str = "<redacted: carries a credential>";
+
 pub(super) fn payload_preview(bytes: &[u8]) -> String {
     const MAX_PREVIEW: usize = 256;
     if bytes.is_empty() {
@@ -392,6 +420,27 @@ mod tests {
             "secret store error while fetching key"
         ));
         assert!(!needs_secret_context("ordinary validation failure"));
+    }
+
+    #[test]
+    fn the_approval_request_op_is_never_previewed_into_a_log_line() {
+        // Its input carries the rail's `decision_token` in cleartext and its
+        // output carries the same token base64'd inside the rendered Slack
+        // message. Contract §4 forbids either reaching a log line in any form.
+        assert!(op_payload_is_credential_bearing("approval_request"));
+
+        // Keyed off the op id the bridge actually invokes, so renaming one
+        // without the other is a compile-time break rather than a silent
+        // un-hooking of the suppression.
+        assert!(op_payload_is_credential_bearing(
+            crate::approval_rail::delivery::APPROVAL_REQUEST_OP
+        ));
+
+        // And ordinary messaging traffic keeps its preview — this is a narrow
+        // suppression, not a blanket one.
+        for op in ["send_payload", "encode", "render_plan", "ingest_http"] {
+            assert!(!op_payload_is_credential_bearing(op), "{op}");
+        }
     }
 
     #[test]

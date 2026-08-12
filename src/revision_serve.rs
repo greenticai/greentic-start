@@ -4737,7 +4737,7 @@ async fn dispatch_provider_route(
     // so we extract the `_greentic` metadata inline.
     try_notify_webchat_activity(state.notifier.as_ref(), &output).await;
 
-    let result = parse_dispatch_result(&output).map_err(|err| {
+    let mut result = parse_dispatch_result(&output).map_err(|err| {
         operator_log::warn(
             module_path!(),
             format!(
@@ -4750,6 +4750,26 @@ async fn dispatch_provider_route(
             "could not decode provider response envelope",
         )
     })?;
+
+    // Lift any approval decision off the batch before anything routes it.
+    // The envelope a click produces carries `[approval:approved]` as its text,
+    // which is a marker and not something a human typed — routed to a flow (and
+    // with fast2flow enabled, to an LLM router) it would read as chat. The raw
+    // body is passed too: it is where the clicked message's id lives, and that
+    // is what lets the next republish for this gate UPDATE the outstanding
+    // message instead of posting a second approval. No-op unless the bridge is
+    // running.
+    {
+        let content_type = request_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.as_str());
+        crate::approval_rail::intercept_inbound(
+            content_type,
+            body,
+            &mut result.messaging_envelopes,
+        );
+    }
 
     // `result.events` are EventEnvelopeV1 (event-fabric) emissions. The
     // legacy `dispatch_http_ingress` routes these only for `Domain::Events`

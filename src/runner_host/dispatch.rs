@@ -35,8 +35,9 @@ use crate::state_layout;
 
 use super::DemoRunnerHost;
 use super::helpers::{
-    build_demo_host_config, domain_name, make_runtime_or_thread_scope, needs_secret_context,
-    payload_preview, primary_provider_type, read_transcript_outputs, secret_error_context,
+    REDACTED_PREVIEW, build_demo_host_config, domain_name, make_runtime_or_thread_scope,
+    needs_secret_context, op_payload_is_credential_bearing, payload_preview, primary_provider_type,
+    read_transcript_outputs, secret_error_context,
 };
 use super::hooks::json_to_canonical_cbor;
 use super::types::{
@@ -159,7 +160,11 @@ impl DemoRunnerHost {
                         ctx.tenant,
                         ctx.team.as_deref().unwrap_or("default"),
                         payload_bytes.len(),
-                        payload_preview(payload_bytes),
+                        if op_payload_is_credential_bearing(op_id) {
+                            REDACTED_PREVIEW.to_string()
+                        } else {
+                            payload_preview(payload_bytes)
+                        },
                     ),
                 );
             }
@@ -431,7 +436,11 @@ impl DemoRunnerHost {
 
         match result {
             Ok(value) => {
-                let value_str = serde_json::to_string(&value).unwrap_or_default();
+                let value_str = if op_payload_is_credential_bearing(op_id) {
+                    REDACTED_PREVIEW.to_string()
+                } else {
+                    serde_json::to_string(&value).unwrap_or_default()
+                };
                 let level = if is_startup_diagnostic_op(op_id) {
                     operator_log::Level::Info
                 } else {

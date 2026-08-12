@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::approval_rail::{ApprovalRailListener, ApprovalRailListenerConfig};
 use crate::business_event_listener::{BusinessEventListener, BusinessEventListenerConfig};
 use crate::domains::Domain;
 use crate::http_ingress::{HttpIngressConfig, HttpIngressServer};
@@ -44,6 +45,7 @@ pub struct ForegroundRuntimeHandles {
     pub timer_scheduler: Option<TimerScheduler>,
     pub threshold_watcher: Option<ThresholdWatcher>,
     pub business_event_listener: Option<BusinessEventListener>,
+    pub approval_rail_listener: Option<ApprovalRailListener>,
 }
 
 impl ForegroundRuntimeHandles {
@@ -58,6 +60,9 @@ impl ForegroundRuntimeHandles {
             watcher.stop();
         }
         if let Some(listener) = self.business_event_listener.take() {
+            listener.stop();
+        }
+        if let Some(listener) = self.approval_rail_listener.take() {
             listener.stop();
         }
         Ok(())
@@ -945,6 +950,26 @@ pub fn demo_up_services(
         _ => None,
     };
 
+    // ── Approval rail bridge (optional) ────────────────────────────────────
+    // The middle of greentic-designer's human-in-the-loop rail: subscribe to
+    // `greentic.approval.request.v1`, deliver each request to a human through
+    // an installed messaging provider, and publish their answer back on
+    // `greentic.approval.response.v1`. Contract:
+    // `greentic-designer/docs/approval-rail-contract-v2.md`.
+    //
+    // Off unless BOTH variables are set, and the destination has no default on
+    // purpose. The `decision_token` in an approval message is readable by every
+    // member of the conversation it lands in (§4), so inheriting the Slack
+    // provider's general `default_channel` would put a bearer credential in
+    // front of everyone in it, silently. Fail closed instead — see
+    // `crate::approval_rail`'s module docs.
+    //
+    // Same call-site posture as the business event listener above: this path is
+    // synchronous, so `ApprovalRailListener::start` owns its own thread and
+    // runtime and a connect failure never fails boot.
+    let approval_rail_listener =
+        build_approval_rail_listener(Arc::clone(&runner_host), tenant, team);
+
     // ── SQL gateway (optional) ─────────────────────────────────────────────
     // When `demo_config.sql` is set, resolve secrets and spawn a dedicated
     // localhost axum server serving `/sql/<conn>/schema` + `/sql/<conn>/query`.
@@ -1578,6 +1603,7 @@ pub fn demo_up_services(
         timer_scheduler,
         threshold_watcher,
         business_event_listener,
+        approval_rail_listener,
     })
 }
 
@@ -1646,6 +1672,77 @@ Details: {err:#}",
             );
             Err(err).context("unable to resolve messaging app flow")
         }
+    }
+}
+
+/// Start the approval-rail bridge, when this deployment configures one.
+///
+/// Both variables are required and neither has a default:
+///
+/// * `GREENTIC_APPROVAL_NATS_URL` — the broker carrying the rail. Deliberately
+///   separate from `GREENTIC_EVENTS_NATS_URL`, because the contract's §6 makes
+///   per-tenant subject-level read authorization on the approval subjects
+///   mandatory, which in practice means a different credential from the general
+///   business-event bus.
+/// * `GREENTIC_APPROVAL_DESTINATION` — the conversation approval requests are
+///   delivered to. It must be a DM or a private approver channel; see
+///   `crate::approval_rail`.
+///
+/// A half-configured bridge is reported and not started, rather than started
+/// with a guessed destination.
+fn build_approval_rail_listener(
+    runner_host: Arc<crate::runner_host::DemoRunnerHost>,
+    tenant: &str,
+    team: &str,
+) -> Option<ApprovalRailListener> {
+    let nats_url = std::env::var(crate::approval_rail::NATS_URL_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let destination = std::env::var(crate::approval_rail::DESTINATION_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    match (nats_url, destination) {
+        (Some(nats_url), Some(destination)) => {
+            let delivery = Arc::new(crate::approval_rail::delivery::RunnerHostDelivery::new(
+                runner_host,
+                tenant.to_string(),
+                (!team.is_empty()).then(|| team.to_string()),
+                destination,
+            ));
+            Some(ApprovalRailListener::start(ApprovalRailListenerConfig {
+                nats_url,
+                delivery,
+            }))
+        }
+        (Some(_), None) => {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "{} is set but {} is not; the approval bridge will not start. It has no \
+                     default destination on purpose — an approval message carries a bearer \
+                     token readable by everyone in the conversation it lands in, so the \
+                     conversation must be named explicitly (a DM or a private approver channel).",
+                    crate::approval_rail::NATS_URL_ENV,
+                    crate::approval_rail::DESTINATION_ENV,
+                ),
+            );
+            None
+        }
+        (None, Some(_)) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "{} is set but {} is not; the approval bridge will not start.",
+                    crate::approval_rail::DESTINATION_ENV,
+                    crate::approval_rail::NATS_URL_ENV,
+                ),
+            );
+            None
+        }
+        (None, None) => None,
     }
 }
 
