@@ -54,8 +54,9 @@ pub fn dispatch_http_ingress_with_op(
             anyhow::bail!("{message}");
         }
         let value = outcome.output.unwrap_or_else(|| json!({}));
-        let decoded =
+        let mut decoded =
             parse_dispatch_result(&value).with_context(|| "decode provider ingress output")?;
+        intercept_approval_responses(request, &mut decoded);
         return Ok(decoded);
     }
 
@@ -134,7 +135,30 @@ pub fn dispatch_http_ingress_with_op(
         &mut decoded,
         ctx,
     )?;
+    intercept_approval_responses(request, &mut decoded);
     Ok(decoded)
+}
+
+/// Lift any approval decision off this batch before it is routed to a flow.
+///
+/// Placed on BOTH return paths of `dispatch_http_ingress_with_op` — the
+/// `messaging.provider_ingress.v1` shortcut returns early and skips the
+/// post-ingress hooks entirely, so a single call at the tail would silently
+/// miss every provider that ships an ingress extension.
+///
+/// A no-op unless the approval bridge is running; see
+/// [`crate::approval_rail::intercept_inbound`].
+fn intercept_approval_responses(request: &IngressRequestV1, decoded: &mut IngressDispatchResult) {
+    let content_type = request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.as_str());
+    crate::approval_rail::intercept_inbound(
+        content_type,
+        &request.body,
+        &mut decoded.messaging_envelopes,
+    );
 }
 
 fn provider_ingress_headers_json(request: &IngressRequestV1) -> anyhow::Result<String> {
