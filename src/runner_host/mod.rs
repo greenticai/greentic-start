@@ -6,6 +6,9 @@ mod hooks;
 mod token_validation;
 mod types;
 
+pub(crate) use dispatch::{
+    IngressExtensionCall, invoke_pack_ingress_extension, read_provider_ingress_extension,
+};
 pub use helpers::primary_provider_type;
 // RunnerExecutionMode is re-exported because it is a public field of FlowOutcome.
 #[allow(unused_imports)]

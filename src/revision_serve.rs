@@ -14,22 +14,26 @@
 //! runtime via [`RunnerHost::handle_activity_for_revision`], and serializes the
 //! reply activities back as a JSON array.
 //!
-//! This is the **generic-JSON vertical slice**: the body is treated as a generic
-//! JSON activity (a `text` field becomes a messaging activity, anything else a
-//! custom `http.request` activity routed to the pack's entry flow). Provider
-//! webhook parsing (Slack/Telegram signature-verified `ingest_http`), WebChat /
-//! DirectLine, WebSocket upgrades, and static-asset serving under revisions are
-//! deliberately out of scope and stay on the legacy ingress for now.
+//! Besides that generic-JSON path — where the body is treated as a generic JSON
+//! activity (a `text` field becomes a messaging activity, anything else a custom
+//! `http.request` activity routed to the pack's entry flow) — Phase D.3 added
+//! `dispatch_provider_route`, which serves pack-declared provider webhooks by
+//! invoking the provider component's own op
+//! (`RunnerHost::invoke_provider_for_revision`). A route with no
+//! `provider_type` is still refused (`501`) rather than run generically. Only
+//! `POST` requests to non-provider paths run the entry flow; everything else is
+//! `404` (no deployment bound) / `405` (wrong method). Caller-asserted identity
+//! (`x-greentic-user`/`-session`, body `user`/`session`) is honoured only from
+//! loopback peers, so a remote caller cannot impersonate a user/session or pin a
+//! chosen revision (see `caller_identity`).
 //!
-//! Because provider parsing is deferred, the slice is **fail-closed** rather than
-//! a catch-all: a request whose `(path, method)` matches the selected revision's
-//! declared provider route is refused (`501`) instead of being run generically —
-//! that would skip the provider's signature/token verification. Only `POST`
-//! requests to non-provider paths run the entry flow; everything else is `404`
-//! (no deployment bound) / `405` (wrong method) / `501` (provider path). Caller-
-//! asserted identity (`x-greentic-user`/`-session`, body `user`/`session`) is
-//! honoured only from loopback peers, so a remote caller cannot impersonate a
-//! user/session or pin a chosen revision (see `caller_identity`).
+//! Inbound provider webhooks are authenticated by two gates before the body is
+//! trusted: [`crate::provider_auth`] for a shared secret echoed in a header
+//! (Telegram), and [`crate::provider_webhook_verify`] for a signed request
+//! (Slack). Note this path does NOT run the pack's
+//! `messaging.provider_ingress.v1` component the way the legacy ingress does —
+//! it calls the provider op directly — so nothing a provider component would
+//! have checked on the legacy path is checked here implicitly.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -87,6 +91,7 @@ use crate::ingress_types::IngressHttpResponse;
 use crate::messaging_dto::HttpInV1;
 use crate::operator_log;
 use crate::provider_auth;
+use crate::provider_webhook_verify;
 use crate::revision_dispatcher::{
     DispatchRequest, RevisionDispatcher, RevisionKey, SetCookieDirective, cookie_name,
 };
@@ -4471,6 +4476,11 @@ async fn dispatch_provider_route(
         ));
     };
     let descriptor_pack_id = route_match.descriptor.pack_id.clone();
+    // The pack file behind this route. `provider_webhook_verify` reaches back
+    // into it for the `messaging.provider_ingress.v1` component that verifies
+    // the request signature; cloned here because `route_match` borrows the
+    // activation's route table.
+    let descriptor_pack_path = route_match.descriptor.pack_path.clone();
     let provider_op = route_match.descriptor.provider_op.clone();
     let route_tenant = route_match.tenant.clone();
     let route_team = route_match.team.clone();
@@ -4582,22 +4592,78 @@ async fn dispatch_provider_route(
         Err(response) => return Err(response),
     };
 
-    // Second half of the `defer_pin` two-phase write (A1 follow-up): commit the
-    // body-derived chat-stickiness pin now that the host gate above has admitted
-    // the request (a rejected request returns `Err` above and never pins).
+    // Transport-layer signature gate. `provider_auth` above covers providers
+    // that authenticate with a shared secret in a header (Telegram); this
+    // covers providers that sign the request itself (Slack). Unlike the legacy
+    // `http_ingress` server, this path never runs the pack's
+    // `messaging.provider_ingress.v1` component — it calls the provider's
+    // `ingest_http` op directly — and for Slack that component is the only
+    // place the `X-Slack-Signature` HMAC is checked. Without this gate the body
+    // below is unauthenticated. See [`crate::provider_webhook_verify`] for how
+    // it delegates back to that same component instead of reimplementing the
+    // check, and for what it does when no signing secret is configured.
     //
-    // Trust boundary: the gate only *verifies* the body for providers with a
-    // host-side authenticator — today Telegram endpoints carrying a
-    // `webhook_secret_ref`, i.e. the `Authenticated` outcome. A `Skipped`
-    // outcome means the host had nothing to check the body against: either the
-    // provider verifies inside its own component (e.g. Slack signature), which
-    // runs *after* this point, or the endpoint is a legacy no-secret one. Those
-    // still pin here — unchanged from A1, which pinned them inline during
-    // dispatch — so the pin can precede (delegated) or lack (legacy)
-    // verification. Impact stays low: same-bundle version routing only,
-    // `try_pin` cannot overwrite an existing pin, and the store caps + TTL bound
-    // cardinality. Fully gating the delegated case would need the component to
-    // report its verification result back to the host (tracked separately).
+    // Blocking: instantiating and calling the component compiles wasm, so it
+    // runs on the blocking pool rather than on a hyper worker. The cheap
+    // applicability check happens BEFORE the hop so an uncovered class — most
+    // of all DirectLine, which polls — does not pay for it.
+    if provider_webhook_verify::requires_verification(&provider_type) {
+        let verify_provider_type = provider_type.clone();
+        let verify_pack_id = descriptor_pack_id.clone();
+        let verify_pack_path = descriptor_pack_path.clone();
+        let verify_secrets = secrets.clone();
+        let verify_tenant = tenant.to_string();
+        let verify_headers = request_headers.to_vec();
+        let verify_body = body.to_vec();
+        let verdict = tokio::task::spawn_blocking(move || {
+            provider_webhook_verify::verify_inbound_provider_webhook(
+                &verify_provider_type,
+                &verify_pack_id,
+                &verify_pack_path,
+                verify_secrets,
+                &verify_tenant,
+                &verify_headers,
+                &verify_body,
+            )
+        })
+        .await;
+        match verdict {
+            Ok(Ok(_)) => {}
+            Ok(Err(boxed)) => return Err(*boxed),
+            Err(err) => {
+                // The verification task panicked or was cancelled. There is no
+                // verdict, so there is no admission.
+                operator_log::error(
+                    module_path!(),
+                    format!(
+                        "webhook signature verification task for provider {provider_type} \
+                         did not complete (deployment {deployment_id} revision {revision_id}): \
+                         {err}"
+                    ),
+                );
+                return Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "webhook signature verification is unavailable",
+                ));
+            }
+        }
+    }
+
+    // Second half of the `defer_pin` two-phase write (A1 follow-up): commit the
+    // body-derived chat-stickiness pin now that the host gates above have
+    // admitted the request (a rejected request returns `Err` above and never
+    // pins).
+    //
+    // Trust boundary: two gates run before this point, and between them they
+    // cover the shipped signed providers — `provider_auth` for a Telegram
+    // endpoint carrying a `webhook_secret_ref`, and `provider_webhook_verify`
+    // for a provider class that signs its requests (Slack). What still pins
+    // without any verification is a provider class in neither set: a legacy
+    // Telegram endpoint provisioned with no `webhook_secret_ref`, or a class
+    // that carries no transport authentication at all. Those still pin here —
+    // unchanged from A1, which pinned them inline during dispatch. Impact stays
+    // low: same-bundle version routing only, `try_pin` cannot overwrite an
+    // existing pin, and the store caps + TTL bound cardinality.
     //
     // No-op when there is no hint (endpoint with no extractable chat id).
     if let Some(hint) = session_hint {
@@ -6867,6 +6933,91 @@ mod tests {
         assert_eq!(
             admit_request(&routes, &scope, "/slack/events", &hyper::Method::POST),
             Admission::ProviderRoute
+        );
+    }
+
+    /// The signature gate must be REACHED, not merely exist.
+    ///
+    /// `dispatch_provider_route` is driven with a Slack provider route whose
+    /// pack file does not exist, so the gate cannot find a verifier and refuses
+    /// with `503`. Delete the `provider_webhook_verify` call from
+    /// `dispatch_provider_route` and the request instead walks on to
+    /// `invoke_provider_for_revision`, which answers `502 provider invocation
+    /// failed` — a different status, so this assertion goes red. That is the
+    /// whole point: a unit test of the verifier alone would still pass with the
+    /// call site removed.
+    ///
+    /// `messaging.slack.api` is the `provider_type` the shipped pack declares;
+    /// see `provider_webhook_verify::tests` for why that exact string matters.
+    #[tokio::test]
+    async fn a_slack_webhook_is_gated_before_the_provider_component_is_invoked() {
+        let scope = test_scope();
+        let routes = HttpRouteTable::from_descriptors(vec![
+            crate::http_routes::provider_descriptor_for_test(
+                "/webhook/slack-api",
+                "messaging.slack.api",
+                scope.clone(),
+            ),
+        ]);
+        let base = empty_activation("env-slack");
+        let activation = std::sync::Arc::new(Activation {
+            host: std::sync::Arc::clone(&base.host),
+            routing: std::sync::Arc::new(RevisionIngressRouting {
+                dispatcher: std::sync::Arc::clone(&base.routing.dispatcher),
+                http_routes: routes,
+                deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+                endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+                deployment_config_overrides: std::sync::Arc::default(),
+                static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
+            }),
+        });
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(empty_state("env-slack", bound));
+        let headers = vec![
+            ("x-slack-signature".to_string(), "v0=abc".to_string()),
+            (
+                "x-slack-request-timestamp".to_string(),
+                "1700000000".to_string(),
+            ),
+        ];
+
+        let response = dispatch_provider_route(
+            activation,
+            state,
+            "acme",
+            &scope,
+            "/webhook/slack-api",
+            "POST",
+            None,
+            &headers,
+            b"{}",
+            false,
+            &headers,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("an unverifiable Slack webhook must be refused");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a 502 here means the gate was skipped and the provider component ran"
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect refusal body")
+            .to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("signature verification"),
+            "unexpected refusal body: {body}"
         );
     }
 
