@@ -113,6 +113,9 @@ pub(crate) struct ResolveSecretArgs {
 pub(crate) struct StartArgs {
     #[arg(long)]
     bundle: Option<String>,
+    /// Boot from a greentic-deployer environment home instead of a bundle.
+    #[arg(long)]
+    store_root: Option<PathBuf>,
     /// Environment id whose persisted state the bundle-less boot serves.
     /// Wins over `$GREENTIC_ENV`; defaults to `local`. Ignored (with a
     /// warning) on the legacy `--bundle` / `--config` path, which has no
@@ -263,6 +266,9 @@ pub enum RestartTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartRequest {
     pub bundle: Option<String>,
+    /// Root of the environment store to serve. `None` falls back to
+    /// `LocalFsStore::default_root()`.
+    pub store_root: Option<PathBuf>,
     /// Environment id override for the bundle-less boot (flag >
     /// `$GREENTIC_ENV` > `local` — precedence lives in `resolve_env`).
     pub env: Option<String>,
@@ -319,6 +325,7 @@ pub struct StopRequest {
 pub(crate) fn start_request_from_args(args: StartArgs, tunnel_explicit: bool) -> StartRequest {
     StartRequest {
         bundle: args.bundle,
+        store_root: args.store_root,
         env: args.env,
         tenant: args.tenant,
         team: args.team,
@@ -495,6 +502,7 @@ pub(crate) fn restart_name(target: &RestartTarget) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// `start` and `stop` must land in the same tenant every other tool in
     /// the fleet defaults to. This was `demo` while greentic-deployer and
@@ -692,5 +700,40 @@ mod tests {
         };
         let req = start_request_from_args(args, false);
         assert!(req.open_webchat.is_none());
+    }
+
+    /// `--store-root` parses onto `start` and reaches `StartRequest`.
+    ///
+    /// The flag is what lets a caller serve an env home staged somewhere other
+    /// than `~/.greentic` — greentic-designer spawns exactly this argv, one
+    /// store root per operator environment.
+    #[test]
+    fn start_root_flag_reaches_the_request() {
+        let cli = Cli::try_parse_from([
+            "greentic-start",
+            "start",
+            "--store-root",
+            "/srv/envhome",
+            "--env",
+            "local",
+        ])
+        .expect("start --store-root parses");
+        let Command::Start(args) = cli.command else {
+            panic!("did not parse as start");
+        };
+        let req = start_request_from_args(args, false);
+        assert_eq!(req.store_root.as_deref(), Some(Path::new("/srv/envhome")));
+        assert_eq!(req.env.as_deref(), Some("local"));
+    }
+
+    /// Omitting it stays `None`, which is what keeps the default-root boot
+    /// byte-for-byte unchanged for every existing caller.
+    #[test]
+    fn without_the_flag_the_store_root_is_none() {
+        let cli = Cli::try_parse_from(["greentic-start", "start"]).expect("start parses");
+        let Command::Start(args) = cli.command else {
+            panic!("did not parse as start");
+        };
+        assert!(start_request_from_args(args, false).store_root.is_none());
     }
 }

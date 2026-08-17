@@ -495,9 +495,21 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     // an embedded runner host, run requests through the revision dispatcher.
     if bundle_less {
         let env_id = resolve_env(request.env.as_deref());
-        let rc = runtime_config::load_or_empty(&env_id)?;
-        let store_root = greentic_deployer::environment::LocalFsStore::default_root()
-            .context("cannot determine the default environment store root (no home directory)")?;
+        // `--store-root` overrides the home-rooted default so an operator can
+        // serve an env home staged at an arbitrary path — which is how
+        // greentic-deployer's `op` provisions one per environment. Without the
+        // flag this is byte-for-byte the previous behaviour.
+        let store_root = match request.store_root.clone() {
+            Some(root) => root,
+            None => greentic_deployer::environment::LocalFsStore::default_root().context(
+                "cannot determine the default environment store root (no home directory)",
+            )?,
+        };
+        // Read the config from the SAME root we serve from. `env_dir_in` already
+        // takes the root explicitly; pairing it with the root-implicit
+        // `load_or_empty` would silently load the default store's config while
+        // serving the overridden store's revisions.
+        let rc = runtime_config::load_or_empty_in(&store_root, &env_id)?;
         let env_dir = runtime_config::env_dir_in(&store_root, &env_id)?;
 
         // P7e: capture the exe path ONCE, before any binary swap can
@@ -3657,6 +3669,7 @@ mod tests {
         let mut config = config::DemoConfig::default();
         let args = StartRequest {
             bundle: None,
+            store_root: None,
             env: None,
             tenant: None,
             team: None,
@@ -3696,6 +3709,7 @@ mod tests {
         let mut config = config::DemoConfig::default();
         let args = StartRequest {
             bundle: None,
+            store_root: None,
             env: None,
             tenant: None,
             team: None,
@@ -3804,6 +3818,7 @@ mod tests {
     fn make_start_request(bundle: &Path) -> StartRequest {
         StartRequest {
             bundle: Some(bundle.display().to_string()),
+            store_root: None,
             env: None,
             tenant: None,
             team: None,

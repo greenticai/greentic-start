@@ -111,6 +111,27 @@ pub(crate) fn load_in(
     load_in_dir(&dir, env_id)
 }
 
+/// Same as [`load_or_empty`], but resolves the env directory under `env_root`
+/// instead of [`LocalFsStore::default_root`].
+///
+/// The bundle-less boot MUST use this whenever `--store-root` is supplied: its
+/// sibling `env_dir_in` already takes the root explicitly, so reading the
+/// config through the root-implicit `load_or_empty` would load
+/// `runtime-config.json` from the DEFAULT store while serving revisions out of
+/// the overridden one — a mismatch that produces a zero-revision boot rather
+/// than an error.
+pub(crate) fn load_or_empty_in(
+    env_root: &Path,
+    env_id: &str,
+) -> anyhow::Result<LoadedRuntimeConfig> {
+    Ok(
+        load_in(env_root, env_id)?.unwrap_or_else(|| LoadedRuntimeConfig {
+            env_id: env_id.to_string(),
+            revisions: Vec::new(),
+        }),
+    )
+}
+
 fn load_in_dir(dir: &Path, env_id: &str) -> anyhow::Result<Option<LoadedRuntimeConfig>> {
     let path = dir.join(RUNTIME_CONFIG_FILE);
     if !path.is_file() {

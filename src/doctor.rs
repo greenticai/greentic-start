@@ -526,6 +526,7 @@ fn check_runtime_config(
 fn default_start_request(bundle: Option<String>) -> StartRequest {
     StartRequest {
         bundle,
+        store_root: None,
         env: None,
         tenant: None,
         team: None,
