@@ -57,6 +57,7 @@ pub fn route_events_to_default_flow(
             team: ctx.team.clone(),
             input,
             dist_offline: true,
+            entry_node: None,
         };
         runner_exec::run_provider_pack_flow(request)
             .with_context(|| format!("route event {} -> {}", event.event_type, flow.id))?;

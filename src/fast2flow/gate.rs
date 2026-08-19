@@ -81,6 +81,7 @@ mod tests {
                 id: "default".into(),
                 kind: "messaging".into(),
                 subscribes_to: vec![],
+                node_ids: vec![],
             }],
             capabilities: caps.iter().map(|s| s.to_string()).collect(),
         }
