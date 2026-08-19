@@ -36,6 +36,13 @@ pub struct AppFlowInfo {
     /// (`event_router::select_target_flows`); the default-flow router
     /// (`route_events_to_default_flow`) ignores it.
     pub subscribes_to: Vec<String>,
+    /// Ids of the nodes this flow declares, resolved through the manifest's
+    /// `symbols.node_ids` table.
+    ///
+    /// The demo messaging host consults this to decide whether a card-nav
+    /// target is a FLOW NODE (hand it to the flow, so the node runs and can
+    /// attach the user's answers) or only a card asset (render it directly).
+    pub node_ids: Vec<String>,
 }
 
 pub fn resolve_app_pack_path(
@@ -241,6 +248,7 @@ Fix the pack manifest by marking one flow as id `default`, or by making exactly 
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_app_flow(
     runner_host: &DemoRunnerHost,
     bundle: &Path,
@@ -249,6 +257,7 @@ pub fn run_app_flow(
     pack_id: &str,
     flow_id: &str,
     envelope: &ChannelMessageEnvelope,
+    entry_node: Option<&str>,
 ) -> Result<Vec<ChannelMessageEnvelope>> {
     let mut envelope_for_flow = envelope.clone();
     inject_pack_setup_answers(
@@ -275,6 +284,7 @@ pub fn run_app_flow(
             "correlation_id": ctx.correlation_id,
         }),
         dist_offline: true,
+        entry_node: entry_node.map(str::to_string),
     };
 
     let output = runner_exec::run_provider_pack_flow(request)?;
@@ -286,8 +296,9 @@ pub fn run_app_flow(
     operator_log::info(
         module_path!(),
         format!(
-            "[messaging_app] run_app_flow completed run_dir={} target_node={} status={:?} failures={}",
+            "[messaging_app] run_app_flow completed run_dir={} entry_node={} target_node={} status={:?} failures={}",
             output.run_dir.display(),
+            entry_node.unwrap_or("<entrypoint>"),
             target_node.map(String::as_str).unwrap_or("<none>"),
             output.result.status,
             output.result.failures.len(),
@@ -663,8 +674,10 @@ fn extract_flows(value: &CborValue) -> Vec<AppFlowInfo> {
     if let CborValue::Map(map) = value {
         let flows_key = CborValue::Text("flows".to_string());
         if let Some(CborValue::Array(entries)) = map.get(&flows_key) {
+            let node_ids_table = symbol_table_array(map, "node_ids");
             for entry in entries {
-                if let Some(flow) = parse_flow_entry(entry) {
+                if let Some(mut flow) = parse_flow_entry(entry) {
+                    flow.node_ids = extract_flow_node_ids(entry, node_ids_table.map(Vec::as_slice));
                     flows.push(flow);
                 }
             }
@@ -747,7 +760,42 @@ fn parse_flow_entry(value: &CborValue) -> Option<AppFlowInfo> {
         id,
         kind: kind.unwrap_or_else(|| "messaging".to_string()),
         subscribes_to,
+        node_ids: Vec::new(),
     })
+}
+
+/// Resolve the node ids a flow entry declares, through `symbols.node_ids`.
+///
+/// The canonical encoder symbol-indexes each node id as an integer; an inline
+/// text id is also accepted for non-canonical encodings.
+fn extract_flow_node_ids(entry: &CborValue, node_ids_table: Option<&[CborValue]>) -> Vec<String> {
+    let CborValue::Map(entry_map) = entry else {
+        return Vec::new();
+    };
+    let Some(CborValue::Map(flow_map)) = entry_map.get(&CborValue::Text("flow".to_string())) else {
+        return Vec::new();
+    };
+    let Some(CborValue::Array(nodes)) = flow_map.get(&CborValue::Text("nodes".to_string())) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for node in nodes {
+        let CborValue::Map(node_map) = node else {
+            continue;
+        };
+        match node_map.get(&CborValue::Text("id".to_string())) {
+            Some(CborValue::Text(id)) => out.push(id.clone()),
+            Some(CborValue::Integer(idx)) => {
+                if let Some(CborValue::Text(id)) =
+                    node_ids_table.and_then(|table| table.get(*idx as usize))
+                {
+                    out.push(id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Extract a `Vec<String>` from a CBOR map field holding a text array;
@@ -1649,11 +1697,13 @@ mod tests {
                     id: "alternate".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
                 AppFlowInfo {
                     id: "default".to_string(),
                     kind: "workflow".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1667,11 +1717,13 @@ mod tests {
                     id: "notify".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
                 AppFlowInfo {
                     id: "wizard".to_string(),
                     kind: "setup".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1693,16 +1745,19 @@ mod tests {
                     id: "main".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
                 AppFlowInfo {
                     id: "on_message".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
                 AppFlowInfo {
                     id: "order_tracking_flow".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1725,16 +1780,19 @@ mod tests {
                     id: "main".to_string(),
                     kind: "workflow".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
                 AppFlowInfo {
                     id: "alpha".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
                 AppFlowInfo {
                     id: "beta".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1756,11 +1814,13 @@ mod tests {
                     id: "one".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
                 AppFlowInfo {
                     id: "two".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1814,6 +1874,61 @@ mod tests {
                 .expect("default kind flow")
                 .kind,
             "messaging"
+        );
+    }
+
+    #[test]
+    fn extract_flows_resolves_each_flow_s_node_ids_through_the_symbol_table() {
+        // A card id that is ALSO a flow node must be handed to the flow, not
+        // rendered from the card asset — only a node that actually runs can
+        // attach the user's submitted answers for later nodes to read. That
+        // decision needs the flow's node ids, which the canonical encoder
+        // symbol-indexes as integers.
+        let manifest = CborValue::Map(BTreeMap::from([
+            (
+                CborValue::Text("symbols".to_string()),
+                CborValue::Map(BTreeMap::from([(
+                    CborValue::Text("node_ids".to_string()),
+                    CborValue::Array(vec![
+                        CborValue::Text("welcome".to_string()),
+                        CborValue::Text("quote_page1".to_string()),
+                        CborValue::Text("cap_company_name".to_string()),
+                    ]),
+                )])),
+            ),
+            (
+                CborValue::Text("flows".to_string()),
+                CborValue::Array(vec![CborValue::Map(BTreeMap::from([
+                    cbor_text("id", "main"),
+                    (
+                        CborValue::Text("flow".to_string()),
+                        CborValue::Map(BTreeMap::from([
+                            cbor_text("kind", "messaging"),
+                            (
+                                CborValue::Text("nodes".to_string()),
+                                CborValue::Array(vec![
+                                    CborValue::Map(BTreeMap::from([(
+                                        CborValue::Text("id".to_string()),
+                                        CborValue::Integer(0),
+                                    )])),
+                                    CborValue::Map(BTreeMap::from([(
+                                        CborValue::Text("id".to_string()),
+                                        CborValue::Integer(2),
+                                    )])),
+                                ]),
+                            ),
+                        ])),
+                    ),
+                ]))]),
+            ),
+        ]));
+
+        let flows = extract_flows(&manifest);
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].node_ids, vec!["welcome", "cap_company_name"]);
+        assert!(
+            !flows[0].node_ids.iter().any(|n| n == "quote_page1"),
+            "only the nodes this flow declares may be listed"
         );
     }
 
@@ -2900,6 +3015,7 @@ mod tests {
             "weatherapi-pack",
             "default",
             &env,
+            None,
         )
     }
 

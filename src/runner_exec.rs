@@ -27,6 +27,12 @@ pub struct RunRequest {
     pub team: Option<String>,
     pub input: JsonValue,
     pub dist_offline: bool,
+    /// Start the flow at this node instead of its entrypoint.
+    ///
+    /// Card-driven packs name the next node to run on the inbound activity.
+    /// Without it every turn restarts the journey at the entrypoint and the
+    /// capture nodes chained between two cards never execute.
+    pub entry_node: Option<String>,
 }
 
 pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> {
@@ -144,6 +150,7 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
             ..DevProfile::default()
         }),
         entry_flow: Some(request.flow_id.clone()),
+        entry_node: request.entry_node.clone(),
         input: request.input,
         ctx: TenantContext {
             tenant_id: Some(request.tenant),
@@ -285,6 +292,7 @@ mod tests {
             team: Some("default".to_string()),
             input,
             dist_offline: true,
+            entry_node: None,
         })
         .expect("run provider pack flow");
 
@@ -320,6 +328,7 @@ mod tests {
             team: Some("default".to_string()),
             input,
             dist_offline: true,
+            entry_node: None,
         })
         .expect("run provider pack flow");
 

@@ -55,11 +55,13 @@ fn pack_with_metric_subscriber() -> AppPackInfo {
                 id: "default".to_string(),
                 kind: "events".to_string(),
                 subscribes_to: vec![],
+                node_ids: vec![],
             },
             AppFlowInfo {
                 id: "on_metric_crossed".to_string(),
                 kind: "events".to_string(),
                 subscribes_to: vec!["metric.test.crossed".to_string()],
+                node_ids: vec![],
             },
         ],
         capabilities: vec![],

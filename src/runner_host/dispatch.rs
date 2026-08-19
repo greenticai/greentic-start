@@ -277,6 +277,7 @@ impl DemoRunnerHost {
             team: ctx.team.clone(),
             input: payload.clone(),
             dist_offline: true,
+            entry_node: None,
         };
         let run_output = runner_exec::run_provider_pack_flow(request)?;
         let parsed = read_transcript_outputs(&run_output.run_dir)?;

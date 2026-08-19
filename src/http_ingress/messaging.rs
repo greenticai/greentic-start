@@ -80,13 +80,15 @@ pub(super) fn route_messaging_envelopes(
                 None => original,
             },
         };
-        let outputs = if let Some(route_to_card) = envelope
-            .metadata
-            .get("routeToCardId")
-            .or_else(|| envelope.metadata.get("toCardId"))
-            .or_else(|| envelope.metadata.get("nextCardId"))
-        {
-            match read_card_from_pack(&app_pack_path, route_to_card) {
+        let outputs = if let Some(route_to_card) = card_nav_target(envelope) {
+            // A target that names a FLOW NODE goes to the flow even when a card
+            // asset of the same name exists. Rendering the asset directly is
+            // faster but leaves the flow with no record of the card, so the
+            // node never runs, never parks awaiting the submit, and never
+            // attaches the user's `answers` — which every capture node
+            // downstream reads as `{{node.<card>.answers.<field>}}`.
+            let flow_node = flow.node_ids.iter().any(|n| n == route_to_card);
+            match read_card_from_pack(&app_pack_path, route_to_card).filter(|_| !flow_node) {
                 Some(mut card_json) => {
                     operator_log::info(
                         module_path!(),
@@ -125,13 +127,25 @@ pub(super) fn route_messaging_envelopes(
                     vec![reply]
                 }
                 None => {
-                    operator_log::warn(
+                    // Enter the flow at the named node rather than restarting
+                    // at the entrypoint. A restart means the capture nodes
+                    // chained between two cards never run and the journey never
+                    // advances. This drives only the FIRST hop into the flow —
+                    // once a card has parked, the runner resumes it instead.
+                    let entry_node = route_to_card.clone();
+                    operator_log::info(
                         module_path!(),
                         format!(
-                            "[demo messaging] card routing: {} -> card asset NOT found, using app flow",
-                            route_to_card
+                            "[demo messaging] card routing: {entry_node} -> entering the app \
+                             flow at that node (flow_node={flow_node})"
                         ),
                     );
+                    // The nav directive must not travel into the flow: the
+                    // adaptive-card component prefers an inbound nextCardId
+                    // over its node's own card asset, so leaving it in makes
+                    // the next card node fail with AC_ASSET_NOT_FOUND.
+                    let mut flow_envelope = envelope.clone();
+                    strip_card_nav_keys(&mut flow_envelope);
                     run_app_flow_safe(
                         runner_host,
                         bundle,
@@ -139,7 +153,8 @@ pub(super) fn route_messaging_envelopes(
                         &app_pack_path,
                         &pack_info,
                         flow,
-                        envelope,
+                        &flow_envelope,
+                        Some(&entry_node),
                     )
                 }
             }
@@ -180,6 +195,7 @@ pub(super) fn route_messaging_envelopes(
                 &pack_info,
                 flow,
                 envelope,
+                None,
             )
         };
 
@@ -509,6 +525,7 @@ fn read_card_from_pack(pack_path: &Path, card_key: &str) -> Option<serde_json::V
     serde_json::from_slice(&buf).ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_app_flow_safe(
     runner_host: &DemoRunnerHost,
     bundle: &Path,
@@ -517,6 +534,7 @@ fn run_app_flow_safe(
     pack_info: &app::AppPackInfo,
     flow: &app::AppFlowInfo,
     envelope: &ChannelMessageEnvelope,
+    entry_node: Option<&str>,
 ) -> Vec<ChannelMessageEnvelope> {
     match app::run_app_flow(
         runner_host,
@@ -526,6 +544,7 @@ fn run_app_flow_safe(
         &pack_info.pack_id,
         &flow.id,
         envelope,
+        entry_node,
     ) {
         Ok(outputs) => outputs,
         Err(err) => {
@@ -553,6 +572,33 @@ const ROUTING_META_KEYS: &[&str] = &[
     "mcp_wizard",
     "mcp_operation",
 ];
+
+/// Metadata keys that name where to navigate next, in precedence order.
+///
+/// A subset of [`ROUTING_META_KEYS`]: those carry other non-form values
+/// (`locale`, `adaptive_card`) that downstream nodes still need.
+const CARD_NAV_META_KEYS: &[&str] = &["routeToCardId", "toCardId", "nextCardId"];
+
+/// Read the card-navigation target from an envelope, if it carries one.
+fn card_nav_target(envelope: &ChannelMessageEnvelope) -> Option<&String> {
+    CARD_NAV_META_KEYS
+        .iter()
+        .find_map(|key| envelope.metadata.get(*key))
+}
+
+/// Drop the card-navigation directives from an envelope bound for the app flow.
+///
+/// These keys say WHERE TO GO, not what to render. The adaptive-card component
+/// prefers an inbound `nextCardId` over its node's own configured card asset,
+/// so an id that names a flow node (not a card) makes the first card node in
+/// the chain fail with `AC_ASSET_NOT_FOUND` — surfacing to the user as
+/// "Something went wrong with this service". The target is passed to the runner
+/// as the flow's entry node instead.
+fn strip_card_nav_keys(envelope: &mut ChannelMessageEnvelope) {
+    for key in CARD_NAV_META_KEYS {
+        envelope.metadata.remove(*key);
+    }
+}
 
 /// Inject form data from envelope metadata into every `Action.Submit` `data`
 /// object found in the card.  This ensures that when a user clicks a button on
@@ -1017,8 +1063,10 @@ mod tests {
                 id: "default".to_string(),
                 kind: "messaging".to_string(),
                 subscribes_to: vec![],
+                node_ids: vec![],
             },
             &original,
+            None,
         );
 
         assert_eq!(outputs.len(), 1);
@@ -1166,6 +1214,59 @@ mod tests {
         assert!(
             result.is_err(),
             "expected egress error, proving the nextCardId alias took the card-routing fast-path"
+        );
+    }
+
+    #[test]
+    fn card_nav_keys_are_stripped_before_the_envelope_reaches_the_flow() {
+        // `nextCardId` says WHERE TO GO, not what to render. When it names a
+        // flow node the envelope is handed to the app flow — and every
+        // adaptive-card node downstream prefers an inbound nextCardId over its
+        // own configured card asset, so leaving it in makes the first card node
+        // fail with AC_ASSET_NOT_FOUND and the user sees a service error.
+        let mut env = envelope();
+        env.metadata
+            .insert("nextCardId".to_string(), "cap_company_name".to_string());
+        env.metadata
+            .insert("routeToCardId".to_string(), "cap_company_name".to_string());
+        env.metadata
+            .insert("toCardId".to_string(), "cap_company_name".to_string());
+        // Carried form data and locale must survive: the capture nodes read the
+        // form fields, and locale drives card i18n further down the flow.
+        env.metadata
+            .insert("company_name".to_string(), "Acme Ltd".to_string());
+        env.metadata
+            .insert("locale".to_string(), "en-GB".to_string());
+        // `action` must SURVIVE: the card node the run enters/resumes at routes
+        // on `response.action == "..."`. The engine makes it one-shot after
+        // that node has routed (`consume_routing_action`), so stripping it here
+        // would strand the journey on the card it started from.
+        env.metadata
+            .insert("action".to_string(), "continue".to_string());
+
+        strip_card_nav_keys(&mut env);
+
+        assert_eq!(
+            env.metadata.get("action").map(String::as_str),
+            Some("continue"),
+            "the action drives the entered/resumed card's own routing and must \
+             reach the flow; the engine consumes it once that node has routed"
+        );
+        for key in ["nextCardId", "routeToCardId", "toCardId"] {
+            assert!(
+                !env.metadata.contains_key(key),
+                "{key} is a navigation directive and must not reach the flow"
+            );
+        }
+        assert_eq!(
+            env.metadata.get("company_name").map(String::as_str),
+            Some("Acme Ltd"),
+            "form data must survive stripping"
+        );
+        assert_eq!(
+            env.metadata.get("locale").map(String::as_str),
+            Some("en-GB"),
+            "locale must survive stripping"
         );
     }
 
