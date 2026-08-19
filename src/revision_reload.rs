@@ -894,19 +894,36 @@ mod tests {
             .expect("watcher must fire after the runtime-config is deleted");
     }
 
-    #[test]
-    fn watcher_coalesces_burst_writes_into_one_rebuild() {
-        // Narrow enough to keep the debouncer's tick fine-grained, wide
-        // enough that a loaded runner still lands the whole burst in one
-        // window; the burst is timed below so a runner slow enough to break
-        // that premise says so instead of failing as "did not coalesce".
-        const DEBOUNCE: Duration = Duration::from_millis(200);
+    /// Outcome of one attempt of the coalescing burst below.
+    enum BurstAttempt {
+        /// The burst landed inside one debouncer tick; carries how many
+        /// rebuild batches the watcher fired for it.
+        Rebuilds(usize),
+        /// The machine was too slow to land the burst inside one tick, so the
+        /// attempt never exercised coalescing; carries the burst it measured.
+        BurstTooSlow(Duration),
+    }
+
+    /// Writes five runtime-configs back to back under a watcher debounced at
+    /// `debounce`, and reports how many rebuild batches came back.
+    ///
+    /// `notify-debouncer-full` expires each event `debounce` after that
+    /// event's own timestamp, and only sweeps on a tick boundary (tick =
+    /// debounce/4 when unset). A burst therefore collapses into one batch
+    /// only while it fits inside a single tick: spread it wider and the early
+    /// writes expire in an earlier sweep than the late ones, which is a
+    /// legitimate second rebuild rather than a coalescing bug. So the burst is
+    /// timed against the tick — not against the whole debounce — and a burst
+    /// that overruns it is reported back for a wider window instead of being
+    /// read as a broken debouncer.
+    fn burst_rebuilds(debounce: Duration) -> BurstAttempt {
+        let tick = debounce / 4;
 
         let env = fresh_env_dir();
         let (tx, rx) = std_mpsc::channel();
         let _handle = spawn_runtime_config_watcher(
             env.path().to_path_buf(),
-            DEBOUNCE,
+            debounce,
             Duration::ZERO,
             placeholder_server(),
             channel_rebuild(tx),
@@ -920,31 +937,61 @@ mod tests {
             write_runtime_config(env.path(), &format!(r#"{{"i":{i}}}"#));
         }
         let burst = burst_started.elapsed();
-        assert!(
-            burst < DEBOUNCE,
-            "burst of 5 writes took {burst:?}, exceeding the {DEBOUNCE:?} debounce — coalescing was never exercised"
-        );
+        if burst > tick {
+            return BurstAttempt::BurstTooSlow(burst);
+        }
 
         // Await the flush; do NOT sleep a fixed margin past the debounce.
-        // `notify-debouncer-full` only emits on a tick boundary (tick =
-        // debounce/4 when unset, as noted in `WatcherHandle::drop`), so the
-        // flush lands anywhere in `[debounce, debounce + tick]` depending on
-        // how the burst aligns with the tick the debouncer thread is already
-        // sleeping in. Any fixed margin narrower than one tick reads the
-        // count before the rebuild has run.
-        rx.recv_timeout(Duration::from_secs(3))
+        // The sweep carrying the burst lands anywhere in
+        // `[debounce, debounce + tick]` depending on how the burst aligns
+        // with the tick the debouncer thread is already sleeping in, so wait
+        // on the channel with a ceiling well past that instead.
+        rx.recv_timeout(debounce + Duration::from_secs(3))
             .expect("burst of 5 writes must produce a rebuild");
 
         // Coalescing is the actual claim: the other four writes must not each
-        // produce a rebuild of their own. Drain a quiet window and allow one
-        // straggler batch, nothing more.
+        // produce a rebuild of their own. A burst inside one tick can still
+        // straddle a sweep boundary, so one straggler batch is allowed — it
+        // arrives at most `debounce + tick` after the first, which two
+        // debounces of quiet cover with margin.
         let mut rebuilds = 1;
-        while rx.recv_timeout(DEBOUNCE * 4).is_ok() {
+        while rx.recv_timeout(debounce * 2).is_ok() {
             rebuilds += 1;
         }
-        assert!(
-            rebuilds <= 2,
-            "burst of 5 writes must coalesce to ~1 rebuild (saw {rebuilds})"
+        BurstAttempt::Rebuilds(rebuilds)
+    }
+
+    #[test]
+    fn watcher_coalesces_burst_writes_into_one_rebuild() {
+        // Coalescing only means anything relative to the debounce window, and
+        // five small writes are not reliably fast on a shared runner — CI has
+        // stretched them to ~200ms. Widen the window until the burst fits
+        // inside one tick instead of failing on how loaded the machine was;
+        // only a machine that cannot manage even the widest window fails, and
+        // it says so as a machine problem rather than as "did not coalesce".
+        const DEBOUNCES: [Duration; 3] = [
+            Duration::from_millis(200),
+            Duration::from_millis(800),
+            Duration::from_millis(3_200),
+        ];
+
+        let mut slowest_burst = Duration::ZERO;
+        for debounce in DEBOUNCES {
+            match burst_rebuilds(debounce) {
+                BurstAttempt::Rebuilds(rebuilds) => {
+                    assert!(
+                        rebuilds <= 2,
+                        "burst of 5 writes must coalesce to ~1 rebuild (saw {rebuilds} at a {debounce:?} debounce)"
+                    );
+                    return;
+                }
+                BurstAttempt::BurstTooSlow(burst) => {
+                    slowest_burst = slowest_burst.max(burst);
+                }
+            }
+        }
+        panic!(
+            "burst of 5 writes took up to {slowest_burst:?}, overrunning the tick of every debounce in {DEBOUNCES:?} — this machine is too slow to exercise coalescing"
         );
     }
 
