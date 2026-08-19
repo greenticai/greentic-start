@@ -7762,6 +7762,9 @@ mod tests {
                 flow_id: "flow.main".into(),
                 next_flow: None,
                 next_node: next_node.into(),
+                // This fixture models a `session.wait` pause, not a card
+                // awaiting the user's submit.
+                awaiting_submit: false,
                 state,
             },
         }

@@ -183,8 +183,12 @@ version = ">=1.2.0-dev, <1.3.0-0"
 default-features = false
 features = ["pack-fetch"]
 
+# Floor pinned to the greentic-runner#698 publish that adds
+# `RunOptions::entry_node`: the demo messaging host passes a card-nav target
+# that names a flow node as the flow's entry node, so an earlier publish does
+# not compile here.
 [dependencies.greentic-runner-desktop]
-version = ">=1.2.0-dev, <1.3.0-0"
+version = ">=1.2.0-dev.32267250441, <1.3.0-0"
 
 # Floor pinned to the greentic-runner#466 publish that fixes flow-node
 # component-id resolution: `HostNode::from` no longer splits a resolved
@@ -202,8 +206,13 @@ version = ">=1.2.0-dev, <1.3.0-0"
 # earlier dev publish — 1.2.0-dev.29558260044 and older declare deploy-spec
 # ">=0.1.0-0, <0.2.0-0" — drags a second deploy-spec copy back in and
 # reintroduces the E0308 above. An API floor, not a preference: don't lower it.
+#
+# Floor raised again to 1.2.0-dev.32267250441 (greentic-runner#698): that
+# publish carries `FlowEngine::execute_from`, the ported `var.set` and card
+# `answers` node families, and the one-shot routing action. Without it a
+# designer card journey loses every captured field. An API floor: don't lower.
 [dependencies.greentic-runner-host]
-version = ">=1.2.0-dev.29565371086, <1.3.0-0"
+version = ">=1.2.0-dev.32267250441, <1.3.0-0"
 
 [dependencies.greentic-secrets-lib]
 # `providers-vault` brings in the HashiCorp Vault KV backend used for runtime
