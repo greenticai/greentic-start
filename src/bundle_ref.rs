@@ -175,14 +175,26 @@ fn fetch_remote_bundle(reference: &str, allow_insecure: bool) -> anyhow::Result<
     // every other registry stays HTTPS. Honored only when `allow_insecure` is
     // set — i.e. the digest-gated boot-pull. Unset/empty => HTTPS everywhere.
     let insecure_registries = insecure_registries_for_fetch(allow_insecure);
-    let fetcher: OciPackFetcher<DefaultRegistryClient> = if insecure_registries.is_empty() {
-        OciPackFetcher::new(opts)
-    } else {
-        OciPackFetcher::with_client(
-            DefaultRegistryClient::with_insecure_registries(insecure_registries),
-            opts,
-        )
-    };
+    // Google Artifact Registry authenticates PULLS, and every client built
+    // below pulls anonymously — so a bundle pushed to AR by the deployer could
+    // never be fetched here, and the boot failed with `Not authorized` after
+    // seeding had already succeeded. On GCP the runtime identity is available
+    // from the metadata server; anywhere else this resolves to `None` and the
+    // anonymous client is used exactly as before.
+    let fetcher: OciPackFetcher<DefaultRegistryClient> =
+        if let Some(token) = artifact_registry_token(&mapped_ref) {
+            OciPackFetcher::with_client(
+                DefaultRegistryClient::with_basic_auth("oauth2accesstoken", token),
+                opts,
+            )
+        } else if insecure_registries.is_empty() {
+            OciPackFetcher::new(opts)
+        } else {
+            OciPackFetcher::with_client(
+                DefaultRegistryClient::with_insecure_registries(insecure_registries),
+                opts,
+            )
+        };
     let fetched = rt
         .block_on(fetcher.fetch_pack_to_cache(&mapped_ref))
         .with_context(|| format!("fetch bundle reference {reference}"))?;
@@ -966,6 +978,50 @@ fn map_registry_target(target: &str, base: Option<String>) -> Option<String> {
     Some(format!("{normalized_base}/{normalized_target}"))
 }
 
+/// Host suffix identifying a Google Artifact Registry reference.
+const ARTIFACT_REGISTRY_SUFFIX: &str = "-docker.pkg.dev";
+
+/// The GCP metadata server's token endpoint for the attached service account.
+const METADATA_TOKEN_URL: &str = "http://metadata.google.internal/computeMetadata/v1/\
+instance/service-accounts/default/token";
+
+/// An OAuth access token for pulling `reference` from Google Artifact
+/// Registry, or `None` when that does not apply.
+///
+/// `None` for a non-AR reference, and `None` when the metadata server does not
+/// answer — which is the normal case off GCP. Returning `None` rather than an
+/// error keeps every existing pull working unchanged: a public registry never
+/// needed a token, and an AR reference without one still fails at the registry
+/// with its own message rather than here with ours.
+fn artifact_registry_token(reference: &str) -> Option<String> {
+    let host = reference
+        .trim_start_matches("oci://")
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    if !host.ends_with(ARTIFACT_REGISTRY_SUFFIX) {
+        return None;
+    }
+    let body = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?
+        .get(METADATA_TOKEN_URL)
+        .header("Metadata-Flavor", "Google")
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .ok()?;
+    let token = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()?
+        .get("access_token")?
+        .as_str()?
+        .to_string();
+    (!token.is_empty()).then_some(token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1565,5 +1621,27 @@ mod tests {
         let err = assert_symlink_target_within_root("packs/link", Path::new("../../etc"))
             .expect_err("must reject escape");
         assert!(format!("{err:#}").contains("escapes extract root"));
+    }
+
+    /// A non-Artifact-Registry reference must never reach the metadata server:
+    /// the check is on the host, so this returns without any network call and
+    /// every public-registry pull keeps its existing anonymous client.
+    #[test]
+    fn a_non_artifact_registry_reference_asks_for_no_token() {
+        assert!(super::artifact_registry_token("oci://ghcr.io/acme/demo:v1").is_none());
+        assert!(super::artifact_registry_token("ghcr.io/acme/demo:v1").is_none());
+        assert!(super::artifact_registry_token("oci://docker.io/library/alpine:3").is_none());
+    }
+
+    /// Off GCP the metadata server does not answer, and that is the ordinary
+    /// case for every developer machine — it must degrade to the anonymous
+    /// client rather than failing the pull with an error of our own.
+    #[test]
+    fn an_artifact_registry_reference_off_gcp_degrades_to_no_token() {
+        assert!(
+            super::artifact_registry_token("oci://asia-southeast1-docker.pkg.dev/p/repo/bundle:v1")
+                .is_none(),
+            "no metadata server here, so this must be None rather than an error"
+        );
     }
 }
