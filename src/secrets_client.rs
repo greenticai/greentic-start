@@ -73,18 +73,64 @@ impl SecretsManager for SecretsClient {
     }
 }
 
+/// Provider segment whose key is stored verbatim — see
+/// `canonicalize_dev_store_secret_uri`.
+const MCP_CATEGORY: &str = "mcp";
+
 fn canonicalize_dev_store_secret_uri(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("secrets://")?;
     let mut segments = trimmed.split('/').collect::<Vec<_>>();
     if segments.len() != 5 {
         return None;
     }
+    // The `mcp` category is exempt. greentic-designer-admin keys an MCP
+    // server's credential by its hyphenated UUID and writes it VERBATIM, and
+    // greentic-runner reads it verbatim through
+    // `greentic_aw_runtime::mcp_secrets`. Canonicalizing here (lowercase, and
+    // `-` to `_`) rewrote the lookup to `…/mcp/ff308b9c_951a_…` and resolved
+    // nothing — silently, because an unresolved credential surfaces only as an
+    // ordinary MCP node error. Every other category keeps normalizing.
+    if segments[3] == MCP_CATEGORY {
+        return None;
+    }
+
     let canonical_key = secret_name::canonical_secret_key_path(segments[4]);
     if canonical_key == segments[4] {
         return None;
     }
     segments[4] = &canonical_key;
     Some(format!("secrets://{}", segments.join("/")))
+}
+
+#[cfg(test)]
+mod mcp_uri_tests {
+    use super::canonicalize_dev_store_secret_uri;
+
+    /// The `mcp` category is keyed by a hyphenated server UUID that
+    /// greentic-designer-admin writes VERBATIM, and greentic-runner reads
+    /// verbatim via `greentic_aw_runtime::mcp_secrets`. Canonicalizing it here
+    /// rewrote the lookup to `ff308b9c_951a_…` and resolved nothing — silently,
+    /// because a missing credential is reported as an ordinary MCP node error.
+    #[test]
+    fn an_mcp_uri_is_never_canonicalized() {
+        let uri = "secrets://default/acme/_/mcp/ff308b9c-951a-40b8-acea-f62cdd19c8f3";
+        assert_eq!(
+            canonicalize_dev_store_secret_uri(uri),
+            None,
+            "an mcp key must reach the store byte-for-byte"
+        );
+    }
+
+    /// Every other category keeps the existing behaviour.
+    #[test]
+    fn a_non_mcp_uri_still_canonicalizes() {
+        let uri = "secrets://local/acme/_/messaging-telegram/BOT-TOKEN";
+        assert_eq!(
+            canonicalize_dev_store_secret_uri(uri).as_deref(),
+            Some("secrets://local/acme/_/messaging-telegram/bot_token"),
+            "non-mcp keys must still be normalized"
+        );
+    }
 }
 
 #[cfg(test)]
