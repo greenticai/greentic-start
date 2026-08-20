@@ -290,6 +290,12 @@ pub(super) fn build_demo_host_config(tenant: &str) -> HostConfig {
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
         fast2flow: Fast2FlowRoutingConfig::default(),
+        // `agents`/`graphs` exist on HostConfig whenever greentic-runner-host
+        // carries `agentic-worker`, which is on by default. The demo path
+        // declares no in-process agents or agent graphs of its own; flows that
+        // use them resolve through the pack.
+        agents: HashMap::new(),
+        graphs: HashMap::new(),
     }
 }
 
