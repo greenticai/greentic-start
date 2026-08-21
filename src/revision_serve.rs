@@ -7722,6 +7722,8 @@ mod tests {
 
     fn envelope_for(user: &str, conversation: &str) -> IngressEnvelope {
         IngressEnvelope {
+            // This fixture is about session isolation, not card navigation.
+            entry_node: None,
             tenant: "acme".into(),
             env: Some("local".into()),
             pack_id: Some("pack.demo".into()),
