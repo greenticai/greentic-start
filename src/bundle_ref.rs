@@ -175,16 +175,42 @@ fn fetch_remote_bundle(reference: &str, allow_insecure: bool) -> anyhow::Result<
     // every other registry stays HTTPS. Honored only when `allow_insecure` is
     // set — i.e. the digest-gated boot-pull. Unset/empty => HTTPS everywhere.
     let insecure_registries = insecure_registries_for_fetch(allow_insecure);
-    // Google Artifact Registry authenticates PULLS, and every client built
-    // below pulls anonymously — so a bundle pushed to AR by the deployer could
-    // never be fetched here, and the boot failed with `Not authorized` after
-    // seeding had already succeeded. On GCP the runtime identity is available
-    // from the metadata server; anywhere else this resolves to `None` and the
-    // anonymous client is used exactly as before.
+    // Google Artifact Registry authenticates PULLS, and an anonymous client
+    // cannot reach it — so a bundle pushed to AR by the deployer could never
+    // be fetched here, and the boot failed with `Not authorized` after
+    // seeding had already succeeded. That was the first instance of this bug;
+    // this is the second, generalized to any authenticated registry (e.g. a
+    // Kubernetes worker pulling from a private in-cluster or cloud registry
+    // that greentic-deployer seeded a credential for): an explicit
+    // `OCI_USERNAME`/`OCI_PASSWORD` pair is honored, and it takes precedence
+    // over the ambient AR token — see `resolve_pull_credentials`.
+    let credentials = resolve_pull_credentials(&mapped_ref, generic_registry_credentials());
+    // `DefaultRegistryClient`'s two public constructors are mutually
+    // exclusive and neither field they set (transport protocol, auth) is
+    // reachable from outside the crate once built: `with_basic_auth` always
+    // builds on top of `default_client()`, which hardcodes HTTPS, and
+    // `with_insecure_registries` always builds with `Anonymous` auth baked
+    // in. There is no public way to combine them into one client, so a
+    // registry that is BOTH plain-HTTP and password-protected cannot be
+    // expressed through this type today — that is a gap in
+    // `greentic-distributor-client`'s public API, not something this call
+    // site works around. Credentials win when both apply (see below), which
+    // is the right default for the motivating case (an authenticated
+    // registry, almost always HTTPS) at the cost of leaving the plain-HTTP
+    // *and* authenticated combination unreachable until the client crate
+    // grows a combined constructor.
     let fetcher: OciPackFetcher<DefaultRegistryClient> =
-        if let Some(token) = artifact_registry_token(&mapped_ref) {
+        if let Some((username, password)) = credentials {
+            if !insecure_registries.is_empty() {
+                tracing::warn!(
+                    registries = ?insecure_registries,
+                    "GREENTIC_OCI_INSECURE_REGISTRIES is set but this pull is authenticated; \
+                     DefaultRegistryClient cannot combine basic auth with insecure transport, \
+                     so this pull stays HTTPS and will fail if the registry only serves plain HTTP"
+                );
+            }
             OciPackFetcher::with_client(
-                DefaultRegistryClient::with_basic_auth("oauth2accesstoken", token),
+                DefaultRegistryClient::with_basic_auth(username, password),
                 opts,
             )
         } else if insecure_registries.is_empty() {
@@ -1022,6 +1048,64 @@ fn artifact_registry_token(reference: &str) -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
+/// Read explicit, operator-supplied basic-auth credentials for OCI registry
+/// pulls from `OCI_USERNAME` / `OCI_PASSWORD`.
+///
+/// These are the same two env var names `greentic-setup`'s
+/// `bundle_source::registry_basic_auth_for_reference` reads first, ahead of
+/// its GHCR-specific fallbacks (`GHCR_TOKEN`/`GITHUB_TOKEN`,
+/// `GHCR_USERNAME`/`GITHUB_ACTOR`/…). That function cannot be called from
+/// here even though the names line up: it is a private `fn`, not `pub`, so it
+/// is not reachable across the crate boundary regardless of feature flags;
+/// and this crate consumes `greentic-setup` as a registry-published
+/// dependency rather than a path/git one, so — as `dev_store_path.rs`
+/// documents for the same situation — a call into it would also resolve
+/// whatever behavior shipped in that publish, not necessarily this one. The
+/// GHCR/`GITHUB_TOKEN`-shaped fallbacks are deliberately NOT reproduced here:
+/// the intended caller of this path is `greentic-deployer`, which is expected
+/// to supply these two generic variables directly, so replicating untested
+/// GHCR-specific surface would add risk with no known caller.
+fn generic_registry_credentials() -> Option<(String, String)> {
+    let username = std::env::var("OCI_USERNAME")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let password = std::env::var("OCI_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty());
+    match (username, password) {
+        (Some(username), Some(password)) => Some((username, password)),
+        _ => None,
+    }
+}
+
+/// Decide which credential authenticates a pull of `reference`, when both an
+/// explicit generic OCI credential and an ambient Artifact Registry token
+/// could apply.
+///
+/// Explicit wins: an operator who deliberately set `OCI_USERNAME` /
+/// `OCI_PASSWORD` must not be silently overridden by a GCP service-account
+/// token that happens to also be ambient (any pull running on a GCE/GKE
+/// host, not only an Artifact Registry one) — that ambient token was never a
+/// deliberate choice about *this* registry, and an operator who set an
+/// explicit credential and silently got the ambient one instead would have no
+/// way to notice short of the wrong identity showing up in the registry's own
+/// access logs.
+///
+/// This is a separate, pure function (rather than inlined at the call site)
+/// specifically so the precedence is unit-tested without needing a live GCP
+/// metadata server: `Option::or_else` only invokes `artifact_registry_token`
+/// (a real network call) when `generic` is `None`, so passing
+/// `generic = Some(..)` proves explicit-wins by construction — the closure is
+/// never run — identically on GCP and off it.
+fn resolve_pull_credentials(
+    reference: &str,
+    generic: Option<(String, String)>,
+) -> Option<(String, String)> {
+    generic.or_else(|| {
+        artifact_registry_token(reference).map(|token| ("oauth2accesstoken".to_string(), token))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1643,5 +1727,152 @@ mod tests {
                 .is_none(),
             "no metadata server here, so this must be None rather than an error"
         );
+    }
+
+    /// `crate::test_env_lock()` serializes every test in this module that
+    /// mutates `OCI_USERNAME` / `OCI_PASSWORD`, matching the convention the
+    /// rest of the crate already uses for env-mutating tests (see
+    /// `bin_resolver.rs`, `secrets_manager.rs`, `admin_certs.rs`, …) — unlike
+    /// this file's *other* env-mutating tests, which get away without a lock
+    /// because each one owns an env var name no other test in the module
+    /// touches. `OCI_USERNAME`/`OCI_PASSWORD` are shared across the four
+    /// tests below, so skipping the lock here would be genuinely racy under
+    /// parallel test execution, not merely inconsistent with the rest of the
+    /// crate.
+    #[test]
+    fn generic_registry_credentials_are_picked_up_when_both_env_vars_are_set() {
+        let _guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("OCI_USERNAME", "oci-user");
+            std::env::set_var("OCI_PASSWORD", "oci-pass");
+        }
+
+        assert_eq!(
+            generic_registry_credentials(),
+            Some(("oci-user".to_string(), "oci-pass".to_string()))
+        );
+
+        unsafe {
+            std::env::remove_var("OCI_USERNAME");
+            std::env::remove_var("OCI_PASSWORD");
+        }
+    }
+
+    /// The anonymous path must be unchanged when the env vars are absent —
+    /// this is the pre-fix behavior for every registry that isn't Artifact
+    /// Registry, and it must not regress now that a generic credential path
+    /// exists alongside the AR one.
+    #[test]
+    fn generic_registry_credentials_is_none_when_env_vars_are_unset() {
+        let _guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            std::env::remove_var("OCI_USERNAME");
+            std::env::remove_var("OCI_PASSWORD");
+        }
+
+        assert_eq!(generic_registry_credentials(), None);
+    }
+
+    /// Both variables are required — a lone username or password is not a
+    /// usable credential and must not be reported as one, since
+    /// `DefaultRegistryClient::with_basic_auth` requires both.
+    #[test]
+    fn generic_registry_credentials_requires_both_username_and_password() {
+        let _guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("OCI_USERNAME", "oci-user");
+            std::env::remove_var("OCI_PASSWORD");
+        }
+        assert_eq!(generic_registry_credentials(), None);
+
+        unsafe {
+            std::env::remove_var("OCI_USERNAME");
+            std::env::set_var("OCI_PASSWORD", "oci-pass");
+        }
+        assert_eq!(generic_registry_credentials(), None);
+
+        unsafe {
+            std::env::remove_var("OCI_PASSWORD");
+        }
+    }
+
+    /// Precedence: an explicit generic credential must win over the ambient
+    /// Artifact Registry token, for ANY reference — including one that is
+    /// itself Artifact-Registry-shaped, which is exactly the case where the
+    /// two could otherwise collide. Passing `generic = Some(..)` means
+    /// `resolve_pull_credentials`'s `or_else` never invokes
+    /// `artifact_registry_token`, so this holds identically on a GCE/GKE host
+    /// and off it — deleting the `or_else` short-circuit (e.g. checking the
+    /// ambient token first) would make this test flaky-to-wrong depending on
+    /// environment instead of failing deterministically.
+    #[test]
+    fn resolve_pull_credentials_prefers_explicit_over_ambient_token() {
+        let explicit = Some(("oci-user".to_string(), "oci-pass".to_string()));
+        assert_eq!(
+            resolve_pull_credentials(
+                "asia-southeast1-docker.pkg.dev/p/repo/bundle:v1",
+                explicit.clone(),
+            ),
+            explicit
+        );
+    }
+
+    /// With no explicit credential, resolution falls back to the ambient AR
+    /// token — which, off GCP, is `None`, mirroring
+    /// `an_artifact_registry_reference_off_gcp_degrades_to_no_token` above.
+    /// This pins that the fallback path is actually wired up (not just
+    /// short-circuited away), rather than only testing the short-circuit.
+    #[test]
+    fn resolve_pull_credentials_falls_back_to_ambient_token_when_no_explicit_credential() {
+        assert_eq!(
+            resolve_pull_credentials(
+                "oci://asia-southeast1-docker.pkg.dev/p/repo/bundle:v1",
+                None,
+            ),
+            None,
+            "no metadata server here, so the ambient fallback must also be None"
+        );
+    }
+
+    /// The combination nobody could reach before this fix: an insecure
+    /// (plain-HTTP) registry allow-list and an explicit generic credential
+    /// configured at the same time. The two are resolved independently, so
+    /// neither setting can silently suppress the other — a regression here
+    /// would be, for instance, only checking `generic_registry_credentials`
+    /// when `insecure_registries_for_fetch` is empty (or clearing the
+    /// insecure list whenever credentials are present), either of which
+    /// would make this test fail while leaving each half's own test green.
+    /// `fetch_remote_bundle`'s doc comment records why `DefaultRegistryClient`
+    /// still can't combine both into a single network client — this test is
+    /// about the configuration RESOLUTION not silently dropping either half,
+    /// which is the part this crate controls.
+    #[test]
+    fn insecure_registries_and_generic_credentials_resolve_independently() {
+        let _guard = crate::test_env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("GREENTIC_OCI_INSECURE_REGISTRIES", "registry.local:5000");
+            std::env::set_var("OCI_USERNAME", "oci-user");
+            std::env::set_var("OCI_PASSWORD", "oci-pass");
+        }
+
+        assert_eq!(
+            insecure_registries_for_fetch(true),
+            vec!["registry.local:5000".to_string()],
+            "an explicit credential must not suppress the insecure allow-list"
+        );
+        assert_eq!(
+            resolve_pull_credentials(
+                "registry.local:5000/acme/demo:v1",
+                generic_registry_credentials(),
+            ),
+            Some(("oci-user".to_string(), "oci-pass".to_string())),
+            "the insecure allow-list must not suppress the explicit credential"
+        );
+
+        unsafe {
+            std::env::remove_var("GREENTIC_OCI_INSECURE_REGISTRIES");
+            std::env::remove_var("OCI_USERNAME");
+            std::env::remove_var("OCI_PASSWORD");
+        }
     }
 }
