@@ -19,6 +19,13 @@
 //! `<service>-<port>`, so the supervisor's pidfile plumbing works unchanged.
 //! greentic-setup implements the same file protocol (it does not depend on
 //! this crate); changing these paths is a cross-repo protocol change.
+//!
+//! **Instance records** (`shared.<service>~<instance>/…`) key by identity
+//! instead of port, for a tunnel whose public identity is NOT its port. The
+//! managed tunnel is the case: a multi-tenant env serves several tenants on ONE
+//! port, each under its own tunnel id, so a port-keyed record would make those
+//! agents share a pidfile and stop one another. See
+//! [`instance_runtime_paths`].
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -58,6 +65,73 @@ fn state_dir(root: &Path) -> PathBuf {
 
 fn shared_key(service: &str, port: u16) -> String {
     format!("{service}-{port}")
+}
+
+/// Separator for instance-keyed records. `~` cannot occur in a service name or
+/// a sanitized tunnel id (both are `[a-z0-9-]`), so an instance record can
+/// never be mistaken for a port record (`{service}-{port}`) nor for a
+/// longer-named neighbouring service — the same ambiguity the port form guards
+/// against by requiring a `u16` suffix.
+const INSTANCE_SEP: char = '~';
+
+fn instance_key(service: &str, instance: &str) -> String {
+    format!("{service}{INSTANCE_SEP}{instance}")
+}
+
+/// [`RuntimePaths`] for a record keyed by INSTANCE rather than port.
+///
+/// Several agents can front one port — one per tenant on a multi-tenant env —
+/// so the port alone no longer identifies a record: they would share a pidfile,
+/// URL cache and lock, and each boot would stop its predecessor. The tunnel id
+/// is the identity the Worker enforces (one agent per id), so it is the right
+/// key.
+pub(crate) fn instance_runtime_paths(service: &str, instance: &str) -> RuntimePaths {
+    instance_runtime_paths_at(&tunnel_state_root(), service, instance)
+}
+
+fn instance_runtime_paths_at(root: &Path, service: &str, instance: &str) -> RuntimePaths {
+    RuntimePaths::new(
+        state_dir(root),
+        SHARED_TENANT,
+        instance_key(service, instance),
+    )
+}
+
+/// Lock guarding the check-then-spawn critical section for one instance.
+pub(crate) fn instance_lock_path(service: &str, instance: &str) -> PathBuf {
+    state_dir(&tunnel_state_root()).join(format!("{}.lock", instance_key(service, instance)))
+}
+
+/// Every instance record for `service`, as `(instance, paths)`. The stop and
+/// eviction paths run without knowing which instances exist.
+pub(crate) fn existing_instance_records(service: &str) -> Vec<(String, RuntimePaths)> {
+    existing_instance_records_at(&tunnel_state_root(), service)
+}
+
+fn existing_instance_records_at(root: &Path, service: &str) -> Vec<(String, RuntimePaths)> {
+    let pids_root = state_dir(root).join("pids");
+    let prefix = format!("{SHARED_TENANT}.{service}{INSTANCE_SEP}");
+    let Ok(entries) = std::fs::read_dir(&pids_root) else {
+        return Vec::new();
+    };
+    let mut records = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(instance) = name.strip_prefix(&prefix).filter(|rest| !rest.is_empty()) else {
+            continue;
+        };
+        records.push((
+            instance.to_string(),
+            RuntimePaths::new(
+                state_dir(root),
+                SHARED_TENANT,
+                instance_key(service, instance),
+            ),
+        ));
+    }
+    records.sort_by(|a, b| a.0.cmp(&b.0));
+    records
 }
 
 /// [`RuntimePaths`] for the shared record of `service` fronting `port`.
@@ -183,6 +257,47 @@ impl Drop for TunnelLock {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn instance_records_are_distinct_per_tunnel_on_one_port() {
+        // The multi-tenant case: several agents front ONE port. Port-keyed
+        // records would collide on pidfile/url/lock and each boot would stop
+        // its predecessor.
+        let a = instance_runtime_paths_at(Path::new("/r"), "gtunnel", "somedude-3b435");
+        let b = instance_runtime_paths_at(Path::new("/r"), "gtunnel", "different-28c8a");
+        assert_ne!(a.pid_path("gtunnel"), b.pid_path("gtunnel"));
+    }
+
+    #[test]
+    fn instance_records_are_discovered_and_never_confused_with_port_records() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let pids = state_dir(root).join("pids");
+        std::fs::create_dir_all(&pids).expect("mkdir");
+        for name in [
+            "shared.gtunnel~somedude-3b435",
+            "shared.gtunnel~different-28c8a",
+            // Must NOT be picked up: a port record, and a neighbouring
+            // service whose name merely starts with `gtunnel`.
+            "shared.gtunnel-8080",
+            "shared.gtunnel-agent~x",
+        ] {
+            std::fs::create_dir_all(pids.join(name)).expect("mkdir");
+        }
+
+        let found: Vec<String> = existing_instance_records_at(root, "gtunnel")
+            .into_iter()
+            .map(|(instance, _)| instance)
+            .collect();
+
+        assert_eq!(found, vec!["different-28c8a", "somedude-3b435"]);
+        // And the port-keyed lookup still ignores the instance records.
+        let ports: Vec<u16> = existing_shared_records_at(root, "gtunnel")
+            .into_iter()
+            .map(|(port, _)| port)
+            .collect();
+        assert_eq!(ports, vec![8080]);
+    }
 
     #[test]
     fn shared_paths_key_by_service_and_port() {

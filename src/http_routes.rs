@@ -61,11 +61,33 @@ pub struct HttpRouteDescriptor {
     segments: Vec<RouteSegment>,
 }
 
+impl HttpRouteDescriptor {
+    /// True for the tenant-qualified provider-ingress pattern
+    /// (`/v1/{domain}/ingress/{provider}/{tenant}/{team}`), whose tenant and
+    /// team are the owning deployment's own. The ingress resolves the
+    /// deployment from such a path directly — see
+    /// [`HttpRouteTable::resolve_tenant_qualified_ingress`].
+    pub(crate) fn is_tenant_qualified(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|s| matches!(s, RouteSegment::TenantLiteral(_)))
+    }
+}
+
 #[derive(Clone, Debug)]
 enum RouteSegment {
     Literal(String),
     Tenant,
     Team,
+    /// Tenant segment pinned to the owning deployment's tenant. Unlike
+    /// [`RouteSegment::Tenant`] it matches one tenant only, which is what makes
+    /// a tenant-qualified ingress pattern self-discriminating: two deployments
+    /// under different tenants produce two different patterns, so a path can
+    /// never match the wrong deployment's route.
+    TenantLiteral(String),
+    /// Team segment pinned to the owning deployment's team; see
+    /// [`RouteSegment::TenantLiteral`].
+    TeamLiteral(String),
     /// Wildcard: matches zero or more remaining path segments.
     Wildcard,
 }
@@ -129,6 +151,24 @@ pub(crate) fn provider_descriptor_for_test(
         scope: Some(scope),
         segments: parse_route_pattern(pattern),
     }
+}
+
+/// Test-only tenant-qualified ingress descriptor, built by the same constructor
+/// production synthesis uses so the two cannot drift.
+#[cfg(test)]
+pub(crate) fn ingress_descriptor_for_test(
+    pack_id: &str,
+    provider_type: &str,
+    scope: RevisionScope,
+    tenant: &str,
+    team: &str,
+) -> HttpRouteDescriptor {
+    ingress_descriptor(
+        pack_id,
+        provider_type,
+        &scope,
+        &TenantBinding { tenant, team },
+    )
 }
 
 impl HttpRouteTable {
@@ -220,6 +260,27 @@ impl HttpRouteTable {
         .and_then(|m| m.descriptor.provider_type.as_deref())
     }
 
+    /// Resolve `(path, method)` to the deployment that owns the matching
+    /// tenant-qualified provider-ingress route, plus that deployment's tenant.
+    ///
+    /// Called BEFORE the dispatcher picks a revision, because the URL itself is
+    /// the discriminator: the `(host, path_prefix)` binding used for every other
+    /// path cannot tell two tenants apart when they share a host and a `/`
+    /// prefix, so a co-tenant's webhook would resolve to whichever deployment
+    /// won the prefix match. The tenant segment is a pinned literal, so only the
+    /// owning deployment's route can match.
+    pub(crate) fn resolve_tenant_qualified_ingress(
+        &self,
+        path: &str,
+        method: &str,
+    ) -> Option<(DeploymentId, String)> {
+        let m = self.match_first(path, method, |route| {
+            route.is_tenant_qualified() && route.scope.is_some()
+        })?;
+        let deployment_id = m.descriptor.scope.as_ref()?.deployment_id;
+        Some((deployment_id, m.tenant))
+    }
+
     fn match_first(
         &self,
         path: &str,
@@ -283,6 +344,24 @@ fn try_match_route<'a>(
                     return None;
                 }
                 team = request_segments[req_idx].to_string();
+                req_idx += 1;
+            }
+            RouteSegment::TenantLiteral(expected) => {
+                if req_idx >= request_segments.len()
+                    || !request_segments[req_idx].eq_ignore_ascii_case(expected)
+                {
+                    return None;
+                }
+                tenant = expected.clone();
+                req_idx += 1;
+            }
+            RouteSegment::TeamLiteral(expected) => {
+                if req_idx >= request_segments.len()
+                    || !request_segments[req_idx].eq_ignore_ascii_case(expected)
+                {
+                    return None;
+                }
+                team = expected.clone();
                 req_idx += 1;
             }
             RouteSegment::Wildcard => {
@@ -580,6 +659,7 @@ pub(crate) fn synthesize_provider_ingest_routes(
     pack_paths: &[PathBuf],
     scope: &RevisionScope,
     path_prefixes: &[String],
+    binding: &TenantBinding<'_>,
 ) -> Vec<HttpRouteDescriptor> {
     let root_fallback = [String::new()];
     let prefixes: &[String] = if path_prefixes.is_empty() {
@@ -603,7 +683,7 @@ pub(crate) fn synthesize_provider_ingest_routes(
             }
         };
         routes.extend(synthesize_provider_routes_from_manifest(
-            &manifest, pack_path, scope, prefixes,
+            &manifest, pack_path, scope, prefixes, binding,
         ));
     }
     routes
@@ -631,6 +711,7 @@ fn synthesize_provider_routes_from_manifest(
     pack_path: &Path,
     scope: &RevisionScope,
     prefixes: &[String],
+    binding: &TenantBinding<'_>,
 ) -> Vec<HttpRouteDescriptor> {
     let Some(inline) = manifest.provider_extension_inline() else {
         return Vec::new();
@@ -669,7 +750,60 @@ fn synthesize_provider_routes_from_manifest(
             });
         }
     }
+    // Tenant-qualified ingress: the same grammar greentic-setup writes into
+    // provider consoles, down to the pack id as the provider segment
+    // (`messaging-slack`), so setup and the runtime name one URL rather than
+    // two. Mounted at the fixed `/v1/{domain}/ingress` root rather than under
+    // the deployment's path prefixes — the tenant and team segments already
+    // name the deployment, and a prefix is one more thing an operator reading
+    // the URL out of a provider console would have to reproduce.
+    //
+    // Emitted only when the pack has a SOLE `ingest_http` provider: the pack id
+    // is the whole provider segment, so with two such providers one pattern
+    // would stand for both and the loser would be silently unreachable. Those
+    // packs keep the per-provider `{prefix}/webhook/{name}` routes only.
+    if let Some(provider_type) = sole_ingest_http_provider_type(manifest) {
+        routes.push(ingress_descriptor(pack_id, &provider_type, scope, binding));
+    }
     routes
+}
+
+/// The deployment's own tenant/team, baked into its tenant-qualified ingress
+/// routes so the path alone identifies the deployment.
+pub struct TenantBinding<'a> {
+    pub tenant: &'a str,
+    pub team: &'a str,
+}
+
+/// Build one `/v1/{domain}/ingress/{pack_id}/{tenant}/{team}` descriptor with
+/// `tenant`/`team` pinned to the owning deployment.
+fn ingress_descriptor(
+    pack_id: &str,
+    provider_type: &str,
+    scope: &RevisionScope,
+    binding: &TenantBinding<'_>,
+) -> HttpRouteDescriptor {
+    let domain = Domain::Messaging;
+    let domain_name = crate::http_helpers::domain_name(domain);
+    let (tenant, team) = (binding.tenant, binding.team);
+    HttpRouteDescriptor {
+        route_id: format!("{pack_id}:provider-ingress@{tenant}/{team}"),
+        pack_id: pack_id.to_string(),
+        pattern: format!("/v1/{domain_name}/ingress/{pack_id}/{tenant}/{team}"),
+        methods: vec!["POST".to_string()],
+        provider_op: INGEST_HTTP_OP.to_string(),
+        provider_type: Some(provider_type.to_string()),
+        domain,
+        scope: Some(scope.clone()),
+        segments: vec![
+            RouteSegment::Literal("v1".to_string()),
+            RouteSegment::Literal(domain_name.to_string()),
+            RouteSegment::Literal("ingress".to_string()),
+            RouteSegment::Literal(pack_id.to_string()),
+            RouteSegment::TenantLiteral(tenant.to_string()),
+            RouteSegment::TeamLiteral(team.to_string()),
+        ],
+    }
 }
 
 /// Single-pass discovery used at revision activation: opens each pack ONCE,
@@ -682,6 +816,7 @@ pub fn discover_revision_routes(
     pack_paths: &[PathBuf],
     scope: &RevisionScope,
     path_prefixes: &[String],
+    binding: &TenantBinding<'_>,
 ) -> Vec<HttpRouteDescriptor> {
     let root_fallback = [String::new()];
     let prefixes: &[String] = if path_prefixes.is_empty() {
@@ -736,7 +871,7 @@ pub fn discover_revision_routes(
             }
         }
         routes.extend(synthesize_provider_routes_from_manifest(
-            &manifest, pack_path, scope, prefixes,
+            &manifest, pack_path, scope, prefixes, binding,
         ));
     }
     warn_on_cross_pack_route_collisions(&routes);
@@ -1307,6 +1442,13 @@ pub(crate) mod tests {
     /// exposes `ingest_http` (and is therefore eligible for webhook
     /// synthesis). `pub(crate)` so the revision_serve tests share this fixture
     /// instead of duplicating the manifest shape.
+    fn test_binding() -> TenantBinding<'static> {
+        TenantBinding {
+            tenant: "acme",
+            team: "support",
+        }
+    }
+
     pub(crate) fn write_provider_pack(
         path: &Path,
         pack_id: &str,
@@ -1369,11 +1511,17 @@ pub(crate) mod tests {
             bundle_id: BundleId::new("acme-bundle"),
             revision_id: RevisionId::new(),
         };
-        let routes = synthesize_provider_ingest_routes(&[pack], &scope, &["/bot".to_string()]);
+        let routes = synthesize_provider_ingest_routes(
+            &[pack],
+            &scope,
+            &["/bot".to_string()],
+            &test_binding(),
+        );
         assert_eq!(
             routes.len(),
-            1,
-            "one prefix × one ingest_http provider = one route"
+            2,
+            "one prefix × one ingest_http provider = one webhook route + one \
+             tenant-qualified ingress route"
         );
         let route = &routes[0];
         assert_eq!(route.pattern, "/bot/webhook/telegram");
@@ -1399,7 +1547,12 @@ pub(crate) mod tests {
             bundle_id: BundleId::new("acme-bundle"),
             revision_id: RevisionId::new(),
         };
-        let routes = synthesize_provider_ingest_routes(&[pack], &scope, &["/bot".to_string()]);
+        let routes = synthesize_provider_ingest_routes(
+            &[pack],
+            &scope,
+            &["/bot".to_string()],
+            &test_binding(),
+        );
         assert!(routes.is_empty());
     }
 
@@ -1423,12 +1576,20 @@ pub(crate) mod tests {
             &[pack],
             &scope,
             &["/bot".to_string(), "/api/bot".to_string()],
+            &test_binding(),
         );
-        let patterns: Vec<&str> = routes.iter().map(|r| r.pattern.as_str()).collect();
+        // The tenant-qualified ingress route is prefix-independent, so only the
+        // webhook routes fan out per prefix.
+        let patterns: Vec<&str> = routes
+            .iter()
+            .filter(|r| !r.is_tenant_qualified())
+            .map(|r| r.pattern.as_str())
+            .collect();
         assert_eq!(
             patterns,
             vec!["/bot/webhook/telegram", "/api/bot/webhook/telegram"]
         );
+        assert_eq!(routes.iter().filter(|r| r.is_tenant_qualified()).count(), 1,);
     }
 
     #[test]
@@ -1451,9 +1612,9 @@ pub(crate) mod tests {
             bundle_id: BundleId::new("acme-bundle"),
             revision_id: RevisionId::new(),
         };
-        let routes = synthesize_provider_ingest_routes(&[pack], &scope, &[]);
+        let routes = synthesize_provider_ingest_routes(&[pack], &scope, &[], &test_binding());
         assert_eq!(
-            routes.len(),
+            routes.iter().filter(|r| !r.is_tenant_qualified()).count(),
             1,
             "empty prefixes treated as a single root binding"
         );
@@ -1481,9 +1642,133 @@ pub(crate) mod tests {
             bundle_id: BundleId::new("acme-bundle"),
             revision_id: RevisionId::new(),
         };
-        let routes =
-            synthesize_provider_ingest_routes(&[bad, missing], &scope, &["/bot".to_string()]);
+        let routes = synthesize_provider_ingest_routes(
+            &[bad, missing],
+            &scope,
+            &["/bot".to_string()],
+            &test_binding(),
+        );
         assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn synthesizes_the_tenant_qualified_ingress_grammar_setup_registers() {
+        // The pattern greentic-setup writes into provider consoles, verbatim:
+        // pack id as the provider segment, then the deployment's tenant + team.
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("slack.gtpack");
+        write_provider_pack(
+            &pack,
+            "messaging-slack",
+            "messaging.slack.api",
+            &["ingest_http"],
+        );
+
+        let scope = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let routes = synthesize_provider_ingest_routes(&[pack], &scope, &[], &test_binding());
+        let ingress = routes
+            .iter()
+            .find(|r| r.is_tenant_qualified())
+            .expect("tenant-qualified route");
+        assert_eq!(
+            ingress.pattern,
+            "/v1/messaging/ingress/messaging-slack/acme/support"
+        );
+        assert_eq!(
+            ingress.provider_type.as_deref(),
+            Some("messaging.slack.api")
+        );
+
+        let table = HttpRouteTable::from_descriptors(routes);
+        assert_eq!(
+            table.resolve_tenant_qualified_ingress(
+                "/v1/messaging/ingress/messaging-slack/acme/support",
+                "POST",
+            ),
+            Some((scope.deployment_id, "acme".to_string())),
+        );
+        // The tenant-less route stays served for anything already registered.
+        assert!(
+            table
+                .match_request_for_revision("/webhook/slack-api", "POST", &scope)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_co_tenants_ingress_path_never_matches_another_tenants_route() {
+        // The point of the grammar: the tenant segment is a pinned literal, so
+        // two deployments sharing a host and a `/` prefix are told apart by the
+        // URL alone.
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("slack.gtpack");
+        write_provider_pack(
+            &pack,
+            "messaging-slack",
+            "messaging.slack.api",
+            &["ingest_http"],
+        );
+
+        let acme = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let globex = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("globex-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let mut routes = synthesize_provider_ingest_routes(
+            std::slice::from_ref(&pack),
+            &acme,
+            &[],
+            &TenantBinding {
+                tenant: "acme",
+                team: "support",
+            },
+        );
+        routes.extend(synthesize_provider_ingest_routes(
+            &[pack],
+            &globex,
+            &[],
+            &TenantBinding {
+                tenant: "globex",
+                team: "default",
+            },
+        ));
+        let table = HttpRouteTable::from_descriptors(routes);
+
+        assert_eq!(
+            table
+                .resolve_tenant_qualified_ingress(
+                    "/v1/messaging/ingress/messaging-slack/globex/default",
+                    "POST",
+                )
+                .map(|(dep, _)| dep),
+            Some(globex.deployment_id),
+        );
+        // Right tenant, wrong team, and an unknown tenant: neither resolves.
+        assert!(
+            table
+                .resolve_tenant_qualified_ingress(
+                    "/v1/messaging/ingress/messaging-slack/globex/support",
+                    "POST",
+                )
+                .is_none()
+        );
+        assert!(
+            table
+                .resolve_tenant_qualified_ingress(
+                    "/v1/messaging/ingress/messaging-slack/initech/default",
+                    "POST",
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -1507,7 +1792,12 @@ pub(crate) mod tests {
             bundle_id: BundleId::new("b"),
             revision_id: RevisionId::new(),
         };
-        let routes = synthesize_provider_ingest_routes(&[pack], &scope_a, &["/bot".to_string()]);
+        let routes = synthesize_provider_ingest_routes(
+            &[pack],
+            &scope_a,
+            &["/bot".to_string()],
+            &test_binding(),
+        );
         let table = HttpRouteTable::from_descriptors(routes);
         assert!(
             table

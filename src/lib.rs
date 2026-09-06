@@ -672,6 +672,14 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             env_tunnel::choose_tunnel(request.cloudflared, request.ngrok, request.gtunnel),
             env_tunnel::TunnelChoice::Gtunnel
         ) {
+            // Per DEPLOYMENT, never per env: `persisted_env_tunnel_id` returns
+            // the first id found scanning revisions newest-first, with no idea
+            // which deployment recorded it. Applying that to every deployment
+            // let one bundle's id capture its siblings — an env serving
+            // tenants `default`, `somedude` and `different` served all three
+            // as `default-ba564`, so two of them advertised URLs on a tunnel
+            // that was not theirs and their secrets no longer resolved.
+            let recorded_ids = recorded_tunnel_ids_by_bundle(&env_dir, &rc);
             match persisted_env_tunnel_id(&env_dir) {
                 Some(tunnel_id) => {
                     // An explicit --gtunnel-tunnel-id still wins; this only fills
@@ -699,16 +707,24 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                     // `tenants/` dir). Non-gtunnel runs never reach this branch,
                     // so cloudflared/ngrok/tunnel-less keep the bare tenant.
                     for dep in &mut environment.bundles {
-                        dep.route_binding.tenant_selector.tenant = tunnel_id.clone();
+                        let base = dep.route_binding.tenant_selector.tenant.clone();
+                        // This deployment's OWN recorded id, else derive from
+                        // its own tenant. Never a sibling's id.
+                        let served = recorded_ids
+                            .get(dep.bundle_id.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| crate::gtunnel::managed_tenant_alias(&base));
+                        operator_log::info(
+                            module_path!(),
+                            format!(
+                                "serving bundle `{}` (tenant `{base}`) as public tenant \
+                                 `{served}`; secrets and state stay scoped to the base tenant \
+                                 via the alias→base fallback",
+                                dep.bundle_id
+                            ),
+                        );
+                        dep.route_binding.tenant_selector.tenant = served;
                     }
-                    operator_log::info(
-                        module_path!(),
-                        format!(
-                            "adopting the tunnel id `{tunnel_id}` recorded by greentic-setup and \
-                             serving it as the public tenant; secrets and state stay scoped to the \
-                             base tenant via the alias→base fallback"
-                        ),
-                    );
                 }
                 None => {
                     for dep in &mut environment.bundles {
@@ -1024,13 +1040,31 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // listener is up so the tunnel's first health probe has something to
         // reach. Explicit flag + tunnel failure = hard error, never a silent
         // local-only boot.
+        // Every distinct served tenant needs its own agent: after the
+        // per-deployment aliasing above, each deployment's tenant IS its tunnel
+        // id, and the Worker routes by that id.
+        let served_tunnel_ids: Vec<String> = {
+            let mut ids: Vec<String> = environment
+                .bundles
+                .iter()
+                .map(|dep| dep.route_binding.tenant_selector.tenant.clone())
+                .collect();
+            ids.sort();
+            ids.dedup();
+            ids
+        };
         let tunnel = env_tunnel::start_env_tunnel(
             &request,
             &env_dir,
             &env_id,
             server.actual_port(),
             &log_dir,
+            &served_tunnel_ids,
         )?;
+        // Id of the tunnel `tunnel_url` points at (gtunnel only). Webhook
+        // registration re-tenants the URL's tunnel segment per deployment, so
+        // each co-tenant's provider posts to its own agent instead of this one.
+        let primary_tunnel_id = tunnel.as_ref().and_then(|t| t.tunnel_id.clone());
         let tunnel_url = tunnel.map(|t| {
             let line = format!("public URL: {} ({} tunnel)", t.url, t.service);
             operator_log::info(module_path!(), line.clone());
@@ -1131,11 +1165,15 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             let boot_activation = std::sync::Arc::clone(&activation);
             let boot_url = public_base_url.clone();
             let boot_env = environment;
+            // Only the tunnel's own URL carries a tunnel segment; when the base
+            // came from the env store / `PUBLIC_BASE_URL` there is none.
+            let boot_tunnel_id = tunnel_url.as_ref().and_then(|_| primary_tunnel_id.clone());
             activation_rt.spawn(async move {
                 revision_webhook_register::register_new_model_webhooks(
                     &boot_activation,
                     &boot_env,
                     boot_url.as_deref(),
+                    boot_tunnel_id.as_deref(),
                 )
                 .await;
             });
@@ -1198,6 +1236,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 env_id.clone(),
                 activation_rt.handle().clone(),
                 tunnel_url,
+                primary_tunnel_id,
             ),
             // C5 snapshot-reload arm: pure `store.reload()` call.
             move || snapshot_store_for_watcher.reload(),
@@ -1434,6 +1473,28 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 );
                 request.gtunnel = GtunnelModeArg::On;
                 request.tunnel_explicit = true;
+                // Adopt the id setup recorded for THIS bundle rather than
+                // re-deriving. Setup mints the id once, at application
+                // creation, and registers the resulting public URL with Slack /
+                // Webex / OAuth providers; deriving here would serve a
+                // different path segment than those registrations point at.
+                // The env-serving arm already does this (see the
+                // `recorded_tunnel_ids_by_bundle` branch below) — this is the
+                // legacy `--bundle` arm's equivalent. An explicit
+                // `--gtunnel-tunnel-id` still wins.
+                if request.gtunnel_tunnel_id.is_none()
+                    && let Some(tunnel_id) = tunnel
+                        .tunnel_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                {
+                    operator_log::info(
+                        module_path!(),
+                        format!("adopting gtunnel id `{tunnel_id}` recorded by setup"),
+                    );
+                    request.gtunnel_tunnel_id = Some(tunnel_id.to_string());
+                }
             }
             Some("off") => {
                 operator_log::info(
@@ -1944,6 +2005,36 @@ fn persisted_env_tunnel_mode(env_dir: &std::path::Path) -> Option<String> {
 /// setup started writing the field — callers fall back to deriving it.
 fn persisted_env_tunnel_id(env_dir: &std::path::Path) -> Option<String> {
     persisted_env_tunnel_field(env_dir, |cfg| cfg.tunnel_id.clone())
+}
+
+/// `bundle_id → tunnel id`, read from each bundle's OWN staged revision.
+///
+/// [`persisted_env_tunnel_id`] answers "does any revision record an id", which
+/// is the right question for "did setup choose gtunnel" and the wrong one for
+/// "what is THIS deployment's id" — it returns whichever revision sorts newest,
+/// belonging to whatever bundle. Keyed by bundle so a deployment can only ever
+/// adopt the id recorded for itself.
+fn recorded_tunnel_ids_by_bundle(
+    env_dir: &std::path::Path,
+    rc: &runtime_config::LoadedRuntimeConfig,
+) -> std::collections::HashMap<String, String> {
+    let mut ids = std::collections::HashMap::new();
+    for block in &rc.revisions {
+        if ids.contains_key(&block.bundle_id) {
+            continue;
+        }
+        let staged = env_dir
+            .join("revisions")
+            .join(&block.revision_id)
+            .join("bundle");
+        if let Some(id) = load_tunnel_config(&staged).and_then(|cfg| cfg.tunnel_id) {
+            let id = id.trim().to_string();
+            if !id.is_empty() {
+                ids.insert(block.bundle_id.clone(), id);
+            }
+        }
+    }
+    ids
 }
 
 /// Scan staged revisions newest-first (revision ids are ULIDs, so the
@@ -2533,7 +2624,76 @@ mod tests {
         std::fs::write(bundle.join(".greentic").join("tunnel.json"), body).expect("write");
     }
 
+    fn revision_block(bundle_id: &str, revision_id: &str) -> runtime_config::ResolvedRevisionBlock {
+        runtime_config::ResolvedRevisionBlock {
+            deployment_id: format!("dep-{bundle_id}"),
+            revision_id: revision_id.to_string(),
+            bundle_id: bundle_id.to_string(),
+            pack_list_refs: Vec::new(),
+            pack_config_refs: Vec::new(),
+            weight_bps: 10_000,
+        }
+    }
+
+    #[test]
+    fn recorded_tunnel_ids_are_keyed_per_bundle_not_per_env() {
+        // The observed env: three tenants across four deployments, where only
+        // koncar recorded an id. Reading "the newest revision with an id" gave
+        // `default-ba564` for ALL of them, so helpdesk and sales-crm
+        // advertised URLs on koncar's tunnel and their secrets stopped
+        // resolving. Each bundle must see only its own.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env_dir = dir.path();
+        stage_tunnel_json(
+            env_dir,
+            "01KZ38164Z6DW7HPTZXKPK8TEF",
+            r#"{"mode":"gtunnel","tunnel_id":"default-ba564"}"#,
+        );
+        stage_tunnel_json(
+            env_dir,
+            "01KZ3HW31C953BQ2V5GZNWVW3N",
+            r#"{"mode":"gtunnel"}"#,
+        );
+        let rc = runtime_config::LoadedRuntimeConfig {
+            env_id: "local".to_string(),
+            revisions: vec![
+                revision_block("koncar-demo", "01KZ38164Z6DW7HPTZXKPK8TEF"),
+                revision_block("helpdesk-itsm-demo", "01KZ3HW31C953BQ2V5GZNWVW3N"),
+            ],
+        };
+
+        let ids = recorded_tunnel_ids_by_bundle(env_dir, &rc);
+
+        assert_eq!(
+            ids.get("koncar-demo").map(String::as_str),
+            Some("default-ba564")
+        );
+        assert!(
+            !ids.contains_key("helpdesk-itsm-demo"),
+            "a bundle with no recorded id must not inherit a sibling's: {ids:?}"
+        );
+    }
+
     // ---- persisted tunnel id (setup owns the id) ----
+
+    #[test]
+    fn bundle_arm_reads_the_tunnel_id_recorded_beside_the_mode() {
+        // The legacy `--bundle` arm reads `<bundle>/.greentic/tunnel.json` for
+        // the mode; it must see the id in the same read, or it re-derives one
+        // that nothing was registered against.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".greentic")).expect("mkdir");
+        std::fs::write(
+            dir.path().join(".greentic").join("tunnel.json"),
+            r#"{"mode":"gtunnel","tunnel_id":"stating-81015"}"#,
+        )
+        .expect("write");
+
+        let cfg = load_tunnel_config(dir.path()).expect("tunnel config");
+
+        assert_eq!(cfg.mode.as_deref(), Some("gtunnel"));
+        assert_eq!(cfg.tunnel_id.as_deref(), Some("stating-81015"));
+    }
 
     #[test]
     fn persisted_tunnel_id_is_read_and_prefers_the_newest_revision() {
