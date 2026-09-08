@@ -1264,6 +1264,11 @@ pub(crate) fn parse_envelopes(
         let mut reply = base_reply_envelope(ingress_envelope);
         reply.text = Some(text.to_string());
         copy_directline_passthrough(value, &mut reply);
+        // AFTER the passthrough, so a runner-supplied `channelData` is already
+        // on the envelope and the provenance merges into it. The text bubble
+        // above is untouched either way: provenance rides on `channelData`
+        // only, and is absent entirely when the trail records no tool that ran.
+        crate::agent_provenance::attach_provenance(value, &mut reply);
         operator_log::info(
             module_path!(),
             format!(
@@ -2808,6 +2813,78 @@ mod tests {
         assert!(reply.extensions.contains_key(ext_keys::CHANNEL_DATA));
         assert!(reply.extensions.contains_key(ext_keys::ENTITIES));
         assert!(reply.extensions.contains_key(ext_keys::SUGGESTED_ACTIONS));
+    }
+
+    #[test]
+    fn parse_envelopes_agent_reply_carries_trail_provenance_on_channel_data() {
+        // The `trail` shape is `greentic_aw_runtime::AgentStep`, serialised
+        // with `#[serde(tag = "kind", rename_all = "snake_case")]`. Mapping
+        // lives in `crate::agent_provenance`; this asserts only that the reply
+        // arm reaches it and that the text bubble is unaffected.
+        let ingress = envelope();
+        let output = json!({
+            "reply": "Refunds are accepted within 30 days.",
+            "terminated_by": "final_reply",
+            "trail": [
+                {
+                    "kind": "tool_call",
+                    "name": "rag_search",
+                    "call_id": "call_1",
+                    "result": {"citations": [{
+                        "doc": "Refund policy",
+                        "source_file": "policies/refunds.pdf",
+                        "excerpt": "Refunds are accepted within 30 days.",
+                        "relevance_score": 0.96
+                    }]}
+                },
+                {"kind": "reply", "text": "Refunds are accepted within 30 days."}
+            ],
+        });
+
+        let replies = parse_envelopes(&output, &ingress).expect("agent_reply branch");
+        assert_eq!(replies.len(), 1);
+        let reply = &replies[0];
+        assert_eq!(
+            reply.text.as_deref(),
+            Some("Refunds are accepted within 30 days."),
+            "provenance must not change the text bubble"
+        );
+        let provenance = reply
+            .extensions
+            .get(ext_keys::CHANNEL_DATA)
+            .and_then(|data| data.get(crate::agent_provenance::CHANNEL_DATA_KEY))
+            .expect("provenance on channelData");
+        assert_eq!(provenance["tools"], json!(["rag_search"]));
+        assert_eq!(provenance["citations"][0]["doc"], json!("Refund policy"));
+    }
+
+    #[test]
+    fn parse_envelopes_agent_reply_is_identical_with_and_without_a_trail() {
+        // Provenance is additive: the same reply text, metadata and extension
+        // set either way — `channel_data` is the ONLY difference. A GUI that
+        // ignores provenance must see exactly the pre-existing envelope.
+        let ingress = envelope();
+        let bare = json!({"reply": "same answer", "terminated_by": "final_reply"});
+        let with_trail = json!({
+            "reply": "same answer",
+            "terminated_by": "final_reply",
+            "trail": [{"kind": "tool_call", "name": "rag_search", "call_id": "c1", "result": {}}],
+        });
+
+        let bare = parse_envelopes(&bare, &ingress).expect("agent_reply branch");
+        let with_trail = parse_envelopes(&with_trail, &ingress).expect("agent_reply branch");
+        assert_eq!(bare[0].text, with_trail[0].text);
+        assert_eq!(bare[0].metadata, with_trail[0].metadata);
+        assert!(
+            !bare[0].extensions.contains_key(ext_keys::CHANNEL_DATA),
+            "a reply with no trail keeps PR #566's behaviour exactly"
+        );
+        let extra: Vec<&String> = with_trail[0]
+            .extensions
+            .keys()
+            .filter(|key| !bare[0].extensions.contains_key(*key))
+            .collect();
+        assert_eq!(extra, vec![&ext_keys::CHANNEL_DATA.to_string()]);
     }
 
     #[test]

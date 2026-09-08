@@ -7,6 +7,7 @@ use clap::error::ErrorKind;
 
 mod admin_certs;
 mod admin_server;
+mod agent_provenance;
 // `pub` (doc-hidden) so `tests/approval_rail_live_broker.rs` can drive the
 // bridge against a real NATS without a bundle or a Slack workspace.
 #[doc(hidden)]
