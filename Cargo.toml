@@ -41,7 +41,16 @@ chrono = "0.4"
 dashmap = "6"
 flate2 = "1"
 futures-util = "0.3"
-greentic-llm = { version = "1" }
+# Exact pin, not a `"1"` range, and deliberately a pre-release. Cargo excludes
+# pre-releases from a requirement that carries none, so `"1"` could never
+# resolve the `-research` line at all — it sat on 1.1.0, and a published
+# greentic-start therefore shipped a runner that predates describe-v2. This is
+# the version `greentic-aw-runtime 1.2.0-dev.34079091767` (reached through
+# `greentic-runner-host`) pins; resolving anything else puts two greentic-llm
+# copies in the graph. Exact rather than floored for the same reason: the two
+# must agree on ONE version. Follow-up: move to 1.3.1-research.0 once a runner
+# publish carrying it exists (sibling PR in greentic-runner).
+greentic-llm = { version = "=1.3.0-research.0" }
 hmac = "0.13"
 http-body-util = "0.1"
 hyper-tungstenite = "0.20"
@@ -78,6 +87,7 @@ subtle = "2"
 sys-locale = "0.3"
 sysinfo = "0.39"
 tar = "0.4"
+tempfile = "3"
 thiserror = "2"
 tokio-rustls = "0.26"
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
@@ -89,7 +99,6 @@ ulid = "1"
 unic-langid = "0.9"
 urlencoding = "2"
 wasmtime = { version = "45", default-features = false, features = ["component-model", "cranelift", "runtime"] }
-tempfile = "3"
 zip = "8"
 zstd = "0.13"
 
@@ -154,16 +163,6 @@ version = ">=0.2.30561430155, <0.3"
 [dependencies.greentic-deployer]
 version = ">=1.2.0-dev, <1.3.0-0"
 default-features = false
-
-# Update-serving surface (revision_serve.rs): `binswap` carries the archive-unpack
-# + atomic-swap primitive behind the stage-only binary self-update path
-# (`select_binary`); `stream` carries the SSE client the push path uses
-# (`stream::{build_stream_client, run_stream}`). Tracks greentic-update's dev
-# line — the `0.1.x` cross-lane conflict that once blocked this (distributor-client
-# 1.2) is gone now that greentic-update publishes `1.2.0-dev.N` on the same lane.
-[dependencies.greentic-update]
-version = ">=1.2.0-dev.30553549034, <1.3.0-0"
-features = ["binswap", "stream"]
 # Floor bumped to 1.2.0-dev.30347759036: first publish carrying
 # StagedPlan::verify_binary_on_disk + the staging binary CAS (B3 in-band
 # binary consumption). Floor bumped again to 1.2.0-dev.30553549034 — the
@@ -248,6 +247,16 @@ version = ">=1.2.0-dev, <1.3.0-0"
 version = ">=1.2.0-dev, <1.3.0-0"
 features = ["serde"]
 
+# Update-serving surface (revision_serve.rs): `binswap` carries the archive-unpack
+# + atomic-swap primitive behind the stage-only binary self-update path
+# (`select_binary`); `stream` carries the SSE client the push path uses
+# (`stream::{build_stream_client, run_stream}`). Tracks greentic-update's dev
+# line — the `0.1.x` cross-lane conflict that once blocked this (distributor-client
+# 1.2) is gone now that greentic-update publishes `1.2.0-dev.N` on the same lane.
+[dependencies.greentic-update]
+version = ">=1.2.0-dev.30553549034, <1.3.0-0"
+features = ["binswap", "stream"]
+
 [dependencies.hyper]
 version = "1"
 features = ["full"]
@@ -284,5 +293,7 @@ criterion = "0.8"
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 # Enable greentic-llm's scriptable test double (TestLlmProvider) for unit tests
 # only — `test-mock` stays out of release builds.
-greentic-llm = { version = "1", features = ["test-mock"] }
+# Must stay byte-identical to the [dependencies] pin above (see its comment):
+# a differing requirement here resolves a second greentic-llm for test builds.
+greentic-llm = { version = "=1.3.0-research.0", features = ["test-mock"] }
 tokio = { version = "1", features = ["test-util"] }
