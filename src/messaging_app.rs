@@ -1239,6 +1239,41 @@ pub(crate) fn parse_envelopes(
         );
         return Ok(vec![reply]);
     }
+    // greentic-runner-host's `dw.agent` node output contract:
+    // `{"reply": "...", "trail": [...], "terminated_by": "..."}`. None of the
+    // shapes above matches it and none of the text fallbacks below reads
+    // `reply`, so before this branch existed every Designer-authored agentic
+    // worker turn logged `parse_envelopes failed` and the env-path caller
+    // (`revision_serve::build_reply_envelopes`) swallowed the Err and delivered
+    // nothing — the agent's answer was dropped silently.
+    //
+    // Deliberately NOT gated on `terminated_by`: `reply` alone is the signal,
+    // and a turn may carry the text without the terminator. An empty or
+    // whitespace-only `reply` FALLS THROUGH instead of producing a blank
+    // bubble — such a turn can still carry a `renderedCard` (handled above) or
+    // a `metadata.error_kind` (handled below), and either must win.
+    if let Some(text) = value
+        .get("reply")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        // `base_reply_envelope`, not a raw clone: this is a runner node output,
+        // so the reply needs the same fresh id / cleared inbound fields the
+        // text-fallback branch below gives every other runner-shaped reply.
+        let mut reply = base_reply_envelope(ingress_envelope);
+        reply.text = Some(text.to_string());
+        copy_directline_passthrough(value, &mut reply);
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[messaging_app] parse_envelopes path=agent_reply text_len={} shape={}",
+                text.len(),
+                summarize_output_shape(value)
+            ),
+        );
+        return Ok(vec![reply]);
+    }
     let messages_text = value
         .get("messages")
         .and_then(|messages| messages.as_array())
@@ -2666,6 +2701,113 @@ mod tests {
             !reply.extensions.contains_key(ext_keys::ADAPTIVE_CARD),
             "ADAPTIVE_CARD must NOT be lifted when ATTACHMENTS is present"
         );
+    }
+
+    #[test]
+    fn parse_envelopes_shapes_the_agent_reply_node_output() {
+        // greentic-runner-host's `dw.agent` node-output contract. Before the
+        // `reply` arm existed this shape matched nothing and every turn of a
+        // Designer-authored agentic worker was dropped with a
+        // `parse_envelopes failed` warning.
+        let ingress = envelope();
+        let output = json!({
+            "reply": "The order shipped on Tuesday.",
+            "trail": [{"node": "agent", "took_ms": 812}],
+            "terminated_by": "final_answer",
+        });
+
+        let replies = parse_envelopes(&output, &ingress).expect("agent_reply branch");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            replies[0].text.as_deref(),
+            Some("The order shipped on Tuesday.")
+        );
+    }
+
+    #[test]
+    fn parse_envelopes_agent_reply_is_not_gated_on_terminated_by() {
+        // `reply` alone is the signal — a turn may carry text without the
+        // terminator, and gating on it would resurrect the silent drop.
+        let ingress = envelope();
+        let replies = parse_envelopes(&json!({ "reply": "  spaced answer  " }), &ingress)
+            .expect("agent_reply branch");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            replies[0].text.as_deref(),
+            Some("spaced answer"),
+            "reply text is trimmed"
+        );
+    }
+
+    #[test]
+    fn parse_envelopes_blank_agent_reply_lets_the_rendered_card_win() {
+        // An empty `reply` must FALL THROUGH rather than emit a blank bubble:
+        // the same turn can still carry a card, which is the real answer.
+        let ingress = envelope();
+        let card = json!({
+            "type": "AdaptiveCard",
+            "version": "1.5",
+            "body": [{"type": "TextBlock", "text": "card body"}]
+        });
+        let output = json!({
+            "reply": "   ",
+            "renderedCard": card.clone(),
+            "terminated_by": "final_answer",
+        });
+
+        let replies = parse_envelopes(&output, &ingress).expect("renderedCard branch");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].text, None, "card branch sets no text bubble");
+        assert_eq!(
+            replies[0].extensions.get(ext_keys::ADAPTIVE_CARD),
+            Some(&card)
+        );
+    }
+
+    #[test]
+    fn parse_envelopes_blank_agent_reply_lets_the_flow_error_win() {
+        // Same fall-through, against the last-resort error branch: a failed
+        // agent turn carries no reply text but must still surface the
+        // categorized error rather than being shaped as an empty reply.
+        let ingress = envelope();
+        let output = json!({
+            "reply": "",
+            "metadata": {
+                "error_kind": "flow_node_failed",
+                "error_message": "component weatherapi_current failed: MCP_TOOL_ERROR: 401 API key required",
+            }
+        });
+
+        let replies = parse_envelopes(&output, &ingress).expect("flow_error branch");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            replies[0]
+                .metadata
+                .get("error_category")
+                .map(String::as_str),
+            Some("service_auth"),
+            "an empty reply must not preempt the flow-error branch"
+        );
+    }
+
+    #[test]
+    fn parse_envelopes_agent_reply_forwards_directline_passthrough() {
+        let ingress = envelope();
+        let output = json!({
+            "reply": "here you go",
+            "terminated_by": "final_answer",
+            "channelData": {"directline": {"conversationId": "c-1"}},
+            "entities": [{"type": "mention", "text": "@user"}],
+            "suggestedActions": {"actions": [{"type": "imBack", "title": "More", "value": "more"}]},
+        });
+
+        let replies = parse_envelopes(&output, &ingress).expect("agent_reply branch");
+        assert_eq!(replies.len(), 1);
+        let reply = &replies[0];
+        assert_eq!(reply.text.as_deref(), Some("here you go"));
+        assert!(reply.extensions.contains_key(ext_keys::CHANNEL_DATA));
+        assert!(reply.extensions.contains_key(ext_keys::ENTITIES));
+        assert!(reply.extensions.contains_key(ext_keys::SUGGESTED_ACTIONS));
     }
 
     #[test]

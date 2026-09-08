@@ -7652,6 +7652,43 @@ mod tests {
     }
 
     #[test]
+    fn build_reply_envelopes_delivers_the_agent_reply_node_output() {
+        // End-to-end for the env path a `greentic-start --store-root` operator
+        // environment actually serves: a Designer-authored `dw.agent` node
+        // returns `{reply, trail, terminated_by}`, which matched no
+        // `parse_envelopes` shape — so the Err was swallowed here and the
+        // partner's worker answered every turn with nothing at all.
+        let ingress: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-in-agent",
+            "tenant": { "env": "dev", "tenant": "acme", "tenant_id": "acme", "attempt": 0 },
+            "channel": "webchat-gui",
+            "session_id": "conv-a",
+            "to": [{ "id": "room-1", "kind": "room" }],
+            "text": "when did my order ship?",
+        }))
+        .expect("ingress envelope");
+        let reply = Activity::custom(
+            "response",
+            json!({
+                "reply": "The order shipped on Tuesday.",
+                "trail": [{"node": "agent", "took_ms": 812}],
+                "terminated_by": "final_answer",
+            }),
+        );
+
+        let envs = build_reply_envelopes(&ingress, &reply, "pack", "acme");
+        assert_eq!(envs.len(), 1, "the agent reply must produce an envelope");
+        assert_eq!(
+            envs[0].text.as_deref(),
+            Some("The order shipped on Tuesday.")
+        );
+        assert_ne!(
+            envs[0].id, ingress.id,
+            "each reply gets its own id, not the inbound request's"
+        );
+    }
+
+    #[test]
     fn synthesize_provider_response_defaults_to_200_and_preserves_body() {
         let response = IngressHttpResponse {
             status: 0, // Not a real HTTP status — synth must fall back to 200.
