@@ -77,19 +77,31 @@ pub(crate) fn choose_tunnel(
 }
 
 /// The tunnel id both binaries key on: explicit flag > `GREENTIC_TUNNEL_ID` >
-/// the sanitized `<tenant>`. It is deliberately the TENANT alone (not
-/// `<tenant>-<team>`) so it equals the `<tenant>` segment of the webchat URL
-/// space (`/v1/web/webchat/<tenant>/…`): the Worker routes the SPA's
-/// root-absolute calls by that tenant, so the id it registers under must match.
-/// Single source of truth so the default-tunnel decision, the config, and
-/// greentic-setup all agree. (One box per tenant; multiple teams of the same
-/// tenant would share a tunnel — override `GREENTIC_TUNNEL_ID` to separate them.)
+/// the served tenant alias `<sanitized tenant>-<install suffix>`, which is what
+/// greentic-setup's `derive_gtunnel_id` produces. It is keyed on the TENANT
+/// alone (not `<tenant>-<team>`) so it equals the `<tenant>` segment of the
+/// webchat URL space (`/v1/web/webchat/<tenant>/…`): the Worker routes the
+/// SPA's root-absolute calls by that tenant, so the id it registers under must
+/// match. Single source of truth so the default-tunnel decision, the config,
+/// and greentic-setup all agree. (One box per tenant; multiple teams of the
+/// same tenant share a tunnel — override `GREENTIC_TUNNEL_ID` to separate them.)
 pub(crate) fn resolve_gtunnel_tunnel_id(request: &StartRequest) -> String {
     request
         .gtunnel_tunnel_id
         .clone()
         .or_else(|| std::env::var("GREENTIC_TUNNEL_ID").ok())
-        .unwrap_or_else(|| sanitize_tunnel_id(request.tenant.as_deref().unwrap_or("default")))
+        .unwrap_or_else(|| {
+            // Must equal greentic-setup's `derive_gtunnel_id`, which appends the
+            // per-install clash suffix. Deriving the BARE tenant here made the
+            // two binaries disagree: setup registered a provider's webhooks
+            // under `<tenant>-<suffix>` while the agent came up as `<tenant>`,
+            // so inbound events addressed a tunnel nobody served. It is also
+            // the alias already used for the served tenant, so the id and the
+            // `<tenant>` segment of the webchat URL now match.
+            crate::gtunnel::managed_tenant_alias(&sanitize_tunnel_id(
+                request.tenant.as_deref().unwrap_or("default"),
+            ))
+        })
 }
 
 /// Resolve the zero-config gtunnel settings for this request. Order for each
@@ -161,6 +173,11 @@ fn sanitize_tunnel_id(raw: &str) -> String {
 pub(crate) struct EnvTunnelHandle {
     pub(crate) service: &'static str,
     pub(crate) url: String,
+    /// The id this tunnel is served under, when the provider has one (gtunnel).
+    /// Webhook registration needs it to tell a tunnel-id path segment apart
+    /// from an operator's path — cloudflared/ngrok mint a bare hostname and
+    /// carry no id, hence `None`.
+    pub(crate) tunnel_id: Option<String>,
 }
 
 /// Start the tunnel the request asks for against the bound revision-serve
@@ -175,6 +192,7 @@ pub(crate) fn start_env_tunnel(
     env_id: &str,
     local_port: u16,
     log_dir: &Path,
+    extra_tunnel_ids: &[String],
 ) -> anyhow::Result<Option<EnvTunnelHandle>> {
     let choice = choose_tunnel(request.cloudflared, request.ngrok, request.gtunnel);
     if let TunnelChoice::Off = choice {
@@ -198,9 +216,40 @@ pub(crate) fn start_env_tunnel(
                 format!("gtunnel not yet reachable, continuing anyway: {err}"),
             ),
         }
+        // One agent per distinct served tenant. The env serves several
+        // deployments on ONE port, each advertising its own tunnel id; without
+        // an agent per id every tenant but this one addresses a tunnel nobody
+        // serves. Records are instance-keyed, so they coexist on the port.
+        for tunnel_id in extra_tunnel_ids {
+            if tunnel_id == &config.tunnel_id {
+                continue;
+            }
+            let extra = crate::gtunnel::GtunnelConfig {
+                tunnel_id: tunnel_id.clone(),
+                secret: crate::gtunnel::resolve_secret(tunnel_id),
+                ..config.clone()
+            };
+            match crate::gtunnel::start_agent(&extra) {
+                Ok(extra_handle) => operator_log::info(
+                    module_path!(),
+                    format!(
+                        "gtunnel agent for tenant tunnel `{tunnel_id}` at {}",
+                        extra_handle.url
+                    ),
+                ),
+                // A co-tenant's agent failing must not fail the boot: the
+                // primary tunnel is still serving, and the operator gets a
+                // named warning for the one that did not come up.
+                Err(err) => operator_log::warn(
+                    module_path!(),
+                    format!("gtunnel agent for tenant tunnel `{tunnel_id}` did not start: {err:#}"),
+                ),
+            }
+        }
         return Ok(Some(EnvTunnelHandle {
             service: crate::gtunnel::SERVICE_ID,
             url: handle.url,
+            tunnel_id: Some(config.tunnel_id.clone()),
         }));
     }
     let (service, explicit_binary) = match choice {
@@ -251,7 +300,11 @@ pub(crate) fn start_env_tunnel(
             .url
         }
     };
-    let handle = EnvTunnelHandle { service, url };
+    let handle = EnvTunnelHandle {
+        service,
+        url,
+        tunnel_id: None,
+    };
 
     // Reachability probe is best-effort (HEAD requests until the edge
     // answers), exactly like the legacy arm — the URL is already known, and
@@ -310,6 +363,71 @@ pub(crate) fn stop_env_tunnels(paths: &RuntimePaths) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tunnel_id_request(tenant: &str, explicit_id: Option<&str>) -> StartRequest {
+        StartRequest {
+            bundle: None,
+            env: None,
+            tenant: Some(tenant.to_string()),
+            team: None,
+            no_nats: false,
+            nats: crate::NatsModeArg::Off,
+            nats_url: None,
+            config: None,
+            cloudflared: crate::CloudflaredModeArg::Off,
+            cloudflared_binary: None,
+            ngrok: crate::NgrokModeArg::Off,
+            ngrok_binary: None,
+            gtunnel: crate::GtunnelModeArg::Off,
+            gtunnel_worker_url: None,
+            gtunnel_tunnel_id: explicit_id.map(str::to_string),
+            runner_binary: None,
+            restart: Vec::new(),
+            log_dir: None,
+            verbose: false,
+            quiet: false,
+            no_browser: false,
+            open_webchat: None,
+            no_updates: false,
+            no_auto_restart: false,
+            admin: false,
+            admin_port: 8443,
+            admin_certs_dir: None,
+            admin_allowed_clients: Vec::new(),
+            tunnel_explicit: false,
+        }
+    }
+
+    #[test]
+    fn derived_gtunnel_id_matches_the_served_tenant_alias() {
+        // Setup keys a provider's registered webhook URL on
+        // `derive_gtunnel_id` = `<tenant>-<install suffix>`. Deriving the bare
+        // tenant here left the agent serving `<tenant>` while Slack posted to
+        // `<tenant>-<suffix>` — nobody served the target.
+        let request = tunnel_id_request("somedude", None);
+
+        let id = resolve_gtunnel_tunnel_id(&request);
+
+        assert_eq!(
+            id,
+            crate::gtunnel::managed_tenant_alias("somedude"),
+            "tunnel id must equal the served tenant alias"
+        );
+        assert_ne!(
+            id, "somedude",
+            "the bare tenant is what diverged from setup"
+        );
+        let (base, suffix) = id.rsplit_once('-').expect("id carries a suffix");
+        assert_eq!(base, "somedude");
+        assert_eq!(suffix.len(), 5, "5-hex install suffix, got {id}");
+    }
+
+    #[test]
+    fn explicit_gtunnel_tunnel_id_still_wins_over_the_derived_alias() {
+        let request = tunnel_id_request("somedude", Some("explicit-id"));
+
+        assert_eq!(resolve_gtunnel_tunnel_id(&request), "explicit-id");
+    }
 
     #[test]
     fn env_runtime_paths_root_under_env_dir() {

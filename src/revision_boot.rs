@@ -51,7 +51,7 @@ use crate::deployment_routes::{
 };
 use crate::endpoint_admit::EndpointAdmit;
 use crate::http_routes::{
-    HttpRouteDescriptor, HttpRouteTable, RevisionScope, discover_revision_routes,
+    HttpRouteDescriptor, HttpRouteTable, RevisionScope, TenantBinding, discover_revision_routes,
 };
 use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig, parse_ulid};
 use crate::revision_pin::RevisionPinStore;
@@ -385,6 +385,10 @@ pub(crate) async fn activate_runtime_config(
             &pack_paths,
             &scope,
             &meta.path_prefixes,
+            &TenantBinding {
+                tenant: &meta.tenant,
+                team: &meta.team,
+            },
         ));
         static_plan.merge(discover_revision_static_routes(
             &pack_paths,

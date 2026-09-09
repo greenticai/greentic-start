@@ -1238,6 +1238,25 @@ async fn serve(
             StatusCode::NOT_FOUND,
             "no bundle is bound to this tenant and path",
         ));
+    } else if let Some((dep_id, route_tenant)) = classify_provider_ingress_path(
+        &activation.routing,
+        &path,
+        method.as_str(),
+        host_header.as_deref(),
+    ) {
+        deployment_id = dep_id;
+        tenant = route_tenant;
+        effective_path = path.clone();
+    } else if is_provider_ingress_path(&path) {
+        // Same posture as the webchat arm above: the tenant is IN the URL, so a
+        // path in this grammar that names no routable deployment must not fall
+        // through to the `(host, path_prefix)` resolve — that resolve would hand
+        // the request to whichever deployment won the prefix match, under a
+        // tenant the caller never named, and the tenant segment would be dead.
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "no deployment is bound to this tenant and provider",
+        ));
     } else {
         // Resolve the bound deployment + tenant before touching the body, so
         // an unroutable request is rejected cheaply.
@@ -3483,6 +3502,41 @@ enum Admission {
     ProviderRoute,
     /// A non-POST request to a generic (non-provider) path.
     MethodNotAllowed,
+}
+
+/// True for the reserved tenant-qualified provider-ingress grammar,
+/// `/v1/{domain}/ingress/{provider}/{tenant}/{team?}`. The `/v1/` prefix is
+/// deliberate: the legacy prefix-less form (`/messaging/ingress/...`) is not
+/// reserved here, so a bundle binding a broad `/` prefix keeps serving its own
+/// paths under that shape.
+fn is_provider_ingress_path(path: &str) -> bool {
+    path.split('/')
+        .find(|s| !s.is_empty())
+        .is_some_and(|first| first.eq_ignore_ascii_case("v1"))
+        && crate::http_helpers::parse_route_segments(path).is_some()
+}
+
+/// Resolve a tenant-qualified provider-ingress URL to its deployment, or `None`
+/// when no served route claims it.
+///
+/// A webhook registered at `/v1/messaging/ingress/{provider}/{tenant}/{team}`
+/// names its deployment in the path, so it resolves here rather than through
+/// the `(host, path_prefix)` binding — under a shared host and a `/` prefix that
+/// binding cannot tell two tenants apart. Host admission is still enforced, so
+/// a deployment pinned to a hostname is not reachable off it.
+fn classify_provider_ingress_path(
+    routing: &crate::deployment_routes::RevisionIngressRouting,
+    path: &str,
+    method: &str,
+    host: Option<&str>,
+) -> Option<(DeploymentId, String)> {
+    let (deployment_id, tenant) = routing
+        .http_routes
+        .resolve_tenant_qualified_ingress(path, method)?;
+    routing
+        .deployment_routes
+        .host_admits(deployment_id, host)
+        .then_some((deployment_id, tenant))
 }
 
 /// Decide whether a dispatched request may run the generic entry flow. Provider
@@ -7020,8 +7074,11 @@ mod tests {
             &[pack_path],
             &scope,
             &[], // root-bound deployment
+            &crate::http_routes::TenantBinding {
+                tenant: "acme",
+                team: "support",
+            },
         );
-        assert_eq!(descriptors.len(), 1, "root-bound synthesis emits one route");
         let table = HttpRouteTable::from_descriptors(descriptors);
 
         assert_eq!(
