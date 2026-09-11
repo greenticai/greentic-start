@@ -297,3 +297,26 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 # a differing requirement here resolves a second greentic-llm for test builds.
 greentic-llm = { version = "=1.3.0-research.0", features = ["test-mock"] }
 tokio = { version = "1", features = ["test-util"] }
+
+# TEMPORARY -- resolve the runner crates from git while crates.io publishing is
+# locked fleet-wide (403 authentication failed; the sole owning account is
+# locked out). Without this, the engine compiled into this binary -- and into
+# the greentic-start-distroless image that k8s and Cloud Run pods run -- is
+# whatever was last published to crates.io on 2026-09-07, which predates
+# greentic-runner#757 (the "now" flow-template namespace).
+#
+# The dependency REQUIREMENTS above are deliberately untouched: their floor is
+# documented as an API floor and must not be lowered. greentic-runner#758
+# raised that repo's develop placeholder above the floor instead, which is what
+# lets this patch resolve at all -- a patch whose version sits below the
+# requirement is silently IGNORED by cargo ("was not used in the crate graph")
+# and the stale registry copy wins, with nothing reported anywhere.
+#
+# A patch section does not travel into a published crate (verified with
+# cargo package), so this does not change what a crates.io consumer resolves.
+#
+# TO UNWIND once publishing is restored: delete this block and run
+# cargo update -p greentic-runner-host -p greentic-runner-desktop
+[patch.crates-io]
+greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "83b2aaa526a649ea65d06b22ef1144d906ed2b68" }
+greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "83b2aaa526a649ea65d06b22ef1144d906ed2b68" }
