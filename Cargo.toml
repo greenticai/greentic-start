@@ -48,9 +48,14 @@ futures-util = "0.3"
 # the version `greentic-aw-runtime 1.2.0-dev.34079091767` (reached through
 # `greentic-runner-host`) pins; resolving anything else puts two greentic-llm
 # copies in the graph. Exact rather than floored for the same reason: the two
-# must agree on ONE version. Follow-up: move to 1.3.1-research.0 once a runner
-# publish carrying it exists (sibling PR in greentic-runner).
-greentic-llm = { version = "=1.3.0-research.0" }
+# must agree on ONE version.
+#
+# 1.3.1-research.0 since runner-host's `greentic-llm-backend` feature is enabled
+# below: that feature pulls runner-host's own optional `greentic-llm =
+# "=1.3.1-research.0"` (greentic-runner#743), so this pin has to be the same
+# exact version or the graph cannot resolve. It is also the release in which
+# Ollama advertises tool calling.
+greentic-llm = { version = "=1.3.1-research.0" }
 hmac = "0.13"
 http-body-util = "0.1"
 hyper-tungstenite = "0.20"
@@ -220,6 +225,20 @@ version = ">=1.2.0-dev.32455370325, <1.3.0-0"
 # compile here. An API floor: don't lower it.
 [dependencies.greentic-runner-host]
 version = ">=1.2.0-dev.32455370325, <1.3.0-0"
+# `greentic-llm-backend` routes every in-process `dw.agent` LLM call through
+# greentic-llm's multi-provider backend. Without it runner-host compiles the
+# OpenAI-only client (`agent_node.rs`, "built WITHOUT the greentic-llm-backend
+# feature"): the agent's configured `llm.provider` is ignored, Ollama cannot call
+# tools, and a keyless provider still needs a key. greentic-runner's own release
+# binary has always been built with it; the operator environment, k8s and
+# Cloud Run all serve through THIS binary instead, so they never had it.
+#
+# `desktop-agent-ephemeral` is deliberately NOT enabled. runner-host documents it
+# as "must NOT be enabled in the server binary": it switches on greentic-aw-runtime's
+# `test-mock` (a mock token meter) and `dev-allow-unsigned`, and this binary is
+# also the greentic-start-distroless image pods run. So `dw.agent` here still
+# needs `GREENTIC_AW_REDIS_URL` for its state store, exactly as before.
+features = ["greentic-llm-backend"]
 
 [dependencies.greentic-secrets-lib]
 # `providers-vault` brings in the HashiCorp Vault KV backend used for runtime
@@ -295,7 +314,7 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 # only — `test-mock` stays out of release builds.
 # Must stay byte-identical to the [dependencies] pin above (see its comment):
 # a differing requirement here resolves a second greentic-llm for test builds.
-greentic-llm = { version = "=1.3.0-research.0", features = ["test-mock"] }
+greentic-llm = { version = "=1.3.1-research.0", features = ["test-mock"] }
 tokio = { version = "1", features = ["test-util"] }
 
 # TEMPORARY -- resolve the runner crates from git while crates.io publishing is
