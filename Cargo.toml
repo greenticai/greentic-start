@@ -322,7 +322,10 @@ tokio = { version = "1", features = ["test-util"] }
 # locked out). Without this, the engine compiled into this binary -- and into
 # the greentic-start-distroless image that k8s and Cloud Run pods run -- is
 # whatever was last published to crates.io on 2026-09-07, which predates
-# greentic-runner#757 (the "now" flow-template namespace).
+# greentic-runner#757 (the "now" flow-template namespace) and #759 (a provider
+# instance's configured answers reaching its invocation at all -- without it
+# every setup answer arrives as an empty `request.config`, which a provider
+# reports, if at all, as its own feature being switched off).
 #
 # The dependency REQUIREMENTS above are deliberately untouched: their floor is
 # documented as an API floor and must not be lowered. greentic-runner#758
@@ -337,5 +340,5 @@ tokio = { version = "1", features = ["test-util"] }
 # TO UNWIND once publishing is restored: delete this block and run
 # cargo update -p greentic-runner-host -p greentic-runner-desktop
 [patch.crates-io]
-greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "83b2aaa526a649ea65d06b22ef1144d906ed2b68" }
-greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "83b2aaa526a649ea65d06b22ef1144d906ed2b68" }
+greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "b603e1b36c006e673dbaa742d2d790ee289e9d55" }
+greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "b603e1b36c006e673dbaa742d2d790ee289e9d55" }
