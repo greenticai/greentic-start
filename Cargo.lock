@@ -397,7 +397,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "aw-event-bridge"
 version = "1.2.0-dev.34428856459"
-source = "git+https://github.com/greenticai/greentic-runner?rev=83b2aaa526a649ea65d06b22ef1144d906ed2b68#83b2aaa526a649ea65d06b22ef1144d906ed2b68"
+source = "git+https://github.com/greenticai/greentic-runner?rev=b603e1b36c006e673dbaa742d2d790ee289e9d55#b603e1b36c006e673dbaa742d2d790ee289e9d55"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -2585,7 +2585,7 @@ dependencies = [
 [[package]]
 name = "greentic-aw-runtime"
 version = "1.2.0-dev.34428856459"
-source = "git+https://github.com/greenticai/greentic-runner?rev=83b2aaa526a649ea65d06b22ef1144d906ed2b68#83b2aaa526a649ea65d06b22ef1144d906ed2b68"
+source = "git+https://github.com/greenticai/greentic-runner?rev=b603e1b36c006e673dbaa742d2d790ee289e9d55#b603e1b36c006e673dbaa742d2d790ee289e9d55"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -3210,7 +3210,7 @@ dependencies = [
 [[package]]
 name = "greentic-runner-desktop"
 version = "1.2.0-dev.34428856459"
-source = "git+https://github.com/greenticai/greentic-runner?rev=83b2aaa526a649ea65d06b22ef1144d906ed2b68#83b2aaa526a649ea65d06b22ef1144d906ed2b68"
+source = "git+https://github.com/greenticai/greentic-runner?rev=b603e1b36c006e673dbaa742d2d790ee289e9d55#b603e1b36c006e673dbaa742d2d790ee289e9d55"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -3230,7 +3230,7 @@ dependencies = [
 [[package]]
 name = "greentic-runner-host"
 version = "1.2.0-dev.34428856459"
-source = "git+https://github.com/greenticai/greentic-runner?rev=83b2aaa526a649ea65d06b22ef1144d906ed2b68#83b2aaa526a649ea65d06b22ef1144d906ed2b68"
+source = "git+https://github.com/greenticai/greentic-runner?rev=b603e1b36c006e673dbaa742d2d790ee289e9d55#b603e1b36c006e673dbaa742d2d790ee289e9d55"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5996,7 +5996,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6648,7 +6648,7 @@ dependencies = [
 [[package]]
 name = "runner-core"
 version = "1.2.0-dev.34428856459"
-source = "git+https://github.com/greenticai/greentic-runner?rev=83b2aaa526a649ea65d06b22ef1144d906ed2b68#83b2aaa526a649ea65d06b22ef1144d906ed2b68"
+source = "git+https://github.com/greenticai/greentic-runner?rev=b603e1b36c006e673dbaa742d2d790ee289e9d55#b603e1b36c006e673dbaa742d2d790ee289e9d55"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
