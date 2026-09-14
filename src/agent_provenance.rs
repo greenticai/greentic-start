@@ -80,6 +80,35 @@ use serde_json::{Map as JsonMap, Value as JsonValue, json};
 /// that already carries `channelData` keeps every key it had.
 pub(crate) const CHANNEL_DATA_KEY: &str = "greenticProvenance";
 
+/// Second key the SAME payload is written under, for GUIs that read the
+/// platform's `rag` name rather than this module's.
+///
+/// ## Why two names and not a rename
+///
+/// `greenticProvenance` is what has shipped since this module landed, and a
+/// GUI reading it must keep working — renaming a key a partner already parses
+/// is the one change that breaks silently on their side. `rag` is the name
+/// `greentic_types`' `ext_keys::RAG` already reserves for "RAG component
+/// citations/context payload", and the name a 3Point-style chat GUI looks for.
+/// Writing both costs a clone of a small object per reply and ends a class of
+/// bug worth more than that: a payload arriving correctly under a name nobody
+/// is reading looks exactly like no payload at all. That is precisely what
+/// happened — provenance shipped on 2026-09-08 and was reported as "the reply
+/// arm delivers text only" four days later, because the panel was looking at
+/// `channelData.rag`.
+///
+/// ## What this deliberately does NOT do
+///
+/// It does not reshape the payload to any external schema. The object is
+/// byte-identical under both keys, so nothing here can drift between them. In
+/// particular there is still **no `confidence`** and no per-citation
+/// `source_type`: the first would have to be derived (see the module doc on
+/// why a derived number beside real ones reads as a measurement) and the
+/// second names a vocabulary this module does not own. If a consumer's schema
+/// requires either, that is a decision to take explicitly — not something to
+/// approximate here and hope it renders.
+pub(crate) const CHANNEL_DATA_RAG_KEY: &str = "rag";
+
 /// Shape version of the payload under [`CHANNEL_DATA_KEY`]. Bump only for a
 /// breaking change; new fields are additive and do not move it.
 pub(crate) const PROVENANCE_VERSION: u64 = 1;
@@ -131,16 +160,24 @@ pub(crate) fn attach_provenance(output: &JsonValue, envelope: &mut ChannelMessag
     };
 
     match envelope.extensions.get_mut(ext_keys::CHANNEL_DATA) {
-        // No channelData yet: this reply gets one carrying only our key.
+        // No channelData yet: this reply gets one carrying only our keys.
         None => {
             envelope.extensions.insert(
                 ext_keys::CHANNEL_DATA.to_string(),
-                json!({ CHANNEL_DATA_KEY: provenance }),
+                json!({
+                    CHANNEL_DATA_KEY: provenance,
+                    CHANNEL_DATA_RAG_KEY: provenance,
+                }),
             );
         }
         // channelData exists and is an object: merge, never clobber. A runner
-        // value that already set this key wins — it knows something we do not.
+        // value that already set either key wins — it knows something we do
+        // not, and that is decided per key: a reply carrying its own `rag`
+        // still gets `greenticProvenance`, and the reverse.
         Some(JsonValue::Object(existing)) => {
+            existing
+                .entry(CHANNEL_DATA_RAG_KEY.to_string())
+                .or_insert_with(|| provenance.clone());
             existing
                 .entry(CHANNEL_DATA_KEY.to_string())
                 .or_insert(provenance);
@@ -603,6 +640,75 @@ mod tests {
             provenance_of(&reply).expect("provenance kept")["version"],
             json!(99)
         );
+    }
+
+    /// The same object under both names — and byte-identical, so nothing can
+    /// drift between them.
+    #[test]
+    fn the_payload_is_written_under_both_keys() {
+        let output = agent_output(json!([{
+            "kind": "tool_call", "name": "rag_search", "call_id": "c1",
+            "result": { "citations": [{ "doc": "handbook", "excerpt": "x", "score": 0.9 }] }
+        }]));
+
+        let mut reply = envelope();
+        attach_provenance(&output, &mut reply);
+
+        let cd = reply
+            .extensions
+            .get(ext_keys::CHANNEL_DATA)
+            .expect("channelData");
+        let under_provenance = &cd[CHANNEL_DATA_KEY];
+        let under_rag = &cd[CHANNEL_DATA_RAG_KEY];
+
+        assert!(!under_rag.is_null(), "a GUI reading `rag` must find it");
+        assert_eq!(
+            under_provenance, under_rag,
+            "the two names must carry the same object, not two shapes"
+        );
+        assert_eq!(under_rag["tools"], json!(["rag_search"]));
+    }
+
+    /// Each key is decided on its own. A reply that already carries its own
+    /// `rag` keeps it AND still gets `greenticProvenance` — collapsing the two
+    /// into one decision would drop a payload because of an unrelated key.
+    #[test]
+    fn an_existing_rag_key_is_kept_without_costing_the_other() {
+        let output = agent_output(json!([{
+            "kind": "tool_call", "name": "rag_search", "call_id": "c1", "result": {}
+        }]));
+
+        let mut reply = envelope();
+        reply.extensions.insert(
+            ext_keys::CHANNEL_DATA.to_string(),
+            json!({ CHANNEL_DATA_RAG_KEY: { "mine": true } }),
+        );
+        attach_provenance(&output, &mut reply);
+
+        let cd = reply.extensions.get(ext_keys::CHANNEL_DATA).expect("cd");
+        assert_eq!(cd[CHANNEL_DATA_RAG_KEY]["mine"], json!(true), "runner wins");
+        assert_eq!(
+            cd[CHANNEL_DATA_KEY]["tools"],
+            json!(["rag_search"]),
+            "the other key must still be populated"
+        );
+    }
+
+    /// Nothing is invented to satisfy an external schema. Both are absent on
+    /// purpose — see `CHANNEL_DATA_RAG_KEY`'s doc comment.
+    #[test]
+    fn no_confidence_and_no_source_type_are_invented() {
+        let output = agent_output(json!([{
+            "kind": "tool_call", "name": "rag_search", "call_id": "c1",
+            "result": { "citations": [{ "doc": "d", "excerpt": "e", "score": 0.4 }] }
+        }]));
+
+        let mut reply = envelope();
+        attach_provenance(&output, &mut reply);
+        let rag = &reply.extensions[ext_keys::CHANNEL_DATA][CHANNEL_DATA_RAG_KEY];
+
+        assert!(rag.get("confidence").is_none());
+        assert!(rag["citations"][0].get("source_type").is_none());
     }
 
     /// A non-object `channelData` cannot be merged into without destroying it.
