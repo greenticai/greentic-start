@@ -368,15 +368,66 @@ fn resolve_path(base: &Path, value: &str) -> PathBuf {
     }
 }
 
-/// Tenant a runtime config assumes when neither `demo.yaml` nor the CLI names
-/// one. Was `demo`; see [`crate::DEFAULT_TENANT`] for why it is now `default`
-/// and why the constant is duplicated rather than imported from greentic-types.
+/// Environment variable naming the tenant a container-hosted runtime serves.
+///
+/// greentic-start already EXPORTS this name onto every child it spawns
+/// (`runtime::build_env`); this is the read half, so a workload that was only
+/// ever configured through the environment lands in the same namespace.
+pub const TENANT_ENV_VAR: &str = "GREENTIC_TENANT";
+
+/// Environment variable naming the team. See [`TENANT_ENV_VAR`].
+pub const TEAM_ENV_VAR: &str = "GREENTIC_TEAM";
+
+/// Tenant a runtime config assumes when neither `demo.yaml`/`bundle.yaml` nor
+/// the CLI names one. Was `demo`; see [`crate::DEFAULT_TENANT`] for why it is
+/// now `default` and why the constant is duplicated rather than imported from
+/// greentic-types.
+///
+/// Precedence, most specific first:
+///
+/// 1. `--tenant` on the CLI — applied last, in
+///    `bundle_config::apply_target_overrides`.
+/// 2. the config file (`demo.yaml`'s `tenant:`, `bundle.yaml`'s `tenant:`, or
+///    the bundle manifest's resolved target).
+/// 3. `$GREENTIC_TENANT` — this function.
+/// 4. [`crate::DEFAULT_TENANT`].
+///
+/// Serde is a sound seam for rung 3 precisely because `#[serde(default = …)]`
+/// runs ONLY when the key is absent from the document: a `demo.yaml` that says
+/// `tenant: default` explicitly still beats the environment, which is the
+/// point — the environment must never override a source a human named. Both
+/// non-serde construction sites (`DemoConfig::default()`, which
+/// `bundle_config::load_runtime_demo_config` uses as the base of the
+/// normalized-bundle path) route through here too, and both apply their own
+/// explicit sources afterwards, so the ladder holds on every path.
+///
+/// A Cloud Run or Kubernetes workload has no config file and no CLI argument:
+/// the deployer configures the container purely through the environment, so
+/// without this rung every deployed workload ran as tenant `default` whatever
+/// tenant actually owned the environment — and that string is a segment of
+/// every `secrets://` URI the runtime resolves, so a credential staged under
+/// the real tenant was never found.
 fn default_demo_tenant() -> String {
-    crate::DEFAULT_TENANT.to_string()
+    target_from_env(TENANT_ENV_VAR).unwrap_or_else(|| crate::DEFAULT_TENANT.to_string())
 }
 
+/// Team counterpart of [`default_demo_tenant`]; same ladder, reading
+/// [`TEAM_ENV_VAR`].
 fn default_demo_team() -> String {
-    crate::DEFAULT_TEAM.to_string()
+    target_from_env(TEAM_ENV_VAR).unwrap_or_else(|| crate::DEFAULT_TEAM.to_string())
+}
+
+/// Read a tenant/team name from the process environment.
+///
+/// An unset, empty or whitespace-only value is ABSENT, never a tenant named
+/// `""`: a container runtime that renders an unresolved substitution leaves an
+/// empty string behind, and honouring it would key state directories and
+/// `secrets://` URIs on nothing at all.
+fn target_from_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
 }
 
 fn default_true() -> bool {
@@ -427,18 +478,76 @@ pub(crate) fn default_events_components() -> Vec<ServiceComponentConfig> {
     Vec::new()
 }
 
+/// Serializes a test against the shared process environment's tenant/team
+/// variables and restores whatever they held on the way out, so a test that
+/// sets `GREENTIC_TENANT` cannot decide another test's answer.
+///
+/// Every assertion about a tenant or team default is env-sensitive now, so
+/// each one has to hold this — including the ones that predate the environment
+/// rung, which would otherwise read a value a parallel test set.
+#[cfg(test)]
+pub(crate) struct TargetEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Vec<(&'static str, Option<String>)>,
+}
+
+#[cfg(test)]
+impl TargetEnvGuard {
+    /// `None` means "make sure this variable is unset for the test".
+    pub(crate) fn set(tenant: Option<&str>, team: Option<&str>) -> Self {
+        let lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = vec![
+            (TENANT_ENV_VAR, std::env::var(TENANT_ENV_VAR).ok()),
+            (TEAM_ENV_VAR, std::env::var(TEAM_ENV_VAR).ok()),
+        ];
+        // SAFETY: `test_env_lock` serializes every env mutation in this
+        // crate's tests, and `Drop` restores the previous values.
+        unsafe {
+            apply_target_env(TENANT_ENV_VAR, tenant);
+            apply_target_env(TEAM_ENV_VAR, team);
+        }
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TargetEnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.previous {
+            // SAFETY: still holding `test_env_lock`.
+            unsafe { apply_target_env(name, value.as_deref()) }
+        }
+    }
+}
+
+/// # Safety
+/// Callers must hold `crate::test_env_lock()`.
+#[cfg(test)]
+unsafe fn apply_target_env(name: &str, value: Option<&str>) {
+    match value {
+        Some(value) => unsafe { std::env::set_var(name, value) },
+        None => unsafe { std::env::remove_var(name) },
+    }
+}
+
 #[cfg(test)]
 mod tenant_default_tests {
     use super::*;
 
-    /// The tenant the runtime uses when neither `demo.yaml` nor the CLI names
-    /// one. This is the value that ends up in `state/runtime/<tenant.team>/`,
-    /// in `GREENTIC_TENANT`, and in every `secrets://` URI the run resolves.
-    /// It was `demo` while greentic-deployer and greentic-setup bound bundles
-    /// under `default`, so the server ran in one namespace and served
-    /// deployments from another.
+    /// The tenant the runtime uses when neither `demo.yaml`, the environment,
+    /// nor the CLI names one. This is the value that ends up in
+    /// `state/runtime/<tenant.team>/`, in `GREENTIC_TENANT`, and in every
+    /// `secrets://` URI the run resolves. It was `demo` while greentic-deployer
+    /// and greentic-setup bound bundles under `default`, so the server ran in
+    /// one namespace and served deployments from another.
     #[test]
     fn runtime_config_defaults_to_the_fleet_tenant_not_demo() {
+        let _env = TargetEnvGuard::set(None, None);
         let config = DemoConfig::default();
         assert_eq!(config.tenant, "default");
         assert_ne!(config.tenant, "demo");
@@ -450,9 +559,90 @@ mod tenant_default_tests {
     /// `Default::default()`.
     #[test]
     fn a_demo_yaml_without_tenant_keys_gets_the_same_defaults() {
+        let _env = TargetEnvGuard::set(None, None);
         let config: DemoConfig =
             serde_yaml_bw::from_str("services: {}\n").expect("minimal demo.yaml parses");
         assert_eq!(config.tenant, "default");
+        assert_eq!(config.team, "default");
+    }
+
+    /// Rung 3 beats rung 4. A Cloud Run or Kubernetes workload gets no config
+    /// file and no CLI argument, so without this the deployed runtime resolves
+    /// `secrets://default/default/…` whatever tenant owns the environment.
+    #[test]
+    fn the_environment_names_the_tenant_when_nothing_else_does() {
+        let _env = TargetEnvGuard::set(Some("aws"), Some("platform"));
+        let config = DemoConfig::default();
+        assert_eq!(config.tenant, "aws");
+        assert_eq!(config.team, "platform");
+    }
+
+    /// The same rung, reached through serde rather than through
+    /// `Default::default()` — a `demo.yaml` that omits the keys.
+    #[test]
+    fn a_demo_yaml_without_tenant_keys_falls_through_to_the_environment() {
+        let _env = TargetEnvGuard::set(Some("aws"), Some("platform"));
+        let config: DemoConfig =
+            serde_yaml_bw::from_str("services: {}\n").expect("minimal demo.yaml parses");
+        assert_eq!(config.tenant, "aws");
+        assert_eq!(config.team, "platform");
+    }
+
+    /// Rung 2 beats rung 3. Anything a human or a config file names has to keep
+    /// winning, or this change silently re-targets working deployments in order
+    /// to fix a broken one.
+    #[test]
+    fn a_config_file_beats_the_environment() {
+        let _env = TargetEnvGuard::set(Some("aws"), Some("platform"));
+        let config: DemoConfig = serde_yaml_bw::from_str("tenant: acme\nteam: support\n")
+            .expect("demo.yaml naming a target parses");
+        assert_eq!(config.tenant, "acme");
+        assert_eq!(config.team, "support");
+    }
+
+    /// And it keeps winning when what it names happens to BE the default —
+    /// `#[serde(default = "…")]` runs only on an absent key, so this is a
+    /// deliberate choice of `default`, not a fall-through to the environment.
+    #[test]
+    fn a_config_file_naming_the_default_still_beats_the_environment() {
+        let _env = TargetEnvGuard::set(Some("aws"), Some("platform"));
+        let config: DemoConfig = serde_yaml_bw::from_str("tenant: default\nteam: default\n")
+            .expect("demo.yaml naming the default parses");
+        assert_eq!(config.tenant, "default");
+        assert_eq!(config.team, "default");
+    }
+
+    /// An empty or whitespace-only variable is ABSENT, not a tenant named `""`.
+    /// A container runtime that renders an unresolved substitution leaves an
+    /// empty string behind, and keying state directories and `secrets://` URIs
+    /// on nothing at all is worse than the default.
+    #[test]
+    fn an_empty_or_blank_environment_value_is_absent() {
+        let _env = TargetEnvGuard::set(Some(""), Some("   "));
+        let config = DemoConfig::default();
+        assert_eq!(config.tenant, "default");
+        assert_eq!(config.team, "default");
+    }
+
+    /// Surrounding whitespace is stripped rather than carried into the path
+    /// segment — `state/runtime/< aws .default>/` is not a directory anyone
+    /// meant to create.
+    #[test]
+    fn a_padded_environment_value_is_trimmed() {
+        let _env = TargetEnvGuard::set(Some("  aws  "), Some("\tplatform\n"));
+        let config = DemoConfig::default();
+        assert_eq!(config.tenant, "aws");
+        assert_eq!(config.team, "platform");
+    }
+
+    /// The two variables are independent rungs: naming only the tenant must not
+    /// drag the team off its default, or a half-configured deployment lands in
+    /// a namespace neither side chose.
+    #[test]
+    fn the_tenant_and_team_variables_are_read_independently() {
+        let _env = TargetEnvGuard::set(Some("aws"), None);
+        let config = DemoConfig::default();
+        assert_eq!(config.tenant, "aws");
         assert_eq!(config.team, "default");
     }
 }
