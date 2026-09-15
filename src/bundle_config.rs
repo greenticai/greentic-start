@@ -621,6 +621,7 @@ mod tests {
 
     #[test]
     fn load_runtime_demo_config_infers_normalized_bundle_target() {
+        let _env = crate::config::TargetEnvGuard::set(None, None);
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path();
         std::fs::write(bundle.join("bundle.yaml"), "bundle_id: demo-bundle\n").expect("bundle");
@@ -644,6 +645,7 @@ mod tests {
 
     #[test]
     fn load_runtime_demo_config_applies_cli_target_overrides() {
+        let _env = crate::config::TargetEnvGuard::set(None, None);
         let temp = tempfile::tempdir().expect("tempdir");
         let bundle = temp.path();
         std::fs::write(bundle.join("bundle.yaml"), "bundle_id: demo-bundle\n").expect("bundle");
@@ -694,5 +696,103 @@ mod tests {
 
         assert_eq!(config.services.gateway.listen_addr, "0.0.0.0");
         assert_eq!(config.services.gateway.port, 18080);
+    }
+
+    /// A normalized bundle carrying no tenant of its own — which is what a
+    /// Cloud Run or Kubernetes revision boots from — takes the target the
+    /// deployer projected onto the container.
+    #[test]
+    fn load_runtime_demo_config_takes_the_target_from_the_environment() {
+        let _env = crate::config::TargetEnvGuard::set(Some("aws"), Some("platform"));
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        std::fs::write(bundle.join("bundle.yaml"), "bundle_id: demo-bundle\n").expect("bundle");
+        let request = make_test_request(Some(&bundle.display().to_string()));
+        let paths = DemoPaths {
+            config_path: bundle.join("bundle.yaml"),
+            root_dir: bundle.to_path_buf(),
+            state_dir: bundle.join("state"),
+            config_source: DemoConfigSource::NormalizedBundle,
+        };
+
+        let config = load_runtime_demo_config(&paths, &request).expect("config");
+        assert_eq!(config.tenant, "aws");
+        assert_eq!(config.team, "platform");
+    }
+
+    /// Rung 1 beats rung 3: `--tenant` is an explicit instruction and must not
+    /// be overridden by whatever the container's environment happens to say.
+    #[test]
+    fn load_runtime_demo_config_prefers_cli_targets_over_the_environment() {
+        let _env = crate::config::TargetEnvGuard::set(Some("aws"), Some("platform"));
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        std::fs::write(bundle.join("bundle.yaml"), "bundle_id: demo-bundle\n").expect("bundle");
+        let mut request = make_test_request(Some(&bundle.display().to_string()));
+        request.tenant = Some("tenant-a".to_string());
+        request.team = Some("team-b".to_string());
+        let paths = DemoPaths {
+            config_path: bundle.join("bundle.yaml"),
+            root_dir: bundle.to_path_buf(),
+            state_dir: bundle.join("state"),
+            config_source: DemoConfigSource::NormalizedBundle,
+        };
+
+        let config = load_runtime_demo_config(&paths, &request).expect("config");
+        assert_eq!(config.tenant, "tenant-a");
+        assert_eq!(config.team, "team-b");
+    }
+
+    /// Rung 2 beats rung 3 on this path too: a `bundle.yaml` that names a
+    /// target keeps winning, so adding the environment rung cannot re-target a
+    /// bundle that already worked.
+    #[test]
+    fn load_runtime_demo_config_prefers_bundle_yaml_over_the_environment() {
+        let _env = crate::config::TargetEnvGuard::set(Some("aws"), Some("platform"));
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        std::fs::write(
+            bundle.join("bundle.yaml"),
+            "bundle_id: demo-bundle\ntenant: acme\nteam: support\n",
+        )
+        .expect("bundle");
+        let request = make_test_request(Some(&bundle.display().to_string()));
+        let paths = DemoPaths {
+            config_path: bundle.join("bundle.yaml"),
+            root_dir: bundle.to_path_buf(),
+            state_dir: bundle.join("state"),
+            config_source: DemoConfigSource::NormalizedBundle,
+        };
+
+        let config = load_runtime_demo_config(&paths, &request).expect("config");
+        assert_eq!(config.tenant, "acme");
+        assert_eq!(config.team, "support");
+    }
+
+    /// And so does the bundle manifest's own resolved target, which is the
+    /// other rung-2 source on this path. A bundle that was built for a tenant
+    /// states so; the environment is the answer for one that states nothing.
+    #[test]
+    fn load_runtime_demo_config_prefers_the_inferred_target_over_the_environment() {
+        let _env = crate::config::TargetEnvGuard::set(Some("aws"), Some("platform"));
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path();
+        std::fs::write(bundle.join("bundle.yaml"), "bundle_id: demo-bundle\n").expect("bundle");
+        std::fs::write(
+            bundle.join("bundle-manifest.json"),
+            r#"{"resolved_targets":[{"tenant":"acme","team":"support"}]}"#,
+        )
+        .expect("manifest");
+        let request = make_test_request(Some(&bundle.display().to_string()));
+        let paths = DemoPaths {
+            config_path: bundle.join("bundle.yaml"),
+            root_dir: bundle.to_path_buf(),
+            state_dir: bundle.join("state"),
+            config_source: DemoConfigSource::NormalizedBundle,
+        };
+
+        let config = load_runtime_demo_config(&paths, &request).expect("config");
+        assert_eq!(config.tenant, "acme");
+        assert_eq!(config.team, "support");
     }
 }
