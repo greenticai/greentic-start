@@ -397,7 +397,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "aw-event-bridge"
 version = "1.2.0-dev.34428856459"
-source = "git+https://github.com/greenticai/greentic-runner?rev=ccb75a18d31a5d477321589d2cee0bc0f76b1969#ccb75a18d31a5d477321589d2cee0bc0f76b1969"
+source = "git+https://github.com/greenticai/greentic-runner?rev=b661e139fa1b6ccce61738798cbc369599d42cfd#b661e139fa1b6ccce61738798cbc369599d42cfd"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -2585,7 +2585,7 @@ dependencies = [
 [[package]]
 name = "greentic-aw-runtime"
 version = "1.2.0-dev.34428856459"
-source = "git+https://github.com/greenticai/greentic-runner?rev=ccb75a18d31a5d477321589d2cee0bc0f76b1969#ccb75a18d31a5d477321589d2cee0bc0f76b1969"
+source = "git+https://github.com/greenticai/greentic-runner?rev=b661e139fa1b6ccce61738798cbc369599d42cfd#b661e139fa1b6ccce61738798cbc369599d42cfd"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -3210,7 +3210,7 @@ dependencies = [
 [[package]]
 name = "greentic-runner-desktop"
 version = "1.2.0-dev.34428856459"
-source = "git+https://github.com/greenticai/greentic-runner?rev=ccb75a18d31a5d477321589d2cee0bc0f76b1969#ccb75a18d31a5d477321589d2cee0bc0f76b1969"
+source = "git+https://github.com/greenticai/greentic-runner?rev=b661e139fa1b6ccce61738798cbc369599d42cfd#b661e139fa1b6ccce61738798cbc369599d42cfd"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -3230,7 +3230,7 @@ dependencies = [
 [[package]]
 name = "greentic-runner-host"
 version = "1.2.0-dev.34428856459"
-source = "git+https://github.com/greenticai/greentic-runner?rev=ccb75a18d31a5d477321589d2cee0bc0f76b1969#ccb75a18d31a5d477321589d2cee0bc0f76b1969"
+source = "git+https://github.com/greenticai/greentic-runner?rev=b661e139fa1b6ccce61738798cbc369599d42cfd#b661e139fa1b6ccce61738798cbc369599d42cfd"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6648,7 +6648,7 @@ dependencies = [
 [[package]]
 name = "runner-core"
 version = "1.2.0-dev.34428856459"
-source = "git+https://github.com/greenticai/greentic-runner?rev=ccb75a18d31a5d477321589d2cee0bc0f76b1969#ccb75a18d31a5d477321589d2cee0bc0f76b1969"
+source = "git+https://github.com/greenticai/greentic-runner?rev=b661e139fa1b6ccce61738798cbc369599d42cfd#b661e139fa1b6ccce61738798cbc369599d42cfd"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
