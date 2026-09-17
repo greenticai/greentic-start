@@ -201,6 +201,66 @@ struct DlClaims {
     ctx: DlContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     conv: Option<String>,
+    /// Every other claim on the token — `groups`, `role`, `teams`, `email`,
+    /// `name`, whatever the issuer put there.
+    ///
+    /// Without this the re-mint below dropped all of them, so an identity
+    /// provider's roles and groups never reached the provider's second look at
+    /// the token (greentic-start#584). They are only ever read out of a token
+    /// whose HMAC signature has ALREADY verified against the provider's own
+    /// signing key ([`parse_token`]), so they are exactly as trustworthy as
+    /// `sub` — never request input.
+    ///
+    /// On deserialize, serde routes the named fields above into their own
+    /// slots, so a reserved name can only appear here when a value is built by
+    /// hand; [`carried_extra_claims`] strips those anyway before signing.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    extra: serde_json::Map<String, Value>,
+}
+
+/// Claims whose meaning greentic-start or the provider owns. They are never
+/// copied from [`DlClaims::extra`]: the named fields are re-stamped by
+/// [`mint_token`], and letting an extra with the same name through would
+/// serialize a duplicate key — which parsers resolve differently — or, for
+/// `jti`, replay a single-use id onto a new token.
+const RESERVED_CLAIMS: &[&str] = &[
+    "iss", "aud", "sub", "iat", "nbf", "exp", "jti", "ctx", "conv",
+];
+
+/// Upper bound on the serialized size of the carried extra claims. The token
+/// travels in an `Authorization` header on every poll, and common proxies
+/// refuse headers past ~8 KiB; an issuer that stuffs hundreds of groups into
+/// its token must not turn every Direct Line request into a 431.
+const MAX_EXTRA_CLAIMS_BYTES: usize = 4096;
+
+/// The extra claims a re-minted token carries: reserved names removed, and the
+/// whole set dropped (with a warning) when it exceeds
+/// [`MAX_EXTRA_CLAIMS_BYTES`].
+///
+/// Over the cap it drops ALL of them rather than truncating. A truncated
+/// `groups` array, or `role` kept while `groups` is lost, would hand a
+/// downstream authorisation check a partial identity that looks complete;
+/// an absent claim is an answer every consumer already has to handle.
+fn carried_extra_claims(extra: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    let carried: serde_json::Map<String, Value> = extra
+        .iter()
+        .filter(|(name, _)| !RESERVED_CLAIMS.contains(&name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let size = serde_json::to_vec(&carried)
+        .map(|b| b.len())
+        .unwrap_or(usize::MAX);
+    if size > MAX_EXTRA_CLAIMS_BYTES {
+        crate::operator_log::warn(
+            module_path!(),
+            format!(
+                "directline re-mint: dropping {} extra claim(s) ({size} bytes > {MAX_EXTRA_CLAIMS_BYTES} byte cap); the renewed token carries only sub/ctx/conv",
+                carried.len()
+            ),
+        );
+        return serde_json::Map::new();
+    }
+    carried
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,7 +299,8 @@ fn parse_token(token: &str, key: &[u8]) -> Result<DlClaims, TokenError> {
     serde_json::from_slice::<DlClaims>(&payload_bytes).map_err(|_| TokenError::Malformed)
 }
 
-/// Mint a fresh DirectLine JWT carrying the same `sub`/`ctx`/`conv` as
+/// Mint a fresh DirectLine JWT carrying the same `sub`/`ctx`/`conv` — and the
+/// same non-reserved extra claims (see [`carried_extra_claims`]) — as
 /// `template`, with `iat = nbf = now` and `exp = now + ttl_secs`, signed with
 /// `key`. The provider validates it like any token it issued itself.
 fn mint_token(template: &DlClaims, key: &[u8], ttl_secs: u64) -> String {
@@ -253,6 +314,7 @@ fn mint_token(template: &DlClaims, key: &[u8], ttl_secs: u64) -> String {
         exp: now + ttl_secs as i64,
         ctx: template.ctx.clone(),
         conv: template.conv.clone(),
+        extra: carried_extra_claims(&template.extra),
     };
     let header_enc = URL_SAFE_NO_PAD.encode(JOSE_HEADER);
     let payload_enc =
@@ -702,6 +764,7 @@ mod tests {
                 team: None,
             },
             conv: conv.map(str::to_string),
+            extra: serde_json::Map::new(),
         };
         let header_enc = URL_SAFE_NO_PAD.encode(JOSE_HEADER);
         let payload_enc = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
@@ -744,6 +807,139 @@ mod tests {
         assert!(!sessions.is_alive("c1"));
         sessions.touch("");
         assert_eq!(sessions.tracked(), 0);
+    }
+
+    /// Sign an arbitrary JSON payload, so a test can put claims on a token that
+    /// `DlClaims` would not produce itself (duplicates, `jti`, IdP claims).
+    fn sign_raw(payload: &Value, key: &[u8]) -> String {
+        let header_enc = URL_SAFE_NO_PAD.encode(JOSE_HEADER);
+        let payload_enc = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap());
+        let signing_input = format!("{header_enc}.{payload_enc}");
+        let sig = URL_SAFE_NO_PAD.encode(hs256(&signing_input, key));
+        format!("{signing_input}.{sig}")
+    }
+
+    fn payload_of(token: &str) -> Value {
+        let payload = token.split('.').nth(1).unwrap();
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap()
+    }
+
+    fn idp_token(extra: Value, key: &[u8]) -> String {
+        let now = now_secs();
+        let mut payload = json!({
+            "iss": TOKEN_ISS, "aud": TOKEN_AUD, "sub": "alice",
+            "iat": now, "nbf": now, "exp": now + 1800,
+            "ctx": { "env": "default", "tenant": "demo", "team": "sales" },
+            "conv": "conv-1",
+        });
+        for (name, value) in extra.as_object().unwrap() {
+            payload[name] = value.clone();
+        }
+        sign_raw(&payload, key)
+    }
+
+    #[test]
+    fn re_mint_carries_the_identity_providers_extra_claims() {
+        let token = idp_token(
+            json!({
+                "groups": ["engineering", "admins"],
+                "role": "owner",
+                "teams": ["sales"],
+                "email": "alice@example.com",
+                "name": "Alice",
+            }),
+            KEY,
+        );
+        let claims = parse_token(&token, KEY).unwrap();
+        let minted = mint_token(&claims, KEY, 1800);
+        let reparsed = parse_token(&minted, KEY).unwrap();
+
+        assert_eq!(reparsed.sub, "alice");
+        assert_eq!(reparsed.ctx.team.as_deref(), Some("sales"));
+        assert_eq!(reparsed.extra["groups"], json!(["engineering", "admins"]));
+        assert_eq!(reparsed.extra["role"], json!("owner"));
+        assert_eq!(reparsed.extra["teams"], json!(["sales"]));
+        assert_eq!(reparsed.extra["email"], json!("alice@example.com"));
+        assert_eq!(reparsed.extra["name"], json!("Alice"));
+
+        // And the renewed token the preflight hands upstream carries them too.
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        let Preflight::Forward(plan) = preflight(
+            &Method::POST,
+            "/v3/directline/conversations/conv-1/activities",
+            &auth(&token),
+            Some(KEY),
+            &sessions,
+        ) else {
+            panic!("expected forward");
+        };
+        let rewritten = plan.rewrite_authorization.unwrap();
+        let forwarded = payload_of(rewritten.strip_prefix("Bearer ").unwrap());
+        assert_eq!(forwarded["groups"], json!(["engineering", "admins"]));
+        assert_eq!(forwarded["role"], json!("owner"));
+    }
+
+    #[test]
+    fn reserved_claims_cannot_be_spoofed_through_extras() {
+        // A template built by hand whose extras shadow every reserved name.
+        let token = make_token("alice", Some("conv-1"), 100, 200, KEY);
+        let mut claims = parse_token(&token, KEY).unwrap();
+        for name in RESERVED_CLAIMS {
+            claims.extra.insert((*name).to_string(), json!("forged"));
+        }
+        claims.extra.insert("role".to_string(), json!("owner"));
+
+        let minted = mint_token(&claims, KEY, 1800);
+        let payload = payload_of(&minted);
+        let raw = String::from_utf8(
+            URL_SAFE_NO_PAD
+                .decode(minted.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(payload["sub"], json!("alice"));
+        assert_eq!(payload["iss"], json!(TOKEN_ISS));
+        assert_eq!(payload["aud"], json!(TOKEN_AUD));
+        assert_eq!(payload["conv"], json!("conv-1"));
+        assert_eq!(payload["ctx"]["tenant"], json!("demo"));
+        assert!(payload["exp"].as_i64().unwrap() > now_secs());
+        assert!(payload.get("jti").is_none(), "jti must not be replayed");
+        assert_eq!(payload["role"], json!("owner"));
+        // No duplicate keys in the signed bytes.
+        for name in ["\"sub\"", "\"iss\"", "\"exp\"", "\"conv\"", "\"ctx\""] {
+            assert_eq!(raw.matches(name).count(), 1, "duplicate {name} in {raw}");
+        }
+    }
+
+    #[test]
+    fn an_inbound_jti_is_not_copied_onto_the_renewed_token() {
+        let token = idp_token(json!({ "jti": "once-only", "role": "owner" }), KEY);
+        let claims = parse_token(&token, KEY).unwrap();
+        let payload = payload_of(&mint_token(&claims, KEY, 1800));
+        assert!(payload.get("jti").is_none());
+        assert_eq!(payload["role"], json!("owner"));
+    }
+
+    #[test]
+    fn oversized_extra_claims_are_dropped_whole_not_truncated() {
+        let groups: Vec<String> = (0..500).map(|i| format!("group-number-{i}")).collect();
+        let token = idp_token(json!({ "groups": groups, "role": "owner" }), KEY);
+        let claims = parse_token(&token, KEY).unwrap();
+        let payload = payload_of(&mint_token(&claims, KEY, 1800));
+        assert!(payload.get("groups").is_none());
+        assert!(payload.get("role").is_none());
+        assert_eq!(payload["sub"], json!("alice"));
+        assert_eq!(payload["conv"], json!("conv-1"));
+    }
+
+    #[test]
+    fn extra_claims_on_a_token_with_a_bad_signature_are_never_read() {
+        let token = idp_token(json!({ "role": "owner" }), b"someone-elses-key");
+        assert!(matches!(
+            parse_token(&token, KEY),
+            Err(TokenError::BadSignature)
+        ));
     }
 
     #[test]
