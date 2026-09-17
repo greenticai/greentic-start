@@ -35,6 +35,38 @@ pub struct RunRequest {
     pub entry_node: Option<String>,
 }
 
+/// Fallback user id for a run with no verified caller: a local `gtc start`
+/// session, an event or hook with no human behind it, or a messaging provider
+/// that predates the `extensions.caller` contract. It is a placeholder, not an
+/// identity — nothing should authorise on it.
+const ANONYMOUS_LOCAL_USER_ID: &str = "developer";
+
+/// The verified caller's `sub`, from the block a messaging provider stamps at
+/// `extensions.caller` after verifying the bearer token (the contract
+/// greentic-runner#760/#762 reads).
+///
+/// Looked for on the channel envelope — `input.extensions` for the messaging
+/// app lane, which wraps the envelope, or `extensions` when the payload IS the
+/// envelope — and nowhere else. Never from a root-level `caller`, and never
+/// from `metadata`: those are shapes a flow or an upstream producer can write,
+/// while the extensions map is what the provider component owns.
+///
+/// Only a block with `user_verified: true` and a non-empty string `sub`
+/// counts. An unverified or malformed block yields `None`, which falls back to
+/// [`ANONYMOUS_LOCAL_USER_ID`] — the restrictive direction.
+fn verified_caller_user_id(input: &JsonValue) -> Option<String> {
+    ["/input/extensions/caller", "/extensions/caller"]
+        .iter()
+        .filter_map(|pointer| input.pointer(pointer))
+        .find(|block| block.is_object())
+        .filter(|block| block.get("user_verified").and_then(JsonValue::as_bool) == Some(true))
+        .and_then(|block| block.get("sub"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|sub| !sub.is_empty())
+        .map(str::to_string)
+}
+
 pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> {
     // Ensure flow.log is initialized in bundle's logs directory
     let _ = crate::flow_log::init(&request.root.join("logs"));
@@ -142,11 +174,13 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
             .join(&request.flow_id),
     );
     let components_map = component_overrides_from_env();
+    let user_id = verified_caller_user_id(&request.input)
+        .unwrap_or_else(|| ANONYMOUS_LOCAL_USER_ID.to_string());
     let opts = RunOptions {
         profile: Profile::Dev(DevProfile {
             tenant_id: request.tenant.clone(),
             team_id: team.clone(),
-            user_id: "developer".to_string(),
+            user_id: user_id.clone(),
             ..DevProfile::default()
         }),
         entry_flow: Some(request.flow_id.clone()),
@@ -155,7 +189,7 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
         ctx: TenantContext {
             tenant_id: Some(request.tenant),
             team_id: Some(team),
-            user_id: Some("developer".to_string()),
+            user_id: Some(user_id),
             session_id: session_id.clone(),
         },
         mocks: MocksConfig {
@@ -266,10 +300,39 @@ fn write_run_artifacts(run_dir: &Path, result: &RunResult) -> anyhow::Result<()>
 
 #[cfg(test)]
 mod tests {
+    use super::verified_caller_user_id;
     use super::{RunRequest, run_provider_pack_flow};
     use crate::domains::Domain;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::path::PathBuf;
+
+    #[test]
+    fn caller_id_comes_from_the_verified_envelope_caller() {
+        let wrapped = json!({
+            "input": { "extensions": { "caller": { "user_verified": true, "sub": "alice" } } },
+            "tenant": "demo",
+        });
+        assert_eq!(verified_caller_user_id(&wrapped).as_deref(), Some("alice"));
+
+        let bare = json!({ "extensions": { "caller": { "user_verified": true, "sub": "bob" } } });
+        assert_eq!(verified_caller_user_id(&bare).as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn no_verified_caller_falls_back_to_the_placeholder() {
+        for input in [
+            json!({ "input": { "text": "hi" } }),
+            json!({ "input": { "extensions": { "caller": { "user_verified": false, "sub": "alice" } } } }),
+            json!({ "input": { "extensions": { "caller": { "user_verified": true } } } }),
+            json!({ "input": { "extensions": { "caller": { "user_verified": true, "sub": "  " } } } }),
+            json!({ "input": { "extensions": { "caller": "alice" } } }),
+            // Positions a flow or producer can write are not the provider's.
+            json!({ "caller": { "user_verified": true, "sub": "mallory" } }),
+            json!({ "input": { "metadata": { "caller": { "user_verified": true, "sub": "mallory" } } } }),
+        ] {
+            assert_eq!(verified_caller_user_id(&input), None, "input: {input}");
+        }
+    }
 
     #[test]
     #[ignore = "requires local /tmp ollama repro artifacts"]
