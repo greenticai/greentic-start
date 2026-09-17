@@ -381,11 +381,16 @@ pub(crate) async fn activate_runtime_config(
             revision_id,
         };
         let pack_paths: Vec<PathBuf> = pack_refs.iter().map(|r| r.path.clone()).collect();
-        scoped_routes.extend(discover_revision_routes(
-            &pack_paths,
-            &scope,
-            &meta.path_prefixes,
-        ));
+        let mut revision_routes =
+            discover_revision_routes(&pack_paths, &scope, &meta.path_prefixes);
+        // Carry each pack's deploy-time setup answers onto its routes so
+        // provider dispatch can put them in `HttpInV1.config` (#585) — the
+        // runner host only reaches them through the runtime-config import,
+        // which a provider's `ingest_http` does not read.
+        for route in &mut revision_routes {
+            route.pack_non_secret = non_secret_by_pack_id.get(&route.pack_id).cloned();
+        }
+        scoped_routes.extend(revision_routes);
         static_plan.merge(discover_revision_static_routes(
             &pack_paths,
             &scope,

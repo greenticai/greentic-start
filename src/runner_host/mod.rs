@@ -459,7 +459,7 @@ impl DemoRunnerHost {
     }
 }
 
-fn secret_read_uris(
+pub(crate) fn secret_read_uris(
     env: &str,
     tenant: &str,
     team: Option<&str>,
@@ -481,7 +481,7 @@ fn secret_read_uris(
     }
 }
 
-fn is_secret_not_found(err: &impl std::fmt::Display) -> bool {
+pub(crate) fn is_secret_not_found(err: &impl std::fmt::Display) -> bool {
     let err_str = err.to_string();
     err_str.contains("not found")
         || err_str.contains("NotFound")

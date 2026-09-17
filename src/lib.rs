@@ -85,6 +85,7 @@ mod revision_dispatcher;
 mod revision_drain;
 pub mod revision_health_gate;
 mod revision_pin;
+mod revision_provider_config;
 mod revision_pull;
 mod revision_reload;
 mod revision_secrets;
