@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
 use greentic_deploy_spec::{BundleId, DeploymentId, RevisionId};
@@ -63,6 +64,12 @@ pub struct HttpRouteDescriptor {
     /// Deployment/bundle/revision this route belongs to, or `None` for a
     /// legacy single-bundle route (every route discovered today).
     pub scope: Option<RevisionScope>,
+    /// The revision's pinned `pack-config.v1.non_secret` map for this route's
+    /// pack — the deploy-time setup answers. Stamped by revision activation so
+    /// provider dispatch can hand them to the provider as `HttpInV1.config`
+    /// (see [`crate::revision_provider_config`]). `None` for legacy routes and
+    /// for packs whose revision carries no non-secret config.
+    pub pack_non_secret: Option<Arc<BTreeMap<String, serde_json::Value>>>,
     /// Parsed segments from the pattern for matching.
     segments: Vec<RouteSegment>,
 }
@@ -112,6 +119,7 @@ pub(crate) fn descriptor_for_test(
         domain,
         pack_path: PathBuf::from("<test-pack>"),
         scope,
+        pack_non_secret: None,
         segments: parse_route_pattern(pattern),
     }
 }
@@ -135,6 +143,7 @@ pub(crate) fn provider_descriptor_for_test(
         domain: Domain::Messaging,
         pack_path: PathBuf::from("<test-pack>"),
         scope: Some(scope),
+        pack_non_secret: None,
         segments: parse_route_pattern(pattern),
     }
 }
@@ -523,6 +532,7 @@ fn parse_http_routes_v1(
             // Single-bundle discovery: no deployment provenance. B4's
             // runtime-config-backed discovery stamps `Some(..)`.
             scope: None,
+            pack_non_secret: None,
             segments,
         });
     }
@@ -675,6 +685,7 @@ fn synthesize_provider_routes_from_manifest(
                 domain: Domain::Messaging,
                 pack_path: pack_path.to_path_buf(),
                 scope: Some(scope.clone()),
+                pack_non_secret: None,
                 segments,
             });
         }

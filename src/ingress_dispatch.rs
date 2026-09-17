@@ -19,7 +19,7 @@ use crate::post_ingress_hooks::apply_post_ingress_hooks_dispatch;
 use crate::provider_config_envelope::read_provider_config_envelope;
 use crate::runner_host::{DemoRunnerHost, OperatorContext};
 use crate::secret_requirements::{answer_key_is_secret, secret_answer_keys_for_pack};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn dispatch_http_ingress(
     runner_host: &DemoRunnerHost,
@@ -217,6 +217,10 @@ fn provider_ingress_body_json(request: &IngressRequestV1) -> anyhow::Result<Stri
 ///
 /// The function reads secret requirements from the provider's pack and fetches all required
 /// secrets, injecting them into the config as base64-encoded values with `_b64` suffix.
+///
+/// The non-secret half is [`ProviderConfigDraft::resolve`], shared with the
+/// revision-serve path ([`crate::revision_provider_config`]) so the two
+/// ingress lanes cannot disagree about what a provider's `config` holds.
 pub(crate) fn build_injected_config(
     runner_host: &DemoRunnerHost,
     domain: Domain,
@@ -228,49 +232,16 @@ pub(crate) fn build_injected_config(
         return Ok(None);
     };
 
-    let mut config_map = serde_json::Map::new();
+    let mut draft = ProviderConfigDraft::resolve(&ProviderConfigSources {
+        bundle_root: Some(runner_host.bundle_root()),
+        pack_path,
+        provider,
+        pack_non_secret: None,
+    })?;
 
-    // Secret-marked keys, derived from the SAME source the producer redacts
-    // from (form `secret:true` + secret-requirements). Computed up front so
-    // the config-value injection below can SKIP them: after B12a the envelope
-    // carries `secrets://` URI references for secret keys, and a stale bundle
-    // may still carry plaintext in setup-answers.json. Either way we must NOT
-    // base64-encode that into `<key>_b64` — the contains_key guard on the
-    // fetch loop would then skip the real `get_secret` and hand the component
-    // a base64'd URI (or stale plaintext) instead of the resolved secret.
-    let secret_keys = secret_answer_keys_for_pack(pack_path, provider);
-
-    // Prefer already-materialized runtime config over live secret-store reads.
-    // This keeps hot ingress paths off the dev-store for cloud targets like AWS.
-    let mut envelope_config =
-        load_provider_config_from_envelope(runner_host.bundle_root(), provider);
-    let mut setup_answers = load_provider_setup_answers(runner_host.bundle_root(), provider);
-
-    // Path 3: substitute any `ext://<path>[/<instance>]` config value with the
-    // bound extension's resolved config/answers blob before it is encoded for
-    // the component — the open-namespace analogue of the `secrets://`
-    // resolution below. Fail-closed: a value naming an unbound extension errors
-    // the ingress rather than handing the component an opaque `ext://` string.
-    resolve_ext_refs_in_sources(&mut envelope_config, &mut setup_answers)?;
-
-    if let Some(envelope_config) = &envelope_config {
-        inject_config_values(&mut config_map, envelope_config, &secret_keys);
-    }
-    if let Some(setup_answers) = &setup_answers {
-        inject_config_values(&mut config_map, setup_answers, &secret_keys);
-    }
-    inject_runtime_env_config(&mut config_map, provider);
-
-    for key in &secret_keys {
-        let key_b64 = format!("{key}_b64");
-        if config_map.contains_key(&key_b64) {
-            continue;
-        }
-        match runner_host.get_secret(provider, key, ctx) {
-            Ok(Some(bytes)) => {
-                // Store as base64-encoded value with _b64 suffix
-                config_map.insert(key_b64, JsonValue::String(STANDARD.encode(&bytes)));
-            }
+    for key in draft.secret_keys_to_fetch() {
+        match runner_host.get_secret(provider, &key, ctx) {
+            Ok(Some(bytes)) => draft.insert_secret(&key, &bytes),
             Ok(None) => {
                 operator_log::debug(
                     module_path!(),
@@ -290,10 +261,122 @@ pub(crate) fn build_injected_config(
         }
     }
 
-    if !config_map.is_empty() {
-        Ok(Some(JsonValue::Object(config_map)))
-    } else {
-        Ok(None)
+    Ok(draft.into_config())
+}
+
+/// Where a provider's injected config is read from.
+pub(crate) struct ProviderConfigSources<'a> {
+    /// Bundle root holding `.providers/` envelopes and
+    /// `state/config/<provider>/setup-answers.json`. `None` when no extracted
+    /// bundle sits behind the pack (a revision pack staged without one).
+    pub bundle_root: Option<&'a Path>,
+    /// The provider's `.gtpack`; its setup form decides which keys are secret.
+    pub pack_path: &'a Path,
+    /// Provider id: the `.providers/` / `state/config/` directory name and the
+    /// secret-store provider segment.
+    pub provider: &'a str,
+    /// The revision's pinned `pack-config.v1.non_secret` map for this pack
+    /// (revision-serve only). Layered over the bundle files.
+    pub pack_non_secret: Option<&'a BTreeMap<String, JsonValue>>,
+}
+
+/// A provider's `HttpInV1.config` with its non-secret values resolved and its
+/// secrets still to be fetched.
+///
+/// Split this way because the two callers read secrets differently — the
+/// legacy host synchronously through `DemoRunnerHost::get_secret`, the
+/// revision path asynchronously from the runner host's secrets manager — while
+/// everything else about the config must be identical.
+#[derive(Debug)]
+pub(crate) struct ProviderConfigDraft {
+    config_map: JsonMap<String, JsonValue>,
+    secret_keys: BTreeSet<String>,
+}
+
+impl ProviderConfigDraft {
+    /// Resolve every non-secret source, in increasing precedence: config
+    /// envelope, setup answers, pinned pack-config, runtime env overrides.
+    ///
+    /// Errors only when an `ext://` reference cannot be resolved (fail-closed).
+    pub(crate) fn resolve(sources: &ProviderConfigSources<'_>) -> anyhow::Result<Self> {
+        let provider = sources.provider;
+        let mut config_map = serde_json::Map::new();
+
+        // Secret-marked keys, derived from the SAME source the producer redacts
+        // from (form `secret:true` + secret-requirements). Computed up front so
+        // the config-value injection below can SKIP them: after B12a the envelope
+        // carries `secrets://` URI references for secret keys, and a stale bundle
+        // may still carry plaintext in setup-answers.json. Either way we must NOT
+        // base64-encode that into `<key>_b64` — the contains_key guard on the
+        // fetch loop would then skip the real `get_secret` and hand the component
+        // a base64'd URI (or stale plaintext) instead of the resolved secret.
+        let secret_keys = secret_answer_keys_for_pack(sources.pack_path, provider);
+
+        // Prefer already-materialized runtime config over live secret-store reads.
+        // This keeps hot ingress paths off the dev-store for cloud targets like AWS.
+        let mut envelope_config = sources
+            .bundle_root
+            .and_then(|root| load_provider_config_from_envelope(root, provider));
+        let mut setup_answers = sources
+            .bundle_root
+            .and_then(|root| load_provider_setup_answers(root, provider));
+        let mut pack_non_secret = sources.pack_non_secret.map(|map| {
+            JsonValue::Object(
+                map.iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            )
+        });
+
+        // Path 3: substitute any `ext://<path>[/<instance>]` config value with the
+        // bound extension's resolved config/answers blob before it is encoded for
+        // the component — the open-namespace analogue of the `secrets://`
+        // resolution below. Fail-closed: a value naming an unbound extension errors
+        // the ingress rather than handing the component an opaque `ext://` string.
+        resolve_ext_refs_in_sources(&mut [
+            &mut envelope_config,
+            &mut setup_answers,
+            &mut pack_non_secret,
+        ])?;
+
+        for source in [&envelope_config, &setup_answers, &pack_non_secret]
+            .into_iter()
+            .flatten()
+        {
+            inject_config_values(&mut config_map, source, &secret_keys);
+        }
+        inject_runtime_env_config(&mut config_map, provider);
+
+        Ok(Self {
+            config_map,
+            secret_keys,
+        })
+    }
+
+    /// Secret keys whose `<key>_b64` value is not already present.
+    pub(crate) fn secret_keys_to_fetch(&self) -> Vec<String> {
+        self.secret_keys
+            .iter()
+            .filter(|key| !self.config_map.contains_key(&format!("{key}_b64")))
+            .cloned()
+            .collect()
+    }
+
+    /// Store a fetched secret as `<key>_b64`.
+    pub(crate) fn insert_secret(&mut self, key: &str, bytes: &[u8]) {
+        self.config_map.insert(
+            format!("{key}_b64"),
+            JsonValue::String(STANDARD.encode(bytes)),
+        );
+    }
+
+    /// The finished config, or `None` when nothing was resolved.
+    pub(crate) fn into_config(self) -> Option<JsonValue> {
+        if self.config_map.is_empty() {
+            None
+        } else {
+            Some(JsonValue::Object(self.config_map))
+        }
     }
 }
 
@@ -302,13 +385,10 @@ pub(crate) fn build_injected_config(
 /// (the env-store read stays off the common ingress path, which carries none).
 /// Fail-closed — a stale or invalid reference is an error, never a
 /// pass-through. See [`crate::extension_resolver`].
-fn resolve_ext_refs_in_sources(
-    envelope_config: &mut Option<JsonValue>,
-    setup_answers: &mut Option<JsonValue>,
-) -> anyhow::Result<()> {
-    let any_ext_ref = [envelope_config.as_ref(), setup_answers.as_ref()]
-        .into_iter()
-        .flatten()
+fn resolve_ext_refs_in_sources(sources: &mut [&mut Option<JsonValue>]) -> anyhow::Result<()> {
+    let any_ext_ref = sources
+        .iter()
+        .filter_map(|source| source.as_ref())
         .filter_map(JsonValue::as_object)
         .any(crate::extension_resolver::map_has_ext_ref);
     if !any_ext_ref {
@@ -325,10 +405,10 @@ fn resolve_ext_refs_in_sources(
     let environment = EnvironmentStore::load(&store, &env_typed)
         .with_context(|| format!("loading environment `{env_id}` for ext:// resolution"))?;
 
-    // One memo across both sources: the same `ext://` ref under several keys
-    // (or in both envelope and setup-answers) reads its blob once per ingress.
+    // One memo across all sources: the same `ext://` ref under several keys
+    // (or in several sources) reads its blob once per ingress.
     let mut resolved = std::collections::HashMap::new();
-    for source in [envelope_config, setup_answers] {
+    for source in sources.iter_mut() {
         if let Some(map) = source.as_mut().and_then(JsonValue::as_object_mut) {
             crate::extension_resolver::rewrite_ext_refs(
                 map,

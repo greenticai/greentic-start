@@ -4481,6 +4481,7 @@ async fn dispatch_provider_route(
     // the request signature; cloned here because `route_match` borrows the
     // activation's route table.
     let descriptor_pack_path = route_match.descriptor.pack_path.clone();
+    let descriptor_pack_non_secret = route_match.descriptor.pack_non_secret.clone();
     let provider_op = route_match.descriptor.provider_op.clone();
     let route_tenant = route_match.tenant.clone();
     let route_team = route_match.team.clone();
@@ -4755,6 +4756,34 @@ async fn dispatch_provider_route(
     // welcome_flow on first contact.
     let welcome_hint = flow_target.clone().or(welcome_hint);
 
+    // Deploy-time provider answers (#585): resolved exactly as the legacy host
+    // resolves them, after every admission gate above so a refused request
+    // does no secret reads.
+    let provider_config = crate::revision_provider_config::resolve_revision_provider_config(
+        &secrets,
+        crate::revision_provider_config::RevisionProviderPack {
+            pack_id: descriptor_pack_id.clone(),
+            pack_path: descriptor_pack_path.clone(),
+            pack_non_secret: descriptor_pack_non_secret,
+        },
+        tenant,
+        Some(&route_team),
+    )
+    .await
+    .map_err(|err| {
+        operator_log::error(
+            module_path!(),
+            format!(
+                "could not resolve config for provider {provider_type} \
+                 (deployment {deployment_id} revision {revision_id}): {err:#}"
+            ),
+        );
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provider config could not be resolved",
+        )
+    })?;
+
     let http_in = build_provider_http_in(
         &provider_type,
         tenant,
@@ -4763,6 +4792,7 @@ async fn dispatch_provider_route(
         &dl_query_pairs,
         &dl_headers,
         body,
+        provider_config,
     );
     let input_json = serde_json::to_vec(&http_in).map_err(|err| {
         error_response(
@@ -5358,10 +5388,10 @@ fn collect_forwarded_request_headers(headers: &HeaderMap) -> Vec<(String, String
 
 /// Build the [`HttpInV1`] wire envelope a `greentic.provider-extension.v1`
 /// component expects on `ingest_http`. Mirrors the shape the legacy ingress
-/// builds in [`crate::ingress_dispatch::build_ingress_request`], minus the
-/// pack-level config injection (Phase D revision-aware config injection is
-/// follow-up work — components that need secrets read them from the host
-/// directly today).
+/// builds in [`crate::ingress_dispatch::build_ingress_request`]; `config` is
+/// resolved by [`crate::revision_provider_config`] the same way the legacy
+/// host resolves it.
+#[allow(clippy::too_many_arguments)]
 fn build_provider_http_in(
     provider: &str,
     tenant: &str,
@@ -5370,6 +5400,7 @@ fn build_provider_http_in(
     query: &[(String, String)],
     headers: &[(String, String)],
     body: &[u8],
+    config: Option<Value>,
 ) -> HttpInV1 {
     HttpInV1 {
         v: 1,
@@ -5383,7 +5414,7 @@ fn build_provider_http_in(
         query: query.to_vec(),
         headers: headers.to_vec(),
         body_b64: BASE64.encode(body),
-        config: None,
+        config,
     }
 }
 
@@ -5855,16 +5886,20 @@ struct RevisionActivitySource {
     team: String,
     /// Bearer token captured at WS upgrade time.
     auth_token: Option<String>,
+    /// The provider's `HttpInV1.config`, resolved once at upgrade time from
+    /// the pinned revision (#585). A revision's pack-config cannot change
+    /// under a live socket; a new deploy is a new revision.
+    config: Option<Value>,
 }
 
-#[async_trait::async_trait]
-impl crate::websocket::pump::ActivitySource for RevisionActivitySource {
-    async fn fetch_since(
+impl RevisionActivitySource {
+    /// The `HttpInV1` the pump sends to read activities past `since_watermark`.
+    fn activities_poll_payload(
         &self,
         tenant_id: &str,
         conversation_id: &str,
         since_watermark: u64,
-    ) -> Result<(Vec<Value>, u64), String> {
+    ) -> Value {
         let headers: Vec<Value> = match &self.auth_token {
             Some(token) if !token.is_empty() => {
                 vec![serde_json::json!([
@@ -5874,7 +5909,7 @@ impl crate::websocket::pump::ActivitySource for RevisionActivitySource {
             }
             _ => Vec::new(),
         };
-        let payload = serde_json::json!({
+        serde_json::json!({
             "v": 1,
             "provider": self.provider_type,
             "route": Value::Null,
@@ -5886,8 +5921,20 @@ impl crate::websocket::pump::ActivitySource for RevisionActivitySource {
             "query": format!("watermark={since_watermark}&tenant={tenant_id}&team={}", self.team),
             "headers": headers,
             "body_b64": "",
-            "config": Value::Null,
-        });
+            "config": self.config.clone().unwrap_or(Value::Null),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::websocket::pump::ActivitySource for RevisionActivitySource {
+    async fn fetch_since(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        since_watermark: u64,
+    ) -> Result<(Vec<Value>, u64), String> {
+        let payload = self.activities_poll_payload(tenant_id, conversation_id, since_watermark);
         let input_json = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
 
         // Try canonical `ingest-http` op, then fall back to the underscore
@@ -6077,6 +6124,44 @@ async fn handle_websocket_upgrade(
         Err(err) => return Ok(crate::websocket::refusal_response(&err)),
     };
 
+    // Resolve the provider's config from the pinned revision (#585), after
+    // the token check so an unauthenticated upgrade does no secret reads.
+    let revision_scope = RevisionScope {
+        deployment_id,
+        bundle_id: bundle_id.clone(),
+        revision_id,
+    };
+    let provider_pack = activation
+        .routing
+        .http_routes
+        .match_request_for_revision(effective_ws_path, "GET", &revision_scope)
+        .map(|route| {
+            crate::revision_provider_config::RevisionProviderPack::from_descriptor(route.descriptor)
+        });
+    let provider_config = match provider_pack {
+        Some(pack) => crate::revision_provider_config::resolve_revision_provider_config(
+            &activation.host.secrets_manager(),
+            pack,
+            &tenant,
+            Some(team),
+        )
+        .await
+        .map_err(|err| {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "could not resolve config for provider {provider_type} \
+                     (deployment {deployment_id} revision {revision_id}): {err:#}"
+                ),
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "provider config could not be resolved",
+            )
+        })?,
+        None => None,
+    };
+
     // Acquire a session slot.
     let guard = match state.session_manager.acquire(&tenant, &conv_id) {
         Ok(g) => g,
@@ -6124,6 +6209,7 @@ async fn handle_websocket_upgrade(
                 provider_type,
                 team: team.to_string(),
                 auth_token,
+                config: provider_config,
             })
         };
     #[cfg(not(test))]
@@ -6136,6 +6222,7 @@ async fn handle_websocket_upgrade(
             provider_type,
             team: team.to_string(),
             auth_token,
+            config: provider_config,
         });
 
     let notifier = state.notifier.clone();
@@ -7124,6 +7211,7 @@ mod tests {
             &query,
             &headers,
             br#"{"update_id":42}"#,
+            None,
         );
         assert_eq!(http_in.provider, "messaging.telegram.bot");
         assert_eq!(http_in.tenant_hint.as_deref(), Some("acme"));
@@ -7132,6 +7220,93 @@ mod tests {
         assert_eq!(http_in.headers, headers);
         assert_eq!(http_in.query.len(), 2);
         assert_eq!(http_in.body_b64, BASE64.encode(br#"{"update_id":42}"#));
+    }
+
+    /// #585: deploy-time provider answers ride the ingress envelope instead
+    /// of being dropped as `config: None`.
+    #[tokio::test]
+    async fn provider_ingress_carries_the_stored_setup_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("revisions/r1/bundle");
+        let pack_dir = bundle.join("providers/messaging");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(bundle.join("bundle-manifest.json"), b"{}").unwrap();
+        let pack_path = pack_dir.join("messaging-provider-under-test.gtpack");
+        std::fs::write(&pack_path, b"not a real pack").unwrap();
+        let answers_dir = bundle.join("state/config/messaging-provider-under-test");
+        std::fs::create_dir_all(&answers_dir).unwrap();
+        std::fs::write(
+            answers_dir.join("setup-answers.json"),
+            br#"{"auto_start_on_open": true}"#,
+        )
+        .unwrap();
+        let secrets = test_host().secrets_manager();
+
+        let config = crate::revision_provider_config::resolve_revision_provider_config(
+            &secrets,
+            crate::revision_provider_config::RevisionProviderPack {
+                pack_id: "messaging-provider-under-test".to_string(),
+                pack_path,
+                pack_non_secret: None,
+            },
+            "acme",
+            Some("default"),
+        )
+        .await
+        .unwrap();
+        let http_in = build_provider_http_in(
+            "messaging.provider.under-test",
+            "acme",
+            "POST",
+            "/v3/directline/conversations",
+            &[],
+            &[],
+            b"{}",
+            config,
+        );
+
+        let config = http_in.config.expect("setup answers reach HttpInV1.config");
+        assert_eq!(
+            config["auto_start_on_open_b64"],
+            json!(BASE64.encode("true")),
+        );
+    }
+
+    /// #585: the WebSocket pump's activity poll carries the same config.
+    fn test_host() -> std::sync::Arc<RunnerHost> {
+        std::sync::Arc::new(
+            greentic_runner_host::HostBuilder::new()
+                .with_config(greentic_runner_host::HostConfig::from_gtbind(
+                    greentic_runner_host::TenantBindings {
+                        tenant: "acme".to_string(),
+                        packs: Vec::new(),
+                        env_passthrough: Vec::new(),
+                    },
+                ))
+                .build()
+                .expect("build test host"),
+        )
+    }
+
+    #[test]
+    fn activity_poll_payload_carries_the_resolved_config() {
+        let host = test_host();
+        let config = json!({"auto_start_on_open_b64": BASE64.encode("true")});
+        let source = RevisionActivitySource {
+            host,
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("bundle-a"),
+            revision_id: RevisionId::new(),
+            provider_type: "messaging.webchat.gui".to_string(),
+            team: "default".to_string(),
+            auth_token: None,
+            config: Some(config.clone()),
+        };
+
+        let payload = source.activities_poll_payload("acme", "conv-1", 7);
+
+        assert_eq!(payload["config"], config);
+        assert_eq!(payload["method"], "GET");
     }
 
     #[test]
@@ -7149,6 +7324,7 @@ mod tests {
             &pairs,
             &[],
             b"{}",
+            None,
         );
         assert_eq!(
             http_in.query,

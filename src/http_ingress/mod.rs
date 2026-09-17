@@ -2307,6 +2307,16 @@ impl websocket::RunnerHostHandle for DemoRunnerHost {
             }
             _ => Vec::new(),
         };
+        let ctx = OperatorContext {
+            tenant: tenant.to_string(),
+            team: Some(team.to_string()),
+            correlation_id: None,
+        };
+        // Same config the ingress resolves (#585): without it the provider's
+        // deploy-time answers vanish on every poll the pump makes.
+        let config =
+            crate::ingress_dispatch::build_injected_config(self, Domain::Messaging, provider, &ctx)
+                .map_err(|err| format!("resolve config for provider {provider}: {err:#}"))?;
         let payload = serde_json::json!({
             "v": 1,
             "provider": provider,
@@ -2319,14 +2329,9 @@ impl websocket::RunnerHostHandle for DemoRunnerHost {
             "query": format!("watermark={watermark}&tenant={tenant}&team={team}"),
             "headers": headers,
             "body_b64": "",
-            "config": serde_json::Value::Null,
+            "config": config.unwrap_or(serde_json::Value::Null),
         });
         let payload_bytes = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
-        let ctx = OperatorContext {
-            tenant: tenant.to_string(),
-            team: Some(team.to_string()),
-            correlation_id: None,
-        };
         // The webchat provider exposes its directline routing under the
         // generic `ingest_http` op (with hyphen alias). Try the canonical
         // name first, then fall back to the underscore alias used by older
