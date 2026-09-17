@@ -328,7 +328,8 @@ tokio = { version = "1", features = ["test-util"] }
 # reports, if at all, as its own feature being switched off), #760/#762 (an
 # extension tool receiving the caller the SESSION established rather than the
 # one the model composed) and #761 (a configured endpoint making an empty LLM
-# key legitimate, instead of falling onto a client that cannot reach it).
+# key legitimate, instead of falling onto a client that cannot reach it), and
+# #766/#768 (a component.exec invocation is told the verified caller).
 #
 # The dependency REQUIREMENTS above are deliberately untouched: their floor is
 # documented as an API floor and must not be lowered. greentic-runner#758
@@ -343,5 +344,5 @@ tokio = { version = "1", features = ["test-util"] }
 # TO UNWIND once publishing is restored: delete this block and run
 # cargo update -p greentic-runner-host -p greentic-runner-desktop
 [patch.crates-io]
-greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "ccb75a18d31a5d477321589d2cee0bc0f76b1969" }
-greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "ccb75a18d31a5d477321589d2cee0bc0f76b1969" }
+greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "b661e139fa1b6ccce61738798cbc369599d42cfd" }
+greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "b661e139fa1b6ccce61738798cbc369599d42cfd" }
