@@ -4898,12 +4898,10 @@ async fn dispatch_provider_route(
             apply_directline_forward_plan_to_response(&state, plan, &mut response);
         }
 
-        // streamUrl rewrite: the provider returns a relative path, but
-        // DirectLineJS requires an absolute ws:// URL.
-        if dl_method == "POST"
-            && (dl_path == "/v3/directline/conversations" || dl_path.ends_with("/conversations"))
-            && (200..300).contains(&response.status)
-        {
+        let succeeded = (200..300).contains(&response.status);
+        let creates_conversation = is_conversation_create(&dl_method, &dl_path);
+
+        if succeeded && creates_conversation {
             // Pin the newly created conversation to the revision that
             // created it. POST /conversations has no conversation_id in
             // the URL yet, so the pre-dispatch session_hint was None
@@ -4919,13 +4917,26 @@ async fn dispatch_provider_route(
                     .commit_pin(tenant, deployment_id, &hint, revision_id)
                     .await;
             }
+        }
 
+        // streamUrl rewrite: the provider returns a relative path, but
+        // DirectLineJS requires an absolute ws:// URL that routes back through
+        // the same bundle. BOTH responses that carry one need it: the create,
+        // and the reconnect (`GET /conversations/{id}`) DirectLineJS issues
+        // whenever its socket drops — which Cloud Run does at its request
+        // timeout. Rewriting only the create left the reconnect answering a
+        // tenant-scoped URL with no bundle segment; on a bundle-routed
+        // deployment that URL 404s, the client retries it forever, and every
+        // reply after the first socket drop is silently undeliverable.
+        if succeeded && returns_stream_url(&dl_method, &dl_path) {
             rewrite_stream_url(
                 &dl_headers,
                 &mut response,
                 webchat_target.and_then(super::webchat_routing::WebchatTarget::url_bundle_segment),
             );
+        }
 
+        if succeeded && creates_conversation {
             // Cache the post-rewrite response for conversation dedup.
             if let Some(key) = dl_dedup_key {
                 state.conversation_dedup.insert(key, response.clone());
@@ -5656,7 +5667,30 @@ fn apply_directline_forward_plan_to_response(
     }
 }
 
-/// Rewrite a relative `streamUrl` in a `POST /conversations` response body
+/// `POST .../conversations` — starts a DirectLine conversation.
+fn is_conversation_create(method: &str, path: &str) -> bool {
+    method == "POST" && (path == "/v3/directline/conversations" || path.ends_with("/conversations"))
+}
+
+/// Whether a successful DirectLine response carries a `streamUrl`: the create
+/// (`POST .../conversations`) and the reconnect (`GET .../conversations/{id}`).
+/// Activity and stream paths (`.../conversations/{id}/activities`, `/stream`)
+/// carry none.
+fn returns_stream_url(method: &str, path: &str) -> bool {
+    if is_conversation_create(method, path) {
+        return true;
+    }
+    if method != "GET" {
+        return false;
+    }
+    let Some(idx) = path.rfind("/conversations/") else {
+        return false;
+    };
+    let conversation_id = &path[idx + "/conversations/".len()..];
+    !conversation_id.is_empty() && !conversation_id.contains('/')
+}
+
+/// Rewrite a relative `streamUrl` in a conversation create or reconnect response body
 /// to an absolute `ws://` URL using the request's `Host` header. DirectLineJS
 /// requires an absolute URL on the WebSocket constructor; a relative path
 /// makes the SDK fall back to HTTP polling.
@@ -8783,6 +8817,96 @@ mod tests {
             body["streamUrl"],
             "ws://127.0.0.1:8080/v1/messaging/webchat/default/legal/v3/directline/conversations/abc123/stream?watermark=-1&t=TOKEN",
             "the bundle segment belongs before /v3/directline, not in front of an already tenant-scoped path"
+        );
+    }
+
+    #[test]
+    fn stream_url_is_returned_by_create_and_reconnect_only() {
+        // Create and reconnect both answer with a streamUrl, and both must be
+        // rewritten — rewriting only the create is what broke every
+        // bundle-routed webchat after its first socket drop.
+        assert!(returns_stream_url("POST", "/v3/directline/conversations"));
+        assert!(returns_stream_url(
+            "POST",
+            "/v1/messaging/webchat/default/v3/directline/conversations"
+        ));
+        assert!(returns_stream_url(
+            "GET",
+            "/v3/directline/conversations/13704d81-f98b-4108-96fe-f2e429648925"
+        ));
+        assert!(returns_stream_url(
+            "GET",
+            "/v1/messaging/webchat/default/v3/directline/conversations/abc123"
+        ));
+
+        assert!(!returns_stream_url("GET", "/v3/directline/conversations"));
+        assert!(!returns_stream_url("GET", "/v3/directline/conversations/"));
+        assert!(!returns_stream_url(
+            "GET",
+            "/v3/directline/conversations/abc123/activities"
+        ));
+        assert!(!returns_stream_url(
+            "GET",
+            "/v3/directline/conversations/abc123/stream"
+        ));
+        assert!(!returns_stream_url(
+            "POST",
+            "/v3/directline/conversations/abc123/activities"
+        ));
+        assert!(!returns_stream_url(
+            "POST",
+            "/v3/directline/tokens/generate"
+        ));
+    }
+
+    #[test]
+    fn only_the_create_pins_and_dedups() {
+        // The reconnect gets the rewrite but must not re-pin the revision or
+        // overwrite the create's dedup cache entry.
+        assert!(is_conversation_create(
+            "POST",
+            "/v3/directline/conversations"
+        ));
+        assert!(!is_conversation_create(
+            "GET",
+            "/v3/directline/conversations/abc123"
+        ));
+    }
+
+    #[test]
+    fn reconnect_stream_url_keeps_the_bundle_segment() {
+        // The exact body a bundle-routed Cloud Run deployment answered a
+        // reconnect with on 2026-09-17: tenant-scoped, no bundle segment. The
+        // browser resolved it against the page origin and 404'd on every retry.
+        let headers = vec![
+            (
+                "Host".to_string(),
+                "gtc-svc-01m2j1dmm4qmbqhk6qgtc28w86-zhwr2khniq-ew.a.run.app".to_string(),
+            ),
+            ("X-Forwarded-Proto".to_string(), "https".to_string()),
+        ];
+        let mut response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "conversationId": "13704d81",
+                    "expires_in": 86400,
+                    "streamUrl": "/v1/messaging/webchat/default/v3/directline/conversations/13704d81/stream?watermark=-1&t=TOKEN"
+                }))
+                .unwrap(),
+            ),
+        };
+        assert!(returns_stream_url(
+            "GET",
+            "/v1/messaging/webchat/default/v3/directline/conversations/13704d81"
+        ));
+        rewrite_stream_url(&headers, &mut response, Some("/freddies-freight-challenge"));
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["streamUrl"],
+            "wss://gtc-svc-01m2j1dmm4qmbqhk6qgtc28w86-zhwr2khniq-ew.a.run.app/v1/messaging/webchat/default/freddies-freight-challenge/v3/directline/conversations/13704d81/stream?watermark=-1&t=TOKEN",
         );
     }
 
