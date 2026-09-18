@@ -693,6 +693,7 @@ impl DemoRunnerHost {
         provider_id: &str,
         headers_json: String,
         body_json: String,
+        config: Option<JsonValue>,
         ctx: &OperatorContext,
     ) -> anyhow::Result<Option<FlowOutcome>> {
         let Some(pack) = self.catalog.get(&(domain, provider_id.to_string())) else {
@@ -713,6 +714,7 @@ impl DemoRunnerHost {
             &[IngressExtensionCall {
                 headers_json,
                 body_json,
+                config,
             }],
         ) {
             // One call in, one result out — but take it without indexing, so a
@@ -749,11 +751,28 @@ impl DemoRunnerHost {
 }
 
 /// One `handle-webhook` invocation: the headers/body JSON pair the component
-/// receives.
+/// receives, plus the provider's resolved config.
+///
+/// `config` reaches the component only through `provider:common/ingress@0.0.3`,
+/// whose `handle-webhook` takes a third `config-json` argument (`null` when this
+/// is `None`). A component that exports only `@0.0.2` is called with headers and
+/// body, and the config is dropped — that export has nowhere to put it.
 #[derive(Clone, Debug)]
 pub(crate) struct IngressExtensionCall {
     pub headers_json: String,
     pub body_json: String,
+    pub config: Option<JsonValue>,
+}
+
+/// The configured ingress contract. Preferred whenever the component exports it.
+const INGRESS_EXPORT_WITH_CONFIG: &str = "provider:common/ingress@0.0.3";
+/// The original contract, kept as the fallback for components built before 0.0.3.
+const INGRESS_EXPORT: &str = "provider:common/ingress@0.0.2";
+
+/// Which `handle-webhook` the instantiated component exposes.
+enum IngressHandle {
+    WithConfig(TypedFunc<(String, String, String), (Result<String, String>,)>),
+    HeadersAndBody(TypedFunc<(String, String), (Result<String, String>,)>),
 }
 
 /// Instantiate a pack's `messaging.provider_ingress.v1` component once and run
@@ -830,23 +849,10 @@ pub(crate) fn invoke_pack_ingress_extension(
         let store_state = ComponentState::new(host_state, Arc::new(RunnerWasiPolicy::default()))?;
         let mut store = Store::new(&engine, store_state);
         let instance = linker.instantiate(&mut store, &component)?;
-        let ingress_index = instance
-            .get_export_index(&mut store, None, "provider:common/ingress@0.0.2")
-            .context("get provider-common ingress export")?;
-        let handle_index = instance
-            .get_export_index(&mut store, Some(&ingress_index), &extension.export_name)
-            .with_context(|| format!("get {} export", extension.export_name))?;
-        let handle: TypedFunc<(String, String), (Result<String, String>,)> = instance
-            .get_typed_func(&mut store, handle_index)
-            .map_err(|err| anyhow!("get typed handle-webhook function: {err}"))?;
+        let handle = resolve_ingress_handle(&instance, &mut store, &extension.export_name)?;
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
-            let (result,) = handle
-                .call(
-                    &mut store,
-                    (call.headers_json.clone(), call.body_json.clone()),
-                )
-                .map_err(|err| anyhow!("call provider-common handle-webhook: {err}"))?;
+            let result = call_ingress_handle(&handle, &mut store, call)?;
             results.push(
                 result.map(|output| {
                     serde_json::from_str(&output).unwrap_or(JsonValue::String(output))
@@ -855,6 +861,75 @@ pub(crate) fn invoke_pack_ingress_extension(
         }
         anyhow::Ok(results)
     })
+}
+
+/// Find the component's `handle-webhook`, preferring the configured contract.
+///
+/// A component whose `@0.0.3` export exists but does not type-check is treated
+/// as not having it: falling back to `@0.0.2` still serves the webhook, which is
+/// the point — config is an improvement to a request, never a reason to fail it.
+fn resolve_ingress_handle<T: 'static>(
+    instance: &wasmtime::component::Instance,
+    store: &mut Store<T>,
+    export_name: &str,
+) -> anyhow::Result<IngressHandle> {
+    if let Some(interface) =
+        instance.get_export_index(&mut *store, None, INGRESS_EXPORT_WITH_CONFIG)
+        && let Some(func) = instance.get_export_index(&mut *store, Some(&interface), export_name)
+    {
+        match instance.get_typed_func::<(String, String, String), (Result<String, String>,)>(
+            &mut *store,
+            func,
+        ) {
+            Ok(handle) => return Ok(IngressHandle::WithConfig(handle)),
+            Err(err) => operator_log::warn(
+                module_path!(),
+                format!(
+                    "{INGRESS_EXPORT_WITH_CONFIG} {export_name} has an unexpected signature, \
+                     falling back to {INGRESS_EXPORT}: {err}"
+                ),
+            ),
+        }
+    }
+    let interface = instance
+        .get_export_index(&mut *store, None, INGRESS_EXPORT)
+        .context("get provider-common ingress export")?;
+    let func = instance
+        .get_export_index(&mut *store, Some(&interface), export_name)
+        .with_context(|| format!("get {export_name} export"))?;
+    let handle = instance
+        .get_typed_func::<(String, String), (Result<String, String>,)>(&mut *store, func)
+        .map_err(|err| anyhow!("get typed handle-webhook function: {err}"))?;
+    Ok(IngressHandle::HeadersAndBody(handle))
+}
+
+/// Run one call; the outer `Err` is a trap, the inner one the component's own error.
+fn call_ingress_handle<T: 'static>(
+    handle: &IngressHandle,
+    store: &mut Store<T>,
+    call: &IngressExtensionCall,
+) -> anyhow::Result<Result<String, String>> {
+    let (result,) = match handle {
+        IngressHandle::WithConfig(handle) => handle.call(
+            &mut *store,
+            (
+                call.headers_json.clone(),
+                call.body_json.clone(),
+                ingress_config_json(call.config.as_ref()),
+            ),
+        ),
+        IngressHandle::HeadersAndBody(handle) => handle.call(
+            &mut *store,
+            (call.headers_json.clone(), call.body_json.clone()),
+        ),
+    }
+    .map_err(|err| anyhow!("call provider-common handle-webhook: {err}"))?;
+    Ok(result)
+}
+
+/// The `config-json` argument: the config object, or JSON `null` when there is none.
+fn ingress_config_json(config: Option<&JsonValue>) -> String {
+    config.map_or_else(|| "null".to_string(), JsonValue::to_string)
 }
 
 fn operation_is_provider_common_subscription(op_id: &str) -> bool {
@@ -1068,6 +1143,10 @@ struct PackComponentJson {
     #[serde(default)]
     wasm: Option<String>,
 }
+
+#[cfg(test)]
+#[path = "ingress_contract_tests.rs"]
+mod ingress_contract_tests;
 
 #[cfg(test)]
 mod tests {
