@@ -68,7 +68,7 @@ once_cell = "1.21"
 open = "5"
 opentelemetry = { version = "0.32", features = ["logs"] }
 opentelemetry-appender-tracing = "0.32"
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-blocking-client"] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "logs"] }
 rand = "0.10"
 redis = { version = "1", features = [
@@ -315,6 +315,7 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 # Must stay byte-identical to the [dependencies] pin above (see its comment):
 # a differing requirement here resolves a second greentic-llm for test builds.
 greentic-llm = { version = "=1.3.1-research.0", features = ["test-mock"] }
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 tokio = { version = "1", features = ["test-util"] }
 wat = "1"
 

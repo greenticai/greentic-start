@@ -1882,7 +1882,7 @@ fn init_trace_log(
     let otlp_layer = resolved
         .as_ref()
         .and_then(|r| match otlp_telemetry::install_layer(r) {
-            Ok(layer) => Some(layer),
+            Ok((layer, _providers)) => Some(layer),
             Err(err) => {
                 operator_log::warn(
                     module_path!(),

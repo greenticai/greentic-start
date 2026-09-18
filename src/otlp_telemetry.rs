@@ -9,20 +9,23 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use opentelemetry::global;
+use opentelemetry::logs::Severity;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
-use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::logs::LogExporter as SdkLogExporter;
+use opentelemetry_sdk::logs::{LogBatch, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::Temporality;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
-use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter as SdkSpanExporter};
 use tokio::runtime::Handle;
 
 use crate::bundle_config::BundleTelemetryConfig;
+use crate::otlp_status::{self, Signal};
 
 /// Resolved telemetry settings after merging bundle.yaml with env-var overrides.
 #[derive(Clone, Debug)]
@@ -87,9 +90,57 @@ pub(crate) fn resolve(
     })
 }
 
+/// The three OTel provider handles `install_layer` builds, handed back to the
+/// caller so it can flush/shut them down on graceful shutdown (Task 3). Each
+/// field is a cheap `Arc`-backed clone: the tracer is also cloned into
+/// `opentelemetry::global`, the logger's clone lives inside the returned
+/// layer's [`OpenTelemetryTracingBridge`], and the meter is cloned into
+/// `opentelemetry::global` too — so dropping this struct alone never shuts a
+/// provider down (see the module tests / task report for the drop-semantics
+/// check this relies on).
+///
+/// Not yet wired up: `install_layer`'s caller only destructures the tuple
+/// today to keep `init_trace_log` compiling. Task 3 (the flush guard) reads
+/// `meter` and calls `shutdown`, so `#[allow(dead_code)]` covers the gap
+/// until then — same reasoning as `otlp_status`'s module-level allow.
+#[allow(dead_code)]
+pub(crate) struct OtlpProviders {
+    pub tracer: SdkTracerProvider,
+    pub logger: SdkLoggerProvider,
+    pub meter: SdkMeterProvider,
+}
+
+impl OtlpProviders {
+    /// Shuts down all three providers, bounding each to `timeout`. A failure
+    /// is logged (redacted) but never propagated — shutdown must not block or
+    /// fail process exit.
+    #[allow(dead_code)]
+    pub(crate) fn shutdown(&self, timeout: Duration) {
+        if let Err(e) = self.tracer.shutdown_with_timeout(timeout) {
+            tracing::warn!(
+                "OTLP tracer shutdown error: {}",
+                otlp_status::redact(&e.to_string())
+            );
+        }
+        if let Err(e) = self.logger.shutdown_with_timeout(timeout) {
+            tracing::warn!(
+                "OTLP logger shutdown error: {}",
+                otlp_status::redact(&e.to_string())
+            );
+        }
+        if let Err(e) = self.meter.shutdown_with_timeout(timeout) {
+            tracing::warn!(
+                "OTLP meter shutdown error: {}",
+                otlp_status::redact(&e.to_string())
+            );
+        }
+    }
+}
+
 /// Install the global OTel tracer + meter + logger providers for the given
-/// config and return a single combined `tracing-subscriber` layer that fans
-/// events to BOTH the span tracer and the OTLP log exporter.
+/// config and return a combined `tracing-subscriber` layer that fans events
+/// to BOTH the span tracer and the OTLP log exporter, plus the provider
+/// handles themselves so the caller can flush/shut them down later.
 ///
 /// Tonic transports require a running Tokio runtime; this function spins up a
 /// dedicated multi-thread runtime when none is current and intentionally leaks
@@ -101,7 +152,10 @@ pub(crate) fn resolve(
 /// reach the tonic client via a captured runtime handle.
 pub(crate) fn install_layer<S>(
     resolved: &ResolvedTelemetry,
-) -> Result<Box<dyn tracing_subscriber::Layer<S> + Send + Sync + 'static>>
+) -> Result<(
+    Box<dyn tracing_subscriber::Layer<S> + Send + Sync + 'static>,
+    OtlpProviders,
+)>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
 {
@@ -133,19 +187,37 @@ where
     let tracer_layer = tracing_opentelemetry::layer().with_tracer(tracer);
     let logger_layer = OpenTelemetryTracingBridge::new(&providers.logger);
 
-    Ok(tracer_layer.and_then(logger_layer).boxed())
+    Ok((tracer_layer.and_then(logger_layer).boxed(), providers))
 }
 
-struct Providers {
-    tracer: SdkTracerProvider,
-    logger: SdkLoggerProvider,
+/// Rewrites a base OTLP/HTTP endpoint to carry the per-signal path (per the
+/// OTLP/HTTP spec, `/v1/traces`, `/v1/logs`, `/v1/metrics`), unless the
+/// operator already configured a custom, non-root path — which is kept
+/// verbatim. gRPC endpoints are returned unchanged: gRPC has no per-signal
+/// path, only a service/method on the one channel.
+fn signal_endpoint(base: &str, exporter: ExporterKind, path: &str) -> String {
+    if exporter != ExporterKind::OtlpHttp {
+        return base.to_string();
+    }
+    let authority_start = base.find("://").map(|i| i + 3).unwrap_or(0);
+    let authority_and_path = &base[authority_start..];
+    match authority_and_path.find('/') {
+        None => format!("{}{path}", base.trim_end_matches('/')),
+        Some(slash_offset) => {
+            if &authority_and_path[slash_offset..] == "/" {
+                format!("{}{path}", base.trim_end_matches('/'))
+            } else {
+                base.to_string()
+            }
+        }
+    }
 }
 
 fn build_providers(
     resolved: &ResolvedTelemetry,
     resource: Resource,
     runtime_handle: Handle,
-) -> Result<Providers> {
+) -> Result<OtlpProviders> {
     let span_exporter: SpanExporter = match resolved.exporter {
         ExporterKind::OtlpGrpc => SpanExporter::builder()
             .with_tonic()
@@ -154,8 +226,12 @@ fn build_providers(
             .build()
             .map_err(|e| anyhow!("build OTLP gRPC span exporter: {e}"))?,
         ExporterKind::OtlpHttp => SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint(resolved.endpoint.clone())
+            .with_http()
+            .with_endpoint(signal_endpoint(
+                &resolved.endpoint,
+                ExporterKind::OtlpHttp,
+                "/v1/traces",
+            ))
             .with_protocol(Protocol::HttpBinary)
             .build()
             .map_err(|e| anyhow!("build OTLP HTTP span exporter: {e}"))?,
@@ -169,8 +245,12 @@ fn build_providers(
             .build()
             .map_err(|e| anyhow!("build OTLP gRPC metric exporter: {e}"))?,
         ExporterKind::OtlpHttp => MetricExporter::builder()
-            .with_tonic()
-            .with_endpoint(resolved.endpoint.clone())
+            .with_http()
+            .with_endpoint(signal_endpoint(
+                &resolved.endpoint,
+                ExporterKind::OtlpHttp,
+                "/v1/metrics",
+            ))
             .with_protocol(Protocol::HttpBinary)
             .build()
             .map_err(|e| anyhow!("build OTLP HTTP metric exporter: {e}"))?,
@@ -184,8 +264,12 @@ fn build_providers(
             .build()
             .map_err(|e| anyhow!("build OTLP gRPC log exporter: {e}"))?,
         ExporterKind::OtlpHttp => LogExporter::builder()
-            .with_tonic()
-            .with_endpoint(resolved.endpoint.clone())
+            .with_http()
+            .with_endpoint(signal_endpoint(
+                &resolved.endpoint,
+                ExporterKind::OtlpHttp,
+                "/v1/logs",
+            ))
             .with_protocol(Protocol::HttpBinary)
             .build()
             .map_err(|e| anyhow!("build OTLP HTTP log exporter: {e}"))?,
@@ -200,22 +284,110 @@ fn build_providers(
         .with_resource(resource.clone())
         .with_periodic_exporter(wrapped_metric_exporter)
         .build();
-    global::set_meter_provider(meter_provider);
+    global::set_meter_provider(meter_provider.clone());
 
     let logger_provider = SdkLoggerProvider::builder()
         .with_resource(resource.clone())
-        .with_batch_exporter(log_exporter)
+        .with_batch_exporter(RecordingLogExporter {
+            inner: log_exporter,
+        })
         .build();
 
     let tracer_provider = SdkTracerProvider::builder()
         .with_resource(resource)
-        .with_batch_exporter(span_exporter)
+        .with_batch_exporter(RecordingSpanExporter {
+            inner: span_exporter,
+        })
         .build();
 
-    Ok(Providers {
+    Ok(OtlpProviders {
         tracer: tracer_provider,
         logger: logger_provider,
+        meter: meter_provider,
     })
+}
+
+/// Wraps a `SpanExporter` so every `export` outcome is stamped into
+/// `otlp_status` (spec §3.4) — forwards every other trait method unchanged,
+/// `set_resource` included (dropping that would silently lose
+/// `service.name` and friends on the wrapped exporter).
+#[derive(Debug)]
+struct RecordingSpanExporter<E> {
+    inner: E,
+}
+
+impl<E: SdkSpanExporter> SdkSpanExporter for RecordingSpanExporter<E> {
+    fn export(
+        &self,
+        batch: Vec<SpanData>,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+        let fut = self.inner.export(batch);
+        async move {
+            let r = fut.await;
+            otlp_status::record_export(
+                Signal::Traces,
+                r.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+            );
+            r
+        }
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn shutdown(&self) -> OTelSdkResult {
+        self.inner.shutdown()
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
+    }
+}
+
+/// Wraps a `LogExporter` so every `export` outcome is stamped into
+/// `otlp_status` (spec §3.4) — forwards every other trait method unchanged,
+/// `event_enabled` and `set_resource` included.
+#[derive(Debug)]
+struct RecordingLogExporter<E> {
+    inner: E,
+}
+
+impl<E: SdkLogExporter> SdkLogExporter for RecordingLogExporter<E> {
+    fn export(
+        &self,
+        batch: LogBatch<'_>,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+        let fut = self.inner.export(batch);
+        async move {
+            let r = fut.await;
+            otlp_status::record_export(
+                Signal::Logs,
+                r.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+            );
+            r
+        }
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn shutdown(&self) -> OTelSdkResult {
+        self.inner.shutdown()
+    }
+
+    fn event_enabled(&self, level: Severity, target: &str, name: Option<&str>) -> bool {
+        self.inner.event_enabled(level, target, name)
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.inner.set_resource(resource);
+    }
 }
 
 /// Wraps an OTLP `MetricExporter` so it can be driven from the
@@ -233,6 +405,10 @@ impl PushMetricExporter for TokioMetricExporter {
         metrics: &ResourceMetrics,
     ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
         let result = self.runtime.block_on(self.inner.export(metrics));
+        otlp_status::record_export(
+            Signal::Metrics,
+            result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+        );
         async move { result }
     }
 
@@ -372,5 +548,48 @@ mod tests {
         .expect("resolved telemetry");
 
         assert_eq!(resolved.endpoint, "http://collector:9999");
+    }
+
+    #[test]
+    fn http_endpoints_get_per_signal_paths_grpc_does_not() {
+        assert_eq!(
+            signal_endpoint("http://c:4318", ExporterKind::OtlpHttp, "/v1/traces"),
+            "http://c:4318/v1/traces"
+        );
+        assert_eq!(
+            signal_endpoint("http://c:4318/", ExporterKind::OtlpHttp, "/v1/logs"),
+            "http://c:4318/v1/logs"
+        );
+        assert_eq!(
+            signal_endpoint(
+                "http://c:4318/custom/v1/traces",
+                ExporterKind::OtlpHttp,
+                "/v1/traces"
+            ),
+            "http://c:4318/custom/v1/traces"
+        );
+        assert_eq!(
+            signal_endpoint("http://c:4317", ExporterKind::OtlpGrpc, "/v1/traces"),
+            "http://c:4317"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_recording_span_exporter_stamps_ok_and_errors() {
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SpanExporter as _};
+        // The lock only needs to cover the reset, not the export/snapshot —
+        // holding a std::sync::MutexGuard across an .await trips
+        // clippy::await_holding_lock (and would risk deadlocking the async
+        // executor), so it is dropped before the await point.
+        {
+            let _lock = env_lock();
+            crate::otlp_status::reset_for_test();
+        }
+        let rec = RecordingSpanExporter {
+            inner: InMemorySpanExporter::default(),
+        };
+        rec.export(vec![]).await.unwrap();
+        let s = crate::otlp_status::snapshot_json();
+        assert!(s["signals"]["traces"]["last_ok_at"].is_string());
     }
 }
