@@ -69,6 +69,7 @@ mod offers;
 mod onboard;
 mod operator_i18n;
 mod operator_log;
+pub(crate) mod otlp_status;
 mod otlp_telemetry;
 #[doc(hidden)]
 pub mod perf_harness;
