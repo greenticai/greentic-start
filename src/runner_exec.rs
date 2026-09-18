@@ -67,6 +67,62 @@ fn verified_caller_user_id(input: &JsonValue) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The runner session id a conversation runs under inside one flow:
+/// `{pack}:{flow}:{conversation}`, so two flows or packs sharing a
+/// conversation id keep separate parked snapshots.
+pub(crate) fn flow_session_id(pack_label: &str, flow_id: &str, conversation: &str) -> String {
+    format!("{pack_label}:{flow_id}:{conversation}")
+}
+
+/// Directory the desktop runner persists a flow's parked snapshots in:
+/// `state/sessions/{tenant}/{team}/{pack}/{flow}`. Tenant- and team-scoped,
+/// so two workspaces never resume each other's conversations.
+pub(crate) fn session_state_dir(
+    root: &Path,
+    tenant: &str,
+    team: Option<&str>,
+    pack_label: &str,
+    flow_id: &str,
+) -> PathBuf {
+    root.join("state")
+        .join("sessions")
+        .join(tenant)
+        .join(team.unwrap_or("default"))
+        .join(pack_label)
+        .join(flow_id)
+}
+
+/// The file a conversation's parked `FlowSnapshot` lives in while `flow_id`
+/// is waiting on it. Present means "this flow is parked on this
+/// conversation"; the runner deletes it when the flow completes.
+///
+/// Mirrors `session_snapshot_file` in greentic-runner-desktop
+/// (`crates/greentic-runner-desktop/src/lib.rs`, checked at rev `b661e13`),
+/// which is private: every byte outside `[A-Za-z0-9-_.:]` becomes `_`. If the
+/// two ever drift, a parked flow reads as completed — callers degrade to
+/// routing the turn afresh rather than resuming, never to a wrong resume.
+pub(crate) fn session_snapshot_path(
+    root: &Path,
+    tenant: &str,
+    team: Option<&str>,
+    pack_label: &str,
+    flow_id: &str,
+    conversation: &str,
+) -> PathBuf {
+    let safe_id: String = flow_session_id(pack_label, flow_id, conversation)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    session_state_dir(root, tenant, team, pack_label, flow_id)
+        .join(format!("{safe_id}.snapshot.json"))
+}
+
 pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> {
     // Ensure flow.log is initialized in bundle's logs directory
     let _ = crate::flow_log::init(&request.root.join("logs"));
@@ -156,23 +212,16 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let session_id = envelope_session_id.as_deref().map(|conv| {
-        format!(
-            "{pack}:{flow}:{conv}",
-            pack = request.pack_label,
-            flow = request.flow_id,
-        )
-    });
-    let session_state_dir = Some(
-        request
-            .root
-            .join("state")
-            .join("sessions")
-            .join(&request.tenant)
-            .join(&team)
-            .join(&request.pack_label)
-            .join(&request.flow_id),
-    );
+    let session_id = envelope_session_id
+        .as_deref()
+        .map(|conv| flow_session_id(&request.pack_label, &request.flow_id, conv));
+    let session_state_dir = Some(session_state_dir(
+        &request.root,
+        &request.tenant,
+        Some(&team),
+        &request.pack_label,
+        &request.flow_id,
+    ));
     let components_map = component_overrides_from_env();
     let user_id = verified_caller_user_id(&request.input)
         .unwrap_or_else(|| ANONYMOUS_LOCAL_USER_ID.to_string());

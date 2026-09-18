@@ -4,7 +4,9 @@ use base64::Engine as _;
 use greentic_types::ChannelMessageEnvelope;
 use serde_json::json;
 
+use super::flow_owner;
 use crate::domains::Domain;
+use crate::ingress::control_directive::{ControlDirective, DispatchTarget};
 use crate::ingress_dispatch::build_injected_config;
 use crate::messaging_app as app;
 use crate::messaging_dto::ProviderPayloadV1;
@@ -23,63 +25,41 @@ pub(super) fn route_messaging_envelopes(
     let app_pack_path = app::resolve_app_pack_path(bundle, &ctx.tenant, team, None)
         .context("resolve app pack for messaging pipeline")?;
     let pack_info = app::load_app_pack_info(&app_pack_path).context("load app pack manifest")?;
-    let flow = app::select_app_flow(&pack_info).context("select app default flow")?;
+    let default_flow = app::select_app_flow(&pack_info).context("select app default flow")?;
 
     operator_log::debug(
         module_path!(),
         format!(
             "[demo messaging] routing {} envelope(s) through app flow={} pack={}",
             envelopes.len(),
-            flow.id,
+            default_flow.id,
             pack_info.pack_id
         ),
     );
 
     for original in &envelopes {
-        // Per-envelope Fast2Flow probe. On Dispatch with a node target, we
-        // synthesize the same metadata an Adaptive Card button click would
-        // produce — `routeToCardId` — so the existing card path renders the
-        // chosen card. Continue / Respond / Deny still fall through to the
-        // default flow path; per-directive handling lands incrementally.
-        let mut owned;
-        let envelope: &ChannelMessageEnvelope = match crate::fast2flow::try_for_request(
-            crate::fast2flow::Fast2FlowConfig::global(),
-            ctx,
-            &pack_info,
-            &app_pack_path,
-            original,
-            provider,
-        ) {
-            Some(crate::ingress::control_directive::ControlDirective::Dispatch {
-                target,
-                entities,
-            }) if target.node.is_some() => {
-                let node = target.node.as_ref().expect("checked some").clone();
-                operator_log::info(
-                    module_path!(),
-                    format!(
-                        "[fast2flow] dispatch -> routeToCardId={node} entities={} \
-                         (pack={} flow={:?})",
-                        entities.len(),
-                        target.pack,
-                        target.flow
-                    ),
-                );
-                owned = original.clone();
-                owned.metadata.insert("routeToCardId".to_string(), node);
-                inject_prefill_metadata(&mut owned, &entities);
-                &owned
-            }
-            // No deterministic node dispatch. Try the embedded LLM fallback
+        let turn = resolve_turn(bundle, ctx, &pack_info, default_flow, original, || {
+            // Per-envelope Fast2Flow probe. A node target synthesizes the same
+            // metadata an Adaptive Card button click would produce —
+            // `routeToCardId` — so the existing card path renders the chosen
+            // card inside the default flow. A `pack/flow` target runs that
+            // flow from its entry. Continue / Respond / Deny still fall
+            // through; per-directive handling lands incrementally.
+            crate::fast2flow::try_for_request(
+                crate::fast2flow::Fast2FlowConfig::global(),
+                ctx,
+                &pack_info,
+                &app_pack_path,
+                original,
+                provider,
+            )
+            .and_then(|directive| apply_dispatch(directive, &pack_info, original, "fast2flow"))
+            // No usable deterministic dispatch. Try the embedded LLM fallback
             // (greentic-start's own greentic-llm capability) before giving up.
-            _ => match try_llm_fallback(ctx, &pack_info, &app_pack_path, original) {
-                Some(synth) => {
-                    owned = synth;
-                    &owned
-                }
-                None => original,
-            },
-        };
+            .or_else(|| try_llm_fallback(ctx, &pack_info, &app_pack_path, original))
+        });
+        let flow = turn.flow;
+        let envelope = &turn.envelope;
         let outputs = if let Some(route_to_card) = card_nav_target(envelope) {
             // A target that names a FLOW NODE goes to the flow even when a card
             // asset of the same name exists. Rendering the asset directly is
@@ -158,10 +138,11 @@ pub(super) fn route_messaging_envelopes(
                     )
                 }
             }
-        } else if pack_info
-            .capabilities
-            .iter()
-            .any(|c| c == crate::fast2flow::FAST2FLOW_CAPABILITY)
+        } else if !turn.owns_conversation
+            && pack_info
+                .capabilities
+                .iter()
+                .any(|c| c == crate::fast2flow::FAST2FLOW_CAPABILITY)
             && envelope
                 .text
                 .as_deref()
@@ -198,6 +179,18 @@ pub(super) fn route_messaging_envelopes(
                 None,
             )
         };
+
+        if turn.owns_conversation {
+            // Keep the conversation with this flow while it is parked on it;
+            // give it back to routing once the flow has completed.
+            flow_owner::settle(
+                bundle,
+                ctx,
+                &pack_info.pack_id,
+                &flow.id,
+                &envelope.session_id,
+            );
+        }
 
         for mut out_envelope in outputs {
             if let Some(team) = &ctx.team {
@@ -409,17 +402,17 @@ fn inject_prefill_metadata(
     }
 }
 
-/// Embedded LLM routing fallback: when the deterministic tier yields no node
+/// Embedded LLM routing fallback: when the deterministic tier yields no usable
 /// dispatch for a Fast2Flow-capable pack and the bundle declared an `llm:`
-/// instance (with `fast2flow` enabled), ask [`crate::llm`] to pick a card and
-/// synthesize the same `routeToCardId` + prefill the host path produces. Needs
-/// no external binary, so it works embedded. `None` ⇒ fall through.
-fn try_llm_fallback(
+/// instance (with `fast2flow` enabled), ask [`crate::llm`] to pick a card or a
+/// flow and route it exactly as a host dispatch is routed ([`apply_dispatch`]).
+/// Needs no external binary, so it works embedded. `None` ⇒ fall through.
+fn try_llm_fallback<'p>(
     ctx: &OperatorContext,
-    pack_info: &app::AppPackInfo,
+    pack_info: &'p app::AppPackInfo,
     app_pack_path: &Path,
     original: &ChannelMessageEnvelope,
-) -> Option<ChannelMessageEnvelope> {
+) -> Option<Routed<'p>> {
     // The bundle's shared `llm:` instance, with the Fast2Flow consumer enabled.
     let cfg = crate::llm::config()?;
     if !cfg.fast2flow {
@@ -442,28 +435,144 @@ fn try_llm_fallback(
         ctx,
         app_pack_path,
     )?;
-    match crate::fast2flow::try_llm_route(cfg, ctx, &index_path, text)? {
-        crate::ingress::control_directive::ControlDirective::Dispatch { target, entities }
-            if target.node.is_some() =>
-        {
-            let node = target.node.as_ref().expect("checked some").clone();
-            operator_log::info(
-                module_path!(),
-                format!(
-                    "[fast2flow:llm] dispatch -> routeToCardId={node} entities={} \
-                     (pack={} flow={:?})",
-                    entities.len(),
-                    target.pack,
-                    target.flow
-                ),
-            );
-            let mut owned = original.clone();
-            owned.metadata.insert("routeToCardId".to_string(), node);
-            inject_prefill_metadata(&mut owned, &entities);
-            Some(owned)
-        }
-        _ => None,
+    let directive = crate::fast2flow::try_llm_route(cfg, ctx, &index_path, text)?;
+    apply_dispatch(directive, pack_info, original, "fast2flow:llm")
+}
+
+/// What the router decided for one turn.
+enum Routed<'p> {
+    /// A card node inside the default flow; the envelope carries
+    /// `routeToCardId`.
+    Node(ChannelMessageEnvelope),
+    /// A whole flow of the app pack, run from its entry (greentic-start#590).
+    Flow(&'p app::AppFlowInfo, ChannelMessageEnvelope),
+}
+
+/// One turn, resolved: which flow runs it, with which envelope.
+struct Turn<'p> {
+    flow: &'p app::AppFlowInfo,
+    envelope: ChannelMessageEnvelope,
+    /// The conversation's ownership follows this turn's outcome: it stays with
+    /// `flow` while the flow is parked on it, and is released once the flow
+    /// completes. Set for a turn dispatched to a flow and for a turn resumed
+    /// in the flow that owns the conversation — never for default-flow or
+    /// card-node turns, which behave exactly as before #590.
+    owns_conversation: bool,
+}
+
+/// Decide which flow runs this turn.
+///
+/// A conversation stays with the flow it was dispatched to until that flow
+/// completes: while it is parked on the conversation, the turn resumes it and
+/// `probe` — Fast2Flow and the LLM fallback — is never consulted, because a
+/// parked flow can only be continued by the flow that parked it. Otherwise
+/// the probe decides, and with no decision the default flow runs.
+fn resolve_turn<'p>(
+    bundle: &Path,
+    ctx: &OperatorContext,
+    pack_info: &'p app::AppPackInfo,
+    default_flow: &'p app::AppFlowInfo,
+    original: &ChannelMessageEnvelope,
+    probe: impl FnOnce() -> Option<Routed<'p>>,
+) -> Turn<'p> {
+    if let Some(owner) = flow_owner::sticky_flow(bundle, ctx, pack_info, &original.session_id) {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[fast2flow] conversation owned by flow={} pack={} — resuming it, routing skipped",
+                owner.id, pack_info.pack_id
+            ),
+        );
+        return Turn {
+            flow: owner,
+            envelope: original.clone(),
+            owns_conversation: true,
+        };
     }
+    match probe() {
+        Some(Routed::Node(envelope)) => Turn {
+            flow: default_flow,
+            envelope,
+            owns_conversation: false,
+        },
+        Some(Routed::Flow(flow, envelope)) => Turn {
+            flow,
+            envelope,
+            owns_conversation: true,
+        },
+        None => Turn {
+            flow: default_flow,
+            envelope: original.clone(),
+            owns_conversation: false,
+        },
+    }
+}
+
+/// Turn a router `Dispatch` into a route, or `None` when it names nothing this
+/// pack can run (which leaves the turn to the next fallback, as before #590).
+fn apply_dispatch<'p>(
+    directive: ControlDirective,
+    pack_info: &'p app::AppPackInfo,
+    original: &ChannelMessageEnvelope,
+    source: &str,
+) -> Option<Routed<'p>> {
+    let ControlDirective::Dispatch { target, entities } = directive else {
+        return None;
+    };
+    if let Some(node) = target.node.clone() {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[{source}] dispatch -> routeToCardId={node} entities={} (pack={} flow={:?})",
+                entities.len(),
+                target.pack,
+                target.flow
+            ),
+        );
+        let mut owned = original.clone();
+        owned.metadata.insert("routeToCardId".to_string(), node);
+        inject_prefill_metadata(&mut owned, &entities);
+        return Some(Routed::Node(owned));
+    }
+    let Some(flow) = dispatch_flow(pack_info, &target) else {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[{source}] dispatch to pack={} flow={:?} names no messaging flow of app pack {}; ignored",
+                target.pack, target.flow, pack_info.pack_id
+            ),
+        );
+        return None;
+    };
+    operator_log::info(
+        module_path!(),
+        format!(
+            "[{source}] dispatch -> flow={} entities={} (pack={})",
+            flow.id,
+            entities.len(),
+            target.pack
+        ),
+    );
+    let mut owned = original.clone();
+    inject_prefill_metadata(&mut owned, &entities);
+    Some(Routed::Flow(flow, owned))
+}
+
+/// The flow a `pack/flow` target names, when it is a messaging flow of THIS
+/// app pack. A node target (`pack/flow/node`) is a card route, not a flow
+/// route, and a target for another pack is not ours to run.
+fn dispatch_flow<'p>(
+    pack_info: &'p app::AppPackInfo,
+    target: &DispatchTarget,
+) -> Option<&'p app::AppFlowInfo> {
+    if target.node.is_some() || target.pack != pack_info.pack_id {
+        return None;
+    }
+    let flow_id = target.flow.as_deref()?;
+    pack_info
+        .flows
+        .iter()
+        .find(|f| f.id == flow_id && f.kind.eq_ignore_ascii_case("messaging"))
 }
 
 /// Insert empty-string defaults for any unmatched `${prefill_*}`
@@ -875,6 +984,10 @@ fn ensure_card_i18n_resolved(envelope: &mut ChannelMessageEnvelope, pack_path: &
             .insert("adaptive_card".to_string(), resolved);
     }
 }
+
+#[cfg(test)]
+#[path = "messaging_routing_tests.rs"]
+mod routing_tests;
 
 #[cfg(test)]
 mod tests {
