@@ -265,14 +265,19 @@ where
 
     // Negative control first: if the component accepts a corrupted signature
     // there is nothing to learn from the real one.
+    //
+    // No config: the gate runs before config is resolved, so a refused request
+    // does no secret reads, and it discards the normalized output anyway.
     let calls = [
         IngressExtensionCall {
             headers_json: probe_headers,
             body_json: body_json.clone(),
+            config: None,
         },
         IngressExtensionCall {
             headers_json: real_headers,
             body_json,
+            config: None,
         },
     ];
 

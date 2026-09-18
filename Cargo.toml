@@ -316,6 +316,7 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 # a differing requirement here resolves a second greentic-llm for test builds.
 greentic-llm = { version = "=1.3.1-research.0", features = ["test-mock"] }
 tokio = { version = "1", features = ["test-util"] }
+wat = "1"
 
 # TEMPORARY -- resolve the runner crates from git while crates.io publishing is
 # locked fleet-wide (403 authentication failed; the sole owning account is

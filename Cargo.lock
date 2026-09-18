@@ -3534,6 +3534,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "wasmtime",
+ "wat",
  "zip 8.6.0",
  "zstd",
 ]

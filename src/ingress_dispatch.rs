@@ -37,12 +37,17 @@ pub fn dispatch_http_ingress_with_op(
     ctx: &OperatorContext,
     op_name: &str,
 ) -> anyhow::Result<IngressDispatchResult> {
+    // Resolved once and shared by both branches: the provider_ingress extension
+    // receives it through ingress@0.0.3, `ingest_http` through `HttpInV1.config`.
+    let injected_config = build_injected_config(runner_host, domain, &request.provider, ctx);
+
     if op_name == "ingest_http"
         && let Some(outcome) = runner_host.invoke_provider_ingress_extension(
             domain,
             &request.provider,
             provider_ingress_headers_json(request)?,
             provider_ingress_body_json(request)?,
+            provider_ingress_config(&request.provider, &injected_config),
             ctx,
         )?
     {
@@ -63,17 +68,16 @@ pub fn dispatch_http_ingress_with_op(
     // Inject secrets into config for providers running in provider_core_only mode.
     // Fall back to a minimal config for events providers that require a non-null
     // config object even when no secrets or setup have been configured yet.
-    let config =
-        build_injected_config(runner_host, domain, &request.provider, ctx)?.or_else(|| {
-            if matches!(domain, Domain::Events) {
-                Some(json!({
-                    "target_url": "http://0.0.0.0:0/events/noop",
-                    "timeout_ms": 1
-                }))
-            } else {
-                None
-            }
-        });
+    let config = injected_config?.or_else(|| {
+        if matches!(domain, Domain::Events) {
+            Some(json!({
+                "target_url": "http://0.0.0.0:0/events/noop",
+                "timeout_ms": 1
+            }))
+        } else {
+            None
+        }
+    });
 
     let http_in = build_ingress_request(
         &request.provider,
@@ -159,6 +163,30 @@ fn intercept_approval_responses(request: &IngressRequestV1, decoded: &mut Ingres
         &request.body,
         &mut decoded.messaging_envelopes,
     );
+}
+
+/// The config handed to a `messaging.provider_ingress.v1` component.
+///
+/// Unlike `ingest_http`, which fails closed on an unresolvable config, this
+/// path served webhooks without any config before ingress@0.0.3 existed, so a
+/// resolution error degrades to "no config" rather than refusing the webhook.
+fn provider_ingress_config(
+    provider: &str,
+    injected: &anyhow::Result<Option<JsonValue>>,
+) -> Option<JsonValue> {
+    match injected {
+        Ok(config) => config.clone(),
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "provider ingress for {provider} runs without config: \
+                     config could not be resolved: {err:#}"
+                ),
+            );
+            None
+        }
+    }
 }
 
 fn provider_ingress_headers_json(request: &IngressRequestV1) -> anyhow::Result<String> {
@@ -794,6 +822,25 @@ pub fn log_invalid_event_warning(err: &anyhow::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_ingress_receives_the_resolved_config() {
+        let resolved = Ok(Some(json!({"auto_start_on_open": false})));
+        assert_eq!(
+            provider_ingress_config("messaging-webchat-gui", &resolved),
+            Some(json!({"auto_start_on_open": false}))
+        );
+        assert_eq!(provider_ingress_config("messaging-slack", &Ok(None)), None);
+    }
+
+    #[test]
+    fn an_unresolvable_config_does_not_fail_the_provider_ingress_webhook() {
+        let unresolvable = Err(anyhow::anyhow!("ext:// reference could not be resolved"));
+        assert_eq!(
+            provider_ingress_config("messaging-slack", &unresolvable),
+            None
+        );
+    }
 
     fn messaging_envelope() -> JsonValue {
         json!({
