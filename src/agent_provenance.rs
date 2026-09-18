@@ -12,15 +12,18 @@
 //! # What the trail actually is
 //!
 //! `trail` is `Vec<greentic_aw_runtime::AgentStep>`, serialised with
-//! `#[serde(tag = "kind", rename_all = "snake_case")]`, so every entry is one
-//! of exactly four shapes:
+//! `#[serde(tag = "kind", rename_all = "snake_case")]`. The entries this
+//! module reads are:
 //!
 //! ```json
-//! {"kind": "tool_call",         "name": "…", "call_id": "…", "result": <any json>}
-//! {"kind": "tool_call_reused",  "name": "…", "call_id": "…"}
-//! {"kind": "tool_call_blocked", "name": "…", "reason": "…"}
-//! {"kind": "reply",             "text": "…"}
+//! {"kind": "tool_call",           "name": "…", "call_id": "…", "result": <any json>}
+//! {"kind": "tool_call_reused",    "name": "…", "call_id": "…"}
+//! {"kind": "knowledge_retrieval", "chunks": [{"text", "score", "doc_id"?, "chunk_index"?, "metadata"}]}
 //! ```
+//!
+//! Every other kind (`tool_call_blocked`, `reply`, `llm_call`, and any kind a
+//! newer runtime adds) is skipped, never fatal — the trail is another
+//! process's JSON.
 //!
 //! Everything this module emits is read out of those entries. Three
 //! consequences are worth stating, because each one is a field a partner has
@@ -33,11 +36,43 @@
 //! - **There is no confidence.** A top-level confidence would have to be
 //!   derived (e.g. the best citation score), and a derived number presented
 //!   beside real ones reads as a measurement.
-//! - **The built-in knowledge/RAG seam produces no trail entries at all.** The
-//!   agent loop injects retrieved chunks into the system prompt
-//!   (`greentic_aw_runtime::knowledge::augment_system_prompt`) rather than
-//!   dispatching a tool, so citations exist here only when the worker calls a
-//!   *retrieval tool*, whose result lands verbatim in `AgentStep::ToolCall`.
+//!
+//! # Built-in knowledge, and why its excerpts are opt-in
+//!
+//! A worker's BUILT-IN knowledge base (`KnowledgeSettings`) is not a tool: the
+//! agent loop retrieves chunks and injects them into the system prompt. Until
+//! greentic-runner#770 that left no trail entry, so a knowledge-grounded answer
+//! arrived with no citations. The runtime now records the retrieval as
+//! `AgentStep::KnowledgeRetrieval`, faithfully and with full chunk text — the
+//! trail is server-side data.
+//!
+//! What reaches the end user's BROWSER is decided here, and the two sources
+//! are treated differently on purpose:
+//!
+//! - A **retrieval tool's** result is something the tool's author chose to
+//!   return, and its excerpts have always travelled; that default is kept
+//!   (only length-capped, see below).
+//! - A **built-in knowledge** chunk is a passage from a document a tenant may
+//!   expect the model to USE and not QUOTE. So by default its citation carries
+//!   identifying fields only — `doc`, `title`, `sourceFile`, `section`, `page`,
+//!   `chunkIndex`, `score` — and **no excerpt text**. Excerpts are included only
+//!   when the deployment sets [`KNOWLEDGE_EXCERPTS_ENV`] to a truthy value.
+//!
+//! That switch is per DEPLOYMENT (one greentic-start process serves one
+//! bundle), not per tenant: this reply arm has no per-tenant settings seam to
+//! read, and the analogous `withheld` question below is likewise unresolved.
+//! A knowledge citation carries `"origin": "knowledge"` and no `tool`.
+//!
+//! # Size caps
+//!
+//! This object rides on every reply and is written TWICE (under
+//! [`CHANNEL_DATA_KEY`] and [`CHANNEL_DATA_RAG_KEY`]), and the webchat
+//! provider stores `channelData` verbatim on every activity. So, for every
+//! citation from either source: an excerpt is cut to [`MAX_EXCERPT_CHARS`]
+//! characters (marked `"excerptTruncated": true`), at most [`MAX_CITATIONS`]
+//! citations are kept, and the serialised object is held under
+//! [`MAX_PROVENANCE_BYTES`] by dropping the lowest-ranked citations (marked
+//! `"citationsTruncated": true`).
 //!
 //! # Why the citation reader has an alias set, and why it is closed
 //!
@@ -125,6 +160,50 @@ const PROVENANCE_SOURCE: &str = "dw.agent";
 /// keeps the best hits.
 const MAX_CITATIONS: usize = 20;
 
+/// Longest excerpt, in characters, carried on one citation. Applies to
+/// retrieval-tool excerpts and (when enabled) knowledge excerpts alike: enough
+/// to show the reader the passage, never a whole chunk of a corpus.
+pub(crate) const MAX_EXCERPT_CHARS: usize = 500;
+
+/// Upper bound on the serialised size of the provenance object. It is written
+/// under two keys, so the reply carries at most twice this — well inside the
+/// 64 KiB the webchat provider allows a client-posted `channelData`.
+pub(crate) const MAX_PROVENANCE_BYTES: usize = 16 * 1024;
+
+/// Deployment switch that lets built-in knowledge citations carry excerpt
+/// text. Off unless set to `1` / `true` / `yes` / `on`: a knowledge base may
+/// hold documents a tenant expects the model to use and not quote, so quoting
+/// them to the browser has to be a decision somebody took.
+pub(crate) const KNOWLEDGE_EXCERPTS_ENV: &str = "GREENTIC_PROVENANCE_KNOWLEDGE_EXCERPTS";
+
+/// `origin` value on a citation that came from the built-in knowledge base.
+const KNOWLEDGE_ORIGIN: &str = "knowledge";
+
+/// What this reply's provenance may disclose. Read from the environment by
+/// [`attach_provenance`]; passed explicitly everywhere else so tests do not
+/// depend on process state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DisclosurePolicy {
+    /// Include (capped) excerpt text on built-in knowledge citations.
+    pub(crate) knowledge_excerpts: bool,
+}
+
+impl DisclosurePolicy {
+    pub(crate) fn from_env() -> Self {
+        Self::from_env_value(std::env::var(KNOWLEDGE_EXCERPTS_ENV).ok().as_deref())
+    }
+
+    fn from_env_value(value: Option<&str>) -> Self {
+        let knowledge_excerpts = value.is_some_and(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+        Self { knowledge_excerpts }
+    }
+}
+
 /// Result keys whose array value is read as a list of retrieval hits. Kept
 /// narrow on purpose: these three name retrieval specifically, whereas a
 /// generic `results` array would sweep in every non-retrieval tool's output.
@@ -143,6 +222,11 @@ const PAGE_KEYS: &[&str] = &["page", "page_number", "pageNumber"];
 const EXCERPT_KEYS: &[&str] = &["excerpt", "text"];
 /// Relevance, read only when it is a number. `score` is `RetrievedChunk`'s.
 const SCORE_KEYS: &[&str] = &["score", "relevance_score", "relevanceScore"];
+/// A human-readable document name, read for built-in knowledge chunks (whose
+/// `doc_id` is often an opaque id). Looked up in the chunk's `metadata`.
+const TITLE_KEYS: &[&str] = &["title", "name", "filename", "file_name", "fileName"];
+/// Position of the chunk within its document; read only when it is a number.
+const CHUNK_INDEX_KEYS: &[&str] = &["chunk_index", "chunkIndex"];
 
 /// Attach reply provenance to `envelope` when `output`'s `trail` carries tool
 /// activity.
@@ -151,11 +235,20 @@ const SCORE_KEYS: &[&str] = &["score", "relevance_score", "relevanceScore"];
 /// runner-supplied `channelData` is already on the envelope and this merges
 /// into it rather than being overwritten by it.
 ///
-/// A no-op when the trail is absent, empty, or records no tool that ran — an
+/// A no-op when the trail is absent, empty, or records neither a tool that ran
+/// nor a citable knowledge retrieval — an
 /// empty provenance object is worse than none, because a GUI cannot tell "this
 /// answer had no sources" from "we lost them".
 pub(crate) fn attach_provenance(output: &JsonValue, envelope: &mut ChannelMessageEnvelope) {
-    let Some(provenance) = provenance_from_trail(output.get("trail")) else {
+    attach_provenance_with(output, envelope, DisclosurePolicy::from_env());
+}
+
+fn attach_provenance_with(
+    output: &JsonValue,
+    envelope: &mut ChannelMessageEnvelope,
+    policy: DisclosurePolicy,
+) {
+    let Some(provenance) = provenance_from_trail(output.get("trail"), policy) else {
         return;
     };
 
@@ -191,10 +284,10 @@ pub(crate) fn attach_provenance(output: &JsonValue, envelope: &mut ChannelMessag
 
 /// Build the provenance payload from a `dw.agent` node output's `trail`.
 ///
-/// `None` when the trail is missing, is not an array, or records no
-/// `tool_call` / `tool_call_reused` step — i.e. whenever there is no tool
-/// activity to describe.
-fn provenance_from_trail(trail: Option<&JsonValue>) -> Option<JsonValue> {
+/// `None` when the trail is missing, is not an array, or records neither a
+/// `tool_call` / `tool_call_reused` step nor a knowledge retrieval that yields
+/// a citation — i.e. whenever there is nothing to describe.
+fn provenance_from_trail(trail: Option<&JsonValue>, policy: DisclosurePolicy) -> Option<JsonValue> {
     let steps = trail?.as_array()?;
 
     let mut tools: Vec<String> = Vec::new();
@@ -209,6 +302,10 @@ fn provenance_from_trail(trail: Option<&JsonValue>) -> Option<JsonValue> {
         let Some(kind) = step.get("kind").and_then(JsonValue::as_str) else {
             continue;
         };
+        if kind == "knowledge_retrieval" {
+            collect_knowledge_citations(step.get("chunks"), policy, &mut citations);
+            continue;
+        }
         if kind != "tool_call" && kind != "tool_call_reused" {
             continue;
         }
@@ -232,7 +329,7 @@ fn provenance_from_trail(trail: Option<&JsonValue>) -> Option<JsonValue> {
         }
     }
 
-    if tools.is_empty() {
+    if tools.is_empty() && citations.is_empty() {
         return None;
     }
 
@@ -243,7 +340,119 @@ fn provenance_from_trail(trail: Option<&JsonValue>) -> Option<JsonValue> {
     if !citations.is_empty() {
         payload.insert("citations".to_string(), json!(citations));
     }
+    enforce_size_cap(&mut payload);
     Some(JsonValue::Object(payload))
+}
+
+/// Hold the serialised payload under [`MAX_PROVENANCE_BYTES`] by dropping
+/// citations from the end — the lowest-ranked, since every source orders by
+/// relevance — and flag that it happened, so a GUI does not present a partial
+/// list as complete. Excerpts are already capped, so this only bites on many
+/// long identifiers; it is a backstop, not the main control.
+fn enforce_size_cap(payload: &mut JsonMap<String, JsonValue>) {
+    let serialised_len =
+        |payload: &JsonMap<String, JsonValue>| serde_json::to_vec(payload).map_or(0, |b| b.len());
+    if serialised_len(payload) <= MAX_PROVENANCE_BYTES {
+        return;
+    }
+    payload.insert("citationsTruncated".to_string(), json!(true));
+    loop {
+        let Some(JsonValue::Array(citations)) = payload.get_mut("citations") else {
+            return;
+        };
+        if citations.pop().is_none() {
+            payload.remove("citations");
+            return;
+        }
+        if citations.is_empty() {
+            payload.remove("citations");
+        }
+        if serialised_len(payload) <= MAX_PROVENANCE_BYTES {
+            return;
+        }
+    }
+}
+
+/// Append a citation for every recognisable chunk of one
+/// `knowledge_retrieval` step, stopping at [`MAX_CITATIONS`].
+fn collect_knowledge_citations(
+    chunks: Option<&JsonValue>,
+    policy: DisclosurePolicy,
+    into: &mut Vec<JsonValue>,
+) {
+    let Some(chunks) = chunks.and_then(JsonValue::as_array) else {
+        return;
+    };
+    for chunk in chunks {
+        if into.len() >= MAX_CITATIONS {
+            return;
+        }
+        if let Some(citation) = citation_from_knowledge_chunk(chunk, policy) {
+            into.push(citation);
+        }
+    }
+}
+
+/// Map one built-in knowledge chunk onto a citation.
+///
+/// Identifying fields only, unless `policy.knowledge_excerpts` is on — see the
+/// module doc. `None` for a chunk that names no document (no `doc`, `title` or
+/// `sourceFile`, and no permitted excerpt): a bare score cites nothing.
+fn citation_from_knowledge_chunk(chunk: &JsonValue, policy: DisclosurePolicy) -> Option<JsonValue> {
+    let chunk = chunk.as_object()?;
+
+    let mut citation = JsonMap::new();
+    citation.insert("origin".to_string(), json!(KNOWLEDGE_ORIGIN));
+
+    for (field, aliases) in [
+        ("doc", DOC_KEYS),
+        ("title", TITLE_KEYS),
+        ("sourceFile", SOURCE_FILE_KEYS),
+        ("section", SECTION_KEYS),
+    ] {
+        if let Some(text) = first_string(chunk, aliases) {
+            citation.insert(field.to_string(), json!(text));
+        }
+    }
+    // `title` falls back through the same `title` alias `doc` reads, so a chunk
+    // with no `doc_id` would otherwise carry its title twice.
+    if citation.get("title") == citation.get("doc") {
+        citation.remove("title");
+    }
+    if let Some(page) = first_number(chunk, PAGE_KEYS).and_then(|page| page.as_u64()) {
+        citation.insert("page".to_string(), json!(page));
+    }
+    if let Some(index) = first_number(chunk, CHUNK_INDEX_KEYS).and_then(|index| index.as_u64()) {
+        citation.insert("chunkIndex".to_string(), json!(index));
+    }
+    if let Some(score) = first_number(chunk, SCORE_KEYS) {
+        citation.insert("score".to_string(), score);
+    }
+    if policy.knowledge_excerpts
+        && let Some(text) = first_string(chunk, EXCERPT_KEYS)
+    {
+        insert_capped_excerpt(&mut citation, &text);
+    }
+
+    let names_a_source = ["doc", "title", "sourceFile", "excerpt"]
+        .iter()
+        .any(|field| citation.contains_key(*field));
+    names_a_source.then(|| JsonValue::Object(citation))
+}
+
+/// Insert `text` as the citation's `excerpt`, cut to [`MAX_EXCERPT_CHARS`]
+/// characters (on a char boundary) and flagged when it was cut.
+fn insert_capped_excerpt(citation: &mut JsonMap<String, JsonValue>, text: &str) {
+    let mut chars = text.char_indices();
+    match chars.nth(MAX_EXCERPT_CHARS) {
+        None => {
+            citation.insert("excerpt".to_string(), json!(text));
+        }
+        Some((cut, _)) => {
+            citation.insert("excerpt".to_string(), json!(text[..cut].trim_end()));
+            citation.insert("excerptTruncated".to_string(), json!(true));
+        }
+    }
 }
 
 /// Append every recognisable citation in one tool `result` to `into`, stopping
@@ -288,11 +497,13 @@ fn citation_from_hit(tool: &str, hit: &JsonValue) -> Option<JsonValue> {
         ("doc", DOC_KEYS),
         ("sourceFile", SOURCE_FILE_KEYS),
         ("section", SECTION_KEYS),
-        ("excerpt", EXCERPT_KEYS),
     ] {
         if let Some(text) = first_string(hit, aliases) {
             citation.insert(field.to_string(), json!(text));
         }
+    }
+    if let Some(text) = first_string(hit, EXCERPT_KEYS) {
+        insert_capped_excerpt(&mut citation, &text);
     }
     if let Some(page) = first_number(hit, PAGE_KEYS).and_then(|page| page.as_u64()) {
         citation.insert("page".to_string(), json!(page));
@@ -728,6 +939,221 @@ mod tests {
         assert_eq!(
             reply.extensions.get(ext_keys::CHANNEL_DATA),
             Some(&json!("opaque runner string"))
+        );
+    }
+
+    // ---- greentic-runner#770: built-in knowledge retrieval ----
+
+    fn knowledge_trail() -> JsonValue {
+        agent_output(json!([
+            {
+                "kind": "knowledge_retrieval",
+                "chunks": [
+                    {
+                        "text": "Refunds are accepted within 30 days of purchase.",
+                        "score": 0.91,
+                        "doc_id": "kb/refunds",
+                        "chunk_index": 3,
+                        "metadata": { "title": "Refund policy", "page": 2 }
+                    }
+                ]
+            },
+            { "kind": "llm_call", "content": "", "tokens_in": 10, "tokens_out": 5 },
+            { "kind": "reply", "text": "The refund window is 30 days." }
+        ]))
+    }
+
+    #[test]
+    fn a_knowledge_retrieval_cites_identifying_fields_and_no_excerpt_by_default() {
+        let mut reply = envelope();
+        attach_provenance_with(&knowledge_trail(), &mut reply, DisclosurePolicy::default());
+
+        let provenance = provenance_of(&reply).expect("knowledge alone produces provenance");
+        assert_eq!(provenance["tools"], json!([]), "a retrieval is not a tool");
+        assert_eq!(
+            provenance["citations"],
+            json!([{
+                "origin": "knowledge",
+                "doc": "kb/refunds",
+                "title": "Refund policy",
+                "page": 2,
+                "chunkIndex": 3,
+                "score": 0.91
+            }])
+        );
+        let wire = serde_json::to_string(provenance).expect("serialise");
+        assert!(
+            !wire.contains("Refunds are accepted"),
+            "chunk text must not reach the browser by default: {wire}"
+        );
+    }
+
+    #[test]
+    fn knowledge_excerpts_are_included_when_the_deployment_enables_them() {
+        let mut reply = envelope();
+        attach_provenance_with(
+            &knowledge_trail(),
+            &mut reply,
+            DisclosurePolicy {
+                knowledge_excerpts: true,
+            },
+        );
+        let citation = &provenance_of(&reply).expect("provenance")["citations"][0];
+        assert_eq!(
+            citation["excerpt"],
+            "Refunds are accepted within 30 days of purchase."
+        );
+        assert!(
+            !citation
+                .as_object()
+                .expect("object")
+                .contains_key("excerptTruncated")
+        );
+    }
+
+    #[test]
+    fn an_enabled_knowledge_excerpt_is_capped() {
+        let long = "é".repeat(MAX_EXCERPT_CHARS + 40);
+        let output = agent_output(json!([
+            {
+                "kind": "knowledge_retrieval",
+                "chunks": [{ "text": long, "score": 0.5, "doc_id": "kb/long", "metadata": {} }]
+            }
+        ]));
+        let mut reply = envelope();
+        attach_provenance_with(
+            &output,
+            &mut reply,
+            DisclosurePolicy {
+                knowledge_excerpts: true,
+            },
+        );
+        let citation = &provenance_of(&reply).expect("provenance")["citations"][0];
+        let excerpt = citation["excerpt"].as_str().expect("excerpt");
+        assert_eq!(excerpt.chars().count(), MAX_EXCERPT_CHARS);
+        assert_eq!(citation["excerptTruncated"], true);
+    }
+
+    #[test]
+    fn a_retrieval_tool_excerpt_is_capped_but_still_included_by_default() {
+        let long = "x".repeat(MAX_EXCERPT_CHARS * 3);
+        let output = agent_output(json!([
+            {
+                "kind": "tool_call",
+                "name": "rag_search",
+                "call_id": "c1",
+                "result": { "citations": [{ "doc": "Big doc", "excerpt": long }] }
+            }
+        ]));
+        let mut reply = envelope();
+        attach_provenance_with(&output, &mut reply, DisclosurePolicy::default());
+        let citation = &provenance_of(&reply).expect("provenance")["citations"][0];
+        assert_eq!(citation["tool"], "rag_search");
+        assert_eq!(
+            citation["excerpt"].as_str().expect("excerpt").len(),
+            MAX_EXCERPT_CHARS
+        );
+        assert_eq!(citation["excerptTruncated"], true);
+        assert!(
+            citation.get("origin").is_none(),
+            "tool citations are unchanged"
+        );
+    }
+
+    #[test]
+    fn tool_and_knowledge_citations_travel_together() {
+        let output = agent_output(json!([
+            {
+                "kind": "knowledge_retrieval",
+                "chunks": [{ "text": "t", "score": 0.4, "doc_id": "kb/a", "metadata": {} }]
+            },
+            {
+                "kind": "tool_call",
+                "name": "rag_search",
+                "call_id": "c1",
+                "result": { "citations": [{ "doc": "Tool doc", "excerpt": "quoted" }] }
+            }
+        ]));
+        let mut reply = envelope();
+        attach_provenance_with(&output, &mut reply, DisclosurePolicy::default());
+        let provenance = provenance_of(&reply).expect("provenance");
+        assert_eq!(provenance["tools"], json!(["rag_search"]));
+        let citations = provenance["citations"].as_array().expect("citations");
+        assert_eq!(citations.len(), 2);
+        assert_eq!(citations[0]["origin"], "knowledge");
+        assert_eq!(citations[1]["excerpt"], "quoted");
+    }
+
+    #[test]
+    fn a_knowledge_chunk_naming_no_document_is_not_a_citation() {
+        let output = agent_output(json!([
+            { "kind": "knowledge_retrieval", "chunks": [{ "text": "t", "score": 0.4, "metadata": {} }] }
+        ]));
+        let mut reply = envelope();
+        attach_provenance_with(&output, &mut reply, DisclosurePolicy::default());
+        assert!(
+            !reply.extensions.contains_key(ext_keys::CHANNEL_DATA),
+            "an unattributable chunk with its text withheld cites nothing"
+        );
+    }
+
+    #[test]
+    fn the_whole_object_is_held_under_the_size_cap() {
+        let hits: Vec<JsonValue> = (0..MAX_CITATIONS)
+            .map(|i| {
+                json!({
+                    "doc": format!("{i}-{}", "d".repeat(MAX_EXCERPT_CHARS)),
+                    "source_file": "s".repeat(MAX_EXCERPT_CHARS),
+                    "section": "x".repeat(MAX_EXCERPT_CHARS),
+                    "excerpt": "e".repeat(MAX_EXCERPT_CHARS * 2)
+                })
+            })
+            .collect();
+        let output = agent_output(json!([
+            { "kind": "tool_call", "name": "rag_search", "call_id": "c1", "result": { "citations": hits } }
+        ]));
+        let mut reply = envelope();
+        attach_provenance_with(&output, &mut reply, DisclosurePolicy::default());
+        let provenance = provenance_of(&reply).expect("provenance");
+        let size = serde_json::to_vec(provenance).expect("serialise").len();
+        assert!(size <= MAX_PROVENANCE_BYTES, "{size} bytes");
+        assert_eq!(provenance["citationsTruncated"], true);
+        let kept = provenance["citations"].as_array().expect("citations");
+        assert!(!kept.is_empty() && kept.len() < MAX_CITATIONS);
+        assert!(
+            kept[0]["doc"].as_str().expect("doc").starts_with("0-"),
+            "best hits kept"
+        );
+    }
+
+    #[test]
+    fn the_knowledge_excerpt_switch_is_off_unless_explicitly_truthy() {
+        assert!(!DisclosurePolicy::from_env_value(None).knowledge_excerpts);
+        for off in ["", "0", "false", "no", "off", "maybe"] {
+            assert!(
+                !DisclosurePolicy::from_env_value(Some(off)).knowledge_excerpts,
+                "{off}"
+            );
+        }
+        for on in ["1", "true", "YES", " on "] {
+            assert!(
+                DisclosurePolicy::from_env_value(Some(on)).knowledge_excerpts,
+                "{on}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_trail_kind_is_skipped() {
+        let output = agent_output(json!([
+            { "kind": "some_future_kind", "payload": 1 },
+            { "kind": "tool_call", "name": "lookup", "call_id": "c", "result": {} }
+        ]));
+        let mut reply = envelope();
+        attach_provenance_with(&output, &mut reply, DisclosurePolicy::default());
+        assert_eq!(
+            provenance_of(&reply).expect("provenance")["tools"],
+            json!(["lookup"])
         );
     }
 }
