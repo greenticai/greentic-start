@@ -1267,7 +1267,8 @@ pub(crate) fn parse_envelopes(
         // AFTER the passthrough, so a runner-supplied `channelData` is already
         // on the envelope and the provenance merges into it. The text bubble
         // above is untouched either way: provenance rides on `channelData`
-        // only, and is absent entirely when the trail records no tool that ran.
+        // only, and is absent entirely when the trail records neither a tool
+        // that ran nor a citable knowledge retrieval.
         crate::agent_provenance::attach_provenance(value, &mut reply);
         operator_log::info(
             module_path!(),
