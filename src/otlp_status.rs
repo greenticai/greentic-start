@@ -134,20 +134,28 @@ pub(crate) fn reset_for_test() {
     with(|s| *s = State::default());
 }
 
+/// The one lock every test that touches this module's process-wide `State`
+/// must hold, in THIS file and in any other file's test module (e.g.
+/// `otlp_telemetry.rs`'s exporter-wrapper tests) — the state is a single
+/// crate-wide static regardless of which file calls into it, so two
+/// independently-defined locks would not actually serialise against each
+/// other and `cargo test`'s default parallelism could still race them.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        static L: OnceLock<Mutex<()>> = OnceLock::new();
-        L.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-    }
 
     #[test]
     fn nothing_installed_reads_as_none() {
-        let _g = lock();
+        let _g = test_lock();
         reset_for_test();
         let s = snapshot_json();
         assert_eq!(s["exporter"], "none");
@@ -157,7 +165,7 @@ mod tests {
 
     #[test]
     fn an_ok_export_stamps_last_ok_and_an_error_is_redacted() {
-        let _g = lock();
+        let _g = test_lock();
         reset_for_test();
         record_installed("otlp-grpc");
         record_export(Signal::Logs, Ok(()));
@@ -181,7 +189,7 @@ mod tests {
 
     #[test]
     fn an_init_error_is_reported_and_not_installed() {
-        let _g = lock();
+        let _g = test_lock();
         reset_for_test();
         record_init_error("build OTLP gRPC span exporter: bad uri http://u:p@x");
         let s = snapshot_json();

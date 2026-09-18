@@ -92,12 +92,28 @@ pub(crate) fn resolve(
 
 /// The three OTel provider handles `install_layer` builds, handed back to the
 /// caller so it can flush/shut them down on graceful shutdown (Task 3). Each
-/// field is a cheap `Arc`-backed clone: the tracer is also cloned into
-/// `opentelemetry::global`, the logger's clone lives inside the returned
-/// layer's [`OpenTelemetryTracingBridge`], and the meter is cloned into
-/// `opentelemetry::global` too — so dropping this struct alone never shuts a
-/// provider down (see the module tests / task report for the drop-semantics
-/// check this relies on).
+/// field is a cheap `Arc`-backed clone, and dropping this struct alone never
+/// shuts a provider down, because each provider already has a SEPARATE
+/// strong reference rooted in something that outlives it:
+/// - `tracer`: `install_layer` calls `global::set_tracer_provider(providers.tracer.clone())`
+///   before returning — `opentelemetry::global`'s tracer slot is a
+///   process-lifetime static, so that clone survives independently of this
+///   struct.
+/// - `logger`: `OpenTelemetryTracingBridge::new(&providers.logger)` calls
+///   `provider.logger("")` internally, which clones the provider into the
+///   `SdkLogger` the bridge stores (`SdkLogger::new(scope, self.clone())` in
+///   `opentelemetry_sdk`). That bridge is boxed into the layer returned from
+///   `install_layer`, which the caller installs as the process's global
+///   default `tracing` subscriber — itself a process-lifetime static.
+/// - `meter`: cloned into `global::set_meter_provider(meter_provider.clone())`
+///   the same way as the tracer, into the same kind of process-lifetime
+///   global slot.
+///
+/// Each provider's `Drop` only runs its real shutdown when the STRONG
+/// refcount hits zero (see `TracerProviderInner`/`LoggerProviderInner`/
+/// `MeterProviderInner`'s `Drop` impls in `opentelemetry_sdk`), so as long as
+/// one of these two references is outstanding, dropping the other is a
+/// no-op.
 ///
 /// Not yet wired up: `install_layer`'s caller only destructures the tuple
 /// today to keep `init_trace_log` compiling. Task 3 (the flush guard) reads
@@ -190,27 +206,39 @@ where
     Ok((tracer_layer.and_then(logger_layer).boxed(), providers))
 }
 
-/// Rewrites a base OTLP/HTTP endpoint to carry the per-signal path (per the
-/// OTLP/HTTP spec, `/v1/traces`, `/v1/logs`, `/v1/metrics`), unless the
-/// operator already configured a custom, non-root path — which is kept
-/// verbatim. gRPC endpoints are returned unchanged: gRPC has no per-signal
-/// path, only a service/method on the one channel.
+/// The three OTLP/HTTP default per-signal paths, per the OTLP/HTTP spec.
+/// `signal_endpoint` strips exactly one of these from the end of a
+/// configured base URL before re-appending the requested signal's path, so
+/// that pointing `OTLP_ENDPOINT` at the DEFAULT traces path (the shape
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is commonly copy-pasted with) does not
+/// leave logs/metrics exports carrying `/v1/traces` too.
+const SIGNAL_PATH_SUFFIXES: [&str; 3] = ["/v1/traces", "/v1/logs", "/v1/metrics"];
+
+/// Rewrites a base OTLP/HTTP endpoint to carry the requested signal's path.
+///
+/// gRPC endpoints are returned unchanged: gRPC has no per-signal path, only
+/// a service/method on the one channel.
+///
+/// For OtlpHttp: the base is trimmed of a trailing `/`, then — if what
+/// remains ends with one of [`SIGNAL_PATH_SUFFIXES`] (any of the three, not
+/// just the one being requested) — that suffix is stripped to recover the
+/// collector's true root before `path` is appended. A base with no matching
+/// suffix (root, or an operator's own custom sub-path such as `/otlp`) is
+/// kept as-is and `path` is simply appended to it. This mirrors the OTel
+/// base-endpoint convention: `http://c:4318` and `http://c:4318/custom/v1/traces`
+/// both normalise to a root the requested signal path can be appended to,
+/// the former trivially (nothing to strip) and the latter by first removing
+/// the default traces suffix it happens to carry.
 fn signal_endpoint(base: &str, exporter: ExporterKind, path: &str) -> String {
     if exporter != ExporterKind::OtlpHttp {
         return base.to_string();
     }
-    let authority_start = base.find("://").map(|i| i + 3).unwrap_or(0);
-    let authority_and_path = &base[authority_start..];
-    match authority_and_path.find('/') {
-        None => format!("{}{path}", base.trim_end_matches('/')),
-        Some(slash_offset) => {
-            if &authority_and_path[slash_offset..] == "/" {
-                format!("{}{path}", base.trim_end_matches('/'))
-            } else {
-                base.to_string()
-            }
-        }
-    }
+    let trimmed = base.trim_end_matches('/');
+    let root = SIGNAL_PATH_SUFFIXES
+        .iter()
+        .find_map(|suffix| trimmed.strip_suffix(suffix))
+        .unwrap_or(trimmed);
+    format!("{root}{path}")
 }
 
 fn build_providers(
@@ -277,7 +305,13 @@ fn build_providers(
 
     let wrapped_metric_exporter = TokioMetricExporter {
         inner: metric_exporter,
-        runtime: runtime_handle,
+        // Only gRPC (tonic) needs the captured runtime entered for it — see
+        // the doc comment on `TokioMetricExporter` for why the HTTP exporter
+        // must never be driven from inside a Tokio runtime context.
+        runtime: match resolved.exporter {
+            ExporterKind::OtlpGrpc => Some(runtime_handle),
+            ExporterKind::OtlpHttp => None,
+        },
     };
 
     let meter_provider = SdkMeterProvider::builder()
@@ -390,13 +424,30 @@ impl<E: SdkLogExporter> SdkLogExporter for RecordingLogExporter<E> {
     }
 }
 
-/// Wraps an OTLP `MetricExporter` so it can be driven from the
+/// Wraps an OTLP `MetricExporter` so gRPC (tonic) can be driven from the
 /// `PeriodicReader` background `std::thread` (which has no Tokio runtime
 /// scope) by entering a captured runtime handle on every export.
+///
+/// `runtime` is `Some` for gRPC and `None` for HTTP — HTTP must NOT be
+/// entered into any Tokio runtime, captured or ambient. The HTTP exporter
+/// (built with `.with_http()` / the `reqwest-blocking-client` feature)
+/// delegates to `reqwest::blocking::Client::send_bytes`, which is `async fn`
+/// in name only: its body calls the genuinely-blocking `Client::execute`
+/// directly, and that call's internal wait (`reqwest`'s
+/// `blocking::wait::enter()`) does a debug-only sanity check — "are we
+/// already inside a Tokio runtime?" — by building and dropping a throwaway
+/// `current_thread` runtime. If the calling thread already HAS a runtime
+/// entered (which `Handle::block_on` does, for the duration of the call),
+/// that throwaway runtime's drop panics with "Cannot drop a runtime in a
+/// context where blocking is not allowed". Driving the HTTP exporter WITHOUT
+/// entering any runtime first (i.e. straight off the `PeriodicReader`'s bare
+/// background thread, exactly as `futures_executor::block_on` does) avoids
+/// the nested-runtime condition entirely, since `reqwest`'s sanity check then
+/// finds no runtime to conflict with.
 #[derive(Debug)]
 struct TokioMetricExporter {
     inner: MetricExporter,
-    runtime: Handle,
+    runtime: Option<Handle>,
 }
 
 impl PushMetricExporter for TokioMetricExporter {
@@ -404,21 +455,32 @@ impl PushMetricExporter for TokioMetricExporter {
         &self,
         metrics: &ResourceMetrics,
     ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
-        let result = self.runtime.block_on(self.inner.export(metrics));
-        otlp_status::record_export(
-            Signal::Metrics,
-            result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
-        );
-        async move { result }
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            let result = match runtime {
+                Some(handle) => handle.block_on(self.inner.export(metrics)),
+                None => self.inner.export(metrics).await,
+            };
+            otlp_status::record_export(
+                Signal::Metrics,
+                result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+            );
+            result
+        })
     }
 
     fn force_flush(&self) -> OTelSdkResult {
-        self.runtime.block_on(async { self.inner.force_flush() })
+        match &self.runtime {
+            Some(handle) => handle.block_on(async { self.inner.force_flush() }),
+            None => self.inner.force_flush(),
+        }
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
-        self.runtime
-            .block_on(async { self.inner.shutdown_with_timeout(timeout) })
+        match &self.runtime {
+            Some(handle) => handle.block_on(async { self.inner.shutdown_with_timeout(timeout) }),
+            None => self.inner.shutdown_with_timeout(timeout),
+        }
     }
 
     fn temporality(&self) -> Temporality {
@@ -572,24 +634,106 @@ mod tests {
             signal_endpoint("http://c:4317", ExporterKind::OtlpGrpc, "/v1/traces"),
             "http://c:4317"
         );
+        // A custom collector path with no default per-signal suffix is kept
+        // and the requested signal path appended to it verbatim.
+        assert_eq!(
+            signal_endpoint(
+                "https://gw.example/otlp",
+                ExporterKind::OtlpHttp,
+                "/v1/traces"
+            ),
+            "https://gw.example/otlp/v1/traces"
+        );
+        // A base already carrying a DIFFERENT signal's default suffix has
+        // that suffix stripped before the requested one is appended, so a
+        // generic `OTLP_ENDPOINT` copy-pasted with the traces path does not
+        // leak into a logs export.
+        assert_eq!(
+            signal_endpoint(
+                "http://c:4318/custom/v1/traces",
+                ExporterKind::OtlpHttp,
+                "/v1/logs"
+            ),
+            "http://c:4318/custom/v1/logs"
+        );
     }
 
-    #[tokio::test]
-    async fn the_recording_span_exporter_stamps_ok_and_errors() {
-        use opentelemetry_sdk::trace::{InMemorySpanExporter, SpanExporter as _};
-        // The lock only needs to cover the reset, not the export/snapshot —
-        // holding a std::sync::MutexGuard across an .await trips
-        // clippy::await_holding_lock (and would risk deadlocking the async
-        // executor), so it is dropped before the await point.
-        {
-            let _lock = env_lock();
-            crate::otlp_status::reset_for_test();
+    /// Drives a future to completion on the CURRENT thread with no ambient
+    /// Tokio runtime whatsoever — deliberately not `#[tokio::test]` (which
+    /// would itself enter a runtime on this thread) and not
+    /// `Handle::block_on` (same reason). This is what lets
+    /// `http_metric_export_never_panics_and_records_an_error` faithfully
+    /// reproduce the real `PeriodicReader` calling context (its own bare
+    /// `std::thread`, driven via `futures_executor::block_on` — see the
+    /// `TokioMetricExporter` doc comment) instead of accidentally recreating
+    /// the very nested-runtime precondition the fix removes.
+    fn poll_to_completion<F: std::future::Future>(fut: F) -> F::Output {
+        let mut fut = std::pin::pin!(fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(v) => return v,
+                std::task::Poll::Pending => std::thread::yield_now(),
+            }
         }
+    }
+
+    #[test]
+    fn the_recording_span_exporter_stamps_ok_and_errors() {
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SpanExporter as _};
+        // Held across the whole export+snapshot: this is a plain sync #[test]
+        // (no `.await` in this function), so clippy::await_holding_lock does
+        // not apply, and `otlp_status`'s state can't be touched by a
+        // concurrently-running test in either file while this runs.
+        let _lock = crate::otlp_status::test_lock();
+        crate::otlp_status::reset_for_test();
         let rec = RecordingSpanExporter {
             inner: InMemorySpanExporter::default(),
         };
-        rec.export(vec![]).await.unwrap();
+        poll_to_completion(rec.export(vec![])).unwrap();
         let s = crate::otlp_status::snapshot_json();
         assert!(s["signals"]["traces"]["last_ok_at"].is_string());
+    }
+
+    #[test]
+    fn http_metric_export_never_panics_and_records_an_error() {
+        let _lock = crate::otlp_status::test_lock();
+        crate::otlp_status::reset_for_test();
+
+        // Bind an ephemeral port, then drop the listener so nothing answers
+        // there — a reliable, fast connection-refused without depending on
+        // network access or a fixed "probably free" port number.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("read local addr");
+        drop(listener);
+
+        let dead_endpoint = signal_endpoint(
+            &format!("http://{addr}"),
+            ExporterKind::OtlpHttp,
+            "/v1/metrics",
+        );
+        let metric_exporter = MetricExporter::builder()
+            .with_http()
+            .with_endpoint(dead_endpoint)
+            .with_protocol(Protocol::HttpBinary)
+            .build()
+            .expect("build http metric exporter");
+
+        let wrapped = TokioMetricExporter {
+            inner: metric_exporter,
+            runtime: None,
+        };
+
+        let metrics = ResourceMetrics::default();
+        // Pre-fix, driving the OtlpHttp-built exporter through a captured
+        // runtime handle here panicked under debug_assertions (nested Tokio
+        // runtime — see the `TokioMetricExporter` doc comment). This must
+        // not panic, and the refused connection must surface as a recorded
+        // error rather than silently vanishing.
+        let _ = poll_to_completion(wrapped.export(&metrics));
+
+        let s = crate::otlp_status::snapshot_json();
+        assert!(s["signals"]["metrics"]["last_error_at"].is_string());
     }
 }
