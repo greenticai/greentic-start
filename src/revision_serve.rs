@@ -65,6 +65,7 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{Notify, oneshot};
+use tracing::Instrument as _;
 
 use greentic_runner_host::{Activity, RunnerHost, WelcomeFlowHint};
 
@@ -1095,11 +1096,22 @@ fn try_capture_public_url(cap: &PublicUrlCapture, headers: &hyper::HeaderMap) {
 }
 
 /// infallible response hyper wants.
+///
+/// Opens the same `http.request` span the `--bundle` boot path
+/// (`http_ingress::handle_request`) opens, and records the same HTTP metrics
+/// via `crate::metrics::record_http_request` — this store-root path recorded
+/// neither before, which is why every env-canvas lane (all `--store-root`)
+/// exported no HTTP metrics and no traces.
 async fn handle_connection(
     mut req: Request<Incoming>,
     state: Arc<ServeState>,
     peer_is_loopback: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    let started = std::time::Instant::now();
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    let span = crate::request_span::request_span(&method, &path);
+
     // Cloud Run deferred public-URL capture: on the first inbound request
     // through the GFE, derive the public base URL from the Host header and
     // wake the deferred webhook-registration task. Placed BEFORE the WS
@@ -1111,16 +1123,26 @@ async fn handle_connection(
     // A5: intercept WebSocket stream paths BEFORE `serve` so the upgrade
     // handshake can borrow the request mutably. The stream path is the WS
     // endpoint browsers open after creating a conversation over REST.
-    let path = req.uri().path().to_string();
-    if is_directline_stream_path(&path) {
+    let response = if is_directline_stream_path(&path) {
         let (Ok(response) | Err(response)) =
-            handle_websocket_upgrade(&mut req, &path, Arc::clone(&state)).await;
-        return Ok(response);
-    }
+            handle_websocket_upgrade(&mut req, &path, Arc::clone(&state))
+                .instrument(span.clone())
+                .await;
+        response
+    } else {
+        let cors = path_allows_cors(&path);
+        let (Ok(response) | Err(response)) = serve(req, state, peer_is_loopback)
+            .instrument(span.clone())
+            .await;
+        if cors { with_cors(response) } else { response }
+    };
 
-    let cors = path_allows_cors(&path);
-    let (Ok(response) | Err(response)) = serve(req, state, peer_is_loopback).await;
-    Ok(if cors { with_cors(response) } else { response })
+    let status = response.status().as_u16();
+    crate::request_span::record_status(&span, status);
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let route = crate::metrics::normalise_route(&path);
+    crate::metrics::record_http_request(&method, &route, status, elapsed_ms);
+    Ok(response)
 }
 
 /// Paths that are never legitimately called cross-origin, and so must not
@@ -4236,6 +4258,7 @@ fn try_probe_response(path: &str, state: &ServeState) -> Option<Response<Full<By
             "deployments_routed": deployments_routed,
             "revisions_active": revisions_active,
             "restart_required": restart,
+            "telemetry": crate::otlp_status::snapshot_json(),
         });
         return Some(json_response(StatusCode::OK, body.to_string().into_bytes()));
     }
@@ -4900,23 +4923,36 @@ async fn dispatch_provider_route(
         let pipeline_provider = provider_type.clone();
         let pipeline_bundle = bundle_id.clone();
         let pipeline_notifier = Arc::clone(&state.notifier);
-        tokio::spawn(async move {
-            run_provider_inbound_pipeline(
-                pipeline_activation,
-                pipeline_tenant,
-                deployment_id,
-                pipeline_bundle,
-                revision_id,
-                descriptor_pack_id,
-                pipeline_provider,
-                ingress_envelopes,
-                endpoint_id,
-                flow_target,
-                welcome_hint,
-                pipeline_notifier,
-            )
-            .await;
-        });
+        // Created here, inside the request-instrumented future, so it parents
+        // to the `http.request` span and the turn shares the request's trace.
+        // Ids only — never message content.
+        let turn_span = tracing::info_span!(
+            "messaging.turn",
+            greentic.provider = %provider_type,
+            greentic.tenant = %tenant,
+            greentic.deployment_id = %deployment_id,
+            greentic.revision_id = %revision_id,
+        );
+        tokio::spawn(
+            async move {
+                run_provider_inbound_pipeline(
+                    pipeline_activation,
+                    pipeline_tenant,
+                    deployment_id,
+                    pipeline_bundle,
+                    revision_id,
+                    descriptor_pack_id,
+                    pipeline_provider,
+                    ingress_envelopes,
+                    endpoint_id,
+                    flow_target,
+                    welcome_hint,
+                    pipeline_notifier,
+                )
+                .await;
+            }
+            .instrument(turn_span),
+        );
     }
 
     // A4: DirectLine post-processing — apply the forward plan (seed sliding
@@ -8211,6 +8247,100 @@ mod tests {
         let collected = runtime.block_on(body.collect()).expect("collect Full body");
         let bytes = collected.to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The store-root path (`handle_connection`, reached through the real
+    /// accept helper and hyper) opens an `http.request` span per request and
+    /// records the final status on it as an INTEGER — the OTel bridge exports
+    /// a `u64` as a string, which semconv forbids. Two requests (a 200 probe
+    /// and a 404 unknown path) pin that the recorded value tracks the actual
+    /// response, not a constant.
+    ///
+    /// `crate::metrics::record_http_request` is not asserted here: it writes
+    /// to the process-global meter, and installing a reader for it would leak
+    /// into every other test in the binary.
+    #[test]
+    fn handle_connection_records_the_status_on_the_request_span() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn get(addr: SocketAddr, path: &str) -> u16 {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            stream
+                .write_all(
+                    format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .expect("write request");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read response");
+            let head = String::from_utf8_lossy(&buf);
+            head.lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse().ok())
+                .unwrap_or_else(|| panic!("no status line in response: {head:?}"))
+        }
+
+        let (subscriber, captured) = crate::request_span::capture::subscriber();
+        // A current-thread runtime runs every spawned task on this thread, so
+        // the thread-local subscriber installed by `with_default` sees the
+        // connection tasks' spans too.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let statuses = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let addr = listener.local_addr().expect("local addr");
+                let state = Arc::new(empty_state("span-test", addr));
+                let accept_state = Arc::clone(&state);
+                let accept_loop = tokio::spawn(async move {
+                    for _ in 0..2 {
+                        let accepted = listener.accept().await;
+                        spawn_revision_connection(accepted, &accept_state, true);
+                    }
+                });
+                let ok = get(addr, "/healthz").await;
+                let missing = get(addr, "/nope/12345").await;
+                accept_loop.await.expect("accept loop");
+                (ok, missing)
+            })
+        });
+        assert_eq!(statuses, (200, 404));
+
+        let requests = captured.named("http.request");
+        assert_eq!(
+            requests.len(),
+            2,
+            "one request span per request: {requests:?}"
+        );
+        let by_route = |route: &str| {
+            requests
+                .iter()
+                .find(|s| s.fields.get("http.route").map(String::as_str) == Some(route))
+                .unwrap_or_else(|| panic!("no request span for {route}: {requests:?}"))
+                .clone()
+        };
+        let healthz = by_route("/healthz");
+        assert_eq!(
+            healthz.i64_fields.get("http.response.status_code"),
+            Some(&200),
+            "status must be recorded as an integer"
+        );
+        let missing = by_route("/nope/:id");
+        assert_eq!(
+            missing.i64_fields.get("http.response.status_code"),
+            Some(&404)
+        );
+        assert_eq!(
+            missing.fields.get("otel.name").map(String::as_str),
+            Some("GET /nope/:id"),
+            "a numeric path segment must not reach the span name"
+        );
     }
 
     #[test]
@@ -11770,6 +11900,70 @@ mod binary_update_tests {
             Some(env!("CARGO_PKG_VERSION")),
             "/status must include version"
         );
+    }
+
+    #[test]
+    fn status_includes_telemetry_field_with_no_endpoint_echoed() {
+        let _g = crate::otlp_status::test_lock();
+        crate::otlp_status::reset_for_test();
+        crate::otlp_status::record_installed("otlp-grpc");
+        crate::otlp_status::record_export(
+            crate::otlp_status::Signal::Traces,
+            Err("connect http://u:p@collector:4317 failed".into()),
+        );
+
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            activity_source_override: None,
+        };
+        let resp = try_probe_response("/status", &state).expect("/status response");
+        let body_bytes = resp.into_body();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let collected = rt
+            .block_on(http_body_util::BodyExt::collect(body_bytes))
+            .unwrap();
+        let text = String::from_utf8_lossy(&collected.to_bytes()).to_string();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["schema"], "greentic.status.v1");
+        assert_eq!(json["telemetry"]["exporter"], "otlp-grpc");
+        assert_eq!(json["telemetry"]["installed"], true);
+        assert!(json["telemetry"]["signals"]["traces"].is_object());
+
+        // The credential must never be echoed. `redact` keeps `scheme://host`
+        // (see otlp_status::redact's doc comment and its own tests) and only
+        // strips the `user:pass@` userinfo, so the body legitimately still
+        // contains the bare "http://collector:4317" host — assert on the
+        // credential, not on the scheme separator.
+        assert!(
+            !text.contains("u:p"),
+            "credential leaked into /status: {text}"
+        );
+        assert!(
+            !text.contains("u:p@"),
+            "credential leaked into /status: {text}"
+        );
+
+        crate::otlp_status::reset_for_test();
     }
 
     /// Regression: binary swap response with restart_required=true must set

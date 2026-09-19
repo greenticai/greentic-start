@@ -69,6 +69,7 @@ mod offers;
 mod onboard;
 mod operator_i18n;
 mod operator_log;
+pub(crate) mod otlp_status;
 mod otlp_telemetry;
 #[doc(hidden)]
 pub mod perf_harness;
@@ -80,6 +81,7 @@ pub mod provider_config_envelope;
 mod provider_webhook_verify;
 mod qa_persist;
 mod redis_tls;
+mod request_span;
 mod revision_boot;
 mod revision_dispatcher;
 mod revision_drain;
@@ -1365,6 +1367,10 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             &shutdown_paths,
             if auto_restart { Some(&server) } else { None },
         ))?;
+        operator_log::info(
+            module_path!(),
+            format!("runtime shutdown requested via {}", reason.as_str()),
+        );
         if matches!(reason, ShutdownReason::AdminStop) {
             runtime_state::clear_stop_request(&shutdown_paths)?;
             let line = operator_i18n::tr(
@@ -1400,6 +1406,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 );
             }
         }
+        // Flush and shut down the OTLP providers now, while the activation
+        // runtime and everything else this arm owns is still alive — not at
+        // scope exit, after `activation_rt` and friends have been torn down.
+        // Also covers the binary-update `exec` below, which never returns.
+        drop(_trace_guard);
 
         #[cfg(unix)]
         if matches!(reason, ShutdownReason::BinaryUpdateRestart) {
@@ -1410,8 +1421,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                     own_exe.display(),
                 ),
             );
-            // Drop the trace guard to flush logs before exec.
-            drop(_trace_guard);
+            // The trace guard was already dropped (flushed) above.
             exec_into_self(&own_exe)?;
             // exec_into_self does not return on success.
         }
@@ -1838,6 +1848,33 @@ fn build_trace_filter(bundle_level: Option<&str>) -> tracing_subscriber::EnvFilt
     })
 }
 
+/// Holds the file-appender's `WorkerGuard` for the process lifetime and, when
+/// telemetry resolved to OTLP, the exporter provider handles too — so that
+/// dropping this guard flushes and shuts down the OTLP tracer/logger/meter
+/// providers instead of leaving up to `scheduled_delay` worth of buffered
+/// spans/logs stranded on process exit.
+///
+/// In `run_start` it is dropped explicitly on the `--store-root` arm right
+/// after `server.stop()` (which also precedes the binary-update `exec`), and
+/// on the `--bundle` path at scope exit of `run_start`. Either way it only runs if the process gets
+/// that far: an unhandled SIGTERM would kill it first, which is why
+/// [`wait_for_shutdown_inner`] handles SIGTERM on unix.
+pub(crate) struct TraceGuard {
+    _file: tracing_appender::non_blocking::WorkerGuard,
+    otlp: Option<otlp_telemetry::OtlpProviders>,
+}
+
+impl Drop for TraceGuard {
+    fn drop(&mut self) {
+        if let Some(providers) = &self.otlp {
+            // Cloud Run gives ~10s after SIGTERM; bound each provider's
+            // shutdown well under that so flushing telemetry cannot eat into
+            // the window the rest of shutdown needs.
+            providers.shutdown(std::time::Duration::from_secs(3));
+        }
+    }
+}
+
 /// Install a `tracing` subscriber writing to `<log_dir>/system.log`. When
 /// `telemetry` resolves to OTLP, an additional OpenTelemetry tracer + meter
 /// + logger layer is composed alongside the file appender.
@@ -1845,7 +1882,7 @@ fn init_trace_log(
     log_dir: &std::path::Path,
     telemetry: Option<&bundle_config::BundleTelemetryConfig>,
     fallback_service_name: &str,
-) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+) -> Option<TraceGuard> {
     use std::fs::OpenOptions;
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
@@ -1878,24 +1915,43 @@ fn init_trace_log(
         }));
 
     let resolved = otlp_telemetry::resolve(telemetry, fallback_service_name);
-    let otlp_layer = resolved
-        .as_ref()
-        .and_then(|r| match otlp_telemetry::install_layer(r) {
-            Ok(layer) => Some(layer),
+    // `(layer, providers, exporter name)`. The exporter is recorded as
+    // installed only once the subscriber carrying its layer is actually
+    // installed below — `install_layer` succeeding is not enough.
+    let (otlp_layer, otlp_providers, otlp_exporter_name) = match resolved.as_ref() {
+        Some(r) => match otlp_telemetry::install_layer(r) {
+            Ok((layer, providers)) => {
+                let exporter_name = match r.exporter {
+                    otlp_telemetry::ExporterKind::OtlpGrpc => "otlp-grpc",
+                    otlp_telemetry::ExporterKind::OtlpHttp => "otlp-http",
+                };
+                (Some(layer), Some(providers), Some(exporter_name))
+            }
             Err(err) => {
+                // The endpoint can carry userinfo; never log it raw.
                 operator_log::warn(
                     module_path!(),
                     format!(
-                        "OTLP exporter init failed (endpoint={}); file logging only: {err:#}",
-                        r.endpoint
+                        "OTLP exporter init failed (endpoint={}); file logging only: {}",
+                        otlp_status::redact(&r.endpoint),
+                        otlp_status::redact(&format!("{err:#}"))
                     ),
                 );
-                None
+                otlp_status::record_init_error(&format!("{err:#}"));
+                (None, None, None)
             }
-        });
+        },
+        None => (None, None, None),
+    };
     let otlp_summary = resolved
         .as_ref()
-        .map(|r| format!("{:?} endpoint={}", r.exporter, r.endpoint))
+        .map(|r| {
+            format!(
+                "{:?} endpoint={}",
+                r.exporter,
+                otlp_status::redact(&r.endpoint)
+            )
+        })
         .unwrap_or_else(|| "none".to_string());
 
     let init_result = match otlp_layer {
@@ -1911,6 +1967,9 @@ fn init_trace_log(
     };
     match init_result {
         Ok(()) => {
+            if let Some(exporter_name) = otlp_exporter_name {
+                otlp_status::record_installed(exporter_name);
+            }
             operator_log::info(
                 module_path!(),
                 format!(
@@ -1933,10 +1992,20 @@ fn init_trace_log(
                     "tracing subscriber try_init failed (another subscriber already installed?): {err}"
                 ),
             );
+            // The OTLP layer never reached a subscriber, so nothing will ever
+            // export through these providers: report it, and stop their
+            // batch/periodic workers rather than leaking them.
+            if let Some(providers) = otlp_providers {
+                otlp_status::record_init_error("tracing subscriber already installed");
+                providers.shutdown(std::time::Duration::from_secs(3));
+            }
             return None;
         }
     }
-    Some(guard)
+    Some(TraceGuard {
+        _file: guard,
+        otlp: otlp_providers,
+    })
 }
 
 /// Idempotently auto-create the `local` Environment on first `gtc start`.
@@ -2576,8 +2645,14 @@ pub(crate) fn advertise_webchat_urls(
     advert
 }
 
+#[derive(Debug)]
 enum ShutdownReason {
     CtrlC,
+    /// SIGTERM — how Cloud Run, Kubernetes, ECS, `docker stop` and the
+    /// designer's own child supervision stop the process. Handled exactly
+    /// like [`Self::CtrlC`]; unix only (never constructed on Windows).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Terminate,
     AdminStop,
     BinaryUpdateRestart,
 }
@@ -2586,6 +2661,7 @@ impl ShutdownReason {
     fn as_str(&self) -> &'static str {
         match self {
             Self::CtrlC => "ctrl_c",
+            Self::Terminate => "sigterm",
             Self::AdminStop => "admin_stop",
             Self::BinaryUpdateRestart => "binary_update_restart",
         }
@@ -2609,11 +2685,25 @@ async fn wait_for_shutdown_inner(
     paths: &runtime_state::RuntimePaths,
     auto_restart_check: Option<&std::sync::Arc<revision_serve::RevisionServer>>,
 ) -> anyhow::Result<ShutdownReason> {
+    // Without this handler SIGTERM's default action kills the process on the
+    // spot, so `TraceGuard` never drops and the buffered OTLP batch is lost —
+    // in every production lane, since they all stop with SIGTERM. Registered
+    // once, before the loop, so a signal arriving between two 250 ms polls is
+    // not missed.
+    //
+    // Once registered, tokio keeps the handler installed for the rest of the
+    // process: a SECOND SIGTERM during a slow shutdown is swallowed, not
+    // fatal. That is acceptable — the platform follows up with SIGKILL when
+    // its grace period runs out, and the flush is bounded well inside it.
+    let mut terminate = TerminateSignal::new()?;
     loop {
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 result.map_err(|err| anyhow!("failed to wait for Ctrl+C: {err}"))?;
                 return Ok(ShutdownReason::CtrlC);
+            }
+            () = terminate.recv() => {
+                return Ok(ShutdownReason::Terminate);
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                 if runtime_state::read_stop_request(paths)?.is_some() {
@@ -2626,6 +2716,42 @@ async fn wait_for_shutdown_inner(
                 }
             }
         }
+    }
+}
+
+/// SIGTERM listener for [`wait_for_shutdown_inner`]. On non-unix targets
+/// there is no SIGTERM, and `recv` never completes (Windows keeps Ctrl+C only).
+struct TerminateSignal {
+    #[cfg(unix)]
+    inner: tokio::signal::unix::Signal,
+}
+
+impl TerminateSignal {
+    #[cfg(unix)]
+    fn new() -> anyhow::Result<Self> {
+        let inner = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|err| anyhow!("failed to install SIGTERM handler: {err}"))?;
+        Ok(Self { inner })
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> anyhow::Result<Self> {
+        Ok(Self {})
+    }
+
+    /// Resolves when SIGTERM arrives. If the signal stream ever closes (it
+    /// does not while the runtime is alive), stays pending rather than
+    /// reporting a SIGTERM that never happened.
+    #[cfg(unix)]
+    async fn recv(&mut self) {
+        if self.inner.recv().await.is_none() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn recv(&mut self) {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -4190,6 +4316,58 @@ mod tests {
     // --- P7e: ShutdownReason + auto-restart tests ---
 
     #[test]
+    fn shutdown_reason_terminate_as_str() {
+        assert_eq!(ShutdownReason::Terminate.as_str(), "sigterm");
+    }
+
+    /// SIGTERM must end the wait with `Terminate` — without a handler the
+    /// default action kills the process and the OTLP flush never runs.
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_shutdown_returns_terminate_on_sigterm() {
+        // The SIGTERM goes to the whole test process: hold the env lock so no
+        // `run_start_request` test is inside its own shutdown wait (it would
+        // read our signal as its own and skip its stop-request path).
+        let _env_guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = runtime_state::RuntimePaths::new(dir.path(), "demo", "default");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let reason = runtime.block_on(async {
+            // Register a process-wide handler FIRST, so a SIGTERM that lands
+            // before the waiter's own handler is registered is still caught
+            // by tokio instead of killing the test binary.
+            let _guard = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("guard SIGTERM handler");
+            let waiter = tokio::spawn(async move { wait_for_shutdown_inner(&paths, None).await });
+            // Let the waiter register its listener; tokio delivers a signal
+            // only to listeners that existed when it arrived, so retry until
+            // the waiter reports.
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                // SAFETY: getpid/kill are async-signal-safe libc calls with no
+                // memory preconditions.
+                let rc = unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+                assert_eq!(rc, 0, "kill(getpid(), SIGTERM) failed");
+                if waiter.is_finished() {
+                    break;
+                }
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+                .await
+                .expect("waiter finished")
+                .expect("waiter joined")
+        });
+        assert!(
+            matches!(reason, Ok(ShutdownReason::Terminate)),
+            "expected Terminate, got {reason:?}"
+        );
+    }
+
+    #[test]
     fn shutdown_reason_binary_update_restart_as_str() {
         assert_eq!(
             ShutdownReason::BinaryUpdateRestart.as_str(),
@@ -4339,6 +4517,92 @@ mod tests {
         assert!(
             should_clear,
             "stale marker from a different lineage must be cleared"
+        );
+    }
+
+    // ---- TraceGuard flushes OTLP providers on drop ----
+
+    /// A minimal `SpanExporter` that appends every exported batch into a
+    /// shared `Vec` and never clears it. `opentelemetry_sdk`'s own
+    /// `InMemorySpanExporter` resets its buffer inside `shutdown()` by
+    /// default (verified against `opentelemetry_sdk` 0.32.1's
+    /// `in_memory_exporter.rs`: `InMemorySpanExporterBuilder::new()` sets
+    /// `reset_on_shutdown: true`, and the only way to disable that,
+    /// `keep_records_on_shutdown()`, is `#[cfg(test)] pub(crate)` inside
+    /// that crate and unreachable from here) — so asserting "the exporter
+    /// still holds the span" *after* a full `TraceGuard` drop (which flushes
+    /// then shuts down) would always read empty regardless of whether the
+    /// flush happened. This exporter captures on `export` and leaves
+    /// `shutdown`/`shutdown_with_timeout` at the trait's no-op defaults, so
+    /// the captured spans are exactly what was flushed.
+    #[derive(Debug, Clone, Default)]
+    struct CapturingSpanExporter {
+        spans: std::sync::Arc<std::sync::Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>,
+    }
+
+    impl opentelemetry_sdk::trace::SpanExporter for CapturingSpanExporter {
+        fn export(
+            &self,
+            mut batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+        {
+            let spans = self.spans.clone();
+            async move {
+                spans
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .append(&mut batch);
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn trace_guard_drop_flushes_pending_otlp_spans() {
+        use opentelemetry::trace::{Span as _, Tracer as _, TracerProvider as _};
+
+        let exporter = CapturingSpanExporter::default();
+        let captured = exporter.spans.clone();
+
+        let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .build();
+        let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder().build();
+        let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder().build();
+
+        let providers = otlp_telemetry::OtlpProviders {
+            tracer: tracer_provider,
+            logger: logger_provider,
+            meter: meter_provider,
+        };
+
+        let tracer = providers.tracer.tracer("t");
+        let mut span = tracer.start("test-span");
+        span.end();
+
+        assert!(
+            captured
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "the batch processor must not have exported yet: it waits for its \
+             scheduled interval, which this test relies on TraceGuard's drop \
+             to preempt"
+        );
+
+        let (_writer, file_guard) = tracing_appender::non_blocking(std::io::sink());
+        let guard = TraceGuard {
+            _file: file_guard,
+            otlp: Some(providers),
+        };
+        drop(guard);
+
+        let spans = captured.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            spans.len(),
+            1,
+            "TraceGuard::drop must flush the OTLP batch processor instead of \
+             waiting for its interval"
         );
     }
 }

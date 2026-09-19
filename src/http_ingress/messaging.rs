@@ -129,6 +129,7 @@ pub(super) fn route_messaging_envelopes(
                     run_app_flow_safe(
                         runner_host,
                         bundle,
+                        provider,
                         ctx,
                         &app_pack_path,
                         &pack_info,
@@ -171,6 +172,7 @@ pub(super) fn route_messaging_envelopes(
             run_app_flow_safe(
                 runner_host,
                 bundle,
+                provider,
                 ctx,
                 &app_pack_path,
                 &pack_info,
@@ -638,6 +640,7 @@ fn read_card_from_pack(pack_path: &Path, card_key: &str) -> Option<serde_json::V
 fn run_app_flow_safe(
     runner_host: &DemoRunnerHost,
     bundle: &Path,
+    provider: &str,
     ctx: &OperatorContext,
     app_pack_path: &Path,
     pack_info: &app::AppPackInfo,
@@ -645,6 +648,20 @@ fn run_app_flow_safe(
     envelope: &ChannelMessageEnvelope,
     entry_node: Option<&str>,
 ) -> Vec<ChannelMessageEnvelope> {
+    // Ids only, never message content — `envelope.text`/`entry_node` carry
+    // the user's text and must not be added as span attributes.
+    // `provider` is the messaging provider id the ingress route resolved
+    // (e.g. "messaging-webchat-gui"). NOT `envelope.channel`: for Direct Line
+    // that is the per-user conversation id — high-cardinality and not a
+    // provider at all.
+    let span = tracing::info_span!(
+        "messaging.turn",
+        greentic.provider = %provider,
+        greentic.tenant = %ctx.tenant,
+        greentic.pack_id = %pack_info.pack_id,
+        greentic.flow_id = %flow.id,
+    );
+    let _entered = span.enter();
     match app::run_app_flow(
         runner_host,
         bundle,
@@ -1161,6 +1178,7 @@ mod tests {
         let outputs = run_app_flow_safe(
             &runner_host,
             dir.path(),
+            "messaging-webchat-gui",
             &OperatorContext {
                 tenant: "demo".to_string(),
                 team: Some("default".to_string()),
@@ -1185,6 +1203,86 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].id, original.id);
         assert_eq!(outputs[0].text, original.text);
+    }
+
+    /// Pins the `messaging.turn` span's `greentic.provider` to the provider
+    /// id the ingress resolved — NOT `envelope.channel`, which for Direct
+    /// Line is the per-user conversation id — and pins that the span is a
+    /// child of whatever span is current (the `http.request` span in
+    /// production), so the turn lands in the request's trace.
+    #[test]
+    fn messaging_turn_span_records_the_provider_and_parents_to_the_request() {
+        let dir = tempdir().expect("tempdir");
+        let discovery = crate::discovery::discover(dir.path()).expect("discovery");
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
+                .expect("secrets handle");
+        let runner_host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )
+        .expect("runner host");
+        let original = envelope();
+        let (subscriber, captured) = crate::request_span::capture::subscriber();
+        tracing::subscriber::with_default(subscriber, || {
+            let request = crate::request_span::request_span(
+                "POST",
+                "/v1/messaging/webchat/default/v3/directline/conversations/conv-1/activities",
+            );
+            let _entered = request.enter();
+            let _ = run_app_flow_safe(
+                &runner_host,
+                dir.path(),
+                "messaging-webchat-gui",
+                &OperatorContext {
+                    tenant: "demo".to_string(),
+                    team: Some("default".to_string()),
+                    correlation_id: None,
+                },
+                &dir.path().join("missing.gtpack"),
+                &AppPackInfo {
+                    pack_id: "app-pack".to_string(),
+                    flows: vec![],
+                    capabilities: Vec::new(),
+                },
+                &AppFlowInfo {
+                    id: "default".to_string(),
+                    kind: "messaging".to_string(),
+                    subscribes_to: vec![],
+                    node_ids: vec![],
+                },
+                &original,
+                None,
+            );
+        });
+
+        let requests = captured.named("http.request");
+        assert_eq!(requests.len(), 1, "one request span");
+        let turns = captured.named("messaging.turn");
+        assert_eq!(turns.len(), 1, "one turn span");
+        let turn = &turns[0];
+        assert_eq!(
+            turn.fields.get("greentic.provider").map(String::as_str),
+            Some("messaging-webchat-gui"),
+            "provider must be the resolved provider id"
+        );
+        assert_ne!(
+            turn.fields.get("greentic.provider").map(String::as_str),
+            Some(original.channel.as_str()),
+            "provider must never be the envelope channel (Direct Line conversation id)"
+        );
+        assert_eq!(
+            turn.parent,
+            Some(requests[0].id),
+            "turn must be a child of the request"
+        );
+        assert!(
+            !turn.fields.values().any(|v| v.contains("hello")),
+            "message content must never become a span attribute"
+        );
     }
 
     #[test]
