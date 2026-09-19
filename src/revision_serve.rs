@@ -4258,6 +4258,7 @@ fn try_probe_response(path: &str, state: &ServeState) -> Option<Response<Full<By
             "deployments_routed": deployments_routed,
             "revisions_active": revisions_active,
             "restart_required": restart,
+            "telemetry": crate::otlp_status::snapshot_json(),
         });
         return Some(json_response(StatusCode::OK, body.to_string().into_bytes()));
     }
@@ -11792,6 +11793,70 @@ mod binary_update_tests {
             Some(env!("CARGO_PKG_VERSION")),
             "/status must include version"
         );
+    }
+
+    #[test]
+    fn status_includes_telemetry_field_with_no_endpoint_echoed() {
+        let _g = crate::otlp_status::test_lock();
+        crate::otlp_status::reset_for_test();
+        crate::otlp_status::record_installed("otlp-grpc");
+        crate::otlp_status::record_export(
+            crate::otlp_status::Signal::Traces,
+            Err("connect http://u:p@collector:4317 failed".into()),
+        );
+
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            activity_source_override: None,
+        };
+        let resp = try_probe_response("/status", &state).expect("/status response");
+        let body_bytes = resp.into_body();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let collected = rt
+            .block_on(http_body_util::BodyExt::collect(body_bytes))
+            .unwrap();
+        let text = String::from_utf8_lossy(&collected.to_bytes()).to_string();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["schema"], "greentic.status.v1");
+        assert_eq!(json["telemetry"]["exporter"], "otlp-grpc");
+        assert_eq!(json["telemetry"]["installed"], true);
+        assert!(json["telemetry"]["signals"]["traces"].is_object());
+
+        // The credential must never be echoed. `redact` keeps `scheme://host`
+        // (see otlp_status::redact's doc comment and its own tests) and only
+        // strips the `user:pass@` userinfo, so the body legitimately still
+        // contains the bare "http://collector:4317" host — assert on the
+        // credential, not on the scheme separator.
+        assert!(
+            !text.contains("u:p"),
+            "credential leaked into /status: {text}"
+        );
+        assert!(
+            !text.contains("u:p@"),
+            "credential leaked into /status: {text}"
+        );
+
+        crate::otlp_status::reset_for_test();
     }
 
     /// Regression: binary swap response with restart_required=true must set

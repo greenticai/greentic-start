@@ -6,9 +6,8 @@
 //!
 //! `record_installed`/`record_init_error` are wired from `init_trace_log`
 //! (Task 3) and `record_export` from the exporter wrappers in
-//! `otlp_telemetry`. `snapshot_json` is not read yet — a later task in the
-//! same series serves it from `/status` — so it keeps its own narrow allow
-//! until then.
+//! `otlp_telemetry`. `snapshot_json` is served under the `telemetry` key on
+//! both `/status` implementations (Task 5).
 
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
@@ -116,9 +115,9 @@ fn signal_json(s: &SignalState) -> serde_json::Value {
     })
 }
 
-// Not read outside tests until the `/status` wiring lands (a later task in
-// this series).
-#[allow(dead_code)]
+/// Serialised for the `/status` `telemetry` field on both boot paths (the
+/// revision ingress in `revision_serve.rs` and the `--bundle` ingress in
+/// `http_helpers.rs`).
 pub(crate) fn snapshot_json() -> serde_json::Value {
     let s = with(|s| s.clone());
     serde_json::json!({
