@@ -1957,7 +1957,12 @@ where
             let provider = request.provider.to_string();
             let ctx_for_worker = ctx.clone();
             let runner_host = state.runner_host.clone();
+            // The worker thread has no span context of its own; carry the
+            // `http.request` span across so `messaging.turn` is its child and
+            // the whole turn lands in the request's trace.
+            let request_span = tracing::Span::current();
             std::thread::spawn(move || {
+                let _request = request_span.enter();
                 if let Err(err) = route_messaging_envelopes(
                     &bundle,
                     &runner_host,

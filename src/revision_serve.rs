@@ -4923,23 +4923,36 @@ async fn dispatch_provider_route(
         let pipeline_provider = provider_type.clone();
         let pipeline_bundle = bundle_id.clone();
         let pipeline_notifier = Arc::clone(&state.notifier);
-        tokio::spawn(async move {
-            run_provider_inbound_pipeline(
-                pipeline_activation,
-                pipeline_tenant,
-                deployment_id,
-                pipeline_bundle,
-                revision_id,
-                descriptor_pack_id,
-                pipeline_provider,
-                ingress_envelopes,
-                endpoint_id,
-                flow_target,
-                welcome_hint,
-                pipeline_notifier,
-            )
-            .await;
-        });
+        // Created here, inside the request-instrumented future, so it parents
+        // to the `http.request` span and the turn shares the request's trace.
+        // Ids only — never message content.
+        let turn_span = tracing::info_span!(
+            "messaging.turn",
+            greentic.provider = %provider_type,
+            greentic.tenant = %tenant,
+            greentic.deployment_id = %deployment_id,
+            greentic.revision_id = %revision_id,
+        );
+        tokio::spawn(
+            async move {
+                run_provider_inbound_pipeline(
+                    pipeline_activation,
+                    pipeline_tenant,
+                    deployment_id,
+                    pipeline_bundle,
+                    revision_id,
+                    descriptor_pack_id,
+                    pipeline_provider,
+                    ingress_envelopes,
+                    endpoint_id,
+                    flow_target,
+                    welcome_hint,
+                    pipeline_notifier,
+                )
+                .await;
+            }
+            .instrument(turn_span),
+        );
     }
 
     // A4: DirectLine post-processing — apply the forward plan (seed sliding
@@ -8234,6 +8247,100 @@ mod tests {
         let collected = runtime.block_on(body.collect()).expect("collect Full body");
         let bytes = collected.to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The store-root path (`handle_connection`, reached through the real
+    /// accept helper and hyper) opens an `http.request` span per request and
+    /// records the final status on it as an INTEGER — the OTel bridge exports
+    /// a `u64` as a string, which semconv forbids. Two requests (a 200 probe
+    /// and a 404 unknown path) pin that the recorded value tracks the actual
+    /// response, not a constant.
+    ///
+    /// `crate::metrics::record_http_request` is not asserted here: it writes
+    /// to the process-global meter, and installing a reader for it would leak
+    /// into every other test in the binary.
+    #[test]
+    fn handle_connection_records_the_status_on_the_request_span() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn get(addr: SocketAddr, path: &str) -> u16 {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            stream
+                .write_all(
+                    format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .expect("write request");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read response");
+            let head = String::from_utf8_lossy(&buf);
+            head.lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse().ok())
+                .unwrap_or_else(|| panic!("no status line in response: {head:?}"))
+        }
+
+        let (subscriber, captured) = crate::request_span::capture::subscriber();
+        // A current-thread runtime runs every spawned task on this thread, so
+        // the thread-local subscriber installed by `with_default` sees the
+        // connection tasks' spans too.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let statuses = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let addr = listener.local_addr().expect("local addr");
+                let state = Arc::new(empty_state("span-test", addr));
+                let accept_state = Arc::clone(&state);
+                let accept_loop = tokio::spawn(async move {
+                    for _ in 0..2 {
+                        let accepted = listener.accept().await;
+                        spawn_revision_connection(accepted, &accept_state, true);
+                    }
+                });
+                let ok = get(addr, "/healthz").await;
+                let missing = get(addr, "/nope/12345").await;
+                accept_loop.await.expect("accept loop");
+                (ok, missing)
+            })
+        });
+        assert_eq!(statuses, (200, 404));
+
+        let requests = captured.named("http.request");
+        assert_eq!(
+            requests.len(),
+            2,
+            "one request span per request: {requests:?}"
+        );
+        let by_route = |route: &str| {
+            requests
+                .iter()
+                .find(|s| s.fields.get("http.route").map(String::as_str) == Some(route))
+                .unwrap_or_else(|| panic!("no request span for {route}: {requests:?}"))
+                .clone()
+        };
+        let healthz = by_route("/healthz");
+        assert_eq!(
+            healthz.i64_fields.get("http.response.status_code"),
+            Some(&200),
+            "status must be recorded as an integer"
+        );
+        let missing = by_route("/nope/:id");
+        assert_eq!(
+            missing.i64_fields.get("http.response.status_code"),
+            Some(&404)
+        );
+        assert_eq!(
+            missing.fields.get("otel.name").map(String::as_str),
+            Some("GET /nope/:id"),
+            "a numeric path segment must not reach the span name"
+        );
     }
 
     #[test]

@@ -35,8 +35,122 @@ pub(crate) fn request_span(method: &str, path: &str) -> tracing::Span {
 }
 
 /// Record the final HTTP status code on a span opened by [`request_span`].
+///
+/// Recorded as `i64`, not `u64`: `tracing-opentelemetry` has no `record_u64`
+/// arm, so a `u64` falls through to `record_debug` and exports as a STRING
+/// attribute, while OTel HTTP semconv defines `http.response.status_code` as
+/// an int. `i64` maps to an OTel `Int`.
 pub(crate) fn record_status(span: &tracing::Span, status: u16) {
-    span.record("http.response.status_code", status as u64);
+    span.record("http.response.status_code", i64::from(status));
+}
+
+/// Test-only capturing `tracing` layer shared by tests in other modules that
+/// need to assert on span names, recorded field values (including whether a
+/// value arrived as an integer) and parent/child structure.
+#[cfg(test)]
+pub(crate) mod capture {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::Subscriber;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::Context;
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::registry::LookupSpan;
+
+    /// One captured span.
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct SpanRecord {
+        pub(crate) id: u64,
+        pub(crate) name: &'static str,
+        /// Registry id of the parent span, if any.
+        pub(crate) parent: Option<u64>,
+        pub(crate) fields: BTreeMap<String, String>,
+        /// Fields recorded through `record_i64` (exported by the OTel bridge
+        /// as `Int`).
+        pub(crate) i64_fields: BTreeMap<String, i64>,
+    }
+
+    #[derive(Clone, Default)]
+    pub(crate) struct Captured(Arc<Mutex<Vec<SpanRecord>>>);
+
+    impl Captured {
+        pub(crate) fn spans(&self) -> Vec<SpanRecord> {
+            self.0.lock().map(|g| g.clone()).unwrap_or_default()
+        }
+
+        pub(crate) fn named(&self, name: &str) -> Vec<SpanRecord> {
+            self.spans()
+                .into_iter()
+                .filter(|s| s.name == name)
+                .collect()
+        }
+    }
+
+    struct Visitor<'a>(&'a mut SpanRecord);
+
+    impl Visit for Visitor<'_> {
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.0.i64_fields.insert(field.name().to_string(), value);
+            self.0
+                .fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0
+                .fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    struct CaptureLayer(Captured);
+
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+            let parent = ctx
+                .span(id)
+                .and_then(|span| span.parent())
+                .map(|parent| parent.id().into_u64());
+            let mut record = SpanRecord {
+                id: id.into_u64(),
+                name: attrs.metadata().name(),
+                parent,
+                ..SpanRecord::default()
+            };
+            attrs.record(&mut Visitor(&mut record));
+            if let Ok(mut spans) = (self.0).0.lock() {
+                spans.push(record);
+            }
+        }
+
+        fn on_record(&self, id: &Id, values: &Record<'_>, _ctx: Context<'_, S>) {
+            if let Ok(mut spans) = (self.0).0.lock()
+                && let Some(record) = spans.iter_mut().rev().find(|s| s.id == id.into_u64())
+            {
+                values.record(&mut Visitor(record));
+            }
+        }
+    }
+
+    /// A subscriber that records every span into the returned [`Captured`].
+    /// Install it with `tracing::subscriber::with_default`.
+    pub(crate) fn subscriber() -> (impl Subscriber + Send + Sync, Captured) {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer(captured.clone()));
+        (subscriber, captured)
+    }
 }
 
 #[cfg(test)]
@@ -62,13 +176,25 @@ mod tests {
     struct Captured {
         span_name: Mutex<Option<&'static str>>,
         fields: Mutex<BTreeMap<String, String>>,
+        /// Fields that arrived through `record_i64` — i.e. that an OTel
+        /// bridge would export as an `Int` attribute.
+        i64_fields: Mutex<BTreeMap<String, i64>>,
     }
 
-    struct FieldVisitor<'a>(&'a mut BTreeMap<String, String>);
+    struct FieldVisitor<'a> {
+        fields: &'a mut BTreeMap<String, String>,
+        i64_fields: &'a mut BTreeMap<String, i64>,
+    }
 
     impl Visit for FieldVisitor<'_> {
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.i64_fields.insert(field.name().to_string(), value);
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
         fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            self.0
+            self.fields
                 .insert(field.name().to_string(), format!("{value:?}"));
         }
     }
@@ -83,12 +209,20 @@ mod tests {
             *self.0.span_name.lock().expect("span_name mutex poisoned") =
                 Some(attrs.metadata().name());
             let mut fields = self.0.fields.lock().expect("fields mutex poisoned");
-            attrs.record(&mut FieldVisitor(&mut fields));
+            let mut i64_fields = self.0.i64_fields.lock().expect("i64 mutex poisoned");
+            attrs.record(&mut FieldVisitor {
+                fields: &mut fields,
+                i64_fields: &mut i64_fields,
+            });
         }
 
         fn on_record(&self, _id: &Id, values: &Record<'_>, _ctx: Context<'_, S>) {
             let mut fields = self.0.fields.lock().expect("fields mutex poisoned");
-            values.record(&mut FieldVisitor(&mut fields));
+            let mut i64_fields = self.0.i64_fields.lock().expect("i64 mutex poisoned");
+            values.record(&mut FieldVisitor {
+                fields: &mut fields,
+                i64_fields: &mut i64_fields,
+            });
         }
     }
 
@@ -141,6 +275,12 @@ mod tests {
         assert_eq!(
             fields.get("http.response.status_code").map(String::as_str),
             Some("201")
+        );
+        let ints = captured.i64_fields.lock().expect("mutex poisoned");
+        assert_eq!(
+            ints.get("http.response.status_code"),
+            Some(&201),
+            "status must be recorded as an integer so OTel exports Int, not Str"
         );
     }
 }
