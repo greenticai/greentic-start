@@ -562,6 +562,9 @@ fn first_field<T>(
 }
 
 #[cfg(test)]
+mod runtime_contract_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
