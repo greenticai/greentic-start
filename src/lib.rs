@@ -81,6 +81,7 @@ pub mod provider_config_envelope;
 mod provider_webhook_verify;
 mod qa_persist;
 mod redis_tls;
+mod request_span;
 mod revision_boot;
 mod revision_dispatcher;
 mod revision_drain;

@@ -65,6 +65,7 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{Notify, oneshot};
+use tracing::Instrument as _;
 
 use greentic_runner_host::{Activity, RunnerHost, WelcomeFlowHint};
 
@@ -1095,11 +1096,22 @@ fn try_capture_public_url(cap: &PublicUrlCapture, headers: &hyper::HeaderMap) {
 }
 
 /// infallible response hyper wants.
+///
+/// Opens the same `http.request` span the `--bundle` boot path
+/// (`http_ingress::handle_request`) opens, and records the same HTTP metrics
+/// via `crate::metrics::record_http_request` — this store-root path recorded
+/// neither before, which is why every env-canvas lane (all `--store-root`)
+/// exported no HTTP metrics and no traces.
 async fn handle_connection(
     mut req: Request<Incoming>,
     state: Arc<ServeState>,
     peer_is_loopback: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    let started = std::time::Instant::now();
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    let span = crate::request_span::request_span(&method, &path);
+
     // Cloud Run deferred public-URL capture: on the first inbound request
     // through the GFE, derive the public base URL from the Host header and
     // wake the deferred webhook-registration task. Placed BEFORE the WS
@@ -1111,16 +1123,26 @@ async fn handle_connection(
     // A5: intercept WebSocket stream paths BEFORE `serve` so the upgrade
     // handshake can borrow the request mutably. The stream path is the WS
     // endpoint browsers open after creating a conversation over REST.
-    let path = req.uri().path().to_string();
-    if is_directline_stream_path(&path) {
+    let response = if is_directline_stream_path(&path) {
         let (Ok(response) | Err(response)) =
-            handle_websocket_upgrade(&mut req, &path, Arc::clone(&state)).await;
-        return Ok(response);
-    }
+            handle_websocket_upgrade(&mut req, &path, Arc::clone(&state))
+                .instrument(span.clone())
+                .await;
+        response
+    } else {
+        let cors = path_allows_cors(&path);
+        let (Ok(response) | Err(response)) = serve(req, state, peer_is_loopback)
+            .instrument(span.clone())
+            .await;
+        if cors { with_cors(response) } else { response }
+    };
 
-    let cors = path_allows_cors(&path);
-    let (Ok(response) | Err(response)) = serve(req, state, peer_is_loopback).await;
-    Ok(if cors { with_cors(response) } else { response })
+    let status = response.status().as_u16();
+    crate::request_span::record_status(&span, status);
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let route = crate::metrics::normalise_route(&path);
+    crate::metrics::record_http_request(&method, &route, status, elapsed_ms);
+    Ok(response)
 }
 
 /// Paths that are never legitimately called cross-origin, and so must not

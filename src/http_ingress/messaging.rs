@@ -645,6 +645,15 @@ fn run_app_flow_safe(
     envelope: &ChannelMessageEnvelope,
     entry_node: Option<&str>,
 ) -> Vec<ChannelMessageEnvelope> {
+    // Ids only, never message content — `envelope`/`entry_node` carry the
+    // user's text and must not be added as span attributes.
+    let span = tracing::info_span!(
+        "messaging.turn",
+        greentic.tenant = %ctx.tenant,
+        greentic.pack_id = %pack_info.pack_id,
+        greentic.flow_id = %flow.id,
+    );
+    let _entered = span.enter();
     match app::run_app_flow(
         runner_host,
         bundle,

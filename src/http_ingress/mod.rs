@@ -25,6 +25,7 @@ use hyper::{
 };
 use hyper_util::rt::tokio::TokioIo;
 use tokio::{net::TcpListener, runtime::Runtime, sync::oneshot};
+use tracing::Instrument as _;
 
 use crate::deployment_routes::RevisionIngressRouting;
 use crate::domains::Domain;
@@ -434,12 +435,18 @@ where
 {
     let started = std::time::Instant::now();
     let method = req.method().as_str().to_string();
-    let route = crate::metrics::normalise_route(req.uri().path());
-    let response = match handle_request_inner(req, state).await {
+    let path = req.uri().path().to_string();
+    let route = crate::metrics::normalise_route(&path);
+    let span = crate::request_span::request_span(&method, &path);
+    let response = match handle_request_inner(req, state)
+        .instrument(span.clone())
+        .await
+    {
         Ok(response) => with_cors(response),
         Err(response) => with_cors(response),
     };
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    crate::request_span::record_status(&span, response.status().as_u16());
     crate::metrics::record_http_request(&method, &route, response.status().as_u16(), elapsed_ms);
     Ok(response)
 }
