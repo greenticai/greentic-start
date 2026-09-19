@@ -1911,33 +1911,43 @@ fn init_trace_log(
         }));
 
     let resolved = otlp_telemetry::resolve(telemetry, fallback_service_name);
-    let (otlp_layer, otlp_providers) = match resolved.as_ref() {
+    // `(layer, providers, exporter name)`. The exporter is recorded as
+    // installed only once the subscriber carrying its layer is actually
+    // installed below — `install_layer` succeeding is not enough.
+    let (otlp_layer, otlp_providers, otlp_exporter_name) = match resolved.as_ref() {
         Some(r) => match otlp_telemetry::install_layer(r) {
             Ok((layer, providers)) => {
                 let exporter_name = match r.exporter {
                     otlp_telemetry::ExporterKind::OtlpGrpc => "otlp-grpc",
                     otlp_telemetry::ExporterKind::OtlpHttp => "otlp-http",
                 };
-                otlp_status::record_installed(exporter_name);
-                (Some(layer), Some(providers))
+                (Some(layer), Some(providers), Some(exporter_name))
             }
             Err(err) => {
+                // The endpoint can carry userinfo; never log it raw.
                 operator_log::warn(
                     module_path!(),
                     format!(
-                        "OTLP exporter init failed (endpoint={}); file logging only: {err:#}",
-                        r.endpoint
+                        "OTLP exporter init failed (endpoint={}); file logging only: {}",
+                        otlp_status::redact(&r.endpoint),
+                        otlp_status::redact(&format!("{err:#}"))
                     ),
                 );
                 otlp_status::record_init_error(&format!("{err:#}"));
-                (None, None)
+                (None, None, None)
             }
         },
-        None => (None, None),
+        None => (None, None, None),
     };
     let otlp_summary = resolved
         .as_ref()
-        .map(|r| format!("{:?} endpoint={}", r.exporter, r.endpoint))
+        .map(|r| {
+            format!(
+                "{:?} endpoint={}",
+                r.exporter,
+                otlp_status::redact(&r.endpoint)
+            )
+        })
         .unwrap_or_else(|| "none".to_string());
 
     let init_result = match otlp_layer {
@@ -1953,6 +1963,9 @@ fn init_trace_log(
     };
     match init_result {
         Ok(()) => {
+            if let Some(exporter_name) = otlp_exporter_name {
+                otlp_status::record_installed(exporter_name);
+            }
             operator_log::info(
                 module_path!(),
                 format!(
@@ -1975,6 +1988,13 @@ fn init_trace_log(
                     "tracing subscriber try_init failed (another subscriber already installed?): {err}"
                 ),
             );
+            // The OTLP layer never reached a subscriber, so nothing will ever
+            // export through these providers: report it, and stop their
+            // batch/periodic workers rather than leaking them.
+            if let Some(providers) = otlp_providers {
+                otlp_status::record_init_error("tracing subscriber already installed");
+                providers.shutdown(std::time::Duration::from_secs(3));
+            }
             return None;
         }
     }
@@ -2621,8 +2641,14 @@ pub(crate) fn advertise_webchat_urls(
     advert
 }
 
+#[derive(Debug)]
 enum ShutdownReason {
     CtrlC,
+    /// SIGTERM — how Cloud Run, Kubernetes, ECS, `docker stop` and the
+    /// designer's own child supervision stop the process. Handled exactly
+    /// like [`Self::CtrlC`]; unix only (never constructed on Windows).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Terminate,
     AdminStop,
     BinaryUpdateRestart,
 }
@@ -2631,6 +2657,7 @@ impl ShutdownReason {
     fn as_str(&self) -> &'static str {
         match self {
             Self::CtrlC => "ctrl_c",
+            Self::Terminate => "sigterm",
             Self::AdminStop => "admin_stop",
             Self::BinaryUpdateRestart => "binary_update_restart",
         }
@@ -2641,14 +2668,8 @@ fn wait_for_shutdown(paths: &runtime_state::RuntimePaths) -> anyhow::Result<Shut
     let runtime =
         tokio::runtime::Runtime::new().context("failed to spawn runtime for Ctrl+C listener")?;
     runtime.block_on(wait_for_shutdown_inner(paths, None))
-#[derive(Debug)]
 }
 
-    /// SIGTERM — how Cloud Run, Kubernetes, ECS, `docker stop` and the
-    /// designer's own child supervision stop the process. Handled exactly
-    /// like [`Self::CtrlC`]; unix only (never constructed on Windows).
-    #[cfg_attr(not(unix), allow(dead_code))]
-    Terminate,
 /// Core Ctrl+C / stop-request select loop, shared by the legacy bundle arm
 /// (via [`wait_for_shutdown`], on its own throwaway runtime) and the
 /// bundle-less env-serving arm (on the activation runtime it already owns).
@@ -2657,15 +2678,28 @@ fn wait_for_shutdown(paths: &runtime_state::RuntimePaths) -> anyhow::Result<Shut
 /// auto-restart-pending flag and returns `BinaryUpdateRestart` when set.
 /// The legacy bundle arm passes `None` (auto-restart is env-serve only).
 async fn wait_for_shutdown_inner(
-            Self::Terminate => "sigterm",
     paths: &runtime_state::RuntimePaths,
     auto_restart_check: Option<&std::sync::Arc<revision_serve::RevisionServer>>,
 ) -> anyhow::Result<ShutdownReason> {
+    // Without this handler SIGTERM's default action kills the process on the
+    // spot, so `TraceGuard` never drops and the buffered OTLP batch is lost —
+    // in every production lane, since they all stop with SIGTERM. Registered
+    // once, before the loop, so a signal arriving between two 250 ms polls is
+    // not missed.
+    //
+    // Once registered, tokio keeps the handler installed for the rest of the
+    // process: a SECOND SIGTERM during a slow shutdown is swallowed, not
+    // fatal. That is acceptable — the platform follows up with SIGKILL when
+    // its grace period runs out, and the flush is bounded well inside it.
+    let mut terminate = TerminateSignal::new()?;
     loop {
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 result.map_err(|err| anyhow!("failed to wait for Ctrl+C: {err}"))?;
                 return Ok(ShutdownReason::CtrlC);
+            }
+            () = terminate.recv() => {
+                return Ok(ShutdownReason::Terminate);
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                 if runtime_state::read_stop_request(paths)?.is_some() {
@@ -2681,40 +2715,6 @@ async fn wait_for_shutdown_inner(
     }
 }
 
-    // Without this handler SIGTERM's default action kills the process on the
-    // spot, so `TraceGuard` never drops and the buffered OTLP batch is lost —
-    // in every production lane, since they all stop with SIGTERM. Registered
-    // once, before the loop, so a signal arriving between two 250 ms polls is
-    // not missed.
-    //
-    // Once registered, tokio keeps the handler installed for the rest of the
-    // process: a SECOND SIGTERM during a slow shutdown is swallowed, not
-    // fatal. That is acceptable — the platform follows up with SIGKILL when
-    // its grace period runs out, and the flush is bounded well inside it.
-    let mut terminate = TerminateSignal::new()?;
-/// Decide whether the built-in `/chat` webchat console is served on the
-/// env/revision path.
-///
-/// Explicit operator intent (`gui_enabled` in the env host config) always
-/// wins. By default the console follows `resolved_gui_enabled()` (on for the
-/// `local` env) — unless a deployed pack ships its own webchat UI, which
-            () = terminate.recv() => {
-                return Ok(ShutdownReason::Terminate);
-            }
-/// supersedes the console so only the qualified `/v1/web/webchat/{tenant}/`
-/// surface is exposed.
-fn resolve_console_enabled(
-    host_config: &greentic_deploy_spec::EnvironmentHostConfig,
-    has_pack_webchat_ui: bool,
-) -> bool {
-    // A pack-provided webchat UI ALWAYS wins, explicit `gui_enabled: true`
-    // included. The flag means "this environment has a browser tier", not
-    // "serve the built-in console specifically" — and `/chat` is a hand-rolled
-    // single-page console that POSTs to the loopback `/workers/invoke`
-    // endpoint, bypassing the provider stack, the tenant/bundle routing and the
-    // per-bundle SPA entirely. Pointing an operator at it while a real
-    // `/v1/web/webchat/{tenant}/{bundle}/` UI is being served is offering the
-    // strictly worse of the two. The console stays as the FALLBACK for
 /// SIGTERM listener for [`wait_for_shutdown_inner`]. On non-unix targets
 /// there is no SIGTERM, and `recv` never completes (Windows keeps Ctrl+C only).
 struct TerminateSignal {
@@ -2751,6 +2751,26 @@ impl TerminateSignal {
     }
 }
 
+/// Decide whether the built-in `/chat` webchat console is served on the
+/// env/revision path.
+///
+/// Explicit operator intent (`gui_enabled` in the env host config) always
+/// wins. By default the console follows `resolved_gui_enabled()` (on for the
+/// `local` env) — unless a deployed pack ships its own webchat UI, which
+/// supersedes the console so only the qualified `/v1/web/webchat/{tenant}/`
+/// surface is exposed.
+fn resolve_console_enabled(
+    host_config: &greentic_deploy_spec::EnvironmentHostConfig,
+    has_pack_webchat_ui: bool,
+) -> bool {
+    // A pack-provided webchat UI ALWAYS wins, explicit `gui_enabled: true`
+    // included. The flag means "this environment has a browser tier", not
+    // "serve the built-in console specifically" — and `/chat` is a hand-rolled
+    // single-page console that POSTs to the loopback `/workers/invoke`
+    // endpoint, bypassing the provider stack, the tenant/bundle routing and the
+    // per-bundle SPA entirely. Pointing an operator at it while a real
+    // `/v1/web/webchat/{tenant}/{bundle}/` UI is being served is offering the
+    // strictly worse of the two. The console stays as the FALLBACK for
     // environments whose packs ship no UI at all, which is its actual job.
     if has_pack_webchat_ui {
         return false;
@@ -4292,26 +4312,6 @@ mod tests {
     // --- P7e: ShutdownReason + auto-restart tests ---
 
     #[test]
-    fn shutdown_reason_binary_update_restart_as_str() {
-        assert_eq!(
-            ShutdownReason::BinaryUpdateRestart.as_str(),
-            "binary_update_restart"
-        );
-    }
-
-    #[test]
-    fn auto_restart_env_var_disables() {
-        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("GREENTIC_NO_AUTO_RESTART", "1") };
-        let result = super::resolve_auto_restart(false);
-        assert!(
-            !result,
-            "env var GREENTIC_NO_AUTO_RESTART=1 must disable auto-restart"
-        );
-        unsafe { std::env::remove_var("GREENTIC_NO_AUTO_RESTART") };
-    }
-
-    #[test]
     fn shutdown_reason_terminate_as_str() {
         assert_eq!(ShutdownReason::Terminate.as_str(), "sigterm");
     }
@@ -4361,6 +4361,26 @@ mod tests {
             matches!(reason, Ok(ShutdownReason::Terminate)),
             "expected Terminate, got {reason:?}"
         );
+    }
+
+    #[test]
+    fn shutdown_reason_binary_update_restart_as_str() {
+        assert_eq!(
+            ShutdownReason::BinaryUpdateRestart.as_str(),
+            "binary_update_restart"
+        );
+    }
+
+    #[test]
+    fn auto_restart_env_var_disables() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("GREENTIC_NO_AUTO_RESTART", "1") };
+        let result = super::resolve_auto_restart(false);
+        assert!(
+            !result,
+            "env var GREENTIC_NO_AUTO_RESTART=1 must disable auto-restart"
+        );
+        unsafe { std::env::remove_var("GREENTIC_NO_AUTO_RESTART") };
     }
 
     #[test]
