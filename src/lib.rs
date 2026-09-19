@@ -1402,6 +1402,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 );
             }
         }
+        // Flush and shut down the OTLP providers now, while the activation
+        // runtime and everything else this arm owns is still alive — not at
+        // scope exit, after `activation_rt` and friends have been torn down.
+        // Also covers the binary-update `exec` below, which never returns.
+        drop(_trace_guard);
 
         #[cfg(unix)]
         if matches!(reason, ShutdownReason::BinaryUpdateRestart) {
@@ -1412,8 +1417,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                     own_exe.display(),
                 ),
             );
-            // Drop the trace guard to flush logs before exec.
-            drop(_trace_guard);
+            // The trace guard was already dropped (flushed) above.
             exec_into_self(&own_exe)?;
             // exec_into_self does not return on success.
         }
@@ -1842,10 +1846,15 @@ fn build_trace_filter(bundle_level: Option<&str>) -> tracing_subscriber::EnvFilt
 
 /// Holds the file-appender's `WorkerGuard` for the process lifetime and, when
 /// telemetry resolved to OTLP, the exporter provider handles too — so that
-/// dropping this guard (see the `drop(_trace_guard)` shutdown points in
-/// `run`) flushes and shuts down the OTLP tracer/logger/meter providers
-/// instead of leaving up to `scheduled_delay` worth of buffered spans/logs
-/// stranded on process exit.
+/// dropping this guard flushes and shuts down the OTLP tracer/logger/meter
+/// providers instead of leaving up to `scheduled_delay` worth of buffered
+/// spans/logs stranded on process exit.
+///
+/// In `run_start` it is dropped explicitly on the `--store-root` arm right
+/// after `server.stop()` (which also precedes the binary-update `exec`), and
+/// on the `--bundle` path at scope exit of `run_start`. Either way it only runs if the process gets
+/// that far: an unhandled SIGTERM would kill it first, which is why
+/// [`wait_for_shutdown_inner`] handles SIGTERM on unix.
 pub(crate) struct TraceGuard {
     _file: tracing_appender::non_blocking::WorkerGuard,
     otlp: Option<otlp_telemetry::OtlpProviders>,
@@ -2632,8 +2641,14 @@ fn wait_for_shutdown(paths: &runtime_state::RuntimePaths) -> anyhow::Result<Shut
     let runtime =
         tokio::runtime::Runtime::new().context("failed to spawn runtime for Ctrl+C listener")?;
     runtime.block_on(wait_for_shutdown_inner(paths, None))
+#[derive(Debug)]
 }
 
+    /// SIGTERM — how Cloud Run, Kubernetes, ECS, `docker stop` and the
+    /// designer's own child supervision stop the process. Handled exactly
+    /// like [`Self::CtrlC`]; unix only (never constructed on Windows).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Terminate,
 /// Core Ctrl+C / stop-request select loop, shared by the legacy bundle arm
 /// (via [`wait_for_shutdown`], on its own throwaway runtime) and the
 /// bundle-less env-serving arm (on the activation runtime it already owns).
@@ -2642,6 +2657,7 @@ fn wait_for_shutdown(paths: &runtime_state::RuntimePaths) -> anyhow::Result<Shut
 /// auto-restart-pending flag and returns `BinaryUpdateRestart` when set.
 /// The legacy bundle arm passes `None` (auto-restart is env-serve only).
 async fn wait_for_shutdown_inner(
+            Self::Terminate => "sigterm",
     paths: &runtime_state::RuntimePaths,
     auto_restart_check: Option<&std::sync::Arc<revision_serve::RevisionServer>>,
 ) -> anyhow::Result<ShutdownReason> {
@@ -2665,12 +2681,26 @@ async fn wait_for_shutdown_inner(
     }
 }
 
+    // Without this handler SIGTERM's default action kills the process on the
+    // spot, so `TraceGuard` never drops and the buffered OTLP batch is lost —
+    // in every production lane, since they all stop with SIGTERM. Registered
+    // once, before the loop, so a signal arriving between two 250 ms polls is
+    // not missed.
+    //
+    // Once registered, tokio keeps the handler installed for the rest of the
+    // process: a SECOND SIGTERM during a slow shutdown is swallowed, not
+    // fatal. That is acceptable — the platform follows up with SIGKILL when
+    // its grace period runs out, and the flush is bounded well inside it.
+    let mut terminate = TerminateSignal::new()?;
 /// Decide whether the built-in `/chat` webchat console is served on the
 /// env/revision path.
 ///
 /// Explicit operator intent (`gui_enabled` in the env host config) always
 /// wins. By default the console follows `resolved_gui_enabled()` (on for the
 /// `local` env) — unless a deployed pack ships its own webchat UI, which
+            () = terminate.recv() => {
+                return Ok(ShutdownReason::Terminate);
+            }
 /// supersedes the console so only the qualified `/v1/web/webchat/{tenant}/`
 /// surface is exposed.
 fn resolve_console_enabled(
@@ -2685,6 +2715,42 @@ fn resolve_console_enabled(
     // per-bundle SPA entirely. Pointing an operator at it while a real
     // `/v1/web/webchat/{tenant}/{bundle}/` UI is being served is offering the
     // strictly worse of the two. The console stays as the FALLBACK for
+/// SIGTERM listener for [`wait_for_shutdown_inner`]. On non-unix targets
+/// there is no SIGTERM, and `recv` never completes (Windows keeps Ctrl+C only).
+struct TerminateSignal {
+    #[cfg(unix)]
+    inner: tokio::signal::unix::Signal,
+}
+
+impl TerminateSignal {
+    #[cfg(unix)]
+    fn new() -> anyhow::Result<Self> {
+        let inner = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|err| anyhow!("failed to install SIGTERM handler: {err}"))?;
+        Ok(Self { inner })
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> anyhow::Result<Self> {
+        Ok(Self {})
+    }
+
+    /// Resolves when SIGTERM arrives. If the signal stream ever closes (it
+    /// does not while the runtime is alive), stays pending rather than
+    /// reporting a SIGTERM that never happened.
+    #[cfg(unix)]
+    async fn recv(&mut self) {
+        if self.inner.recv().await.is_none() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn recv(&mut self) {
+        std::future::pending::<()>().await;
+    }
+}
+
     // environments whose packs ship no UI at all, which is its actual job.
     if has_pack_webchat_ui {
         return false;
@@ -4243,6 +4309,58 @@ mod tests {
             "env var GREENTIC_NO_AUTO_RESTART=1 must disable auto-restart"
         );
         unsafe { std::env::remove_var("GREENTIC_NO_AUTO_RESTART") };
+    }
+
+    #[test]
+    fn shutdown_reason_terminate_as_str() {
+        assert_eq!(ShutdownReason::Terminate.as_str(), "sigterm");
+    }
+
+    /// SIGTERM must end the wait with `Terminate` — without a handler the
+    /// default action kills the process and the OTLP flush never runs.
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_shutdown_returns_terminate_on_sigterm() {
+        // The SIGTERM goes to the whole test process: hold the env lock so no
+        // `run_start_request` test is inside its own shutdown wait (it would
+        // read our signal as its own and skip its stop-request path).
+        let _env_guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = runtime_state::RuntimePaths::new(dir.path(), "demo", "default");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let reason = runtime.block_on(async {
+            // Register a process-wide handler FIRST, so a SIGTERM that lands
+            // before the waiter's own handler is registered is still caught
+            // by tokio instead of killing the test binary.
+            let _guard = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("guard SIGTERM handler");
+            let waiter = tokio::spawn(async move { wait_for_shutdown_inner(&paths, None).await });
+            // Let the waiter register its listener; tokio delivers a signal
+            // only to listeners that existed when it arrived, so retry until
+            // the waiter reports.
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                // SAFETY: getpid/kill are async-signal-safe libc calls with no
+                // memory preconditions.
+                let rc = unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+                assert_eq!(rc, 0, "kill(getpid(), SIGTERM) failed");
+                if waiter.is_finished() {
+                    break;
+                }
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+                .await
+                .expect("waiter finished")
+                .expect("waiter joined")
+        });
+        assert!(
+            matches!(reason, Ok(ShutdownReason::Terminate)),
+            "expected Terminate, got {reason:?}"
+        );
     }
 
     #[test]
