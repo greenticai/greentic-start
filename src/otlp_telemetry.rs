@@ -113,13 +113,11 @@ pub(crate) fn resolve(
 /// refcount hits zero (see `TracerProviderInner`/`LoggerProviderInner`/
 /// `MeterProviderInner`'s `Drop` impls in `opentelemetry_sdk`), so as long as
 /// one of these two references is outstanding, dropping the other is a
-/// no-op.
-///
-/// Not yet wired up: `install_layer`'s caller only destructures the tuple
-/// today to keep `init_trace_log` compiling. Task 3 (the flush guard) reads
-/// `meter` and calls `shutdown`, so `#[allow(dead_code)]` covers the gap
-/// until then — same reasoning as `otlp_status`'s module-level allow.
-#[allow(dead_code)]
+/// no-op. That is why flushing on shutdown (`TraceGuard::drop` in `lib.rs`,
+/// Task 3) goes through the explicit `shutdown()` method below rather than
+/// relying on this struct going out of scope — an explicit
+/// `shutdown_with_timeout` call runs regardless of how many clones of a
+/// provider are still alive elsewhere.
 pub(crate) struct OtlpProviders {
     pub tracer: SdkTracerProvider,
     pub logger: SdkLoggerProvider,
@@ -130,7 +128,6 @@ impl OtlpProviders {
     /// Shuts down all three providers, bounding each to `timeout`. A failure
     /// is logged (redacted) but never propagated — shutdown must not block or
     /// fail process exit.
-    #[allow(dead_code)]
     pub(crate) fn shutdown(&self, timeout: Duration) {
         if let Err(e) = self.tracer.shutdown_with_timeout(timeout) {
             tracing::warn!(

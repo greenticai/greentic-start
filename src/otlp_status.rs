@@ -4,10 +4,11 @@
 //! collector accepted a batch: the first fact that is evidence telemetry works.
 //! No endpoint or header value is ever stored.
 //!
-//! Not yet wired up: later tasks in the same series feed this from exporter
-//! wrappers and read it from `/status`, so `#![allow(dead_code)]` covers the
-//! gap until then.
-#![allow(dead_code)]
+//! `record_installed`/`record_init_error` are wired from `init_trace_log`
+//! (Task 3) and `record_export` from the exporter wrappers in
+//! `otlp_telemetry`. `snapshot_json` is not read yet — a later task in the
+//! same series serves it from `/status` — so it keeps its own narrow allow
+//! until then.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
@@ -115,6 +116,9 @@ fn signal_json(s: &SignalState) -> serde_json::Value {
     })
 }
 
+// Not read outside tests until the `/status` wiring lands (a later task in
+// this series).
+#[allow(dead_code)]
 pub(crate) fn snapshot_json() -> serde_json::Value {
     let s = with(|s| s.clone());
     serde_json::json!({

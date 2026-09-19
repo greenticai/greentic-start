@@ -1839,6 +1839,28 @@ fn build_trace_filter(bundle_level: Option<&str>) -> tracing_subscriber::EnvFilt
     })
 }
 
+/// Holds the file-appender's `WorkerGuard` for the process lifetime and, when
+/// telemetry resolved to OTLP, the exporter provider handles too — so that
+/// dropping this guard (see the `drop(_trace_guard)` shutdown points in
+/// `run`) flushes and shuts down the OTLP tracer/logger/meter providers
+/// instead of leaving up to `scheduled_delay` worth of buffered spans/logs
+/// stranded on process exit.
+pub(crate) struct TraceGuard {
+    _file: tracing_appender::non_blocking::WorkerGuard,
+    otlp: Option<otlp_telemetry::OtlpProviders>,
+}
+
+impl Drop for TraceGuard {
+    fn drop(&mut self) {
+        if let Some(providers) = &self.otlp {
+            // Cloud Run gives ~10s after SIGTERM; bound each provider's
+            // shutdown well under that so flushing telemetry cannot eat into
+            // the window the rest of shutdown needs.
+            providers.shutdown(std::time::Duration::from_secs(3));
+        }
+    }
+}
+
 /// Install a `tracing` subscriber writing to `<log_dir>/system.log`. When
 /// `telemetry` resolves to OTLP, an additional OpenTelemetry tracer + meter
 /// + logger layer is composed alongside the file appender.
@@ -1846,7 +1868,7 @@ fn init_trace_log(
     log_dir: &std::path::Path,
     telemetry: Option<&bundle_config::BundleTelemetryConfig>,
     fallback_service_name: &str,
-) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+) -> Option<TraceGuard> {
     use std::fs::OpenOptions;
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
@@ -1879,10 +1901,16 @@ fn init_trace_log(
         }));
 
     let resolved = otlp_telemetry::resolve(telemetry, fallback_service_name);
-    let otlp_layer = resolved
-        .as_ref()
-        .and_then(|r| match otlp_telemetry::install_layer(r) {
-            Ok((layer, _providers)) => Some(layer),
+    let (otlp_layer, otlp_providers) = match resolved.as_ref() {
+        Some(r) => match otlp_telemetry::install_layer(r) {
+            Ok((layer, providers)) => {
+                let exporter_name = match r.exporter {
+                    otlp_telemetry::ExporterKind::OtlpGrpc => "otlp-grpc",
+                    otlp_telemetry::ExporterKind::OtlpHttp => "otlp-http",
+                };
+                otlp_status::record_installed(exporter_name);
+                (Some(layer), Some(providers))
+            }
             Err(err) => {
                 operator_log::warn(
                     module_path!(),
@@ -1891,9 +1919,12 @@ fn init_trace_log(
                         r.endpoint
                     ),
                 );
-                None
+                otlp_status::record_init_error(&format!("{err:#}"));
+                (None, None)
             }
-        });
+        },
+        None => (None, None),
+    };
     let otlp_summary = resolved
         .as_ref()
         .map(|r| format!("{:?} endpoint={}", r.exporter, r.endpoint))
@@ -1937,7 +1968,10 @@ fn init_trace_log(
             return None;
         }
     }
-    Some(guard)
+    Some(TraceGuard {
+        _file: guard,
+        otlp: otlp_providers,
+    })
 }
 
 /// Idempotently auto-create the `local` Environment on first `gtc start`.
@@ -4340,6 +4374,92 @@ mod tests {
         assert!(
             should_clear,
             "stale marker from a different lineage must be cleared"
+        );
+    }
+
+    // ---- TraceGuard flushes OTLP providers on drop ----
+
+    /// A minimal `SpanExporter` that appends every exported batch into a
+    /// shared `Vec` and never clears it. `opentelemetry_sdk`'s own
+    /// `InMemorySpanExporter` resets its buffer inside `shutdown()` by
+    /// default (verified against `opentelemetry_sdk` 0.32.1's
+    /// `in_memory_exporter.rs`: `InMemorySpanExporterBuilder::new()` sets
+    /// `reset_on_shutdown: true`, and the only way to disable that,
+    /// `keep_records_on_shutdown()`, is `#[cfg(test)] pub(crate)` inside
+    /// that crate and unreachable from here) — so asserting "the exporter
+    /// still holds the span" *after* a full `TraceGuard` drop (which flushes
+    /// then shuts down) would always read empty regardless of whether the
+    /// flush happened. This exporter captures on `export` and leaves
+    /// `shutdown`/`shutdown_with_timeout` at the trait's no-op defaults, so
+    /// the captured spans are exactly what was flushed.
+    #[derive(Debug, Clone, Default)]
+    struct CapturingSpanExporter {
+        spans: std::sync::Arc<std::sync::Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>,
+    }
+
+    impl opentelemetry_sdk::trace::SpanExporter for CapturingSpanExporter {
+        fn export(
+            &self,
+            mut batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+        {
+            let spans = self.spans.clone();
+            async move {
+                spans
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .append(&mut batch);
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn trace_guard_drop_flushes_pending_otlp_spans() {
+        use opentelemetry::trace::{Span as _, Tracer as _, TracerProvider as _};
+
+        let exporter = CapturingSpanExporter::default();
+        let captured = exporter.spans.clone();
+
+        let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .build();
+        let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder().build();
+        let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder().build();
+
+        let providers = otlp_telemetry::OtlpProviders {
+            tracer: tracer_provider,
+            logger: logger_provider,
+            meter: meter_provider,
+        };
+
+        let tracer = providers.tracer.tracer("t");
+        let mut span = tracer.start("test-span");
+        span.end();
+
+        assert!(
+            captured
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "the batch processor must not have exported yet: it waits for its \
+             scheduled interval, which this test relies on TraceGuard's drop \
+             to preempt"
+        );
+
+        let (_writer, file_guard) = tracing_appender::non_blocking(std::io::sink());
+        let guard = TraceGuard {
+            _file: file_guard,
+            otlp: Some(providers),
+        };
+        drop(guard);
+
+        let spans = captured.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            spans.len(),
+            1,
+            "TraceGuard::drop must flush the OTLP batch processor instead of \
+             waiting for its interval"
         );
     }
 }
