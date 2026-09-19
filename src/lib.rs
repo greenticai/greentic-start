@@ -1367,6 +1367,10 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             &shutdown_paths,
             if auto_restart { Some(&server) } else { None },
         ))?;
+        operator_log::info(
+            module_path!(),
+            format!("runtime shutdown requested via {}", reason.as_str()),
+        );
         if matches!(reason, ShutdownReason::AdminStop) {
             runtime_state::clear_stop_request(&shutdown_paths)?;
             let line = operator_i18n::tr(
