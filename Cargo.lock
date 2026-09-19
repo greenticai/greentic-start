@@ -2707,6 +2707,63 @@ dependencies = [
 ]
 
 [[package]]
+name = "greentic-cap-profile"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fa927eca8f35b2f4c0e4b0be175795688c94c9732b3c301f692a6a84ef81c71"
+dependencies = [
+ "greentic-cap-types",
+ "schemars 1.2.2",
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "greentic-cap-resolver"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8f027c27f7ec82fb8847d9d811e94e0ee0d525fca7209e780a306d8acc13cca"
+dependencies = [
+ "greentic-cap-profile",
+ "greentic-cap-types",
+ "schemars 1.2.2",
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "greentic-cap-runtime"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abaa1bc2e06034d7fef2efcbf8ef19f4e55218eb11e70fc2b3d346ebae902234"
+dependencies = [
+ "greentic-cap-types",
+ "jsonschema 0.46.10",
+ "schemars 1.2.2",
+ "serde",
+ "serde_cbor",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "greentic-cap-schema"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b604ce86a87ab3b17063f56849942496d3b3d4c4728822151f242ad87e7ea22"
+dependencies = [
+ "greentic-cap-resolver",
+ "greentic-cap-runtime",
+ "greentic-cap-types",
+ "schemars 1.2.2",
+ "serde",
+ "serde_cbor",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "greentic-cap-types"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2854,6 +2911,72 @@ dependencies = [
 ]
 
 [[package]]
+name = "greentic-dw-context"
+version = "1.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "schemars 1.2.2",
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "greentic-dw-context-llm"
+version = "1.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "greentic-dw-context",
+ "greentic-dw-workspace",
+ "greentic-llm",
+ "tokio",
+]
+
+[[package]]
+name = "greentic-dw-core"
+version = "1.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "greentic-dw-manifest",
+ "greentic-dw-types",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "greentic-dw-delegation"
+version = "1.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "schemars 1.2.2",
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "greentic-dw-delegation-llm"
+version = "1.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "greentic-dw-delegation",
+ "greentic-llm",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "greentic-dw-engine"
+version = "1.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "greentic-dw-core",
+ "greentic-dw-types",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "greentic-dw-manifest"
 version = "1.1.0"
 source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
@@ -2881,11 +3004,128 @@ dependencies = [
 ]
 
 [[package]]
+name = "greentic-dw-operala-bridge"
+version = "1.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "anyhow",
+ "async-nats 0.46.0",
+ "async-trait",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "greentic-dw-operala-invoker"
+version = "1.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "greentic-dw-context-llm",
+ "greentic-dw-core",
+ "greentic-dw-delegation",
+ "greentic-dw-delegation-llm",
+ "greentic-dw-engine",
+ "greentic-dw-operala-bridge",
+ "greentic-dw-planning",
+ "greentic-dw-planning-llm",
+ "greentic-dw-reflection",
+ "greentic-dw-reflection-llm",
+ "greentic-dw-runtime",
+ "greentic-dw-types",
+ "greentic-dw-workspace",
+ "greentic-dw-workspace-mem",
+ "greentic-llm",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "greentic-dw-pack"
+version = "1.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "greentic-cap-resolver",
+ "greentic-cap-schema",
+ "greentic-cap-types",
+ "greentic-dw-core",
+ "greentic-dw-types",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "greentic-dw-planning"
 version = "1.1.0"
 source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
 dependencies = [
  "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "greentic-dw-planning-llm"
+version = "1.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "greentic-dw-planning",
+ "greentic-llm",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "greentic-dw-reflection"
+version = "1.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "schemars 1.2.2",
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "greentic-dw-reflection-llm"
+version = "1.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "greentic-dw-reflection",
+ "greentic-llm",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "greentic-dw-runtime"
+version = "1.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "greentic-cap-types",
+ "greentic-dw-context",
+ "greentic-dw-core",
+ "greentic-dw-delegation",
+ "greentic-dw-engine",
+ "greentic-dw-pack",
+ "greentic-dw-planning",
+ "greentic-dw-reflection",
+ "greentic-dw-types",
+ "greentic-dw-workspace",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -2901,6 +3141,26 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "greentic-dw-workspace"
+version = "1.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "schemars 1.2.2",
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "greentic-dw-workspace-mem"
+version = "0.1.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?rev=00cf18318a20f071d5878aff66e8f33b157cb1ed#00cf18318a20f071d5878aff66e8f33b157cb1ed"
+dependencies = [
+ "blake3",
+ "greentic-dw-workspace",
+ "time",
 ]
 
 [[package]]
@@ -3276,6 +3536,8 @@ dependencies = [
  "greentic-config-types",
  "greentic-deploy-spec",
  "greentic-distributor-client",
+ "greentic-dw-operala-bridge",
+ "greentic-dw-operala-invoker",
  "greentic-ext-runtime",
  "greentic-flow",
  "greentic-interfaces",
