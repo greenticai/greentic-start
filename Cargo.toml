@@ -243,7 +243,22 @@ version = ">=1.3.0-research.0, <1.4.0-0"
 # `test-mock` (a mock token meter) and `dev-allow-unsigned`, and this binary is
 # also the greentic-start-distroless image pods run. So `dw.agent` here still
 # needs `GREENTIC_AW_REDIS_URL` for its state store, exactly as before.
-features = ["greentic-llm-backend"]
+#
+# `operala-in-process` (greentic-runner #774) wires the in-process deep-worker
+# handler for `operala.call` nodes (`greentic-dw-operala-invoker` running
+# `DeepLoopCoordinator` over a `greentic_llm::RigBackend`), so a deployed Deep
+# worker runs without a NATS remote dispatcher. Unlike `desktop-agent-ephemeral`
+# it does NOT imply greentic-aw-runtime's `test-mock` (or `dev-allow-unsigned`):
+# runner-host declares it server-safe, pulling only `agentic-worker`, the two
+# operala crates and `greentic-llm`. The handler is wired only when an LLM key
+# resolves, by the same policy `dw.agent`'s in-process backend uses:
+# `GREENTIC_LLM_API_KEY` / `OPENAI_API_KEY` first, else the first agent's
+# `llm.credential_ref` from the tenant secrets store. With no key, `operala.call`
+# falls back to NATS (and fails without it). `GREENTIC_OPERALA_DISPATCH=nats`
+# forces the NATS `RemoteDispatchHandler` path. The operala crates pin
+# greentic-llm from git; the `[patch."https://github.com/greenticai/greentic-llm"]`
+# section below keeps that ONE crate with the registry copy.
+features = ["greentic-llm-backend", "operala-in-process"]
 
 [dependencies.greentic-secrets-lib]
 # `providers-vault` brings in the HashiCorp Vault KV backend used for runtime
