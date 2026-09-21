@@ -4533,13 +4533,18 @@ async fn dispatch_provider_route(
         // Session-token renewal preflight: loads the provider's
         // jwt_signing_key, applies any Authorization rewrite, and may
         // short-circuit (auth failure, /tokens/refresh served locally).
-        let signing_key =
+        let signing_key_read =
             read_provider_signing_key(&activation, tenant, Some(&route_team), &provider_type).await;
+        let signing_key = match &signing_key_read {
+            SigningKeyRead::Found(key) => crate::directline_session::SigningKey::Present(key),
+            SigningKeyRead::NotConfigured => crate::directline_session::SigningKey::NotConfigured,
+            SigningKeyRead::Unavailable => crate::directline_session::SigningKey::Unavailable,
+        };
         let preflight_outcome = crate::directline_session::preflight(
             &hyper::Method::from_bytes(norm_method.as_bytes()).unwrap_or(hyper::Method::POST),
             &norm_path,
             &dl_headers,
-            signing_key.as_deref(),
+            signing_key,
             &state.directline_sessions,
         );
         let forward_plan = match preflight_outcome {
@@ -5569,15 +5574,89 @@ fn synthesize_provider_response(response: &IngressHttpResponse) -> Response<Full
 // except `read_provider_signing_key` which reads the secrets manager.
 // ---------------------------------------------------------------------------
 
+/// Owned form of [`crate::directline_session::SigningKey`], returned by the
+/// read so the borrow does not outlive the secrets call.
+#[derive(Debug)]
+enum SigningKeyRead {
+    Found(Vec<u8>),
+    NotConfigured,
+    Unavailable,
+}
+
+/// True for a [`greentic_secrets_lib::SecretError`] that means the read
+/// itself failed, as opposed to `NotFound`, which means the key was never
+/// configured. This is the security-relevant decision in
+/// `read_provider_signing_key`: `Permission` is grouped with the failures,
+/// not with "not found", because a denial means the key probably exists and
+/// cannot be read — treating it as "no key" would reopen the authentication
+/// bypass this module exists to close. Kept as a pure function, independently
+/// testable against all four `SecretError` variants without an `Activation`
+/// or a secrets manager, so this classification cannot silently drift.
+///
+/// Written as a negative match (`!matches!(.., NotFound(_))`) rather than an
+/// explicit list of failure variants, so it fails CLOSED — refuses — if
+/// `greentic-secrets-api` ever adds a fifth `SecretError` variant, rather
+/// than silently treating an unrecognised one as "not found" and forwarding
+/// unverified. The trade-off is deliberate and asymmetric: a future
+/// not-found-shaped variant (say, a typed "no such secret" distinct from
+/// `NotFound`) would read as a failure and refuse legitimate, never-configured
+/// tenant traffic until this arm is updated to name it — an availability
+/// regression, not a security one. That is the correct side to fail on here.
+fn is_backend_failure(err: &greentic_secrets_lib::SecretError) -> bool {
+    !matches!(err, greentic_secrets_lib::SecretError::NotFound(_))
+}
+
+/// Fold the two URI read outcomes into the final decision, plus the most
+/// recent backend-failure message (for the caller's `warn!`; `None` when the
+/// outcome is not `Unavailable`).
+///
+/// Pure and directly testable — this is the accumulation glue itself, not
+/// just [`is_backend_failure`]'s per-error classification: "a successful read
+/// anywhere wins outright; otherwise any backend failure outranks any
+/// not-found". Deleting the fold that turns a lone backend failure into
+/// `Unavailable` would reopen the authentication bypass this module exists
+/// to close while every test that only exercises `is_backend_failure` in
+/// isolation stays green — these tests exist to catch exactly that.
+///
+/// Scan order matters only for which message is reported when both entries
+/// are backend failures (the later one wins); it does not affect the
+/// decision, which is symmetric in the two entries.
+fn classify_reads(
+    results: [Result<Vec<u8>, greentic_secrets_lib::SecretError>; 2],
+) -> (SigningKeyRead, Option<String>) {
+    let mut backend_failure_message: Option<String> = None;
+    for result in results {
+        match result {
+            Ok(bytes) => return (SigningKeyRead::Found(bytes), None),
+            Err(err) if is_backend_failure(&err) => {
+                backend_failure_message = Some(err.to_string());
+            }
+            Err(_) => {}
+        }
+    }
+    match backend_failure_message {
+        Some(message) => (SigningKeyRead::Unavailable, Some(message)),
+        None => (SigningKeyRead::NotConfigured, None),
+    }
+}
+
 /// Read the `jwt_signing_key` for a provider from the secrets manager.
-/// Returns `None` when the key is absent or the read fails (best-effort —
-/// a missing key just means no token renewal, not a hard failure).
+///
+/// Distinguishes a provider that never had a key configured — every URI read
+/// answered "not found" — from one whose key could not be READ: any read for
+/// which [`is_backend_failure`] is true (see [`classify_reads`] for how the
+/// two reads are combined into one decision). Those are not the same thing
+/// downstream: forwarding an unverified request on the first is the
+/// long-standing, deliberate posture for a provider with auth switched off;
+/// doing it on the second turns a degraded secrets backend into an
+/// authentication bypass. The `warn!` below fires only on that failure
+/// path — a never-configured provider is not a warning.
 async fn read_provider_signing_key(
     activation: &Activation,
     tenant: &str,
     team: Option<&str>,
     provider_type: &str,
-) -> Option<Vec<u8>> {
+) -> SigningKeyRead {
     let secrets = activation.host.secrets_manager();
     let env = crate::resolve_env(None);
     let team_segment = crate::secrets_manager::canonical_team(team);
@@ -5595,13 +5674,29 @@ async fn read_provider_signing_key(
         &provider_hyphen,
         "jwt_signing_key",
     );
-    for uri in [&raw_uri, &canonical_uri] {
-        match secrets.read(uri).await {
-            Ok(bytes) => return Some(bytes),
-            Err(_) => continue,
-        }
+    // Try the raw URI first and return immediately on success, so a
+    // provider whose key is found there (the common case) never pays for a
+    // second secrets-manager read. Only a raw-URI failure falls through to
+    // trying the canonical URI too — at that point both outcomes are known,
+    // so the actual decision is delegated to `classify_reads` rather than
+    // re-implemented here.
+    let raw_result = match secrets.read(&raw_uri).await {
+        Ok(bytes) => return SigningKeyRead::Found(bytes),
+        Err(err) => Err(err),
+    };
+    let canonical_result = secrets.read(&canonical_uri).await;
+    let (outcome, backend_failure_message) = classify_reads([raw_result, canonical_result]);
+    if let Some(err) = backend_failure_message {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "directline signing key unreadable for provider={provider_type} \
+                 tenant={tenant}: {err}; requests to this provider will be \
+                 REFUSED until it can be read"
+            ),
+        );
     }
-    None
+    outcome
 }
 
 /// Extract the DirectLine-relative path from a full request path.
@@ -6168,13 +6263,16 @@ async fn handle_websocket_upgrade(
         }
     };
 
-    // Read the JWT signing key from the pinned revision's secrets.
+    // Read the JWT signing key from the pinned revision's secrets. This path
+    // has no "auth is off" posture of its own — it always needs the actual
+    // key bytes to validate the `?t=` token — so both a never-configured key
+    // and one that could not be read refuse the same way.
     let team = "default";
     let signing_key =
         read_provider_signing_key(&activation, &tenant, Some(team), &provider_type).await;
     let signing_key = match signing_key {
-        Some(key) => key,
-        None => {
+        SigningKeyRead::Found(key) => key,
+        SigningKeyRead::NotConfigured | SigningKeyRead::Unavailable => {
             return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "missing jwt_signing_key for the webchat provider",
@@ -8992,6 +9090,99 @@ mod tests {
     #[test]
     fn encode_directline_query_string_empty_returns_none() {
         assert_eq!(encode_directline_query_string(&[]), None);
+    }
+
+    // `is_backend_failure` is the security-relevant classification behind
+    // `read_provider_signing_key`: get it wrong and a degraded secrets
+    // backend silently reopens the DirectLine authentication bypass. Tested
+    // directly, against all four `SecretError` variants, so nothing can move
+    // a variant across the NotFound/failure line without a test noticing.
+    #[test]
+    fn is_backend_failure_is_false_only_for_not_found() {
+        assert!(!is_backend_failure(
+            &greentic_secrets_lib::SecretError::NotFound("jwt_signing_key".to_string())
+        ));
+    }
+
+    #[test]
+    fn is_backend_failure_is_true_for_permission() {
+        assert!(is_backend_failure(
+            &greentic_secrets_lib::SecretError::Permission("denied".to_string())
+        ));
+    }
+
+    #[test]
+    fn is_backend_failure_is_true_for_backend() {
+        assert!(is_backend_failure(
+            &greentic_secrets_lib::SecretError::Backend("storage unreachable".into())
+        ));
+    }
+
+    #[test]
+    fn is_backend_failure_is_true_for_other() {
+        assert!(is_backend_failure(
+            &greentic_secrets_lib::SecretError::Other(anyhow::anyhow!("boom"))
+        ));
+    }
+
+    // `classify_reads` is the accumulation glue that decides `Unavailable`
+    // vs. `NotConfigured` from the two URI outcomes — the part
+    // `is_backend_failure` alone does not cover, since it only classifies
+    // one error. Deleting the fold this function performs would reopen the
+    // DirectLine auth bypass while every `is_backend_failure`-only test
+    // stayed green; these four cases pin the fold itself.
+    #[test]
+    fn classify_reads_both_not_found_is_not_configured() {
+        let (outcome, message) = classify_reads([
+            Err(greentic_secrets_lib::SecretError::NotFound(
+                "raw".to_string(),
+            )),
+            Err(greentic_secrets_lib::SecretError::NotFound(
+                "canonical".to_string(),
+            )),
+        ]);
+        assert!(matches!(outcome, SigningKeyRead::NotConfigured));
+        assert!(message.is_none());
+    }
+
+    #[test]
+    fn classify_reads_backend_failure_then_not_found_is_unavailable() {
+        let (outcome, message) = classify_reads([
+            Err(greentic_secrets_lib::SecretError::Backend(
+                "storage unreachable".into(),
+            )),
+            Err(greentic_secrets_lib::SecretError::NotFound(
+                "canonical".to_string(),
+            )),
+        ]);
+        assert!(matches!(outcome, SigningKeyRead::Unavailable));
+        assert!(message.is_some());
+    }
+
+    #[test]
+    fn classify_reads_not_found_then_backend_failure_is_unavailable() {
+        let (outcome, message) = classify_reads([
+            Err(greentic_secrets_lib::SecretError::NotFound(
+                "raw".to_string(),
+            )),
+            Err(greentic_secrets_lib::SecretError::Backend(
+                "storage unreachable".into(),
+            )),
+        ]);
+        assert!(matches!(outcome, SigningKeyRead::Unavailable));
+        assert!(message.is_some());
+    }
+
+    #[test]
+    fn classify_reads_a_success_wins_even_beside_a_prior_failure() {
+        let (outcome, message) = classify_reads([
+            Err(greentic_secrets_lib::SecretError::Backend(
+                "storage unreachable".into(),
+            )),
+            Ok(b"the-signing-key".to_vec()),
+        ]);
+        assert!(matches!(outcome, SigningKeyRead::Found(key) if key == b"the-signing-key"));
+        assert!(message.is_none());
     }
 
     // Category 5: rewrite_stream_url
