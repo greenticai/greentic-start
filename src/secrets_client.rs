@@ -73,9 +73,10 @@ impl SecretsManager for SecretsClient {
     }
 }
 
-/// Provider segment whose key is stored verbatim — see
+/// Provider segments whose key is stored verbatim — see
 /// `canonicalize_dev_store_secret_uri`.
 const MCP_CATEGORY: &str = "mcp";
+const A2A_CATEGORY: &str = "a2a";
 
 fn canonicalize_dev_store_secret_uri(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("secrets://")?;
@@ -83,14 +84,16 @@ fn canonicalize_dev_store_secret_uri(path: &str) -> Option<String> {
     if segments.len() != 5 {
         return None;
     }
-    // The `mcp` category is exempt. greentic-designer-admin keys an MCP
-    // server's credential by its hyphenated UUID and writes it VERBATIM, and
-    // greentic-runner reads it verbatim through
-    // `greentic_aw_runtime::mcp_secrets`. Canonicalizing here (lowercase, and
-    // `-` to `_`) rewrote the lookup to `…/mcp/ff308b9c_951a_…` and resolved
-    // nothing — silently, because an unresolved credential surfaces only as an
-    // ordinary MCP node error. Every other category keeps normalizing.
-    if segments[3] == MCP_CATEGORY {
+    // The `mcp` and `a2a` categories are exempt. greentic-designer-admin keys
+    // an MCP server's credential, and an external A2A agent's credential
+    // (`secrets://default/<tenant>/<team>/a2a/<agent_id>`), by a hyphenated
+    // UUID and writes it VERBATIM; greentic-runner reads both verbatim
+    // (`greentic_aw_runtime::mcp_secrets`, and the a2a equivalent).
+    // Canonicalizing here (lowercase, and `-` to `_`) rewrote the lookup to
+    // `…/mcp/ff308b9c_951a_…` (or the a2a equivalent) and resolved nothing —
+    // silently, because an unresolved credential surfaces only as an ordinary
+    // node/dispatch error. Every other category keeps normalizing.
+    if matches!(segments[3], MCP_CATEGORY | A2A_CATEGORY) {
         return None;
     }
 
@@ -129,6 +132,35 @@ mod mcp_uri_tests {
             canonicalize_dev_store_secret_uri(uri).as_deref(),
             Some("secrets://local/acme/_/messaging-telegram/bot_token"),
             "non-mcp keys must still be normalized"
+        );
+    }
+
+    /// The `a2a` category is keyed by a hyphenated agent UUID that
+    /// greentic-designer-admin writes VERBATIM
+    /// (`secrets://default/<tenant>/<team>/a2a/<agent_id>`). Canonicalizing it
+    /// here would rewrite the lookup to the underscored form and resolve
+    /// nothing — silently, since a missing credential surfaces only as an
+    /// ordinary A2A dispatch error.
+    #[test]
+    fn an_a2a_uri_is_never_canonicalized() {
+        let uri = "secrets://default/acme/_/a2a/ff308b9c-951a-40b8-acea-f62cdd19c8f3";
+        assert_eq!(
+            canonicalize_dev_store_secret_uri(uri),
+            None,
+            "an a2a key must reach the store byte-for-byte"
+        );
+    }
+
+    /// `a2a` only exempts the CATEGORY segment (index 3). The same literal
+    /// appearing elsewhere in the URI — e.g. as the tenant — must still be
+    /// canonicalized like any other segment.
+    #[test]
+    fn a2a_in_a_non_category_position_still_canonicalizes() {
+        let uri = "secrets://default/a2a/_/mypack/My-Secret";
+        assert_eq!(
+            canonicalize_dev_store_secret_uri(uri).as_deref(),
+            Some("secrets://default/a2a/_/mypack/my_secret"),
+            "a2a is only exempt as the category segment"
         );
     }
 }
@@ -217,6 +249,37 @@ mod tests {
         assert_eq!(value, b"xoxe-access".to_vec());
         let value = runtime.block_on(async { client.read(uri).await })?;
         assert_eq!(value, b"xoxe-access".to_vec());
+        Ok(())
+    }
+
+    #[test]
+    fn round_trips_an_a2a_credential_under_its_hyphenated_agent_id() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let store_path = dir.path().join("secrets.env");
+        let store = DevStore::with_path(store_path.clone())?;
+        let uri = "secrets://default/acme/_/a2a/ff308b9c-951a-40b8-acea-f62cdd19c8f3";
+        let seed = SeedDoc {
+            entries: vec![SeedEntry {
+                uri: uri.to_string(),
+                format: SecretFormat::Text,
+                value: SeedValue::Text {
+                    text: "a2a-bearer-token".to_string(),
+                },
+                description: None,
+            }],
+        };
+        let runtime = Runtime::new()?;
+        let report =
+            runtime.block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
+        assert_eq!(report.ok, 1);
+
+        let client = SecretsClient::open_with_path(store_path)?;
+        let value = runtime.block_on(async { client.read(uri).await })?;
+        assert_eq!(
+            value,
+            b"a2a-bearer-token".to_vec(),
+            "a hyphenated a2a agent id must resolve without canonicalization"
+        );
         Ok(())
     }
 }
