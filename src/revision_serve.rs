@@ -5570,8 +5570,13 @@ fn synthesize_provider_response(response: &IngressHttpResponse) -> Response<Full
 // ---------------------------------------------------------------------------
 
 /// Read the `jwt_signing_key` for a provider from the secrets manager.
-/// Returns `None` when the key is absent or the read fails (best-effort —
-/// a missing key just means no token renewal, not a hard failure).
+///
+/// Returns `None` both when no key is configured and when every read failed.
+/// **Those two are not the same thing downstream**: three of the four
+/// handlers in `crate::directline_session` forward an unverified request
+/// when they are handed `None`, so a secrets backend that is merely
+/// unreachable currently reads as "auth is off for this provider". The
+/// `warn!` below is what makes that visible.
 async fn read_provider_signing_key(
     activation: &Activation,
     tenant: &str,
@@ -5595,11 +5600,25 @@ async fn read_provider_signing_key(
         &provider_hyphen,
         "jwt_signing_key",
     );
+    let mut last_error: Option<String> = None;
     for uri in [&raw_uri, &canonical_uri] {
         match secrets.read(uri).await {
             Ok(bytes) => return Some(bytes),
-            Err(_) => continue,
+            Err(err) => {
+                last_error = Some(err.to_string());
+                continue;
+            }
         }
+    }
+    if let Some(err) = last_error {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "directline signing key unreadable for provider={provider_type} \
+                 tenant={tenant}: {err}; requests to this provider will be \
+                 forwarded WITHOUT token verification"
+            ),
+        );
     }
     None
 }
