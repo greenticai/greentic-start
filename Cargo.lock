@@ -434,7 +434,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "aw-event-bridge"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-runner?rev=669c2cd38359682878b60ae429280cac6b353609#669c2cd38359682878b60ae429280cac6b353609"
+source = "git+https://github.com/greenticai/greentic-runner?rev=3d2f3f59f44bc8eeb84a976d23ebe7ed876bc718#3d2f3f59f44bc8eeb84a976d23ebe7ed876bc718"
 dependencies = [
  "anyhow",
  "async-nats 0.46.0",
@@ -2620,9 +2620,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "greentic-a2a"
+version = "0.1.0"
+source = "git+https://github.com/greenticai/greentic-runner?rev=3d2f3f59f44bc8eeb84a976d23ebe7ed876bc718#3d2f3f59f44bc8eeb84a976d23ebe7ed876bc718"
+dependencies = [
+ "anyhow",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "url",
+]
+
+[[package]]
 name = "greentic-aw-runtime"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-runner?rev=669c2cd38359682878b60ae429280cac6b353609#669c2cd38359682878b60ae429280cac6b353609"
+source = "git+https://github.com/greenticai/greentic-runner?rev=3d2f3f59f44bc8eeb84a976d23ebe7ed876bc718#3d2f3f59f44bc8eeb84a976d23ebe7ed876bc718"
 dependencies = [
  "anyhow",
  "async-nats 0.46.0",
@@ -2633,6 +2646,7 @@ dependencies = [
  "dashmap",
  "ed25519-dalek",
  "futures",
+ "greentic-a2a",
  "greentic-dw-manifest",
  "greentic-dw-memory-long-term",
  "greentic-ext-runtime",
@@ -3497,7 +3511,7 @@ dependencies = [
 [[package]]
 name = "greentic-runner-desktop"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-runner?rev=669c2cd38359682878b60ae429280cac6b353609#669c2cd38359682878b60ae429280cac6b353609"
+source = "git+https://github.com/greenticai/greentic-runner?rev=3d2f3f59f44bc8eeb84a976d23ebe7ed876bc718#3d2f3f59f44bc8eeb84a976d23ebe7ed876bc718"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -3517,7 +3531,7 @@ dependencies = [
 [[package]]
 name = "greentic-runner-host"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-runner?rev=669c2cd38359682878b60ae429280cac6b353609#669c2cd38359682878b60ae429280cac6b353609"
+source = "git+https://github.com/greenticai/greentic-runner?rev=3d2f3f59f44bc8eeb84a976d23ebe7ed876bc718#3d2f3f59f44bc8eeb84a976d23ebe7ed876bc718"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6307,7 +6321,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6968,7 +6982,7 @@ dependencies = [
 [[package]]
 name = "runner-core"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-runner?rev=669c2cd38359682878b60ae429280cac6b353609#669c2cd38359682878b60ae429280cac6b353609"
+source = "git+https://github.com/greenticai/greentic-runner?rev=3d2f3f59f44bc8eeb84a976d23ebe7ed876bc718#3d2f3f59f44bc8eeb84a976d23ebe7ed876bc718"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
