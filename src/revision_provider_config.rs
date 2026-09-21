@@ -62,16 +62,19 @@ pub(crate) async fn resolve_revision_provider_config(
     team: Option<&str>,
 ) -> anyhow::Result<Option<Value>> {
     let provider = pack.pack_id.clone();
+    let pack_path = pack.pack_path.clone();
     // Reading the pack's setup form opens the `.gtpack` archive, and `ext://`
     // resolution reads the environment store: both are blocking file I/O.
-    let mut draft = tokio::task::spawn_blocking(move || {
+    let (mut draft, lookup) = tokio::task::spawn_blocking(move || {
         let bundle_root = revision_bundle_root_for_pack(&pack.pack_path);
+        let lookup = ConfigLookup::describe(bundle_root.as_deref(), &pack.pack_id);
         ProviderConfigDraft::resolve(&ProviderConfigSources {
             bundle_root: bundle_root.as_deref(),
             pack_path: &pack.pack_path,
             provider: &pack.pack_id,
             pack_non_secret: pack.pack_non_secret.as_deref(),
         })
+        .map(|draft| (draft, lookup))
     })
     .await
     .context("provider config resolution task did not complete")??;
@@ -81,7 +84,98 @@ pub(crate) async fn resolve_revision_provider_config(
     for (key, bytes) in fetch_secrets(secrets, &env, tenant, team, &provider, &keys).await {
         draft.insert_secret(&key, &bytes);
     }
-    Ok(draft.into_config())
+    let config = draft.into_config();
+    if config.is_none() {
+        lookup.report(&provider, &pack_path);
+    }
+    Ok(config)
+}
+
+/// Where this resolution looked, so an empty answer can say why.
+///
+/// # Why this exists
+///
+/// An empty config is indistinguishable from a working one at every layer
+/// above: the request succeeds, the component runs, and it reports
+/// `config_shape: absent` with no hint of which lookup missed. A partner spent
+/// a reporting cycle on exactly that — their deploy-time `auto_start_on_open`
+/// was in `.providers/<pack>/config.envelope.cbor`, the merge that reads it
+/// was already in the build they were running (#587), and every layer stayed
+/// quiet about the two ways it can still come out empty.
+///
+/// Those two ways are the whole of this type. Both are silent, and neither is
+/// an error: a pack legitimately staged without a bundle, and a pack whose id
+/// is not the directory name the envelope was written under.
+struct ConfigLookup {
+    /// The revision bundle the pack was pinned from, if one was found by
+    /// walking up from the pack file.
+    bundle_root: Option<PathBuf>,
+    /// The envelope this resolution would have read, and whether it is there.
+    envelope: Option<(PathBuf, bool)>,
+}
+
+impl ConfigLookup {
+    fn describe(bundle_root: Option<&Path>, provider: &str) -> Self {
+        let envelope = bundle_root.map(|root| {
+            let path = root
+                .join(".providers")
+                .join(provider)
+                .join("config.envelope.cbor");
+            let present = path.is_file();
+            (path, present)
+        });
+        Self {
+            bundle_root: bundle_root.map(Path::to_path_buf),
+            envelope,
+        }
+    }
+
+    /// Say which lookup came up empty, naming the path and the key.
+    ///
+    /// `warn`, not `debug`: a provider resolving no config at all is nearly
+    /// always a misconfiguration, and the operator who can fix it is not
+    /// running with debug logging on. It costs one line per request on an
+    /// already-broken route and nothing at all on a healthy one.
+    ///
+    /// Paths and the pack id only — never a value, and never a secret key
+    /// name, keeping the module's "secret VALUES are never logged" rule.
+    fn report(&self, provider: &str, pack_path: &Path) {
+        match &self.envelope {
+            None => operator_log::warn(
+                module_path!(),
+                format!(
+                    "provider {provider} resolved no deploy-time config: no \
+                     bundle-manifest.json in any directory above {}, so \
+                     .providers/{provider}/config.envelope.cbor was never read. \
+                     Only the pinned pack-config and secrets can apply to this \
+                     pack.",
+                    pack_path.display()
+                ),
+            ),
+            Some((path, false)) => operator_log::warn(
+                module_path!(),
+                format!(
+                    "provider {provider} resolved no deploy-time config: {} does \
+                     not exist. The lookup key is the PACK ID; check it matches \
+                     the directory greentic-setup wrote under {}/.providers/.",
+                    path.display(),
+                    self.bundle_root
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new("<bundle>"))
+                        .display()
+                ),
+            ),
+            Some((path, true)) => operator_log::warn(
+                module_path!(),
+                format!(
+                    "provider {provider} resolved no deploy-time config, though \
+                     {} exists — it carries no non-secret answers, or every \
+                     answer it names is secret and unreadable.",
+                    path.display()
+                ),
+            ),
+        }
+    }
 }
 
 /// The extracted revision bundle a pinned pack came from: the nearest
@@ -332,5 +426,70 @@ mod tests {
         .await;
 
         assert_eq!(found, vec![("bot_token".to_string(), b"s3cr3t".to_vec())]);
+    }
+
+    /// The two silent misses, told apart. Both produce an empty config and a
+    /// successful request; only the message distinguishes them, which is the
+    /// whole reason this type exists.
+    #[test]
+    fn an_empty_config_can_say_which_lookup_missed() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+
+        // No bundle root at all: the envelope is never even named.
+        let none = ConfigLookup::describe(None, "messaging-webchat-gui");
+        assert!(none.envelope.is_none());
+        assert!(none.bundle_root.is_none());
+
+        // A bundle root, but nothing written under the pack id — the
+        // pack-id-does-not-match-the-directory case.
+        let absent = ConfigLookup::describe(Some(bundle.path()), "messaging-webchat-gui");
+        let (path, present) = absent.envelope.as_ref().expect("a named envelope");
+        assert!(!present);
+        assert!(
+            path.ends_with(".providers/messaging-webchat-gui/config.envelope.cbor"),
+            "{path:?}"
+        );
+
+        // The envelope is there; an empty config then means it carried nothing
+        // applicable, which is a different conversation again.
+        let dir = bundle
+            .path()
+            .join(".providers")
+            .join("messaging-webchat-gui");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("config.envelope.cbor"), b"\x00").expect("file");
+        let found = ConfigLookup::describe(Some(bundle.path()), "messaging-webchat-gui");
+        assert!(found.envelope.expect("a named envelope").1);
+    }
+
+    /// The lookup key is the PACK ID, and getting that wrong is exactly the
+    /// failure an operator cannot see. Two ids must not resolve to one path.
+    #[test]
+    fn the_envelope_path_is_keyed_on_the_pack_id() {
+        let bundle = tempfile::tempdir().expect("tempdir");
+        let stock = ConfigLookup::describe(Some(bundle.path()), "messaging-webchat-gui");
+        let custom = ConfigLookup::describe(Some(bundle.path()), "messaging-threepoint-rag-gui");
+        assert_ne!(
+            stock.envelope.expect("named").0,
+            custom.envelope.expect("named").0
+        );
+    }
+
+    /// A pack staged with no bundle above it resolves no envelope — the
+    /// `bundle_root: None` arm, reached through the real walk rather than by
+    /// constructing it.
+    #[test]
+    fn a_pack_with_no_bundle_manifest_above_it_finds_no_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = dir.path().join("nested").join("some.gtpack");
+        std::fs::create_dir_all(pack.parent().expect("parent")).expect("dirs");
+        std::fs::write(&pack, b"").expect("pack");
+        assert!(revision_bundle_root_for_pack(&pack).is_none());
+
+        std::fs::write(dir.path().join(BUNDLE_MANIFEST_FILE), b"{}").expect("manifest");
+        assert_eq!(
+            revision_bundle_root_for_pack(&pack).as_deref(),
+            Some(dir.path())
+        );
     }
 }
