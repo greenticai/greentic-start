@@ -1606,16 +1606,28 @@ fn directline_session_preflight(
     headers: &mut Vec<(String, String)>,
     ctx: &OperatorContext,
 ) -> directline_session::Preflight {
+    // NOTE: `get_secret` already distinguishes "not found" from "backend
+    // error" (an `Err` only for a genuine read failure), but this call site
+    // collapses both into `None` via `.ok().flatten()` exactly as
+    // `read_provider_signing_key` used to in `revision_serve.rs` before this
+    // change. That collapse is preserved here unchanged: this is the
+    // `--bundle` boot ingress path, out of scope for this fix (not in the
+    // brief's file list, not covered by its tests), and is flagged as a
+    // follow-up rather than changed silently alongside the reviewed fix.
     let signing_key = state
         .runner_host
         .get_secret(provider, "jwt_signing_key", ctx)
         .ok()
         .flatten();
+    let signing_key = match signing_key.as_deref() {
+        Some(key) => directline_session::SigningKey::Present(key),
+        None => directline_session::SigningKey::NotConfigured,
+    };
     let outcome = directline_session::preflight(
         method,
         provider_path,
         headers,
-        signing_key.as_deref(),
+        signing_key,
         &state.directline_sessions,
     );
     if let directline_session::Preflight::Forward(plan) = &outcome

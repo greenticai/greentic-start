@@ -4533,13 +4533,18 @@ async fn dispatch_provider_route(
         // Session-token renewal preflight: loads the provider's
         // jwt_signing_key, applies any Authorization rewrite, and may
         // short-circuit (auth failure, /tokens/refresh served locally).
-        let signing_key =
+        let signing_key_read =
             read_provider_signing_key(&activation, tenant, Some(&route_team), &provider_type).await;
+        let signing_key = match &signing_key_read {
+            SigningKeyRead::Found(key) => crate::directline_session::SigningKey::Present(key),
+            SigningKeyRead::NotConfigured => crate::directline_session::SigningKey::NotConfigured,
+            SigningKeyRead::Unavailable => crate::directline_session::SigningKey::Unavailable,
+        };
         let preflight_outcome = crate::directline_session::preflight(
             &hyper::Method::from_bytes(norm_method.as_bytes()).unwrap_or(hyper::Method::POST),
             &norm_path,
             &dl_headers,
-            signing_key.as_deref(),
+            signing_key,
             &state.directline_sessions,
         );
         let forward_plan = match preflight_outcome {
@@ -5569,20 +5574,33 @@ fn synthesize_provider_response(response: &IngressHttpResponse) -> Response<Full
 // except `read_provider_signing_key` which reads the secrets manager.
 // ---------------------------------------------------------------------------
 
+/// Owned form of [`crate::directline_session::SigningKey`], returned by the
+/// read so the borrow does not outlive the secrets call.
+pub enum SigningKeyRead {
+    Found(Vec<u8>),
+    NotConfigured,
+    Unavailable,
+}
+
 /// Read the `jwt_signing_key` for a provider from the secrets manager.
 ///
-/// Returns `None` both when no key is configured and when every read failed.
-/// **Those two are not the same thing downstream**: three of the four
-/// handlers in `crate::directline_session` forward an unverified request
-/// when they are handed `None`, so a secrets backend that is merely
-/// unreachable currently reads as "auth is off for this provider". The
-/// `warn!` below is what makes that visible.
+/// Distinguishes a provider that never had a key configured — every URI read
+/// answered "not found" — from one whose key could not be READ: a
+/// [`greentic_secrets_lib::SecretError::Permission`], `Backend` or `Other`
+/// from any read. Those are not the same thing downstream: forwarding an
+/// unverified request on the first is the long-standing, deliberate posture
+/// for a provider with auth switched off; doing it on the second turns a
+/// degraded secrets backend into an authentication bypass. `Permission` is
+/// grouped with the failures, not with "not found" — a denial means the key
+/// probably exists and cannot be read, which is exactly the bypass this
+/// distinction closes. The `warn!` below fires only on that failure path —
+/// a never-configured provider is not a warning.
 async fn read_provider_signing_key(
     activation: &Activation,
     tenant: &str,
     team: Option<&str>,
     provider_type: &str,
-) -> Option<Vec<u8>> {
+) -> SigningKeyRead {
     let secrets = activation.host.secrets_manager();
     let env = crate::resolve_env(None);
     let team_segment = crate::secrets_manager::canonical_team(team);
@@ -5600,27 +5618,34 @@ async fn read_provider_signing_key(
         &provider_hyphen,
         "jwt_signing_key",
     );
-    let mut last_error: Option<String> = None;
+    // Set only by a read that failed for a reason OTHER than "not found" —
+    // i.e. a genuine backend failure. Any single one of those is enough to
+    // refuse, even if a different URI for the same key answered "not found".
+    let mut backend_failure: Option<String> = None;
     for uri in [&raw_uri, &canonical_uri] {
         match secrets.read(uri).await {
-            Ok(bytes) => return Some(bytes),
+            Ok(bytes) => return SigningKeyRead::Found(bytes),
+            Err(greentic_secrets_lib::SecretError::NotFound(_)) => continue,
             Err(err) => {
-                last_error = Some(err.to_string());
+                backend_failure = Some(err.to_string());
                 continue;
             }
         }
     }
-    if let Some(err) = last_error {
-        operator_log::warn(
-            module_path!(),
-            format!(
-                "directline signing key unreadable for provider={provider_type} \
-                 tenant={tenant}: {err}; requests to this provider will be \
-                 forwarded WITHOUT token verification"
-            ),
-        );
+    match backend_failure {
+        Some(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "directline signing key unreadable for provider={provider_type} \
+                     tenant={tenant}: {err}; requests to this provider will be \
+                     REFUSED until it can be read"
+                ),
+            );
+            SigningKeyRead::Unavailable
+        }
+        None => SigningKeyRead::NotConfigured,
     }
-    None
 }
 
 /// Extract the DirectLine-relative path from a full request path.
@@ -6187,13 +6212,16 @@ async fn handle_websocket_upgrade(
         }
     };
 
-    // Read the JWT signing key from the pinned revision's secrets.
+    // Read the JWT signing key from the pinned revision's secrets. This path
+    // has no "auth is off" posture of its own — it always needs the actual
+    // key bytes to validate the `?t=` token — so both a never-configured key
+    // and one that could not be read refuse the same way.
     let team = "default";
     let signing_key =
         read_provider_signing_key(&activation, &tenant, Some(team), &provider_type).await;
     let signing_key = match signing_key {
-        Some(key) => key,
-        None => {
+        SigningKeyRead::Found(key) => key,
+        SigningKeyRead::NotConfigured | SigningKeyRead::Unavailable => {
             return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "missing jwt_signing_key for the webchat provider",

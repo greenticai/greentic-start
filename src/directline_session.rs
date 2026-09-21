@@ -374,22 +374,48 @@ pub enum Preflight {
     Respond(Response<Full<Bytes>>),
 }
 
+/// What the caller found when it looked for this provider's signing key.
+///
+/// The three states must stay distinct. A provider that never had a key has
+/// DirectLine auth switched off and has always been forwarded; a read that
+/// FAILED is a degraded secrets backend, and forwarding there turns a
+/// transient error into an authentication bypass. Collapsing them into one
+/// `Option` is what this type replaces — see
+/// `docs/superpowers/specs/2026-09-21-mcp-a2a-interop-research.md` §4.3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigningKey<'a> {
+    /// A key was read and requests are verified against it.
+    Present(&'a [u8]),
+    /// No key is configured for this provider. Auth is off, deliberately.
+    NotConfigured,
+    /// A key may exist but could not be read. Refuse rather than guess.
+    Unavailable,
+}
+
 /// Screen a normalized DirectLine request (`provider_path` is post
 /// [`normalize_directline_dispatch`], e.g. `/v3/directline/conversations/<id>/activities`).
 ///
 /// Side effect: accepted activity / reconnect / refresh requests `touch` the
 /// sliding-window store for their conversation. `signing_key` is the
-/// `jwt_signing_key` secret for the target provider; when absent the request is
-/// forwarded unchanged (the provider performs its own auth) except for
-/// `/tokens/refresh`, which cannot work without it.
+/// `jwt_signing_key` secret for the target provider; when [`SigningKey::NotConfigured`]
+/// the request is forwarded unchanged (the provider performs its own auth)
+/// except for `/tokens/refresh`, which cannot work without it. When
+/// [`SigningKey::Unavailable`] the request is refused rather than forwarded
+/// unverified.
 pub fn preflight(
     method: &Method,
     provider_path: &str,
     headers: &[(String, String)],
-    signing_key: Option<&[u8]>,
+    signing_key: SigningKey<'_>,
     sessions: &DirectLineSessions,
 ) -> Preflight {
-    let signing_key = signing_key.filter(|key| !key.is_empty());
+    // An empty key cannot verify anything. Treat it as a broken configuration
+    // (`Unavailable`), never as "no key" (`NotConfigured`) — the latter would
+    // silently reopen the fail-open this type exists to close.
+    let signing_key = match signing_key {
+        SigningKey::Present([]) => SigningKey::Unavailable,
+        other => other,
+    };
     let segments: Vec<&str> = provider_path.trim_start_matches('/').split('/').collect();
     match segments.as_slice() {
         ["v3", "directline", "tokens", "refresh"] if method == Method::POST => {
@@ -471,11 +497,22 @@ fn handle_activities(
     method: &Method,
     conv_id: &str,
     headers: &[(String, String)],
-    signing_key: Option<&[u8]>,
+    signing_key: SigningKey<'_>,
     sessions: &DirectLineSessions,
 ) -> Preflight {
-    let Some(key) = signing_key else {
-        return Preflight::Forward(ForwardPlan::default());
+    let key = match signing_key {
+        SigningKey::Present(key) => key,
+        SigningKey::NotConfigured => {
+            return Preflight::Forward(ForwardPlan::default());
+        }
+        SigningKey::Unavailable => {
+            return Preflight::Respond(coded_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "ServerError",
+                "directline signing key unavailable",
+            ));
+        }
     };
     let token = match bearer(headers) {
         Some(token) => token,
@@ -528,11 +565,22 @@ fn handle_activities(
 fn handle_reconnect(
     conv_id: &str,
     headers: &[(String, String)],
-    signing_key: Option<&[u8]>,
+    signing_key: SigningKey<'_>,
     sessions: &DirectLineSessions,
 ) -> Preflight {
-    let Some(key) = signing_key else {
-        return Preflight::Forward(ForwardPlan::default());
+    let key = match signing_key {
+        SigningKey::Present(key) => key,
+        SigningKey::NotConfigured => {
+            return Preflight::Forward(ForwardPlan::default());
+        }
+        SigningKey::Unavailable => {
+            return Preflight::Respond(coded_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "ServerError",
+                "directline signing key unavailable",
+            ));
+        }
     };
     let token = match bearer(headers) {
         Some(token) => token,
@@ -572,14 +620,25 @@ fn handle_reconnect(
 
 fn handle_conversations_create(
     headers: &[(String, String)],
-    signing_key: Option<&[u8]>,
+    signing_key: SigningKey<'_>,
     sessions: &DirectLineSessions,
 ) -> Preflight {
-    let Some(key) = signing_key else {
-        return Preflight::Forward(ForwardPlan {
-            seed_from_response: true,
-            ..ForwardPlan::default()
-        });
+    let key = match signing_key {
+        SigningKey::Present(key) => key,
+        SigningKey::NotConfigured => {
+            return Preflight::Forward(ForwardPlan {
+                seed_from_response: true,
+                ..ForwardPlan::default()
+            });
+        }
+        SigningKey::Unavailable => {
+            return Preflight::Respond(coded_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "ServerError",
+                "directline signing key unavailable",
+            ));
+        }
     };
     let token = match bearer(headers) {
         Some(token) => token,
@@ -610,16 +669,19 @@ fn handle_conversations_create(
 
 fn handle_refresh(
     headers: &[(String, String)],
-    signing_key: Option<&[u8]>,
+    signing_key: SigningKey<'_>,
     sessions: &DirectLineSessions,
 ) -> Preflight {
-    let Some(key) = signing_key else {
-        return Preflight::Respond(coded_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            "ServerError",
-            "directline signing key unavailable",
-        ));
+    let key = match signing_key {
+        SigningKey::Present(key) => key,
+        SigningKey::NotConfigured | SigningKey::Unavailable => {
+            return Preflight::Respond(coded_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "ServerError",
+                "directline signing key unavailable",
+            ));
+        }
     };
     let token = match bearer(headers) {
         Some(token) => token,
@@ -868,7 +930,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&token),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected forward");
@@ -977,7 +1039,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&token),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         );
         match outcome {
@@ -1002,7 +1064,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&token),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         );
         assert!(
@@ -1019,7 +1081,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&token),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         );
         let Preflight::Respond(resp) = outcome else {
@@ -1046,7 +1108,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&token),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         );
         let Preflight::Respond(resp) = outcome else {
@@ -1066,7 +1128,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&token),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         );
         let Preflight::Respond(resp) = outcome else {
@@ -1086,7 +1148,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/tokens/refresh",
             &auth(&token),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected respond");
@@ -1111,7 +1173,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations",
             &auth(&bootstrap),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected forward");
@@ -1143,7 +1205,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations",
             &auth(&bound),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected reject");
@@ -1161,7 +1223,7 @@ mod tests {
                 &Method::POST,
                 "/v3/directline/tokens/generate",
                 &[],
-                Some(KEY),
+                SigningKey::Present(KEY),
                 &sessions
             ),
             Preflight::Forward(plan) if plan.rewrite_authorization.is_none()
@@ -1169,7 +1231,13 @@ mod tests {
                 && !plan.seed_from_response
         ));
         assert!(matches!(
-            preflight(&Method::GET, "/v3/directline", &[], Some(KEY), &sessions),
+            preflight(
+                &Method::GET,
+                "/v3/directline",
+                &[],
+                SigningKey::Present(KEY),
+                &sessions
+            ),
             Preflight::Forward(_)
         ));
     }
@@ -1182,7 +1250,7 @@ mod tests {
                 &Method::POST,
                 "/v3/directline/conversations/conv-1/activities",
                 &auth("whatever"),
-                None,
+                SigningKey::NotConfigured,
                 &sessions
             ),
             Preflight::Forward(_)
@@ -1191,12 +1259,81 @@ mod tests {
             &Method::POST,
             "/v3/directline/tokens/refresh",
             &auth("whatever"),
-            None,
+            SigningKey::NotConfigured,
             &sessions,
         ) else {
             panic!("expected respond");
         };
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn an_unreadable_signing_key_refuses_activities_instead_of_forwarding() {
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        let now = now_secs();
+        let token = make_token("alice", Some("conv-1"), now, now + 1800, KEY);
+        let outcome = preflight(
+            &Method::POST,
+            "/v3/directline/conversations/conv-1/activities",
+            &auth(&token),
+            SigningKey::Unavailable,
+            &sessions,
+        );
+        let Preflight::Respond(resp) = outcome else {
+            panic!("an unreadable signing key must never forward an unverified request");
+        };
+        let (status, body) = body_of(resp);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["code"], "ServerError");
+    }
+
+    #[test]
+    fn an_unreadable_signing_key_refuses_reconnect_and_conversation_create() {
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        for (method, path) in [
+            (Method::GET, "/v3/directline/conversations/conv-1"),
+            (Method::POST, "/v3/directline/conversations"),
+        ] {
+            let outcome = preflight(&method, path, &[], SigningKey::Unavailable, &sessions);
+            let Preflight::Respond(resp) = outcome else {
+                panic!("{path} forwarded an unverified request on an unreadable key");
+            };
+            let (status, _) = body_of(resp);
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{path}");
+        }
+    }
+
+    #[test]
+    fn an_empty_signing_key_is_refused_rather_than_treated_as_absent() {
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        let outcome = preflight(
+            &Method::POST,
+            "/v3/directline/conversations/conv-1/activities",
+            &[],
+            SigningKey::Present(b""),
+            &sessions,
+        );
+        let Preflight::Respond(resp) = outcome else {
+            panic!("an empty key cannot verify anything and must not forward");
+        };
+        let (status, _) = body_of(resp);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn a_tenant_with_no_key_configured_is_still_served() {
+        // Auth was never switched on for this provider. That is a deliberate
+        // posture, not a degraded one, and it must keep working exactly as it
+        // did before this change — otherwise the fix takes a live tenant down.
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        let outcome = preflight(
+            &Method::POST,
+            "/v3/directline/conversations/conv-1/activities",
+            &[],
+            SigningKey::NotConfigured,
+            &sessions,
+        );
+        assert!(matches!(outcome, Preflight::Forward(_)));
     }
 
     #[test]
@@ -1242,7 +1379,13 @@ mod tests {
             let now = now_secs();
             // Modelled as "the t = 0 bearer, observed `elapsed` seconds later".
             let original = make_token("alice", Some(conv), now - elapsed, now - elapsed + ttl, KEY);
-            match preflight(&Method::POST, &path, &auth(&original), Some(KEY), &sessions) {
+            match preflight(
+                &Method::POST,
+                &path,
+                &auth(&original),
+                SigningKey::Present(KEY),
+                &sessions,
+            ) {
                 Preflight::Forward(plan) => {
                     let renewed = plan
                         .rewrite_authorization
@@ -1285,7 +1428,7 @@ mod tests {
                 &Method::POST,
                 "/v3/directline/conversations/conv-idle/activities",
                 &auth(&stale),
-                Some(KEY),
+                SigningKey::Present(KEY),
                 &sessions,
             ),
             Preflight::Respond(_)
@@ -1302,7 +1445,7 @@ mod tests {
             &Method::GET,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&fresh),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected forward");
@@ -1323,7 +1466,7 @@ mod tests {
             &Method::GET,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&stale),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected forward");
@@ -1341,7 +1484,7 @@ mod tests {
             &Method::GET,
             "/v3/directline/conversations/conv-7",
             &auth(&unbound),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected forward");
@@ -1365,7 +1508,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations/conv-1/activities",
             &[],
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected reject");
