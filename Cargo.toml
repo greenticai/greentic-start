@@ -374,9 +374,9 @@ wat = "1"
 # TO UNWIND once publishing is restored: publish these versions, delete this
 # block, and run `cargo update`.
 [patch.crates-io]
-greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "728e6a4302790814a125052de8c3c84d775d95bf" }
-greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "728e6a4302790814a125052de8c3c84d775d95bf" }
-greentic-aw-runtime = { git = "https://github.com/greenticai/greentic-runner", rev = "728e6a4302790814a125052de8c3c84d775d95bf" }
+greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "669c2cd38359682878b60ae429280cac6b353609" }
+greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "669c2cd38359682878b60ae429280cac6b353609" }
+greentic-aw-runtime = { git = "https://github.com/greenticai/greentic-runner", rev = "669c2cd38359682878b60ae429280cac6b353609" }
 greentic-setup = { git = "https://github.com/greenticai/greentic-setup", rev = "ba6416abd5df63b700d2500e8e83d167becc483c" }
 greentic-deployer = { git = "https://github.com/greenticai/greentic-deployer", rev = "a706eea6db1e8f20a5460ea7af0470ff9c53f552" }
 greentic-deploy-spec = { git = "https://github.com/greenticai/greentic-deployer", rev = "a706eea6db1e8f20a5460ea7af0470ff9c53f552" }
