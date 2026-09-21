@@ -1606,25 +1606,41 @@ fn directline_session_preflight(
     headers: &mut Vec<(String, String)>,
     ctx: &OperatorContext,
 ) -> directline_session::Preflight {
-    // NOTE: `get_secret` distinguishes "not found" (`Ok(None)`) from a
-    // genuine read failure (`Err`), but this call site collapses both into
-    // `None` via `.ok().flatten()`, exactly as `read_provider_signing_key`
-    // used to in `revision_serve.rs` before this change. That collapse is
-    // preserved here UNCHANGED: this is the `--bundle` boot ingress path
-    // (the designer's Run Demo, not a deployed bundle), out of scope for
-    // this fix (not in the brief's file list, not covered by its tests),
-    // and flagged as a follow-up rather than closed silently alongside the
-    // reviewed change.
+    // This is the `--bundle` boot ingress path (the designer's Run Demo via
+    // `DemoRunnerHost`), never a deployed bundle — deployed traffic runs
+    // through `revision_serve.rs::read_provider_signing_key` instead, which
+    // this call site does not share.
     //
-    // One thing here DID change, and is not covered by the note above: an
+    // `get_secret` distinguishes "not found" (`Ok(None)`) from a genuine read
+    // failure (`Err`), but `.ok().flatten()` collapses both into `None` here,
+    // so this lane cannot tell "no key configured" from "secrets backend
+    // degraded" — a failed read is accepted as `SigningKey::NotConfigured`
+    // and the request is forwarded unverified. That fail-open is accepted on
+    // this path and tracked separately from the DirectLine fix above; it is
+    // not this function's job to close it.
+    //
+    // Hazard for whoever DOES close it: `get_secret` (`runner_host/mod.rs`)
+    // already distinguishes the two cases internally, but not with
+    // `SecretError`'s variants — it uses `is_secret_not_found`, a STRING
+    // matcher over the error's `Display` output (`contains("not found")`,
+    // `"NotFound"`, `"not-found"`, `"not provisioned"`). Forwarding
+    // `get_secret`'s `Err` here without going through that same matcher would
+    // fail OPEN on any `SecretError::Backend` whose message happens to
+    // contain one of those substrings (e.g. `Backend("upstream said not
+    // found")`), the opposite of what closing this is meant to do. If this
+    // lane and the `SecretError`-based classification in `revision_serve.rs`
+    // are ever unified, `is_secret_not_found` moves onto the enum — the
+    // string matcher does not get promoted to the shared classifier.
+    //
+    // One thing here already changed as a side effect of the shared type: an
     // empty secret (`Ok(Some(vec![]))`) used to reach the old `preflight` as
-    // `Some(&[])`, which it filtered down to "no key" and forwarded
-    // unverified. Because this call site shares `directline_session::preflight`
-    // with the reviewed path, an empty secret now reads as
-    // `SigningKey::Present(&[])`, which `preflight` normalises to
-    // `Unavailable` and refuses (500) instead. That change is intentional
-    // and safe — it is not reverted here — it just is not the same thing as
-    // the not-found/backend-error collapse described above.
+    // `Some(&[])`, filtered down to "no key", and forward unverified. Because
+    // this call site shares `directline_session::preflight` with the fixed
+    // path, an empty secret now reads as `SigningKey::Present(&[])`, which
+    // `preflight` normalises to `Unavailable` and refuses (500) instead.
+    // Intentional, not reverted here, and distinct from the not-found/backend
+    // collapse above (which is about `get_secret`'s `Err`, not an empty
+    // `Ok`).
     let signing_key = state
         .runner_host
         .get_secret(provider, "jwt_signing_key", ctx)

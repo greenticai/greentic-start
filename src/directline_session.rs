@@ -507,12 +507,7 @@ fn handle_activities(
             return Preflight::Forward(ForwardPlan::default());
         }
         SigningKey::Unavailable => {
-            return Preflight::Respond(coded_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "ServerError",
-                "directline signing key unavailable",
-            ));
+            return signing_key_unavailable();
         }
     };
     let token = match bearer(headers) {
@@ -575,12 +570,7 @@ fn handle_reconnect(
             return Preflight::Forward(ForwardPlan::default());
         }
         SigningKey::Unavailable => {
-            return Preflight::Respond(coded_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "ServerError",
-                "directline signing key unavailable",
-            ));
+            return signing_key_unavailable();
         }
     };
     let token = match bearer(headers) {
@@ -633,12 +623,7 @@ fn handle_conversations_create(
             });
         }
         SigningKey::Unavailable => {
-            return Preflight::Respond(coded_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "ServerError",
-                "directline signing key unavailable",
-            ));
+            return signing_key_unavailable();
         }
     };
     let token = match bearer(headers) {
@@ -676,12 +661,7 @@ fn handle_refresh(
     let key = match signing_key {
         SigningKey::Present(key) => key,
         SigningKey::NotConfigured | SigningKey::Unavailable => {
-            return Preflight::Respond(coded_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "ServerError",
-                "directline signing key unavailable",
-            ));
+            return signing_key_unavailable();
         }
     };
     let token = match bearer(headers) {
@@ -766,6 +746,20 @@ fn forbidden(code: &str, message: &str) -> Preflight {
         "forbidden",
         code,
         message,
+    ))
+}
+
+/// The refusal every handler returns for [`SigningKey::Unavailable`] (and,
+/// in `handle_refresh`, for [`SigningKey::NotConfigured`] too — that handler
+/// has no "auth off" posture, see its own match). One function so a future
+/// fifth handler cannot spell this refusal subtly differently from the other
+/// four.
+fn signing_key_unavailable() -> Preflight {
+    Preflight::Respond(coded_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "server_error",
+        "ServerError",
+        "directline signing key unavailable",
     ))
 }
 
