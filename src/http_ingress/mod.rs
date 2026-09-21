@@ -1606,14 +1606,25 @@ fn directline_session_preflight(
     headers: &mut Vec<(String, String)>,
     ctx: &OperatorContext,
 ) -> directline_session::Preflight {
-    // NOTE: `get_secret` already distinguishes "not found" from "backend
-    // error" (an `Err` only for a genuine read failure), but this call site
-    // collapses both into `None` via `.ok().flatten()` exactly as
-    // `read_provider_signing_key` used to in `revision_serve.rs` before this
-    // change. That collapse is preserved here unchanged: this is the
-    // `--bundle` boot ingress path, out of scope for this fix (not in the
-    // brief's file list, not covered by its tests), and is flagged as a
-    // follow-up rather than changed silently alongside the reviewed fix.
+    // NOTE: `get_secret` distinguishes "not found" (`Ok(None)`) from a
+    // genuine read failure (`Err`), but this call site collapses both into
+    // `None` via `.ok().flatten()`, exactly as `read_provider_signing_key`
+    // used to in `revision_serve.rs` before this change. That collapse is
+    // preserved here UNCHANGED: this is the `--bundle` boot ingress path
+    // (the designer's Run Demo, not a deployed bundle), out of scope for
+    // this fix (not in the brief's file list, not covered by its tests),
+    // and flagged as a follow-up rather than closed silently alongside the
+    // reviewed change.
+    //
+    // One thing here DID change, and is not covered by the note above: an
+    // empty secret (`Ok(Some(vec![]))`) used to reach the old `preflight` as
+    // `Some(&[])`, which it filtered down to "no key" and forwarded
+    // unverified. Because this call site shares `directline_session::preflight`
+    // with the reviewed path, an empty secret now reads as
+    // `SigningKey::Present(&[])`, which `preflight` normalises to
+    // `Unavailable` and refuses (500) instead. That change is intentional
+    // and safe — it is not reverted here — it just is not the same thing as
+    // the not-found/backend-error collapse described above.
     let signing_key = state
         .runner_host
         .get_secret(provider, "jwt_signing_key", ctx)

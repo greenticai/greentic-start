@@ -380,8 +380,9 @@ pub enum Preflight {
 /// DirectLine auth switched off and has always been forwarded; a read that
 /// FAILED is a degraded secrets backend, and forwarding there turns a
 /// transient error into an authentication bypass. Collapsing them into one
-/// `Option` is what this type replaces — see
-/// `docs/superpowers/specs/2026-09-21-mcp-a2a-interop-research.md` §4.3.
+/// `Option` is what this type replaces — see the classification in
+/// `read_provider_signing_key` (`revision_serve.rs`), and the visibility fix
+/// that preceded it (`git log --grep "report an unreadable signing key"`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SigningKey<'a> {
     /// A key was read and requests are verified against it.

@@ -5582,19 +5582,29 @@ pub enum SigningKeyRead {
     Unavailable,
 }
 
+/// True for a [`greentic_secrets_lib::SecretError`] that means the read
+/// itself failed, as opposed to `NotFound`, which means the key was never
+/// configured. This is the security-relevant decision in
+/// `read_provider_signing_key`: `Permission` is grouped with the failures,
+/// not with "not found", because a denial means the key probably exists and
+/// cannot be read — treating it as "no key" would reopen the authentication
+/// bypass this module exists to close. Kept as a pure function, independently
+/// testable against all four `SecretError` variants without an `Activation`
+/// or a secrets manager, so this classification cannot silently drift.
+fn is_backend_failure(err: &greentic_secrets_lib::SecretError) -> bool {
+    !matches!(err, greentic_secrets_lib::SecretError::NotFound(_))
+}
+
 /// Read the `jwt_signing_key` for a provider from the secrets manager.
 ///
 /// Distinguishes a provider that never had a key configured — every URI read
-/// answered "not found" — from one whose key could not be READ: a
-/// [`greentic_secrets_lib::SecretError::Permission`], `Backend` or `Other`
-/// from any read. Those are not the same thing downstream: forwarding an
-/// unverified request on the first is the long-standing, deliberate posture
-/// for a provider with auth switched off; doing it on the second turns a
-/// degraded secrets backend into an authentication bypass. `Permission` is
-/// grouped with the failures, not with "not found" — a denial means the key
-/// probably exists and cannot be read, which is exactly the bypass this
-/// distinction closes. The `warn!` below fires only on that failure path —
-/// a never-configured provider is not a warning.
+/// answered "not found" — from one whose key could not be READ: any read for
+/// which [`is_backend_failure`] is true. Those are not the same thing
+/// downstream: forwarding an unverified request on the first is the
+/// long-standing, deliberate posture for a provider with auth switched off;
+/// doing it on the second turns a degraded secrets backend into an
+/// authentication bypass. The `warn!` below fires only on that failure
+/// path — a never-configured provider is not a warning.
 async fn read_provider_signing_key(
     activation: &Activation,
     tenant: &str,
@@ -5625,11 +5635,11 @@ async fn read_provider_signing_key(
     for uri in [&raw_uri, &canonical_uri] {
         match secrets.read(uri).await {
             Ok(bytes) => return SigningKeyRead::Found(bytes),
-            Err(greentic_secrets_lib::SecretError::NotFound(_)) => continue,
-            Err(err) => {
+            Err(err) if is_backend_failure(&err) => {
                 backend_failure = Some(err.to_string());
                 continue;
             }
+            Err(_) => continue,
         }
     }
     match backend_failure {
@@ -9039,6 +9049,39 @@ mod tests {
     #[test]
     fn encode_directline_query_string_empty_returns_none() {
         assert_eq!(encode_directline_query_string(&[]), None);
+    }
+
+    // `is_backend_failure` is the security-relevant classification behind
+    // `read_provider_signing_key`: get it wrong and a degraded secrets
+    // backend silently reopens the DirectLine authentication bypass. Tested
+    // directly, against all four `SecretError` variants, so nothing can move
+    // a variant across the NotFound/failure line without a test noticing.
+    #[test]
+    fn is_backend_failure_is_false_only_for_not_found() {
+        assert!(!is_backend_failure(
+            &greentic_secrets_lib::SecretError::NotFound("jwt_signing_key".to_string())
+        ));
+    }
+
+    #[test]
+    fn is_backend_failure_is_true_for_permission() {
+        assert!(is_backend_failure(
+            &greentic_secrets_lib::SecretError::Permission("denied".to_string())
+        ));
+    }
+
+    #[test]
+    fn is_backend_failure_is_true_for_backend() {
+        assert!(is_backend_failure(
+            &greentic_secrets_lib::SecretError::Backend("storage unreachable".into())
+        ));
+    }
+
+    #[test]
+    fn is_backend_failure_is_true_for_other() {
+        assert!(is_backend_failure(
+            &greentic_secrets_lib::SecretError::Other(anyhow::anyhow!("boom"))
+        ));
     }
 
     // Category 5: rewrite_stream_url
