@@ -1534,24 +1534,7 @@ async fn serve(
         header_revision: None,
         cookie: cookie_value.as_deref(),
     };
-    // `ThreadRng` is `!Send` and the dispatcher is async, so it cannot survive
-    // the `.await` in the spawned connection task. Seed a `Send` `SmallRng`.
-    let mut rng: rand::rngs::SmallRng = rand::make_rng();
-    let outcome = activation
-        .routing
-        .dispatcher
-        .dispatch(&dispatch_req, &mut rng)
-        .await
-        .map_err(|err| {
-            operator_log::warn(
-                module_path!(),
-                format!("revision dispatch for deployment {deployment_id} failed: {err:#}"),
-            );
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "revision dispatch failed",
-            )
-        })?;
+    let outcome = dispatch_turn(&activation, &dispatch_req, "revision dispatch").await?;
 
     // Bind the dispatched revision tuple once. Both the resolver (below)
     // and `admit_request` (further down) consume it; sharing one binding
@@ -1671,26 +1654,15 @@ async fn serve(
         welcome_hint,
     );
 
-    let replies = activation
-        .host
-        .handle_activity_for_revision(
-            &tenant,
-            deployment_id,
-            outcome.bundle_id.clone(),
-            outcome.revision_id,
-            activity,
-        )
-        .await
-        .map_err(|err| {
-            operator_log::error(
-                module_path!(),
-                format!(
-                    "revision execution failed for deployment {deployment_id} revision {}: {err:#}",
-                    outcome.revision_id
-                ),
-            );
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "flow execution failed")
-        })?;
+    let replies = execute_turn(
+        &state,
+        &activation,
+        &tenant,
+        &scope,
+        activity,
+        "revision execution",
+    )
+    .await?;
 
     let body = serde_json::to_vec(&replies)
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
@@ -1699,6 +1671,125 @@ async fn serve(
         apply_set_cookie(&mut response, &directive);
     }
     Ok(response)
+}
+
+/// One conversation turn's inputs for [`run_turn`]: what the dispatcher needs
+/// to pick a revision plus what [`build_activity`] needs to shape the turn.
+pub(crate) struct TurnSpec<'a> {
+    pub tenant: &'a str,
+    pub deployment_id: DeploymentId,
+    pub session_hint: Option<&'a str>,
+    /// See [`DispatchRequest::defer_pin`].
+    pub defer_pin: bool,
+    pub cookie: Option<&'a str>,
+    pub user: Option<&'a str>,
+    pub payload: &'a Value,
+}
+
+/// Ask the dispatcher which revision serves this turn. `label` prefixes the
+/// operator-log line so each ingress keeps its own diagnostic wording.
+async fn dispatch_turn(
+    activation: &Activation,
+    dispatch_req: &DispatchRequest<'_>,
+    label: &str,
+) -> Result<crate::revision_dispatcher::DispatchOutcome, Response<Full<Bytes>>> {
+    // `ThreadRng` is `!Send` and the dispatcher is async, so it cannot survive
+    // the `.await` in the spawned connection task. Seed a `Send` `SmallRng`.
+    let mut rng: rand::rngs::SmallRng = rand::make_rng();
+    let deployment_id = dispatch_req.deployment_id;
+    activation
+        .routing
+        .dispatcher
+        .dispatch(dispatch_req, &mut rng)
+        .await
+        .map_err(|err| {
+            operator_log::warn(
+                module_path!(),
+                format!("{label} for deployment {deployment_id} failed: {err:#}"),
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "revision dispatch failed",
+            )
+        })
+}
+
+/// Run one already-shaped [`Activity`] against the dispatched revision.
+async fn execute_turn(
+    _state: &ServeState,
+    activation: &Activation,
+    tenant: &str,
+    scope: &RevisionScope,
+    activity: Activity,
+    label: &str,
+) -> Result<Vec<Activity>, Response<Full<Bytes>>> {
+    let deployment_id = scope.deployment_id;
+    let revision_id = scope.revision_id;
+    activation
+        .host
+        .handle_activity_for_revision(
+            tenant,
+            deployment_id,
+            scope.bundle_id.clone(),
+            revision_id,
+            activity,
+        )
+        .await
+        .map_err(|err| {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "{label} failed for deployment {deployment_id} revision {revision_id}: {err:#}"
+                ),
+            );
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "flow execution failed")
+        })
+}
+
+/// Dispatch → [`build_activity`] → execute, for an ingress with nothing to do
+/// between picking the revision and running the turn. The generic JSON branch
+/// of [`serve`] calls the two halves itself because static routes, provider
+/// routes and endpoint resolution sit between them.
+async fn run_turn(
+    state: &ServeState,
+    activation: &Activation,
+    spec: TurnSpec<'_>,
+    dispatch_label: &str,
+    execute_label: &str,
+) -> Result<Vec<Activity>, Response<Full<Bytes>>> {
+    let dispatch_req = DispatchRequest {
+        env_id: activation.routing.dispatcher.env_id(),
+        tenant: spec.tenant,
+        deployment_id: spec.deployment_id,
+        session_hint: spec.session_hint,
+        defer_pin: spec.defer_pin,
+        trusted: false,
+        header_revision: None,
+        cookie: spec.cookie,
+    };
+    let outcome = dispatch_turn(activation, &dispatch_req, dispatch_label).await?;
+    let activity = build_activity(
+        spec.payload,
+        spec.tenant,
+        spec.user,
+        spec.session_hint,
+        None,
+        None,
+    );
+    let scope = RevisionScope {
+        deployment_id: spec.deployment_id,
+        bundle_id: outcome.bundle_id.clone(),
+        revision_id: outcome.revision_id,
+    };
+    execute_turn(
+        state,
+        activation,
+        spec.tenant,
+        &scope,
+        activity,
+        execute_label,
+    )
+    .await
 }
 
 /// `POST /workers/invoke` payload, mirroring
@@ -1796,70 +1887,30 @@ async fn handle_worker_invoke(
         })?;
 
     let session_hint = worker_req.session_id.clone();
-    let dispatch_req = DispatchRequest {
-        env_id: activation.routing.dispatcher.env_id(),
-        tenant: &tenant,
-        deployment_id,
-        session_hint: session_hint.as_deref(),
-        // Worker-invoke is loopback-gated (trusted caller), so the supplied
-        // session id pins inline like other caller-asserted hints.
-        defer_pin: false,
-        trusted: false,
-        header_revision: None,
-        cookie: None,
-    };
-    let mut rng: rand::rngs::SmallRng = rand::make_rng();
-    let outcome = activation
-        .routing
-        .dispatcher
-        .dispatch(&dispatch_req, &mut rng)
-        .await
-        .map_err(|err| {
-            operator_log::warn(
-                module_path!(),
-                format!("worker-invoke dispatch for deployment {deployment_id} failed: {err:#}"),
-            );
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "revision dispatch failed",
-            )
-        })?;
-
     let user = worker_req
         .tenant
         .user_id
         .as_ref()
         .map(|u| u.as_str().to_string());
     let flow_payload = normalize_worker_payload(&worker_req.payload);
-    let activity = build_activity(
-        &flow_payload,
-        &tenant,
-        user.as_deref(),
-        session_hint.as_deref(),
-        None,
-        None,
-    );
-
-    let replies = activation
-        .host
-        .handle_activity_for_revision(
-            &tenant,
+    let replies = run_turn(
+        &state,
+        &activation,
+        TurnSpec {
+            tenant: &tenant,
             deployment_id,
-            outcome.bundle_id.clone(),
-            outcome.revision_id,
-            activity,
-        )
-        .await
-        .map_err(|err| {
-            operator_log::error(
-                module_path!(),
-                format!(
-                    "worker-invoke execution failed for deployment {deployment_id} revision {}: {err:#}",
-                    outcome.revision_id
-                ),
-            );
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "flow execution failed")
-        })?;
+            session_hint: session_hint.as_deref(),
+            // Worker-invoke is loopback-gated (trusted caller), so the supplied
+            // session id pins inline like other caller-asserted hints.
+            defer_pin: false,
+            cookie: None,
+            user: user.as_deref(),
+            payload: &flow_payload,
+        },
+        "worker-invoke dispatch",
+        "worker-invoke execution",
+    )
+    .await?;
 
     let messages = replies.iter().map(activity_to_worker_message).collect();
     let response = WorkerInvokeResponse {
