@@ -225,6 +225,10 @@ pub(crate) struct RevisionServeConfig {
     pub auto_restart_enabled: bool,
     /// Executable path captured at boot, before any swap.
     pub exe_path: Option<std::path::PathBuf>,
+    /// The public base URL resolved at boot, when one was configured
+    /// (env-store, then `PUBLIC_BASE_URL`). The interop agent card needs an
+    /// absolute HTTPS URL and must never derive one from the request's `Host`.
+    pub public_base_url: Option<String>,
     /// Armed on Cloud Run when no boot-time `public_base_url` is available:
     /// the first inbound request that passes the GFE trust gate sets the URL
     /// via [`PublicUrlCapture::offer`], waking the deferred registration task.
@@ -593,7 +597,7 @@ impl RevisionServer {
             session_manager,
             notifier,
             public_url_capture: config.public_url_capture,
-            interop: crate::interop::InteropState::from_env(),
+            interop: crate::interop::InteropState::from_env(config.public_base_url),
             #[cfg(test)]
             activity_source_override: None,
         });
@@ -1185,7 +1189,7 @@ async fn handle_connection(
 /// and `greentic-gui` reaches it **server-side** via `HttpWorkerBackend`, where
 /// CORS does not apply.
 fn path_allows_cors(path: &str) -> bool {
-    path != "/workers/invoke"
+    path != "/workers/invoke" && !crate::interop::a2a::is_cors_excluded(path)
 }
 
 /// Resolve → dispatch → execute for a single request. `Err` carries a ready HTTP
@@ -1317,6 +1321,7 @@ async fn serve(
     // Phase 0b: read before the body consumes `req`. Only the generic-JSON
     // branch reads it; provider routes carry their own verification.
     let authorization_header = header_str(req.headers(), header::AUTHORIZATION.as_str());
+    let if_none_match = header_str(req.headers(), header::IF_NONE_MATCH.as_str());
     // M1 IID.4d wrapper: collect routing-relevant request headers BEFORE
     // `read_body_limited` consumes `req`. The resolver uses these to give
     // header-discriminated providers (Telegram via secret-token) the same
@@ -1329,6 +1334,21 @@ async fn serve(
     // exact request the upstream sent.
     let request_headers = collect_forwarded_request_headers(req.headers());
     let query_string = req.uri().query().map(str::to_string);
+
+    // Worker-interop surfaces (A2A). Checked BEFORE webchat classification and
+    // provider routing, and only for a unit whose staged config enables the
+    // feature — otherwise the path is NOT reserved and falls through to normal
+    // routing, exactly as before this shipped.
+    if let Some(route) = crate::interop::a2a::route_for(&path) {
+        match resolve_interop_unit(&state, &activation, host_header.as_deref(), &path).await {
+            Err(response) => return Err(response),
+            Ok(Some(unit)) => {
+                return serve_interop(req, route, &unit, &state, &method, if_none_match.as_deref())
+                    .await;
+            }
+            Ok(None) => {}
+        }
+    }
 
     // Webchat bundle routing: classify the path against the bundle/flow
     // indices BEFORE the generic deployment resolve. A classified request
@@ -1706,6 +1726,123 @@ pub(crate) struct TurnSpec<'a> {
     pub cookie: Option<&'a str>,
     pub user: Option<&'a str>,
     pub payload: &'a Value,
+}
+
+/// One unit's interop configuration, resolved for a request that named an
+/// interop path.
+struct InteropUnit {
+    bundle_id: String,
+    config: crate::interop::config::InteropConfig,
+}
+
+/// Resolve the deployment an interop path belongs to and read its staged
+/// config.
+///
+/// `Ok(None)` means the path is NOT reserved on this deployment — no
+/// deployment resolves, nothing is staged, or the feature is switched off —
+/// and the caller falls through to normal routing. `Err` is a ready `503`:
+/// the store could not answer, so whether the path is reserved is unknown,
+/// and guessing either way is wrong (falling through would run an
+/// unauthenticated turn; answering would invent an agent).
+async fn resolve_interop_unit(
+    state: &ServeState,
+    activation: &Activation,
+    host: Option<&str>,
+    path: &str,
+) -> Result<Option<InteropUnit>, Response<Full<Bytes>>> {
+    let Some((deployment_id, _tenant)) = activation.routing.deployment_routes.resolve(host, path)
+    else {
+        return Ok(None);
+    };
+    let Some(bundle_id) = activation
+        .routing
+        .deployment_routes
+        .bundle_for(deployment_id)
+        .map(|bundle| bundle.as_str().to_string())
+    else {
+        return Ok(None);
+    };
+    let tenant = match activation
+        .routing
+        .deployment_routes
+        .tenant_for(deployment_id)
+    {
+        Some(tenant) => tenant.to_string(),
+        None => return Ok(None),
+    };
+    let secrets = activation.host.secrets_manager();
+    let env = crate::resolve_env(None);
+    let config = crate::ingress_auth::load_unit_config(secrets.as_ref(), &env, &tenant, &bundle_id)
+        .await
+        .map_err(|crate::ingress_auth::ConfigUnavailable(message)| {
+            operator_log::warn(
+                module_path!(),
+                format!("interop config for unit `{bundle_id}` could not be read: {message}"),
+            );
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the ingress credential store is unavailable",
+            )
+        })?;
+    let _ = state;
+    Ok(config
+        .filter(|config| config.a2a)
+        .map(|config| InteropUnit { bundle_id, config }))
+}
+
+/// The public base URL for a served agent card: the boot-resolved one, else
+/// the Cloud Run capture. NEVER the request `Host`, which any caller sets.
+fn interop_base_url(state: &ServeState) -> Option<String> {
+    state
+        .interop
+        .public_base_url
+        .clone()
+        .or_else(|| {
+            state
+                .public_url_capture
+                .as_ref()
+                .and_then(|capture| capture.get().cloned())
+        })
+        .map(|url| url.trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+}
+
+/// Serve one reserved interop path.
+async fn serve_interop(
+    _req: Request<Incoming>,
+    route: crate::interop::a2a::A2aRoute,
+    unit: &InteropUnit,
+    state: &ServeState,
+    method: &hyper::Method,
+    if_none_match: Option<&str>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let base_url = interop_base_url(state);
+    let ctx = crate::interop::a2a::A2aContext {
+        config: &unit.config,
+        base_url: base_url.as_deref(),
+        bundle_id: &unit.bundle_id,
+    };
+    match route {
+        crate::interop::a2a::A2aRoute::Card => {
+            if method != hyper::Method::GET {
+                return Err(error_response(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "the agent card is served on GET",
+                ));
+            }
+            let request = crate::interop::a2a::A2aRequest {
+                authorization: None,
+                version_header: None,
+                query: None,
+                if_none_match,
+                body: &[],
+            };
+            Ok(crate::interop::a2a::card::card_response(&ctx, &request))
+        }
+        crate::interop::a2a::A2aRoute::JsonRpc | crate::interop::a2a::A2aRoute::RestSend => Err(
+            error_response(StatusCode::NOT_IMPLEMENTED, "not implemented"),
+        ),
+    }
 }
 
 /// Phase 0b (worker-interop contract D7): refuse a non-loopback caller of the
@@ -7059,6 +7196,7 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_base_url: None,
             public_url_capture: None,
         })
         .expect("start split server");
@@ -7109,6 +7247,7 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_base_url: None,
             public_url_capture: None,
         })
         .expect("start must succeed even when main bumps into admin range");
@@ -8922,6 +9061,7 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_base_url: None,
             public_url_capture: None,
         })
         .expect("start server");
@@ -8977,6 +9117,7 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_base_url: None,
             public_url_capture: None,
         })
         .expect("start server");

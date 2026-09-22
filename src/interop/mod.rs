@@ -4,6 +4,7 @@
 //! ([`config`]) and the process-wide state the interop surfaces share.
 //! Authentication of the generic ingress lives in [`crate::ingress_auth`].
 
+pub(crate) mod a2a;
 pub(crate) mod config;
 
 /// A test-only replacement for running a turn against a loaded revision, so
@@ -18,16 +19,24 @@ pub(crate) struct InteropState {
     /// `false` only when the host-local `GREENTIC_GENERIC_INGRESS_AUTH=off`
     /// escape hatch is set. Resolved once at boot.
     pub generic_auth_enabled: bool,
+    /// The public base URL resolved at boot
+    /// (`startup_contract::resolve_public_base_url`), when one was known
+    /// there. On Cloud Run it is not: the listener's deferred
+    /// [`crate::revision_serve::PublicUrlCapture`] supplies it instead. Never
+    /// the request's own `Host` header, which any caller controls.
+    pub public_base_url: Option<String>,
     /// See [`TurnOverride`].
     #[cfg(test)]
     pub turn_override: Option<TurnOverride>,
 }
 
 impl InteropState {
-    /// Production state: the escape hatch read from the environment.
-    pub(crate) fn from_env() -> Self {
+    /// Production state: the escape hatch read from the environment, plus the
+    /// boot-resolved public base URL.
+    pub(crate) fn from_env(public_base_url: Option<String>) -> Self {
         Self {
             generic_auth_enabled: crate::ingress_auth::generic_ingress_auth_enabled_from_env(),
+            public_base_url,
             #[cfg(test)]
             turn_override: None,
         }
@@ -39,6 +48,7 @@ impl Default for InteropState {
     fn default() -> Self {
         Self {
             generic_auth_enabled: true,
+            public_base_url: None,
             #[cfg(test)]
             turn_override: None,
         }

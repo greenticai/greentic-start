@@ -1056,6 +1056,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             updates_enabled: !request.no_updates,
             auto_restart_enabled: auto_restart,
             exe_path: Some(own_exe.clone()),
+            public_base_url: boot_configured_url.clone(),
             public_url_capture: cloud_run_capture.clone(),
         })
         .context("starting the revision ingress server")?;

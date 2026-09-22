@@ -358,3 +358,97 @@ async fn a_remote_get_still_reports_method_not_allowed() {
     let response = exchange(&state, false, &get("/", &[])).await;
     assert_eq!(response.status, 405);
 }
+
+// ---------------------------------------------------------------------------
+// A2A: the public agent card
+// ---------------------------------------------------------------------------
+
+/// The card needs an absolute URL, and the listener knows one only from the
+/// boot-resolved `public_base_url` or the Cloud Run capture.
+fn interop_with_base_url(replies: Vec<Activity>) -> crate::interop::InteropState {
+    crate::interop::InteropState {
+        public_base_url: Some("https://gtc-svc.example.run.app/".to_string()),
+        ..interop_replying(replies)
+    }
+}
+
+#[tokio::test]
+async fn the_agent_card_is_served_without_authentication() {
+    let (activation, _) = activation_with(Store::Config(true));
+    let state = state_with(activation, interop_with_base_url(Vec::new()));
+    let response = exchange(&state, false, &get("/.well-known/agent-card.json", &[])).await;
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let card = response.json();
+    assert_eq!(card["name"], "Support Bot");
+    assert_eq!(
+        card["supportedInterfaces"][0]["url"], "https://gtc-svc.example.run.app/a2a",
+        "the trailing slash of the base URL must not double"
+    );
+    assert_eq!(
+        card["securitySchemes"]["bearer"]["httpAuthSecurityScheme"]["scheme"],
+        "bearer"
+    );
+    assert!(
+        response
+            .header("cache-control")
+            .is_some_and(|value| value.contains("max-age"))
+    );
+    let etag = response.header("etag").expect("an ETag").to_string();
+
+    let conditional = exchange(
+        &state,
+        false,
+        &get("/.well-known/agent-card.json", &[("If-None-Match", &etag)]),
+    )
+    .await;
+    assert_eq!(conditional.status, 304);
+}
+
+#[tokio::test]
+async fn the_interop_paths_fall_through_when_a2a_is_off() {
+    // `a2a: false` in the staged config: the card path is NOT reserved, so it
+    // reaches normal routing — where a GET is a 405, not a card.
+    let (activation, _) = activation_with(Store::Config(false));
+    let state = state_with(activation, interop_with_base_url(Vec::new()));
+    let card = exchange(&state, false, &get("/.well-known/agent-card.json", &[])).await;
+    assert_eq!(card.status, 405);
+
+    // Nothing staged at all: same answer, by a different route through the
+    // same decision.
+    let (activation, _) = activation_with(Store::Empty);
+    let state = state_with(activation, interop_with_base_url(Vec::new()));
+    let card = exchange(&state, false, &get("/.well-known/agent-card.json", &[])).await;
+    assert_eq!(card.status, 405);
+}
+
+#[tokio::test]
+async fn an_unreadable_store_refuses_an_interop_path_rather_than_falling_through() {
+    let (activation, _) = activation_with(Store::Down);
+    let state = state_with(activation, interop_with_base_url(Vec::new()));
+    let response = exchange(&state, false, &get("/.well-known/agent-card.json", &[])).await;
+    assert_eq!(response.status, 503);
+}
+
+#[tokio::test]
+async fn the_card_is_refused_when_no_public_base_url_is_known() {
+    let (activation, _) = activation_with(Store::Config(true));
+    let state = state_with(activation, interop_replying(Vec::new()));
+    let response = exchange(&state, false, &get("/.well-known/agent-card.json", &[])).await;
+    assert_eq!(
+        response.status, 503,
+        "a card with no absolute URL is not a card"
+    );
+}
+
+#[tokio::test]
+async fn a_post_to_the_card_path_is_method_not_allowed() {
+    let (activation, _) = activation_with(Store::Config(true));
+    let state = state_with(activation, interop_with_base_url(Vec::new()));
+    let response = exchange(
+        &state,
+        false,
+        &post("/.well-known/agent-card.json", &[AUTH], "{}"),
+    )
+    .await;
+    assert_eq!(response.status, 405);
+}
