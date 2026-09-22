@@ -699,6 +699,7 @@ mod tests {
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
+                triggers: Default::default(),
             }),
         }
     }

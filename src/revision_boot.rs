@@ -310,6 +310,11 @@ pub(crate) async fn activate_runtime_config(
     // ingress matches against these via `match_request_for_revision` once the
     // dispatcher picks a revision.
     let mut scoped_routes: Vec<HttpRouteDescriptor> = Vec::new();
+    let mut trigger_entries: Vec<crate::triggers::table::LoadedTrigger> = Vec::new();
+    let mut trigger_prefixes: std::collections::HashMap<
+        greentic_deploy_spec::DeploymentId,
+        Vec<String>,
+    > = std::collections::HashMap::new();
     // Revision-scoped static routes, parallel to `scoped_routes`. Accumulated
     // as a `StaticRoutePlan` so validation results (blocking_failures, warnings)
     // propagate to the caller the same way `discover_from_bundle` does on the
@@ -391,6 +396,15 @@ pub(crate) async fn activate_runtime_config(
             route.pack_non_secret = non_secret_by_pack_id.get(&route.pack_id).cloned();
         }
         scoped_routes.extend(revision_routes);
+        // Flow triggers (`assets/triggers.json`). Loaded per revision like the
+        // routes above; a broken declaration logs and contributes nothing
+        // rather than failing the activation.
+        trigger_entries.extend(crate::triggers::load_revision_triggers(
+            &pack_paths,
+            &scope,
+            &meta.tenant,
+        ));
+        trigger_prefixes.insert(scope.deployment_id, meta.path_prefixes.clone());
         static_plan.merge(discover_revision_static_routes(
             &pack_paths,
             &scope,
@@ -534,6 +548,7 @@ pub(crate) async fn activate_runtime_config(
         static_routes: ActiveRouteTable::from_plan(&static_plan),
         bundle_index,
         flow_index,
+        triggers: crate::triggers::TriggerTable::build(trigger_entries, &trigger_prefixes),
     };
 
     // Commit only now that every revision loaded: `retained` holds exactly the
@@ -577,6 +592,7 @@ pub(crate) fn reactivate_routing_only(
         http_routes: prev.http_routes.clone(),
         static_routes: prev.static_routes.clone(),
         flow_index: prev.flow_index.clone(),
+        triggers: prev.triggers.clone(),
         deployment_routes,
         bundle_index,
         endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),

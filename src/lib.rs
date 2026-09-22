@@ -124,6 +124,7 @@ mod subscriptions_universal;
 pub mod supervisor;
 #[cfg(test)]
 mod test_fixtures;
+mod triggers;
 // `pub` (doc-hidden) so `tests/threshold_watcher.rs` can drive `poll_once`
 // and the config/state/eval types directly, the same way `ws_test_support`
 // and `perf_harness` are exposed for their own integration tests.
@@ -3502,6 +3503,7 @@ mod tests {
             static_routes: crate::static_routes::ActiveRouteTable::from_plan(&plan),
             bundle_index,
             flow_index: crate::webchat_routing::FlowIndex::default(),
+            triggers: Default::default(),
         }
     }
 

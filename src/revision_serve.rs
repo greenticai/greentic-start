@@ -617,6 +617,7 @@ impl RevisionServer {
             .flatten();
         let poll_state = Arc::clone(&state);
         let stream_state = Arc::clone(&state);
+        let trigger_state = Arc::clone(&state);
         // Wakes the poll loop out of its interval wait when a plan is published.
         let update_wake = Arc::new(Notify::new());
         let poll_wake = Arc::clone(&update_wake);
@@ -684,6 +685,20 @@ impl RevisionServer {
                     let update_stream_task = update_poll_root.map(|root| {
                         tokio::spawn(run_update_stream_loop(stream_state, root, update_wake))
                     });
+                    // Flow triggers: resolve the shared store once, then run
+                    // the cron loop for the server's life. It reads the live
+                    // activation on every tick, so reloads need no restart.
+                    crate::triggers::install_store(crate::triggers::store::resolve().await);
+                    let trigger_task = tokio::spawn(crate::triggers::scheduler::run(
+                        move || {
+                            let activation = trigger_state.current();
+                            (
+                                Arc::clone(&activation.host),
+                                Arc::clone(&activation.routing),
+                            )
+                        },
+                        crate::triggers::store(),
+                    ));
                     let mut shutdown = rx;
                     loop {
                         tokio::select! {
@@ -705,6 +720,7 @@ impl RevisionServer {
                                 if let Some(task) = &update_stream_task {
                                     task.abort();
                                 }
+                                trigger_task.abort();
                                 break;
                             }
                             // Main listener: the loopback gate + caller-asserted
@@ -1387,6 +1403,31 @@ async fn serve(
         deployment_id = resolved.0;
         tenant = resolved.1;
         effective_path = path.clone();
+    }
+
+    // Flow triggers (`<prefix>/trigger/<id>`, contract `greentic.triggers.v1`).
+    // Matched BEFORE the generic body read on purpose: a trigger carries its
+    // own body limit (up to 5 MiB, above this path's 1 MiB), must verify the
+    // raw bytes, and never goes through the session-hint and caller-identity
+    // steps below — it is not a conversation turn. A webchat path is never a
+    // trigger path, so the classifier branch cannot reach here with one.
+    if webchat_target.is_none()
+        && let Some(trigger_id) = activation
+            .routing
+            .triggers
+            .webhook_trigger_for(deployment_id, &effective_path)
+            .map(str::to_string)
+    {
+        return Ok(crate::triggers::webhook::handle(
+            req,
+            Arc::clone(&activation.host),
+            Arc::clone(&activation.routing),
+            crate::triggers::store(),
+            deployment_id,
+            &tenant,
+            &trigger_id,
+        )
+        .await);
     }
 
     let body_bytes = read_body_limited(req).await.map_err(|_| {
@@ -4259,6 +4300,7 @@ fn try_probe_response(path: &str, state: &ServeState) -> Option<Response<Full<By
             "revisions_active": revisions_active,
             "restart_required": restart,
             "telemetry": crate::otlp_status::snapshot_json(),
+            "triggers": activation.routing.triggers.status_json(),
         });
         return Some(json_response(StatusCode::OK, body.to_string().into_bytes()));
     }
@@ -7226,6 +7268,7 @@ mod tests {
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
+                triggers: Default::default(),
             }),
         });
         let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -8290,6 +8333,7 @@ mod tests {
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
+                triggers: Default::default(),
             }),
         }
     }
@@ -8581,6 +8625,7 @@ mod tests {
                 static_routes: crate::static_routes::ActiveRouteTable::from_plan(&plan),
                 bundle_index,
                 flow_index: crate::webchat_routing::FlowIndex::default(),
+                triggers: Default::default(),
             }),
         }
     }
@@ -9939,6 +9984,7 @@ mod tests {
             http_routes: live.routing.http_routes.clone(),
             static_routes: live.routing.static_routes.clone(),
             flow_index: live.routing.flow_index.clone(),
+            triggers: live.routing.triggers.clone(),
             // …and rebuilds the env-derived half.
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
@@ -9991,6 +10037,7 @@ mod tests {
             http_routes: live.routing.http_routes.clone(),
             static_routes: live.routing.static_routes.clone(),
             flow_index: live.routing.flow_index.clone(),
+            triggers: live.routing.triggers.clone(),
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: std::sync::Arc::default(),
@@ -10559,6 +10606,7 @@ mod tests {
             static_routes: crate::static_routes::ActiveRouteTable::default(),
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
+            triggers: Default::default(),
         });
         let activation = Activation {
             host: base.host,
@@ -11581,6 +11629,7 @@ mod binary_update_tests {
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
+                triggers: Default::default(),
             }),
         }
     }
@@ -14354,6 +14403,7 @@ mod binary_update_tests {
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
+                triggers: Default::default(),
             }),
         }
     }
