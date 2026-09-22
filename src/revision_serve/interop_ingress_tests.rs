@@ -29,20 +29,25 @@ const TOKEN: &str = "gtw_test-token";
 struct TestSecrets {
     entries: HashMap<String, Vec<u8>>,
     fail: bool,
+    /// Every `read` counted, so a test can assert the config cache actually
+    /// removed the per-request store read.
+    reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl TestSecrets {
-    fn with(entries: HashMap<String, Vec<u8>>) -> Self {
+    fn with(entries: HashMap<String, Vec<u8>>, reads: Arc<std::sync::atomic::AtomicUsize>) -> Self {
         Self {
             entries,
             fail: false,
+            reads,
         }
     }
 
-    fn failing() -> Self {
+    fn failing(reads: Arc<std::sync::atomic::AtomicUsize>) -> Self {
         Self {
             entries: HashMap::new(),
             fail: true,
+            reads,
         }
     }
 }
@@ -50,6 +55,8 @@ impl TestSecrets {
 #[async_trait::async_trait]
 impl greentic_secrets_lib::SecretsManager for TestSecrets {
     async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.fail {
             return Err(greentic_secrets_lib::SecretError::Backend(
                 "store unreachable".into(),
@@ -105,14 +112,28 @@ enum Store {
 }
 
 fn activation_with(store: Store) -> (Activation, DeploymentId) {
+    let (activation, deployment_id, _reads) = activation_counting(store);
+    (activation, deployment_id)
+}
+
+/// The same activation, plus the counter of store reads its secrets manager
+/// has served.
+fn activation_counting(
+    store: Store,
+) -> (
+    Activation,
+    DeploymentId,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let secrets: greentic_runner_host::secrets::DynSecretsManager = match store {
         Store::Config(a2a) => {
             let mut entries = HashMap::new();
             entries.insert(config_uri(), staged_config(a2a));
-            Arc::new(TestSecrets::with(entries))
+            Arc::new(TestSecrets::with(entries, Arc::clone(&reads)))
         }
-        Store::Empty => Arc::new(TestSecrets::with(HashMap::new())),
-        Store::Down => Arc::new(TestSecrets::failing()),
+        Store::Empty => Arc::new(TestSecrets::with(HashMap::new(), Arc::clone(&reads))),
+        Store::Down => Arc::new(TestSecrets::failing(Arc::clone(&reads))),
     };
     let host = Arc::new(
         greentic_runner_host::HostBuilder::new()
@@ -164,7 +185,7 @@ fn activation_with(store: Store) -> (Activation, DeploymentId) {
             triggers: Default::default(),
         }),
     };
-    (activation, deployment_id)
+    (activation, deployment_id, reads)
 }
 
 /// A `ServeState` over `activation`, answering every turn with `replies`.
@@ -575,4 +596,45 @@ async fn a_get_on_the_json_rpc_path_is_method_not_allowed() {
     let state = state_with(activation, interop_with_base_url(Vec::new()));
     let response = exchange(&state, false, &get("/a2a", &[AUTH])).await;
     assert_eq!(response.status, 405);
+}
+
+// ---------------------------------------------------------------------------
+// The staged-config cache
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_units_config_is_read_once_for_a_burst_of_requests() {
+    let (activation, _, reads) = activation_counting(Store::Config(true));
+    let state = state_with(
+        activation,
+        interop_with_base_url(vec![Activity::text("hi")]),
+    );
+    for _ in 0..3 {
+        let response = exchange(&state, false, &post("/", &[AUTH], r#"{"text":"hello"}"#)).await;
+        assert_eq!(response.status, 200, "body: {}", response.body);
+    }
+    // …and a different surface on the same unit shares the entry.
+    let card = exchange(&state, false, &get("/.well-known/agent-card.json", &[])).await;
+    assert_eq!(card.status, 200);
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the staged config must be read from the store once, not per request"
+    );
+}
+
+/// A read FAILURE is never cached: holding a 503 for the TTL after the store
+/// recovered would turn one blip into a window of refusals.
+#[tokio::test]
+async fn an_unreadable_store_is_retried_on_the_next_request() {
+    let (activation, _, reads) = activation_counting(Store::Down);
+    let state = state_with(
+        activation,
+        interop_with_base_url(vec![Activity::text("hi")]),
+    );
+    for _ in 0..2 {
+        let response = exchange(&state, false, &post("/", &[AUTH], r#"{"text":"hello"}"#)).await;
+        assert_eq!(response.status, 503);
+    }
+    assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 2);
 }

@@ -1742,6 +1742,34 @@ pub(crate) struct TurnSpec<'a> {
     pub payload: &'a Value,
 }
 
+/// Read a unit's staged interop config, through the listener's short TTL
+/// cache.
+///
+/// Both gates need the config before they can decide anything, so without the
+/// cache every non-loopback POST paid a secrets read. Only the two SUCCESSFUL
+/// outcomes are cached — see [`crate::interop::config_cache`]; a read failure
+/// is retried on the next request rather than holding a `503` for a window
+/// after the store recovered.
+async fn load_unit_config_cached(
+    state: &ServeState,
+    activation: &Activation,
+    tenant: &str,
+    bundle_id: &str,
+) -> Result<Option<crate::interop::config::InteropConfig>, crate::ingress_auth::ConfigUnavailable> {
+    if let Some(cached) = state.interop.configs.get(tenant, bundle_id) {
+        return Ok(cached);
+    }
+    let secrets = activation.host.secrets_manager();
+    let env = crate::resolve_env(None);
+    let config =
+        crate::ingress_auth::load_unit_config(secrets.as_ref(), &env, tenant, bundle_id).await?;
+    state
+        .interop
+        .configs
+        .store(tenant, bundle_id, config.clone());
+    Ok(config)
+}
+
 /// One unit's interop configuration, resolved for a request that named an
 /// interop path.
 struct InteropUnit {
@@ -1786,9 +1814,7 @@ async fn resolve_interop_unit(
         Some(tenant) => tenant.to_string(),
         None => return Ok(None),
     };
-    let secrets = activation.host.secrets_manager();
-    let env = crate::resolve_env(None);
-    let config = crate::ingress_auth::load_unit_config(secrets.as_ref(), &env, &tenant, &bundle_id)
+    let config = load_unit_config_cached(state, activation, &tenant, &bundle_id)
         .await
         .map_err(|crate::ingress_auth::ConfigUnavailable(message)| {
             operator_log::warn(
@@ -1800,7 +1826,6 @@ async fn resolve_interop_unit(
                 "the ingress credential store is unavailable",
             )
         })?;
-    let _ = state;
     Ok(config
         .filter(|config| config.a2a)
         .map(|config| InteropUnit {
@@ -1971,10 +1996,7 @@ async fn gate_generic_ingress(
     if peer_is_loopback || !gate_enabled {
         return Ok(());
     }
-    let secrets = activation.host.secrets_manager();
-    let env = crate::resolve_env(None);
-    let config =
-        crate::ingress_auth::load_unit_config(secrets.as_ref(), &env, tenant, bundle_id).await;
+    let config = load_unit_config_cached(state, activation, tenant, bundle_id).await;
     match crate::ingress_auth::decide_generic(
         peer_is_loopback,
         gate_enabled,

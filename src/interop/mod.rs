@@ -6,6 +6,7 @@
 
 pub(crate) mod a2a;
 pub(crate) mod config;
+pub(crate) mod config_cache;
 pub(crate) mod limits;
 pub(crate) mod reply;
 
@@ -27,6 +28,9 @@ pub(crate) struct InteropState {
     /// [`crate::revision_serve::PublicUrlCapture`] supplies it instead. Never
     /// the request's own `Host` header, which any caller controls.
     pub public_base_url: Option<String>,
+    /// A short TTL over each unit's staged config, so an authenticated
+    /// surface does not read the secrets store on every request.
+    pub configs: config_cache::UnitConfigCache,
     /// Per-credential token buckets, shared by every interop surface so one
     /// caller's budget is the same whichever binding it uses.
     pub limiter: limits::RateLimiter,
@@ -44,6 +48,7 @@ impl InteropState {
         Self {
             generic_auth_enabled: crate::ingress_auth::generic_ingress_auth_enabled_from_env(),
             public_base_url,
+            configs: config_cache::UnitConfigCache::default(),
             limiter: limits::RateLimiter::default(),
             turns: limits::TurnGate::new(limits::max_concurrent_turns(
                 std::env::var(limits::MAX_CONCURRENT_TURNS_ENV)
@@ -62,6 +67,7 @@ impl Default for InteropState {
         Self {
             generic_auth_enabled: true,
             public_base_url: None,
+            configs: config_cache::UnitConfigCache::default(),
             limiter: limits::RateLimiter::default(),
             turns: limits::TurnGate::new(limits::DEFAULT_MAX_CONCURRENT_TURNS),
             #[cfg(test)]
