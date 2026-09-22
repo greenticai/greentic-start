@@ -301,6 +301,10 @@ pub struct RevisionIngressRouting {
     /// Webchat flow index: bundle_id -> set of flow ids. Built from pack
     /// manifests read during the activation loop.
     pub(crate) flow_index: crate::webchat_routing::FlowIndex,
+    /// Flow triggers (`greentic.triggers.v1`) declared by the loaded
+    /// revisions' packs. Pack-derived, so it travels with the activation and
+    /// is carried over unchanged by a routing-only reload.
+    pub(crate) triggers: crate::triggers::TriggerTable,
 }
 
 /// Strip a trailing `:port` from a host header value. IPv6 literals are bracketed

@@ -1,0 +1,21 @@
+{
+  "schema": "greentic.triggers.v1",
+  "pack_id": "pack.acme.orders",
+  "triggers": [
+    {
+      "trigger_id": "order_created",
+      "kind": "webhook",
+      "flow_id": "intake",
+      "entry_node": "classify_order",
+      "session": { "mode": "per_key", "key": "body.order.customer_id" },
+      "source": { "extension_id": "greentic.webhook", "node_id": "orders_hook" },
+      "webhook": {
+        "methods": ["POST"],
+        "verify": { "scheme": "bearer", "header": "Authorization", "secret_ref": "orders/ingest_key" },
+        "idempotency": { "key": "header:x-request-id", "ttl_s": 86400 },
+        "max_body_bytes": 65536,
+        "allowed_sources": ["203.0.113.0/24"]
+      }
+    }
+  ]
+}

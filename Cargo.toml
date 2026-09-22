@@ -38,6 +38,10 @@ async-trait = "0.1"
 backhand = "0.25"
 base64 = "0.22"
 chrono = "0.4"
+# Flow triggers (greentic.triggers.v1): cron evaluated in the declared IANA
+# timezone. `cron` matches the runner's own timer dialect (adapt_timer).
+chrono-tz = "0.10"
+cron = "0.16"
 dashmap = "6"
 flate2 = "1"
 futures-util = "0.3"
@@ -87,6 +91,9 @@ rustls-pemfile = "2"
 semver = "1"
 serde_cbor = "0.11"
 serde_json = "1.0"
+# hmac-sha1 webhook verification (greentic.triggers.v1 §6.3.3); same digest
+# 0.11 line as sha2, so it composes with `hmac` 0.13.
+sha1 = "0.11"
 sha2 = "0.11"
 subtle = "2"
 sys-locale = "0.3"
