@@ -51,9 +51,11 @@ mod http_ingress;
 mod http_routes;
 mod identify_payload;
 mod ingress;
+mod ingress_auth;
 mod ingress_dispatch;
 #[doc(hidden)]
 pub mod ingress_types;
+mod interop;
 mod llm;
 #[doc(hidden)]
 pub mod messaging_app;

@@ -289,6 +289,9 @@ struct ServeState {
     /// via [`PublicUrlCapture::offer`], waking the deferred registration
     /// task in `lib.rs`. `None` = not armed.
     public_url_capture: Option<Arc<PublicUrlCapture>>,
+    /// Worker-interop state: the Phase 0b escape hatch, and (in tests) the
+    /// turn override. Shared by every connection of this listener.
+    interop: crate::interop::InteropState,
     /// Test-only: override the activity source used by the WS pump. When
     /// `Some`, `handle_websocket_upgrade` substitutes this source instead of
     /// constructing a `RevisionActivitySource` that calls
@@ -590,6 +593,7 @@ impl RevisionServer {
             session_manager,
             notifier,
             public_url_capture: config.public_url_capture,
+            interop: crate::interop::InteropState::from_env(),
             #[cfg(test)]
             activity_source_override: None,
         });
@@ -1310,6 +1314,9 @@ async fn serve(
     let session_header = header_str(req.headers(), "x-greentic-session");
     let endpoint_header = header_str(req.headers(), "x-greentic-messaging-endpoint-id");
     let flow_header = header_str(req.headers(), "x-greentic-flow");
+    // Phase 0b: read before the body consumes `req`. Only the generic-JSON
+    // branch reads it; provider routes carry their own verification.
+    let authorization_header = header_str(req.headers(), header::AUTHORIZATION.as_str());
     // M1 IID.4d wrapper: collect routing-relevant request headers BEFORE
     // `read_body_limited` consumes `req`. The resolver uses these to give
     // header-discriminated providers (Telegram via secret-token) the same
@@ -1621,6 +1628,21 @@ async fn serve(
         Admission::Serve => {}
     }
 
+    // Phase 0b: the generic JSON branch runs a flow turn, so a non-loopback
+    // caller must present the unit's bearer credential. Checked AFTER
+    // dispatch because the credential is staged per UNIT and the unit is the
+    // dispatched revision's bundle; dispatch itself writes no pin for a
+    // non-loopback caller (`defer_pin`), so nothing is committed before this.
+    gate_generic_ingress(
+        &state,
+        &activation,
+        &tenant,
+        scope.bundle_id.as_str(),
+        peer_is_loopback,
+        authorization_header.as_deref(),
+    )
+    .await?;
+
     // Generic-JSON branch: NOW require the body to be valid JSON. Provider
     // routes already short-circuited above with the raw bytes.
     let payload: Value = if body_bytes.is_empty() {
@@ -1686,6 +1708,68 @@ pub(crate) struct TurnSpec<'a> {
     pub payload: &'a Value,
 }
 
+/// Phase 0b (worker-interop contract D7): refuse a non-loopback caller of the
+/// generic JSON ingress that presents no valid bearer for the dispatched unit.
+///
+/// Fails CLOSED. No config staged, no credential in it, or a wrong/expired
+/// token is `401`; a secrets backend that cannot answer is `503`, never an
+/// allow — the same distinction [`read_provider_signing_key`] draws, and for
+/// the same reason: a degraded store must not become an authentication bypass.
+/// Loopback-trusted peers keep their existing trust, and the host-local
+/// `GREENTIC_GENERIC_INGRESS_AUTH=off` escape hatch skips the read entirely.
+async fn gate_generic_ingress(
+    state: &ServeState,
+    activation: &Activation,
+    tenant: &str,
+    bundle_id: &str,
+    peer_is_loopback: bool,
+    authorization: Option<&str>,
+) -> Result<(), Response<Full<Bytes>>> {
+    let gate_enabled = state.interop.generic_auth_enabled;
+    if peer_is_loopback || !gate_enabled {
+        return Ok(());
+    }
+    let secrets = activation.host.secrets_manager();
+    let env = crate::resolve_env(None);
+    let config =
+        crate::ingress_auth::load_unit_config(secrets.as_ref(), &env, tenant, bundle_id).await;
+    match crate::ingress_auth::decide_generic(
+        peer_is_loopback,
+        gate_enabled,
+        &config,
+        authorization,
+        crate::ingress_auth::now_ms(),
+    ) {
+        crate::ingress_auth::GenericGate::Allow => Ok(()),
+        crate::ingress_auth::GenericGate::Unauthorized => {
+            let mut response = error_response(
+                StatusCode::UNAUTHORIZED,
+                "a bearer credential is required for this ingress",
+            );
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Bearer"),
+            );
+            Err(response)
+        }
+        crate::ingress_auth::GenericGate::Unavailable => {
+            if let Err(crate::ingress_auth::ConfigUnavailable(message)) = &config {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "generic ingress credential for unit `{bundle_id}` could not be read: \
+                         {message}"
+                    ),
+                );
+            }
+            Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the ingress credential store is unavailable",
+            ))
+        }
+    }
+}
+
 /// Ask the dispatcher which revision serves this turn. `label` prefixes the
 /// operator-log line so each ingress keeps its own diagnostic wording.
 async fn dispatch_turn(
@@ -1725,6 +1809,11 @@ async fn execute_turn(
 ) -> Result<Vec<Activity>, Response<Full<Bytes>>> {
     let deployment_id = scope.deployment_id;
     let revision_id = scope.revision_id;
+    // Listener-level tests drive the whole ingress without a WASM pack.
+    #[cfg(test)]
+    if let Some(run) = _state.interop.turn_override.as_ref() {
+        return Ok(run(&activity));
+    }
     activation
         .host
         .handle_activity_for_revision(
@@ -8426,6 +8515,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         }
     }
@@ -10253,6 +10343,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -10360,6 +10451,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -10461,6 +10553,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -10535,6 +10628,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -10814,6 +10908,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         })
     }
@@ -11852,6 +11947,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -11891,6 +11987,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
@@ -11925,6 +12022,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
@@ -11955,6 +12053,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -12174,6 +12273,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -12222,6 +12322,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -12280,6 +12381,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         state.mark_restart_required();
@@ -12317,6 +12419,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         state.mark_restart_required();
@@ -14522,6 +14625,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::clone(&notifier),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: Some(
                 test_source.clone() as Arc<dyn crate::websocket::pump::ActivitySource>
             ),
@@ -14798,3 +14902,7 @@ mod public_url_capture_tests {
         assert_eq!(url, "https://race.run.app");
     }
 }
+
+#[cfg(test)]
+#[path = "revision_serve/interop_ingress_tests.rs"]
+mod interop_ingress_tests;
