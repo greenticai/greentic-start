@@ -1322,6 +1322,7 @@ async fn serve(
     // branch reads it; provider routes carry their own verification.
     let authorization_header = header_str(req.headers(), header::AUTHORIZATION.as_str());
     let if_none_match = header_str(req.headers(), header::IF_NONE_MATCH.as_str());
+    let a2a_version_header = header_str(req.headers(), crate::interop::a2a::VERSION_HEADER);
     // M1 IID.4d wrapper: collect routing-relevant request headers BEFORE
     // `read_body_limited` consumes `req`. The resolver uses these to give
     // header-discriminated providers (Telegram via secret-token) the same
@@ -1343,8 +1344,21 @@ async fn serve(
         match resolve_interop_unit(&state, &activation, host_header.as_deref(), &path).await {
             Err(response) => return Err(response),
             Ok(Some(unit)) => {
-                return serve_interop(req, route, &unit, &state, &method, if_none_match.as_deref())
-                    .await;
+                return serve_interop(
+                    req,
+                    route,
+                    &unit,
+                    &state,
+                    &activation,
+                    &method,
+                    InteropRequestHeaders {
+                        authorization: authorization_header.as_deref(),
+                        version: a2a_version_header.as_deref(),
+                        query: query_string.as_deref(),
+                        if_none_match: if_none_match.as_deref(),
+                    },
+                )
+                .await;
             }
             Ok(None) => {}
         }
@@ -1731,6 +1745,8 @@ pub(crate) struct TurnSpec<'a> {
 /// One unit's interop configuration, resolved for a request that named an
 /// interop path.
 struct InteropUnit {
+    deployment_id: DeploymentId,
+    tenant: String,
     bundle_id: String,
     config: crate::interop::config::InteropConfig,
 }
@@ -1787,7 +1803,12 @@ async fn resolve_interop_unit(
     let _ = state;
     Ok(config
         .filter(|config| config.a2a)
-        .map(|config| InteropUnit { bundle_id, config }))
+        .map(|config| InteropUnit {
+            deployment_id,
+            tenant,
+            bundle_id,
+            config,
+        }))
 }
 
 /// The public base URL for a served agent card: the boot-resolved one, else
@@ -1807,42 +1828,126 @@ fn interop_base_url(state: &ServeState) -> Option<String> {
         .filter(|url| !url.is_empty())
 }
 
+/// Runs one interop turn against the dispatched revision. Holds the
+/// activation the request pinned, so a concurrent reload cannot move the turn
+/// onto a different host mid-request.
+struct IngressTurnRunner<'a> {
+    state: &'a ServeState,
+    activation: &'a Activation,
+    tenant: &'a str,
+    deployment_id: DeploymentId,
+}
+
+#[async_trait::async_trait]
+impl crate::interop::a2a::rpc::TurnRunner for IngressTurnRunner<'_> {
+    async fn run(
+        &self,
+        session_hint: &str,
+        user: &str,
+        payload: &Value,
+    ) -> Result<Vec<Activity>, crate::interop::a2a::rpc::TurnFailure> {
+        run_turn(
+            self.state,
+            self.activation,
+            TurnSpec {
+                tenant: self.tenant,
+                deployment_id: self.deployment_id,
+                session_hint: Some(session_hint),
+                // The caller authenticated before this runs, so the hint is
+                // as trusted as a loopback caller's and pins inline.
+                defer_pin: false,
+                cookie: None,
+                user: Some(user),
+                payload,
+            },
+            "a2a dispatch",
+            "a2a execution",
+        )
+        .await
+        // The detail is already in the operator log; the caller sees a
+        // protocol-level internal error, never an ingress response body.
+        .map_err(|_| crate::interop::a2a::rpc::TurnFailure)
+    }
+}
+
 /// Serve one reserved interop path.
 async fn serve_interop(
-    _req: Request<Incoming>,
+    req: Request<Incoming>,
     route: crate::interop::a2a::A2aRoute,
     unit: &InteropUnit,
     state: &ServeState,
+    activation: &Activation,
     method: &hyper::Method,
-    if_none_match: Option<&str>,
+    headers: InteropRequestHeaders<'_>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
     let base_url = interop_base_url(state);
     let ctx = crate::interop::a2a::A2aContext {
         config: &unit.config,
         base_url: base_url.as_deref(),
+        tenant: &unit.tenant,
         bundle_id: &unit.bundle_id,
+        deployment_id: unit.deployment_id,
+        limiter: &state.interop.limiter,
+        turns: &state.interop.turns,
+        now_ms: crate::ingress_auth::now_ms(),
     };
-    match route {
-        crate::interop::a2a::A2aRoute::Card => {
-            if method != hyper::Method::GET {
-                return Err(error_response(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "the agent card is served on GET",
-                ));
-            }
-            let request = crate::interop::a2a::A2aRequest {
-                authorization: None,
-                version_header: None,
-                query: None,
-                if_none_match,
-                body: &[],
-            };
-            Ok(crate::interop::a2a::card::card_response(&ctx, &request))
+    if route == crate::interop::a2a::A2aRoute::Card {
+        if method != hyper::Method::GET {
+            return Err(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "the agent card is served on GET",
+            ));
         }
-        crate::interop::a2a::A2aRoute::JsonRpc | crate::interop::a2a::A2aRoute::RestSend => Err(
-            error_response(StatusCode::NOT_IMPLEMENTED, "not implemented"),
-        ),
+        let request = crate::interop::a2a::A2aRequest {
+            authorization: None,
+            version_header: None,
+            query: None,
+            if_none_match: headers.if_none_match,
+            body: &[],
+        };
+        return Ok(crate::interop::a2a::card::card_response(&ctx, &request));
     }
+
+    if method != hyper::Method::POST {
+        return Err(error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "this A2A endpoint requires POST",
+        ));
+    }
+    let body_bytes = read_body_limited(req).await.map_err(|_| {
+        error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds the size limit",
+        )
+    })?;
+    let request = crate::interop::a2a::A2aRequest {
+        authorization: headers.authorization,
+        version_header: headers.version,
+        query: headers.query,
+        if_none_match: None,
+        body: &body_bytes,
+    };
+    let runner = IngressTurnRunner {
+        state,
+        activation,
+        tenant: &unit.tenant,
+        deployment_id: unit.deployment_id,
+    };
+    Ok(match route {
+        crate::interop::a2a::A2aRoute::JsonRpc => {
+            crate::interop::a2a::rpc::handle_jsonrpc(&ctx, &request, &runner).await
+        }
+        _ => crate::interop::a2a::rpc::handle_rest_send(&ctx, &request, &runner).await,
+    })
+}
+
+/// The request facts the interop surfaces read, gathered before the body is
+/// consumed.
+struct InteropRequestHeaders<'a> {
+    authorization: Option<&'a str>,
+    version: Option<&'a str>,
+    query: Option<&'a str>,
+    if_none_match: Option<&'a str>,
 }
 
 /// Phase 0b (worker-interop contract D7): refuse a non-loopback caller of the
@@ -5641,7 +5746,7 @@ async fn try_notify_webchat_activity(
 /// (channel/session/to) from the ingress. Otherwise treat the payload as
 /// the reply text or wholesale `metadata` carrier and start from a
 /// clone of the ingress envelope.
-fn build_reply_envelopes(
+pub(crate) fn build_reply_envelopes(
     ingress: &ChannelMessageEnvelope,
     reply: &Activity,
     pack_id: &str,

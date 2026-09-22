@@ -6,8 +6,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::*;
+use greentic_deploy_spec::ids::DeploymentId;
+
 use crate::interop::a2a::{A2aContext, A2aRequest};
 use crate::interop::config::{AgentMeta, AgentSkillMeta, Credential, InteropConfig};
+use crate::interop::limits::{RateLimiter, TurnGate};
 
 const TOKEN: &str = "gtw_test-token";
 
@@ -25,18 +28,31 @@ fn config() -> InteropConfig {
 
 struct Fixture {
     config: InteropConfig,
+    limiter: RateLimiter,
+    turns: TurnGate,
+    deployment_id: DeploymentId,
 }
 
 impl Fixture {
     fn new(config: InteropConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            limiter: RateLimiter::default(),
+            turns: TurnGate::new(4),
+            deployment_id: DeploymentId::new(),
+        }
     }
 
     fn ctx(&self) -> A2aContext<'_> {
         A2aContext {
             config: &self.config,
             base_url: Some("https://w.example"),
+            tenant: "default",
             bundle_id: "support-bot",
+            deployment_id: self.deployment_id,
+            limiter: &self.limiter,
+            turns: &self.turns,
+            now_ms: 0,
         }
     }
 }

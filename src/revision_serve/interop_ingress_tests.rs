@@ -452,3 +452,127 @@ async fn a_post_to_the_card_path_is_method_not_allowed() {
     .await;
     assert_eq!(response.status, 405);
 }
+
+// ---------------------------------------------------------------------------
+// A2A: the request bindings
+// ---------------------------------------------------------------------------
+
+fn send_message_body(context_id: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "SendMessage",
+        "params": {"message": {
+            "messageId": "m-in",
+            "contextId": context_id,
+            "role": "ROLE_USER",
+            "parts": [{"text": "how do I reset my password?"}]
+        }}
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_send_message_round_trip_returns_the_turns_reply() {
+    let (activation, _) = activation_with(Store::Config(true));
+    let state = state_with(
+        activation,
+        interop_with_base_url(vec![Activity::custom(
+            "response",
+            json!({"reply": "Use the reset link."}),
+        )]),
+    );
+    let response = exchange(
+        &state,
+        false,
+        &post("/a2a", &[AUTH], &send_message_body("ctx-1")),
+    )
+    .await;
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let value = response.json();
+    assert_eq!(value["id"], 7);
+    assert_eq!(value["result"]["message"]["role"], "ROLE_AGENT");
+    assert_eq!(value["result"]["message"]["contextId"], "ctx-1");
+    assert_eq!(
+        value["result"]["message"]["parts"],
+        json!([{"text": "Use the reset link."}])
+    );
+    assert_eq!(response.header("a2a-version"), Some("1.0"));
+    assert!(
+        response.header("access-control-allow-origin").is_none(),
+        "/a2a must never be CORS-enabled"
+    );
+}
+
+#[tokio::test]
+async fn the_rest_binding_runs_the_same_turn() {
+    let (activation, _) = activation_with(Store::Config(true));
+    let state = state_with(
+        activation,
+        interop_with_base_url(vec![Activity::text("hello there")]),
+    );
+    let body = json!({"message": {
+        "messageId": "m-in", "contextId": "ctx-2", "role": "ROLE_USER",
+        "parts": [{"text": "hi"}]
+    }})
+    .to_string();
+    let response = exchange(&state, false, &post("/a2a/message:send", &[AUTH], &body)).await;
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    assert_eq!(
+        response.json()["message"]["parts"],
+        json!([{"text": "hello there"}])
+    );
+}
+
+#[tokio::test]
+async fn a_send_message_without_a_bearer_is_refused_and_runs_nothing() {
+    let (activation, _) = activation_with(Store::Config(true));
+    let state = state_with(
+        activation,
+        interop_with_base_url(vec![Activity::text("never sent")]),
+    );
+    let response = exchange(&state, false, &post("/a2a", &[], &send_message_body("c"))).await;
+    assert_eq!(response.status, 401);
+    assert!(!response.body.contains("never sent"));
+}
+
+/// Loopback trust is a property of the GENERIC ingress, not of A2A: the
+/// session namespace is derived from the credential, so an anonymous caller
+/// has no conversation to be in.
+#[tokio::test]
+async fn a2a_requires_a_bearer_even_from_a_loopback_peer() {
+    let (activation, _) = activation_with(Store::Config(true));
+    let state = state_with(
+        activation,
+        interop_with_base_url(vec![Activity::text("never sent")]),
+    );
+    let response = exchange(&state, true, &post("/a2a", &[], &send_message_body("c"))).await;
+    assert_eq!(response.status, 401);
+}
+
+#[tokio::test]
+async fn the_a2a_paths_fall_through_when_a2a_is_off() {
+    let (activation, _) = activation_with(Store::Config(false));
+    let state = state_with(activation, interop_with_base_url(vec![Activity::text("x")]));
+    // Falls through to the generic branch, which answers the JSON-RPC body as
+    // an ordinary turn once the Phase 0b bearer check passes.
+    let response = exchange(
+        &state,
+        false,
+        &post("/a2a", &[AUTH], &send_message_body("c")),
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    assert!(
+        response.json().get("result").is_none(),
+        "a JSON-RPC result means the A2A binding answered a unit that has it off"
+    );
+}
+
+#[tokio::test]
+async fn a_get_on_the_json_rpc_path_is_method_not_allowed() {
+    let (activation, _) = activation_with(Store::Config(true));
+    let state = state_with(activation, interop_with_base_url(Vec::new()));
+    let response = exchange(&state, false, &get("/a2a", &[AUTH])).await;
+    assert_eq!(response.status, 405);
+}

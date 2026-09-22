@@ -20,17 +20,17 @@
 //! whatever `contextId` they send.
 
 pub(crate) mod card;
-// The message, task and JSON-RPC types are the wire contract of the two
-// request bindings, which land with `rpc` in the next commit; only the card
-// half is reachable today. The allow goes away with them.
-#[allow(dead_code)]
+pub(crate) mod rpc;
 pub(crate) mod types;
 
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Response, StatusCode, header};
 
+use greentic_deploy_spec::ids::DeploymentId;
+
 use super::config::InteropConfig;
+use super::limits::{RateLimiter, TurnGate};
 use types::ProtocolVersion;
 
 /// `GET` path of the public agent card.
@@ -45,7 +45,6 @@ pub(crate) const ADAPTIVE_CARD_MEDIA_TYPE: &str = "application/vnd.microsoft.car
 
 /// The request header carrying the caller's protocol version. Its
 /// query-parameter alternative (`?A2A-Version=`) is read by the handlers.
-#[allow(dead_code)]
 pub(crate) const VERSION_HEADER: &str = "a2a-version";
 
 /// `Cache-Control` on the card (A2A §8.6: SHOULD carry max-age and an ETag).
@@ -80,11 +79,17 @@ pub(crate) struct A2aContext<'a> {
     pub config: &'a InteropConfig,
     /// The public base URL (no trailing slash), when known.
     pub base_url: Option<&'a str>,
+    pub tenant: &'a str,
     pub bundle_id: &'a str,
+    pub deployment_id: DeploymentId,
+    pub limiter: &'a RateLimiter,
+    pub turns: &'a TurnGate,
+    /// The wall clock the credential expiry is judged against, threaded in so
+    /// a test can drive it.
+    pub now_ms: u64,
 }
 
 /// The request facts the handlers read, gathered before the body is consumed.
-#[allow(dead_code)]
 pub(crate) struct A2aRequest<'a> {
     pub authorization: Option<&'a str>,
     pub version_header: Option<&'a str>,
@@ -99,7 +104,6 @@ pub(crate) type HttpResponse = Response<Full<Bytes>>;
 // Response helpers
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 pub(crate) fn json(status: StatusCode, body: Vec<u8>) -> HttpResponse {
     Response::builder()
         .status(status)

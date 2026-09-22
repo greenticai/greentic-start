@@ -6,6 +6,8 @@
 
 pub(crate) mod a2a;
 pub(crate) mod config;
+pub(crate) mod limits;
+pub(crate) mod reply;
 
 /// A test-only replacement for running a turn against a loaded revision, so
 /// listener-level tests can drive the whole ingress without a WASM pack.
@@ -25,6 +27,11 @@ pub(crate) struct InteropState {
     /// [`crate::revision_serve::PublicUrlCapture`] supplies it instead. Never
     /// the request's own `Host` header, which any caller controls.
     pub public_base_url: Option<String>,
+    /// Per-credential token buckets, shared by every interop surface so one
+    /// caller's budget is the same whichever binding it uses.
+    pub limiter: limits::RateLimiter,
+    /// The per-deployment concurrent-turn cap.
+    pub turns: limits::TurnGate,
     /// See [`TurnOverride`].
     #[cfg(test)]
     pub turn_override: Option<TurnOverride>,
@@ -37,6 +44,12 @@ impl InteropState {
         Self {
             generic_auth_enabled: crate::ingress_auth::generic_ingress_auth_enabled_from_env(),
             public_base_url,
+            limiter: limits::RateLimiter::default(),
+            turns: limits::TurnGate::new(limits::max_concurrent_turns(
+                std::env::var(limits::MAX_CONCURRENT_TURNS_ENV)
+                    .ok()
+                    .as_deref(),
+            )),
             #[cfg(test)]
             turn_override: None,
         }
@@ -49,6 +62,8 @@ impl Default for InteropState {
         Self {
             generic_auth_enabled: true,
             public_base_url: None,
+            limiter: limits::RateLimiter::default(),
+            turns: limits::TurnGate::new(limits::DEFAULT_MAX_CONCURRENT_TURNS),
             #[cfg(test)]
             turn_override: None,
         }
