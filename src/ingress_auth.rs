@@ -39,16 +39,51 @@ pub(crate) const INGRESS_SECRET_CATEGORY: &str = "ingress";
 /// The env var that switches the generic-ingress gate off for one host.
 pub(crate) const GENERIC_INGRESS_AUTH_ENV: &str = "GREENTIC_GENERIC_INGRESS_AUTH";
 
-/// The URI a unit's interop config is read from.
+/// The URI a unit's interop config is read from:
+/// `secrets://<env>/<tenant>/_/ingress/<canonical(bundle id)>`.
 ///
 /// `tenant` is the DEPLOYMENT's tenant — the same string every other secret
 /// this workload reads is scoped by, and on a remote (Cloud Run / k8s) runtime
 /// the `default` the designer stages under. The team is always the `_`
-/// placeholder. The name is the unit's bundle id through the ecosystem-wide
-/// [`crate::secret_name::canonical_secret_name`] (via
-/// [`crate::secrets_gate::canonical_secret_uri`]), the same function the
-/// deployer's `op secrets put` applies, so a producer and this reader cannot
-/// derive the name differently.
+/// placeholder ([`greentic_secrets_lib::normalize_team`] of `None`).
+///
+/// # The canonicalisation, exactly
+///
+/// The name is the unit's bundle id through
+/// [`crate::secrets_gate::canonical_secret_uri`], which applies
+/// `crate::secret_name::canonical_secret_name` — a thin wrapper (it only adds
+/// the opt-in `GREENTIC_SECRETS_TRACE` diagnostic) around
+/// **`greentic_secrets_lib::canonical_secret_name`**, i.e.
+/// `greentic_secrets_spec::uri::canonical_secret_name` at the rev this crate
+/// pins. The deployer's `op secrets put` normalises through the same
+/// function, so a producer and this reader cannot derive a name differently —
+/// **as long as the producer calls it rather than re-implementing it.**
+///
+/// It is written out here because **the designer derives this same name
+/// independently, and a mismatch is a silent `401`**: nothing fails at deploy
+/// time, the config is simply never found. The rule is NOT "every character
+/// outside `[a-z0-9_]` becomes `_`":
+///
+/// 1. `A-Z` is lowercased; `a-z`, `0-9` and `_` are kept.
+/// 2. `-`, `.`, ` ` and `/` become `_`.
+/// 3. **Every other character is DROPPED, not replaced** — including every
+///    non-ASCII one.
+/// 4. A run of `_` collapses to ONE.
+/// 5. Leading and trailing `_` are trimmed.
+/// 6. A name left empty by all of that becomes the literal `secret`.
+///
+/// Worked examples (pinned by
+/// `the_canonicalisation_rule_is_the_shared_one`):
+///
+/// | bundle id | name |
+/// |---|---|
+/// | `support-bot` | `support_bot` |
+/// | `Support-Bot.v2` | `support_bot_v2` |
+/// | `2fa.bot` | `2fa_bot` (a leading digit is kept as-is) |
+/// | `unit--name` | `unit_name` (the run collapses) |
+/// | `trailing-` | `trailing` (the edge is trimmed) |
+/// | `héllo/bot` | `hllo_bot` (`é` is dropped, NOT turned into `_`) |
+/// | `!!!` | `secret` |
 pub(crate) fn ingress_secret_uri(env: &str, tenant: &str, bundle_id: &str) -> String {
     crate::secrets_gate::canonical_secret_uri(env, tenant, None, INGRESS_SECRET_CATEGORY, bundle_id)
 }
@@ -238,6 +273,48 @@ mod tests {
             ingress_secret_uri("prod", "default", "Support-Bot.v2"),
             "secrets://prod/default/_/ingress/support_bot_v2"
         );
+        // The team segment is the `_` placeholder, and the env and tenant are
+        // passed through verbatim.
+        assert_eq!(
+            ingress_secret_uri("local", "acme", "unit"),
+            "secrets://local/acme/_/ingress/unit"
+        );
+    }
+
+    /// The rule in the doc comment above, example by example — because the
+    /// designer derives this name independently and a mismatch is a silent
+    /// 401, never a failed deploy.
+    ///
+    /// These assert through `ingress_secret_uri`, so they pin the WHOLE chain
+    /// (`canonical_secret_uri` → `secret_name::canonical_secret_name` →
+    /// `greentic_secrets_lib::canonical_secret_name`) rather than a local
+    /// copy of the rule — a local copy is the thing that could drift.
+    #[test]
+    fn the_canonicalisation_rule_is_the_shared_one() {
+        let name = |bundle: &str| {
+            ingress_secret_uri("e", "t", bundle)
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        };
+        // Separators map to `_`; uppercase folds; dots are separators too.
+        assert_eq!(name("support-bot"), "support_bot");
+        assert_eq!(name("Support-Bot.v2"), "support_bot_v2");
+        // A leading digit is kept — no prefix is added.
+        assert_eq!(name("2fa.bot"), "2fa_bot");
+        // Consecutive separators collapse to ONE underscore…
+        assert_eq!(name("unit--name"), "unit_name");
+        assert_eq!(name("unit_ -name"), "unit_name");
+        // …and an edge separator is trimmed, not kept.
+        assert_eq!(name("trailing-"), "trailing");
+        assert_eq!(name("-leading"), "leading");
+        // Anything else is DROPPED rather than replaced — the part of the
+        // rule a "every non-[a-z0-9_] becomes _" reading gets wrong.
+        assert_eq!(name("héllo/bot"), "hllo_bot");
+        assert_eq!(name("a+b"), "ab");
+        // A name left empty becomes the literal `secret`.
+        assert_eq!(name("!!!"), "secret");
     }
 
     #[test]
