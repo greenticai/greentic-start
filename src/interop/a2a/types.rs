@@ -45,6 +45,32 @@ pub(crate) struct AgentCard {
     pub icon_url: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub security_schemes: BTreeMap<String, SecurityScheme>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub security_requirements: Vec<SecurityRequirement>,
+}
+
+/// One alternative the caller must satisfy: every scheme named in `schemes`,
+/// each with the scopes it needs.
+///
+/// **The value is a `StringList` message, not a bare array.** The proto is
+/// `map<string, StringList>` (`SecurityRequirement`), and proto JSON renders a
+/// message-valued map as an object — `{"bearer": {"list": []}}`, never
+/// `{"bearer": []}`. The bare-array spelling is what an OpenAPI habit
+/// produces, and a client decoding strictly against the proto rejects it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SecurityRequirement {
+    pub schemes: BTreeMap<String, StringList>,
+}
+
+/// The proto's `StringList` wrapper. `list` is always emitted, including when
+/// empty: a scheme that needs no scopes still has to be named with a value of
+/// the right shape.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StringList {
+    #[serde(default)]
+    pub list: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

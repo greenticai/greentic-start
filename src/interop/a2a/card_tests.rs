@@ -125,6 +125,12 @@ async fn the_card_is_synthesized_from_the_staged_agent_with_an_etag() {
         card["securitySchemes"]["bearer"]["httpAuthSecurityScheme"]["bearerFormat"],
         "gtw"
     );
+    // The requirement, in the proto's shape: a StringList message, not an
+    // array. A scheme declared but not REQUIRED reads as "no authentication".
+    assert_eq!(
+        card["securityRequirements"],
+        json!([{"schemes": {"bearer": {"list": []}}}])
+    );
 
     let mut conditional = request(None, b"");
     conditional.if_none_match = Some(&etag);

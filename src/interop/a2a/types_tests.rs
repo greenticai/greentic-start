@@ -118,6 +118,9 @@ fn agent_card() {
         documentation_url: None,
         icon_url: None,
         security_schemes: BTreeMap::from([("bearer".to_string(), bearer_scheme())]),
+        security_requirements: vec![SecurityRequirement {
+            schemes: BTreeMap::from([("bearer".to_string(), StringList::default())]),
+        }],
     };
     golden(
         &card,
@@ -141,9 +144,45 @@ fn agent_card() {
             "provider": {"url": "https://greentic.ai", "organization": "Greentic"},
             "securitySchemes": {
                 "bearer": {"httpAuthSecurityScheme": {"scheme": "bearer", "bearerFormat": "gtw"}}
-            }
+            },
+            "securityRequirements": [{"schemes": {"bearer": {"list": []}}}]
         }),
     );
+}
+
+/// Trap 1, second half: a requirement's value is a `StringList` MESSAGE, so
+/// the JSON is `{"bearer": {"list": []}}`. The bare-array spelling an OpenAPI
+/// habit produces must not parse, or a card emitting it would look correct
+/// here and be rejected by a client decoding against the proto.
+#[test]
+fn a_security_requirement_wraps_its_scopes_in_a_string_list() {
+    golden(
+        &SecurityRequirement {
+            schemes: BTreeMap::from([
+                ("bearer".to_string(), StringList::default()),
+                (
+                    "oauth".to_string(),
+                    StringList {
+                        list: vec!["read".into(), "write".into()],
+                    },
+                ),
+            ]),
+        },
+        json!({"schemes": {
+            "bearer": {"list": []},
+            "oauth": {"list": ["read", "write"]}
+        }}),
+    );
+    // What matters is what we EMIT: the bare-array spelling must never be
+    // produced. (serde will read `{"bearer": []}` as a struct-from-sequence
+    // with `list` defaulted, which is harmless here — this server never
+    // consumes a card — but it is why this is an assertion about the
+    // serialized bytes rather than about parsing.)
+    let emitted = serde_json::to_string(&SecurityRequirement {
+        schemes: BTreeMap::from([("bearer".to_string(), StringList::default())]),
+    })
+    .expect("serialize");
+    assert_eq!(emitted, r#"{"schemes":{"bearer":{"list":[]}}}"#);
 }
 
 #[test]

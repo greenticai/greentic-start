@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 use super::types::{
     AgentCapabilities, AgentCard, AgentInterface, AgentSkill, HttpAuthSecurityScheme,
-    ProtocolVersion, SecurityScheme,
+    ProtocolVersion, SecurityRequirement, SecurityScheme, StringList,
 };
 use super::{
     A2aContext, A2aRequest, ADAPTIVE_CARD_MEDIA_TYPE, CARD_CACHE_CONTROL, HttpResponse,
@@ -93,15 +93,26 @@ pub(crate) fn build_card(ctx: &A2aContext<'_>, base_url: &str) -> AgentCard {
         documentation_url: None,
         icon_url: None,
         security_schemes: BTreeMap::from([(
-            "bearer".to_string(),
+            BEARER_SCHEME_NAME.to_string(),
             SecurityScheme::HttpAuth(HttpAuthSecurityScheme {
                 description: Some("A worker interop token (gtw_…).".into()),
                 scheme: "bearer".into(),
                 bearer_format: Some("gtw".into()),
             }),
         )]),
+        // Declaring the scheme is not the same as requiring it: a card with
+        // no requirement reads as "no authentication", and this endpoint
+        // refuses every anonymous call. No scopes, so an empty `list`.
+        security_requirements: vec![SecurityRequirement {
+            schemes: BTreeMap::from([(BEARER_SCHEME_NAME.to_string(), StringList::default())]),
+        }],
     }
 }
+
+/// The name both `securitySchemes` and `securityRequirements` refer the bearer
+/// scheme by. Spelled once: a requirement naming a scheme the card does not
+/// define is unsatisfiable, and nothing would report it.
+const BEARER_SCHEME_NAME: &str = "bearer";
 
 /// `GET /.well-known/agent-card.json`: unauthenticated, cacheable, with a
 /// strong ETag over the exact bytes served.
