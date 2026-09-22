@@ -1,6 +1,13 @@
 # syntax=docker/dockerfile:1.7
 
+# Multi-arch: built natively per platform (linux/amd64, linux/arm64) by
+# `.github/workflows/distroless{,-dev}.yml` and merged into one index. The
+# musl target and the cloudflared asset are both derived from BuildKit's
+# TARGETARCH; an unknown arch fails the build instead of shipping the wrong
+# binary.
 FROM rust:1.95-bookworm AS build
+
+ARG TARGETARCH
 
 WORKDIR /app
 
@@ -12,10 +19,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-RUN rustup target add x86_64-unknown-linux-musl
+RUN case "${TARGETARCH}" in \
+      amd64) echo x86_64-unknown-linux-musl ;; \
+      arm64) echo aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported TARGETARCH '${TARGETARCH}'" >&2; exit 1 ;; \
+    esac > /rust-target \
+    && rustup target add "$(cat /rust-target)"
 
+# Debian's musl-tools provides a musl-gcc for the HOST arch, which is why each
+# platform is built on a native runner rather than cross-compiled.
 ENV CC_x86_64_unknown_linux_musl=musl-gcc
 ENV CXX_x86_64_unknown_linux_musl=g++
+ENV CC_aarch64_unknown_linux_musl=musl-gcc
+ENV CXX_aarch64_unknown_linux_musl=g++
 ENV CARGO_TARGET_DIR=/tmp/target
 
 COPY Cargo.toml Cargo.lock ./
@@ -32,24 +48,34 @@ COPY benches ./benches
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/tmp/target \
-    cargo build --release --target x86_64-unknown-linux-musl \
+    target="$(cat /rust-target)" \
+    && cargo build --release --target "$target" \
     --config 'profile.release.strip=true' --bin greentic-start \
     && mkdir -p /out \
-    && cp /tmp/target/x86_64-unknown-linux-musl/release/greentic-start /out/greentic-start
+    && cp "/tmp/target/$target/release/greentic-start" /out/greentic-start
 
 # cloudflared — static Go binary for the optional in-pod quick tunnel. The K8s
 # deployer boots the worker with `--cloudflared on --cloudflared-binary
 # /usr/local/bin/cloudflared`; greentic-start spawns it via direct `Command::new`
 # (no shell, distroless-safe) to obtain a public `*.trycloudflare.com` URL for
-# Telegram webhook auto-registration. Pinned + sha256-verified; bump both ARGs
-# together. Fetched in a throwaway stage so it never invalidates the Rust build.
+# Telegram webhook auto-registration. Pinned + sha256-verified per arch; bump
+# the version and BOTH sha256 ARGs together (the release notes of each
+# cloudflared release list every asset's sha256). Fetched in a throwaway stage
+# so it never invalidates the Rust build.
 FROM debian:bookworm-slim AS cloudflared
+ARG TARGETARCH
 ARG CLOUDFLARED_VERSION=2026.6.1
-ARG CLOUDFLARED_SHA256=5861a10a438fe8ddcfebb3b830f83966cbf193edafce0fe2eeb198fbae1f7a22
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+ARG CLOUDFLARED_SHA256_AMD64=5861a10a438fe8ddcfebb3b830f83966cbf193edafce0fe2eeb198fbae1f7a22
+ARG CLOUDFLARED_SHA256_ARM64=59816ce9b16db71f5bc2a86d59b3632a96c8c3ee934bde2bc8641ee83a6070eb
+RUN case "${TARGETARCH}" in \
+      amd64) sha="${CLOUDFLARED_SHA256_AMD64}" ;; \
+      arm64) sha="${CLOUDFLARED_SHA256_ARM64}" ;; \
+      *) echo "unsupported TARGETARCH '${TARGETARCH}'" >&2; exit 1 ;; \
+    esac \
+    && apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" -o /cloudflared \
-    && echo "${CLOUDFLARED_SHA256}  /cloudflared" | sha256sum -c - \
+    && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${TARGETARCH}" -o /cloudflared \
+    && echo "${sha}  /cloudflared" | sha256sum -c - \
     && chmod 0755 /cloudflared
 
 # static-debian12:nonroot ships ca-certificates + a uid-65532 nonroot user and
