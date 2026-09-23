@@ -9,16 +9,19 @@
 //! only thing that catches it.
 //!
 //! These are `#[ignore]`d because they need an operator-provisioned `op` store
-//! and a running server. Point them at one with two env vars:
+//! and a running server. Point them at one with two env vars, plus a third
+//! that unlocks the `--store-root` check:
 //!
 //! ```text
-//! GREENTIC_INTEROP_E2E_BASE   the listener's base URL, e.g. http://127.0.0.1:8899
-//! GREENTIC_INTEROP_E2E_TOKEN  a plaintext gtw_ token whose sha256 is staged
+//! GREENTIC_INTEROP_E2E_BASE              the listener's base URL, e.g. http://127.0.0.1:8899
+//! GREENTIC_INTEROP_E2E_TOKEN             a plaintext gtw_ token whose sha256 is staged
+//! GREENTIC_INTEROP_E2E_HOME_STORE_TOKEN  the DECOY token staged only in the $HOME store
 //! ```
 //!
 //! ```bash
 //! GREENTIC_INTEROP_E2E_BASE=http://127.0.0.1:8899 \
 //! GREENTIC_INTEROP_E2E_TOKEN=gtw_… \
+//! GREENTIC_INTEROP_E2E_HOME_STORE_TOKEN=gtw_… \
 //!   cargo test -p greentic-start --lib interop::live_e2e -- --ignored --nocapture
 //! ```
 //!
@@ -27,17 +30,32 @@
 //! The recipe below is the one this suite was written against. Every step uses
 //! the real tooling on purpose — staging the secret with `greentic-deployer op
 //! secrets put` rather than writing the dev-store file by hand is half of what
-//! is being proven, because the deployer is what a deploy actually runs.
+//! is being proven, because the deployer is what a deploy actually runs. It
+//! needs **greentic-deployer at `592175a` or newer**; an older `op` writes a
+//! store this runtime's pinned `greentic-deployer` reads differently, and the
+//! symptom is a zero-revision boot rather than an error.
+//!
+//! Two roots, and the SEPARATION between them is the point:
+//!
+//! - `$STORE` is what `--store-root` names, and it is deliberately **outside**
+//!   `$FHOME`. That is the arrangement `op` provisions per environment and the
+//!   one a container-less host actually runs.
+//! - `$FHOME` is an isolated `HOME`. It is not merely hygiene: a store under it
+//!   is a real competitor for the same env, and staging a DECOY there is what
+//!   lets [`the_store_root_config_wins_over_the_home_store`] tell the two
+//!   apart. Until the `EnvDirOrigin` fix the home store won, so a runtime
+//!   started with `--store-root` answered `401` to the token its own deploy
+//!   staged — with nothing red at any layer.
 //!
 //! ```bash
-//! # An isolated HOME. This is NOT optional: `dev_store_path::find_existing`
-//! # resolves the dev store from `LocalFsStore::default_root()` — i.e. from
-//! # $HOME — BEFORE it looks under the env dir that `--store-root` names. A
-//! # store staged outside $HOME is staged somewhere the runtime will not read.
-//! export FHOME=/tmp/interop-e2e-home
-//! export STORE=$FHOME/.greentic/environments
-//! mkdir -p "$STORE"
-//! D() { env HOME="$FHOME" greentic-deployer op --store-root "$STORE" "$@"; }
+//! export E2E=/tmp/interop-e2e
+//! export FHOME=$E2E/home                 # isolated HOME (holds the decoy store)
+//! export STORE=$E2E/store                # the --store-root, OUTSIDE $FHOME
+//! export HOME_STORE=$FHOME/.greentic/environments
+//! mkdir -p "$STORE" "$HOME_STORE"
+//! # Build it if it is not on PATH: the pinned crates.io binary predates this.
+//! export OP=/path/to/greentic-deployer   # >= 592175a
+//! D() { env HOME="$FHOME" "$OP" op --store-root "$STORE" "$@"; }
 //!
 //! D env create --answers <(echo '{"environment_id":"local","name":"e2e",
 //!     "public_base_url":"http://127.0.0.1:8899"}')
@@ -46,24 +64,45 @@
 //!     "kind":"greentic.secrets.dev-store@0.1.7",
 //!     "pack_ref":"builtin://greentic.secrets.dev-store"}')
 //! # Any .gtbundle whose pack carries a `manifest.cbor` flow. A card-only flow
-//! # needs no LLM key.
+//! # needs no LLM key. `a_parked_card_flow_advances_across_turns` additionally
+//! # wants the designer's `new-flow` starter shape (greeting → answer_billing
+//! # → resolution → thank_you, routed on `response.action`).
 //! D deploy --answers <(echo '{"environment_id":"local","bundle_id":"Support-Bot.v2",
-//!     "bundle_path":"/path/to/bundle.gtbundle"}')
+//!     "bundle_path":"/path/to/new-flow.gtbundle"}')
 //!
 //! # The interop config. The NAME is the bundle id through
 //! # `ingress_secret_uri`'s canonicalisation — `Support-Bot.v2` becomes
 //! # `support_bot_v2`. `op secrets put` REFUSES a non-canonical name rather
-//! # than transforming one, which is what keeps the two sides in step.
-//! D secrets put --answers <(echo '{"environment_id":"local",
-//!     "path":"default/_/ingress/support_bot_v2",
-//!     "value":"{\"v\":1,\"a2a\":true,\"mcp\":true,\"credentials\":[{\"id\":\"c_e2e\",
-//!              \"sha256\":\"<sha256 of the gtw_ token>\"}],\"tenant_slug\":\"acme\",
-//!              \"issuer\":\"http://127.0.0.1:8901\"}"}')
+//! # than transforming one, which is what keeps the two sides in step. The
+//! # TENANT segment is the deployment's (`default` for a local `op` deploy),
+//! # not the `tenant_slug` inside the document.
+//! TOKEN=gtw_$(head -c 24 /dev/urandom | base64 | tr -d '=+/')
+//! SHA=$(printf %s "$TOKEN" | sha256sum | cut -d" " -f1)
+//! D secrets put --answers <(echo "{\"environment_id\":\"local\",
+//!     \"path\":\"default/_/ingress/support_bot_v2\",
+//!     \"value\":\"{\\\"v\\\":1,\\\"a2a\\\":true,\\\"mcp\\\":true,
+//!       \\\"credentials\\\":[{\\\"id\\\":\\\"c_e2e\\\",\\\"sha256\\\":\\\"$SHA\\\"}],
+//!       \\\"tenant_slug\\\":\\\"acme\\\",\\\"issuer\\\":\\\"http://127.0.0.1:8901\\\"}\"}")
+//!
+//! # The DECOY, in the $HOME store: same uri, a DIFFERENT credential. A
+//! # runtime that reads this one answers 401 to $TOKEN and 200 to $HOME_TOKEN.
+//! H() { env HOME="$FHOME" "$OP" op --store-root "$HOME_STORE" "$@"; }
+//! H env create --answers <(echo '{"environment_id":"local","name":"decoy"}')
+//! H env-packs add --answers <(echo '{"environment_id":"local","slot":"secrets",
+//!     "kind":"greentic.secrets.dev-store@0.1.7",
+//!     "pack_ref":"builtin://greentic.secrets.dev-store"}')
+//! # …then `H secrets put` the same path with sha256($HOME_TOKEN).
 //!
 //! env -i PATH=/usr/bin:/bin HOME="$FHOME" PORT=8899 \
 //!     PUBLIC_BASE_URL=http://127.0.0.1:8899 GREENTIC_ENV=local \
 //!   greentic-start start --store-root "$STORE" --env local --no-browser
 //! ```
+//!
+//! The boot line to check before blaming a test is the serve-path backend
+//! selection: `serve-path secrets backend selected: … dev_store_path=…` must
+//! name a path under `$STORE`. When a decoy exists it is preceded by the
+//! `two dev secret stores exist for this environment` warning, which names
+//! both paths and the winner.
 //!
 //! # What is deliberately NOT here
 //!
@@ -75,11 +114,35 @@
 //! point `GREENTIC_INTEROP_E2E_BASE` at it to cover that half too;
 //! [`the_generic_ingress_refuses_a_remote_caller_without_a_bearer`] then stops
 //! skipping.
+//!
+//! Three neighbouring surfaces are covered in-process instead, because each
+//! needs something a live HTTP suite cannot supply — a local JWKS, a
+//! controlled clock — and a second, slower copy here would need an issuer
+//! stood up beside the server:
+//!
+//! - the OAuth/JWKS matrix (wrong `aud`, wrong issuer, another tenant,
+//!   expired, unknown `kid`, unreachable issuer) —
+//!   [`crate::interop::mcp::auth`]'s `auth_tests`;
+//! - credential-ROTATION expiry, i.e. `expires_at_ms` on a rotated-out
+//!   `gtw_` credential — `ingress_auth`'s
+//!   `an_expired_previous_credential_stops_working_at_its_expiry`;
+//! - the per-credential rate limit and its `Retry-After` —
+//!   [`crate::interop::limits`] and `interop::a2a::rpc`'s
+//!   `the_rate_limit_refuses_with_retry_after`.
+//!
+//! `alg: none` is refused STRUCTURALLY rather than by a test: the algorithm
+//! comes from our own `Validation` and never from the token's header
+//! (`interop::mcp::auth`, the comment above `Validation::new`), so there is no
+//! code path a crafted header can reach. A test asserting it would be
+//! asserting that `jsonwebtoken` honours the `Validation` it is handed.
 
 use serde_json::{Value, json};
 
 const BASE_ENV: &str = "GREENTIC_INTEROP_E2E_BASE";
 const TOKEN_ENV: &str = "GREENTIC_INTEROP_E2E_TOKEN";
+/// The decoy token, staged ONLY in the `$HOME`-rooted store. See
+/// [`the_store_root_config_wins_over_the_home_store`].
+const HOME_STORE_TOKEN_ENV: &str = "GREENTIC_INTEROP_E2E_HOME_STORE_TOKEN";
 
 /// The live server's base URL and a token staged for it.
 ///
@@ -592,5 +655,65 @@ fn the_generic_ingress_refuses_a_remote_caller_without_a_bearer() {
         authenticated.status().as_u16(),
         200,
         "the same request with the staged bearer runs the turn"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Which store the runtime read
+// ---------------------------------------------------------------------------
+
+/// `--store-root` decides which dev store the runtime reads, and this is the
+/// only check in the suite that can tell the two apart.
+///
+/// Every other test here passes as long as SOME store answers, which is
+/// exactly why the defect it guards survived: `dev_store_path` resolved
+/// `LocalFsStore::default_root()` — `$HOME` — ahead of the env dir that
+/// `--store-root` names, so a runtime staged by `op --store-root <root>
+/// secrets put` silently read the operator's home store instead. Every interop
+/// call answered `401` while the deploy succeeded, the process booted, `/livez`
+/// stayed green and one `Info` line named a path nobody reads.
+///
+/// So this stages a SECOND, decoy config at the same uri in the `$HOME` store
+/// with a DIFFERENT credential, and asserts both directions: the `--store-root`
+/// token runs a turn, and the decoy's token is refused. Asserting only the
+/// first would pass against a runtime reading either store.
+#[test]
+#[ignore = "needs a live greentic-start started with --store-root; see the module docs"]
+fn the_store_root_config_wins_over_the_home_store() {
+    let (base, token) = target();
+    let Ok(decoy) = std::env::var(HOME_STORE_TOKEN_ENV) else {
+        eprintln!(
+            "skipping: {HOME_STORE_TOKEN_ENV} is unset, so there is no decoy home store to \
+             be preferred over — see this module's docs for how to stage one"
+        );
+        return;
+    };
+    assert_ne!(
+        decoy, token,
+        "the decoy must be a DIFFERENT token, or accepting it proves nothing"
+    );
+
+    // The store `--store-root` names answers.
+    let reply = a2a_send(&base, &token, None, json!([{"text": "hello"}]));
+    assert_eq!(reply["role"], "ROLE_AGENT", "{reply}");
+
+    // The home store's credential is not a credential of the config that was
+    // read. This is the assertion that fails on the pre-fix runtime — there it
+    // is the decoy that answers and the staged token that is refused.
+    let body = json!({"jsonrpc":"2.0","id":1,"method":"SendMessage",
+                      "params":{"message":{"messageId":"decoy","role":"ROLE_USER",
+                                           "parts":[{"text":"hello"}]}}});
+    let status = client()
+        .post(format!("{base}/a2a"))
+        .bearer_auth(&decoy)
+        .json(&body)
+        .send()
+        .expect("send")
+        .status()
+        .as_u16();
+    assert_eq!(
+        status, 401,
+        "the $HOME store's token was accepted, so the runtime read the home store \
+         rather than the one --store-root names"
     );
 }
