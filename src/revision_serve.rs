@@ -15343,8 +15343,11 @@ mod binary_update_tests {
                 std::env::remove_var(crate::secrets_gate::ENV_SERVE_SECRETS_BACKEND);
                 std::env::remove_var("GREENTIC_DEV_SECRETS_PATH");
             }
-            let resolved =
-                crate::secrets_gate::resolve_serve_secrets_manager(env_dir.path(), "demo");
+            let resolved = crate::secrets_gate::resolve_serve_secrets_manager(
+                env_dir.path(),
+                "demo",
+                crate::dev_store_path::EnvDirOrigin::Default,
+            );
             drop(guard);
             resolved.expect("serve secrets manager")
         };
