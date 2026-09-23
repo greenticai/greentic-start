@@ -175,6 +175,47 @@ fn the_default_wait_ttl_is_twenty_four_hours() {
     );
 }
 
+/// Durable sessions without revision affinity is half a configuration, and the
+/// half that is missing produces an INTERMITTENT version of the failure the
+/// operator just configured Redis to remove. The boot has to say so.
+#[test]
+fn the_affinity_warning_fires_only_when_it_is_the_missing_half() {
+    let durable = DurableStorage {
+        config: StorageConfig::redis("redis://127.0.0.1:6379", "greentic:session:prod")
+            .expect("resolves"),
+    };
+
+    let warning = durable
+        .revision_affinity_warning(None)
+        .expect("durable sessions with no pin store must warn");
+    assert!(
+        warning.contains(PIN_REDIS_URL_ENV),
+        "the warning must name the variable to set; got: {warning}"
+    );
+    assert!(
+        warning.contains("greentic:session:prod"),
+        "the warning must name what is already configured; got: {warning}"
+    );
+
+    assert!(
+        durable
+            .revision_affinity_warning(Some("redis://127.0.0.1:6379"))
+            .is_none(),
+        "a configured pin store is the other half; warning then is noise"
+    );
+    assert!(
+        durable.revision_affinity_warning(Some("   ")).is_some(),
+        "a blank pin URL configures nothing and must not silence the warning"
+    );
+
+    assert!(
+        DurableStorage::in_memory()
+            .revision_affinity_warning(None)
+            .is_none(),
+        "in-memory sessions do not survive a restart at all, so affinity is moot"
+    );
+}
+
 /// The boot probe is what makes an unreachable backend a STARTUP failure rather
 /// than a first-deploy failure — an environment with no revision attached opens
 /// no per-revision store, so nothing else would notice.

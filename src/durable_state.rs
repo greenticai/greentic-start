@@ -56,7 +56,7 @@ use greentic_runner_host::storage::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::revision_pin::redact_redis_url;
+use crate::revision_pin::{PIN_REDIS_URL_ENV, redact_redis_url};
 
 /// The storage choice for this process, resolved once at boot.
 ///
@@ -152,6 +152,50 @@ impl DurableStorage {
                  the flow-state key/value is shared",
             );
         }
+    }
+
+    /// Durable conversations that can land on a different revision than they
+    /// parked on are a new failure mode, not a fix.
+    ///
+    /// Interop callers get no stickiness cookie at all — `revision_serve` hands
+    /// the dispatcher `cookie: None, defer_pin: false` — so
+    /// [`PIN_REDIS_URL_ENV`] is the ONLY thing that keeps a conversation on the
+    /// revision it parked on once more than one replica is serving. Configured
+    /// without it, a resumed turn can be weighted onto another revision, find no
+    /// snapshot under that revision's keyspace, and restart the conversation:
+    /// the same symptom the operator just configured Redis to remove, now
+    /// intermittent instead of certain.
+    ///
+    /// A warning rather than a refusal: a single-replica, single-revision
+    /// deployment is a legitimate configuration in which pinning buys nothing,
+    /// and refusing to boot one would be wrong.
+    pub(crate) fn warn_if_no_revision_affinity(&self) {
+        if let Some(warning) =
+            self.revision_affinity_warning(std::env::var(PIN_REDIS_URL_ENV).ok().as_deref())
+        {
+            crate::operator_log::warn(module_path!(), warning);
+        }
+    }
+
+    /// The pure half of [`warn_if_no_revision_affinity`], so the decision is
+    /// testable without mutating process-global state.
+    ///
+    /// [`warn_if_no_revision_affinity`]: Self::warn_if_no_revision_affinity
+    fn revision_affinity_warning(&self, pin_url: Option<&str>) -> Option<String> {
+        if !self.config.session.is_durable() {
+            return None;
+        }
+        if pin_url.is_some_and(|value| !value.trim().is_empty()) {
+            return None;
+        }
+        Some(format!(
+            "durable sessions are configured ({session}) but revision affinity is not: \
+             {PIN_REDIS_URL_ENV} is unset, and an interop caller carries no stickiness cookie, \
+             so a resumed turn may be routed to a different revision — which keeps its own \
+             keyspace and will restart the conversation. Set {PIN_REDIS_URL_ENV} (the same Redis \
+             is fine) whenever more than one revision serves traffic",
+            session = self.config.session.describe(),
+        ))
     }
 
     /// Prove the configured backends are reachable, at BOOT, before anything

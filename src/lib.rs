@@ -907,6 +907,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let durable = durable_state::DurableStorage::resolve(&env_id)?;
         durable.ensure_reachable()?;
         durable.log_once();
+        durable.warn_if_no_revision_affinity();
         // Per-revision session/state stores, likewise shared between the
         // cold-start activation and every reload-rebuilt one. A reload builds a
         // whole new `RunnerHost`, and the host owns these stores; without the
