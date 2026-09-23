@@ -2001,6 +2001,12 @@ async fn serve_interop(
         limiter: &state.interop.limiter,
         turns: &state.interop.turns,
         now_ms: crate::ingress_auth::now_ms(),
+        metering: crate::interop::metering::TurnMetering::for_unit(
+            &state.interop.meter,
+            &unit.config,
+            unit.deployment_id,
+            &unit.bundle_id,
+        ),
     };
     if route == crate::interop::a2a::A2aRoute::Card {
         if method != hyper::Method::GET {
@@ -2173,6 +2179,19 @@ async fn serve_mcp(
         tenant: unit.tenant.clone(),
         bundle_id: unit.bundle_id.clone(),
         caller_key: caller.key().to_string(),
+        // Only a STAGED credential may be named as one; an OAuth `sub` is
+        // minted by the authorization server and is not a credential the
+        // designer issued.
+        credential_id: match &caller {
+            crate::interop::mcp::auth::McpCaller::Bearer(id) => Some(id.clone()),
+            crate::interop::mcp::auth::McpCaller::Oauth(_) => None,
+        },
+        metering: crate::interop::metering::TurnMetering::for_unit(
+            &state.interop.meter,
+            &unit.config,
+            unit.deployment_id,
+            &unit.bundle_id,
+        ),
         agent_name: unit
             .config
             .agent

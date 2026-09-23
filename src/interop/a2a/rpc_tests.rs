@@ -12,6 +12,8 @@ use super::*;
 use crate::interop::a2a::{A2aContext, A2aRequest, ADAPTIVE_CARD_MEDIA_TYPE};
 use crate::interop::config::{Credential, InteropConfig};
 use crate::interop::limits::{RateLimiter, TurnGate};
+use crate::interop::metering::testkit::{StubAdmin, unreachable_metering};
+use crate::interop::metering::{Meter, TurnMetering};
 
 const TOKEN: &str = "gtw_test-token";
 
@@ -66,15 +68,27 @@ struct Fixture {
     limiter: RateLimiter,
     turns: TurnGate,
     deployment_id: DeploymentId,
+    meter: std::sync::Arc<Meter>,
 }
 
 impl Fixture {
     fn new(config: InteropConfig) -> Self {
+        Self::with_meter(config, std::sync::Arc::new(Meter::inspectable()))
+    }
+
+    /// A fixture whose meter really runs its sink, for the tests that assert
+    /// against a stub admin rather than against the queue.
+    fn with_live_meter(config: InteropConfig) -> Self {
+        Self::with_meter(config, std::sync::Arc::new(Meter::default()))
+    }
+
+    fn with_meter(config: InteropConfig, meter: std::sync::Arc<Meter>) -> Self {
         Self {
             config,
             limiter: RateLimiter::default(),
             turns: TurnGate::new(4),
             deployment_id: DeploymentId::new(),
+            meter,
         }
     }
 
@@ -88,6 +102,12 @@ impl Fixture {
             limiter: &self.limiter,
             turns: &self.turns,
             now_ms: 0,
+            metering: TurnMetering::for_unit(
+                &self.meter,
+                &self.config,
+                self.deployment_id,
+                "support-bot",
+            ),
         }
     }
 }
@@ -369,4 +389,283 @@ async fn rest_send_uses_the_same_turn() {
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     let unauth = rest_call(&fixture, None, &request(&body), &runner).await;
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Metering (worker-interop contract §8)
+// ---------------------------------------------------------------------------
+
+/// One `dw.agent` reply activity, exactly the shape greentic-runner-host
+/// builds: `{"reply","trail","terminated_by","usage"}`.
+fn dw_agent_reply(text: &str) -> Activity {
+    Activity::custom(
+        "response",
+        json!({
+            "reply": text,
+            "trail": [],
+            "terminated_by": "final",
+            "usage": {"tokens_in": 310, "tokens_out": 88, "iterations": 2},
+        }),
+    )
+}
+
+/// The whole feature, end to end on the A2A binding: a stub admin receives
+/// the usage POST **while the caller still gets its answer**. Both halves are
+/// asserted in one test on purpose — a metering emit that cost the turn its
+/// reply would pass a queue-only assertion.
+#[tokio::test]
+async fn a_send_message_records_usage_while_the_caller_still_gets_its_reply() {
+    let stub = StubAdmin::accepting().await;
+    let mut config = config();
+    config.metering = Some(stub.metering());
+    let fixture = Fixture::with_live_meter(config);
+    let runner = FakeRunner::replying(vec![dw_agent_reply("the answer")]);
+    let body = rpc(methods::SEND_MESSAGE, send_params(Some("ctx-metered")));
+
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let answered = body_json(response).await;
+    assert_eq!(
+        answered["result"]["message"]["parts"][0]["text"], "the answer",
+        "the caller must still be answered: {answered}"
+    );
+
+    assert_eq!(
+        stub.wait_for(1).await,
+        1,
+        "no usage event reached the admin"
+    );
+    let event = stub.last_body();
+    assert_eq!(event["surface"], "a2a");
+    assert_eq!(event["tokens_in"], 310);
+    assert_eq!(event["tokens_out"], 88);
+    assert_eq!(event["iterations"], 2);
+    assert_eq!(event["tenant_slug"], "acme");
+    assert_eq!(event["credential_id"], "c1");
+    assert_eq!(event["bundle_id"], "support-bot");
+    assert_eq!(event["deployment_id"], fixture.deployment_id.to_string());
+    assert!(event["duration_ms"].is_u64(), "{event}");
+    // The caller's message and the worker's reply must not be in it.
+    let wire = event.to_string();
+    assert!(!wire.contains("hello"), "{wire}");
+    assert!(!wire.contains("the answer"), "{wire}");
+}
+
+/// Absent config, absent feature: the deployment every unit is on today.
+#[tokio::test]
+async fn a_unit_with_no_metering_block_emits_nothing() {
+    let fixture = Fixture::new(config());
+    assert!(
+        fixture.ctx().metering.is_none(),
+        "an unstaged unit must build no metering"
+    );
+    let runner = FakeRunner::replying(vec![dw_agent_reply("the answer")]);
+    let body = rpc(methods::SEND_MESSAGE, send_params(None));
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(fixture.meter.drain().is_empty());
+}
+
+/// A turn is what produces an event. A request refused BEFORE one ran —
+/// here, a bad bearer and an unparseable `params` — spent nothing, so it
+/// records nothing.
+#[tokio::test]
+async fn a_request_refused_before_the_turn_records_nothing() {
+    let mut config = config();
+    config.metering = Some(unreachable_metering());
+    let fixture = Fixture::new(config);
+    let runner = FakeRunner::replying(vec![dw_agent_reply("unreachable")]);
+
+    let body = rpc(methods::SEND_MESSAGE, send_params(None));
+    let refused = rpc_call(&fixture, Some("Bearer gtw_wrong"), &request(&body), &runner).await;
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+
+    let bad_params = rpc(methods::SEND_MESSAGE, json!({"message": {"parts": []}}));
+    let _ = rpc_call(&fixture, Some(BEARER), &request(&bad_params), &runner).await;
+
+    let listed = rpc(methods::LIST_TASKS, json!({}));
+    let _ = rpc_call(&fixture, Some(BEARER), &request(&listed), &runner).await;
+
+    assert!(
+        fixture.meter.drain().is_empty(),
+        "nothing ran, so nothing may be recorded"
+    );
+    assert!(runner.calls().is_empty());
+}
+
+/// A turn that produced no measurable usage still produces an event: "a turn
+/// ran and cost nothing measurable" and "no turn ran" are different facts.
+#[tokio::test]
+async fn a_turn_with_no_usage_records_zeros_rather_than_nothing() {
+    let mut config = config();
+    config.metering = Some(unreachable_metering());
+    let fixture = Fixture::new(config);
+    let runner = FakeRunner::replying(vec![Activity::text("a card-only flow answered")]);
+    let body = rpc(methods::SEND_MESSAGE, send_params(None));
+    let _ = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+
+    let queued = fixture.meter.drain();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].event.tokens_in, 0);
+    assert_eq!(queued[0].event.tokens_out, 0);
+    assert_eq!(queued[0].event.iterations, 0);
+}
+
+/// A turn that FAILED still ran, and may well have spent before it failed.
+#[tokio::test]
+async fn a_failed_turn_is_still_recorded() {
+    let mut config = config();
+    config.metering = Some(unreachable_metering());
+    let fixture = Fixture::new(config);
+    let runner = FailingRunner;
+    let body = rpc(methods::SEND_MESSAGE, send_params(None));
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    let answered = body_json(response).await;
+    assert_eq!(answered["error"]["code"], codes::INTERNAL_ERROR);
+    assert_eq!(fixture.meter.drain().len(), 1);
+}
+
+/// A turn is metered on both bindings, not only the JSON-RPC one.
+#[tokio::test]
+async fn the_rest_binding_records_the_same_event() {
+    let mut config = config();
+    config.metering = Some(unreachable_metering());
+    let fixture = Fixture::new(config);
+    let runner = FakeRunner::replying(vec![dw_agent_reply("the answer")]);
+    let body = send_params(None).to_string().into_bytes();
+    let ctx = fixture.ctx();
+    let response = handle_rest_send(&ctx, &request(&body), "c1", &runner).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let queued = fixture.meter.drain();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].event.surface, "a2a");
+    assert_eq!(queued[0].event.tokens_in, 310);
+}
+
+struct FailingRunner;
+
+#[async_trait]
+impl TurnRunner for FailingRunner {
+    async fn run(
+        &self,
+        _session_hint: &str,
+        _user: &str,
+        _payload: &Value,
+    ) -> Result<Vec<Activity>, TurnFailure> {
+        Err(TurnFailure)
+    }
+}
+
+/// **The property this whole feature turns on, over the production chain.**
+///
+/// A real turn answers with every reply shape this runtime projects — plain
+/// text, a `dw.agent` reply, a nested card, a parked card, a categorized flow
+/// error — each carrying distinctive content. The event that reaches the
+/// queue is then serialized and must contain NONE of it.
+///
+/// Asserted over the RECORDED event rather than over a hand-built one, so a
+/// field added anywhere between the reply activities and the queue fails
+/// here. The type-level half — that the event's key set is a closed list —
+/// is `metering::event::event_tests::the_event_carries_only_identifiers_and_counters`.
+#[tokio::test]
+async fn no_turn_content_reaches_the_recorded_event() {
+    const CONTENT: &[&str] = &[
+        "my credit card is 4111111111111111",
+        "the answer is 42 and here is why",
+        "Pick a department",
+        "Nested detail",
+        "Fill the form",
+        "API key is invalid",
+    ];
+    let mut config = config();
+    // `credential_id` populated too, so the key-set assertion below sees the
+    // event at its WIDEST: a field that is skipped when absent cannot be
+    // caught by a fixture that leaves it absent.
+    config.metering = Some(unreachable_metering());
+    let fixture = Fixture::new(config);
+    let runner = FakeRunner::replying(vec![
+        // The `dw.agent` reply is FIRST on purpose: anything that lifts a
+        // "preview" off a turn reads the first reply, so putting a
+        // content-bearing one there is what catches it.
+        Activity::custom(
+            "response",
+            json!({"reply": CONTENT[1], "trail": [], "terminated_by": "final",
+                   "usage": {"tokens_in": 9, "tokens_out": 3, "iterations": 1}}),
+        ),
+        Activity::text(CONTENT[1]),
+        Activity::custom(
+            "response",
+            json!({"outputs": {"result": {"renderedCard": {
+                "type": "AdaptiveCard", "version": "1.6",
+                "body": [{"type": "TextBlock", "text": CONTENT[2]},
+                         {"type": "Container",
+                          "items": [{"type": "TextBlock", "text": CONTENT[3]}]}]
+            }}}}),
+        ),
+        Activity::custom(
+            "response",
+            json!({"status": "pending", "response": {"renderedCard":
+                {"type": "AdaptiveCard", "fallbackText": CONTENT[4]}}}),
+        ),
+        Activity::custom(
+            "response",
+            json!({"metadata": {"error_kind": "component", "error_message": CONTENT[5]}}),
+        ),
+    ]);
+
+    let mut message =
+        json!({"messageId": "m-in", "role": "ROLE_USER", "parts": [{"text": CONTENT[0]}]});
+    message["contextId"] = json!("ctx-with-content");
+    let body = rpc(methods::SEND_MESSAGE, json!({"message": message}));
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let queued = fixture.meter.drain();
+    assert_eq!(
+        queued.len(),
+        1,
+        "the turn ran, so exactly one event is owed"
+    );
+    let wire = serde_json::to_string(&queued[0].event).expect("serialise");
+    for content in CONTENT {
+        assert!(
+            !wire.contains(content),
+            "turn content `{content}` reached the usage event: {wire}"
+        );
+    }
+    // The caller-chosen conversation id is content too: it is a string the
+    // caller writes, and it must not be recorded either.
+    assert!(!wire.contains("ctx-with-content"), "{wire}");
+    // The counters DID travel — a test that passed because nothing was read
+    // would prove nothing.
+    assert!(wire.contains("\"tokens_in\":9"), "{wire}");
+    // And the recorded event carries nothing BEYOND the closed list. A
+    // substring check alone cannot see a new field whose value happens not to
+    // match this fixture's strings; the key set can.
+    let recorded: Value = serde_json::from_str(&wire).expect("an object");
+    let mut keys: Vec<&str> = recorded
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "agent_id",
+            "bundle_id",
+            "credential_id",
+            "deployment_id",
+            "duration_ms",
+            "event_id",
+            "iterations",
+            "occurred_at",
+            "surface",
+            "tenant_slug",
+            "tokens_in",
+            "tokens_out",
+        ],
+        "a field was added to the recorded usage event: {wire}"
+    );
 }
