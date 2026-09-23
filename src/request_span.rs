@@ -144,9 +144,36 @@ pub(crate) mod capture {
         }
     }
 
+    /// Keeps a SECOND dispatcher registered with `tracing-core` for the life
+    /// of the test binary, which is what makes a capture subscriber reliable
+    /// when tests run in parallel.
+    ///
+    /// `tracing` caches each callsite's `Interest` globally. With exactly one
+    /// dispatcher registered, a rebuild — which any `Dispatch::new`, i.e. any
+    /// other test installing a subscriber, triggers — recomputes every
+    /// callsite against `dispatcher::get_default()` **on the rebuilding
+    /// thread**. That thread usually has no subscriber, so `http.request`
+    /// caches `Interest::never` and a capture test running concurrently sees
+    /// ZERO spans: not a missing span, a disabled callsite. With two
+    /// dispatchers registered, tracing-core instead ANDs their answers, and
+    /// `never.and(always)` is `sometimes` — "ask per call" — which is exactly
+    /// the behaviour a thread-local subscriber needs.
+    ///
+    /// This inert dispatcher is never installed as anyone's default, so it
+    /// records nothing; registration alone is the point. It fixes a flake
+    /// that predates the worker-interop work
+    /// (`handle_connection_records_the_status_on_the_request_span` failed
+    /// roughly two runs in eight on `origin/develop` at 6d5a981) and that
+    /// grew more frequent as the binary gained callsites.
+    static INTEREST_KEEPALIVE: std::sync::LazyLock<tracing::Dispatch> =
+        std::sync::LazyLock::new(|| tracing::Dispatch::new(tracing_subscriber::registry()));
+
     /// A subscriber that records every span into the returned [`Captured`].
     /// Install it with `tracing::subscriber::with_default`.
     pub(crate) fn subscriber() -> (impl Subscriber + Send + Sync, Captured) {
+        // Touch the keepalive so it is registered before the caller's own
+        // dispatcher starts recording. See [`INTEREST_KEEPALIVE`].
+        std::sync::LazyLock::force(&INTEREST_KEEPALIVE);
         let captured = Captured::default();
         let subscriber = tracing_subscriber::registry().with(CaptureLayer(captured.clone()));
         (subscriber, captured)
