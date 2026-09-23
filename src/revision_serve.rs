@@ -8204,6 +8204,49 @@ mod tests {
         );
     }
 
+    /// #585, the shape a Direct Line request really has. The test above
+    /// passes an empty query, which is the one case a provider's strict
+    /// `greentic_types` parse accepts; every Direct Line request carries the
+    /// `tenant`/`team` pairs `augment_directline_queries` adds, and start
+    /// serialises `query` as an array of `[key, value]` pairs. The strict
+    /// `universal_dto::HttpInV1` (`query: Option<String>`) rejects that, so a
+    /// provider falling back to a parser that drops `config` loses the
+    /// deploy-time answers on exactly this route. Providers must parse this
+    /// envelope tolerantly AND keep `config`; changing the wire shape here
+    /// must be deliberate.
+    #[test]
+    fn directline_envelope_keeps_config_beside_the_tenant_query() {
+        let query = augment_directline_queries(&[], "acme", Some("support"));
+        let config = json!({"auto_start_on_open_b64": BASE64.encode("true")});
+        let http_in = build_provider_http_in(
+            "messaging.webchat.gui",
+            "acme",
+            "POST",
+            "/v3/directline/conversations",
+            &query,
+            &[],
+            b"{}",
+            Some(config.clone()),
+        );
+
+        let bytes = serde_json::to_vec(&http_in).unwrap();
+        let wire: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire["config"], config, "config must survive serialisation");
+        assert_eq!(
+            wire["query"],
+            json!([["tenant", "acme"], ["team", "support"]]),
+            "documented wire shape: query is an array of [key, value] pairs",
+        );
+
+        let strict =
+            serde_json::from_slice::<greentic_types::messaging::universal_dto::HttpInV1>(&bytes);
+        assert!(
+            strict.is_err(),
+            "the strict greentic_types HttpInV1 rejects the Direct Line query \
+             shape; providers need a tolerant parser that keeps `config`",
+        );
+    }
+
     /// #585: the WebSocket pump's activity poll carries the same config.
     fn test_host() -> std::sync::Arc<RunnerHost> {
         std::sync::Arc::new(
