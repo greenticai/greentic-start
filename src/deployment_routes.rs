@@ -179,6 +179,19 @@ impl DeploymentRouteTable {
             .map(|r| r.tenant.as_str())
     }
 
+    /// The bundle bound to `deployment_id`, or `None` if no Active deployment
+    /// with that id exists.
+    ///
+    /// The worker-interop config is staged per UNIT, and a unit IS a
+    /// deployment's bundle — so this is what names the secret a request's
+    /// interop credential is read from, before any revision is dispatched.
+    pub(crate) fn bundle_for(&self, deployment_id: DeploymentId) -> Option<&BundleId> {
+        self.routes
+            .iter()
+            .find(|r| r.deployment_id == deployment_id)
+            .map(|r| &r.bundle_id)
+    }
+
     /// Resolve `(host, path)` to `(deployment_id, tenant)`.
     ///
     /// Host match is case-insensitive; an empty `hosts` binding matches any

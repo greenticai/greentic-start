@@ -66,6 +66,10 @@ hyper-tungstenite = "0.20"
 hyper-util = "0.1"
 include_dir = "0.7"
 jsonschema = "0.46"
+# RS256 verification of the MCP OAuth tokens (worker-interop contract §3).
+# Already in the tree transitively; declared here because this crate now
+# verifies tokens itself.
+jsonwebtoken = "10"
 libc = "0.2"
 notify-debouncer-full = "0.7"
 once_cell = "1.21"
@@ -85,6 +89,24 @@ redis = { version = "1", features = [
     "tls-rustls-webpki-roots",
 ] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+# MCP SERVER surface (`POST /mcp`, worker-interop contract §3). Pinned
+# EXACTLY: the 3.x line shipped five releases in three weeks
+# (3.0.1 2026-07-29 → 3.1.4 2026-08-20), so a caret range would move the
+# protocol implementation under us between builds. This is the same pin
+# greentic-designer's own MCP surface carries; the two speak to the same
+# clients and must not drift.
+#
+# `default-features = false` states the feature set rather than inheriting it.
+# `server` pulls `schemars` (tool input schemas), `macros` the `#[tool]`
+# attributes, and `transport-streamable-http-server` the
+# `http`/`http-body`/`bytes`/`tower-service` stack this crate already has via
+# hyper 1. Deliberately NOT `client`, `auth`, or any `reqwest` feature: this is
+# a server-only surface, and the token check is this crate's own.
+rmcp = { version = "=3.1.4", default-features = false, features = [
+    "macros",
+    "server",
+    "transport-streamable-http-server",
+] }
 rpassword = "7"
 rustls = "0.23"
 rustls-pemfile = "2"

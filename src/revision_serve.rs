@@ -225,6 +225,10 @@ pub(crate) struct RevisionServeConfig {
     pub auto_restart_enabled: bool,
     /// Executable path captured at boot, before any swap.
     pub exe_path: Option<std::path::PathBuf>,
+    /// The public base URL resolved at boot, when one was configured
+    /// (env-store, then `PUBLIC_BASE_URL`). The interop agent card needs an
+    /// absolute HTTPS URL and must never derive one from the request's `Host`.
+    pub public_base_url: Option<String>,
     /// Armed on Cloud Run when no boot-time `public_base_url` is available:
     /// the first inbound request that passes the GFE trust gate sets the URL
     /// via [`PublicUrlCapture::offer`], waking the deferred registration task.
@@ -289,6 +293,9 @@ struct ServeState {
     /// via [`PublicUrlCapture::offer`], waking the deferred registration
     /// task in `lib.rs`. `None` = not armed.
     public_url_capture: Option<Arc<PublicUrlCapture>>,
+    /// Worker-interop state: the Phase 0b escape hatch, and (in tests) the
+    /// turn override. Shared by every connection of this listener.
+    interop: crate::interop::InteropState,
     /// Test-only: override the activity source used by the WS pump. When
     /// `Some`, `handle_websocket_upgrade` substitutes this source instead of
     /// constructing a `RevisionActivitySource` that calls
@@ -590,6 +597,7 @@ impl RevisionServer {
             session_manager,
             notifier,
             public_url_capture: config.public_url_capture,
+            interop: crate::interop::InteropState::from_env(config.public_base_url),
             #[cfg(test)]
             activity_source_override: None,
         });
@@ -1182,6 +1190,8 @@ async fn handle_connection(
 /// CORS does not apply.
 fn path_allows_cors(path: &str) -> bool {
     path != "/workers/invoke"
+        && !crate::interop::a2a::is_cors_excluded(path)
+        && !crate::interop::mcp::is_cors_excluded(path)
 }
 
 /// Resolve → dispatch → execute for a single request. `Err` carries a ready HTTP
@@ -1310,6 +1320,12 @@ async fn serve(
     let session_header = header_str(req.headers(), "x-greentic-session");
     let endpoint_header = header_str(req.headers(), "x-greentic-messaging-endpoint-id");
     let flow_header = header_str(req.headers(), "x-greentic-flow");
+    // Phase 0b: read before the body consumes `req`. Only the generic-JSON
+    // branch reads it; provider routes carry their own verification.
+    let authorization_header = header_str(req.headers(), header::AUTHORIZATION.as_str());
+    let if_none_match = header_str(req.headers(), header::IF_NONE_MATCH.as_str());
+    let a2a_version_header = header_str(req.headers(), crate::interop::a2a::VERSION_HEADER);
+    let mcp_method_header = header_str(req.headers(), crate::interop::mcp::MCP_METHOD_HEADER);
     // M1 IID.4d wrapper: collect routing-relevant request headers BEFORE
     // `read_body_limited` consumes `req`. The resolver uses these to give
     // header-discriminated providers (Telegram via secret-token) the same
@@ -1322,6 +1338,78 @@ async fn serve(
     // exact request the upstream sent.
     let request_headers = collect_forwarded_request_headers(req.headers());
     let query_string = req.uri().query().map(str::to_string);
+
+    // Worker-interop surfaces (A2A). Checked BEFORE webchat classification and
+    // provider routing, and only for a unit whose staged config enables the
+    // feature — otherwise the path is NOT reserved and falls through to normal
+    // routing, exactly as before this shipped.
+    if let Some(route) = crate::interop::a2a::route_for(&path) {
+        match resolve_interop_unit(
+            &state,
+            &activation,
+            host_header.as_deref(),
+            &path,
+            InteropFeature::A2a,
+        )
+        .await
+        {
+            Err(response) => return Err(response),
+            Ok(Some(unit)) => {
+                return serve_interop(
+                    req,
+                    route,
+                    &unit,
+                    &state,
+                    &activation,
+                    &method,
+                    InteropRequestHeaders {
+                        authorization: authorization_header.as_deref(),
+                        version: a2a_version_header.as_deref(),
+                        query: query_string.as_deref(),
+                        if_none_match: if_none_match.as_deref(),
+                        mcp_method: None,
+                    },
+                )
+                .await;
+            }
+            Ok(None) => {}
+        }
+    }
+
+    // The MCP surface, on the same terms: reserved only for a unit whose
+    // staged config enables it.
+    if let Some(route) = crate::interop::mcp::route_for(&path) {
+        match resolve_interop_unit(
+            &state,
+            &activation,
+            host_header.as_deref(),
+            &path,
+            InteropFeature::Mcp,
+        )
+        .await
+        {
+            Err(response) => return Err(response),
+            Ok(Some(unit)) => {
+                return serve_mcp(
+                    req,
+                    route,
+                    &unit,
+                    &state,
+                    &activation,
+                    &method,
+                    InteropRequestHeaders {
+                        authorization: authorization_header.as_deref(),
+                        version: None,
+                        query: query_string.as_deref(),
+                        if_none_match: None,
+                        mcp_method: mcp_method_header.as_deref(),
+                    },
+                )
+                .await;
+            }
+            Ok(None) => {}
+        }
+    }
 
     // Webchat bundle routing: classify the path against the bundle/flow
     // indices BEFORE the generic deployment resolve. A classified request
@@ -1534,24 +1622,7 @@ async fn serve(
         header_revision: None,
         cookie: cookie_value.as_deref(),
     };
-    // `ThreadRng` is `!Send` and the dispatcher is async, so it cannot survive
-    // the `.await` in the spawned connection task. Seed a `Send` `SmallRng`.
-    let mut rng: rand::rngs::SmallRng = rand::make_rng();
-    let outcome = activation
-        .routing
-        .dispatcher
-        .dispatch(&dispatch_req, &mut rng)
-        .await
-        .map_err(|err| {
-            operator_log::warn(
-                module_path!(),
-                format!("revision dispatch for deployment {deployment_id} failed: {err:#}"),
-            );
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "revision dispatch failed",
-            )
-        })?;
+    let outcome = dispatch_turn(&activation, &dispatch_req, "revision dispatch").await?;
 
     // Bind the dispatched revision tuple once. Both the resolver (below)
     // and `admit_request` (further down) consume it; sharing one binding
@@ -1638,6 +1709,21 @@ async fn serve(
         Admission::Serve => {}
     }
 
+    // Phase 0b: the generic JSON branch runs a flow turn, so a non-loopback
+    // caller must present the unit's bearer credential. Checked AFTER
+    // dispatch because the credential is staged per UNIT and the unit is the
+    // dispatched revision's bundle; dispatch itself writes no pin for a
+    // non-loopback caller (`defer_pin`), so nothing is committed before this.
+    gate_generic_ingress(
+        &state,
+        &activation,
+        &tenant,
+        scope.bundle_id.as_str(),
+        peer_is_loopback,
+        authorization_header.as_deref(),
+    )
+    .await?;
+
     // Generic-JSON branch: NOW require the body to be valid JSON. Provider
     // routes already short-circuited above with the raw bytes.
     let payload: Value = if body_bytes.is_empty() {
@@ -1671,26 +1757,15 @@ async fn serve(
         welcome_hint,
     );
 
-    let replies = activation
-        .host
-        .handle_activity_for_revision(
-            &tenant,
-            deployment_id,
-            outcome.bundle_id.clone(),
-            outcome.revision_id,
-            activity,
-        )
-        .await
-        .map_err(|err| {
-            operator_log::error(
-                module_path!(),
-                format!(
-                    "revision execution failed for deployment {deployment_id} revision {}: {err:#}",
-                    outcome.revision_id
-                ),
-            );
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "flow execution failed")
-        })?;
+    let replies = execute_turn(
+        &state,
+        &activation,
+        &tenant,
+        &scope,
+        activity,
+        "revision execution",
+    )
+    .await?;
 
     let body = serde_json::to_vec(&replies)
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
@@ -1699,6 +1774,690 @@ async fn serve(
         apply_set_cookie(&mut response, &directive);
     }
     Ok(response)
+}
+
+/// One conversation turn's inputs for [`run_turn`]: what the dispatcher needs
+/// to pick a revision plus what [`build_activity`] needs to shape the turn.
+pub(crate) struct TurnSpec<'a> {
+    pub tenant: &'a str,
+    pub deployment_id: DeploymentId,
+    pub session_hint: Option<&'a str>,
+    /// See [`DispatchRequest::defer_pin`].
+    pub defer_pin: bool,
+    pub cookie: Option<&'a str>,
+    pub user: Option<&'a str>,
+    pub payload: &'a Value,
+}
+
+/// Read a unit's staged interop config, through the listener's short TTL
+/// cache.
+///
+/// Both gates need the config before they can decide anything, so without the
+/// cache every non-loopback POST paid a secrets read. Only the two SUCCESSFUL
+/// outcomes are cached — see [`crate::interop::config_cache`]; a read failure
+/// is retried on the next request rather than holding a `503` for a window
+/// after the store recovered.
+async fn load_unit_config_cached(
+    state: &ServeState,
+    activation: &Activation,
+    tenant: &str,
+    bundle_id: &str,
+) -> Result<Option<crate::interop::config::InteropConfig>, crate::ingress_auth::ConfigUnavailable> {
+    if let Some(cached) = state.interop.configs.get(tenant, bundle_id) {
+        return Ok(cached);
+    }
+    let secrets = activation.host.secrets_manager();
+    let env = crate::resolve_env(None);
+    let config =
+        crate::ingress_auth::load_unit_config(secrets.as_ref(), &env, tenant, bundle_id).await?;
+    state
+        .interop
+        .configs
+        .store(tenant, bundle_id, config.clone());
+    Ok(config)
+}
+
+/// Which staged toggle a path needs. A path whose feature is off is NOT
+/// reserved: the request falls through to normal routing, which is what keeps
+/// adding these paths from shadowing an app route on a unit that wants
+/// neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteropFeature {
+    A2a,
+    Mcp,
+}
+
+impl InteropFeature {
+    fn enabled_in(self, config: &crate::interop::config::InteropConfig) -> bool {
+        match self {
+            InteropFeature::A2a => config.a2a,
+            InteropFeature::Mcp => config.mcp,
+        }
+    }
+}
+
+/// One unit's interop configuration, resolved for a request that named an
+/// interop path.
+struct InteropUnit {
+    deployment_id: DeploymentId,
+    tenant: String,
+    bundle_id: String,
+    config: crate::interop::config::InteropConfig,
+}
+
+/// Resolve the deployment an interop path belongs to and read its staged
+/// config.
+///
+/// `Ok(None)` means the path is NOT reserved on this deployment — no
+/// deployment resolves, nothing is staged, or the feature is switched off —
+/// and the caller falls through to normal routing. `Err` is a ready `503`:
+/// the store could not answer, so whether the path is reserved is unknown,
+/// and guessing either way is wrong (falling through would run an
+/// unauthenticated turn; answering would invent an agent).
+async fn resolve_interop_unit(
+    state: &ServeState,
+    activation: &Activation,
+    host: Option<&str>,
+    path: &str,
+    feature: InteropFeature,
+) -> Result<Option<InteropUnit>, Response<Full<Bytes>>> {
+    let Some((deployment_id, _tenant)) = activation.routing.deployment_routes.resolve(host, path)
+    else {
+        return Ok(None);
+    };
+    let Some(bundle_id) = activation
+        .routing
+        .deployment_routes
+        .bundle_for(deployment_id)
+        .map(|bundle| bundle.as_str().to_string())
+    else {
+        return Ok(None);
+    };
+    let tenant = match activation
+        .routing
+        .deployment_routes
+        .tenant_for(deployment_id)
+    {
+        Some(tenant) => tenant.to_string(),
+        None => return Ok(None),
+    };
+    let config = load_unit_config_cached(state, activation, &tenant, &bundle_id)
+        .await
+        .map_err(|crate::ingress_auth::ConfigUnavailable(message)| {
+            operator_log::warn(
+                module_path!(),
+                format!("interop config for unit `{bundle_id}` could not be read: {message}"),
+            );
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the ingress credential store is unavailable",
+            )
+        })?;
+    Ok(config
+        .filter(|config| feature.enabled_in(config))
+        .map(|config| InteropUnit {
+            deployment_id,
+            tenant,
+            bundle_id,
+            config,
+        }))
+}
+
+/// The public base URL the interop surfaces advertise themselves at: the
+/// boot-resolved one (`startup_contract::resolve_public_base_url`), else the
+/// Cloud Run capture. NEVER the request `Host`, which any caller sets.
+///
+/// **It also decides an audience.** With no staged `mcp_resource`, the MCP
+/// resource identifier — the `aud` every OAuth token is checked against — is
+/// derived from this value as `<base>/mcp`, and on Cloud Run that value comes
+/// from [`PublicUrlCapture`]: the first inbound request through the Google
+/// Front End whose `Host` matches this service's own `<K_SERVICE>-*.run.app`.
+/// So an audience can be derived from a header, once, before the designer has
+/// staged the resource it registered with the admin.
+///
+/// What keeps that non-exploitable is the TENANT CLAIM, not the URL. The
+/// capture is pinned to this service's own `K_SERVICE` (see
+/// [`crate::startup_contract::derive_public_base_url`]), so the worst a
+/// caller can do is make the audience name a different path on this same
+/// service — and a token still has to be signed by the unit's staged issuer
+/// AND carry `tenant` equal to the unit's staged `tenant_slug`
+/// ([`crate::interop::mcp::auth`]). A token minted for another workspace is
+/// refused whatever audience this resolves to, and an attacker who is not the
+/// issuer has no token at all.
+fn interop_base_url(state: &ServeState) -> Option<String> {
+    state
+        .interop
+        .public_base_url
+        .clone()
+        .or_else(|| {
+            state
+                .public_url_capture
+                .as_ref()
+                .and_then(|capture| capture.get().cloned())
+        })
+        .map(|url| url.trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+}
+
+/// Runs one interop turn against the dispatched revision. Holds the
+/// activation the request pinned, so a concurrent reload cannot move the turn
+/// onto a different host mid-request.
+struct IngressTurnRunner<'a> {
+    state: &'a ServeState,
+    activation: &'a Activation,
+    tenant: &'a str,
+    deployment_id: DeploymentId,
+}
+
+#[async_trait::async_trait]
+impl crate::interop::a2a::rpc::TurnRunner for IngressTurnRunner<'_> {
+    async fn run(
+        &self,
+        session_hint: &str,
+        user: &str,
+        payload: &Value,
+    ) -> Result<Vec<Activity>, crate::interop::a2a::rpc::TurnFailure> {
+        run_turn(
+            self.state,
+            self.activation,
+            TurnSpec {
+                tenant: self.tenant,
+                deployment_id: self.deployment_id,
+                session_hint: Some(session_hint),
+                // The caller authenticated before this runs, so the hint is
+                // as trusted as a loopback caller's and pins inline.
+                defer_pin: false,
+                cookie: None,
+                user: Some(user),
+                payload,
+            },
+            "a2a dispatch",
+            "a2a execution",
+        )
+        .await
+        // The detail is already in the operator log; the caller sees a
+        // protocol-level internal error, never an ingress response body.
+        .map_err(|_| crate::interop::a2a::rpc::TurnFailure)
+    }
+}
+
+/// Serve one reserved interop path.
+async fn serve_interop(
+    req: Request<Incoming>,
+    route: crate::interop::a2a::A2aRoute,
+    unit: &InteropUnit,
+    state: &ServeState,
+    activation: &Activation,
+    method: &hyper::Method,
+    headers: InteropRequestHeaders<'_>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let base_url = interop_base_url(state);
+    let ctx = crate::interop::a2a::A2aContext {
+        config: &unit.config,
+        base_url: base_url.as_deref(),
+        tenant: &unit.tenant,
+        bundle_id: &unit.bundle_id,
+        deployment_id: unit.deployment_id,
+        limiter: &state.interop.limiter,
+        turns: &state.interop.turns,
+        now_ms: crate::ingress_auth::now_ms(),
+    };
+    if route == crate::interop::a2a::A2aRoute::Card {
+        if method != hyper::Method::GET {
+            return Err(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "the agent card is served on GET",
+            ));
+        }
+        let request = crate::interop::a2a::A2aRequest {
+            version_header: None,
+            query: None,
+            if_none_match: headers.if_none_match,
+            body: &[],
+        };
+        return Ok(crate::interop::a2a::card::card_response(&ctx, &request));
+    }
+
+    if method != hyper::Method::POST {
+        return Err(error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "this A2A endpoint requires POST",
+        ));
+    }
+    // Authenticate BEFORE the body is read. The bearer check needs only the
+    // `Authorization` header, so an unauthenticated peer must not be able to
+    // make this process read (and buffer) a megabyte per request. `/mcp`
+    // already had this order; this path did not.
+    let credential_id = crate::interop::a2a::rpc::authenticate(&ctx, headers.authorization)
+        .map_err(|response| *response)?;
+    let body_bytes = read_body_limited(req).await.map_err(|_| {
+        error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds the size limit",
+        )
+    })?;
+    let request = crate::interop::a2a::A2aRequest {
+        version_header: headers.version,
+        query: headers.query,
+        if_none_match: None,
+        body: &body_bytes,
+    };
+    let runner = IngressTurnRunner {
+        state,
+        activation,
+        tenant: &unit.tenant,
+        deployment_id: unit.deployment_id,
+    };
+    Ok(match route {
+        crate::interop::a2a::A2aRoute::JsonRpc => {
+            crate::interop::a2a::rpc::handle_jsonrpc(&ctx, &request, credential_id, &runner).await
+        }
+        _ => {
+            crate::interop::a2a::rpc::handle_rest_send(&ctx, &request, credential_id, &runner).await
+        }
+    })
+}
+
+/// Serve one reserved MCP path.
+///
+/// The endpoint is authenticated HERE rather than inside `rmcp`, which has no
+/// auth of its own: the verified caller is then baked into the service the
+/// factory builds, so a tool never has to read an identity back out of a
+/// request extension.
+async fn serve_mcp(
+    req: Request<Incoming>,
+    route: crate::interop::mcp::McpRoute,
+    unit: &InteropUnit,
+    state: &Arc<ServeState>,
+    activation: &Arc<Activation>,
+    method: &hyper::Method,
+    headers: InteropRequestHeaders<'_>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let authorization = headers.authorization;
+    let mcp_method = headers.mcp_method;
+    let base_url = interop_base_url(state);
+    // `None` when the unit has neither a staged `mcp_resource` nor a known
+    // public base URL. That is fatal for the DISCOVERY document, which exists
+    // to publish it, and irrelevant to a caller holding the staged A2A bearer
+    // — so it is resolved here and acted on per route rather than refused for
+    // everyone up front.
+    let resource =
+        crate::interop::mcp::metadata::resource_identifier(&unit.config, base_url.as_deref());
+
+    if route == crate::interop::mcp::McpRoute::Metadata {
+        if method != hyper::Method::GET {
+            return Err(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "the protected-resource metadata is served on GET",
+            ));
+        }
+        let Some(resource) = resource.as_deref() else {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "mcp: unit `{}` has neither a staged `mcp_resource` nor a public base \
+                     URL, so no resource identifier can be published",
+                    unit.bundle_id
+                ),
+            );
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "this worker's MCP address is not known yet",
+            ));
+        };
+        let Some(document) = crate::interop::mcp::metadata::document(&unit.config, resource) else {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no authorization server is configured for this worker",
+            ));
+        };
+        let body = serde_json::to_vec(&document)
+            .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        return Ok(json_response(StatusCode::OK, body));
+    }
+
+    // With no resource identifier there is no discovery URL to point a client
+    // at either, so the `401` below carries a bare challenge rather than a
+    // made-up one. The request is NOT refused for it: only the OAuth half
+    // needs an audience, and a caller holding the staged bearer needs none.
+    let metadata_url = resource.as_deref().map(|resource| {
+        crate::interop::mcp::metadata::resource_metadata_url(base_url.as_deref(), resource)
+    });
+    let caller = match crate::interop::mcp::auth::authenticate(
+        &unit.config,
+        resource.as_deref(),
+        authorization,
+        crate::ingress_auth::now_ms(),
+    )
+    .await
+    {
+        crate::interop::mcp::auth::McpAuth::Allowed(caller) => caller,
+        crate::interop::mcp::auth::McpAuth::Unauthorized => {
+            return Err(mcp_unauthorized(metadata_url.as_deref()));
+        }
+        crate::interop::mcp::auth::McpAuth::IssuerUnavailable => {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the authorization server could not be reached to verify this token",
+            ));
+        }
+    };
+
+    // The `Mcp-Method` header prices this request BEFORE the body is read, so
+    // an obvious flood is refused without parsing one. It is caller-supplied,
+    // so it is a pre-filter and never the final price: the `ask` tool settles
+    // the remainder of a turn's cost against this same bucket.
+    let cost = crate::interop::mcp::request_cost(mcp_method);
+    if let Err(retry_after) = state.interop.limiter.check(caller.key(), cost) {
+        let mut response = error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many requests from this connection; wait and retry",
+        );
+        if let Ok(value) = header::HeaderValue::from_str(&retry_after.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return Err(response);
+    }
+
+    let ctx = std::sync::Arc::new(crate::interop::mcp::server::McpContext {
+        runner: std::sync::Arc::new(OwnedTurnRunner {
+            state: Arc::clone(state),
+            activation: Arc::clone(activation),
+            tenant: unit.tenant.clone(),
+            deployment_id: unit.deployment_id,
+        }),
+        turns: std::sync::Arc::clone(&state.interop.turns),
+        limiter: std::sync::Arc::clone(&state.interop.limiter),
+        prepaid: cost,
+        deployment_id: unit.deployment_id,
+        tenant: unit.tenant.clone(),
+        bundle_id: unit.bundle_id.clone(),
+        caller_key: caller.key().to_string(),
+        agent_name: unit
+            .config
+            .agent
+            .name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| unit.bundle_id.clone()),
+    });
+    // GET and DELETE are answered by `rmcp` itself: in stateless mode
+    // (`legacy_session_mode = false`, no event store) its `handle` allows POST
+    // alone and answers anything else `405` with `Allow: POST`.
+    let response = crate::interop::mcp::server::service(ctx).handle(req).await;
+    Ok(collect_boxed_response(response).await)
+}
+
+/// `401` for the MCP endpoint, carrying the discovery URL a client that has
+/// never authenticated needs. Without the header a client fails to connect
+/// with no error that points anywhere.
+fn mcp_unauthorized(metadata_url: Option<&str>) -> Response<Full<Bytes>> {
+    let mut response = error_response(
+        StatusCode::UNAUTHORIZED,
+        "a valid bearer token issued by the configured authorization server is required",
+    );
+    // With no resource identifier there is no discovery document to point at,
+    // so the challenge is bare rather than naming a URL that would 503.
+    let challenge = match metadata_url {
+        Some(url) => format!("Bearer resource_metadata=\"{url}\""),
+        None => "Bearer".to_string(),
+    };
+    if let Ok(value) = header::HeaderValue::from_str(&challenge) {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
+    }
+    response
+}
+
+/// Collapse `rmcp`'s boxed body into this ingress's single body type.
+///
+/// The body's error type is `Infallible`, so the collect cannot actually fail;
+/// it is still handled rather than unwrapped, because a future rmcp release
+/// widening that type must fail as a `500` and not as a panic on the request
+/// path.
+async fn collect_boxed_response(
+    response: Response<http_body_util::combinators::BoxBody<Bytes, Infallible>>,
+) -> Response<Full<Bytes>> {
+    let (parts, body) = response.into_parts();
+    match body.collect().await {
+        Ok(collected) => Response::from_parts(parts, Full::new(collected.to_bytes())),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the MCP transport produced an unreadable body",
+        ),
+    }
+}
+
+/// A [`TurnRunner`] that OWNS what it needs, for a handler that outlives the
+/// request borrow — `rmcp` builds its service from a `'static` factory, so the
+/// borrowed [`IngressTurnRunner`] cannot be handed to it.
+///
+/// It holds the activation the request pinned, so a concurrent reload cannot
+/// move the turn onto a different host mid-request, and goes through the same
+/// [`run_turn`] as every other ingress.
+///
+/// [`TurnRunner`]: crate::interop::a2a::rpc::TurnRunner
+struct OwnedTurnRunner {
+    state: Arc<ServeState>,
+    activation: Arc<Activation>,
+    tenant: String,
+    deployment_id: DeploymentId,
+}
+
+#[async_trait::async_trait]
+impl crate::interop::a2a::rpc::TurnRunner for OwnedTurnRunner {
+    async fn run(
+        &self,
+        session_hint: &str,
+        user: &str,
+        payload: &Value,
+    ) -> Result<Vec<Activity>, crate::interop::a2a::rpc::TurnFailure> {
+        run_turn(
+            &self.state,
+            &self.activation,
+            TurnSpec {
+                tenant: &self.tenant,
+                deployment_id: self.deployment_id,
+                session_hint: Some(session_hint),
+                // The caller authenticated before this runs, so the hint is
+                // as trusted as a loopback caller's and pins inline.
+                defer_pin: false,
+                cookie: None,
+                user: Some(user),
+                payload,
+            },
+            "mcp dispatch",
+            "mcp execution",
+        )
+        .await
+        // The detail is already in the operator log; the caller sees a
+        // tool-level failure, never an ingress response body.
+        .map_err(|_| crate::interop::a2a::rpc::TurnFailure)
+    }
+}
+
+/// The request facts the interop surfaces read, gathered before the body is
+/// consumed.
+struct InteropRequestHeaders<'a> {
+    authorization: Option<&'a str>,
+    /// `A2A-Version`.
+    version: Option<&'a str>,
+    query: Option<&'a str>,
+    if_none_match: Option<&'a str>,
+    /// `Mcp-Method` (SEP-2243), which the MCP limiter meters on so it never
+    /// has to parse a body.
+    mcp_method: Option<&'a str>,
+}
+
+/// Phase 0b (worker-interop contract D7): refuse a non-loopback caller of the
+/// generic JSON ingress that presents no valid bearer for the dispatched unit.
+///
+/// Fails CLOSED. No config staged, no credential in it, or a wrong/expired
+/// token is `401`; a secrets backend that cannot answer is `503`, never an
+/// allow — the same distinction [`read_provider_signing_key`] draws, and for
+/// the same reason: a degraded store must not become an authentication bypass.
+/// Loopback-trusted peers keep their existing trust, and the host-local
+/// `GREENTIC_GENERIC_INGRESS_AUTH=off` escape hatch skips the read entirely.
+async fn gate_generic_ingress(
+    state: &ServeState,
+    activation: &Activation,
+    tenant: &str,
+    bundle_id: &str,
+    peer_is_loopback: bool,
+    authorization: Option<&str>,
+) -> Result<(), Response<Full<Bytes>>> {
+    let gate_enabled = state.interop.generic_auth_enabled;
+    if peer_is_loopback || !gate_enabled {
+        return Ok(());
+    }
+    let config = load_unit_config_cached(state, activation, tenant, bundle_id).await;
+    match crate::ingress_auth::decide_generic(
+        peer_is_loopback,
+        gate_enabled,
+        &config,
+        authorization,
+        crate::ingress_auth::now_ms(),
+    ) {
+        crate::ingress_auth::GenericGate::Allow => Ok(()),
+        crate::ingress_auth::GenericGate::Unauthorized => {
+            let mut response = error_response(
+                StatusCode::UNAUTHORIZED,
+                "a bearer credential is required for this ingress",
+            );
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Bearer"),
+            );
+            Err(response)
+        }
+        crate::ingress_auth::GenericGate::Unavailable => {
+            if let Err(crate::ingress_auth::ConfigUnavailable(message)) = &config {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "generic ingress credential for unit `{bundle_id}` could not be read: \
+                         {message}"
+                    ),
+                );
+            }
+            Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the ingress credential store is unavailable",
+            ))
+        }
+    }
+}
+
+/// Ask the dispatcher which revision serves this turn. `label` prefixes the
+/// operator-log line so each ingress keeps its own diagnostic wording.
+async fn dispatch_turn(
+    activation: &Activation,
+    dispatch_req: &DispatchRequest<'_>,
+    label: &str,
+) -> Result<crate::revision_dispatcher::DispatchOutcome, Response<Full<Bytes>>> {
+    // `ThreadRng` is `!Send` and the dispatcher is async, so it cannot survive
+    // the `.await` in the spawned connection task. Seed a `Send` `SmallRng`.
+    let mut rng: rand::rngs::SmallRng = rand::make_rng();
+    let deployment_id = dispatch_req.deployment_id;
+    activation
+        .routing
+        .dispatcher
+        .dispatch(dispatch_req, &mut rng)
+        .await
+        .map_err(|err| {
+            operator_log::warn(
+                module_path!(),
+                format!("{label} for deployment {deployment_id} failed: {err:#}"),
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "revision dispatch failed",
+            )
+        })
+}
+
+/// Run one already-shaped [`Activity`] against the dispatched revision.
+async fn execute_turn(
+    _state: &ServeState,
+    activation: &Activation,
+    tenant: &str,
+    scope: &RevisionScope,
+    activity: Activity,
+    label: &str,
+) -> Result<Vec<Activity>, Response<Full<Bytes>>> {
+    let deployment_id = scope.deployment_id;
+    let revision_id = scope.revision_id;
+    // Listener-level tests drive the whole ingress without a WASM pack.
+    #[cfg(test)]
+    if let Some(run) = _state.interop.turn_override.as_ref() {
+        return Ok(run(&activity));
+    }
+    activation
+        .host
+        .handle_activity_for_revision(
+            tenant,
+            deployment_id,
+            scope.bundle_id.clone(),
+            revision_id,
+            activity,
+        )
+        .await
+        .map_err(|err| {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "{label} failed for deployment {deployment_id} revision {revision_id}: {err:#}"
+                ),
+            );
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "flow execution failed")
+        })
+}
+
+/// Dispatch → [`build_activity`] → execute, for an ingress with nothing to do
+/// between picking the revision and running the turn. The generic JSON branch
+/// of [`serve`] calls the two halves itself because static routes, provider
+/// routes and endpoint resolution sit between them.
+async fn run_turn(
+    state: &ServeState,
+    activation: &Activation,
+    spec: TurnSpec<'_>,
+    dispatch_label: &str,
+    execute_label: &str,
+) -> Result<Vec<Activity>, Response<Full<Bytes>>> {
+    let dispatch_req = DispatchRequest {
+        env_id: activation.routing.dispatcher.env_id(),
+        tenant: spec.tenant,
+        deployment_id: spec.deployment_id,
+        session_hint: spec.session_hint,
+        defer_pin: spec.defer_pin,
+        trusted: false,
+        header_revision: None,
+        cookie: spec.cookie,
+    };
+    let outcome = dispatch_turn(activation, &dispatch_req, dispatch_label).await?;
+    let activity = build_activity(
+        spec.payload,
+        spec.tenant,
+        spec.user,
+        spec.session_hint,
+        None,
+        None,
+    );
+    let scope = RevisionScope {
+        deployment_id: spec.deployment_id,
+        bundle_id: outcome.bundle_id.clone(),
+        revision_id: outcome.revision_id,
+    };
+    execute_turn(
+        state,
+        activation,
+        spec.tenant,
+        &scope,
+        activity,
+        execute_label,
+    )
+    .await
 }
 
 /// `POST /workers/invoke` payload, mirroring
@@ -1796,70 +2555,30 @@ async fn handle_worker_invoke(
         })?;
 
     let session_hint = worker_req.session_id.clone();
-    let dispatch_req = DispatchRequest {
-        env_id: activation.routing.dispatcher.env_id(),
-        tenant: &tenant,
-        deployment_id,
-        session_hint: session_hint.as_deref(),
-        // Worker-invoke is loopback-gated (trusted caller), so the supplied
-        // session id pins inline like other caller-asserted hints.
-        defer_pin: false,
-        trusted: false,
-        header_revision: None,
-        cookie: None,
-    };
-    let mut rng: rand::rngs::SmallRng = rand::make_rng();
-    let outcome = activation
-        .routing
-        .dispatcher
-        .dispatch(&dispatch_req, &mut rng)
-        .await
-        .map_err(|err| {
-            operator_log::warn(
-                module_path!(),
-                format!("worker-invoke dispatch for deployment {deployment_id} failed: {err:#}"),
-            );
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "revision dispatch failed",
-            )
-        })?;
-
     let user = worker_req
         .tenant
         .user_id
         .as_ref()
         .map(|u| u.as_str().to_string());
     let flow_payload = normalize_worker_payload(&worker_req.payload);
-    let activity = build_activity(
-        &flow_payload,
-        &tenant,
-        user.as_deref(),
-        session_hint.as_deref(),
-        None,
-        None,
-    );
-
-    let replies = activation
-        .host
-        .handle_activity_for_revision(
-            &tenant,
+    let replies = run_turn(
+        &state,
+        &activation,
+        TurnSpec {
+            tenant: &tenant,
             deployment_id,
-            outcome.bundle_id.clone(),
-            outcome.revision_id,
-            activity,
-        )
-        .await
-        .map_err(|err| {
-            operator_log::error(
-                module_path!(),
-                format!(
-                    "worker-invoke execution failed for deployment {deployment_id} revision {}: {err:#}",
-                    outcome.revision_id
-                ),
-            );
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "flow execution failed")
-        })?;
+            session_hint: session_hint.as_deref(),
+            // Worker-invoke is loopback-gated (trusted caller), so the supplied
+            // session id pins inline like other caller-asserted hints.
+            defer_pin: false,
+            cookie: None,
+            user: user.as_deref(),
+            payload: &flow_payload,
+        },
+        "worker-invoke dispatch",
+        "worker-invoke execution",
+    )
+    .await?;
 
     let messages = replies.iter().map(activity_to_worker_message).collect();
     let response = WorkerInvokeResponse {
@@ -5364,7 +6083,7 @@ async fn try_notify_webchat_activity(
 /// (channel/session/to) from the ingress. Otherwise treat the payload as
 /// the reply text or wholesale `metadata` carrier and start from a
 /// clone of the ingress envelope.
-fn build_reply_envelopes(
+pub(crate) fn build_reply_envelopes(
     ingress: &ChannelMessageEnvelope,
     reply: &Activity,
     pack_id: &str,
@@ -6919,6 +7638,7 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_base_url: None,
             public_url_capture: None,
         })
         .expect("start split server");
@@ -6969,6 +7689,7 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_base_url: None,
             public_url_capture: None,
         })
         .expect("start must succeed even when main bumps into admin range");
@@ -8375,6 +9096,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         }
     }
@@ -8781,6 +9503,7 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_base_url: None,
             public_url_capture: None,
         })
         .expect("start server");
@@ -8836,6 +9559,7 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_base_url: None,
             public_url_capture: None,
         })
         .expect("start server");
@@ -10202,6 +10926,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -10309,6 +11034,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -10410,6 +11136,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -10484,6 +11211,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -10763,6 +11491,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         })
     }
@@ -11801,6 +12530,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -11840,6 +12570,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
@@ -11874,6 +12605,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
@@ -11904,6 +12636,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -12123,6 +12856,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -12171,6 +12905,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -12229,6 +12964,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         state.mark_restart_required();
@@ -12266,6 +13002,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         state.mark_restart_required();
@@ -14471,6 +15208,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::clone(&notifier),
             public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: Some(
                 test_source.clone() as Arc<dyn crate::websocket::pump::ActivitySource>
             ),
@@ -14747,3 +15485,7 @@ mod public_url_capture_tests {
         assert_eq!(url, "https://race.run.app");
     }
 }
+
+#[cfg(test)]
+#[path = "revision_serve/interop_ingress_tests.rs"]
+mod interop_ingress_tests;
