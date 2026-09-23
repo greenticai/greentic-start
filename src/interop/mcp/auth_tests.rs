@@ -92,7 +92,7 @@ async fn a_valid_token_authenticates_as_its_subject() {
     let token = testkit::mint_token(&issuer.url, RESOURCE, &sub, TENANT, 600);
     let outcome = authenticate(
         &config(Some(&issuer.url)),
-        RESOURCE,
+        Some(RESOURCE),
         Some(&bearer(&token)),
         0,
     )
@@ -116,7 +116,7 @@ async fn a_trailing_slash_on_the_issuer_is_tolerated() {
     let token = testkit::mint_token(&with_slash, RESOURCE, &sub, TENANT, 600);
     let outcome = authenticate(
         &config(Some(&with_slash)),
-        RESOURCE,
+        Some(RESOURCE),
         Some(&bearer(&token)),
         0,
     )
@@ -136,7 +136,7 @@ async fn a_token_for_another_audience_is_refused() {
     );
     let outcome = authenticate(
         &config(Some(&issuer.url)),
-        RESOURCE,
+        Some(RESOURCE),
         Some(&bearer(&token)),
         0,
     )
@@ -156,7 +156,7 @@ async fn a_token_from_another_issuer_is_refused() {
     );
     let outcome = authenticate(
         &config(Some(&configured.url)),
-        RESOURCE,
+        Some(RESOURCE),
         Some(&bearer(&token)),
         0,
     )
@@ -178,7 +178,7 @@ async fn a_token_naming_another_tenant_is_refused() {
     );
     let outcome = authenticate(
         &config(Some(&issuer.url)),
-        RESOURCE,
+        Some(RESOURCE),
         Some(&bearer(&token)),
         0,
     )
@@ -194,7 +194,7 @@ async fn an_expired_token_is_refused() {
     let token = testkit::mint_token(&issuer.url, RESOURCE, &testkit::unique_sub(), TENANT, -600);
     let outcome = authenticate(
         &config(Some(&issuer.url)),
-        RESOURCE,
+        Some(RESOURCE),
         Some(&bearer(&token)),
         0,
     )
@@ -215,7 +215,7 @@ async fn a_token_naming_an_unknown_kid_is_refused() {
     );
     let outcome = authenticate(
         &config(Some(&issuer.url)),
-        RESOURCE,
+        Some(RESOURCE),
         Some(&bearer(&token)),
         0,
     )
@@ -235,7 +235,7 @@ async fn a_subject_outside_the_caller_key_alphabet_is_refused() {
         assert_eq!(
             authenticate(
                 &config(Some(&issuer.url)),
-                RESOURCE,
+                Some(RESOURCE),
                 Some(&bearer(&token)),
                 0
             )
@@ -251,7 +251,7 @@ async fn a_subject_outside_the_caller_key_alphabet_is_refused() {
     assert_eq!(
         authenticate(
             &config(Some(&issuer.url)),
-            RESOURCE,
+            Some(RESOURCE),
             Some(&bearer(&token)),
             0
         )
@@ -277,7 +277,13 @@ async fn an_unreachable_issuer_is_reported_as_unavailable() {
     };
     crate::interop::mcp::jwks::clear_issuer_for_tests(&dead);
     let token = testkit::mint_token(&dead, RESOURCE, &testkit::unique_sub(), TENANT, 600);
-    let outcome = authenticate(&config(Some(&dead)), RESOURCE, Some(&bearer(&token)), 0).await;
+    let outcome = authenticate(
+        &config(Some(&dead)),
+        Some(RESOURCE),
+        Some(&bearer(&token)),
+        0,
+    )
+    .await;
     assert_eq!(outcome, McpAuth::IssuerUnavailable);
 }
 
@@ -285,7 +291,7 @@ async fn an_unreachable_issuer_is_reported_as_unavailable() {
 async fn a_unit_with_no_issuer_refuses_every_token() {
     let issuer = StubIssuer::serving_keys(0).await;
     let token = testkit::mint_token(&issuer.url, RESOURCE, &testkit::unique_sub(), TENANT, 600);
-    let outcome = authenticate(&config(None), RESOURCE, Some(&bearer(&token)), 0).await;
+    let outcome = authenticate(&config(None), Some(RESOURCE), Some(&bearer(&token)), 0).await;
     assert_eq!(outcome, McpAuth::Unauthorized);
     assert_eq!(
         issuer.fetches.load(Ordering::Relaxed),
@@ -300,7 +306,7 @@ async fn the_staged_a2a_bearer_is_accepted_without_touching_the_issuer() {
     let issuer = StubIssuer::serving_keys(0).await;
     let outcome = authenticate(
         &config(Some(&issuer.url)),
-        RESOURCE,
+        Some(RESOURCE),
         Some(&bearer(BEARER_TOKEN)),
         0,
     )
@@ -323,7 +329,7 @@ async fn no_token_and_a_non_bearer_scheme_are_refused() {
         Some("Bearer ".to_string()),
     ] {
         assert_eq!(
-            authenticate(&config, RESOURCE, header.as_deref(), 0).await,
+            authenticate(&config, Some(RESOURCE), header.as_deref(), 0).await,
             McpAuth::Unauthorized,
             "{header:?}"
         );

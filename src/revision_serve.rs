@@ -2051,21 +2051,13 @@ async fn serve_mcp(
     let authorization = headers.authorization;
     let mcp_method = headers.mcp_method;
     let base_url = interop_base_url(state);
-    let Some(resource) =
-        crate::interop::mcp::metadata::resource_identifier(&unit.config, base_url.as_deref())
-    else {
-        operator_log::warn(
-            module_path!(),
-            format!(
-                "mcp: unit `{}` has neither a staged `mcp_resource` nor a public base URL,                  so no resource identifier can be published",
-                unit.bundle_id
-            ),
-        );
-        return Err(error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "this worker's MCP address is not known yet",
-        ));
-    };
+    // `None` when the unit has neither a staged `mcp_resource` nor a known
+    // public base URL. That is fatal for the DISCOVERY document, which exists
+    // to publish it, and irrelevant to a caller holding the staged A2A bearer
+    // — so it is resolved here and acted on per route rather than refused for
+    // everyone up front.
+    let resource =
+        crate::interop::mcp::metadata::resource_identifier(&unit.config, base_url.as_deref());
 
     if route == crate::interop::mcp::McpRoute::Metadata {
         if method != hyper::Method::GET {
@@ -2074,8 +2066,21 @@ async fn serve_mcp(
                 "the protected-resource metadata is served on GET",
             ));
         }
-        let Some(document) = crate::interop::mcp::metadata::document(&unit.config, &resource)
-        else {
+        let Some(resource) = resource.as_deref() else {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "mcp: unit `{}` has neither a staged `mcp_resource` nor a public base \
+                     URL, so no resource identifier can be published",
+                    unit.bundle_id
+                ),
+            );
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "this worker's MCP address is not known yet",
+            ));
+        };
+        let Some(document) = crate::interop::mcp::metadata::document(&unit.config, resource) else {
             return Err(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no authorization server is configured for this worker",
@@ -2086,11 +2091,16 @@ async fn serve_mcp(
         return Ok(json_response(StatusCode::OK, body));
     }
 
-    let metadata_url =
-        crate::interop::mcp::metadata::resource_metadata_url(base_url.as_deref(), &resource);
+    // With no resource identifier there is no discovery URL to point a client
+    // at either, so the `401` below carries a bare challenge rather than a
+    // made-up one. The request is NOT refused for it: only the OAuth half
+    // needs an audience, and a caller holding the staged bearer needs none.
+    let metadata_url = resource.as_deref().map(|resource| {
+        crate::interop::mcp::metadata::resource_metadata_url(base_url.as_deref(), resource)
+    });
     let caller = match crate::interop::mcp::auth::authenticate(
         &unit.config,
-        &resource,
+        resource.as_deref(),
         authorization,
         crate::ingress_auth::now_ms(),
     )
@@ -2098,7 +2108,7 @@ async fn serve_mcp(
     {
         crate::interop::mcp::auth::McpAuth::Allowed(caller) => caller,
         crate::interop::mcp::auth::McpAuth::Unauthorized => {
-            return Err(mcp_unauthorized(&metadata_url));
+            return Err(mcp_unauthorized(metadata_url.as_deref()));
         }
         crate::interop::mcp::auth::McpAuth::IssuerUnavailable => {
             return Err(error_response(
@@ -2156,14 +2166,18 @@ async fn serve_mcp(
 /// `401` for the MCP endpoint, carrying the discovery URL a client that has
 /// never authenticated needs. Without the header a client fails to connect
 /// with no error that points anywhere.
-fn mcp_unauthorized(metadata_url: &str) -> Response<Full<Bytes>> {
+fn mcp_unauthorized(metadata_url: Option<&str>) -> Response<Full<Bytes>> {
     let mut response = error_response(
         StatusCode::UNAUTHORIZED,
         "a valid bearer token issued by the configured authorization server is required",
     );
-    if let Ok(value) =
-        header::HeaderValue::from_str(&format!("Bearer resource_metadata=\"{metadata_url}\""))
-    {
+    // With no resource identifier there is no discovery document to point at,
+    // so the challenge is bare rather than naming a URL that would 503.
+    let challenge = match metadata_url {
+        Some(url) => format!("Bearer resource_metadata=\"{url}\""),
+        None => "Bearer".to_string(),
+    };
+    if let Ok(value) = header::HeaderValue::from_str(&challenge) {
         response
             .headers_mut()
             .insert(header::WWW_AUTHENTICATE, value);

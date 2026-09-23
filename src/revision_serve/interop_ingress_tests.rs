@@ -85,6 +85,17 @@ fn staged_config(a2a: bool) -> Vec<u8> {
 /// The same document with both toggles and the OAuth issuer under the test's
 /// control.
 fn staged_interop_config(a2a: bool, mcp: bool, issuer: Option<&str>) -> Vec<u8> {
+    staged_interop_config_with(a2a, mcp, issuer, Some("https://w.example/mcp"))
+}
+
+/// …and with the staged `mcp_resource` under the test's control too, so the
+/// "this deployment can name no resource identifier" case is reachable.
+fn staged_interop_config_with(
+    a2a: bool,
+    mcp: bool,
+    issuer: Option<&str>,
+    mcp_resource: Option<&str>,
+) -> Vec<u8> {
     let mut doc = json!({
         "v": 1,
         "a2a": a2a,
@@ -97,11 +108,13 @@ fn staged_interop_config(a2a: bool, mcp: bool, issuer: Option<&str>) -> Vec<u8> 
                 .collect::<String>()
         }],
         "tenant_slug": "acme",
-        "mcp_resource": "https://w.example/mcp",
         "agent": {"name": "Support Bot", "description": "Answers support questions."}
     });
     if let (Some(issuer), Value::Object(map)) = (issuer, &mut doc) {
         map.insert("issuer".to_string(), json!(issuer));
+    }
+    if let (Some(resource), Value::Object(map)) = (mcp_resource, &mut doc) {
+        map.insert("mcp_resource".to_string(), json!(resource));
     }
     doc.to_string().into_bytes()
 }
@@ -116,6 +129,9 @@ enum Store {
     Config(bool),
     /// The staged config with MCP on (and A2A off), naming this issuer.
     Mcp(Option<String>),
+    /// MCP on, with NO issuer and NO staged `mcp_resource` — a unit whose
+    /// only credential is the staged bearer.
+    McpBare,
     /// Nothing staged.
     Empty,
     /// The backend cannot answer.
@@ -141,6 +157,14 @@ fn activation_counting(
         Store::Config(a2a) => {
             let mut entries = HashMap::new();
             entries.insert(config_uri(), staged_config(a2a));
+            Arc::new(TestSecrets::with(entries, Arc::clone(&reads)))
+        }
+        Store::McpBare => {
+            let mut entries = HashMap::new();
+            entries.insert(
+                config_uri(),
+                staged_interop_config_with(false, true, None, None),
+            );
             Arc::new(TestSecrets::with(entries, Arc::clone(&reads)))
         }
         Store::Mcp(issuer) => {
@@ -939,4 +963,62 @@ async fn the_mcp_rate_limit_refuses_with_a_retry_after() {
     }
     let refused = refused.expect("the 61st turn must be refused");
     assert!(refused.header("retry-after").is_some());
+}
+
+/// A unit with no staged `mcp_resource` and no public base URL can name no
+/// resource identifier — which only the OAuth path needs. The staged bearer
+/// must still work, so authentication has to run BEFORE that refusal.
+#[tokio::test]
+async fn a_bearer_caller_needs_no_resource_identifier() {
+    let (activation, _) = activation_with(Store::McpBare);
+    // No `public_base_url` either, so nothing can derive one.
+    let state = state_with(activation, interop_replying(vec![Activity::text("served")]));
+    let response = exchange(
+        &state,
+        false,
+        &post(
+            "/mcp",
+            &mcp_headers("tools/call"),
+            &tools_call("hi", Some("c")),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    assert_eq!(response.json()["result"]["content"][0]["text"], "served");
+}
+
+/// …and an anonymous caller on that same unit is still refused, with a BARE
+/// challenge: there is no discovery document to point at, and naming one that
+/// would 503 sends a client in a circle.
+#[tokio::test]
+async fn an_anonymous_caller_with_no_resource_identifier_gets_a_bare_challenge() {
+    let (activation, _) = activation_with(Store::McpBare);
+    let state = state_with(activation, interop_replying(vec![Activity::text("x")]));
+    let response = exchange(
+        &state,
+        false,
+        &post(
+            "/mcp",
+            &[("Accept", "application/json, text/event-stream")],
+            &tools_call("hi", None),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 401);
+    assert_eq!(response.header("www-authenticate"), Some("Bearer"));
+}
+
+/// The discovery document is the one thing that genuinely needs the resource
+/// identifier, so it still refuses.
+#[tokio::test]
+async fn the_metadata_document_still_needs_a_resource_identifier() {
+    let (activation, _) = activation_with(Store::McpBare);
+    let state = state_with(activation, interop_replying(Vec::new()));
+    let response = exchange(
+        &state,
+        false,
+        &get("/.well-known/oauth-protected-resource", &[]),
+    )
+    .await;
+    assert_eq!(response.status, 503);
 }

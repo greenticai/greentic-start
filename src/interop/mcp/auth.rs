@@ -70,10 +70,13 @@ pub(crate) enum McpAuth {
 /// Authenticate one `/mcp` request.
 ///
 /// `resource` is the audience an OAuth token must carry — the staged
-/// `mcp_resource`, else `<public base>/mcp`.
+/// `mcp_resource`, else `<public base>/mcp`. `None` means this deployment can
+/// name neither, which only the OAuth half needs: a caller holding the staged
+/// A2A bearer is unaffected, so the bearer check runs first and a missing
+/// resource refuses just the token path.
 pub(crate) async fn authenticate(
     config: &InteropConfig,
-    resource: &str,
+    resource: Option<&str>,
     authorization: Option<&str>,
     now_ms: u64,
 ) -> McpAuth {
@@ -89,14 +92,19 @@ pub(crate) async fn authenticate(
 /// goes to the log.
 async fn verify_oauth(
     config: &InteropConfig,
-    resource: &str,
+    resource: Option<&str>,
     authorization: Option<&str>,
 ) -> McpAuth {
-    // No issuer staged means this unit has no authorization server, so no JWT
-    // can be verified against anything. Refuse rather than guess one.
-    let (Some(issuer), Some(tenant_slug)) =
-        (config.issuer.as_deref(), config.tenant_slug.as_deref())
-    else {
+    // No issuer staged means this unit has no authorization server, and no
+    // resource identifier means there is no audience to check a token
+    // against. Either way no JWT can be verified here, so refuse rather than
+    // guess one — a caller holding the staged A2A bearer has already been
+    // admitted above and is unaffected.
+    let (Some(issuer), Some(tenant_slug), Some(resource)) = (
+        config.issuer.as_deref(),
+        config.tenant_slug.as_deref(),
+        resource,
+    ) else {
         return McpAuth::Unauthorized;
     };
     let Some(token) = bearer_token(authorization) else {
