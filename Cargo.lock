@@ -434,7 +434,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "aw-event-bridge"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-runner?rev=3e9d62bd59997a05473e0dd1a90e35e1cd78cb06#3e9d62bd59997a05473e0dd1a90e35e1cd78cb06"
+source = "git+https://github.com/greenticai/greentic-runner?rev=53194684560ea56d32b1e9e9f2d27c6f4180a76e#53194684560ea56d32b1e9e9f2d27c6f4180a76e"
 dependencies = [
  "anyhow",
  "async-nats 0.46.0",
@@ -2672,7 +2672,7 @@ dependencies = [
 [[package]]
 name = "greentic-a2a"
 version = "0.1.0"
-source = "git+https://github.com/greenticai/greentic-runner?rev=3e9d62bd59997a05473e0dd1a90e35e1cd78cb06#3e9d62bd59997a05473e0dd1a90e35e1cd78cb06"
+source = "git+https://github.com/greenticai/greentic-runner?rev=53194684560ea56d32b1e9e9f2d27c6f4180a76e#53194684560ea56d32b1e9e9f2d27c6f4180a76e"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -2685,7 +2685,7 @@ dependencies = [
 [[package]]
 name = "greentic-aw-runtime"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-runner?rev=3e9d62bd59997a05473e0dd1a90e35e1cd78cb06#3e9d62bd59997a05473e0dd1a90e35e1cd78cb06"
+source = "git+https://github.com/greenticai/greentic-runner?rev=53194684560ea56d32b1e9e9f2d27c6f4180a76e#53194684560ea56d32b1e9e9f2d27c6f4180a76e"
 dependencies = [
  "anyhow",
  "async-nats 0.46.0",
@@ -3561,7 +3561,7 @@ dependencies = [
 [[package]]
 name = "greentic-runner-desktop"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-runner?rev=3e9d62bd59997a05473e0dd1a90e35e1cd78cb06#3e9d62bd59997a05473e0dd1a90e35e1cd78cb06"
+source = "git+https://github.com/greenticai/greentic-runner?rev=53194684560ea56d32b1e9e9f2d27c6f4180a76e#53194684560ea56d32b1e9e9f2d27c6f4180a76e"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -3581,7 +3581,7 @@ dependencies = [
 [[package]]
 name = "greentic-runner-host"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-runner?rev=3e9d62bd59997a05473e0dd1a90e35e1cd78cb06#3e9d62bd59997a05473e0dd1a90e35e1cd78cb06"
+source = "git+https://github.com/greenticai/greentic-runner?rev=53194684560ea56d32b1e9e9f2d27c6f4180a76e#53194684560ea56d32b1e9e9f2d27c6f4180a76e"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7108,7 +7108,7 @@ dependencies = [
 [[package]]
 name = "runner-core"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-runner?rev=3e9d62bd59997a05473e0dd1a90e35e1cd78cb06#3e9d62bd59997a05473e0dd1a90e35e1cd78cb06"
+source = "git+https://github.com/greenticai/greentic-runner?rev=53194684560ea56d32b1e9e9f2d27c6f4180a76e#53194684560ea56d32b1e9e9f2d27c6f4180a76e"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
