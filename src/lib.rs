@@ -33,6 +33,7 @@ mod discovery;
 mod doctor;
 mod doctor_env;
 mod domains;
+mod durable_state;
 mod endpoint_admit;
 mod endpoint_resolver;
 mod env_tunnel;
@@ -900,6 +901,14 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // `GREENTIC_REVISION_PIN_REDIS_URL` is configured (fail-open to
         // in-memory); see that fn for the rationale.
         let pin_store = revision_pin::resolve_pin_store(&activation_rt);
+        // Where a parked conversation lives. Resolved ONCE, logged once, and
+        // — unlike the pin store above — a configured-but-unreachable backend
+        // is a boot failure rather than a fall back to memory. See
+        // `durable_state::DurableStorage::resolve` for why the two differ.
+        let durable = durable_state::DurableStorage::resolve(&env_id)?;
+        durable.ensure_reachable()?;
+        durable.log_once();
+        durable.warn_if_no_revision_affinity();
         // Per-revision session/state stores, likewise shared between the
         // cold-start activation and every reload-rebuilt one. A reload builds a
         // whole new `RunnerHost`, and the host owns these stores; without the
@@ -927,6 +936,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             std::sync::Arc::clone(&runtime_ref_resolver),
             std::sync::Arc::clone(&pin_store),
             &revision_stores,
+            &durable,
         ))?;
 
         // Execution bridge: serve the activated revisions over a slim HTTP
@@ -1327,6 +1337,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 std::sync::Arc::clone(&pin_store),
                 activation_rt.handle().clone(),
                 std::sync::Arc::clone(&revision_stores),
+                durable.clone(),
                 // Seed the reload dedup with what cold start activated, so the
                 // first config change of the process can take the cheap
                 // routing-only path instead of rebuilding the whole host.

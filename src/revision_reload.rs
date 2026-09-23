@@ -411,6 +411,7 @@ pub(crate) fn default_rebuild(
     pin_store: Arc<dyn RevisionPinStore>,
     activation_rt: tokio::runtime::Handle,
     revision_stores: revision_boot::RevisionStores,
+    durable: crate::durable_state::DurableStorage,
     initial: Option<(LoadedRuntimeConfig, Environment)>,
 ) -> impl FnMut() -> Result<ReloadOutcome> + Send + 'static {
     // Seed the dedup snapshot with the inputs the COLD-START activation was
@@ -431,6 +432,7 @@ pub(crate) fn default_rebuild(
             &pin_store,
             &activation_rt,
             &revision_stores,
+            &durable,
             &mut last,
         )
     }
@@ -483,6 +485,7 @@ fn rebuild_once(
     pin_store: &Arc<dyn RevisionPinStore>,
     activation_rt: &tokio::runtime::Handle,
     revision_stores: &revision_boot::RevisionStores,
+    durable: &crate::durable_state::DurableStorage,
     last: &mut Option<LastReloadInputs>,
 ) -> Result<ReloadOutcome> {
     let (mut rc, mut environment) = load_reload_inputs(store_root, env_id)?;
@@ -595,6 +598,7 @@ fn rebuild_once(
             Arc::clone(runtime_ref_resolver),
             Arc::clone(pin_store),
             revision_stores,
+            durable,
         ))?;
     *last = Some(LastReloadInputs {
         rc,

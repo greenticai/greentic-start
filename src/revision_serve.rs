@@ -8966,8 +8966,8 @@ mod tests {
     /// own session store; here we model that — two `FlowResumeStore`s over
     /// separate session backends — and prove a snapshot saved by revision A is
     /// invisible to revision B for the identical resume envelope.
-    #[test]
-    fn isolated_revision_stores_do_not_cross_resume() {
+    #[tokio::test]
+    async fn isolated_revision_stores_do_not_cross_resume() {
         let store_a = FlowResumeStore::new(new_session_store());
         let store_b = FlowResumeStore::new(new_session_store());
 
@@ -8976,29 +8976,31 @@ mod tests {
 
         store_a
             .save(&envelope, &wait_for("node-a"))
+            .await
             .expect("save A");
 
         // Revision B, with its own store, sees nothing for the same envelope.
         assert!(
-            store_b.fetch(&envelope).expect("fetch B").is_none(),
+            store_b.fetch(&envelope).await.expect("fetch B").is_none(),
             "revision B must not observe revision A's suspended snapshot"
         );
         // Revision A still resumes its own snapshot at the right node.
         let resumed = store_a
             .fetch(&envelope)
+            .await
             .expect("fetch A")
             .expect("A snapshot present");
         assert_eq!(resumed.next_node, "node-a");
 
-        store_a.clear(&envelope).expect("clear A");
+        store_a.clear(&envelope).await.expect("clear A");
     }
 
     /// Negative control: a SHARED session store (the pre-fix behavior) DOES leak
     /// across revisions for the same envelope — revision B resumes revision A's
     /// snapshot against a potentially different flow graph. This is exactly the
     /// contamination `revision_boot`'s per-revision stores prevent.
-    #[test]
-    fn shared_revision_store_leaks_across_revisions() {
+    #[tokio::test]
+    async fn shared_revision_store_leaks_across_revisions() {
         let shared = new_session_store();
         let store_a = FlowResumeStore::new(Arc::clone(&shared));
         let store_b = FlowResumeStore::new(shared);
@@ -9006,10 +9008,12 @@ mod tests {
         let envelope = envelope_for("user-1", "conv-1");
         store_a
             .save(&envelope, &wait_for("node-a"))
+            .await
             .expect("save A");
 
         let leaked = store_b
             .fetch(&envelope)
+            .await
             .expect("fetch B")
             .expect("shared store leaks the snapshot to revision B");
         assert_eq!(
@@ -9017,7 +9021,7 @@ mod tests {
             "shared store hands revision A's snapshot to revision B (the bug)"
         );
 
-        store_a.clear(&envelope).expect("clear");
+        store_a.clear(&envelope).await.expect("clear");
     }
 
     // --- N1.2: listen-address resolution ----------------------------------
