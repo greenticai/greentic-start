@@ -134,6 +134,7 @@ mod triggers;
 pub mod threshold_watcher;
 mod timer_scheduler;
 mod topic_match;
+mod trace_stderr;
 mod tunnel_prompt;
 mod tunnel_state;
 mod warmup;
@@ -1964,11 +1965,13 @@ fn init_trace_log(
         Some(layer) => tracing_subscriber::registry()
             .with(filter)
             .with(file_layer)
+            .with(trace_stderr::layer())
             .with(layer)
             .try_init(),
         None => tracing_subscriber::registry()
             .with(filter)
             .with(file_layer)
+            .with(trace_stderr::layer())
             .try_init(),
     };
     match init_result {
