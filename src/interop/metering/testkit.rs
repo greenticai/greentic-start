@@ -19,6 +19,10 @@ use super::{MeteringConfig, MeteringToken, Queued};
 /// name it.
 pub(crate) const TEST_TOKEN: &str = "gtm_usage-token";
 
+/// The tenant every staged fixture records against. Spelled once so an
+/// assertion can name it.
+pub(crate) const TEST_TENANT: &str = "acme";
+
 /// A stub admin `POST /ingest`: one fixed answer, every request recorded.
 pub(crate) struct StubAdmin {
     pub url: String,
@@ -93,6 +97,7 @@ impl StubAdmin {
         MeteringConfig {
             endpoint: self.url.clone(),
             token: MeteringToken(TEST_TOKEN.into()),
+            tenant_slug: TEST_TENANT.into(),
         }
     }
 
@@ -125,7 +130,7 @@ pub(crate) fn queued(endpoint: &str) -> Queued {
         event: UsageEvent {
             event_id: new_event_id(),
             occurred_at: now_rfc3339(),
-            tenant_slug: Some("acme".into()),
+            tenant_slug: TEST_TENANT.into(),
             deployment_id: "01J0000000000000000000000".into(),
             bundle_id: "support-bot".into(),
             agent_id: "support-bot".into(),
@@ -149,5 +154,6 @@ pub(crate) fn unreachable_metering() -> MeteringConfig {
     MeteringConfig {
         endpoint: "https://admin.invalid/api/v1/ingest/worker-usage".into(),
         token: MeteringToken(TEST_TOKEN.into()),
+        tenant_slug: TEST_TENANT.into(),
     }
 }

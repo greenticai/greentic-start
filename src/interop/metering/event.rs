@@ -45,11 +45,17 @@ pub(crate) struct TurnUsage {
 
 /// One metered turn, serialised exactly as the admin's ingest door reads it.
 ///
-/// `tenant_slug` and `credential_id` are omitted rather than emptied when
-/// absent, because absent and empty are different facts on both: the admin
-/// derives the tenant from the TOKEN and treats the body's copy as
-/// corroboration (§8.3), and an OAuth MCP caller genuinely has no staged
-/// credential id.
+/// **`tenant_slug` is not an `Option`**, because the admin's ingest door
+/// declares it required and refuses a body whose value disagrees with the
+/// token's tenant (§8.3). An event that omitted it could only ever be a
+/// `400`, recorded nowhere. A unit whose staged document carries no slug is
+/// refused metering outright instead — see
+/// [`super::MeteringRefusal::NoTenantSlug`] — so there is no path by which
+/// this field can be missing.
+///
+/// `credential_id` IS optional, and is omitted rather than emptied: an OAuth
+/// MCP caller genuinely has no staged credential id, and the admin made the
+/// field optional for exactly that caller.
 ///
 /// **There is no model id**, and there cannot be one at this layer: the model
 /// lives in the agent's `AgentConfig` inside `greentic-aw-runtime` and reaches
@@ -60,8 +66,7 @@ pub(crate) struct TurnUsage {
 pub(crate) struct UsageEvent {
     pub event_id: String,
     pub occurred_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tenant_slug: Option<String>,
+    pub tenant_slug: String,
     pub deployment_id: String,
     pub bundle_id: String,
     pub agent_id: String,

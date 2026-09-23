@@ -417,7 +417,6 @@ fn dw_agent_reply(text: &str) -> Activity {
 async fn a_send_message_records_usage_while_the_caller_still_gets_its_reply() {
     let stub = StubAdmin::accepting().await;
     let mut config = config();
-    config.tenant_slug = Some("acme".into());
     config.metering = Some(stub.metering());
     let fixture = Fixture::with_live_meter(config);
     let runner = FakeRunner::replying(vec![dw_agent_reply("the answer")]);
@@ -579,10 +578,9 @@ async fn no_turn_content_reaches_the_recorded_event() {
         "API key is invalid",
     ];
     let mut config = config();
-    // Both optional fields populated, so the key-set assertion below sees the
+    // `credential_id` populated too, so the key-set assertion below sees the
     // event at its WIDEST: a field that is skipped when absent cannot be
     // caught by a fixture that leaves it absent.
-    config.tenant_slug = Some("acme".into());
     config.metering = Some(unreachable_metering());
     let fixture = Fixture::new(config);
     let runner = FakeRunner::replying(vec![

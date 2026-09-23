@@ -188,7 +188,7 @@ fn the_event_carries_only_identifiers_and_counters() {
     let event = UsageEvent {
         event_id: new_event_id(),
         occurred_at: now_rfc3339(),
-        tenant_slug: Some("acme".into()),
+        tenant_slug: "acme".into(),
         deployment_id: "01J0000000000000000000000".into(),
         bundle_id: "support-bot".into(),
         agent_id: "support-agent".into(),
@@ -227,14 +227,15 @@ fn the_event_carries_only_identifiers_and_counters() {
     );
 }
 
-/// Absent and empty are different facts on both optional fields, so neither
-/// is emitted as `""`.
+/// An OAuth MCP caller has no staged credential id, and absent is not the
+/// same fact as empty — so the field is omitted, never emitted as `""`.
+/// `tenant_slug` is NOT optional and so is always present.
 #[test]
-fn absent_tenant_and_credential_are_omitted_not_emptied() {
+fn an_absent_credential_is_omitted_not_emptied() {
     let event = UsageEvent {
         event_id: "e".into(),
         occurred_at: "2026-09-23T00:00:00.000Z".into(),
-        tenant_slug: None,
+        tenant_slug: "acme".into(),
         deployment_id: "d".into(),
         bundle_id: "b".into(),
         agent_id: "a".into(),
@@ -246,7 +247,7 @@ fn absent_tenant_and_credential_are_omitted_not_emptied() {
         duration_ms: 0,
     };
     let body = serde_json::to_value(&event).expect("serialise");
-    assert!(body.get("tenant_slug").is_none(), "{body}");
+    assert_eq!(body["tenant_slug"], "acme");
     assert!(body.get("credential_id").is_none(), "{body}");
     assert_eq!(body["surface"], "mcp");
     assert_eq!(body["tokens_in"], 0);

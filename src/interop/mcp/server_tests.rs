@@ -56,6 +56,10 @@ fn config_with(metering: crate::interop::metering::MeteringConfig) -> InteropCon
     }
 }
 
+/// The tenant every staged fixture records against — the one the metering
+/// config carries, which is what reaches the wire.
+const TENANT: &str = crate::interop::metering::testkit::TEST_TENANT;
+
 fn server(
     meter: &Arc<Meter>,
     config: &InteropConfig,
@@ -113,7 +117,7 @@ async fn an_ask_records_usage_while_the_caller_still_gets_its_reply() {
     assert_eq!(event["surface"], "mcp");
     assert_eq!(event["tokens_in"], 64);
     assert_eq!(event["credential_id"], "c_01J");
-    assert_eq!(event["tenant_slug"], "acme");
+    assert_eq!(event["tenant_slug"], TENANT);
     let wire = event.to_string();
     assert!(!wire.contains("refunds"), "{wire}");
     assert!(!wire.contains("the answer"), "{wire}");

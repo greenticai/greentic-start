@@ -183,17 +183,20 @@ pub(crate) fn parse(bytes: &[u8], unit: &str) -> Option<InteropConfig> {
             }
         })
         .unwrap_or_default();
-    // A malformed or unsafe `metering` block switches METERING off and
-    // nothing else, for the same reason a malformed credential is dropped
+    let tenant_slug = non_empty(raw.tenant_slug);
+    // A malformed, unsafe or slug-less `metering` block switches METERING off
+    // and nothing else, for the same reason a malformed credential is dropped
     // alone: losing a usage row must never cost a unit its interop surface.
+    // The slug is threaded in because the usage ingest requires it — see
+    // `metering::MeteringRefusal::NoTenantSlug`.
     let metering = raw
         .metering
-        .and_then(|value| super::metering::parse_metering(value, unit));
+        .and_then(|value| super::metering::parse_metering(value, tenant_slug.as_deref(), unit));
     Some(InteropConfig {
         a2a: raw.a2a,
         mcp: raw.mcp,
         credentials,
-        tenant_slug: non_empty(raw.tenant_slug),
+        tenant_slug,
         issuer: non_empty(raw.issuer),
         mcp_resource: non_empty(raw.mcp_resource),
         agent,

@@ -87,11 +87,72 @@ impl std::fmt::Debug for MeteringToken {
     }
 }
 
-/// Where a unit's usage events go, as staged (§8.1).
+/// A unit's RESOLVED metering configuration: where its usage events go, and
+/// the tenant they are recorded against.
+///
+/// `tenant_slug` comes from the document's TOP LEVEL rather than from the
+/// `metering` block, and it is not optional here on purpose — the admin's
+/// ingest door requires the field and refuses a body whose value disagrees
+/// with the token's own tenant (§8.3). Holding the slug inside this type is
+/// what makes "a configured unit always sends one" structural rather than a
+/// rule to remember: there is no way to build a `MeteringConfig` without it,
+/// and [`event::UsageEvent::tenant_slug`] is likewise not an `Option`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MeteringConfig {
     pub endpoint: String,
     pub token: MeteringToken,
+    pub tenant_slug: String,
+}
+
+/// Why a staged `metering` block did not configure metering.
+///
+/// A typed decision rather than only a log line, so a test can assert WHICH
+/// refusal happened without standing up a global log sink. Every variant
+/// means the same thing to a caller — metering is off for this unit — and
+/// [`parse_metering`] is the one place that turns one into an operator line,
+/// so a refusal costs exactly one warn per config read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MeteringRefusal {
+    /// The block is not the shape this build reads.
+    Malformed(String),
+    /// `endpoint` or `token` is missing or blank.
+    Incomplete,
+    /// The document carries no top-level `tenant_slug`.
+    ///
+    /// **Metering is switched off rather than sending events without it.**
+    /// The admin's ingest door declares `tenant_slug` as a required field and
+    /// compares it to the token's tenant, so every such event would be a
+    /// `400` — recorded nowhere, forever, with only a warn on this side.
+    /// Refusing up front is the same fact stated once instead of per turn.
+    /// The designer's contract makes the field non-optional in the staged
+    /// document, so reaching this means a hand-written or mis-staged config.
+    NoTenantSlug,
+    /// The endpoint would carry the token in cleartext off this host.
+    UnsafeEndpoint(String),
+}
+
+impl MeteringRefusal {
+    /// The operator-facing sentence. Names the endpoint where there is one —
+    /// an endpoint is not a credential — and never the token.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            MeteringRefusal::Malformed(err) => {
+                format!("`metering` is malformed ({err}); metering is off")
+            }
+            MeteringRefusal::Incomplete => {
+                "`metering` needs both an `endpoint` and a `token`; metering is off".to_string()
+            }
+            MeteringRefusal::NoTenantSlug => {
+                "`metering` is staged but the document carries no `tenant_slug`, which the \
+                 usage ingest requires and would refuse every event for; metering is off"
+                    .to_string()
+            }
+            MeteringRefusal::UnsafeEndpoint(endpoint) => format!(
+                "`metering.endpoint` `{endpoint}` is not https and not loopback http, so the \
+                 usage token would travel in cleartext; metering is off"
+            ),
+        }
+    }
 }
 
 /// Wire form of the `metering` block, before validation.
@@ -103,11 +164,10 @@ struct RawMetering {
     token: String,
 }
 
-/// Parse and validate the staged `metering` block.
+/// Resolve the staged `metering` block against the document's `tenant_slug`.
 ///
-/// `None` — metering off, with a `warn` naming why — for a block that is not
-/// an object, is missing either field, or names an endpoint this runtime will
-/// not send a bearer credential to.
+/// Pure: every refusal is a value, so the decision is testable on its own and
+/// [`parse_metering`] is the only thing that logs one.
 ///
 /// **The endpoint must be `https`, or `http` on a loopback host.** The token
 /// is a bearer credential; posting it in cleartext to anything reachable off
@@ -115,42 +175,48 @@ struct RawMetering {
 /// allowed because a test or a sidecar collector on `127.0.0.1` cannot leave
 /// the machine, and refusing it would make the feature untestable against a
 /// stub.
-pub(crate) fn parse_metering(value: serde_json::Value, unit: &str) -> Option<MeteringConfig> {
-    let raw: RawMetering = match serde_json::from_value(value) {
-        Ok(raw) => raw,
-        Err(err) => {
-            warn(
-                unit,
-                &format!("`metering` is malformed ({err}); metering is off"),
-            );
-            return None;
-        }
-    };
+pub(crate) fn resolve_metering(
+    value: serde_json::Value,
+    tenant_slug: Option<&str>,
+) -> Result<MeteringConfig, MeteringRefusal> {
+    let raw: RawMetering =
+        serde_json::from_value(value).map_err(|err| MeteringRefusal::Malformed(err.to_string()))?;
     let endpoint = raw.endpoint.trim().to_string();
     let token = raw.token.trim().to_string();
     if endpoint.is_empty() || token.is_empty() {
-        warn(
-            unit,
-            "`metering` needs both an `endpoint` and a `token`; metering is off",
-        );
-        return None;
+        return Err(MeteringRefusal::Incomplete);
     }
+    let tenant_slug = tenant_slug
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty())
+        .ok_or(MeteringRefusal::NoTenantSlug)?
+        .to_string();
     if !endpoint_is_safe(&endpoint) {
-        // The endpoint is not a credential, so naming it is what makes this
-        // actionable. The token never appears here or anywhere else.
-        warn(
-            unit,
-            &format!(
-                "`metering.endpoint` `{endpoint}` is not https and not loopback http, so the \
-                 usage token would travel in cleartext; metering is off"
-            ),
-        );
-        return None;
+        return Err(MeteringRefusal::UnsafeEndpoint(endpoint));
     }
-    Some(MeteringConfig {
+    Ok(MeteringConfig {
         endpoint,
         token: MeteringToken(token),
+        tenant_slug,
     })
+}
+
+/// [`resolve_metering`], with a refusal turned into one operator line.
+///
+/// `None` means metering is off for this unit. This is the ONE warn site, so
+/// a refused block costs one line per config read rather than one per turn.
+pub(crate) fn parse_metering(
+    value: serde_json::Value,
+    tenant_slug: Option<&str>,
+    unit: &str,
+) -> Option<MeteringConfig> {
+    match resolve_metering(value, tenant_slug) {
+        Ok(config) => Some(config),
+        Err(refusal) => {
+            warn(unit, &refusal.message());
+            None
+        }
+    }
 }
 
 fn endpoint_is_safe(endpoint: &str) -> bool {
@@ -172,7 +238,7 @@ fn endpoint_is_safe(endpoint: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UnitMetering {
     pub config: MeteringConfig,
-    pub tenant_slug: Option<String>,
+    pub tenant_slug: String,
     pub deployment_id: String,
     pub bundle_id: String,
     pub agent_id: String,
@@ -203,8 +269,11 @@ impl TurnMetering {
         Some(Self {
             meter: Arc::clone(meter),
             unit: UnitMetering {
+                // From the metering config, never from `config.tenant_slug`:
+                // the two are the same value in production, and reading the
+                // one that was VALIDATED is what stops them drifting.
+                tenant_slug: metering.tenant_slug.clone(),
                 config: metering,
-                tenant_slug: config.tenant_slug.clone(),
                 deployment_id: deployment_id.to_string(),
                 bundle_id: bundle_id.to_string(),
                 // The runtime has no other source for an agent id: the
