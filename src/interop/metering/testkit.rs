@@ -122,6 +122,45 @@ impl StubAdmin {
     }
 }
 
+/// A TCP peer that accepts a connection and then says nothing, ever.
+///
+/// The half of a transport failure a stub admin cannot produce: over `http`
+/// the connector completes and the ANSWER never arrives (a request timeout);
+/// over `https` the `ClientHello` is never replied to, so the TLS handshake —
+/// which lives inside the connector — stalls instead (a connect timeout). One
+/// listener covers both because the difference is entirely the scheme the
+/// caller uses.
+///
+/// Returns its port. Nothing here leaves the loopback interface.
+pub(crate) async fn silent_peer() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        // Accepted streams are HELD rather than dropped: dropping one closes
+        // it, which turns the stall this exists to produce into a reset, and
+        // a reset is a different classification.
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    port
+}
+
+/// A loopback port with nothing listening on it, so a connection to it is
+/// REFUSED rather than dropped — the one transport failure that needs no
+/// waiting at all.
+pub(crate) async fn closed_port() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+    port
+}
+
 /// A ready-made queue item aimed at `endpoint`.
 pub(crate) fn queued(endpoint: &str) -> Queued {
     Queued {
