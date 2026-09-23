@@ -363,6 +363,11 @@ impl Meter {
     }
 
     /// Enqueue one event. Never blocks, never fails, never retries.
+    ///
+    /// The counter below is the QUEUE's: events lost because the sink was not
+    /// keeping up. Events the sink tried to deliver and could not are counted
+    /// separately, per endpoint, and reported on [`sink`]'s suspension line —
+    /// two faults with two different fixes, so two different lines.
     pub(crate) fn record(&self, target: &MeteringConfig, event: UsageEvent) {
         self.ensure_sink();
         let queued = Queued {
