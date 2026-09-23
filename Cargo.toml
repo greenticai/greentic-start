@@ -291,7 +291,16 @@ version = "=1.2.0-dev.0"
 # forces the NATS `RemoteDispatchHandler` path. The operala crates pin
 # greentic-llm from git; the `[patch."https://github.com/greenticai/greentic-llm"]`
 # section below keeps that ONE crate with the registry copy.
-features = ["greentic-llm-backend", "operala-in-process"]
+#
+# `session-redis` is named EXPLICITLY even though it is in runner-host's default
+# feature set. Without it a Redis session backend is a hard build-time refusal
+# (`storage::session::store_from_config`'s `#[cfg(not(feature = ...))]` arm), so
+# the day that default changes upstream, an operator's
+# `GREENTIC_RUNNER_SESSION_BACKEND=redis` stops booting — which is the right
+# failure, and a failure we would rather not discover from a deployment. Naming
+# it here makes this binary's need for durable conversation state a declared
+# fact rather than an inherited one. See `crate::durable_state`.
+features = ["greentic-llm-backend", "operala-in-process", "session-redis"]
 
 [dependencies.greentic-secrets-lib]
 # `providers-vault` brings in the HashiCorp Vault KV backend used for runtime

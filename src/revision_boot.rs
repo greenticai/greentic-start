@@ -40,15 +40,14 @@ use greentic_deploy_spec::{
 use greentic_deployer::path_safety::normalize_under_root;
 use greentic_runner_host::runtime::{RevisionPackRef, TenantRuntime};
 use greentic_runner_host::runtime_refs::RuntimeRefResolver;
-use greentic_runner_host::storage::{
-    new_session_store, new_state_store, session_host_from, state_host_from,
-};
+use greentic_runner_host::storage::{session_host_from, state_host_from};
 use greentic_runner_host::{HostBuilder, HostConfig, RunnerHost, TenantBindings};
 use serde_json::Value;
 
 use crate::deployment_routes::{
     DeploymentRouteTable, RevisionIngressRouting, deployment_config_overrides_from_environment,
 };
+use crate::durable_state::{DurableStorage, isolation_suffix};
 use crate::endpoint_admit::EndpointAdmit;
 use crate::http_routes::{
     HttpRouteDescriptor, HttpRouteTable, RevisionScope, discover_revision_routes,
@@ -151,6 +150,27 @@ fn revision_store_key(
     }
 }
 
+/// One revision's slice of a durable session keyspace.
+///
+/// Every field of [`RevisionStoreKey`] goes in, in a fixed order, because the
+/// key is exactly the identity the in-memory registry uses to decide that two
+/// stores may be shared — and a durable keyspace that dropped one of them would
+/// merge two isolation domains that the in-memory path keeps apart, silently
+/// and only on the deployment that configured durability.
+///
+/// The revision id leads so `SCAN` output stays readable; the digest behind it
+/// is what actually separates them.
+fn revision_namespace_suffix(key: &RevisionStoreKey) -> String {
+    isolation_suffix(&[
+        key.revision_id.as_str(),
+        key.deployment_id.as_str(),
+        key.tenant.as_str(),
+        key.team.as_str(),
+        key.customer_id.as_str(),
+        key.bundle_id.as_str(),
+    ])
+}
+
 /// A fresh, empty [`RevisionStores`] registry. One per running server, created
 /// at cold start and shared with the reload producer.
 pub(crate) fn new_revision_stores() -> RevisionStores {
@@ -196,6 +216,7 @@ pub(crate) async fn activate_runtime_config(
     runtime_ref_resolver: Arc<dyn RuntimeRefResolver>,
     pin_store: Arc<dyn RevisionPinStore>,
     revision_stores: &RevisionStores,
+    durable: &DurableStorage,
 ) -> anyhow::Result<RuntimeConfigActivation> {
     // `env_dir_in` validates `rc.env_id` as a safe directory segment via
     // `EnvId::new`; no separate `EnvId::new` call is needed.
@@ -475,10 +496,22 @@ pub(crate) async fn activate_runtime_config(
         // above intact: it is isolation between revisions, not across reloads of
         // one revision.
         let store_key = revision_store_key(meta, block);
-        let (session_store, state_store) = carried
-            .get(&store_key)
-            .cloned()
-            .unwrap_or_else(|| (new_session_store(), new_state_store()));
+        // A durable backend keys on the SAME identity the registry does, folded
+        // into the keyspace prefix, so a restart re-opens the keyspace this
+        // revision parked into — and no other revision's. See
+        // `crate::durable_state`.
+        let (session_store, state_store) = match carried.get(&store_key).cloned() {
+            Some(pair) => pair,
+            None => durable
+                .stores_for(&revision_namespace_suffix(&store_key))
+                .await
+                .with_context(|| {
+                    format!(
+                        "opening the conversation stores for revision `{}`",
+                        block.revision_id
+                    )
+                })?,
+        };
         retained.insert(
             store_key,
             (Arc::clone(&session_store), Arc::clone(&state_store)),
@@ -886,6 +919,8 @@ fn key_from_bytes(bytes: &[u8], path: &Path) -> anyhow::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greentic_runner_host::storage::{new_session_store, new_state_store};
+
     use greentic_deploy_spec::{
         BundleDeployment, BundleDeploymentStatus, CustomerId, EnvironmentHostConfig, LockedPack,
         PackId, PartyId, RevenueShareEntry, RouteBinding, SchemaVersion, TenantSelector,
@@ -1654,6 +1689,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1681,6 +1717,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1714,6 +1751,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1745,6 +1783,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1779,6 +1818,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         )) {
             Ok(_) => panic!("expected activation to fail at pack reading"),
             Err(e) => e,
@@ -1815,6 +1855,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         ))
         .expect("empty rc activates");
         assert_eq!(activation.routing.dispatcher.deployment_count(), 0);
@@ -1878,6 +1919,7 @@ mod tests {
                 dummy_resolver(),
                 dummy_pin_store(),
                 &stores,
+                &DurableStorage::in_memory(),
             ))
             .is_err(),
             "activation must fail at pack reading (the rc pins no packs)"
@@ -1929,6 +1971,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &stores,
+            &DurableStorage::in_memory(),
         ))
         .expect("empty rc activates");
 
@@ -2110,6 +2153,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         )) {
             Ok(_) => panic!("expected activation to fail closed on a foreign tenant"),
             Err(e) => e,
@@ -2146,6 +2190,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         )) {
             Ok(_) => panic!("expected activation to pass the scope guard and reach pack reading"),
             Err(e) => e,
