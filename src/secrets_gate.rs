@@ -23,6 +23,7 @@ use tokio::runtime::Builder;
 use tracing::info;
 use zip::{ZipArchive, result::ZipError};
 
+use crate::dev_store_path::EnvDirOrigin;
 use crate::operator_log;
 use crate::secret_name;
 use crate::secret_value::SecretValue;
@@ -707,7 +708,9 @@ fn instantiate_manager_for_backend(
     backend_kind: SecretsBackendKind,
 ) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>)> {
     match backend_kind {
-        SecretsBackendKind::DevStore => open_dev_store_manager(bundle_root),
+        // The `--bundle` boot has a real bundle root and no `--store-root`, so
+        // the home-rooted store keeps precedence exactly as before.
+        SecretsBackendKind::DevStore => open_dev_store_manager(bundle_root, EnvDirOrigin::Default),
         SecretsBackendKind::Env => Ok((Arc::new(EnvSecretsManager) as DynSecretsManager, None)),
         SecretsBackendKind::Vault => build_vault_manager(tenant, canonical_team),
     }
@@ -733,14 +736,21 @@ fn instantiate_manager_for_backend(
 /// fail closed when a served deployment's tenant falls outside it (a single
 /// worker pod's Vault manager cannot resolve another tenant org's secrets) —
 /// see `activate_runtime_config`.
+///
+/// `origin` says whether `env_dir` was named by `--store-root`. For the
+/// DevStore backend that decides which of two stores is read — see
+/// [`crate::dev_store_path`] — and it is a parameter rather than something
+/// inferred here because only the boot path knows whether the operator chose
+/// this directory.
 pub fn resolve_serve_secrets_manager(
     env_dir: &Path,
     tenant: &str,
+    origin: EnvDirOrigin,
 ) -> AnyhowResult<(DynSecretsManager, Option<String>)> {
     let raw = env::var(ENV_SERVE_SECRETS_BACKEND).unwrap_or_default();
     let kind = SecretsBackendKind::parse(&raw)
         .with_context(|| format!("invalid {ENV_SERVE_SECRETS_BACKEND}={raw:?}"))?;
-    let (manager, dev_store_path) = serve_secrets_manager_for_kind(kind, env_dir, tenant)?;
+    let (manager, dev_store_path) = serve_secrets_manager_for_kind(kind, env_dir, tenant, origin)?;
     // Wrap with the same canonicalization/team-wildcard fallback chain the
     // `--bundle` runner-host gets via `SecretsManagerHandle::runtime_manager`:
     // stores are keyed with canonical underscore provider segments while the
@@ -765,9 +775,10 @@ fn serve_secrets_manager_for_kind(
     kind: SecretsBackendKind,
     env_dir: &Path,
     tenant: &str,
+    origin: EnvDirOrigin,
 ) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>)> {
     let (manager, dev_store_path) = match kind {
-        SecretsBackendKind::DevStore => open_dev_store_manager(env_dir)?,
+        SecretsBackendKind::DevStore => open_dev_store_manager(env_dir, origin)?,
         SecretsBackendKind::Env => (Arc::new(EnvSecretsManager) as DynSecretsManager, None),
         SecretsBackendKind::Vault => {
             build_vault_manager(tenant, greentic_secrets_lib::TEAM_PLACEHOLDER)?
@@ -788,6 +799,7 @@ fn serve_secrets_manager_for_kind(
 
 fn open_dev_store_manager(
     bundle_root: &Path,
+    origin: EnvDirOrigin,
 ) -> AnyhowResult<(DynSecretsManager, Option<PathBuf>)> {
     // `818e5da` routed the setup *writer* and the `dev_store_path` helpers to
     // the shared env store (`~/.greentic/environments/<env>/.greentic/dev/…`)
@@ -796,9 +808,38 @@ fn open_dev_store_manager(
     // `gtc setup` registered, and every WASM secret read (weather API key, …)
     // came back not-found. Resolve the same env-store-aware path the writer
     // uses; fall back to the bundle root only when no store exists yet.
-    let client = match crate::dev_store_path::find_existing(bundle_root) {
+    //
+    // `origin` is the second half of that: when `--store-root` named this
+    // directory, its own store outranks the home-rooted one, which otherwise
+    // wins and leaves every `op --store-root … secrets put` unread.
+    let choice = crate::dev_store_path::resolve_existing(bundle_root, origin);
+    // A shadowed store is not an error — the chosen one is the right answer —
+    // but reading past an operator's home store without saying so is how this
+    // was silent for a release. Name both paths and the winner.
+    if let (Some(chosen), Some(shadowed)) = (choice.path.as_ref(), choice.shadowed.as_ref()) {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "two dev secret stores exist for this environment; reading `{}` (the \
+                 --store-root this runtime serves from) and ignoring `{}` (the home-rooted \
+                 store). Stage secrets with `op --store-root <root> secrets put`, or drop \
+                 --store-root to use the home store.",
+                chosen.display(),
+                shadowed.display(),
+            ),
+        );
+    }
+    let client = match choice.path {
         Some(store_path) => SecretsClient::open_with_path(store_path)?,
-        None => SecretsClient::open(bundle_root)?,
+        // Nothing is staged anywhere yet. Create the empty store where the
+        // operator's own `op --store-root` writes, so the two agree from the
+        // first boot; without a named root this is the historical home store.
+        None => match origin {
+            EnvDirOrigin::Explicit => SecretsClient::open_with_path(
+                crate::dev_store_path::ensure_env_dir_path(bundle_root)?,
+            )?,
+            EnvDirOrigin::Default => SecretsClient::open(bundle_root)?,
+        },
     };
     let path = client.store_path().map(|path| path.to_path_buf());
     Ok((Arc::new(client) as DynSecretsManager, path))
@@ -1684,7 +1725,8 @@ mod tests {
                 let report = runtime
                     .block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
                 // READER: the runtime side resolves + reads back independently.
-                let (manager, reader_path) = open_dev_store_manager(bundle_root.path())?;
+                let (manager, reader_path) =
+                    open_dev_store_manager(bundle_root.path(), EnvDirOrigin::Default)?;
                 Ok((writer_path, report.ok, manager, reader_path))
             })();
 
@@ -1722,6 +1764,82 @@ mod tests {
         );
         let value = runtime.block_on(async { manager.read(uri).await })?;
         assert_eq!(value, b"WEATHER_KEY".to_vec());
+        Ok(())
+    }
+
+    /// The serve path's half of the `--store-root` fix, end to end through the
+    /// manager rather than through path resolution alone: this is what catches
+    /// an `EnvDirOrigin` that stops being threaded from the boot path.
+    ///
+    /// Both stores exist and hold the SAME uri with DIFFERENT values, so the
+    /// value read names which file was opened — a path assertion alone would
+    /// still pass if the manager were built over the other one.
+    #[test]
+    fn the_serve_manager_reads_the_store_root_store_over_the_home_store() -> anyhow::Result<()> {
+        let home = tempdir()?;
+        let store_root = tempdir()?;
+        let uri = "secrets://local/demo/_/weatherapi_pack/auth_param_get_weather_key";
+        let runtime = Runtime::new()?;
+
+        // The home-rooted store `--store-root` must NOT be read.
+        let home_store = home
+            .path()
+            .join(".greentic/environments/local/.greentic/dev/.dev.secrets.env");
+        // The store the operator staged with `op --store-root <root> secrets put`.
+        let env_dir = store_root.path().join("local");
+        let explicit_store = env_dir.join(".greentic/dev/.dev.secrets.env");
+        for (path, value) in [
+            (&home_store, "HOME_KEY"),
+            (&explicit_store, "STORE_ROOT_KEY"),
+        ] {
+            std::fs::create_dir_all(path.parent().expect("store has a parent"))?;
+            let store = DevStore::with_path(path.clone())?;
+            let seed = SeedDoc {
+                entries: vec![SeedEntry {
+                    uri: uri.to_string(),
+                    format: SecretFormat::Text,
+                    value: SeedValue::Text {
+                        text: value.to_string(),
+                    },
+                    description: None,
+                }],
+            };
+            let report = runtime
+                .block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
+            assert_eq!(report.ok, 1, "seeding {path:?}");
+        }
+
+        let env_guard = crate::test_env_lock().lock().unwrap();
+        let previous = ["HOME", "GREENTIC_ENV", "GREENTIC_DEV_SECRETS_PATH"]
+            .map(|key| (key, env::var_os(key)));
+        unsafe {
+            env::set_var("HOME", home.path());
+            env::set_var("GREENTIC_ENV", "local");
+            env::remove_var("GREENTIC_DEV_SECRETS_PATH");
+        }
+        let opened = open_dev_store_manager(&env_dir, EnvDirOrigin::Explicit);
+        unsafe {
+            for (key, value) in previous {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+        drop(env_guard);
+
+        let (manager, reader_path) = opened?;
+        assert_eq!(
+            reader_path.as_deref(),
+            Some(explicit_store.as_path()),
+            "the runtime must read the store beside the revisions it serves",
+        );
+        let value = runtime.block_on(async { manager.read(uri).await })?;
+        assert_eq!(
+            value,
+            b"STORE_ROOT_KEY".to_vec(),
+            "the home store's value proves the wrong file was opened",
+        );
         Ok(())
     }
 
@@ -2188,8 +2306,12 @@ mod tests {
         // `SecretsClient::open(env_dir)` serve-path boot: it roots the dev store
         // at the env dir and reports its path.
         let env_dir = tempdir()?;
-        let (_manager, dev_store_path) =
-            serve_secrets_manager_for_kind(SecretsBackendKind::DevStore, env_dir.path(), "demo")?;
+        let (_manager, dev_store_path) = serve_secrets_manager_for_kind(
+            SecretsBackendKind::DevStore,
+            env_dir.path(),
+            "demo",
+            EnvDirOrigin::Default,
+        )?;
         assert!(dev_store_path.is_some());
         Ok(())
     }
@@ -2197,8 +2319,12 @@ mod tests {
     #[test]
     fn serve_secrets_manager_for_kind_env_has_no_dev_store() -> anyhow::Result<()> {
         let env_dir = tempdir()?;
-        let (_manager, dev_store_path) =
-            serve_secrets_manager_for_kind(SecretsBackendKind::Env, env_dir.path(), "demo")?;
+        let (_manager, dev_store_path) = serve_secrets_manager_for_kind(
+            SecretsBackendKind::Env,
+            env_dir.path(),
+            "demo",
+            EnvDirOrigin::Default,
+        )?;
         assert!(dev_store_path.is_none());
         Ok(())
     }
@@ -2213,7 +2339,7 @@ mod tests {
         unsafe {
             env::remove_var(ENV_SERVE_SECRETS_BACKEND);
         }
-        let resolved = resolve_serve_secrets_manager(env_dir.path(), "demo");
+        let resolved = resolve_serve_secrets_manager(env_dir.path(), "demo", EnvDirOrigin::Default);
         drop(env_guard);
         let (_manager, tenant_scope) = resolved?;
         assert!(tenant_scope.is_none(), "dev-store is tenant-unscoped");
@@ -2227,7 +2353,7 @@ mod tests {
         unsafe {
             env::set_var(ENV_SERVE_SECRETS_BACKEND, "bogus");
         }
-        let result = resolve_serve_secrets_manager(env_dir.path(), "demo");
+        let result = resolve_serve_secrets_manager(env_dir.path(), "demo", EnvDirOrigin::Default);
         unsafe {
             env::remove_var(ENV_SERVE_SECRETS_BACKEND);
         }
@@ -2264,7 +2390,7 @@ mod tests {
             env::remove_var(ENV_SERVE_SECRETS_BACKEND);
             env::remove_var("GREENTIC_DEV_SECRETS_PATH");
         }
-        let resolved = resolve_serve_secrets_manager(env_dir, "demo");
+        let resolved = resolve_serve_secrets_manager(env_dir, "demo", EnvDirOrigin::Default);
         drop(env_guard);
         let (manager, _tenant_scope) = resolved?;
         Ok(manager)

@@ -767,8 +767,14 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             .tenant_org_id
             .as_deref()
             .unwrap_or(crate::rollout_telemetry::LOCAL_TENANT_FALLBACK);
+        // The env dir's ORIGIN decides which dev store this reads. An operator
+        // who passed `--store-root` staged secrets under it with
+        // `op --store-root <root> secrets put`; without this the reader
+        // resolves the home-rooted store instead and every credentialed read
+        // misses with nothing red anywhere. See `dev_store_path`.
+        let env_dir_origin = request.env_dir_origin();
         let (secrets, secrets_tenant_scope) =
-            crate::secrets_gate::resolve_serve_secrets_manager(&env_dir, tenant)?;
+            crate::secrets_gate::resolve_serve_secrets_manager(&env_dir, tenant, env_dir_origin)?;
         // Clone for the runtime-config watcher's rebuild closure (N2.2): it
         // needs the same backend to rebuild activations after the deployer
         // rewrites `runtime-config.json`. `DynSecretsManager` is `Arc<dyn ...>`,

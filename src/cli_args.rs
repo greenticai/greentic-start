@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::DEFAULT_TEAM;
 use crate::DEFAULT_TENANT;
+use crate::dev_store_path::EnvDirOrigin;
 use crate::runtime::NatsMode;
 
 #[derive(Parser)]
@@ -309,6 +310,28 @@ pub struct StartRequest {
     /// Whether the user explicitly set `--cloudflared` or `--ngrok` on the CLI.
     /// When `false` and the terminal is interactive, we prompt for tunnel selection.
     pub tunnel_explicit: bool,
+}
+
+impl StartRequest {
+    /// Whether the bundle-less serve loop's env dir was NAMED by the operator,
+    /// which is what decides the dev store it reads (see
+    /// [`crate::dev_store_path`]).
+    ///
+    /// A method rather than an inline `match` at the one call site because its
+    /// regression is silent in both directions and neither is caught by
+    /// anything else: a boot that answers `Default` while `--store-root` was
+    /// given reads the `$HOME` store, so every credentialed read misses while
+    /// the deploy succeeds, the process boots and `/livez` stays green; one
+    /// that answers `Explicit` without the flag would move the store out from
+    /// under the `gtc setup` ↔ `gtc start` rendezvous. Keeping the rule here,
+    /// beside the field it reads, is what lets a test drive it from the real
+    /// CLI.
+    pub(crate) fn env_dir_origin(&self) -> EnvDirOrigin {
+        match self.store_root {
+            Some(_) => EnvDirOrigin::Explicit,
+            None => EnvDirOrigin::Default,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -735,5 +758,51 @@ mod tests {
             panic!("did not parse as start");
         };
         assert!(start_request_from_args(args, false).store_root.is_none());
+    }
+
+    /// The flag landing on the request is only half the chain. The other half
+    /// is the ORIGIN it produces, which is what `dev_store_path` orders its
+    /// candidates by — and a regression there is silent: the runtime reads the
+    /// `$HOME` store, every credentialed read misses, and the deploy succeeds
+    /// with `/livez` green. Both tests drive the real parser so the whole
+    /// chain (argv → `StartRequest::store_root` → `EnvDirOrigin`) is covered,
+    /// not just a mapping over an `Option`.
+    #[test]
+    fn the_store_root_flag_makes_the_env_dir_origin_explicit() {
+        let cli = Cli::try_parse_from([
+            "greentic-start",
+            "start",
+            "--store-root",
+            "/srv/envhome",
+            "--env",
+            "local",
+        ])
+        .expect("start --store-root parses");
+        let Command::Start(args) = cli.command else {
+            panic!("did not parse as start");
+        };
+
+        assert_eq!(
+            start_request_from_args(args, false).env_dir_origin(),
+            EnvDirOrigin::Explicit,
+            "an operator who named an env home must get its own dev store",
+        );
+    }
+
+    /// The other direction, and it is not symmetric bookkeeping: answering
+    /// `Explicit` with no flag would move the store out from under the
+    /// `gtc setup` ↔ `gtc start` rendezvous that the `$HOME`-first order
+    /// exists for.
+    #[test]
+    fn without_the_flag_the_env_dir_origin_is_the_default() {
+        let cli = Cli::try_parse_from(["greentic-start", "start"]).expect("start parses");
+        let Command::Start(args) = cli.command else {
+            panic!("did not parse as start");
+        };
+
+        assert_eq!(
+            start_request_from_args(args, false).env_dir_origin(),
+            EnvDirOrigin::Default,
+        );
     }
 }
