@@ -60,23 +60,36 @@ it is not the default, because the failure it produces is invisible.
 ## A shared Redis is a shared blast radius
 
 Every key this writes is under one prefix, and **choosing that prefix is the
-operator's job.** Two environments pointed at one Redis with one namespace do
-not merely see each other's keys: a greentic-session entry key carries the
-tenant, provider, channel, conversation and user but **not the environment**, so
-a lookup that finds the other environment's context drops the entry and returns
-nothing. Two environments sharing a keyspace *evict each other's parked
-conversations* — intermittently, under load, with nothing red anywhere.
+operator's job.**
 
-So:
+Be precise about how much risk that is, because the answer changed once this
+feature landed and over-warning is its own kind of wrong. greentic-start does
+not write under the prefix you configure; it writes under
+`<your prefix>:<revision id>-<digest of deployment, revision, tenant, team,
+customer and bundle>`. Two deployments can only land in the same keyspace when
+**all six** of those agree. In practice that means two environments sharing one
+namespace collide only when they are serving the same bundle, at the same
+revision, for the same tenant, team and customer — a staging and a production
+environment both running `Support-Bot.v2` revision `01JB…` for tenant `acme`,
+say. Different environments running different revisions do not collide at all.
+
+What makes the collision worth avoiding rather than shrugging at is what it
+does when it happens. A greentic-session entry key carries the tenant, provider,
+channel, conversation and user but **not the environment**, so a lookup that
+finds the other environment's context does not return it — it drops the entry
+and returns nothing. Two colliding deployments therefore *evict each other's
+parked conversations* rather than leaking them: no disclosure, but conversations
+that restart intermittently, under load, with nothing red anywhere.
+
+It is cheap to remove entirely, so do:
 
 - give every environment its own `GREENTIC_RUNNER_SESSION_NAMESPACE`, or
 - give every environment its own `GREENTIC_ENV` (the default keyspace is
   `greentic:session:<env>`), or
 - give every environment its own Redis database or instance.
 
-Within one environment, greentic-start folds each pack **revision**'s identity
-into the keyspace automatically — see below. That is the one piece of scoping
-the binary does for you; the environment boundary is yours.
+The revision-level scoping is the one piece the binary does for you; the
+environment boundary is yours.
 
 The same Redis may be shared with `GREENTIC_REVISION_PIN_REDIS_URL` and with
 `GREENTIC_AW_REDIS_URL`; those use their own prefixes.
