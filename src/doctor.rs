@@ -121,13 +121,22 @@ pub fn run_doctor(args: DoctorArgs) -> anyhow::Result<bool> {
     // Env-store readiness checks (PR-3 of `plans/env-manifest-apply.md`).
     if args.env_mode() {
         let env_id = crate::resolve_env(args.env.as_deref());
-        match greentic_deployer::environment::LocalFsStore::default_root() {
+        // `--store-root` names the env home to report on, exactly as it names
+        // the one `start` serves from. Without it this is the home-rooted
+        // default, byte-for-byte the previous behaviour. Every env-mode check
+        // below is scoped to this root, so getting it from the same rule the
+        // boot path uses is what makes doctor's verdict about the environment
+        // the runtime actually runs.
+        let env_dir_origin = args.env_dir_origin();
+        match crate::runtime_config::env_store_root(args.store_root.as_deref()) {
             Some(store_root) => {
                 ctx.report.environment = Some(DoctorEnvironment {
                     env_id: env_id.clone(),
                     store_root: store_root.clone(),
                 });
-                for diagnostic in crate::doctor_env::environment_diagnostics(&store_root, &env_id) {
+                for diagnostic in
+                    crate::doctor_env::environment_diagnostics(&store_root, &env_id, env_dir_origin)
+                {
                     // Env prerequisite failures (resolve/load) must bypass
                     // the --stage filter — a filtered-out prerequisite Error
                     // silently produces exit 0 without running the requested
@@ -152,7 +161,10 @@ pub fn run_doctor(args: DoctorArgs) -> anyhow::Result<bool> {
                         json!({ "store_root_resolves": true }),
                         json!({ "store_root_resolves": false }),
                     ),
-                    Some("Run with a resolvable HOME so ~/.greentic/environments/ can be located."),
+                    Some(
+                        "Pass `--store-root <dir>` to name the environment home explicitly, or \
+                         run with a resolvable HOME so ~/.greentic/environments/ can be located.",
+                    ),
                 ));
             }
         }
@@ -1307,6 +1319,7 @@ mod tests {
             fix_hints: false,
             show_info: false,
             stage: DoctorStageArg::Routes,
+            store_root: None,
         };
         let mut ctx = DoctorCtx {
             report: DoctorReport {

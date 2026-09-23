@@ -67,6 +67,20 @@ pub(crate) fn env_dir_in(root: &Path, env_id: &str) -> anyhow::Result<PathBuf> {
     Ok(root.join(env_id))
 }
 
+/// The environment store root to work against: the one the operator named
+/// with `--store-root`, else the home-rooted default. `None` only when there
+/// is no default either (no `HOME` / `USERPROFILE`).
+///
+/// One rule, one place, because the boot path and `doctor` must answer it
+/// identically: a doctor that resolves a different root than the runtime
+/// reports on an environment nobody serves, which is the whole of #620.
+pub(crate) fn env_store_root(explicit: Option<&Path>) -> Option<PathBuf> {
+    match explicit {
+        Some(root) => Some(root.to_path_buf()),
+        None => LocalFsStore::default_root(),
+    }
+}
+
 fn env_dir(env_id: &str) -> anyhow::Result<PathBuf> {
     let root = LocalFsStore::default_root()
         .context("cannot determine the default environment store root (no home directory)")?;

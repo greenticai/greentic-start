@@ -79,14 +79,6 @@ fn write_path_for_env(bundle_root: &Path, env: &str) -> PathBuf {
     env_store_dev_secrets_path(env).unwrap_or_else(|| bundle_root.join(STORE_RELATIVE))
 }
 
-/// The write path for a bare caller: the shared env store when an env is
-/// selected via `$GREENTIC_ENV`, else the legacy bundle-local path.
-fn bare_write_path(bundle_root: &Path) -> PathBuf {
-    selected_env()
-        .and_then(|env| env_store_dev_secrets_path(&env))
-        .unwrap_or_else(|| bundle_root.join(STORE_RELATIVE))
-}
-
 /// Whether the directory a store is being resolved against was named by the
 /// operator, or merely derived from the default home-rooted store.
 ///
@@ -103,6 +95,24 @@ pub enum EnvDirOrigin {
     Default,
     /// `--store-root` named this env dir, so its own store wins.
     Explicit,
+}
+
+impl EnvDirOrigin {
+    /// The origin implied by a `--store-root` value: `Some` means the operator
+    /// named the env home, `None` means it was derived from the default store.
+    ///
+    /// This one-line rule lives here, rather than at each subcommand, because
+    /// every command that grows a `--store-root` has to answer it the same way
+    /// and a divergent answer is silent in both directions — see
+    /// [`crate::cli_args::StartRequest::env_dir_origin`] for what each
+    /// direction costs. `start` and `doctor` both call this, which is what
+    /// makes doctor's verdict about the store the runtime actually reads.
+    pub(crate) fn of_store_root(store_root: Option<&Path>) -> Self {
+        match store_root {
+            Some(_) => Self::Explicit,
+            None => Self::Default,
+        }
+    }
 }
 
 /// The dev store a reader resolved to, plus the one it passed over.
@@ -223,14 +233,75 @@ pub fn resolve_existing_with_override(
     choose(env_dir, origin, home_store_path().as_deref(), override_path)
 }
 
+/// [`resolve_existing`], with the home-rooted candidate resolved for `env`
+/// rather than for `$GREENTIC_ENV`.
+///
+/// `start` propagates `--env` INTO `$GREENTIC_ENV` before any store lookup, so
+/// for the boot path the two are always the same value and
+/// [`resolve_existing`] is correct. A read-only caller cannot do that — and
+/// one that skips this ends up with no home candidate at all (the ordinary
+/// case: `$GREENTIC_ENV` is unset in an operator's shell) or with the home
+/// store of a DIFFERENT environment (when it is set and `--env` disagrees).
+/// Either way it answers about a store the runtime would not read, which is
+/// the defect this whole module keeps producing in new places.
+pub fn resolve_existing_for_env(env_dir: &Path, origin: EnvDirOrigin, env: &str) -> DevStoreChoice {
+    choose(
+        env_dir,
+        origin,
+        env_store_dev_secrets_path(env).as_deref(),
+        override_path().as_deref(),
+    )
+}
+
+/// The store a reader would CREATE for `env_dir` when nothing is staged
+/// anywhere yet — without creating it.
+///
+/// This is the other half of [`resolve_existing`]: that one answers "which
+/// existing store do I read", this one answers "which store should exist".
+/// Doctor needs the second and may not mutate the env dir, so it cannot reach
+/// for [`ensure_path`] / [`ensure_env_dir_path`] — but it must name the same
+/// file they would, or it sends an operator to seed a store nothing reads.
+/// Both writers therefore route through here, so the prediction and the
+/// creation cannot drift apart.
+pub fn expected_path(env_dir: &Path, origin: EnvDirOrigin) -> PathBuf {
+    expected_path_with(env_dir, origin, home_store_path().as_deref())
+}
+
+/// [`expected_path`], with the home-rooted candidate resolved for `env` rather
+/// than for `$GREENTIC_ENV` — the naming counterpart of
+/// [`resolve_existing_for_env`], and it must move with it: a reader that
+/// resolves against one home candidate and NAMES another is back to sending
+/// an operator to the wrong file.
+pub fn expected_path_for_env(env_dir: &Path, origin: EnvDirOrigin, env: &str) -> PathBuf {
+    expected_path_with(env_dir, origin, env_store_dev_secrets_path(env).as_deref())
+}
+
+/// The decision, with the home lookup already made by the caller — the same
+/// split, for the same reason, as [`choose`].
+fn expected_path_with(env_dir: &Path, origin: EnvDirOrigin, home_store: Option<&Path>) -> PathBuf {
+    // The override names one exact file and outranks both roots, exactly as
+    // it does for a read.
+    if let Some(path) = override_path() {
+        return path;
+    }
+    match origin {
+        // An operator who named this root stages secrets under it with
+        // `op --store-root <root> secrets put`; the store belongs beside the
+        // revisions, not under `$HOME`.
+        EnvDirOrigin::Explicit => env_dir_store_path(env_dir),
+        // Byte-for-byte the historical answer: the `$HOME` store that the
+        // `gtc setup` ↔ `gtc start` rendezvous is built on, falling back to
+        // the bundle-local path when no home store can be resolved.
+        EnvDirOrigin::Default => home_store
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| env_dir_store_path(env_dir)),
+    }
+}
+
 /// Ensures the default dev store path exists (creating parent directories).
 /// Routes to the shared env store when `$GREENTIC_ENV` is set.
 pub fn ensure_path(bundle_root: &Path) -> Result<PathBuf> {
-    if let Some(path) = override_path() {
-        ensure_parent(&path)?;
-        return Ok(path);
-    }
-    let path = bare_write_path(bundle_root);
+    let path = expected_path(bundle_root, EnvDirOrigin::Default);
     ensure_parent(&path)?;
     Ok(path)
 }
@@ -256,18 +327,9 @@ pub fn ensure_path_for_env(bundle_root: &Path, env: &str) -> Result<PathBuf> {
 /// empty file under `$HOME` that the next boot would then have to report as
 /// shadowed.
 pub fn ensure_env_dir_path(env_dir: &Path) -> Result<PathBuf> {
-    if let Some(path) = override_path() {
-        ensure_parent(&path)?;
-        return Ok(path);
-    }
-    let path = env_dir_store_path(env_dir);
+    let path = expected_path(env_dir, EnvDirOrigin::Explicit);
     ensure_parent(&path)?;
     Ok(path)
-}
-
-/// Returns the default dev store path without creating anything.
-pub fn default_path(bundle_root: &Path) -> PathBuf {
-    override_path().unwrap_or_else(|| bare_write_path(bundle_root))
 }
 
 fn ensure_parent(path: &Path) -> anyhow::Result<()> {
@@ -462,6 +524,145 @@ mod tests {
 
         assert_eq!(choice.path.as_deref(), Some(override_store.as_path()));
         assert_eq!(choice.shadowed, None);
+    }
+
+    /// The other half of the ruling, for a reader that has to NAME a store
+    /// rather than read one. Doctor reports this path as the remedy when no
+    /// store exists yet, so it must be the file the runtime would create —
+    /// naming the `$HOME` one under `--store-root` is what sent an operator
+    /// to seed a store nothing reads (#620).
+    #[test]
+    fn the_expected_path_for_an_explicit_env_dir_sits_beside_the_revisions() {
+        // `expected_path` consults `$GREENTIC_DEV_SECRETS_PATH`, which other
+        // tests set; the crate-wide lock is what keeps this deterministic.
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_home_root, _home_store, _store_root, env_dir) = roots();
+
+        assert_eq!(
+            expected_path(&env_dir, EnvDirOrigin::Explicit),
+            env_dir_store_path(&env_dir),
+        );
+    }
+
+    /// The prediction and the creation are one rule: whatever
+    /// [`ensure_env_dir_path`] would make is what [`expected_path`] names.
+    /// Two copies of this would drift silently — the prediction is only ever
+    /// read by a human, so a wrong one fails nothing.
+    #[test]
+    fn the_expected_path_is_the_one_the_writer_would_create() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_home_root, _home_store, _store_root, env_dir) = roots();
+
+        let created = ensure_env_dir_path(&env_dir).expect("writer resolves a path");
+
+        assert_eq!(created, expected_path(&env_dir, EnvDirOrigin::Explicit));
+        assert!(
+            created.parent().is_some_and(Path::exists),
+            "the writer creates the parent; the prediction must not",
+        );
+    }
+
+    /// A read-only caller names the env instead of exporting `$GREENTIC_ENV`,
+    /// and gets the same home candidate the boot path would have had.
+    ///
+    /// `start` propagates `--env` into the process env before it resolves a
+    /// store, so its home candidate always matches the env it serves. `doctor`
+    /// cannot, and without this its home candidate is simply ABSENT in an
+    /// ordinary shell — which silently disables the shadowed-store report, the
+    /// half of #620 that exists to say "two stores exist and I read this one".
+    #[test]
+    fn naming_the_env_gives_the_home_candidate_that_greentic_env_would_have() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempdir().expect("home");
+        let home_store = stage_store(&home.path().join(".greentic").join("environments"));
+        let store_root = tempdir().expect("store root");
+        let env_dir = store_root.path().join(ENV_ID);
+        let explicit_store = stage_store(store_root.path());
+        // `$HOME` is set but `$GREENTIC_ENV` is NOT — an operator's shell.
+        let previous_home = env::var_os("HOME");
+        let previous_env = env::var_os("GREENTIC_ENV");
+        // SAFETY: serialized by the crate-wide test env lock held above.
+        unsafe {
+            env::set_var("HOME", home.path());
+            env::remove_var("GREENTIC_ENV");
+        }
+
+        let ambient = resolve_existing_with_override(&env_dir, EnvDirOrigin::Explicit, None);
+        let named = resolve_existing_for_env(&env_dir, EnvDirOrigin::Explicit, ENV_ID);
+
+        // SAFETY: same lock.
+        unsafe {
+            match previous_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+            if let Some(value) = previous_env {
+                env::set_var("GREENTIC_ENV", value);
+            }
+        }
+
+        assert_eq!(ambient.path.as_deref(), Some(explicit_store.as_path()));
+        assert_eq!(
+            ambient.shadowed, None,
+            "with no $GREENTIC_ENV there is no home candidate to shadow, so the \
+             report an operator needs never fires",
+        );
+        assert_eq!(named.path.as_deref(), Some(explicit_store.as_path()));
+        assert_eq!(
+            named.shadowed.as_deref(),
+            Some(home_store.as_path()),
+            "naming the env recovers the home candidate, and with it the report",
+        );
+    }
+
+    /// The naming counterpart must follow the resolver. A reader that resolves
+    /// against one home candidate and NAMES another is back to pointing an
+    /// operator at a file nothing reads.
+    #[test]
+    fn the_named_env_expected_path_follows_the_named_env_resolver() {
+        let _lock = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (home_root, _home_store, _store_root, env_dir) = roots();
+
+        let previous_home = env::var_os("HOME");
+        // SAFETY: serialized by the crate-wide test env lock held above.
+        unsafe { env::set_var("HOME", home_root.path()) };
+        let named = expected_path_for_env(&env_dir, EnvDirOrigin::Default, ENV_ID);
+        let explicit = expected_path_for_env(&env_dir, EnvDirOrigin::Explicit, ENV_ID);
+        // SAFETY: same lock.
+        unsafe {
+            match previous_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+        }
+
+        assert_eq!(
+            named,
+            env_dir_store_path(&home_root.path().join(".greentic/environments").join(ENV_ID)),
+            "no --store-root still names the home store, whatever $GREENTIC_ENV says",
+        );
+        assert_eq!(explicit, env_dir_store_path(&env_dir));
+    }
+
+    /// `--store-root` is the only input to the origin, and both commands that
+    /// take the flag route through this one rule. A second copy at a new
+    /// subcommand is how doctor and start would come to disagree about which
+    /// store is authoritative.
+    #[test]
+    fn the_origin_follows_whether_a_store_root_was_named() {
+        assert_eq!(
+            EnvDirOrigin::of_store_root(Some(Path::new("/srv/envA"))),
+            EnvDirOrigin::Explicit,
+        );
+        assert_eq!(EnvDirOrigin::of_store_root(None), EnvDirOrigin::Default);
     }
 
     /// Holds the shared env lock and restores `HOME` / `GREENTIC_ENV` on drop,

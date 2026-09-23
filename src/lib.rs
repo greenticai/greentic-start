@@ -506,12 +506,8 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // serve an env home staged at an arbitrary path — which is how
         // greentic-deployer's `op` provisions one per environment. Without the
         // flag this is byte-for-byte the previous behaviour.
-        let store_root = match request.store_root.clone() {
-            Some(root) => root,
-            None => greentic_deployer::environment::LocalFsStore::default_root().context(
-                "cannot determine the default environment store root (no home directory)",
-            )?,
-        };
+        let store_root = runtime_config::env_store_root(request.store_root.as_deref())
+            .context("cannot determine the default environment store root (no home directory)")?;
         // Read the config from the SAME root we serve from. `env_dir_in` already
         // takes the root explicitly; pairing it with the root-implicit
         // `load_or_empty` would silently load the default store's config while
