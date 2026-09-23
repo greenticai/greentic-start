@@ -61,6 +61,16 @@ pub(crate) struct AgentSkillMeta {
 /// The `agent` object: what the A2A card says about the worker.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub(crate) struct AgentMeta {
+    /// The worker's own agent id, when the designer stages one.
+    ///
+    /// Read by usage metering alone — the A2A card publishes a NAME, not an
+    /// id. It exists because nothing else in this runtime knows one: the
+    /// `dw.agent` node output carries `reply`/`trail`/`terminated_by`/`usage`
+    /// and the reply `Activity` carries a pack id, so an absent value falls
+    /// back to the unit's bundle id rather than being invented. See
+    /// [`crate::interop::metering::TurnMetering::for_unit`].
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -81,6 +91,9 @@ pub(crate) struct InteropConfig {
     pub issuer: Option<String>,
     pub mcp_resource: Option<String>,
     pub agent: AgentMeta,
+    /// Where to record what a turn spent (§8.1). **Absent means metering is
+    /// off**, which is every deployment staged before it existed.
+    pub metering: Option<super::metering::MeteringConfig>,
 }
 
 /// Wire form of one credential, before validation.
@@ -111,6 +124,8 @@ struct RawConfig {
     mcp_resource: Option<String>,
     #[serde(default)]
     agent: Option<Value>,
+    #[serde(default)]
+    metering: Option<Value>,
 }
 
 /// Parse the staged bytes. `None` means "treat as absent": the document is not
@@ -168,6 +183,12 @@ pub(crate) fn parse(bytes: &[u8], unit: &str) -> Option<InteropConfig> {
             }
         })
         .unwrap_or_default();
+    // A malformed or unsafe `metering` block switches METERING off and
+    // nothing else, for the same reason a malformed credential is dropped
+    // alone: losing a usage row must never cost a unit its interop surface.
+    let metering = raw
+        .metering
+        .and_then(|value| super::metering::parse_metering(value, unit));
     Some(InteropConfig {
         a2a: raw.a2a,
         mcp: raw.mcp,
@@ -176,6 +197,7 @@ pub(crate) fn parse(bytes: &[u8], unit: &str) -> Option<InteropConfig> {
         issuer: non_empty(raw.issuer),
         mcp_resource: non_empty(raw.mcp_resource),
         agent,
+        metering,
     })
 }
 

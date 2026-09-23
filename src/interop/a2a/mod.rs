@@ -87,6 +87,9 @@ pub(crate) struct A2aContext<'a> {
     /// The wall clock the credential expiry is judged against, threaded in so
     /// a test can drive it.
     pub now_ms: u64,
+    /// Where to record what this unit's turns spend. `None` is the whole off
+    /// switch: a unit that stages no `metering` block has nothing to call.
+    pub metering: Option<super::metering::TurnMetering>,
 }
 
 /// The request facts the handlers read, gathered before the body is consumed.

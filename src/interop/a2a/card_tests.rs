@@ -53,6 +53,9 @@ impl Fixture {
             limiter: &self.limiter,
             turns: &self.turns,
             now_ms: 0,
+            // The card is served before any authentication and runs no turn,
+            // so there is nothing to meter on this path.
+            metering: None,
         }
     }
 }
@@ -80,6 +83,8 @@ async fn body_json(response: HttpResponse) -> Value {
 async fn the_card_is_synthesized_from_the_staged_agent_with_an_etag() {
     let mut staged = config();
     staged.agent = AgentMeta {
+        // Read by usage metering, never published on the card.
+        id: None,
         name: Some("Support Bot".into()),
         description: Some("Answers support questions.".into()),
         version: None,

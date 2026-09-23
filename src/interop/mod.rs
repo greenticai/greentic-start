@@ -9,6 +9,7 @@ pub(crate) mod config;
 pub(crate) mod config_cache;
 pub(crate) mod limits;
 pub(crate) mod mcp;
+pub(crate) mod metering;
 pub(crate) mod reply;
 
 /// Longest caller key accepted. A caller key is a session-namespace segment
@@ -73,6 +74,10 @@ pub(crate) struct InteropState {
     /// The per-deployment concurrent-turn cap. `Arc` because the MCP tool
     /// runs inside an `rmcp` handler that outlives the request borrow.
     pub turns: std::sync::Arc<limits::TurnGate>,
+    /// The bounded queue interop turns record their usage on. Process-wide
+    /// because the bound is what matters; each event carries its own unit's
+    /// endpoint. See [`metering`].
+    pub meter: std::sync::Arc<metering::Meter>,
     /// See [`TurnOverride`].
     #[cfg(test)]
     pub turn_override: Option<TurnOverride>,
@@ -92,6 +97,7 @@ impl InteropState {
                     .ok()
                     .as_deref(),
             ))),
+            meter: std::sync::Arc::new(metering::Meter::default()),
             #[cfg(test)]
             turn_override: None,
         }
@@ -107,6 +113,7 @@ impl Default for InteropState {
             configs: config_cache::UnitConfigCache::default(),
             limiter: std::sync::Arc::new(limits::RateLimiter::default()),
             turns: std::sync::Arc::new(limits::TurnGate::new(limits::DEFAULT_MAX_CONCURRENT_TURNS)),
+            meter: std::sync::Arc::new(metering::Meter::default()),
             #[cfg(test)]
             turn_override: None,
         }

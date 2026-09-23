@@ -16,6 +16,7 @@
 //! GREENTIC_INTEROP_E2E_BASE              the listener's base URL, e.g. http://127.0.0.1:8899
 //! GREENTIC_INTEROP_E2E_TOKEN             a plaintext gtw_ token whose sha256 is staged
 //! GREENTIC_INTEROP_E2E_HOME_STORE_TOKEN  the DECOY token staged only in the $HOME store
+//! GREENTIC_INTEROP_E2E_METERING_PORT     the loopback port staged as `metering.endpoint`
 //! ```
 //!
 //! ```bash
@@ -104,6 +105,25 @@
 //! `two dev secret stores exist for this environment` warning, which names
 //! both paths and the winner.
 //!
+//! # Metering (contract §8)
+//!
+//! [`a_metered_turn_reports_its_usage`] stands a stub admin up ON THIS HOST
+//! and waits for the runtime to POST one usage event. That only works if the
+//! staged config names it, so pick a port first and put it in the secret:
+//!
+//! ```bash
+//! METERING_PORT=8907
+//! # …in the same `D secrets put` document as the credentials above, add:
+//! #   "metering": {"endpoint": "http://127.0.0.1:8907/usage", "token": "gtm_e2e"}
+//! # Loopback http is accepted on purpose (`parse_metering`); anything else
+//! # off-host must be https, or the runtime refuses to send the token at all.
+//! GREENTIC_INTEROP_E2E_METERING_PORT=$METERING_PORT … cargo test …
+//! ```
+//!
+//! The test skips when the variable is unset, because a deployment with no
+//! `metering` block is the correct, common state and failing on it would
+//! report a missing feature as a broken one.
+//!
 //! # What is deliberately NOT here
 //!
 //! The Phase 0b generic-ingress gate needs a NON-loopback peer
@@ -143,6 +163,9 @@ const TOKEN_ENV: &str = "GREENTIC_INTEROP_E2E_TOKEN";
 /// The decoy token, staged ONLY in the `$HOME`-rooted store. See
 /// [`the_store_root_config_wins_over_the_home_store`].
 const HOME_STORE_TOKEN_ENV: &str = "GREENTIC_INTEROP_E2E_HOME_STORE_TOKEN";
+/// The loopback port the live server's staged `metering.endpoint` names. See
+/// [`a_metered_turn_reports_its_usage`].
+const METERING_PORT_ENV: &str = "GREENTIC_INTEROP_E2E_METERING_PORT";
 
 /// The live server's base URL and a token staged for it.
 ///
@@ -716,4 +739,129 @@ fn the_store_root_config_wins_over_the_home_store() {
         "the $HOME store's token was accepted, so the runtime read the home store \
          rather than the one --store-root names"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Metering (worker-interop contract §8)
+// ---------------------------------------------------------------------------
+
+/// A real turn, through a real process, reports what it spent to a real HTTP
+/// listener.
+///
+/// Every in-process metering test drives the emit site with a fake runner, so
+/// the usage numbers come from a fixture. This is the only check that the
+/// object a LIVE `dw.agent` node returns still carries a `usage` the runtime
+/// can read — the same class of gap [`the_store_root_config_wins_over_the_home_store`]
+/// exists for, and one that fails silently: a runner whose output shape moved
+/// records zeros for every turn forever, and zeros are a legal answer.
+///
+/// It needs a worker whose flow actually reaches a `dw.agent` node; a
+/// card-only flow correctly reports zeros and proves only the transport.
+#[test]
+#[ignore = "needs a live greentic-start staged with a metering block; see the module docs"]
+fn a_metered_turn_reports_its_usage() {
+    let (base, token) = target();
+    let Ok(port) = std::env::var(METERING_PORT_ENV) else {
+        eprintln!(
+            "skipping: {METERING_PORT_ENV} is unset, so no stub admin address was \
+             staged — see this module's docs"
+        );
+        return;
+    };
+    let listener = std::net::TcpListener::bind(format!("127.0.0.1:{port}")).unwrap_or_else(|err| {
+        panic!(
+            "{METERING_PORT_ENV}={port} could not be bound ({err}); it must be the port \
+             the staged `metering.endpoint` names, and nothing else may hold it"
+        )
+    });
+    listener
+        .set_nonblocking(false)
+        .expect("a blocking stub listener");
+
+    let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorder = std::sync::Arc::clone(&collected);
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for stream in listener.incoming().take(4) {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = vec![0u8; 16384];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            if let Ok(mut collected) = recorder.lock() {
+                collected.push(String::from_utf8_lossy(&buf[..read]).to_string());
+            }
+            let body = r#"{"event_id":"01J","stored":true}"#;
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: \
+                     {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.flush();
+        }
+    });
+
+    let reply = a2a_send(&base, &token, None, json!([{"text": "hello"}]));
+    assert_eq!(reply["role"], "ROLE_AGENT", "{reply}");
+
+    // The POST is fire-and-forget, so it lands shortly AFTER the answer.
+    let mut request = String::new();
+    for _ in 0..100 {
+        if let Ok(collected) = collected.lock()
+            && let Some(first) = collected.first()
+        {
+            request = first.clone();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        !request.is_empty(),
+        "no usage event arrived; is `metering` staged for this unit, and does its \
+         endpoint name 127.0.0.1:{port}?"
+    );
+    assert!(request.starts_with("POST "), "{request}");
+    assert!(
+        request.to_lowercase().contains("authorization: bearer "),
+        "the usage token must travel as a bearer header: {request}"
+    );
+    let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+    let event: Value = serde_json::from_str(body).expect("a JSON usage event");
+    assert_eq!(event["surface"], "a2a", "{event}");
+    assert!(event["event_id"].as_str().is_some_and(|id| id.len() == 26));
+    assert!(
+        event["deployment_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    assert!(event["duration_ms"].is_u64(), "{event}");
+    assert!(
+        event["occurred_at"]
+            .as_str()
+            .is_some_and(|at| at.ends_with('Z')),
+        "{event}"
+    );
+    // A turn that reached a `dw.agent` node spent tokens. A card-only flow
+    // correctly reports zero, so this is reported rather than asserted.
+    if event["tokens_in"] == json!(0) && event["tokens_out"] == json!(0) {
+        eprintln!(
+            "note: this turn reported zero tokens. That is correct for a card-only flow, \
+             and a real regression for a worker with a dw.agent node: {event}"
+        );
+    }
+    // Whatever the turn said, none of it may be in the event.
+    let wire = event.to_string();
+    assert!(
+        !wire.contains("hello"),
+        "the caller's message reached the usage body: {wire}"
+    );
+    let answered = reply_text(&reply);
+    let answered = answered.trim();
+    if !answered.is_empty() {
+        assert!(
+            !wire.contains(answered),
+            "the worker's reply reached the usage body: {wire}"
+        );
+    }
 }

@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 
 use crate::interop::a2a::rpc::TurnRunner;
 use crate::interop::limits::{RateLimiter, TURN_COST, TurnGate};
+use crate::interop::metering::event::{Surface, usage_from_replies};
 use crate::interop::reply::{ReplyItem, project_replies};
 use greentic_deploy_spec::ids::DeploymentId;
 
@@ -48,6 +49,14 @@ pub(crate) struct McpContext {
     /// The OAuth `sub` or the staged credential id — the conversation
     /// namespace, so two callers cannot resume each other's parked flow.
     pub caller_key: String,
+    /// The staged credential id when the caller authenticated with the A2A
+    /// bearer, `None` for an OAuth one. Distinct from `caller_key`, which
+    /// collapses the two: a usage event may only name a credential the
+    /// designer staged, and an OAuth `sub` is not one.
+    pub credential_id: Option<String>,
+    /// Where to record what this unit's turns spend. `None` when the unit
+    /// stages no `metering` block.
+    pub metering: Option<crate::interop::metering::TurnMetering>,
     /// What the worker calls itself, for the server's `instructions`.
     pub agent_name: String,
 }
@@ -139,7 +148,26 @@ impl WorkerMcpServer {
         };
 
         let payload = json!({ "text": message });
-        let Ok(replies) = self.ctx.runner.run(&session_hint, &user, &payload).await else {
+        // One event per turn that RAN — see the same comment in
+        // `a2a::rpc::send_message`. Everything refused above (an empty
+        // message, a bad conversation id, the limiter, a full turn gate) ran
+        // nothing and records nothing.
+        let started = std::time::Instant::now();
+        let outcome = self.ctx.runner.run(&session_hint, &user, &payload).await;
+        let elapsed = started.elapsed();
+        if let Some(metering) = self.ctx.metering.as_ref() {
+            let usage = outcome
+                .as_ref()
+                .map(|replies| usage_from_replies(replies))
+                .unwrap_or_default();
+            metering.record(
+                Surface::Mcp,
+                self.ctx.credential_id.as_deref(),
+                usage,
+                elapsed,
+            );
+        }
+        let Ok(replies) = outcome else {
             // A tool-level error, not a protocol error: the request was valid
             // and reached the worker; the TURN is what failed.
             return Ok(failed(
@@ -302,3 +330,7 @@ pub(crate) fn service(
         config,
     )
 }
+
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod server_tests;

@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use greentic_runner_host::Activity;
 
 use super::super::limits::{CHEAP_COST, TURN_COST};
+use super::super::metering::event::{Surface, usage_from_replies};
 use super::super::reply::{ReplyItem, project_replies};
 use super::types::{
     CancelTaskRequest, GetTaskRequest, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
@@ -129,10 +130,22 @@ async fn send_message(
         .turns
         .try_acquire(ctx.deployment_id)
         .ok_or(SendError::Busy)?;
-    let replies = runner
-        .run(&session_hint, &user, &payload)
-        .await
-        .map_err(|_| SendError::Internal)?;
+    // One event per turn that RAN, recorded whether or not the turn
+    // succeeded: a turn that failed after calling the model still spent, and
+    // the honest reading of one that failed before is zeros. Everything
+    // refused ABOVE this line — a bad bearer, the limiter, invalid params, a
+    // full turn gate — ran nothing and records nothing.
+    let started = std::time::Instant::now();
+    let outcome = runner.run(&session_hint, &user, &payload).await;
+    let elapsed = started.elapsed();
+    if let Some(metering) = ctx.metering.as_ref() {
+        let usage = outcome
+            .as_ref()
+            .map(|replies| usage_from_replies(replies))
+            .unwrap_or_default();
+        metering.record(Surface::A2a, Some(credential_id), usage, elapsed);
+    }
+    let replies = outcome.map_err(|_| SendError::Internal)?;
     let projected = project_replies(&replies, "a2a", ctx.tenant, ctx.bundle_id, &session_hint);
     let mut parts = Vec::new();
     for item in projected.items {
