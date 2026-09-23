@@ -113,7 +113,7 @@ pub fn log(level: Level, target: &str, message: String) {
 /// read stdout/stderr, not the on-disk `system.log`), a pipe, or CI. False for
 /// an interactive terminal, so local sessions keep stderr quiet and rely on the
 /// file as today. Evaluated once (the stderr fd is fixed for the process life).
-fn mirror_to_stderr() -> bool {
+pub(crate) fn mirror_to_stderr() -> bool {
     use std::io::IsTerminal;
     static IS_TTY: OnceLock<bool> = OnceLock::new();
     !*IS_TTY.get_or_init(|| std::io::stderr().is_terminal())
