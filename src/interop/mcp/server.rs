@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::interop::a2a::rpc::TurnRunner;
-use crate::interop::limits::TurnGate;
+use crate::interop::limits::{RateLimiter, TURN_COST, TurnGate};
 use crate::interop::reply::{ReplyItem, project_replies};
 use greentic_deploy_spec::ids::DeploymentId;
 
@@ -36,6 +36,12 @@ const MAX_CONVERSATION_ID_LEN: usize = 256;
 pub(crate) struct McpContext {
     pub runner: Arc<dyn TurnRunner>,
     pub turns: Arc<TurnGate>,
+    /// The same bucket table the transport charged the pre-filter against, so
+    /// the tool can settle the true price of a turn. See
+    /// [`crate::interop::mcp::request_cost`].
+    pub limiter: Arc<RateLimiter>,
+    /// What this request already paid from the `Mcp-Method` pre-filter.
+    pub prepaid: f64,
     pub deployment_id: DeploymentId,
     pub tenant: String,
     pub bundle_id: String,
@@ -109,6 +115,20 @@ impl WorkerMcpServer {
         };
         let session_hint = format!("mcp:{}:{conversation_id}", self.ctx.caller_key);
         let user = format!("mcp:{}", self.ctx.caller_key);
+
+        // Settle the true price BEFORE running anything. The transport priced
+        // this request from the caller's own `Mcp-Method` header, which a
+        // `tools/call` may announce as `tools/list`; this is what makes a turn
+        // cost a turn regardless.
+        let owed = TURN_COST - self.ctx.prepaid;
+        if owed > 0.0
+            && let Err(retry_after) = self.ctx.limiter.check(&self.ctx.caller_key, owed)
+        {
+            return Ok(failed(
+                &conversation_id,
+                &format!("too many turns from this connection; retry in {retry_after} seconds"),
+            ));
+        }
 
         // The cap is per deployment and nothing queues: an MCP caller holds
         // its connection open for the whole turn, so a queue would convert a

@@ -859,6 +859,58 @@ async fn the_mcp_paths_fall_through_when_mcp_is_off() {
     );
 }
 
+/// A turn costs a turn however the request ANNOUNCES itself.
+///
+/// The transport prices a request from the caller's own `Mcp-Method` header,
+/// so a `tools/call` body may arrive labelled `tools/list` — the cheap tier.
+/// The `ask` tool settles the remainder, so the honest and the lying client
+/// get the same number of turns out of one bucket. Without that settle-up a
+/// lying client gets twice as many, which is a rate limit the caller sets for
+/// itself.
+#[tokio::test]
+async fn a_lying_mcp_method_header_still_pays_for_its_turn() {
+    let (activation, _) = activation_with(Store::Mcp(None));
+    let state = state_with(
+        activation,
+        interop_with_base_url(vec![Activity::text("ok")]),
+    );
+    let mut turns = 0;
+    for _ in 0..80 {
+        let response = exchange(
+            &state,
+            false,
+            // The body is a `tools/call`; the header says `tools/list`.
+            &post(
+                "/mcp",
+                &mcp_headers("tools/list"),
+                &tools_call("hi", Some("c")),
+            ),
+        )
+        .await;
+        if response.status == 429 {
+            break;
+        }
+        let value = response.json();
+        if value["result"]["isError"] == json!(true) {
+            assert!(
+                value["result"]["content"][0]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("too many turns")),
+                "the only tool-level failure here is the rate limit: {}",
+                response.body
+            );
+            break;
+        }
+        turns += 1;
+    }
+    // Burst 120 at 2 per turn is 60 turns; the pre-filter charged 1 of each
+    // pair, the tool settled the other.
+    assert_eq!(
+        turns, 60,
+        "a cheap-labelled turn must cost the same as an honest one"
+    );
+}
+
 /// The limiter keys on the caller and meters on `Mcp-Method`: a `tools/call`
 /// costs two, so a full burst is 60 of them.
 #[tokio::test]

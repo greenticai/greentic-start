@@ -32,13 +32,11 @@ pub(crate) const PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-r
 pub(crate) const PROTECTED_RESOURCE_MCP_PATH: &str = "/.well-known/oauth-protected-resource/mcp";
 
 /// The header SEP-2243 requires an MCP client to send, naming the JSON-RPC
-/// method. Read for rate limiting only, so the limiter never parses a body.
+/// method. Read as a PRE-FILTER only — see [`request_cost`].
 pub(crate) const MCP_METHOD_HEADER: &str = "mcp-method";
 
-/// The methods charged the cheap rate. An ALLOW-LIST: an absent, misspelled
-/// or unknown method falls into the expensive tier, which is the only shape
-/// that fails closed — with a deny-list, a client could pay the cheap rate for
-/// `tools/call` by omitting the header.
+/// The methods charged the cheap rate up front. An ALLOW-LIST, so an absent,
+/// misspelled or unknown method pays the expensive tier immediately.
 const CHEAP_METHODS: &[&str] = &[
     "initialize",
     "notifications/initialized",
@@ -77,7 +75,24 @@ pub(crate) fn is_cors_excluded(path: &str) -> bool {
     path == MCP_PATH
 }
 
-/// What this request costs the caller's token bucket.
+/// What to charge this request BEFORE the body is parsed.
+///
+/// **The header is a pre-filter, never the final price.** It is supplied by
+/// the caller, and the method actually executed comes from the body inside
+/// `rmcp` — so a caller can send `Mcp-Method: tools/list` with a `tools/call`
+/// body. Pricing a turn from that header alone would let it run turns at the
+/// cheap rate, which is a rate limit a caller sets for itself.
+///
+/// Two halves, and BOTH are needed:
+///
+/// - here, an absent or unknown method pays the EXPENSIVE tier up front, so a
+///   client that says nothing cannot be cheap;
+/// - inside the `ask` tool ([`server::WorkerMcpServer::ask`]), the remainder
+///   up to [`super::limits::TURN_COST`] is settled against the same bucket, so
+///   a turn costs a turn however the request was announced.
+///
+/// What the header still buys is refusing an obvious flood before a body is
+/// read, and charging a genuinely cheap request (`tools/list`) only once.
 pub(crate) fn request_cost(mcp_method_header: Option<&str>) -> f64 {
     match mcp_method_header.map(str::trim) {
         Some(name) if CHEAP_METHODS.contains(&name) => super::limits::CHEAP_COST,

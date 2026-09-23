@@ -2108,9 +2108,10 @@ async fn serve_mcp(
         }
     };
 
-    // Metered on the `Mcp-Method` header, never on the body: the limiter costs
-    // nothing in front of a large request and cannot disagree with the
-    // transport about what a request is.
+    // The `Mcp-Method` header prices this request BEFORE the body is read, so
+    // an obvious flood is refused without parsing one. It is caller-supplied,
+    // so it is a pre-filter and never the final price: the `ask` tool settles
+    // the remainder of a turn's cost against this same bucket.
     let cost = crate::interop::mcp::request_cost(mcp_method);
     if let Err(retry_after) = state.interop.limiter.check(caller.key(), cost) {
         let mut response = error_response(
@@ -2131,6 +2132,8 @@ async fn serve_mcp(
             deployment_id: unit.deployment_id,
         }),
         turns: std::sync::Arc::clone(&state.interop.turns),
+        limiter: std::sync::Arc::clone(&state.interop.limiter),
+        prepaid: cost,
         deployment_id: unit.deployment_id,
         tenant: unit.tenant.clone(),
         bundle_id: unit.bundle_id.clone(),

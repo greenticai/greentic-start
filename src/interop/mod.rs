@@ -34,7 +34,7 @@ pub(crate) struct InteropState {
     pub configs: config_cache::UnitConfigCache,
     /// Per-credential token buckets, shared by every interop surface so one
     /// caller's budget is the same whichever binding it uses.
-    pub limiter: limits::RateLimiter,
+    pub limiter: std::sync::Arc<limits::RateLimiter>,
     /// The per-deployment concurrent-turn cap. `Arc` because the MCP tool
     /// runs inside an `rmcp` handler that outlives the request borrow.
     pub turns: std::sync::Arc<limits::TurnGate>,
@@ -51,7 +51,7 @@ impl InteropState {
             generic_auth_enabled: crate::ingress_auth::generic_ingress_auth_enabled_from_env(),
             public_base_url,
             configs: config_cache::UnitConfigCache::default(),
-            limiter: limits::RateLimiter::default(),
+            limiter: std::sync::Arc::new(limits::RateLimiter::default()),
             turns: std::sync::Arc::new(limits::TurnGate::new(limits::max_concurrent_turns(
                 std::env::var(limits::MAX_CONCURRENT_TURNS_ENV)
                     .ok()
@@ -70,7 +70,7 @@ impl Default for InteropState {
             generic_auth_enabled: true,
             public_base_url: None,
             configs: config_cache::UnitConfigCache::default(),
-            limiter: limits::RateLimiter::default(),
+            limiter: std::sync::Arc::new(limits::RateLimiter::default()),
             turns: std::sync::Arc::new(limits::TurnGate::new(limits::DEFAULT_MAX_CONCURRENT_TURNS)),
             #[cfg(test)]
             turn_override: None,
