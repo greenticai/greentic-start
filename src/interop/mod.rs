@@ -114,6 +114,10 @@ impl Default for InteropState {
 }
 
 #[cfg(test)]
+#[path = "live_e2e_tests.rs"]
+mod live_e2e;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
