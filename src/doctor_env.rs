@@ -23,6 +23,16 @@
 //!    over [`crate::dev_store_path`]), so doctor's verdict matches what the
 //!    runtime will see. Secret *values* are discarded immediately —
 //!    diagnostics carry only URIs.
+//!
+//!    "Same reader" is a claim about the RESOLVER'S INPUTS, not just the
+//!    function called, and it was false for a release. The reader orders its
+//!    candidates by an [`crate::dev_store_path::EnvDirOrigin`] the boot path
+//!    passes and doctor did not, and the whole store root was hardcoded to
+//!    `LocalFsStore::default_root()` — so against a runtime started with
+//!    `--store-root` doctor reported on a `$HOME` file nothing opens, with
+//!    both of its verdicts wrong in the same direction and neither red
+//!    (#620). Both now arrive as parameters. A future check that reaches for
+//!    `default_root()` or `$HOME` inside this module re-opens it.
 //! 4. **Materialized runtime-config** — the bundle-less runtime boots from
 //!    `runtime-config.json` in the env directory. If it is missing, the
 //!    runtime serves probes only; if malformed, it cannot boot. Doctor
@@ -48,6 +58,7 @@ use greentic_distributor_client::signing::key_id_for_public_key_pem;
 use greentic_secrets_lib::{SecretError, SecretsManager};
 use serde_json::{Value, json};
 
+use crate::dev_store_path::EnvDirOrigin;
 use crate::doctor::{Diagnostic, DiagnosticComponent, Severity};
 use crate::runtime_config::LoadedRuntimeConfig;
 use crate::webhook_secret_resolver::secret_ref_to_store_uri;
@@ -71,7 +82,25 @@ pub(crate) fn is_prerequisite_failure(diagnostic: &Diagnostic) -> bool {
 /// `store_root`, returning the diagnostics for the caller to push through
 /// the doctor's stage filter. Read-only: never creates the env dir, the
 /// dev store, or any state file.
-pub(crate) fn environment_diagnostics(store_root: &Path, env_id: &str) -> Vec<Diagnostic> {
+///
+/// `origin` says whether `store_root` was named by `--store-root`. It reaches
+/// only the dev-store read, where it decides which of two stores doctor
+/// reports on — the same parameter, with the same meaning, that
+/// [`crate::secrets_gate::resolve_serve_secrets_manager`] takes on the boot
+/// path. Without it doctor answers about the `$HOME` store whenever one
+/// exists, which is a correct-looking verdict about a file the runtime never
+/// opens.
+///
+/// `env_id` reaches that read too, as the env the HOME-rooted candidate is
+/// resolved for. `start` gets that for free by exporting `--env` into
+/// `$GREENTIC_ENV` before it looks a store up; doctor is read-only and must
+/// not, so it passes the value instead of letting an ambient variable decide
+/// (see [`crate::dev_store_path::resolve_existing_for_env`]).
+pub(crate) fn environment_diagnostics(
+    store_root: &Path,
+    env_id: &str,
+    origin: EnvDirOrigin,
+) -> Vec<Diagnostic> {
     let mut out = Vec::new();
 
     let env_dir = match crate::runtime_config::env_dir_in(store_root, env_id) {
@@ -186,7 +215,7 @@ pub(crate) fn environment_diagnostics(store_root: &Path, env_id: &str) -> Vec<Di
 
     check_trust_root(&mut out, &env_dir, &env);
     check_endpoint_linkage(&mut out, &env, runtime_cfg.as_ref());
-    check_secret_refs(&mut out, &env_dir, &env);
+    check_secret_refs(&mut out, &env_dir, &env, env_id, origin);
     out
 }
 
@@ -511,7 +540,13 @@ fn deployment_serving_state(
 /// `webhook_secret_ref` entry through the same dev-store reader the
 /// bundle-less boot uses. Values are discarded — only URIs appear in
 /// diagnostics.
-fn check_secret_refs(out: &mut Vec<Diagnostic>, env_dir: &Path, env: &Environment) {
+fn check_secret_refs(
+    out: &mut Vec<Diagnostic>,
+    env_dir: &Path,
+    env: &Environment,
+    env_id: &str,
+    origin: EnvDirOrigin,
+) {
     let refs: Vec<(&greentic_deploy_spec::MessagingEndpoint, String)> = env
         .messaging_endpoints
         .iter()
@@ -534,15 +569,20 @@ fn check_secret_refs(out: &mut Vec<Diagnostic>, env_dir: &Path, env: &Environmen
     }
 
     // Read-only: locate an existing dev store the way the runtime reader
-    // does (`SecretsClient::open` honors the same override + candidates),
-    // but never create one — doctor must not mutate the env dir.
-    let Some(store_path) = crate::dev_store_path::find_existing(env_dir) else {
+    // does (`open_dev_store_manager` calls this same resolver with this same
+    // origin), but never create one — doctor must not mutate the env dir.
+    let choice = crate::dev_store_path::resolve_existing_for_env(env_dir, origin, env_id);
+    let Some(store_path) = choice.path else {
         out.push(error(
             "start.env.secrets",
             DiagnosticComponent::Provider,
             "Endpoint secret refs are declared but the env has no dev secrets store.",
             json!({
-                "expected": crate::dev_store_path::default_path(env_dir),
+                // The store the RUNTIME would create, not the home-rooted one:
+                // this path is the whole remedy an operator acts on, and
+                // naming the wrong file sends them to seed a store nothing
+                // reads (#620).
+                "expected": crate::dev_store_path::expected_path_for_env(env_dir, origin, env_id),
                 "secret_refs": refs.len(),
             }),
             (
@@ -553,6 +593,29 @@ fn check_secret_refs(out: &mut Vec<Diagnostic>, env_dir: &Path, env: &Environmen
         ));
         return;
     };
+
+    // Two stores exist for this environment and doctor is reporting on one of
+    // them. That is not a failure — the chosen store is the one the runtime
+    // reads — but it is exactly the ambiguity doctor exists to surface, and
+    // the boot path already logs it. `--strict` promotes it to an error like
+    // every other `start.env.*` warning, which is right for an automation
+    // gate: a host with two competing secret stores for one environment is
+    // one `op secrets put` away from seeding the unread one.
+    if let Some(shadowed) = choice.shadowed.as_ref() {
+        out.push(warn(
+            "start.env.secrets",
+            DiagnosticComponent::Provider,
+            "Two dev secrets stores exist for this environment; reporting on the one the runtime reads.",
+            json!({
+                "store_path": store_path,
+                "shadowed": shadowed,
+            }),
+            Some(
+                "Stage secrets with `gtc op --store-root <root> secrets put`, or drop \
+                 --store-root to use the home-rooted store.",
+            ),
+        ));
+    }
 
     let client = match crate::secrets_client::SecretsClient::open_with_path(store_path.clone()) {
         Ok(client) => client,
@@ -923,7 +986,7 @@ mod tests {
     #[test]
     fn uninitialized_env_reports_resolve_error() {
         let tmp = TempDir::new().unwrap();
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let resolve = by_id(&diags, "start.env.resolve");
         assert_eq!(severities(&resolve), vec![Severity::Error]);
         assert!(
@@ -942,7 +1005,7 @@ mod tests {
     #[test]
     fn unsafe_env_id_is_rejected() {
         let tmp = TempDir::new().unwrap();
-        let diags = environment_diagnostics(tmp.path(), "..");
+        let diags = environment_diagnostics(tmp.path(), "..", EnvDirOrigin::Default);
         let resolve = by_id(&diags, "start.env.resolve");
         assert_eq!(severities(&resolve), vec![Severity::Error]);
         assert_eq!(diags.len(), 1);
@@ -954,7 +1017,7 @@ mod tests {
         let env_dir = tmp.path().join(ENV_ID);
         std::fs::create_dir_all(&env_dir).unwrap();
         std::fs::write(env_dir.join("environment.json"), b"{not json").unwrap();
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let load = by_id(&diags, "start.env.load");
         assert_eq!(severities(&load), vec![Severity::Error]);
     }
@@ -963,7 +1026,7 @@ mod tests {
     fn empty_trust_root_warns_before_any_revision_exists() {
         let tmp = TempDir::new().unwrap();
         save_env(tmp.path(), &env_with(Vec::new()));
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let trust = by_id(&diags, "start.env.trust_root");
         assert_eq!(severities(&trust), vec![Severity::Warn]);
         assert_eq!(error_count(&diags), 0, "diags: {diags:#?}");
@@ -974,7 +1037,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (env, _dep, _rev) = env_with_linked_bundle(RevisionLifecycle::Ready, Vec::new());
         save_env(tmp.path(), &env);
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let trust = by_id(&diags, "start.env.trust_root");
         assert_eq!(severities(&trust), vec![Severity::Error]);
         assert!(trust[0].message.contains("fail closed"));
@@ -993,7 +1056,7 @@ mod tests {
             },
         )
         .unwrap();
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let trust = by_id(&diags, "start.env.trust_root");
         assert_eq!(severities(&trust), vec![Severity::Info]);
     }
@@ -1020,7 +1083,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         doc["keys"][0]["key_id"] = serde_json::Value::String("deadbeef".to_string());
         std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let trust = by_id(&diags, "start.env.trust_root");
         assert_eq!(severities(&trust), vec![Severity::Error]);
         assert!(
@@ -1034,7 +1097,7 @@ mod tests {
     fn unlinked_endpoint_warns() {
         let tmp = TempDir::new().unwrap();
         save_env(tmp.path(), &env_with(vec![endpoint("legal-bot", &[])]));
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let links = by_id(&diags, "start.env.endpoint_links");
         assert_eq!(severities(&links), vec![Severity::Warn]);
         assert!(links[0].message.contains("no linked bundles"));
@@ -1049,7 +1112,7 @@ mod tests {
         );
         save_env(tmp.path(), &env);
         write_runtime_config(tmp.path(), &dep, &rev);
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let links = by_id(&diags, "start.env.endpoint_links");
         assert_eq!(
             severities(&links),
@@ -1068,7 +1131,7 @@ mod tests {
             vec![endpoint("legal-bot", &["fast2flow"])],
         );
         save_env(tmp.path(), &env);
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let links = by_id(&diags, "start.env.endpoint_links");
         assert_eq!(severities(&links), vec![Severity::Warn]);
         assert!(links[0].message.contains("no Ready revision"));
@@ -1081,7 +1144,7 @@ mod tests {
         let mut env = env_with(vec![endpoint("legal-bot", &["fast2flow"])]);
         env.bundles = vec![dep];
         save_env(tmp.path(), &env);
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let links = by_id(&diags, "start.env.endpoint_links");
         assert_eq!(severities(&links), vec![Severity::Warn]);
         assert!(links[0].message.contains("not Active"));
@@ -1089,11 +1152,11 @@ mod tests {
 
     #[test]
     fn secret_ref_without_dev_store_is_error() {
-        let _env_guard = crate::test_env_lock().lock().unwrap();
+        let (_home, _env_guard) = isolated_home();
         let tmp = TempDir::new().unwrap();
         let env = env_with(vec![telegram_endpoint_with_webhook_secret("tg-bot", &[])]);
         save_env(tmp.path(), &env);
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let secrets = by_id(&diags, "start.env.secrets");
         assert_eq!(severities(&secrets), vec![Severity::Error]);
         assert!(secrets[0].message.contains("no dev secrets store"));
@@ -1101,7 +1164,7 @@ mod tests {
 
     #[test]
     fn unresolved_secret_ref_is_error() {
-        let _env_guard = crate::test_env_lock().lock().unwrap();
+        let (_home, _env_guard) = isolated_home();
         let tmp = TempDir::new().unwrap();
         let env = env_with(vec![telegram_endpoint_with_webhook_secret("tg-bot", &[])]);
         save_env(tmp.path(), &env);
@@ -1111,7 +1174,7 @@ mod tests {
             "secrets://local/default/_/other-pack/other_key",
             b"unrelated",
         );
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let secrets = by_id(&diags, "start.env.secrets");
         assert_eq!(severities(&secrets), vec![Severity::Error]);
         assert!(secrets[0].message.contains("does not resolve"));
@@ -1127,7 +1190,7 @@ mod tests {
 
     #[test]
     fn resolvable_secret_refs_pass_and_values_never_leak() {
-        let _env_guard = crate::test_env_lock().lock().unwrap();
+        let (_home, _env_guard) = isolated_home();
         let tmp = TempDir::new().unwrap();
         let ep = telegram_endpoint_with_webhook_secret("tg-bot", &[]);
         let uri = secret_ref_to_store_uri(ep.webhook_secret_ref.as_ref().unwrap());
@@ -1135,7 +1198,7 @@ mod tests {
         save_env(tmp.path(), &env);
         const SECRET_VALUE: &[u8] = b"tok-secret-9000";
         seed_dev_store(&tmp.path().join(ENV_ID), &uri, SECRET_VALUE);
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let secrets = by_id(&diags, "start.env.secrets");
         assert_eq!(
             severities(&secrets),
@@ -1155,7 +1218,7 @@ mod tests {
     fn no_endpoints_yields_infos_only() {
         let tmp = TempDir::new().unwrap();
         save_env(tmp.path(), &env_with(Vec::new()));
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         assert_eq!(error_count(&diags), 0);
         assert_eq!(
             severities(&by_id(&diags, "start.env.endpoint_links")),
@@ -1179,7 +1242,7 @@ mod tests {
         );
         save_env(tmp.path(), &env);
         // No runtime-config.json written.
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let links = by_id(&diags, "start.env.endpoint_links");
         // Should get a Warn (NotMaterialized), NOT the all-serving Info.
         assert_eq!(
@@ -1200,7 +1263,7 @@ mod tests {
         );
         save_env(tmp.path(), &env);
         write_runtime_config(tmp.path(), &dep, &rev);
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let links = by_id(&diags, "start.env.endpoint_links");
         assert_eq!(
             severities(&links),
@@ -1219,7 +1282,7 @@ mod tests {
         save_env(tmp.path(), &env_with(Vec::new()));
         let env_dir = tmp.path().join(ENV_ID);
         std::fs::write(env_dir.join("runtime-config.json"), b"not json at all").unwrap();
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let rc = by_id(&diags, "start.env.runtime_config");
         assert_eq!(severities(&rc), vec![Severity::Error]);
         assert!(rc[0].message.contains("runtime-config"));
@@ -1244,7 +1307,7 @@ mod tests {
         save_env(tmp.path(), &env);
         write_runtime_config(tmp.path(), &dep_a, &rev_a);
 
-        let diags = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let links = by_id(&diags, "start.env.endpoint_links");
         // One Warn for dep_b (no Ready traffic), no Info (not all serving).
         let warns: Vec<_> = links
@@ -1271,7 +1334,7 @@ mod tests {
         env2.revisions = vec![rev_a.clone()];
         save_env(tmp.path(), &env2);
         // runtime-config already written for dep_a.
-        let diags2 = environment_diagnostics(tmp.path(), ENV_ID);
+        let diags2 = environment_diagnostics(tmp.path(), ENV_ID, EnvDirOrigin::Default);
         let links2 = by_id(&diags2, "start.env.endpoint_links");
         let warns2: Vec<_> = links2
             .iter()
@@ -1285,5 +1348,253 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .is_some_and(|id| id == dep_b.deployment_id.to_string())
         );
+    }
+    // ---- #620: which dev store doctor reports on -------------------------
+    //
+    // Every test below stages TWO stores for one environment — a `$HOME` one
+    // and a `--store-root` one — because that is the only shape in which the
+    // read order is observable at all. With one store both origins agree.
+
+    /// Points `HOME` at a scratch dir under the crate-wide env lock and
+    /// restores it on drop, including on a failed assertion: `set_var` is
+    /// process-wide, so a test that leaves it wrong breaks its neighbours
+    /// rather than itself.
+    ///
+    /// `HOME` is unavoidable here: `dev_store_path`'s home candidate is rooted
+    /// at it, and a test that left the developer's real one in place would
+    /// find their actual dev store or find nothing, depending on the machine.
+    ///
+    /// `GREENTIC_ENV` is deliberately REMOVED rather than set. That is an
+    /// operator's shell — `start` exports it inside its own process and
+    /// nothing puts it in yours — and it is the condition under which doctor
+    /// had no home candidate at all. Setting it here would have made every
+    /// test below pass against a resolver that only works when an unrelated
+    /// variable happens to be exported.
+    struct HomeEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl HomeEnvGuard {
+        fn new(home: &Path) -> Self {
+            let lock = crate::test_env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = ["HOME", "GREENTIC_ENV", "GREENTIC_DEV_SECRETS_PATH"]
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            // SAFETY: serialized by the crate-wide test env lock held above.
+            unsafe {
+                std::env::set_var("HOME", home);
+                // See the doc comment: absent is the operator's shell, and the
+                // condition doctor used to have no home candidate under.
+                std::env::remove_var("GREENTIC_ENV");
+                // A leaked override from a neighbour outranks both stores and
+                // would make every assertion below vacuous.
+                std::env::remove_var("GREENTIC_DEV_SECRETS_PATH");
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.previous.drain(..) {
+                // SAFETY: the lock is still held for the rest of this scope.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The env dir a `$HOME`-rooted store lives under, matching
+    /// `LocalFsStore::default_root()`'s layout.
+    fn home_env_dir(home: &Path) -> PathBuf {
+        home.join(".greentic").join("environments").join(ENV_ID)
+    }
+
+    /// An empty scratch `$HOME`, for a test that wants NO home-rooted store to
+    /// exist.
+    ///
+    /// Every secret-ref test needs this, and three of them went without it for
+    /// as long as the home candidate happened to be unreachable (it was
+    /// derived from `$GREENTIC_ENV`, which no test sets). Resolving it from
+    /// the env id instead made them read the DEVELOPER'S OWN
+    /// `~/.greentic/environments/local` store — passing or failing by what
+    /// happened to be on the machine. The TempDir is returned so the caller
+    /// keeps it alive; dropping it early puts `$HOME` back on a deleted path.
+    fn isolated_home() -> (TempDir, HomeEnvGuard) {
+        let home = TempDir::new().unwrap();
+        let guard = HomeEnvGuard::new(home.path());
+        (home, guard)
+    }
+
+    /// The store path recorded on a diagnostic, as a `PathBuf`.
+    fn evidence_path(diag: &Diagnostic, key: &str) -> PathBuf {
+        PathBuf::from(
+            diag.evidence[key]
+                .as_str()
+                .unwrap_or_else(|| panic!("`{key}` missing from evidence: {}", diag.evidence)),
+        )
+    }
+
+    /// A fake `$HOME`, a separate `--store-root` holding a saved environment
+    /// that declares one webhook secret ref, and that ref's store URI.
+    ///
+    /// The guard is returned first so it is dropped last: it restores `$HOME`
+    /// after the temp dirs it pointed at are gone.
+    fn two_store_fixture() -> (HomeEnvGuard, TempDir, TempDir, String) {
+        let (home, guard) = isolated_home();
+        let store_root = TempDir::new().unwrap();
+        let ep = telegram_endpoint_with_webhook_secret("tg-bot", &[]);
+        let uri = secret_ref_to_store_uri(ep.webhook_secret_ref.as_ref().unwrap());
+        save_env(store_root.path(), &env_with(vec![ep]));
+        (guard, home, store_root, uri)
+    }
+
+    /// The fix. An operator whose runtime serves from `--store-root /srv/envA`
+    /// staged secrets there with `op --store-root … secrets put`; doctor must
+    /// read that store and report the refs resolve.
+    ///
+    /// Before #620 it read the `$HOME` store — which here holds an unrelated
+    /// secret — and reported the refs unresolved against a file the runtime
+    /// never opens. The home store is deliberately non-empty: an empty one
+    /// would make this pass for the wrong reason (nothing to prefer).
+    #[test]
+    fn a_store_staged_under_an_explicit_root_is_reported_present() {
+        let (guard, home, store_root, uri) = two_store_fixture();
+        let env_dir = store_root.path().join(ENV_ID);
+        seed_dev_store(
+            &home_env_dir(home.path()),
+            "secrets://local/default/_/other-pack/other_key",
+            b"unrelated",
+        );
+        seed_dev_store(&env_dir, &uri, b"tok-secret-9000");
+
+        let diags = environment_diagnostics(store_root.path(), ENV_ID, EnvDirOrigin::Explicit);
+
+        assert_eq!(error_count(&diags), 0, "diags: {diags:#?}");
+        let secrets = by_id(&diags, "start.env.secrets");
+        let resolved = secrets
+            .iter()
+            .find(|diag| diag.severity == Severity::Info)
+            .unwrap_or_else(|| panic!("no resolved-refs Info: {secrets:#?}"));
+        assert_eq!(
+            evidence_path(resolved, "store_path"),
+            crate::dev_store_path::env_dir_store_path(&env_dir),
+            "doctor must report on the store --store-root names",
+        );
+        drop(guard);
+    }
+
+    /// The other half, and the reason this is not a plain inversion: with no
+    /// `--store-root` the `$HOME`-first order is the `gtc setup` ↔ `gtc start`
+    /// rendezvous the module exists for. Same two stores as above, same
+    /// staging — only the origin differs, and the verdict flips.
+    #[test]
+    fn without_an_explicit_root_doctor_still_reports_the_home_store() {
+        let (guard, home, store_root, uri) = two_store_fixture();
+        let home_dir = home_env_dir(home.path());
+        seed_dev_store(
+            &home_dir,
+            "secrets://local/default/_/other-pack/other_key",
+            b"unrelated",
+        );
+        seed_dev_store(&store_root.path().join(ENV_ID), &uri, b"tok-secret-9000");
+
+        let diags = environment_diagnostics(store_root.path(), ENV_ID, EnvDirOrigin::Default);
+
+        let secrets = by_id(&diags, "start.env.secrets");
+        assert_eq!(severities(&secrets), vec![Severity::Error], "{secrets:#?}");
+        assert!(secrets[0].message.contains("does not resolve"));
+        assert_eq!(
+            evidence_path(secrets[0], "store_path"),
+            crate::dev_store_path::env_dir_store_path(&home_dir),
+            "no flag means the home store, byte-for-byte as before",
+        );
+        drop(guard);
+    }
+
+    /// The expensive answer from the issue: doctor's `expected:` path is the
+    /// remedy an operator acts on, so under `--store-root` it must name the
+    /// store the runtime would create. Naming the `$HOME` one is specific,
+    /// actionable and wrong.
+    ///
+    /// Both arms in one test because the contrast is the assertion — either
+    /// path in isolation looks reasonable.
+    #[test]
+    fn the_expected_path_names_the_store_that_was_chosen() {
+        let (guard, home, store_root, _uri) = two_store_fixture();
+        // Nothing staged anywhere, so both origins take the "no dev store" arm.
+        let env_dir = store_root.path().join(ENV_ID);
+
+        let explicit = environment_diagnostics(store_root.path(), ENV_ID, EnvDirOrigin::Explicit);
+        let explicit = by_id(&explicit, "start.env.secrets");
+        assert!(explicit[0].message.contains("no dev secrets store"));
+        assert_eq!(
+            evidence_path(explicit[0], "expected"),
+            crate::dev_store_path::env_dir_store_path(&env_dir),
+        );
+
+        let default = environment_diagnostics(store_root.path(), ENV_ID, EnvDirOrigin::Default);
+        let default = by_id(&default, "start.env.secrets");
+        assert!(default[0].message.contains("no dev secrets store"));
+        assert_eq!(
+            evidence_path(default[0], "expected"),
+            crate::dev_store_path::env_dir_store_path(&home_env_dir(home.path())),
+        );
+        drop(guard);
+    }
+
+    /// "Two stores exist and I am reporting on this one" is precisely what
+    /// doctor is for. Reading past an operator's home store in silence is what
+    /// made the original bug invisible on the serve path.
+    #[test]
+    fn two_stores_make_doctor_name_the_one_it_passed_over() {
+        let (guard, home, store_root, uri) = two_store_fixture();
+        let home_dir = home_env_dir(home.path());
+        seed_dev_store(&home_dir, &uri, b"stale-token");
+        seed_dev_store(&store_root.path().join(ENV_ID), &uri, b"tok-secret-9000");
+
+        let diags = environment_diagnostics(store_root.path(), ENV_ID, EnvDirOrigin::Explicit);
+
+        let secrets = by_id(&diags, "start.env.secrets");
+        let shadow = secrets
+            .iter()
+            .find(|diag| diag.severity == Severity::Warn)
+            .unwrap_or_else(|| panic!("no shadowed-store Warn: {secrets:#?}"));
+        assert_eq!(
+            evidence_path(shadow, "shadowed"),
+            crate::dev_store_path::env_dir_store_path(&home_dir),
+            "the loser must reach the operator, not just the winner",
+        );
+        assert_eq!(
+            evidence_path(shadow, "store_path"),
+            crate::dev_store_path::env_dir_store_path(&store_root.path().join(ENV_ID)),
+        );
+        drop(guard);
+    }
+
+    /// The warning fires only when the two stores genuinely disagree. One
+    /// store under `--store-root` and no home store is the ordinary case, and
+    /// warning there would train operators to ignore it.
+    #[test]
+    fn one_store_under_an_explicit_root_warns_about_nothing() {
+        let (guard, _home, store_root, uri) = two_store_fixture();
+        seed_dev_store(&store_root.path().join(ENV_ID), &uri, b"tok-secret-9000");
+
+        let diags = environment_diagnostics(store_root.path(), ENV_ID, EnvDirOrigin::Explicit);
+
+        let secrets = by_id(&diags, "start.env.secrets");
+        assert_eq!(severities(&secrets), vec![Severity::Info], "{secrets:#?}");
+        drop(guard);
     }
 }
