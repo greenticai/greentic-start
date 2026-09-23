@@ -1903,8 +1903,27 @@ async fn resolve_interop_unit(
         }))
 }
 
-/// The public base URL for a served agent card: the boot-resolved one, else
-/// the Cloud Run capture. NEVER the request `Host`, which any caller sets.
+/// The public base URL the interop surfaces advertise themselves at: the
+/// boot-resolved one (`startup_contract::resolve_public_base_url`), else the
+/// Cloud Run capture. NEVER the request `Host`, which any caller sets.
+///
+/// **It also decides an audience.** With no staged `mcp_resource`, the MCP
+/// resource identifier — the `aud` every OAuth token is checked against — is
+/// derived from this value as `<base>/mcp`, and on Cloud Run that value comes
+/// from [`PublicUrlCapture`]: the first inbound request through the Google
+/// Front End whose `Host` matches this service's own `<K_SERVICE>-*.run.app`.
+/// So an audience can be derived from a header, once, before the designer has
+/// staged the resource it registered with the admin.
+///
+/// What keeps that non-exploitable is the TENANT CLAIM, not the URL. The
+/// capture is pinned to this service's own `K_SERVICE` (see
+/// [`crate::startup_contract::derive_public_base_url`]), so the worst a
+/// caller can do is make the audience name a different path on this same
+/// service — and a token still has to be signed by the unit's staged issuer
+/// AND carry `tenant` equal to the unit's staged `tenant_slug`
+/// ([`crate::interop::mcp::auth`]). A token minted for another workspace is
+/// refused whatever audience this resolves to, and an attacker who is not the
+/// issuer has no token at all.
 fn interop_base_url(state: &ServeState) -> Option<String> {
     state
         .interop
