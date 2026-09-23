@@ -117,7 +117,7 @@ async fn send_message(
             .to_string(),
         None => ulid::Ulid::new().to_string(),
     };
-    let session_hint = format!("a2a:{credential_id}:{context_id}");
+    let session_hint = crate::interop::session_hint("a2a", credential_id, &context_id);
     let user = format!("a2a:{credential_id}");
     let _permit = ctx
         .turns

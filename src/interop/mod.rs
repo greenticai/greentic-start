@@ -11,6 +11,41 @@ pub(crate) mod limits;
 pub(crate) mod mcp;
 pub(crate) mod reply;
 
+/// Longest caller key accepted. A caller key is a session-namespace segment
+/// AND a rate-limit map key, so it is bounded on both counts.
+pub(crate) const MAX_CALLER_KEY_LEN: usize = 128;
+
+/// Whether `key` may be used as the CALLER segment of a session hint.
+///
+/// `[A-Za-z0-9_-]`, non-empty, at most [`MAX_CALLER_KEY_LEN`]. The excluded
+/// character that matters is the COLON: [`session_hint`] joins the caller and
+/// the conversation with one, and a caller key that could contain a colon
+/// makes two different pairs produce the same hint — `("u1", "x:conv")` and
+/// `("u1:x", "conv")` — which is one caller resuming another's parked flow.
+/// A conversation id may contain colons precisely because the caller segment
+/// cannot: the first colon after the protocol always ends the caller.
+///
+/// Applied to BOTH caller kinds: a staged credential id (the designer writes
+/// it) and an OAuth `sub` (the authorization server writes it, and a
+/// compromised or careless one must not be able to mint a colliding subject).
+pub(crate) fn valid_caller_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_CALLER_KEY_LEN
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// Build the session hint one turn runs under: `<protocol>:<caller>:<id>`.
+///
+/// The ONE place the namespace is spelled, so the A2A and MCP surfaces cannot
+/// drift into different escaping rules. `caller` must have passed
+/// [`valid_caller_key`]; see there for why that is what makes the namespace
+/// injective.
+pub(crate) fn session_hint(protocol: &str, caller: &str, conversation: &str) -> String {
+    format!("{protocol}:{caller}:{conversation}")
+}
+
 /// A test-only replacement for running a turn against a loaded revision, so
 /// listener-level tests can drive the whole ingress without a WASM pack.
 #[cfg(test)]
@@ -75,5 +110,49 @@ impl Default for InteropState {
             #[cfg(test)]
             turn_override: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_caller_key_is_bounded_and_colon_free() {
+        assert!(valid_caller_key("c_01J"));
+        assert!(valid_caller_key("u-test-1"));
+        assert!(valid_caller_key(&"a".repeat(MAX_CALLER_KEY_LEN)));
+        assert!(!valid_caller_key(""));
+        assert!(!valid_caller_key(&"a".repeat(MAX_CALLER_KEY_LEN + 1)));
+        for bad in ["a:b", "a b", "a/b", "a.b", "é", "a\nb"] {
+            assert!(!valid_caller_key(bad), "{bad}");
+        }
+    }
+
+    /// The attack the caller-key alphabet exists to stop: subject `u1` asking
+    /// for conversation `x:<victim>` must NOT land in subject `u1:x`'s
+    /// namespace. It cannot, because `u1:x` is not an acceptable caller key —
+    /// so the colliding hint is unreachable from the other side.
+    #[test]
+    fn two_callers_cannot_be_made_to_share_a_namespace() {
+        let victim = session_hint("mcp", "u1x", "conv");
+        let attacker = session_hint("mcp", "u1", "x:conv");
+        assert_ne!(victim, attacker);
+        // The only spelling that WOULD collide is a caller key with a colon,
+        // and that is refused before a hint is ever built.
+        assert_eq!(session_hint("mcp", "u1:x", "conv"), attacker);
+        assert!(!valid_caller_key("u1:x"));
+    }
+
+    /// A conversation id may carry colons: the caller segment cannot, so the
+    /// first colon after the protocol always ends the caller and the rest is
+    /// the conversation, whatever it contains.
+    #[test]
+    fn a_conversation_id_may_contain_colons_without_ambiguity() {
+        let hint = session_hint("a2a", "c1", "a:b:c");
+        assert_eq!(hint, "a2a:c1:a:b:c");
+        let (protocol, rest) = hint.split_once(':').expect("protocol");
+        let (caller, conversation) = rest.split_once(':').expect("caller");
+        assert_eq!((protocol, caller, conversation), ("a2a", "c1", "a:b:c"));
     }
 }

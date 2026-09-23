@@ -113,7 +113,8 @@ impl WorkerMcpServer {
             }
             _ => ulid::Ulid::new().to_string(),
         };
-        let session_hint = format!("mcp:{}:{conversation_id}", self.ctx.caller_key);
+        let session_hint =
+            crate::interop::session_hint("mcp", &self.ctx.caller_key, &conversation_id);
         let user = format!("mcp:{}", self.ctx.caller_key);
 
         // Settle the true price BEFORE running anything. The transport priced

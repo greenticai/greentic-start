@@ -223,6 +223,43 @@ async fn a_token_naming_an_unknown_kid_is_refused() {
     assert_eq!(outcome, McpAuth::Unauthorized);
 }
 
+/// The `sub` is the rate-limit bucket AND the caller segment of every session
+/// hint, so it obeys the credential-id rule. A colon is the sharp one: without
+/// this, subject `u1` asking for conversation `x:<id>` lands in subject
+/// `u1:x`'s namespace and resumes their parked flow.
+#[tokio::test]
+async fn a_subject_outside_the_caller_key_alphabet_is_refused() {
+    let issuer = StubIssuer::serving_keys(4).await;
+    for sub in ["u1:x", "", "   ", &"u".repeat(129)] {
+        let token = testkit::mint_token(&issuer.url, RESOURCE, sub, TENANT, 600);
+        assert_eq!(
+            authenticate(
+                &config(Some(&issuer.url)),
+                RESOURCE,
+                Some(&bearer(&token)),
+                0
+            )
+            .await,
+            McpAuth::Unauthorized,
+            "sub {sub:?} must not become a session namespace"
+        );
+    }
+    // …and a well-formed one still authenticates, so the rule is not simply
+    // refusing everything.
+    let good = testkit::unique_sub();
+    let token = testkit::mint_token(&issuer.url, RESOURCE, &good, TENANT, 600);
+    assert_eq!(
+        authenticate(
+            &config(Some(&issuer.url)),
+            RESOURCE,
+            Some(&bearer(&token)),
+            0
+        )
+        .await,
+        McpAuth::Allowed(McpCaller::Oauth(good))
+    );
+}
+
 /// An issuer that cannot be reached is a `503`, not a `401`: nothing is known
 /// to be wrong with the caller's token, and a `401` would send it to
 /// re-authenticate against the very thing not answering.

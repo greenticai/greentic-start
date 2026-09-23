@@ -144,11 +144,20 @@ async fn verify_oauth(
     let Ok(data) = decode::<McpClaims>(token, &key, &validation) else {
         return McpAuth::Unauthorized;
     };
-    // A blank `sub` is refused rather than normalised: it is the rate-limit
-    // bucket and the conversation namespace, so every token carrying one would
-    // share both — one caller's burst throttling another, and one caller
-    // resuming another's parked flow.
-    if data.claims.sub.trim().is_empty() {
+    // The `sub` is the rate-limit bucket AND the caller segment of every
+    // session hint this connection produces, so it obeys the same rule a
+    // staged credential id does. A blank one would share both with every
+    // other blank-subject token; one carrying a COLON would let subject `u1`
+    // reach subject `u1:x`'s conversations by asking for `x:<their id>` (see
+    // `crate::interop::valid_caller_key`). Neither is the caller's doing —
+    // the token is signed — which is exactly why an issuer bug must refuse
+    // rather than degrade.
+    if !crate::interop::valid_caller_key(data.claims.sub.trim()) {
+        crate::operator_log::warn(
+            module_path!(),
+            "MCP: a validly-signed token carried a `sub` that is empty, too long, or \
+             outside [A-Za-z0-9_-]; refusing rather than namespacing a session with it",
+        );
         return McpAuth::Unauthorized;
     }
     // The tenant claim is the cross-tenant boundary: a token minted for
@@ -160,7 +169,7 @@ async fn verify_oauth(
         );
         return McpAuth::Unauthorized;
     }
-    McpAuth::Allowed(McpCaller::Oauth(data.claims.sub))
+    McpAuth::Allowed(McpCaller::Oauth(data.claims.sub.trim().to_string()))
 }
 
 /// The token of an `Authorization: Bearer <token>` header. The scheme is

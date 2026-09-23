@@ -22,10 +22,6 @@ use crate::operator_log;
 /// The only document version this build understands.
 pub(crate) const CONFIG_VERSION: u64 = 1;
 
-/// Longest credential id accepted. The id is the rate-limit key and a segment
-/// of the namespaced session hint, so it is bounded.
-const MAX_CREDENTIAL_ID_LEN: usize = 128;
-
 /// One accepted bearer credential.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Credential {
@@ -215,15 +211,11 @@ fn parse_credential(entry: Value, unit: &str) -> Option<Credential> {
     })
 }
 
-/// The id becomes a segment of `a2a:<id>:<contextId>`. Restricting it to a
-/// colon-free alphabet is what keeps two callers' namespaces from colliding
-/// (`a` + `b:c` and `a:b` + `c` would otherwise produce the same hint).
+/// The id becomes the CALLER segment of a session hint, so it obeys the one
+/// shared rule — see [`crate::interop::valid_caller_key`] for why a colon in
+/// it would let two callers share a namespace.
 fn valid_credential_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAX_CREDENTIAL_ID_LEN
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    crate::interop::valid_caller_key(id)
 }
 
 fn decode_sha256_hex(raw: &str) -> Option<[u8; 32]> {
