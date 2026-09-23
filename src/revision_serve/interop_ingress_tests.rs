@@ -79,10 +79,16 @@ impl greentic_secrets_lib::SecretsManager for TestSecrets {
 
 /// The staged config document for this unit.
 fn staged_config(a2a: bool) -> Vec<u8> {
-    json!({
+    staged_interop_config(a2a, false, None)
+}
+
+/// The same document with both toggles and the OAuth issuer under the test's
+/// control.
+fn staged_interop_config(a2a: bool, mcp: bool, issuer: Option<&str>) -> Vec<u8> {
+    let mut doc = json!({
         "v": 1,
         "a2a": a2a,
-        "mcp": false,
+        "mcp": mcp,
         "credentials": [{
             "id": "c1",
             "sha256": Sha256::digest(TOKEN.as_bytes())
@@ -91,10 +97,13 @@ fn staged_config(a2a: bool) -> Vec<u8> {
                 .collect::<String>()
         }],
         "tenant_slug": "acme",
+        "mcp_resource": "https://w.example/mcp",
         "agent": {"name": "Support Bot", "description": "Answers support questions."}
-    })
-    .to_string()
-    .into_bytes()
+    });
+    if let (Some(issuer), Value::Object(map)) = (issuer, &mut doc) {
+        map.insert("issuer".to_string(), json!(issuer));
+    }
+    doc.to_string().into_bytes()
 }
 
 fn config_uri() -> String {
@@ -103,8 +112,10 @@ fn config_uri() -> String {
 
 /// What the unit's secrets store holds for this test.
 enum Store {
-    /// The staged config, with A2A enabled or not.
+    /// The staged config, with A2A enabled or not and MCP off.
     Config(bool),
+    /// The staged config with MCP on (and A2A off), naming this issuer.
+    Mcp(Option<String>),
     /// Nothing staged.
     Empty,
     /// The backend cannot answer.
@@ -130,6 +141,14 @@ fn activation_counting(
         Store::Config(a2a) => {
             let mut entries = HashMap::new();
             entries.insert(config_uri(), staged_config(a2a));
+            Arc::new(TestSecrets::with(entries, Arc::clone(&reads)))
+        }
+        Store::Mcp(issuer) => {
+            let mut entries = HashMap::new();
+            entries.insert(
+                config_uri(),
+                staged_interop_config(false, true, issuer.as_deref()),
+            );
             Arc::new(TestSecrets::with(entries, Arc::clone(&reads)))
         }
         Store::Empty => Arc::new(TestSecrets::with(HashMap::new(), Arc::clone(&reads))),
@@ -637,4 +656,235 @@ async fn an_unreadable_store_is_retried_on_the_next_request() {
         assert_eq!(response.status, 503);
     }
     assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
+// ---------------------------------------------------------------------------
+// MCP
+// ---------------------------------------------------------------------------
+
+/// A JSON-RPC `tools/call` for the one tool this surface exposes.
+fn tools_call(message: &str, conversation_id: Option<&str>) -> String {
+    let mut arguments = json!({ "message": message });
+    if let (Some(id), Value::Object(map)) = (conversation_id, &mut arguments) {
+        map.insert("conversation_id".to_string(), json!(id));
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "ask", "arguments": arguments}
+    })
+    .to_string()
+}
+
+/// The headers an MCP client sends: the bearer, the content negotiation rmcp
+/// requires, and the `Mcp-Method` the limiter meters on.
+fn mcp_headers(method: &str) -> Vec<(&str, &str)> {
+    vec![
+        AUTH,
+        ("Accept", "application/json, text/event-stream"),
+        ("Mcp-Method", method),
+    ]
+}
+
+#[tokio::test]
+async fn a_tools_call_runs_a_turn_and_returns_the_reply() {
+    let (activation, _) = activation_with(Store::Mcp(None));
+    let state = state_with(
+        activation,
+        interop_with_base_url(vec![Activity::custom(
+            "response",
+            json!({"reply": "Reset it from the profile page."}),
+        )]),
+    );
+    let response = exchange(
+        &state,
+        false,
+        &post(
+            "/mcp",
+            &mcp_headers("tools/call"),
+            &tools_call("how?", Some("c-1")),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let value = response.json();
+    let result = &value["result"];
+    assert_eq!(
+        result["content"][0]["text"], "Reset it from the profile page.",
+        "body: {}",
+        response.body
+    );
+    assert_eq!(result["structuredContent"]["conversation_id"], "c-1");
+    assert_ne!(result["isError"], json!(true));
+    assert!(
+        response.header("access-control-allow-origin").is_none(),
+        "/mcp must never be CORS-enabled"
+    );
+}
+
+#[tokio::test]
+async fn tools_list_offers_the_ask_tool_and_nothing_else() {
+    let (activation, _) = activation_with(Store::Mcp(None));
+    let state = state_with(activation, interop_with_base_url(Vec::new()));
+    let body = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).to_string();
+    let response = exchange(
+        &state,
+        false,
+        &post("/mcp", &mcp_headers("tools/list"), &body),
+    )
+    .await;
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let tools = response.json()["result"]["tools"].clone();
+    let names: Vec<String> = tools
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(names, vec!["ask".to_string()], "body: {}", response.body);
+}
+
+#[tokio::test]
+async fn an_mcp_call_without_a_token_is_401_with_the_discovery_url() {
+    let (activation, _) = activation_with(Store::Mcp(None));
+    let state = state_with(
+        activation,
+        interop_with_base_url(vec![Activity::text("never sent")]),
+    );
+    let response = exchange(
+        &state,
+        false,
+        &post(
+            "/mcp",
+            &[("Accept", "application/json, text/event-stream")],
+            &tools_call("hi", None),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 401);
+    assert_eq!(
+        response.header("www-authenticate"),
+        Some(
+            "Bearer resource_metadata=\"https://gtc-svc.example.run.app/.well-known/oauth-protected-resource/mcp\""
+        )
+    );
+    assert!(!response.body.contains("never sent"));
+}
+
+/// rmcp answers GET and DELETE itself in stateless mode: with
+/// `legacy_session_mode = false` and no event store its `handle` allows POST
+/// alone. The token is presented so this cannot pass for a 401.
+#[tokio::test]
+async fn a_get_or_delete_on_the_mcp_endpoint_is_405() {
+    let (activation, _) = activation_with(Store::Mcp(None));
+    let state = state_with(activation, interop_with_base_url(Vec::new()));
+    let get_response = exchange(&state, false, &get("/mcp", &mcp_headers("ping"))).await;
+    assert_eq!(get_response.status, 405);
+    assert_eq!(get_response.header("allow"), Some("POST"));
+
+    let delete_request = format!(
+        "DELETE /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\n\
+         Accept: application/json, text/event-stream\r\nConnection: close\r\n\r\n",
+        AUTH.1
+    );
+    let delete_response = exchange(&state, false, &delete_request).await;
+    assert_eq!(delete_response.status, 405);
+}
+
+#[tokio::test]
+async fn the_protected_resource_metadata_is_served_at_both_paths() {
+    let (activation, _) = activation_with(Store::Mcp(Some("https://admin.example/".to_string())));
+    let state = state_with(activation, interop_with_base_url(Vec::new()));
+    for path in [
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+    ] {
+        let response = exchange(&state, false, &get(path, &[])).await;
+        assert_eq!(response.status, 200, "{path}: {}", response.body);
+        assert_eq!(
+            response.json(),
+            json!({
+                "resource": "https://w.example/mcp",
+                "authorization_servers": ["https://admin.example"],
+                "bearer_methods_supported": ["header"],
+            }),
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_unit_with_no_issuer_publishes_no_metadata_document() {
+    let (activation, _) = activation_with(Store::Mcp(None));
+    let state = state_with(activation, interop_with_base_url(Vec::new()));
+    let response = exchange(
+        &state,
+        false,
+        &get("/.well-known/oauth-protected-resource", &[]),
+    )
+    .await;
+    assert_eq!(response.status, 503);
+}
+
+#[tokio::test]
+async fn the_mcp_paths_fall_through_when_mcp_is_off() {
+    // `a2a: true, mcp: false`: the A2A paths are reserved and the MCP ones are
+    // not, on the same unit.
+    let (activation, _) = activation_with(Store::Config(true));
+    let state = state_with(activation, interop_with_base_url(vec![Activity::text("x")]));
+    let metadata = exchange(
+        &state,
+        false,
+        &get("/.well-known/oauth-protected-resource", &[]),
+    )
+    .await;
+    assert_eq!(
+        metadata.status, 405,
+        "a GET falls through to the generic ingress"
+    );
+
+    let endpoint = exchange(
+        &state,
+        false,
+        &post("/mcp", &mcp_headers("tools/call"), &tools_call("hi", None)),
+    )
+    .await;
+    assert_eq!(endpoint.status, 200);
+    assert!(
+        endpoint.json().get("result").is_none(),
+        "a JSON-RPC result means the MCP binding answered a unit that has it off"
+    );
+}
+
+/// The limiter keys on the caller and meters on `Mcp-Method`: a `tools/call`
+/// costs two, so a full burst is 60 of them.
+#[tokio::test]
+async fn the_mcp_rate_limit_refuses_with_a_retry_after() {
+    let (activation, _) = activation_with(Store::Mcp(None));
+    let state = state_with(
+        activation,
+        interop_with_base_url(vec![Activity::text("ok")]),
+    );
+    let mut refused = None;
+    for _ in 0..61 {
+        let response = exchange(
+            &state,
+            false,
+            &post(
+                "/mcp",
+                &mcp_headers("tools/call"),
+                &tools_call("hi", Some("c")),
+            ),
+        )
+        .await;
+        if response.status == 429 {
+            refused = Some(response);
+            break;
+        }
+    }
+    let refused = refused.expect("the 61st turn must be refused");
+    assert!(refused.header("retry-after").is_some());
 }

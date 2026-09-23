@@ -8,6 +8,7 @@ pub(crate) mod a2a;
 pub(crate) mod config;
 pub(crate) mod config_cache;
 pub(crate) mod limits;
+pub(crate) mod mcp;
 pub(crate) mod reply;
 
 /// A test-only replacement for running a turn against a loaded revision, so
@@ -34,8 +35,9 @@ pub(crate) struct InteropState {
     /// Per-credential token buckets, shared by every interop surface so one
     /// caller's budget is the same whichever binding it uses.
     pub limiter: limits::RateLimiter,
-    /// The per-deployment concurrent-turn cap.
-    pub turns: limits::TurnGate,
+    /// The per-deployment concurrent-turn cap. `Arc` because the MCP tool
+    /// runs inside an `rmcp` handler that outlives the request borrow.
+    pub turns: std::sync::Arc<limits::TurnGate>,
     /// See [`TurnOverride`].
     #[cfg(test)]
     pub turn_override: Option<TurnOverride>,
@@ -50,11 +52,11 @@ impl InteropState {
             public_base_url,
             configs: config_cache::UnitConfigCache::default(),
             limiter: limits::RateLimiter::default(),
-            turns: limits::TurnGate::new(limits::max_concurrent_turns(
+            turns: std::sync::Arc::new(limits::TurnGate::new(limits::max_concurrent_turns(
                 std::env::var(limits::MAX_CONCURRENT_TURNS_ENV)
                     .ok()
                     .as_deref(),
-            )),
+            ))),
             #[cfg(test)]
             turn_override: None,
         }
@@ -69,7 +71,7 @@ impl Default for InteropState {
             public_base_url: None,
             configs: config_cache::UnitConfigCache::default(),
             limiter: limits::RateLimiter::default(),
-            turns: limits::TurnGate::new(limits::DEFAULT_MAX_CONCURRENT_TURNS),
+            turns: std::sync::Arc::new(limits::TurnGate::new(limits::DEFAULT_MAX_CONCURRENT_TURNS)),
             #[cfg(test)]
             turn_override: None,
         }

@@ -1189,7 +1189,9 @@ async fn handle_connection(
 /// and `greentic-gui` reaches it **server-side** via `HttpWorkerBackend`, where
 /// CORS does not apply.
 fn path_allows_cors(path: &str) -> bool {
-    path != "/workers/invoke" && !crate::interop::a2a::is_cors_excluded(path)
+    path != "/workers/invoke"
+        && !crate::interop::a2a::is_cors_excluded(path)
+        && !crate::interop::mcp::is_cors_excluded(path)
 }
 
 /// Resolve → dispatch → execute for a single request. `Err` carries a ready HTTP
@@ -1323,6 +1325,7 @@ async fn serve(
     let authorization_header = header_str(req.headers(), header::AUTHORIZATION.as_str());
     let if_none_match = header_str(req.headers(), header::IF_NONE_MATCH.as_str());
     let a2a_version_header = header_str(req.headers(), crate::interop::a2a::VERSION_HEADER);
+    let mcp_method_header = header_str(req.headers(), crate::interop::mcp::MCP_METHOD_HEADER);
     // M1 IID.4d wrapper: collect routing-relevant request headers BEFORE
     // `read_body_limited` consumes `req`. The resolver uses these to give
     // header-discriminated providers (Telegram via secret-token) the same
@@ -1341,7 +1344,15 @@ async fn serve(
     // feature — otherwise the path is NOT reserved and falls through to normal
     // routing, exactly as before this shipped.
     if let Some(route) = crate::interop::a2a::route_for(&path) {
-        match resolve_interop_unit(&state, &activation, host_header.as_deref(), &path).await {
+        match resolve_interop_unit(
+            &state,
+            &activation,
+            host_header.as_deref(),
+            &path,
+            InteropFeature::A2a,
+        )
+        .await
+        {
             Err(response) => return Err(response),
             Ok(Some(unit)) => {
                 return serve_interop(
@@ -1356,6 +1367,42 @@ async fn serve(
                         version: a2a_version_header.as_deref(),
                         query: query_string.as_deref(),
                         if_none_match: if_none_match.as_deref(),
+                        mcp_method: None,
+                    },
+                )
+                .await;
+            }
+            Ok(None) => {}
+        }
+    }
+
+    // The MCP surface, on the same terms: reserved only for a unit whose
+    // staged config enables it.
+    if let Some(route) = crate::interop::mcp::route_for(&path) {
+        match resolve_interop_unit(
+            &state,
+            &activation,
+            host_header.as_deref(),
+            &path,
+            InteropFeature::Mcp,
+        )
+        .await
+        {
+            Err(response) => return Err(response),
+            Ok(Some(unit)) => {
+                return serve_mcp(
+                    req,
+                    route,
+                    &unit,
+                    &state,
+                    &activation,
+                    &method,
+                    InteropRequestHeaders {
+                        authorization: authorization_header.as_deref(),
+                        version: None,
+                        query: query_string.as_deref(),
+                        if_none_match: None,
+                        mcp_method: mcp_method_header.as_deref(),
                     },
                 )
                 .await;
@@ -1770,6 +1817,25 @@ async fn load_unit_config_cached(
     Ok(config)
 }
 
+/// Which staged toggle a path needs. A path whose feature is off is NOT
+/// reserved: the request falls through to normal routing, which is what keeps
+/// adding these paths from shadowing an app route on a unit that wants
+/// neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteropFeature {
+    A2a,
+    Mcp,
+}
+
+impl InteropFeature {
+    fn enabled_in(self, config: &crate::interop::config::InteropConfig) -> bool {
+        match self {
+            InteropFeature::A2a => config.a2a,
+            InteropFeature::Mcp => config.mcp,
+        }
+    }
+}
+
 /// One unit's interop configuration, resolved for a request that named an
 /// interop path.
 struct InteropUnit {
@@ -1793,6 +1859,7 @@ async fn resolve_interop_unit(
     activation: &Activation,
     host: Option<&str>,
     path: &str,
+    feature: InteropFeature,
 ) -> Result<Option<InteropUnit>, Response<Full<Bytes>>> {
     let Some((deployment_id, _tenant)) = activation.routing.deployment_routes.resolve(host, path)
     else {
@@ -1827,7 +1894,7 @@ async fn resolve_interop_unit(
             )
         })?;
     Ok(config
-        .filter(|config| config.a2a)
+        .filter(|config| feature.enabled_in(config))
         .map(|config| InteropUnit {
             deployment_id,
             tenant,
@@ -1966,13 +2033,219 @@ async fn serve_interop(
     })
 }
 
+/// Serve one reserved MCP path.
+///
+/// The endpoint is authenticated HERE rather than inside `rmcp`, which has no
+/// auth of its own: the verified caller is then baked into the service the
+/// factory builds, so a tool never has to read an identity back out of a
+/// request extension.
+async fn serve_mcp(
+    req: Request<Incoming>,
+    route: crate::interop::mcp::McpRoute,
+    unit: &InteropUnit,
+    state: &Arc<ServeState>,
+    activation: &Arc<Activation>,
+    method: &hyper::Method,
+    headers: InteropRequestHeaders<'_>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let authorization = headers.authorization;
+    let mcp_method = headers.mcp_method;
+    let base_url = interop_base_url(state);
+    let Some(resource) =
+        crate::interop::mcp::metadata::resource_identifier(&unit.config, base_url.as_deref())
+    else {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "mcp: unit `{}` has neither a staged `mcp_resource` nor a public base URL,                  so no resource identifier can be published",
+                unit.bundle_id
+            ),
+        );
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this worker's MCP address is not known yet",
+        ));
+    };
+
+    if route == crate::interop::mcp::McpRoute::Metadata {
+        if method != hyper::Method::GET {
+            return Err(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "the protected-resource metadata is served on GET",
+            ));
+        }
+        let Some(document) = crate::interop::mcp::metadata::document(&unit.config, &resource)
+        else {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no authorization server is configured for this worker",
+            ));
+        };
+        let body = serde_json::to_vec(&document)
+            .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        return Ok(json_response(StatusCode::OK, body));
+    }
+
+    let metadata_url =
+        crate::interop::mcp::metadata::resource_metadata_url(base_url.as_deref(), &resource);
+    let caller = match crate::interop::mcp::auth::authenticate(
+        &unit.config,
+        &resource,
+        authorization,
+        crate::ingress_auth::now_ms(),
+    )
+    .await
+    {
+        crate::interop::mcp::auth::McpAuth::Allowed(caller) => caller,
+        crate::interop::mcp::auth::McpAuth::Unauthorized => {
+            return Err(mcp_unauthorized(&metadata_url));
+        }
+        crate::interop::mcp::auth::McpAuth::IssuerUnavailable => {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the authorization server could not be reached to verify this token",
+            ));
+        }
+    };
+
+    // Metered on the `Mcp-Method` header, never on the body: the limiter costs
+    // nothing in front of a large request and cannot disagree with the
+    // transport about what a request is.
+    let cost = crate::interop::mcp::request_cost(mcp_method);
+    if let Err(retry_after) = state.interop.limiter.check(caller.key(), cost) {
+        let mut response = error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many requests from this connection; wait and retry",
+        );
+        if let Ok(value) = header::HeaderValue::from_str(&retry_after.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return Err(response);
+    }
+
+    let ctx = std::sync::Arc::new(crate::interop::mcp::server::McpContext {
+        runner: std::sync::Arc::new(OwnedTurnRunner {
+            state: Arc::clone(state),
+            activation: Arc::clone(activation),
+            tenant: unit.tenant.clone(),
+            deployment_id: unit.deployment_id,
+        }),
+        turns: std::sync::Arc::clone(&state.interop.turns),
+        deployment_id: unit.deployment_id,
+        tenant: unit.tenant.clone(),
+        bundle_id: unit.bundle_id.clone(),
+        caller_key: caller.key().to_string(),
+        agent_name: unit
+            .config
+            .agent
+            .name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| unit.bundle_id.clone()),
+    });
+    // GET and DELETE are answered by `rmcp` itself: in stateless mode
+    // (`legacy_session_mode = false`, no event store) its `handle` allows POST
+    // alone and answers anything else `405` with `Allow: POST`.
+    let response = crate::interop::mcp::server::service(ctx).handle(req).await;
+    Ok(collect_boxed_response(response).await)
+}
+
+/// `401` for the MCP endpoint, carrying the discovery URL a client that has
+/// never authenticated needs. Without the header a client fails to connect
+/// with no error that points anywhere.
+fn mcp_unauthorized(metadata_url: &str) -> Response<Full<Bytes>> {
+    let mut response = error_response(
+        StatusCode::UNAUTHORIZED,
+        "a valid bearer token issued by the configured authorization server is required",
+    );
+    if let Ok(value) =
+        header::HeaderValue::from_str(&format!("Bearer resource_metadata=\"{metadata_url}\""))
+    {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
+    }
+    response
+}
+
+/// Collapse `rmcp`'s boxed body into this ingress's single body type.
+///
+/// The body's error type is `Infallible`, so the collect cannot actually fail;
+/// it is still handled rather than unwrapped, because a future rmcp release
+/// widening that type must fail as a `500` and not as a panic on the request
+/// path.
+async fn collect_boxed_response(
+    response: Response<http_body_util::combinators::BoxBody<Bytes, Infallible>>,
+) -> Response<Full<Bytes>> {
+    let (parts, body) = response.into_parts();
+    match body.collect().await {
+        Ok(collected) => Response::from_parts(parts, Full::new(collected.to_bytes())),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the MCP transport produced an unreadable body",
+        ),
+    }
+}
+
+/// A [`TurnRunner`] that OWNS what it needs, for a handler that outlives the
+/// request borrow — `rmcp` builds its service from a `'static` factory, so the
+/// borrowed [`IngressTurnRunner`] cannot be handed to it.
+///
+/// It holds the activation the request pinned, so a concurrent reload cannot
+/// move the turn onto a different host mid-request, and goes through the same
+/// [`run_turn`] as every other ingress.
+///
+/// [`TurnRunner`]: crate::interop::a2a::rpc::TurnRunner
+struct OwnedTurnRunner {
+    state: Arc<ServeState>,
+    activation: Arc<Activation>,
+    tenant: String,
+    deployment_id: DeploymentId,
+}
+
+#[async_trait::async_trait]
+impl crate::interop::a2a::rpc::TurnRunner for OwnedTurnRunner {
+    async fn run(
+        &self,
+        session_hint: &str,
+        user: &str,
+        payload: &Value,
+    ) -> Result<Vec<Activity>, crate::interop::a2a::rpc::TurnFailure> {
+        run_turn(
+            &self.state,
+            &self.activation,
+            TurnSpec {
+                tenant: &self.tenant,
+                deployment_id: self.deployment_id,
+                session_hint: Some(session_hint),
+                // The caller authenticated before this runs, so the hint is
+                // as trusted as a loopback caller's and pins inline.
+                defer_pin: false,
+                cookie: None,
+                user: Some(user),
+                payload,
+            },
+            "mcp dispatch",
+            "mcp execution",
+        )
+        .await
+        // The detail is already in the operator log; the caller sees a
+        // tool-level failure, never an ingress response body.
+        .map_err(|_| crate::interop::a2a::rpc::TurnFailure)
+    }
+}
+
 /// The request facts the interop surfaces read, gathered before the body is
 /// consumed.
 struct InteropRequestHeaders<'a> {
     authorization: Option<&'a str>,
+    /// `A2A-Version`.
     version: Option<&'a str>,
     query: Option<&'a str>,
     if_none_match: Option<&'a str>,
+    /// `Mcp-Method` (SEP-2243), which the MCP limiter meters on so it never
+    /// has to parse a body.
+    mcp_method: Option<&'a str>,
 }
 
 /// Phase 0b (worker-interop contract D7): refuse a non-loopback caller of the

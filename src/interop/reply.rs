@@ -31,6 +31,10 @@ pub(crate) struct ProjectedReply {
     /// The flow parked waiting for the caller (a card or form awaiting
     /// submit). The caller's next message in the same conversation resumes it.
     pub awaiting_input: bool,
+    /// The flow ENDED AT A FAILURE and the text above is the categorized
+    /// error, not an answer. A protocol that can say so (MCP's `isError`)
+    /// must, or the error reads to a caller as the worker's reply.
+    pub flow_error: bool,
 }
 
 /// Project every reply of one turn. `channel` names the protocol for the
@@ -60,6 +64,11 @@ pub(crate) fn project_replies(
         for envelope in
             crate::revision_serve::build_reply_envelopes(ingress, reply, pack_id, tenant)
         {
+            // `parse_envelopes`' flow-error branch is the ONLY one that stamps
+            // `error_kind`, and it stamps it on the reply it categorized.
+            if envelope.metadata.contains_key("error_kind") {
+                projected.flow_error = true;
+            }
             push_envelope(&mut projected.items, &envelope);
         }
     }
@@ -167,6 +176,7 @@ mod tests {
         let got = project(&[Activity::text("hello")]);
         assert_eq!(got.items, vec![ReplyItem::Text("hello".into())]);
         assert!(!got.awaiting_input);
+        assert!(!got.flow_error, "an ordinary reply is not an error");
     }
 
     #[test]
@@ -232,6 +242,10 @@ mod tests {
         };
         assert!(!text.is_empty());
         assert!(!got.awaiting_input);
+        assert!(
+            got.flow_error,
+            "a failed flow must be reportable as an error"
+        );
     }
 
     #[test]
