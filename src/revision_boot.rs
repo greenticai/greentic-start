@@ -118,7 +118,15 @@ pub(crate) type RevisionStores = Arc<
 /// forward across reloads only when ALL identity fields match — so a tenant,
 /// team, or customer change on the same deployment/revision mints fresh stores
 /// rather than leaking the previous identity's sessions.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// `Serialize`/`Deserialize` are here for ONE reason and it is not persistence:
+/// nothing writes this key anywhere. They let
+/// `every_revision_store_key_field_changes_the_namespace` enumerate the fields
+/// from the struct instead of from a hand-written list, so a seventh field is
+/// covered by that test the moment it is added rather than whenever someone
+/// remembers to extend an array. The struct is `pub(crate)` and has no wire
+/// contract, so the derives cost nothing else.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RevisionStoreKey {
     pub deployment_id: String,
     pub revision_id: String,
@@ -161,13 +169,27 @@ fn revision_store_key(
 /// The revision id leads so `SCAN` output stays readable; the digest behind it
 /// is what actually separates them.
 fn revision_namespace_suffix(key: &RevisionStoreKey) -> String {
+    // Destructured EXHAUSTIVELY, with no `..`: reading the fields through `key.`
+    // would let a seventh field be added to `RevisionStoreKey` — and therefore
+    // to what the in-memory registry treats as a separate isolation domain —
+    // while the durable keyspace silently went on ignoring it. That is the exact
+    // failure this function's own doc comment forbids, and nothing would have
+    // reported it. As written, a new field is an E0027 right here.
+    let RevisionStoreKey {
+        deployment_id,
+        revision_id,
+        tenant,
+        team,
+        customer_id,
+        bundle_id,
+    } = key;
     isolation_suffix(&[
-        key.revision_id.as_str(),
-        key.deployment_id.as_str(),
-        key.tenant.as_str(),
-        key.team.as_str(),
-        key.customer_id.as_str(),
-        key.bundle_id.as_str(),
+        revision_id.as_str(),
+        deployment_id.as_str(),
+        tenant.as_str(),
+        team.as_str(),
+        customer_id.as_str(),
+        bundle_id.as_str(),
     ])
 }
 
@@ -2067,6 +2089,66 @@ mod tests {
             "a customer_id change must NOT reuse the previous customer's stores — \
              the new customer would inherit the old one's sessions"
         );
+    }
+
+    /// The durable keyspace has to separate exactly what the in-memory registry
+    /// separates, on EVERY field — a field the registry treats as identity and
+    /// the keyspace ignores is two isolation domains sharing one set of parked
+    /// conversations, visible only on a deployment that configured durability.
+    ///
+    /// The cases are ENUMERATED FROM THE STRUCT, not from a list written here:
+    /// the baseline is serialized, every field of the resulting object is
+    /// mutated in turn, and the mutant is deserialized back. A seventh field is
+    /// therefore covered the moment it is added. A hand-written array would
+    /// stay green while the field it forgot went unprotected, which is the same
+    /// shape of hole `revision_namespace_suffix`'s exhaustive destructure
+    /// closes on the production side — one of the two alone is not enough:
+    /// the destructure would force someone to ADD the field to the digest, and
+    /// this proves the digest actually reacts to it.
+    ///
+    /// A non-`String` field makes this FAIL rather than skip, naming the field:
+    /// the mutation below only knows how to perturb a JSON string, and quietly
+    /// passing over what it cannot perturb is how a list stops covering things.
+    ///
+    /// MUTATION PROOF: drop any field from `revision_namespace_suffix`'s
+    /// destructured digest input and this fails, naming it.
+    #[test]
+    fn every_revision_store_key_field_changes_the_namespace() {
+        let baseline = RevisionStoreKey {
+            deployment_id: "dep-01".to_string(),
+            revision_id: "rev-01".to_string(),
+            tenant: "acme".to_string(),
+            team: "general".to_string(),
+            customer_id: "cust-01".to_string(),
+            bundle_id: "Support-Bot.v1".to_string(),
+        };
+        let baseline_suffix = revision_namespace_suffix(&baseline);
+        let serde_json::Value::Object(fields) =
+            serde_json::to_value(&baseline).expect("the key serializes")
+        else {
+            panic!("RevisionStoreKey must serialize as an object");
+        };
+        assert!(!fields.is_empty(), "the key must have fields to enumerate");
+
+        for name in fields.keys() {
+            let mut mutant = fields.clone();
+            let slot = mutant.get_mut(name).expect("field present");
+            let Some(current) = slot.as_str() else {
+                panic!(
+                    "`{name}` is not a string, so this test cannot perturb it —                      extend the mutation below rather than letting the field go                      uncovered"
+                );
+            };
+            *slot = serde_json::Value::String(format!("{current}-changed"));
+            let mutated: RevisionStoreKey =
+                serde_json::from_value(serde_json::Value::Object(mutant))
+                    .expect("the mutated key deserializes");
+
+            assert_ne!(
+                revision_namespace_suffix(&mutated),
+                baseline_suffix,
+                "changing `{name}` must change the durable keyspace; as written, two                  revisions the registry keeps apart would share one set of parked                  conversations"
+            );
+        }
     }
 
     /// Same argument for the tenant. `SessionKey` is an opaque generated id and

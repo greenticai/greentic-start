@@ -113,8 +113,12 @@ impl DurableStorage {
             var(greentic_runner_host::storage::config::ENV_SESSION_WAIT_TTL_SECS).as_deref(),
         )
         .context(
-            "refusing to boot on in-memory conversation state after a durable backend was asked \
-             for; every parked conversation would be silently lost on the next restart",
+            // Deliberately covers the typo'd-backend-name case too (`memry`),
+            // not only a named-but-unbuildable Redis: either way the operator
+            // asked for something this boot cannot honour, and the alternative
+            // to refusing is starting on in-memory state that looks healthy.
+            "refusing to boot: the conversation-state configuration could not be honoured, and \
+             starting on in-memory state would silently lose every parked conversation",
         )?;
         Ok(Self { config })
     }

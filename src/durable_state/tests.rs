@@ -8,73 +8,150 @@
 use super::*;
 use greentic_runner_host::engine::runtime::IngressEnvelope;
 use greentic_runner_host::runner::engine::{ExecutionState, FlowSnapshot, FlowWait};
-use greentic_runner_host::storage::config::ENV_REDIS_URL;
+use greentic_runner_host::storage::config::{
+    ENV_GREENTIC_ENV, ENV_REDIS_URL, ENV_SESSION_BACKEND, ENV_SESSION_NAMESPACE,
+    ENV_SESSION_WAIT_TTL_SECS, ENV_STATE_BACKEND,
+};
 
-/// The default must stay byte-for-byte the pre-existing behaviour: naming no
-/// backend resolves to memory, even when a Redis URL is sitting in the
-/// environment for some other reason (the pin store's, say).
+/// An `RAII` restore for the six variables `DurableStorage::resolve` reads, so
+/// a failing assertion cannot leave the process env poisoned for the next test.
+struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+impl EnvGuard {
+    fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
+        let saved = pairs
+            .iter()
+            .map(|(name, _)| (*name, std::env::var(name).ok()))
+            .collect();
+        for (name, value) in pairs {
+            // SAFETY: every caller holds `crate::test_env_lock`, which is the
+            // crate-wide serialisation for process-env mutation in tests.
+            match value {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.0 {
+            // SAFETY: the `crate::test_env_lock` guard the caller holds outlives
+            // this one — it is bound first, so it drops last.
+            match value {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+    }
+}
+
+/// The keyspace an operator gets when they name only the backend and the URL —
+/// and the thing that makes this test worth having: it goes through
+/// [`DurableStorage::resolve`], NOT through `StorageConfig::from_vars`.
+///
+/// `from_vars` takes the environment id as an argument, so a test that calls it
+/// directly proves only that the runner-host crate honours its own parameter.
+/// The claim being made here is about THIS crate's boot: that `resolve` passes
+/// the env id the boot RESOLVED (flag > env > `local`) rather than whatever
+/// `GREENTIC_ENV` happens to hold. A `--env prod` boot with no `GREENTIC_ENV`
+/// set — the normal shape on a container that takes the flag — would otherwise
+/// derive its keyspace from a variable nobody set, or from `local`.
+///
+/// MUTATION PROOF: make `resolve` pass
+/// `std::env::var(ENV_GREENTIC_ENV).ok().as_deref()` instead of its `env_id`
+/// argument and this fails, resolving `greentic:session:something-else`.
 #[test]
-fn naming_no_backend_resolves_to_memory_even_with_a_url_present() {
-    let config = StorageConfig::from_vars(
-        None,
-        None,
-        Some("redis://127.0.0.1:6379"),
-        None,
-        Some("local"),
-        None,
-    )
-    .expect("no backend named is not an error");
-    let storage = DurableStorage { config };
+fn the_namespace_is_derived_from_the_resolved_env_not_the_process_var() {
+    let _lock = crate::test_env_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let _env = EnvGuard::set(&[
+        (ENV_SESSION_BACKEND, Some("redis")),
+        (ENV_STATE_BACKEND, None),
+        (ENV_REDIS_URL, Some("redis://127.0.0.1:6379")),
+        (ENV_SESSION_NAMESPACE, None),
+        // Deliberately DISAGREES with the resolved env id below.
+        (ENV_GREENTIC_ENV, Some("something-else")),
+        (ENV_SESSION_WAIT_TTL_SECS, None),
+    ]);
+
+    let storage = DurableStorage::resolve("prod").expect("resolves");
+    let SessionBackend::Redis { namespace, .. } = &storage.config.session else {
+        panic!("expected a redis session backend");
+    };
+    assert_eq!(
+        namespace, "greentic:session:prod",
+        "the keyspace must come from the env id this boot resolved, not from GREENTIC_ENV"
+    );
+}
+
+/// The other half of the same seam: `resolve` must not invent durability. With
+/// no backend named it yields memory even though a URL is present — and it must
+/// reach that answer through `resolve`, for the same reason as above.
+#[test]
+fn resolve_names_no_backend_and_gets_memory() {
+    let _lock = crate::test_env_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let _env = EnvGuard::set(&[
+        (ENV_SESSION_BACKEND, None),
+        (ENV_STATE_BACKEND, None),
+        (ENV_REDIS_URL, Some("redis://127.0.0.1:6379")),
+        (ENV_SESSION_NAMESPACE, None),
+        (ENV_GREENTIC_ENV, Some("prod")),
+        (ENV_SESSION_WAIT_TTL_SECS, None),
+    ]);
+
+    let storage = DurableStorage::resolve("prod").expect("no backend named is not an error");
     assert!(
         !storage.is_durable(),
         "a URL alone must not switch a deployment onto Redis"
     );
 }
 
-/// A named-but-unbuildable backend is a refusal, not a fall back. This is the
-/// whole difference from `resolve_pin_store`.
+/// A named-but-unbuildable backend must abort the boot, and `resolve` is where
+/// that happens — the error carries the context this crate adds, not just the
+/// runner-host message.
 #[test]
-fn a_named_redis_session_backend_without_a_url_is_a_refusal() {
-    let err = StorageConfig::from_vars(Some("redis"), None, None, None, Some("local"), None)
-        .expect_err("redis with no URL must refuse");
-    let rendered = err.to_string();
+fn resolve_refuses_a_named_backend_with_no_url() {
+    let _lock = crate::test_env_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let _env = EnvGuard::set(&[
+        (ENV_SESSION_BACKEND, Some("redis")),
+        (ENV_STATE_BACKEND, None),
+        (ENV_REDIS_URL, None),
+        (ENV_SESSION_NAMESPACE, None),
+        (ENV_GREENTIC_ENV, Some("prod")),
+        (ENV_SESSION_WAIT_TTL_SECS, None),
+    ]);
+
+    let err = DurableStorage::resolve("prod").expect_err("redis with no URL must refuse");
+    let rendered = format!("{err:#}");
     assert!(
         rendered.contains(ENV_REDIS_URL),
         "the refusal must name the variable to set; got: {rendered}"
     );
     assert!(
-        rendered.contains("refusing"),
-        "the refusal must say it is refusing, not describe a degrade; got: {rendered}"
+        rendered.contains("refusing to boot"),
+        "the refusal must be a boot refusal, not a note; got: {rendered}"
     );
 }
 
-/// The keyspace an operator gets when they name only the backend and the URL.
+/// [`isolation_suffix`] is a generic digest over a slice, so what it owes is
+/// POSITIONAL sensitivity: perturbing any position changes the answer.
+///
+/// This deliberately does NOT claim to cover `RevisionStoreKey`. It cannot —
+/// it knows nothing about that struct, and a test over a literal array here is
+/// exactly the kind that stays green while a seventh field goes unprotected.
+/// That obligation belongs to
+/// `revision_boot::tests::every_revision_store_key_field_changes_the_namespace`,
+/// which enumerates the fields from the struct itself.
 #[test]
-fn the_namespace_is_derived_from_the_resolved_env_not_the_process_var() {
-    let config = StorageConfig::from_vars(
-        Some("redis"),
-        None,
-        Some("redis://127.0.0.1:6379"),
-        None,
-        // `DurableStorage::resolve` passes the env this boot RESOLVED here, so
-        // a `--env prod` boot with no GREENTIC_ENV set still gets `prod`.
-        Some("prod"),
-        None,
-    )
-    .expect("resolves");
-    let SessionBackend::Redis { namespace, .. } = &config.session else {
-        panic!("expected a redis session backend");
-    };
-    assert_eq!(namespace, "greentic:session:prod");
-}
-
-/// MUTATION PROOF: drop any field from `revision_namespace_suffix`'s input and
-/// this fails. Two revisions that differ in ONE field of the isolation identity
-/// must land in different keyspaces — a merged keyspace is the cross-revision
-/// resume `revision_boot` exists to prevent, and it would appear only on the
-/// deployment that configured durability.
-#[test]
-fn every_isolation_field_changes_the_namespace() {
+fn every_position_changes_the_digest() {
     let base = ["rev", "dep", "tenant", "team", "customer", "bundle"];
     let baseline = isolation_suffix(&base);
     for index in 0..base.len() {
@@ -83,7 +160,7 @@ fn every_isolation_field_changes_the_namespace() {
         assert_ne!(
             isolation_suffix(&altered),
             baseline,
-            "changing field {index} must change the keyspace"
+            "changing position {index} must change the digest"
         );
     }
 }
@@ -142,7 +219,8 @@ async fn in_memory_storage_mints_independent_stores() {
 
 /// A zero wait TTL means "no expiry", not "expire immediately" — a zero would
 /// drop the snapshot before the turn that wrote it could be resumed, which
-/// reads as "durable storage does not work".
+/// reads as "durable storage does not work". Same reason as above: the
+/// behaviour is upstream's, the promise to the operator is ours.
 #[test]
 fn a_zero_wait_ttl_disables_expiry_rather_than_expiring_at_once() {
     let config = StorageConfig::from_vars(
@@ -157,7 +235,10 @@ fn a_zero_wait_ttl_disables_expiry_rather_than_expiring_at_once() {
     assert_eq!(config.session.wait_ttl(), None);
 }
 
-/// The documented default, asserted rather than described: 24 hours.
+/// The 24-hour default is a claim `docs/durable-conversation-state.md` makes to
+/// operators about a number this crate does not own. Pinned here so a
+/// runner-host bump that moves it shows up as a failing test in the repo whose
+/// documentation would otherwise start lying.
 #[test]
 fn the_default_wait_ttl_is_twenty_four_hours() {
     let config = StorageConfig::from_vars(
