@@ -92,9 +92,8 @@ impl Fixture {
     }
 }
 
-fn request<'a>(auth: Option<&'a str>, body: &'a [u8]) -> A2aRequest<'a> {
+fn request(body: &[u8]) -> A2aRequest<'_> {
     A2aRequest {
-        authorization: auth,
         version_header: None,
         query: None,
         if_none_match: None,
@@ -129,6 +128,37 @@ fn send_params(context_id: Option<&str>) -> Value {
 
 const BEARER: &str = "Bearer gtw_test-token";
 
+/// Drive a JSON-RPC request the way the ingress does: authenticate from the
+/// header FIRST (before any body is read), then hand the verified credential
+/// id to the handler. A test that called the handler directly would not
+/// exercise the order the real path depends on.
+async fn rpc_call(
+    fixture: &Fixture,
+    authorization: Option<&str>,
+    req: &A2aRequest<'_>,
+    runner: &dyn TurnRunner,
+) -> HttpResponse {
+    let ctx = fixture.ctx();
+    match crate::interop::a2a::rpc::authenticate(&ctx, authorization) {
+        Ok(credential_id) => handle_jsonrpc(&ctx, req, credential_id, runner).await,
+        Err(response) => *response,
+    }
+}
+
+/// The same for the HTTP+JSON binding.
+async fn rest_call(
+    fixture: &Fixture,
+    authorization: Option<&str>,
+    req: &A2aRequest<'_>,
+    runner: &dyn TurnRunner,
+) -> HttpResponse {
+    let ctx = fixture.ctx();
+    match crate::interop::a2a::rpc::authenticate(&ctx, authorization) {
+        Ok(credential_id) => handle_rest_send(&ctx, req, credential_id, runner).await,
+        Err(response) => *response,
+    }
+}
+
 #[tokio::test]
 async fn send_message_runs_one_namespaced_turn_and_returns_a_message() {
     let fixture = Fixture::new(config());
@@ -137,7 +167,7 @@ async fn send_message_runs_one_namespaced_turn_and_returns_a_message() {
         json!({"reply": "hi there"}),
     )]);
     let body = rpc("SendMessage", send_params(Some("ctx-9")));
-    let response = handle_jsonrpc(&fixture.ctx(), &request(Some(BEARER), &body), &runner).await;
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
     assert_eq!(response.status(), StatusCode::OK);
     let value = body_json(response).await;
     let message = &value["result"]["message"];
@@ -159,9 +189,7 @@ async fn a_missing_context_id_is_minted_and_returned() {
     let fixture = Fixture::new(config());
     let runner = FakeRunner::replying(vec![Activity::text("ok")]);
     let body = rpc("SendMessage", send_params(None));
-    let value =
-        body_json(handle_jsonrpc(&fixture.ctx(), &request(Some(BEARER), &body), &runner).await)
-            .await;
+    let value = body_json(rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await).await;
     let context = value["result"]["message"]["contextId"]
         .as_str()
         .unwrap_or_default()
@@ -179,9 +207,7 @@ async fn a_parked_turn_with_a_card_sets_awaiting_input() {
         json!({"status": "pending", "response": {"renderedCard": card.clone()}}),
     )]);
     let body = rpc("SendMessage", send_params(Some("c")));
-    let value =
-        body_json(handle_jsonrpc(&fixture.ctx(), &request(Some(BEARER), &body), &runner).await)
-            .await;
+    let value = body_json(rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await).await;
     let message = &value["result"]["message"];
     assert_eq!(message["metadata"], json!({"awaitingInput": true}));
     assert_eq!(
@@ -199,7 +225,7 @@ async fn no_or_wrong_bearer_is_401_and_runs_nothing() {
     let runner = FakeRunner::replying(vec![]);
     let body = rpc("SendMessage", send_params(None));
     for auth in [None, Some("Bearer gtw_wrong")] {
-        let response = handle_jsonrpc(&fixture.ctx(), &request(auth, &body), &runner).await;
+        let response = rpc_call(&fixture, auth, &request(&body), &runner).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
     }
@@ -224,8 +250,7 @@ async fn task_rpcs_answer_statelessly() {
     for (method, params, code) in cases {
         let body = rpc(method, params);
         let value =
-            body_json(handle_jsonrpc(&fixture.ctx(), &request(Some(BEARER), &body), &runner).await)
-                .await;
+            body_json(rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await).await;
         match code {
             Some(code) => assert_eq!(value["error"]["code"], code, "{method}"),
             None => assert_eq!(
@@ -254,24 +279,20 @@ async fn malformed_requests_get_json_rpc_errors() {
     ];
     for (body, code) in cases {
         let value =
-            body_json(handle_jsonrpc(&fixture.ctx(), &request(Some(BEARER), body), &runner).await)
-                .await;
+            body_json(rpc_call(&fixture, Some(BEARER), &request(body), &runner).await).await;
         assert_eq!(value["error"]["code"], code);
         assert_eq!(value["id"], Value::Null);
     }
     let bad_params = rpc("SendMessage", json!({"message": {"parts": "x"}}));
-    let value = body_json(
-        handle_jsonrpc(&fixture.ctx(), &request(Some(BEARER), &bad_params), &runner).await,
-    )
-    .await;
+    let value =
+        body_json(rpc_call(&fixture, Some(BEARER), &request(&bad_params), &runner).await).await;
     assert_eq!(value["error"]["code"], -32602);
     let raw_only = rpc(
         "SendMessage",
         json!({"message": {"messageId": "m", "role": "ROLE_USER", "parts": [{"raw": "aGk="}]}}),
     );
     let value =
-        body_json(handle_jsonrpc(&fixture.ctx(), &request(Some(BEARER), &raw_only), &runner).await)
-            .await;
+        body_json(rpc_call(&fixture, Some(BEARER), &request(&raw_only), &runner).await).await;
     assert_eq!(value["error"]["code"], -32005);
 }
 
@@ -288,10 +309,10 @@ async fn version_is_negotiated_on_major_minor() {
         (Some("0.3"), None, false),
         (None, Some("x=1&A2A-Version=2.0"), false),
     ] {
-        let mut req = request(Some(BEARER), &body);
+        let mut req = request(&body);
         req.version_header = header_value;
         req.query = query;
-        let value = body_json(handle_jsonrpc(&fixture.ctx(), &req, &runner).await).await;
+        let value = body_json(rpc_call(&fixture, Some(BEARER), &req, &runner).await).await;
         if ok {
             assert!(
                 value.get("result").is_some(),
@@ -310,7 +331,7 @@ async fn the_rate_limit_refuses_with_retry_after() {
     let body = rpc("SendMessage", send_params(Some("c")));
     let mut last = StatusCode::OK;
     for _ in 0..61 {
-        let response = handle_jsonrpc(&fixture.ctx(), &request(Some(BEARER), &body), &runner).await;
+        let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
         last = response.status();
         if last == StatusCode::TOO_MANY_REQUESTS {
             assert!(response.headers().contains_key(header::RETRY_AFTER));
@@ -328,7 +349,7 @@ async fn the_concurrent_turn_cap_refuses_when_full() {
     let _held = fixture.turns.try_acquire(fixture.deployment_id);
     let runner = FakeRunner::replying(vec![Activity::text("ok")]);
     let body = rpc("SendMessage", send_params(Some("c")));
-    let response = handle_jsonrpc(&fixture.ctx(), &request(Some(BEARER), &body), &runner).await;
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(runner.calls().is_empty());
 }
@@ -338,14 +359,14 @@ async fn rest_send_uses_the_same_turn() {
     let fixture = Fixture::new(config());
     let runner = FakeRunner::replying(vec![Activity::text("rest reply")]);
     let body = send_params(Some("r")).to_string().into_bytes();
-    let response = handle_rest_send(&fixture.ctx(), &request(Some(BEARER), &body), &runner).await;
+    let response = rest_call(&fixture, Some(BEARER), &request(&body), &runner).await;
     assert_eq!(response.status(), StatusCode::OK);
     let value = body_json(response).await;
     assert_eq!(value["message"]["parts"], json!([{"text": "rest reply"}]));
     assert_eq!(runner.calls()[0].0, "a2a:c1:r");
 
-    let bad = handle_rest_send(&fixture.ctx(), &request(Some(BEARER), b"{}"), &runner).await;
+    let bad = rest_call(&fixture, Some(BEARER), &request(b"{}"), &runner).await;
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
-    let unauth = handle_rest_send(&fixture.ctx(), &request(None, &body), &runner).await;
+    let unauth = rest_call(&fixture, None, &request(&body), &runner).await;
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
 }

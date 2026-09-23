@@ -90,8 +90,13 @@ pub(crate) struct A2aContext<'a> {
 }
 
 /// The request facts the handlers read, gathered before the body is consumed.
+///
+/// Deliberately carries NO credential: the ingress authenticates from the
+/// `Authorization` header before it reads a body, and hands the handlers the
+/// verified credential id. A request type that carried the header would
+/// invite a handler to re-derive it, and the whole point is that the check
+/// has already happened.
 pub(crate) struct A2aRequest<'a> {
-    pub authorization: Option<&'a str>,
     pub version_header: Option<&'a str>,
     pub query: Option<&'a str>,
     pub if_none_match: Option<&'a str>,

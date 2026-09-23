@@ -2010,7 +2010,6 @@ async fn serve_interop(
             ));
         }
         let request = crate::interop::a2a::A2aRequest {
-            authorization: None,
             version_header: None,
             query: None,
             if_none_match: headers.if_none_match,
@@ -2025,6 +2024,12 @@ async fn serve_interop(
             "this A2A endpoint requires POST",
         ));
     }
+    // Authenticate BEFORE the body is read. The bearer check needs only the
+    // `Authorization` header, so an unauthenticated peer must not be able to
+    // make this process read (and buffer) a megabyte per request. `/mcp`
+    // already had this order; this path did not.
+    let credential_id = crate::interop::a2a::rpc::authenticate(&ctx, headers.authorization)
+        .map_err(|response| *response)?;
     let body_bytes = read_body_limited(req).await.map_err(|_| {
         error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -2032,7 +2037,6 @@ async fn serve_interop(
         )
     })?;
     let request = crate::interop::a2a::A2aRequest {
-        authorization: headers.authorization,
         version_header: headers.version,
         query: headers.query,
         if_none_match: None,
@@ -2046,9 +2050,11 @@ async fn serve_interop(
     };
     Ok(match route {
         crate::interop::a2a::A2aRoute::JsonRpc => {
-            crate::interop::a2a::rpc::handle_jsonrpc(&ctx, &request, &runner).await
+            crate::interop::a2a::rpc::handle_jsonrpc(&ctx, &request, credential_id, &runner).await
         }
-        _ => crate::interop::a2a::rpc::handle_rest_send(&ctx, &request, &runner).await,
+        _ => {
+            crate::interop::a2a::rpc::handle_rest_send(&ctx, &request, credential_id, &runner).await
+        }
     })
 }
 

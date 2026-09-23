@@ -298,10 +298,10 @@ async fn exchange(state: &Arc<ServeState>, trust_loopback_peers: bool, request: 
     });
 
     let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("write request");
+    // A write error is tolerated: a server that refuses before reading the
+    // whole body (an unauthenticated oversized POST, say) legitimately closes
+    // the connection mid-write, and the RESPONSE is what this asserts on.
+    let _ = stream.write_all(request.as_bytes()).await;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.expect("read response");
     accept.await.expect("accept loop");
@@ -1021,4 +1021,35 @@ async fn the_metadata_document_still_needs_a_resource_identifier() {
     )
     .await;
     assert_eq!(response.status, 503);
+}
+
+/// Authentication runs BEFORE the body is read.
+///
+/// Asserted by the status an oversized POST gets: a body past the 1 MiB cap
+/// answers `413` only once the reader has been asked to buffer it, so an
+/// unauthenticated peer seeing `401` proves this process never read one. With
+/// the two steps the other way round — the shape this path shipped with — an
+/// anonymous caller could make every request buffer a megabyte first.
+#[tokio::test]
+async fn an_unauthenticated_a2a_post_is_refused_before_its_body_is_read() {
+    let (activation, _) = activation_with(Store::Config(true));
+    let state = state_with(activation, interop_with_base_url(vec![Activity::text("x")]));
+    let oversized = "x".repeat((1 << 20) + 1);
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "SendMessage",
+        "params": {"message": {"messageId": "m", "role": "ROLE_USER",
+                   "parts": [{"text": oversized}]}}
+    })
+    .to_string();
+
+    let anonymous = exchange(&state, false, &post("/a2a", &[], &body)).await;
+    assert_eq!(
+        anonymous.status, 401,
+        "an anonymous caller must be refused before the body is buffered"
+    );
+
+    // …and the cap still applies to a caller that IS authenticated, so the
+    // reorder did not remove the limit.
+    let authenticated = exchange(&state, false, &post("/a2a", &[AUTH], &body)).await;
+    assert_eq!(authenticated.status, 413);
 }

@@ -57,9 +57,8 @@ impl Fixture {
     }
 }
 
-fn request<'a>(auth: Option<&'a str>, body: &'a [u8]) -> A2aRequest<'a> {
+fn request(body: &[u8]) -> A2aRequest<'_> {
     A2aRequest {
-        authorization: auth,
         version_header: None,
         query: None,
         if_none_match: None,
@@ -91,7 +90,7 @@ async fn the_card_is_synthesized_from_the_staged_agent_with_an_etag() {
         }],
     };
     let fixture = Fixture::new(staged);
-    let response = card_response(&fixture.ctx(), &request(None, b""));
+    let response = card_response(&fixture.ctx(), &request(b""));
     assert_eq!(response.status(), StatusCode::OK);
     let etag = response
         .headers()
@@ -132,7 +131,7 @@ async fn the_card_is_synthesized_from_the_staged_agent_with_an_etag() {
         json!([{"schemes": {"bearer": {"list": []}}}])
     );
 
-    let mut conditional = request(None, b"");
+    let mut conditional = request(b"");
     conditional.if_none_match = Some(&etag);
     let not_modified = card_response(&fixture.ctx(), &conditional);
     assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
@@ -141,7 +140,7 @@ async fn the_card_is_synthesized_from_the_staged_agent_with_an_etag() {
 #[tokio::test]
 async fn the_card_falls_back_to_the_bundle_and_a_converse_skill() {
     let fixture = Fixture::new(config());
-    let card = body_json(card_response(&fixture.ctx(), &request(None, b""))).await;
+    let card = body_json(card_response(&fixture.ctx(), &request(b""))).await;
     assert_eq!(card["name"], "support-bot");
     assert_eq!(card["skills"][0]["id"], "converse");
     assert_eq!(card["version"], "1.0.0");

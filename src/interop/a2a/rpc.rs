@@ -41,13 +41,19 @@ pub(crate) trait TurnRunner: Send + Sync {
 
 /// Bearer check. `Ok(credential id)` or a ready `401`.
 ///
+/// Called by the ingress BEFORE the request body is read, so an
+/// unauthenticated peer cannot make this process read a megabyte per request.
+/// It needs only the `Authorization` header, so nothing forces the body to be
+/// available first — the handlers below take the verified id as a parameter
+/// rather than re-deriving it.
+///
 /// The error is boxed because a `hyper::Response` is ~144 bytes — the same
 /// reason `revision_serve::resolve_endpoint_admission` boxes its own.
-fn authenticate<'c>(
+pub(crate) fn authenticate<'c>(
     ctx: &'c A2aContext<'_>,
-    req: &A2aRequest<'_>,
+    authorization: Option<&str>,
 ) -> Result<&'c str, Box<HttpResponse>> {
-    crate::ingress_auth::verify_bearer(ctx.config, req.authorization, ctx.now_ms).map_err(|_| {
+    crate::ingress_auth::verify_bearer(ctx.config, authorization, ctx.now_ms).map_err(|_| {
         let mut response = plain(StatusCode::UNAUTHORIZED, "a valid bearer token is required");
         response.headers_mut().insert(
             header::WWW_AUTHENTICATE,
@@ -188,12 +194,9 @@ fn valid_context_id(id: &str) -> Option<&str> {
 pub(crate) async fn handle_jsonrpc(
     ctx: &A2aContext<'_>,
     req: &A2aRequest<'_>,
+    credential_id: &str,
     runner: &dyn TurnRunner,
 ) -> HttpResponse {
-    let credential_id = match authenticate(ctx, req) {
-        Ok(id) => id,
-        Err(response) => return *response,
-    };
     let value: Value = match serde_json::from_slice(req.body) {
         Ok(value) => value,
         Err(_) => {
@@ -355,12 +358,9 @@ fn rpc_body(response: &JsonRpcResponse) -> HttpResponse {
 pub(crate) async fn handle_rest_send(
     ctx: &A2aContext<'_>,
     req: &A2aRequest<'_>,
+    credential_id: &str,
     runner: &dyn TurnRunner,
 ) -> HttpResponse {
-    let credential_id = match authenticate(ctx, req) {
-        Ok(id) => id,
-        Err(response) => return *response,
-    };
     if let Err(retry_after) = ctx.limiter.check(credential_id, TURN_COST) {
         return rate_limited(retry_after);
     }
