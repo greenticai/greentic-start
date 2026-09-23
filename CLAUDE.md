@@ -68,6 +68,7 @@ Crate version 1.2.0-dev.0, edition 2024, Rust 1.95.0 (pinned via `rust-toolchain
 | Secrets | `secrets_*.rs`, `secret_*.rs` | Backend selection (pack vs dev-store), secret URI handling, missing secret seeding. **Read side of the setup↔start secret contract — see [docs/secrets-flow.md](docs/secrets-flow.md).** |
 | Services | `services/` | Individual service components: NATS, runner, components |
 | Subscriptions | `subscriptions_universal/` | Universal subscription runtime and persistence (e.g., Microsoft Graph) |
+| Conversation state | `durable_state.rs` | Resolves the session/flow-state backends at boot (in-memory by default, Redis when configured) and mints a per-revision keyspace. **Fails the boot when a named backend is unreachable — see [docs/durable-conversation-state.md](docs/durable-conversation-state.md).** |
 | Revision engine | `revision_boot.rs`, `revision_serve.rs`, `revision_dispatcher.rs`, `revision_drain.rs`, `revision_pull.rs`, `revision_reload.rs`, `revision_pin.rs`, `revision_webhook_register.rs`, `revision_health_gate.rs` | Multi-revision hot-reload runtime (~20k LOC): boots revisions from env-store, dispatches ingress traffic to the active revision, drains old revisions, pulls remote bundles at startup, registers webhooks, and gates readiness |
 | Fast2Flow | `fast2flow/` | Chat-to-flow routing subsystem (gate, host_process, llm_router, mapper, contracts, config) — routes inbound chat messages to the matching flow via BM25 + optional LLM fallback |
 | LLM integration | `llm/` | Provider-agnostic LLM layer consumed by fast2flow and other subsystems; wraps `greentic-llm` crate |
@@ -120,6 +121,12 @@ Crate version 1.2.0-dev.0, edition 2024, Rust 1.95.0 (pinned via `rust-toolchain
 | `GREENTIC_ADMIN_LISTEN` | Admin-relay listen address |
 | `GREENTIC_DIRECTLINE_TOKEN_TTL_SECS` | DirectLine session-token base TTL (seconds, clamped `[60, 604800]`, default `1800`) |
 | `GREENTIC_PROVIDER_CORE_ONLY` | Set to `0` by default in start; `1` enforces provider-core-only mode |
+| `GREENTIC_RUNNER_SESSION_BACKEND` | `memory` (default) or `redis` — where a parked conversation lives. See [docs/durable-conversation-state.md](docs/durable-conversation-state.md) |
+| `GREENTIC_RUNNER_STATE_BACKEND` | `memory` (default) or `redis` — where per-session flow state lives. NOT revision-scoped; the boot warns |
+| `GREENTIC_RUNNER_REDIS_URL` | Connection URL for both stores above. A URL alone switches nothing on — a backend has to be named |
+| `GREENTIC_RUNNER_SESSION_NAMESPACE` | Session keyspace prefix; defaults to `greentic:session:<env>`. Per-environment namespacing is the operator's job |
+| `GREENTIC_RUNNER_SESSION_WAIT_TTL_SECS` | How long a parked conversation survives (default `86400`; `0` disables expiry) |
+| `GREENTIC_REVISION_PIN_REDIS_URL` | Revision affinity. Set it whenever durable sessions are on and more than one revision serves traffic |
 
 ## Git Conventions
 
