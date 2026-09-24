@@ -38,7 +38,7 @@ use greentic_deploy_spec::{
     RevisionId,
 };
 use greentic_deployer::path_safety::normalize_under_root;
-use greentic_runner_host::runtime::{RevisionPackRef, TenantRuntime};
+use greentic_runner_host::runtime::{RevisionLoad, RevisionPackRef, TenantRuntime};
 use greentic_runner_host::runtime_refs::RuntimeRefResolver;
 use greentic_runner_host::storage::{session_host_from, state_host_from};
 use greentic_runner_host::{HostBuilder, HostConfig, RunnerHost, TenantBindings};
@@ -384,6 +384,13 @@ pub(crate) async fn activate_runtime_config(
     let mut retained = HashMap::with_capacity(rc.revisions.len());
 
     let configs = host.tenant_configs();
+    // Phase 2 unit usage: which units get the runner's worker-usage meter.
+    // Read per unit (not per revision) and against the SAME env the serve
+    // path reads the staged interop config with, so the interop reporter's
+    // "tokens come from the runtime" decision matches what was installed.
+    let secrets_env = crate::resolve_env(None);
+    let mut meter_decisions =
+        crate::interop::metering::runtime_meter::UnitMeterDecisions::default();
     for block in &rc.revisions {
         // Both lookups are infallible: the validation loop above proved every
         // block's deployment is present, and registered a host config for its
@@ -541,23 +548,44 @@ pub(crate) async fn activate_runtime_config(
         let session_host = session_host_from(Arc::clone(&session_store));
         let state_host = state_host_from(Arc::clone(&state_store));
 
-        let runtime = TenantRuntime::load_revision(
-            &pack_refs,
-            config,
-            None,
-            host.wasi_policy(),
-            session_host,
-            session_store,
-            state_store,
-            state_host,
-            host.secrets_manager(),
-            deployment_id,
-            bundle_id.clone(),
-            revision_id,
-            Some(meta.customer_id.clone()),
-            &non_secret_by_pack_id,
-            &runtime_refs_by_pack_id,
-            Some(Arc::clone(&runtime_ref_resolver)),
+        // The unit's staged `metering` block, when present, also installs the
+        // runner's per-unit worker-usage meter for this revision; absent (or
+        // unbuildable) means default options, i.e. today's `load_revision`.
+        //
+        // Keyed on the DEPLOYMENT's bundle id (`meta.bundle_id`, from the same
+        // `Environment` entry the route table's `dep.bundle_id` comes from), so
+        // boot and the serve path name the unit from ONE value. It equals
+        // `block.bundle_id` by the cross-check in the validation loop above.
+        let unit_options = meter_decisions
+            .options_for_revision(
+                host.secrets_manager().as_ref(),
+                &secrets_env,
+                &meta.tenant,
+                deployment_id,
+                &meta.bundle_id,
+            )
+            .await;
+
+        let runtime = TenantRuntime::load_revision_with(
+            RevisionLoad {
+                pack_refs: &pack_refs,
+                config,
+                mocks: None,
+                wasi_policy: host.wasi_policy(),
+                session_host,
+                session_store,
+                state_store,
+                state_host,
+                secrets_manager: host.secrets_manager(),
+                deployment_id,
+                bundle_id: bundle_id.clone(),
+                revision_id,
+                customer_id: Some(meta.customer_id.clone()),
+                runtime_configs_by_pack_id: &non_secret_by_pack_id,
+                runtime_refs_by_pack_id: &runtime_refs_by_pack_id,
+                runtime_ref_resolver: Some(Arc::clone(&runtime_ref_resolver)),
+            },
+            unit_options,
         )
         .await
         .with_context(|| format!("loading revision `{}`", block.revision_id))?;
@@ -604,6 +632,7 @@ pub(crate) async fn activate_runtime_config(
         bundle_index,
         flow_index,
         triggers: crate::triggers::TriggerTable::build(trigger_entries, &trigger_prefixes),
+        runtime_metered: meter_decisions.into_metered(),
     };
 
     // Commit only now that every revision loaded: `retained` holds exactly the
@@ -648,6 +677,7 @@ pub(crate) fn reactivate_routing_only(
         static_routes: prev.static_routes.clone(),
         flow_index: prev.flow_index.clone(),
         triggers: prev.triggers.clone(),
+        runtime_metered: prev.runtime_metered.clone(),
         deployment_routes,
         bundle_index,
         endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),

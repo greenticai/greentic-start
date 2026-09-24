@@ -157,6 +157,17 @@ version = "0.8"
 version = "4.5"
 features = ["derive"]
 
+# The agent runtime's billing surface: `billing::WorkerUsageMeter`, which
+# `crate::interop::metering::runtime_meter` builds per unit from the staged
+# `metering` block and hands to `TenantRuntime::load_revision_with`
+# (greentic-runner#798). runner-host does not re-export the crate. Same exact
+# requirement as runner-host's (see the runner-desktop block below for why it
+# is exact), so it is ONE crate with the copy runner-host pulls through its
+# `agentic-worker` feature. No features: `test-mock` stays dev-only (below).
+[dependencies.greentic-aw-runtime]
+version = "=1.2.0-dev.0"
+default-features = false
+
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
 # / `Revision` cross the deployer boundary, so resolution must not pick an
 # older deploy-spec. The same types also cross the `greentic-runner-host`
@@ -446,7 +457,10 @@ wat = "1"
 # registry and the patches for them are gone.
 #
 # What is left is ONE patch, for the three greentic-runner crates, because the
-# revision this binary needs is not published yet: f6ff5590 is the develop merge
+# revision this binary needs is not published yet: 79e516b5 is the develop merge
+# of greentic-runner#798 (`TenantRuntime::load_revision_with`,
+# `RevisionHostOptions::with_billing_meter`, `billing::WorkerUsageMeter` — the
+# per-unit worker-usage meter), and it descends from f6ff5590, the develop merge
 # of greentic-runner#792, which makes runner-host's session and flow-state
 # stores configurable (`storage::StorageConfig` + `HostBuilder::with_storage`)
 # — the surface `durable_state::resolve_storage_config` depends on. Its
@@ -476,9 +490,9 @@ wat = "1"
 # A patch section does not travel into a published crate, so this does not
 # change what a crates.io consumer resolves.
 #
-# TO UNWIND: once a dev-lane publish carries #792, delete this block and run
+# TO UNWIND: once a dev-lane publish carries #798 (and so #792), delete this block and run
 # `cargo update`.
 [patch.crates-io]
-greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "f6ff55903bff2c0df7fae68f982b62e27a3a2c5c" }
-greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "f6ff55903bff2c0df7fae68f982b62e27a3a2c5c" }
-greentic-aw-runtime = { git = "https://github.com/greenticai/greentic-runner", rev = "f6ff55903bff2c0df7fae68f982b62e27a3a2c5c" }
+greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "79e516b58b81fbf0dfbe64f1a39c1c83a906317e" }
+greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "79e516b58b81fbf0dfbe64f1a39c1c83a906317e" }
+greentic-aw-runtime = { git = "https://github.com/greenticai/greentic-runner", rev = "79e516b58b81fbf0dfbe64f1a39c1c83a906317e" }

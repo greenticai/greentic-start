@@ -704,6 +704,7 @@ mod tests {
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
                 triggers: Default::default(),
+                runtime_metered: Default::default(),
             }),
         }
     }

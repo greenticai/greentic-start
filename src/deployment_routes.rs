@@ -388,6 +388,11 @@ pub struct RevisionIngressRouting {
     /// revisions' packs. Pack-derived, so it travels with the activation and
     /// is carried over unchanged by a routing-only reload.
     pub(crate) triggers: crate::triggers::TriggerTable,
+    /// Deployments whose loaded revisions carry the runner's worker-usage
+    /// meter. Revision-derived like `triggers`, so a routing-only reload
+    /// carries it over; the interop reporter reads it to record tokens from
+    /// ONE source (see [`crate::interop::metering::runtime_meter`]).
+    pub(crate) runtime_metered: crate::interop::metering::runtime_meter::RuntimeMeteredDeployments,
 }
 
 /// Strip a trailing `:port` from a host header value. IPv6 literals are bracketed
