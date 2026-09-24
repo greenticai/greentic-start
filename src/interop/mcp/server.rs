@@ -2,10 +2,12 @@
 //! configuration that makes it correct for a public, multi-instance
 //! deployment.
 //!
-//! The three settings in [`service`] all differ from `rmcp`'s defaults, and
-//! two of those defaults fail silently rather than loudly here — so each
-//! carries its reasoning rather than a bare value. They are the same three
-//! greentic-designer's own MCP surface sets, for the same reasons.
+//! The four settings in [`mcp_config`] all differ from `rmcp`'s defaults, and
+//! three of those defaults fail silently rather than loudly here — so each
+//! carries its reasoning rather than a bare value. Three of them are the ones
+//! greentic-designer's own MCP surface sets, for the same reasons; the fourth
+//! is the request-body cap, which exists because `/mcp` is the one POST on
+//! this ingress that does not go through `revision_serve::read_body_limited`.
 
 use std::sync::Arc;
 
@@ -316,7 +318,26 @@ impl ServerHandler for WorkerMcpServer {
     }
 }
 
-/// The `rmcp` transport for `POST /mcp`.
+/// The `rmcp` transport for `POST /mcp`. Its settings are [`mcp_config`].
+pub(crate) fn service(
+    ctx: Arc<McpContext>,
+) -> StreamableHttpService<WorkerMcpServer, NeverSessionManager> {
+    StreamableHttpService::new(
+        move || Ok(WorkerMcpServer::new(Arc::clone(&ctx))),
+        // `NeverSessionManager`, not `LocalSessionManager`. With
+        // `legacy_session_mode = false` no session is ever created, so the two
+        // behave identically today — but this one makes the statelessness
+        // STRUCTURAL: if that flag is ever flipped back, session creation
+        // fails loudly here instead of quietly minting per-process sessions
+        // that break only behind a load balancer.
+        Arc::new(NeverSessionManager::default()),
+        mcp_config(),
+    )
+}
+
+/// The transport configuration [`service`] runs on, built separately so a
+/// test can read the values back — `StreamableHttpService` exposes none of
+/// them once constructed.
 ///
 /// # Two `rmcp` defaults deliberately KEPT
 ///
@@ -336,10 +357,8 @@ impl ServerHandler for WorkerMcpServer {
 /// succeeds. ⚠️ Serving CORS on this path would make both this knob and
 /// `allowed_hosts` load-bearing, and they would have to be set in the same
 /// change.
-pub(crate) fn service(
-    ctx: Arc<McpContext>,
-) -> StreamableHttpService<WorkerMcpServer, NeverSessionManager> {
-    let config = StreamableHttpServerConfig::default()
+pub(crate) fn mcp_config() -> StreamableHttpServerConfig {
+    StreamableHttpServerConfig::default()
         // ⚠️ `legacy_session_mode` DEFAULTS TO TRUE, and the default is wrong
         // for this deployment in a way that cannot reproduce on one instance.
         // The contract picks the stateless MCP core precisely so `/mcp` runs
@@ -366,19 +385,17 @@ pub(crate) fn service(
         // bug. DNS rebinding, which the default defends against, needs a
         // browser to make a CREDENTIALED request, and this surface accepts
         // only a bearer header with no CORS.
-        .with_allowed_hosts(Vec::<String>::new());
-
-    StreamableHttpService::new(
-        move || Ok(WorkerMcpServer::new(Arc::clone(&ctx))),
-        // `NeverSessionManager`, not `LocalSessionManager`. With
-        // `legacy_session_mode = false` no session is ever created, so the two
-        // behave identically today — but this one makes the statelessness
-        // STRUCTURAL: if that flag is ever flipped back, session creation
-        // fails loudly here instead of quietly minting per-process sessions
-        // that break only behind a load balancer.
-        Arc::new(NeverSessionManager::default()),
-        config,
-    )
+        .with_allowed_hosts(Vec::<String>::new())
+        // ⚠️ `max_request_body_bytes` DEFAULTS TO 4 MiB, four times what the
+        // sibling surfaces of this same ingress accept: every other POST is
+        // read through `revision_serve::read_body_limited` at
+        // [`MAX_BODY_BYTES`], and `/mcp` bypasses it because `rmcp` reads its
+        // own body. That gap was only ever reachable through `message`, which
+        // a caller has some reason to keep short; `ask` now also takes
+        // `answer`, an arbitrary JSON object, so it is the argument that makes
+        // the looser cap worth closing. A body over the cap is refused by the
+        // transport before any tool runs.
+        .with_max_request_body_bytes(crate::revision_serve::MAX_BODY_BYTES)
 }
 
 #[cfg(test)]

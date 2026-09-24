@@ -171,7 +171,13 @@ impl PublicUrlCapture {
 /// Largest request body the revision ingress accepts, in bytes. Even on the
 /// loopback / local posture a cap is required so one oversized POST cannot
 /// exhaust memory before the JSON parse rejects it.
-const MAX_BODY_BYTES: usize = 1 << 20; // 1 MiB
+///
+/// `pub(crate)` because `/mcp` does NOT go through [`read_body_limited`] —
+/// the request is handed to `rmcp` whole and that transport reads its own
+/// body — so [`crate::interop::mcp::server::mcp_config`] configures itself
+/// from this same number. One constant, or the two surfaces of one ingress
+/// accept different-sized turns.
+pub(crate) const MAX_BODY_BYTES: usize = 1 << 20; // 1 MiB
 
 /// Activated host + routing as a single coherent unit. Requests bind to one
 /// `Arc<Activation>` at the top of [`serve`] and use the same `host` and
@@ -7297,6 +7303,29 @@ mod tests {
             activity.payload().get("text").and_then(Value::as_str),
             Some("hello there")
         );
+        // A text-only payload must keep taking the `Activity::text` path: the
+        // metadata-sibling arm below it is narrower than "any payload with a
+        // text key", and an arm that widened to this shape would change what
+        // every messaging turn dispatches as.
+        assert_eq!(activity.payload(), &payload);
+        assert!(activity.payload().get("metadata").is_none());
+        assert_eq!(
+            activity_kind(&activity),
+            "message",
+            "a text-only payload must still be a MESSAGE activity"
+        );
+    }
+
+    /// A payload with NO text keeps wrapping whole as a custom activity, and
+    /// keeps its absent flow type — the metadata-sibling arm must not reach
+    /// it and quietly relabel every answer-only submit as messaging.
+    #[test]
+    fn build_activity_metadata_without_text_stays_a_plain_custom_activity() {
+        let payload = json!({ "metadata": { "action": "confirm" } });
+        let activity = build_activity(&payload, "acme", None, Some("s1"), None, None);
+        assert_eq!(activity.payload(), &payload);
+        assert_eq!(activity.flow_type(), None);
+        assert_eq!(activity_kind(&activity), "custom");
     }
 
     #[test]
@@ -7308,6 +7337,19 @@ mod tests {
         assert_eq!(activity.session_id(), None);
         // The whole body is preserved for the entry flow to interpret.
         assert_eq!(activity.payload(), &payload);
+    }
+
+    /// The activity KIND, read through the public `Serialize` impl because
+    /// `Activity::action()` is `pub(crate)` upstream and there is no getter.
+    /// `"message"` is what [`Activity::text`] builds, `"custom"` what
+    /// [`Activity::custom`] does — the difference the metadata-sibling arm in
+    /// `build_activity` turns on, and the one a payload assertion alone
+    /// cannot see.
+    fn activity_kind(activity: &Activity) -> String {
+        serde_json::to_value(activity)
+            .ok()
+            .and_then(|value| value["kind"]["kind"].as_str().map(str::to_string))
+            .unwrap_or_default()
     }
 
     #[test]
@@ -7358,8 +7400,13 @@ mod tests {
             Some("bill it annually")
         );
         // Flow resolution reads the flow type, and it must still be the one
-        // `Activity::text` would have set.
+        // `Activity::text` would have set. The KIND is the one thing that
+        // does differ — `Activity::custom` is the only public constructor
+        // that keeps a whole payload — and it is read by nothing but a
+        // tracing span (checked against runner-host `f6ff5590`:
+        // `IngressEnvelope.action` reaches `FlowContext.action` and stops).
         assert_eq!(activity.flow_type(), Some("messaging"));
+        assert_eq!(activity_kind(&activity), "custom");
     }
 
     #[test]

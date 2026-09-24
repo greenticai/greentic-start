@@ -590,3 +590,17 @@ fn the_tool_schema_advertises_an_optional_answer_object() {
         "the description must say an answer never carries a credential: {description}"
     );
 }
+
+/// `/mcp` is the one POST on this ingress that `rmcp` reads the body of
+/// itself, so it is the one that does not go through
+/// `revision_serve::read_body_limited`. `rmcp`'s own default is 4 MiB —
+/// four times what every sibling surface accepts — and `ask` now takes an
+/// arbitrary JSON object, so the two have to be the same number.
+#[test]
+fn the_mcp_transport_accepts_no_larger_a_body_than_the_rest_of_the_ingress() {
+    assert_eq!(
+        super::mcp_config().max_request_body_bytes,
+        crate::revision_serve::MAX_BODY_BYTES,
+        "the MCP body cap must be the ingress body cap"
+    );
+}
