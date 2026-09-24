@@ -59,6 +59,15 @@ pub(crate) enum A2aRoute {
 }
 
 /// Classify a request path. Exact matches only.
+///
+/// **The argument is the path BELOW the unit's mount**, not the raw request
+/// path — see
+/// [`RouteMount::remainder`](crate::deployment_routes::RouteMount::remainder).
+/// Every one of these paths is reserved relative to the unit, because the
+/// env-canvas Cloud Run lane mounts each unit at `/<slug>`
+/// (`BundleRouting::PerUnit`). Matching the raw path instead reserved them for
+/// a unit at `/` alone — the one mount that lane never emits — and the whole
+/// surface answered `404` or `405` in production.
 pub(crate) fn route_for(path: &str) -> Option<A2aRoute> {
     match path {
         AGENT_CARD_PATH => Some(A2aRoute::Card),

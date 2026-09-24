@@ -1053,3 +1053,460 @@ async fn an_unauthenticated_a2a_post_is_refused_before_its_body_is_read() {
     let authenticated = exchange(&state, false, &post("/a2a", &[AUTH], &body)).await;
     assert_eq!(authenticated.status, 413);
 }
+
+// ---------------------------------------------------------------------------
+// Mounted units: the interop surfaces under a per-unit path prefix
+//
+// The env-canvas Cloud Run lane — contract D6's only v1 lane — mounts every
+// unit at `/<slug>` (`BundleRouting::PerUnit`, hardcoded in the designer so a
+// lone unit's URL cannot move the day a second one joins). Every test above
+// binds its deployment with no path prefix, i.e. at the service root, which is
+// the one mount that lane never emits: matching the reserved paths against the
+// RAW request path therefore reserved nothing there, and the whole surface
+// answered `404` (the card) or `405` (everything else) in production.
+// ---------------------------------------------------------------------------
+
+/// The slug a second unit is mounted under, and its bundle id.
+const OTHER_BUNDLE: &str = "billing-bot";
+const OTHER_MOUNT: &str = "/billing-bot";
+/// The first unit's mount when a test gives it one.
+const MOUNT: &str = "/support-bot";
+
+/// A unit's staged-config URI for a bundle other than [`BUNDLE`].
+fn config_uri_for(bundle: &str) -> String {
+    crate::ingress_auth::ingress_secret_uri(&crate::resolve_env(None), TENANT, bundle)
+}
+
+/// A staged config with the agent name under the test's control and NO
+/// `mcp_resource`, so the resource identifier — and therefore the OAuth
+/// audience — is the one this runtime DERIVES from its own address. That is
+/// the value the mount has to reach: the designer registers
+/// `<service_url><unit path>/mcp` with the admin on a unit's first deploy and
+/// only stages it back on the next one, so until then the derived fallback is
+/// the only thing naming the audience.
+fn staged_named_config(agent_name: &str, a2a: bool, mcp: bool, issuer: Option<&str>) -> Vec<u8> {
+    let mut doc = json!({
+        "v": 1,
+        "a2a": a2a,
+        "mcp": mcp,
+        "credentials": [{
+            "id": "c1",
+            "sha256": Sha256::digest(TOKEN.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        }],
+        "tenant_slug": "acme",
+        "agent": {"name": agent_name, "description": "Answers support questions."}
+    });
+    if let (Some(issuer), Value::Object(map)) = (issuer, &mut doc) {
+        map.insert("issuer".to_string(), json!(issuer));
+    }
+    doc.to_string().into_bytes()
+}
+
+/// One unit of a mounted environment: which bundle it is, where it is mounted,
+/// and what its staged config says.
+struct MountedUnit {
+    bundle: &'static str,
+    mount: &'static str,
+    config: Vec<u8>,
+}
+
+/// An activation binding every unit in `units` at its own path prefix, with
+/// each unit's staged config in one shared secrets manager.
+///
+/// The route table is built through the same `from_parts` the rest of this
+/// file uses, so the prefixes travel the production normalization.
+fn activation_mounting(units: Vec<MountedUnit>) -> Activation {
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut entries = HashMap::new();
+    for unit in &units {
+        entries.insert(config_uri_for(unit.bundle), unit.config.clone());
+    }
+    let secrets: greentic_runner_host::secrets::DynSecretsManager =
+        Arc::new(TestSecrets::with(entries, reads));
+    let host = Arc::new(
+        greentic_runner_host::HostBuilder::new()
+            .with_config(greentic_runner_host::HostConfig::from_gtbind(
+                greentic_runner_host::TenantBindings {
+                    tenant: TENANT.to_string(),
+                    packs: Vec::new(),
+                    env_passthrough: Vec::new(),
+                },
+            ))
+            .with_secrets_manager(secrets)
+            .build()
+            .expect("build test host"),
+    );
+
+    let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new("interop", [0u8; 32]));
+    let mut parts = Vec::new();
+    for unit in &units {
+        let deployment_id = DeploymentId::new();
+        let bundle_id = BundleId::new(unit.bundle);
+        dispatcher
+            .apply_traffic_split(
+                deployment_id,
+                vec![RevisionEntry {
+                    revision_id: RevisionId::new(),
+                    bundle_id: bundle_id.clone(),
+                    weight_bps: 10_000,
+                }],
+                bundle_id.clone(),
+                0,
+            )
+            .expect("apply_traffic_split");
+        parts.push((
+            deployment_id,
+            bundle_id,
+            TENANT.to_string(),
+            Vec::new(),
+            vec![unit.mount.to_string()],
+        ));
+    }
+
+    Activation {
+        host,
+        routing: Arc::new(RevisionIngressRouting {
+            dispatcher: Arc::new(dispatcher),
+            http_routes: HttpRouteTable::from_descriptors(Vec::new()),
+            deployment_routes: crate::deployment_routes::DeploymentRouteTable::from_parts(parts),
+            endpoint_admit: Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+            deployment_config_overrides: Arc::default(),
+            static_routes: crate::static_routes::ActiveRouteTable::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+            flow_index: crate::webchat_routing::FlowIndex::default(),
+            triggers: Default::default(),
+        }),
+    }
+}
+
+/// The lane's own shape: one unit, mounted at `/support-bot`, both features on.
+fn one_mounted_unit(issuer: Option<&str>) -> Activation {
+    activation_mounting(vec![MountedUnit {
+        bundle: BUNDLE,
+        mount: MOUNT,
+        config: staged_named_config("Support Bot", true, true, issuer),
+    }])
+}
+
+#[tokio::test]
+async fn the_agent_card_is_served_under_the_units_own_mount() {
+    let state = state_with(one_mounted_unit(None), interop_with_base_url(Vec::new()));
+    let response = exchange(
+        &state,
+        false,
+        &get("/support-bot/.well-known/agent-card.json", &[]),
+    )
+    .await;
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let card = response.json();
+    assert_eq!(card["name"], "Support Bot");
+    assert_eq!(
+        card["supportedInterfaces"][0]["url"], "https://gtc-svc.example.run.app/support-bot/a2a",
+        "a card that advertises the service root sends every caller to a 404"
+    );
+}
+
+#[tokio::test]
+async fn the_service_root_serves_no_card_when_every_unit_is_mounted() {
+    // The production symptom, from the other side: nothing is bound at `/`, so
+    // the root card path is not an interop path at all.
+    let state = state_with(one_mounted_unit(None), interop_with_base_url(Vec::new()));
+    let response = exchange(&state, false, &get("/.well-known/agent-card.json", &[])).await;
+    assert_eq!(response.status, 404, "body: {}", response.body);
+}
+
+/// Both A2A request bindings, under the mount. The assertions are on the A2A
+/// ENVELOPE, not on the reply text: an unreserved path falls through to the
+/// generic ingress, which runs the same turn and echoes the same words, so a
+/// substring check here would pass with the surface entirely unrouted.
+#[tokio::test]
+async fn a_mounted_send_message_runs_the_turn_on_both_bindings() {
+    let state = state_with(
+        one_mounted_unit(None),
+        interop_with_base_url(vec![Activity::custom(
+            "response",
+            json!({"reply": "Reset it from the profile page."}),
+        )]),
+    );
+
+    let jsonrpc = exchange(
+        &state,
+        false,
+        &post("/support-bot/a2a", &[AUTH], &send_message_body("c-1")),
+    )
+    .await;
+    assert_eq!(jsonrpc.status, 200, "body: {}", jsonrpc.body);
+    let value = jsonrpc.json();
+    assert_eq!(value["id"], 7);
+    assert_eq!(value["result"]["message"]["role"], "ROLE_AGENT");
+    assert_eq!(value["result"]["message"]["contextId"], "c-1");
+    assert_eq!(
+        value["result"]["message"]["parts"],
+        json!([{"text": "Reset it from the profile page."}])
+    );
+    assert_eq!(jsonrpc.header("a2a-version"), Some("1.0"));
+    assert!(
+        jsonrpc.header("access-control-allow-origin").is_none(),
+        "a mounted /a2a must be no more CORS-open than one at the root"
+    );
+
+    let rest_body = json!({"message": {
+        "messageId": "m-in",
+        "contextId": "c-2",
+        "role": "ROLE_USER",
+        "parts": [{"text": "how?"}]
+    }})
+    .to_string();
+    let rest = exchange(
+        &state,
+        false,
+        &post("/support-bot/a2a/message:send", &[AUTH], &rest_body),
+    )
+    .await;
+    assert_eq!(rest.status, 200, "body: {}", rest.body);
+    assert_eq!(
+        rest.json()["message"]["parts"],
+        json!([{"text": "Reset it from the profile page."}])
+    );
+    assert_eq!(rest.json()["message"]["contextId"], "c-2");
+}
+
+/// The `401` must come from the A2A handler, which its `realm="a2a"`
+/// challenge identifies — the generic ingress refuses an unauthenticated
+/// remote caller too (Phase 0b), with a bare `Bearer`, so a status check alone
+/// cannot tell a reserved path from an unreserved one.
+#[tokio::test]
+async fn a_mounted_a2a_post_without_a_bearer_is_still_refused() {
+    let state = state_with(
+        one_mounted_unit(None),
+        interop_with_base_url(vec![Activity::text("never sent")]),
+    );
+    let response = exchange(
+        &state,
+        false,
+        &post("/support-bot/a2a", &[], &send_message_body("c-1")),
+    )
+    .await;
+    assert_eq!(response.status, 401, "body: {}", response.body);
+    assert_eq!(
+        response.header("www-authenticate"),
+        Some("Bearer realm=\"a2a\""),
+        "the refusal must come from the A2A surface, not from the generic gate"
+    );
+    assert!(!response.body.contains("never sent"));
+}
+
+#[tokio::test]
+async fn a_mounted_tools_call_runs_a_turn() {
+    let state = state_with(
+        one_mounted_unit(None),
+        interop_with_base_url(vec![Activity::custom(
+            "response",
+            json!({"reply": "Reset it from the profile page."}),
+        )]),
+    );
+    let response = exchange(
+        &state,
+        false,
+        &post(
+            "/support-bot/mcp",
+            &mcp_headers("tools/call"),
+            &tools_call("how?", Some("c-1")),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    assert_eq!(
+        response.json()["result"]["content"][0]["text"],
+        "Reset it from the profile page."
+    );
+    assert!(
+        response.header("access-control-allow-origin").is_none(),
+        "a mounted /mcp must be no more CORS-open than one at the root"
+    );
+}
+
+#[tokio::test]
+async fn the_mounted_metadata_names_the_mounted_resource_at_both_paths() {
+    let state = state_with(
+        one_mounted_unit(Some("https://admin.example/")),
+        interop_with_base_url(Vec::new()),
+    );
+    for path in [
+        "/support-bot/.well-known/oauth-protected-resource",
+        "/support-bot/.well-known/oauth-protected-resource/mcp",
+    ] {
+        let response = exchange(&state, false, &get(path, &[])).await;
+        assert_eq!(response.status, 200, "{path}: {}", response.body);
+        assert_eq!(
+            response.json(),
+            json!({
+                "resource": "https://gtc-svc.example.run.app/support-bot/mcp",
+                "authorization_servers": ["https://admin.example"],
+                "bearer_methods_supported": ["header"],
+            }),
+            "{path}: the derived resource is the OAuth audience, and the designer \
+             registers it WITH the unit's path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_mounted_mcp_401_points_at_the_mounted_discovery_url() {
+    let state = state_with(
+        one_mounted_unit(Some("https://admin.example/")),
+        interop_with_base_url(Vec::new()),
+    );
+    let response = exchange(
+        &state,
+        false,
+        &post(
+            "/support-bot/mcp",
+            &[("Accept", "application/json, text/event-stream")],
+            &tools_call("hi", None),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 401);
+    assert_eq!(
+        response.header("www-authenticate"),
+        Some(
+            "Bearer resource_metadata=\"https://gtc-svc.example.run.app/support-bot/.well-known/oauth-protected-resource/mcp\""
+        ),
+        "a challenge naming the service root sends the client to a 404"
+    );
+}
+
+/// The Phase 0b gate keys the unit's credential on the DISPATCHED bundle. The
+/// interop surfaces now key theirs on the mount the same resolve produced, so
+/// the two cannot name different units for one request.
+#[tokio::test]
+async fn the_generic_ingress_under_a_mount_gates_on_the_same_unit() {
+    let state = state_with(
+        one_mounted_unit(None),
+        interop_with_base_url(vec![Activity::text("ok")]),
+    );
+    let anonymous = exchange(&state, false, &post("/support-bot", &[], "{}")).await;
+    assert_eq!(anonymous.status, 401, "body: {}", anonymous.body);
+
+    let authenticated = exchange(&state, false, &post("/support-bot", &[AUTH], "{}")).await;
+    assert_eq!(
+        authenticated.status, 200,
+        "the staged bearer of the mounted unit must open its own generic \
+         ingress: body: {}",
+        authenticated.body
+    );
+}
+
+/// The exclusion that keeps a browser page off an authenticated turn runner is
+/// decided from the path BELOW the mount, so it has to follow the unit.
+#[tokio::test]
+async fn a_mounted_a2a_and_mcp_endpoint_refuse_a_cors_preflight() {
+    let state = state_with(one_mounted_unit(None), interop_with_base_url(Vec::new()));
+    for path in ["/support-bot/a2a", "/support-bot/a2a/message:send"] {
+        let response = exchange(
+            &state,
+            false,
+            &format!(
+                "OPTIONS {path} HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\n\
+                 Access-Control-Request-Method: POST\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(response.status, 405, "{path}: {}", response.body);
+    }
+    let mcp = exchange(
+        &state,
+        false,
+        "OPTIONS /support-bot/mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\n\
+         Access-Control-Request-Method: POST\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(mcp.status, 405, "body: {}", mcp.body);
+
+    // A path under the same mount that is NOT reserved keeps its preflight.
+    let ordinary = exchange(
+        &state,
+        false,
+        "OPTIONS /support-bot/v3/directline/conversations HTTP/1.1\r\nHost: localhost\r\n\
+         Origin: https://app.example\r\nAccess-Control-Request-Method: POST\r\n\
+         Connection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(
+        ordinary.status, 204,
+        "a non-reserved path under the same mount keeps its preflight: {}",
+        ordinary.body
+    );
+}
+
+/// Per-unit routing exists so an environment can grow. Two units therefore
+/// need two INDEPENDENT interop surfaces: each answers under its own mount,
+/// with its own identity and its own audience, and neither answers under the
+/// other's.
+#[tokio::test]
+async fn two_mounted_units_serve_two_independent_surfaces() {
+    let activation = activation_mounting(vec![
+        MountedUnit {
+            bundle: BUNDLE,
+            mount: MOUNT,
+            config: staged_named_config("Support Bot", true, true, Some("https://admin.example/")),
+        },
+        MountedUnit {
+            bundle: OTHER_BUNDLE,
+            mount: OTHER_MOUNT,
+            // A2A off on purpose: the second unit's own staged answer must
+            // decide its own surface, not the first unit's.
+            config: staged_named_config("Billing Bot", false, true, Some("https://admin.example/")),
+        },
+    ]);
+    let state = state_with(activation, interop_with_base_url(Vec::new()));
+
+    let support = exchange(
+        &state,
+        false,
+        &get("/support-bot/.well-known/agent-card.json", &[]),
+    )
+    .await;
+    assert_eq!(support.status, 200, "body: {}", support.body);
+    assert_eq!(support.json()["name"], "Support Bot");
+    assert_eq!(
+        support.json()["supportedInterfaces"][0]["url"],
+        "https://gtc-svc.example.run.app/support-bot/a2a"
+    );
+
+    // The second unit has A2A off, so its card path is not reserved and falls
+    // through to normal routing — a 405 on the generic ingress, never the
+    // first unit's card.
+    let billing_card = exchange(
+        &state,
+        false,
+        &get("/billing-bot/.well-known/agent-card.json", &[]),
+    )
+    .await;
+    assert_eq!(
+        billing_card.status, 405,
+        "the second unit's own toggle must decide its own surface: {}",
+        billing_card.body
+    );
+
+    // Both have MCP on, and each publishes its OWN resource identifier — the
+    // audience an OAuth token for that unit is checked against.
+    for (path, resource) in [
+        (
+            "/support-bot/.well-known/oauth-protected-resource/mcp",
+            "https://gtc-svc.example.run.app/support-bot/mcp",
+        ),
+        (
+            "/billing-bot/.well-known/oauth-protected-resource/mcp",
+            "https://gtc-svc.example.run.app/billing-bot/mcp",
+        ),
+    ] {
+        let response = exchange(&state, false, &get(path, &[])).await;
+        assert_eq!(response.status, 200, "{path}: {}", response.body);
+        assert_eq!(response.json()["resource"], resource, "{path}");
+    }
+}

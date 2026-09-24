@@ -8,6 +8,28 @@
 //! being reserved at all). An actual request against an actual process is the
 //! only thing that catches it.
 //!
+//! # What this suite does NOT cover: where the UNIT lives
+//!
+//! The recipe below deploys ONE bundle and drives the surfaces at the service
+//! root (`$BASE/.well-known/agent-card.json`, `$BASE/a2a`, `$BASE/mcp`). The
+//! env-canvas Cloud Run lane — contract D6's only v1 lane — never mounts a
+//! unit there: it passes `BundleRouting::PerUnit`, so every unit is bound at
+//! `/<slug>` and its surfaces hang off `$BASE/<slug>/…`. So the claim above is
+//! about the CONFIG's location, and a second disagreement about the unit's own
+//! PATH went unreported by this suite for the whole of the feature's life:
+//! matching the reserved paths against the raw request path reserved them for
+//! a root-mounted unit alone, and on the shipping lane the card answered `404`
+//! and every other surface `405`. Measured on real Cloud Run, 2026-09-24.
+//!
+//! Mounted units are covered in-process instead, in
+//! `crate::revision_serve::interop_ingress_tests` (search `MountedUnit`):
+//! every surface under a prefix, the two `401`s, the CORS exclusions, the
+//! Phase 0b gate reading the same unit, and a two-unit environment where each
+//! mount answers for its own unit alone. Binding a second bundle here would
+//! cover it live too — `D deploy` a second `.gtbundle`, stage its own
+//! `ingress/<canonical bundle id>` secret, and drive `$BASE/<slug>/…` — and is
+//! worth doing the next time this suite is stood up.
+//!
 //! These are `#[ignore]`d because they need an operator-provisioned `op` store
 //! and a running server. Point them at one with two env vars, plus a third
 //! that unlocks the `--store-root` check:

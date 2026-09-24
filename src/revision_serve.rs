@@ -1154,7 +1154,20 @@ async fn handle_connection(
                 .await;
         response
     } else {
-        let cors = path_allows_cors(&path);
+        // Resolved against the unit's mount, not the raw path: a unit at
+        // `/acme-echo` serves `/acme-echo/a2a`, and the exclusions below are
+        // what keep an authenticated turn runner off a browser page. This is
+        // its own activation snapshot because `req` is moved into `serve`
+        // below, which takes its own; a reload between the two would at worst
+        // decide CORS from the mount the request no longer has.
+        let cors = {
+            let activation = state.current();
+            let host = header_str(req.headers(), header::HOST.as_str());
+            path_allows_cors(
+                &path,
+                interop_request_path(&activation, host.as_deref(), &path),
+            )
+        };
         let (Ok(response) | Err(response)) = serve(req, state, peer_is_loopback)
             .instrument(span.clone())
             .await;
@@ -1167,6 +1180,23 @@ async fn handle_connection(
     let route = crate::metrics::normalise_route(&path);
     crate::metrics::record_http_request(&method, &route, status, elapsed_ms);
     Ok(response)
+}
+
+/// The request path as the UNIT serving it sees it: the raw path with the
+/// unit's mount prefix stripped.
+///
+/// Every worker-interop path is reserved relative to the unit, because the
+/// env-canvas Cloud Run lane mounts each unit at `/<slug>`
+/// (`BundleRouting::PerUnit`). A request no deployment binds keeps its raw
+/// path — there is no unit to be relative to, and the interop matchers then
+/// decide exactly what they decided before, which is what keeps an unrouted
+/// request falling through to the same `404` it always produced.
+fn interop_request_path<'a>(activation: &Activation, host: Option<&str>, path: &'a str) -> &'a str {
+    activation
+        .routing
+        .deployment_routes
+        .resolve_mount(host, path)
+        .map_or(path, |mount| mount.remainder(path))
 }
 
 /// Paths that are never legitimately called cross-origin, and so must not
@@ -1188,10 +1218,18 @@ async fn handle_connection(
 /// **same-origin** (a relative `fetch('/workers/invoke')`, see `assets/chat.html`)
 /// and `greentic-gui` reaches it **server-side** via `HttpWorkerBackend`, where
 /// CORS does not apply.
-fn path_allows_cors(path: &str) -> bool {
+///
+/// `interop_path` is the request path BELOW the unit's mount (see
+/// [`crate::deployment_routes::RouteMount::remainder`]). It is what the
+/// interop exclusions are measured against, because a unit mounted at
+/// `/acme-echo` serves its JSON-RPC endpoint at `/acme-echo/a2a` — reading the
+/// raw path there would CORS-enable exactly the endpoint these exclusions
+/// exist to keep closed. For a unit at the service root the two are the same
+/// string.
+fn path_allows_cors(path: &str, interop_path: &str) -> bool {
     path != "/workers/invoke"
-        && !crate::interop::a2a::is_cors_excluded(path)
-        && !crate::interop::mcp::is_cors_excluded(path)
+        && !crate::interop::a2a::is_cors_excluded(interop_path)
+        && !crate::interop::mcp::is_cors_excluded(interop_path)
 }
 
 /// Resolve → dispatch → execute for a single request. `Err` carries a ready HTTP
@@ -1211,7 +1249,13 @@ async fn serve(
     // turning the preflight into a 405 the browser treats as an opaque
     // CORS failure. Mirrors the legacy `http_ingress` short-circuit.
     if method == hyper::Method::OPTIONS {
-        if !path_allows_cors(&path) {
+        // The interop exclusions are per UNIT, so the mount has to be resolved
+        // even here. This branch always returns, so the snapshot it takes is
+        // still the one snapshot the request makes.
+        let activation = state.current();
+        let host = header_str(req.headers(), header::HOST.as_str());
+        let interop_path = interop_request_path(&activation, host.as_deref(), &path);
+        if !path_allows_cors(&path, interop_path) {
             return Ok(error_response(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "cross-origin requests are not permitted on this path",
@@ -1339,20 +1383,32 @@ async fn serve(
     let request_headers = collect_forwarded_request_headers(req.headers());
     let query_string = req.uri().query().map(str::to_string);
 
+    // Which unit is this request addressed to, and what does the path look
+    // like from inside it? Resolved BEFORE the interop surfaces are matched,
+    // because those paths are reserved RELATIVE to the unit's mount: the
+    // env-canvas Cloud Run lane mounts every unit at `/<slug>`, so matching
+    // the raw path reserved them for a unit at `/` alone and the whole
+    // surface answered 404 (card) or 405 (everything else) on the one lane it
+    // ships on.
+    //
+    // The resolve is the same in-memory longest-prefix walk the generic
+    // ingress does below and costs nothing; the per-unit secrets read stays
+    // behind the route match, so a request that names no interop path still
+    // reads no config.
+    let interop_mount = activation
+        .routing
+        .deployment_routes
+        .resolve_mount(host_header.as_deref(), &path);
+    let interop_path = interop_mount.map_or(path.as_str(), |mount| mount.remainder(&path));
+
     // Worker-interop surfaces (A2A). Checked BEFORE webchat classification and
     // provider routing, and only for a unit whose staged config enables the
     // feature — otherwise the path is NOT reserved and falls through to normal
     // routing, exactly as before this shipped.
-    if let Some(route) = crate::interop::a2a::route_for(&path) {
-        match resolve_interop_unit(
-            &state,
-            &activation,
-            host_header.as_deref(),
-            &path,
-            InteropFeature::A2a,
-        )
-        .await
-        {
+    if let Some(mount) = interop_mount
+        && let Some(route) = crate::interop::a2a::route_for(interop_path)
+    {
+        match resolve_interop_unit(&state, &activation, &mount, InteropFeature::A2a).await {
             Err(response) => return Err(response),
             Ok(Some(unit)) => {
                 return serve_interop(
@@ -1378,16 +1434,10 @@ async fn serve(
 
     // The MCP surface, on the same terms: reserved only for a unit whose
     // staged config enables it.
-    if let Some(route) = crate::interop::mcp::route_for(&path) {
-        match resolve_interop_unit(
-            &state,
-            &activation,
-            host_header.as_deref(),
-            &path,
-            InteropFeature::Mcp,
-        )
-        .await
-        {
+    if let Some(mount) = interop_mount
+        && let Some(route) = crate::interop::mcp::route_for(interop_path)
+    {
+        match resolve_interop_unit(&state, &activation, &mount, InteropFeature::Mcp).await {
             Err(response) => return Err(response),
             Ok(Some(unit)) => {
                 return serve_mcp(
@@ -1842,45 +1892,39 @@ struct InteropUnit {
     deployment_id: DeploymentId,
     tenant: String,
     bundle_id: String,
+    /// The path prefix this unit is mounted under — [`ROOT_PREFIX`] for a
+    /// unit at the service root. Carried because every address the surfaces
+    /// PUBLISH (the card's `supportedInterfaces[].url`, the RFC 9728 resource
+    /// identifier and metadata URL) has to name the path this process serves,
+    /// not the service root.
+    ///
+    /// [`ROOT_PREFIX`]: crate::deployment_routes::ROOT_PREFIX
+    mount: String,
     config: crate::interop::config::InteropConfig,
 }
 
-/// Resolve the deployment an interop path belongs to and read its staged
-/// config.
+/// Read the staged interop config of the unit a request already resolved to.
 ///
-/// `Ok(None)` means the path is NOT reserved on this deployment — no
-/// deployment resolves, nothing is staged, or the feature is switched off —
-/// and the caller falls through to normal routing. `Err` is a ready `503`:
-/// the store could not answer, so whether the path is reserved is unknown,
-/// and guessing either way is wrong (falling through would run an
-/// unauthenticated turn; answering would invent an agent).
+/// The caller resolves the mount — the same
+/// [`resolve_mount`](crate::deployment_routes::DeploymentRouteTable::resolve_mount)
+/// the generic ingress routes on — so the unit whose config is read here is
+/// necessarily the unit the Phase 0b gate would read for the same request.
+///
+/// `Ok(None)` means the path is NOT reserved on this deployment — nothing is
+/// staged, or the feature is switched off — and the caller falls through to
+/// normal routing. `Err` is a ready `503`: the store could not answer, so
+/// whether the path is reserved is unknown, and guessing either way is wrong
+/// (falling through would run an unauthenticated turn; answering would invent
+/// an agent).
 async fn resolve_interop_unit(
     state: &ServeState,
     activation: &Activation,
-    host: Option<&str>,
-    path: &str,
+    mount: &crate::deployment_routes::RouteMount<'_>,
     feature: InteropFeature,
 ) -> Result<Option<InteropUnit>, Response<Full<Bytes>>> {
-    let Some((deployment_id, _tenant)) = activation.routing.deployment_routes.resolve(host, path)
-    else {
-        return Ok(None);
-    };
-    let Some(bundle_id) = activation
-        .routing
-        .deployment_routes
-        .bundle_for(deployment_id)
-        .map(|bundle| bundle.as_str().to_string())
-    else {
-        return Ok(None);
-    };
-    let tenant = match activation
-        .routing
-        .deployment_routes
-        .tenant_for(deployment_id)
-    {
-        Some(tenant) => tenant.to_string(),
-        None => return Ok(None),
-    };
+    let deployment_id = mount.deployment_id;
+    let bundle_id = mount.bundle_id.as_str().to_string();
+    let tenant = mount.tenant.to_string();
     let config = load_unit_config_cached(state, activation, &tenant, &bundle_id)
         .await
         .map_err(|crate::ingress_auth::ConfigUnavailable(message)| {
@@ -1899,6 +1943,7 @@ async fn resolve_interop_unit(
             deployment_id,
             tenant,
             bundle_id,
+            mount: mount.prefix.to_string(),
             config,
         }))
 }
@@ -1937,6 +1982,26 @@ fn interop_base_url(state: &ServeState) -> Option<String> {
         })
         .map(|url| url.trim_end_matches('/').to_string())
         .filter(|url| !url.is_empty())
+}
+
+/// [`interop_base_url`] with the unit's own mount joined onto it — the address
+/// THIS unit is reachable at, which is what its surfaces must publish.
+///
+/// A unit mounted at `/acme-echo` serves its JSON-RPC endpoint at
+/// `<base>/acme-echo/a2a`, so a card advertising `<base>/a2a` sends every
+/// caller that reads it to a path the process does not serve. The same join
+/// decides the RFC 9728 resource identifier, and therefore the `aud` an MCP
+/// token is checked against, whenever the designer has not staged an
+/// `mcp_resource` yet — and the designer builds the value it registers as
+/// `<service_url><unit path>/mcp`, so joining the mount is what makes the
+/// derived fallback and the registered resource the same string rather than
+/// two that differ by exactly this prefix.
+fn interop_unit_base_url(state: &ServeState, unit: &InteropUnit) -> Option<String> {
+    let base = interop_base_url(state)?;
+    Some(crate::deployment_routes::public_base_with_mount(
+        &base,
+        &unit.mount,
+    ))
 }
 
 /// Runs one interop turn against the dispatched revision. Holds the
@@ -1991,7 +2056,7 @@ async fn serve_interop(
     method: &hyper::Method,
     headers: InteropRequestHeaders<'_>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
-    let base_url = interop_base_url(state);
+    let base_url = interop_unit_base_url(state, unit);
     let ctx = crate::interop::a2a::A2aContext {
         config: &unit.config,
         base_url: base_url.as_deref(),
@@ -2081,7 +2146,7 @@ async fn serve_mcp(
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
     let authorization = headers.authorization;
     let mcp_method = headers.mcp_method;
-    let base_url = interop_base_url(state);
+    let base_url = interop_unit_base_url(state, unit);
     // `None` when the unit has neither a staged `mcp_resource` nor a known
     // public base URL. That is fatal for the DISCOVERY document, which exists
     // to publish it, and irrelevant to a caller holding the staged A2A bearer
@@ -10390,7 +10455,10 @@ mod tests {
     #[test]
     fn cors_allows_directline_conversations_path() {
         assert!(
-            path_allows_cors("/v3/directline/conversations"),
+            path_allows_cors(
+                "/v3/directline/conversations",
+                "/v3/directline/conversations"
+            ),
             "DirectLine conversations path must allow CORS"
         );
     }
@@ -10399,7 +10467,8 @@ mod tests {
     fn cors_allows_directline_activities_path() {
         assert!(
             path_allows_cors(
-                "/v1/messaging/webchat/demo/v3/directline/conversations/abc/activities"
+                "/v1/messaging/webchat/demo/v3/directline/conversations/abc/activities",
+                "/v1/messaging/webchat/demo/v3/directline/conversations/abc/activities",
             ),
             "DirectLine activities path must allow CORS"
         );
@@ -10408,7 +10477,10 @@ mod tests {
     #[test]
     fn cors_allows_directline_token_path() {
         assert!(
-            path_allows_cors("/v1/messaging/webchat/demo/token"),
+            path_allows_cors(
+                "/v1/messaging/webchat/demo/token",
+                "/v1/messaging/webchat/demo/token",
+            ),
             "DirectLine token path must allow CORS"
         );
     }
@@ -10416,7 +10488,7 @@ mod tests {
     #[test]
     fn cors_blocks_workers_invoke() {
         assert!(
-            !path_allows_cors("/workers/invoke"),
+            !path_allows_cors("/workers/invoke", "/workers/invoke"),
             "/workers/invoke must NOT allow CORS"
         );
     }
@@ -11701,7 +11773,8 @@ mod tests {
         // anyway. This test validates the classifier's output, not the
         // end-to-end CORS behaviour on stream responses.
         assert!(path_allows_cors(
-            "/v1/messaging/webchat/tenant1/v3/directline/conversations/c1/stream"
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations/c1/stream",
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations/c1/stream",
         ));
     }
 
