@@ -51,6 +51,66 @@ pub fn deployment_config_overrides_from_environment(
         .collect()
 }
 
+/// The prefix an empty `path_prefixes` binding is treated as, and the one
+/// value that contributes NOTHING to a unit's public address.
+pub(crate) const ROOT_PREFIX: &str = "/";
+
+/// Which deployment a request routed to, and the path prefix its binding
+/// matched on.
+///
+/// The prefix is what a unit is MOUNTED under: the env-canvas Cloud Run lane
+/// gives every unit `/<slug>` (`BundleRouting::PerUnit`), so a surface that
+/// reserves fixed paths — the A2A card, `/a2a`, `/mcp`, the RFC 9728
+/// documents — has to measure the request against the remainder below that
+/// mount, not against the raw path. Matching the raw path reserved those
+/// surfaces for a unit at `/` alone, which is the one mount that lane never
+/// emits.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RouteMount<'a> {
+    pub(crate) deployment_id: DeploymentId,
+    pub(crate) tenant: &'a str,
+    pub(crate) bundle_id: &'a BundleId,
+    /// Normalized: a leading `/`, no trailing `/`, [`ROOT_PREFIX`] for a
+    /// unit mounted at the service root.
+    pub(crate) prefix: &'a str,
+}
+
+impl RouteMount<'_> {
+    /// The part of `path` below this mount, always starting with `/`.
+    ///
+    /// `/acme-echo/a2a` under `/acme-echo` is `/a2a`; the mount itself is
+    /// `/`. A path this mount did not match comes back unchanged rather than
+    /// truncated — the resolver never produces one, and inventing a remainder
+    /// for it would reserve a surface on a path the unit does not own.
+    pub(crate) fn remainder<'p>(&self, path: &'p str) -> &'p str {
+        if self.prefix == ROOT_PREFIX {
+            return path;
+        }
+        match path.strip_prefix(self.prefix) {
+            Some("") => ROOT_PREFIX,
+            Some(rest) => rest,
+            None => path,
+        }
+    }
+}
+
+/// Join a mount prefix onto a public base URL, giving the address a unit
+/// mounted there is reachable at from outside.
+///
+/// The agent card's `supportedInterfaces[].url` and the RFC 9728 resource
+/// identifier are both built from the result, so a caller that reads the card
+/// posts back to the path this process actually serves. The base is trimmed of
+/// a trailing `/` and the prefix carries a leading one, so the join can
+/// neither double a slash nor drop one; [`ROOT_PREFIX`] contributes nothing.
+pub(crate) fn public_base_with_mount(base_url: &str, mount_prefix: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if mount_prefix == ROOT_PREFIX || mount_prefix.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}{mount_prefix}")
+    }
+}
+
 /// One Active deployment's public route binding, in matchable form.
 #[derive(Clone, Debug)]
 struct DeploymentRoute {
@@ -102,17 +162,23 @@ impl DeploymentRoute {
         }
     }
 
-    /// Specificity (matched prefix length) of the most specific path prefix that
-    /// is a segment-boundary prefix of `path`, or `None` if none match. An empty
-    /// `path_prefixes` list matches any path at the lowest specificity (root).
-    fn path_prefix_len(&self, path: &str) -> Option<usize> {
+    /// The most specific path prefix that is a segment-boundary prefix of
+    /// `path`, or `None` if none match. An empty `path_prefixes` list matches
+    /// any path at [`ROOT_PREFIX`], the lowest specificity.
+    ///
+    /// Specificity is the prefix's own length, so the returned string and the
+    /// number the resolver ranks on cannot disagree — which matters now that
+    /// the string itself is handed out: a caller strips it off the request
+    /// path to get the remainder the unit actually sees.
+    fn matched_prefix(&self, path: &str) -> Option<&str> {
         if self.path_prefixes.is_empty() {
-            return Some(1); // root "/" — least specific.
+            return Some(ROOT_PREFIX);
         }
         self.path_prefixes
             .iter()
-            .filter_map(|prefix| path_prefix_match_len(path, prefix))
-            .max()
+            .filter(|prefix| path_prefix_matches(path, prefix))
+            .map(String::as_str)
+            .max_by_key(|prefix| prefix.len())
     }
 }
 
@@ -179,19 +245,6 @@ impl DeploymentRouteTable {
             .map(|r| r.tenant.as_str())
     }
 
-    /// The bundle bound to `deployment_id`, or `None` if no Active deployment
-    /// with that id exists.
-    ///
-    /// The worker-interop config is staged per UNIT, and a unit IS a
-    /// deployment's bundle — so this is what names the secret a request's
-    /// interop credential is read from, before any revision is dispatched.
-    pub(crate) fn bundle_for(&self, deployment_id: DeploymentId) -> Option<&BundleId> {
-        self.routes
-            .iter()
-            .find(|r| r.deployment_id == deployment_id)
-            .map(|r| &r.bundle_id)
-    }
-
     /// Resolve `(host, path)` to `(deployment_id, tenant)`.
     ///
     /// Host match is case-insensitive; an empty `hosts` binding matches any
@@ -201,20 +254,37 @@ impl DeploymentRouteTable {
     /// the operator rejects ambiguous bindings at deploy time, so a tie is not
     /// expected at runtime, but the resolution stays deterministic regardless.
     pub fn resolve(&self, host: Option<&str>, path: &str) -> Option<(DeploymentId, &str)> {
+        self.resolve_mount(host, path)
+            .map(|mount| (mount.deployment_id, mount.tenant))
+    }
+
+    /// [`Self::resolve`], plus the path prefix the winning binding matched on.
+    ///
+    /// The one matching implementation, so the deployment a request is routed
+    /// to and the mount its path is measured against can never come from two
+    /// different rankings. Callers that need only the deployment use
+    /// [`Self::resolve`]; callers that serve a path RELATIVE to the unit — the
+    /// worker-interop surfaces — need the prefix so they can strip it.
+    pub(crate) fn resolve_mount(&self, host: Option<&str>, path: &str) -> Option<RouteMount<'_>> {
         let host = host.map(|h| host_without_port(h).to_ascii_lowercase());
-        let mut best: Option<(&DeploymentRoute, usize)> = None;
+        let mut best: Option<(&DeploymentRoute, &str)> = None;
         for route in &self.routes {
             if !route.host_matches(host.as_deref()) {
                 continue;
             }
-            let Some(len) = route.path_prefix_len(path) else {
+            let Some(prefix) = route.matched_prefix(path) else {
                 continue;
             };
-            if best.is_none_or(|(_, best_len)| len > best_len) {
-                best = Some((route, len));
+            if best.is_none_or(|(_, best_prefix)| prefix.len() > best_prefix.len()) {
+                best = Some((route, prefix));
             }
         }
-        best.map(|(route, _)| (route.deployment_id, route.tenant.as_str()))
+        best.map(|(route, prefix)| RouteMount {
+            deployment_id: route.deployment_id,
+            tenant: route.tenant.as_str(),
+            bundle_id: &route.bundle_id,
+            prefix,
+        })
     }
 
     /// Find the first Active deployment whose `(tenant, bundle_id)` matches
@@ -353,21 +423,17 @@ fn normalize_prefix(prefix: &str) -> String {
     }
 }
 
-/// If `prefix` is a segment-boundary prefix of `path`, return its specificity
-/// (the prefix length); otherwise `None`. The root prefix `/` matches every
-/// path at the lowest specificity (length 1).
-fn path_prefix_match_len(path: &str, prefix: &str) -> Option<usize> {
-    if prefix == "/" {
-        return Some(1);
+/// Whether `prefix` is a segment-boundary prefix of `path`. The root prefix
+/// `/` matches every path.
+fn path_prefix_matches(path: &str, prefix: &str) -> bool {
+    if prefix == ROOT_PREFIX {
+        return true;
     }
     if path == prefix {
-        return Some(prefix.len());
+        return true;
     }
     // Segment boundary: `/api` matches `/api/x` but not `/apixyz`.
-    if path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/') {
-        return Some(prefix.len());
-    }
-    None
+    path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/')
 }
 
 #[cfg(test)]
@@ -515,6 +581,89 @@ mod tests {
         assert_eq!(table.resolve(None, "/api/v1/things"), Some((api, "api")));
         // Falls back to root for unrelated paths.
         assert_eq!(table.resolve(None, "/other"), Some((root, "root")));
+    }
+
+    /// The mount a request resolved against is what a path-relative surface —
+    /// the worker-interop card, `/a2a`, `/mcp` — measures its own paths
+    /// against, so it has to be the prefix the SAME ranking picked.
+    #[test]
+    fn resolve_mount_reports_the_winning_prefix_and_its_remainder() {
+        let root = DeploymentId::new();
+        let api = DeploymentId::new();
+        let table = DeploymentRouteTable::from_environment(&env(vec![
+            deployment(root, "root", &[], &["/"], BundleDeploymentStatus::Active),
+            deployment(
+                api,
+                "api",
+                &[],
+                &["/api/v1"],
+                BundleDeploymentStatus::Active,
+            ),
+        ]));
+
+        let mount = table
+            .resolve_mount(None, "/api/v1/.well-known/agent-card.json")
+            .expect("the more specific prefix matches");
+        assert_eq!(mount.deployment_id, api);
+        assert_eq!(mount.prefix, "/api/v1");
+        assert_eq!(
+            mount.remainder("/api/v1/.well-known/agent-card.json"),
+            "/.well-known/agent-card.json"
+        );
+        // The mount itself is the unit's own root.
+        assert_eq!(mount.remainder("/api/v1"), ROOT_PREFIX);
+
+        // A unit at the service root strips nothing, so every path it serves
+        // reads exactly as it did before mounts were consulted at all.
+        let at_root = table
+            .resolve_mount(None, "/.well-known/agent-card.json")
+            .expect("the root prefix matches everything");
+        assert_eq!(at_root.deployment_id, root);
+        assert_eq!(at_root.prefix, ROOT_PREFIX);
+        assert_eq!(
+            at_root.remainder("/.well-known/agent-card.json"),
+            "/.well-known/agent-card.json"
+        );
+    }
+
+    /// A binding with no prefixes at all is the root mount, and `resolve` must
+    /// keep answering exactly what `resolve_mount` decided.
+    #[test]
+    fn an_empty_prefix_list_mounts_at_the_root() {
+        let id = DeploymentId::new();
+        let table = DeploymentRouteTable::from_environment(&env(vec![deployment(
+            id,
+            "acme",
+            &[],
+            &[],
+            BundleDeploymentStatus::Active,
+        )]));
+        let mount = table
+            .resolve_mount(None, "/anything/at/all")
+            .expect("match");
+        assert_eq!(mount.prefix, ROOT_PREFIX);
+        assert_eq!(mount.remainder("/anything/at/all"), "/anything/at/all");
+        assert_eq!(table.resolve(None, "/anything/at/all"), Some((id, "acme")));
+    }
+
+    /// The card's `supportedInterfaces[].url` and the RFC 9728 resource
+    /// identifier are both this join, so a doubled or missing slash is a URL
+    /// that 404s for every caller that reads it.
+    #[test]
+    fn a_mount_joins_onto_a_public_base_exactly_once() {
+        assert_eq!(
+            public_base_with_mount("https://svc.example.run.app/", "/acme-echo"),
+            "https://svc.example.run.app/acme-echo"
+        );
+        assert_eq!(
+            public_base_with_mount("https://svc.example.run.app", "/acme-echo"),
+            "https://svc.example.run.app/acme-echo"
+        );
+        assert_eq!(
+            public_base_with_mount("https://svc.example.run.app/", ROOT_PREFIX),
+            "https://svc.example.run.app",
+            "a unit at the root adds no path segment"
+        );
     }
 
     #[test]
