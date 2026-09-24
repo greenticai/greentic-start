@@ -7,6 +7,7 @@
 pub(crate) mod a2a;
 pub(crate) mod config;
 pub(crate) mod config_cache;
+pub(crate) mod input_request;
 pub(crate) mod limits;
 pub(crate) mod mcp;
 pub(crate) mod metering;

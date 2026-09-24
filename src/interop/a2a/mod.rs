@@ -11,9 +11,14 @@
 //! | `/a2a` | POST, JSON-RPC 2.0 | bearer |
 //! | `/a2a/message:send` | POST, HTTP+JSON binding | bearer |
 //!
-//! Stateless MVP (D4): `SendMessage` runs ONE turn synchronously and answers
-//! with a `Message`. There is no task store, so `GetTask`/`CancelTask` answer
-//! `TaskNotFoundError` and `ListTasks` an empty page — conformant.
+//! Stateless MVP (D4): `SendMessage` runs ONE turn synchronously. A turn that
+//! COMPLETED answers with a `Message`; a turn that PARKED answers with a
+//! `Task` in `input-required` whose id is the conversation's `contextId`
+//! (D8/D9), carrying the question as prose and as a structured input request
+//! ([`crate::interop::input_request`]). There is still no task store, so
+//! `GetTask`/`CancelTask` answer `TaskNotFoundError` for every id — including
+//! one this server minted; [`rpc::handle_jsonrpc`]'s `GetTask` arm records
+//! what would have to exist first. `ListTasks` answers an empty page.
 //!
 //! The conversation is `a2a:<credential id>:<contextId>`: namespaced by the
 //! caller's credential so two callers cannot resume each other's parked flow,

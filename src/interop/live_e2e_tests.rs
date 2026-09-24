@@ -211,13 +211,33 @@ fn client() -> reqwest::blocking::Client {
 
 /// One `SendMessage` over the JSON-RPC binding, returning the `Message`.
 fn a2a_send(base: &str, token: &str, context_id: Option<&str>, parts: Value) -> Value {
+    agent_message(&a2a_send_result(base, token, context_id, parts, None))
+}
+
+/// The whole `SendMessage` result: `{"message": …}` for a turn that
+/// completed, `{"task": …}` for one that parked (contract D8). `accepting`
+/// names an output mode to declare in `configuration.acceptedOutputModes`,
+/// which is the only way to be sent an Adaptive Card (D10).
+fn a2a_send_result(
+    base: &str,
+    token: &str,
+    context_id: Option<&str>,
+    parts: Value,
+    accepting: Option<&str>,
+) -> Value {
     let mut message = json!({"messageId": ulid::Ulid::new().to_string(),
                              "role": "ROLE_USER", "parts": parts});
     if let (Some(id), Some(map)) = (context_id, message.as_object_mut()) {
         map.insert("contextId".into(), json!(id));
     }
-    let body = json!({"jsonrpc":"2.0","id":1,"method":"SendMessage",
-                      "params":{"message": message}});
+    let mut params = json!({"message": message});
+    if let (Some(mode), Some(map)) = (accepting, params.as_object_mut()) {
+        map.insert(
+            "configuration".into(),
+            json!({"acceptedOutputModes": ["text/plain", mode]}),
+        );
+    }
+    let body = json!({"jsonrpc":"2.0","id":1,"method":"SendMessage","params": params});
     let response = client()
         .post(format!("{base}/a2a"))
         .bearer_auth(token)
@@ -227,7 +247,28 @@ fn a2a_send(base: &str, token: &str, context_id: Option<&str>, parts: Value) -> 
     assert_eq!(response.status().as_u16(), 200, "SendMessage should answer");
     let value: Value = response.json().expect("json");
     assert!(value.get("error").is_none(), "unexpected error: {value}");
-    value["result"]["message"].clone()
+    value["result"].clone()
+}
+
+/// The agent's own message, out of whichever envelope carried it.
+fn agent_message(result: &Value) -> Value {
+    match result.get("message") {
+        Some(message) => message.clone(),
+        None => result["task"]["status"]["message"].clone(),
+    }
+}
+
+/// Every part of a message whose `mediaType` is `media_type`.
+fn parts_of_type<'a>(message: &'a Value, media_type: &str) -> Vec<&'a Value> {
+    message["parts"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|part| part["mediaType"] == media_type)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Every text part of a reply, joined — what a human would read.
@@ -406,6 +447,70 @@ fn a_parked_card_flow_advances_across_turns() {
         greeting_text,
         "the identical payload on a FRESH conversation must land on the entry card — \
          if it does not, this assertion proves nothing about session continuity"
+    );
+}
+
+/// **Contract §9, against a real parked flow.** A card flow's first turn
+/// parks, so it must answer with a `Task` in `input-required` carrying the
+/// structured input request — and NOT with an Adaptive Card, unless the
+/// caller declared it accepts one.
+#[test]
+#[ignore = "needs a live greentic-start serving the new-flow card starter"]
+fn a_parked_turn_asks_for_input_in_the_protocols_own_words() {
+    let (base, token) = target();
+    let context = format!("live-e2e-input-{}", ulid::Ulid::new());
+    let result = a2a_send_result(
+        &base,
+        &token,
+        Some(&context),
+        json!([{"text": "hello"}]),
+        None,
+    );
+
+    assert!(
+        result.get("message").is_none(),
+        "a parked turn is a task, not a message: {result}"
+    );
+    let task = &result["task"];
+    assert_eq!(task["status"]["state"], "TASK_STATE_INPUT_REQUIRED");
+    assert_eq!(
+        task["id"],
+        json!(context),
+        "D9: the task is the conversation"
+    );
+    assert_eq!(task["contextId"], json!(context));
+
+    let message = agent_message(&result);
+    let requested = parts_of_type(&message, "application/vnd.greentic.input-request+json");
+    assert_eq!(requested.len(), 1, "exactly one input request: {message}");
+    for key in ["prompt", "fields", "actions"] {
+        assert!(
+            requested[0]["data"].get(key).is_some(),
+            "the input request is missing `{key}`: {}",
+            requested[0]
+        );
+    }
+    assert!(
+        !reply_text(&message).is_empty(),
+        "the same question must also be readable as prose: {message}"
+    );
+    assert!(
+        parts_of_type(&message, "application/vnd.microsoft.card.adaptive+json").is_empty(),
+        "D10: no card without an opt-in: {message}"
+    );
+
+    // …and the card IS sent to a caller that asked for one.
+    let opted_in = agent_message(&a2a_send_result(
+        &base,
+        &token,
+        Some(&format!("live-e2e-card-{}", ulid::Ulid::new())),
+        json!([{"text": "hello"}]),
+        Some("application/vnd.microsoft.card.adaptive"),
+    ));
+    assert_eq!(
+        parts_of_type(&opted_in, "application/vnd.microsoft.card.adaptive+json").len(),
+        1,
+        "an opted-in caller still gets the card: {opted_in}"
     );
 }
 

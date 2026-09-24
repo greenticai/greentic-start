@@ -13,6 +13,12 @@
 //! ONE tool, `ask` — never the worker's own bound tools (research §6.3). The
 //! conversation is `mcp:<sub or credential id>:<conversation_id>`, namespaced
 //! by the caller for the same reason the A2A one is.
+//!
+//! Its `structuredContent` is `{conversation_id, awaiting_input,
+//! input_request?}`. There is no Adaptive Card on this surface: MCP has no
+//! `acceptedOutputModes`, so an MCP caller can never opt in to one (contract
+//! D10), and a parked turn is described by the structured input request
+//! instead ([`crate::interop::input_request`]).
 
 pub(crate) mod auth;
 pub(crate) mod jwks;

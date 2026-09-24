@@ -35,6 +35,45 @@ pub(crate) struct ProjectedReply {
     /// error, not an answer. A protocol that can say so (MCP's `isError`)
     /// must, or the error reads to a caller as the worker's reply.
     pub flow_error: bool,
+    /// The Adaptive Card the PARKING reply carried, when it carried one.
+    ///
+    /// A turn may produce several cards; only this one is the question being
+    /// asked, so only this one may be turned into an input request
+    /// ([`crate::interop::input_request`]). A `session.wait` that rendered no
+    /// card parks with `None`, which is a question with no named fields —
+    /// not the absence of a question.
+    pub parked_card: Option<Value>,
+}
+
+impl ProjectedReply {
+    /// The question a parked turn is asking, in prose.
+    ///
+    /// The parked card's own fallback text, else everything the turn said —
+    /// a `session.wait` with no card still asked something. One spelling, so
+    /// the A2A and MCP surfaces cannot present the same parked turn with two
+    /// different questions.
+    pub(crate) fn parked_prompt(&self) -> String {
+        if let Some(card) = self.parked_card.as_ref() {
+            return card_fallback_text(card);
+        }
+        self.items
+            .iter()
+            .map(|item| match item {
+                ReplyItem::Text(text) => text.as_str(),
+                ReplyItem::Card { fallback, .. } => fallback.as_str(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The contract §9.2 document for a parked turn, ready to ride as a
+    /// `data` part.
+    pub(crate) fn input_request(&self) -> Value {
+        crate::interop::input_request::input_request(
+            &self.parked_prompt(),
+            self.parked_card.as_ref(),
+        )
+    }
 }
 
 /// Project every reply of one turn. `channel` names the protocol for the
@@ -49,9 +88,13 @@ pub(crate) fn project_replies(
     let ingress = synthetic_ingress(channel, tenant, session_hint);
     let mut projected = ProjectedReply::default();
     for reply in replies {
-        if is_pending(reply.payload()) {
+        let parks = is_pending(reply.payload());
+        if parks {
             projected.awaiting_input = true;
         }
+        // Where THIS reply's items start, so the card it parked on can be
+        // told apart from a card an earlier reply of the same turn rendered.
+        let first_item = projected.items.len();
         let Some(ingress) = ingress.as_ref() else {
             // Unreachable in practice (the envelope is a fixed shape); keep
             // the plain text rather than losing the turn.
@@ -70,6 +113,23 @@ pub(crate) fn project_replies(
                 projected.flow_error = true;
             }
             push_envelope(&mut projected.items, &envelope);
+        }
+        if parks {
+            // The LAST card this reply produced: a parking reply that
+            // rendered several has parked on the one the caller is looking
+            // at. A later parking reply supersedes an earlier one for the
+            // same reason.
+            if let Some(card) =
+                projected.items[first_item..]
+                    .iter()
+                    .rev()
+                    .find_map(|item| match item {
+                        ReplyItem::Card { card, .. } => Some(card.clone()),
+                        ReplyItem::Text(_) => None,
+                    })
+            {
+                projected.parked_card = Some(card);
+            }
         }
     }
     projected
@@ -223,10 +283,67 @@ mod tests {
         assert_eq!(
             got.items,
             vec![ReplyItem::Card {
-                card,
+                card: card.clone(),
                 fallback: "Fill the form".into()
             }]
         );
+        assert_eq!(got.parked_card, Some(card));
+        assert_eq!(got.parked_prompt(), "Fill the form");
+    }
+
+    /// A turn may render a card and THEN park on another. Only the card the
+    /// turn parked on is the question being asked, so only that one may
+    /// become an input request.
+    #[test]
+    fn only_the_parking_replys_card_is_the_parked_card() {
+        let answered = json!({"type": "AdaptiveCard", "fallbackText": "Here is your summary"});
+        let asking = json!({"type": "AdaptiveCard", "fallbackText": "Now pick one"});
+        let got = project(&[
+            Activity::custom(
+                "response",
+                json!({"outputs": {"result": {"renderedCard": answered}}}),
+            ),
+            Activity::custom(
+                "response",
+                json!({"status": "pending", "response": {"renderedCard": asking.clone()}}),
+            ),
+        ]);
+        assert!(got.awaiting_input);
+        assert_eq!(got.items.len(), 2, "both cards still reach the caller");
+        assert_eq!(got.parked_card, Some(asking));
+        assert_eq!(got.parked_prompt(), "Now pick one");
+    }
+
+    /// A `session.wait` with no card at all parks on a question the turn
+    /// asked in prose.
+    #[test]
+    fn a_parked_turn_with_no_card_still_has_a_prompt() {
+        let reply = Activity::custom(
+            "response",
+            json!({"status": "pending", "response": {"text": "What is the order number?"}}),
+        );
+        let got = project(&[reply]);
+        assert!(got.awaiting_input);
+        assert_eq!(got.parked_card, None);
+        assert_eq!(got.parked_prompt(), "What is the order number?");
+        assert_eq!(
+            got.input_request(),
+            json!({"prompt": "What is the order number?", "fields": [], "actions": []}),
+            "no card is a question with no named fields, not the absence of one"
+        );
+    }
+
+    /// A completed turn's card is NOT a parked card: nothing is waiting, so
+    /// nothing may be presented as a question.
+    #[test]
+    fn a_completed_turn_has_no_parked_card() {
+        let card = json!({"type": "AdaptiveCard", "fallbackText": "Your receipt"});
+        let got = project(&[Activity::custom(
+            "response",
+            json!({"outputs": {"result": {"renderedCard": card}}}),
+        )]);
+        assert!(!got.awaiting_input);
+        assert_eq!(got.parked_card, None);
     }
 
     #[test]
