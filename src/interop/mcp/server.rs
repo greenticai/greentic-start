@@ -16,9 +16,10 @@ use rmcp::transport::streamable_http_server::session::never::NeverSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::interop::a2a::rpc::TurnRunner;
+use crate::interop::input_request::answer_payload;
 use crate::interop::limits::{RateLimiter, TURN_COST, TurnGate};
 use crate::interop::metering::event::{Surface, usage_from_replies};
 use crate::interop::reply::{ReplyItem, project_replies};
@@ -77,17 +78,31 @@ impl WorkerMcpServer {
     }
 }
 
-/// `ask`'s arguments. Exactly the two the contract names: everything else a
+/// `ask`'s arguments. Exactly the three the contract names: everything else a
 /// turn needs is a property of the deployment, not of the call.
 #[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct AskArgs {
     /// What to say to the worker.
-    pub message: String,
+    ///
+    /// Optional ONLY because `answer` alone is a valid submit — a form filled
+    /// in with no covering sentence (contract D12). A call carrying neither
+    /// is refused, which is the same refusal the agent-to-agent surface gives
+    /// a message with no parts.
+    #[serde(default)]
+    pub message: Option<String>,
     /// The conversation to continue. Omit it to start one; the id is returned
     /// so the next call can pass it back.
     #[serde(default)]
     pub conversation_id: Option<String>,
+    /// The filled-in fields of the `input_request` the previous call
+    /// returned: field id → value.
+    ///
+    /// `answer` and `message` are NOT alternatives — a caller may send both,
+    /// either, and is refused only for neither. An EMPTY object submits
+    /// nothing and counts as absent.
+    #[serde(default)]
+    pub answer: Option<Map<String, Value>>,
 }
 
 #[tool_router(router = tool_router_ask, vis = "pub(crate)")]
@@ -100,16 +115,35 @@ impl WorkerMcpServer {
     /// tool the worker's instructions and guardrails never chose to run.
     #[tool(
         name = "ask",
-        description = "Ask this Greentic worker a question, or continue a conversation with it. Returns the worker's reply."
+        description = "Ask this Greentic worker a question, or continue a conversation with it. \
+Returns the worker's reply. Pass the `conversation_id` it returns to stay in the same \
+conversation.\n\n\
+When the worker needs more from you it answers with `awaiting_input: true` and an \
+`input_request` in `structuredContent`, listing the named fields it is waiting for. Answer it \
+by calling `ask` again on the SAME `conversation_id` with `answer` set to an object of those \
+field ids and the values you are submitting — `input_request.fields[].id` are the exact keys, \
+and to press one of `input_request.actions` put its id under `action`. `answer` and `message` \
+are independent: send `answer` alone to submit the form with nothing to say, or both to submit \
+it with a covering sentence.\n\n\
+Never put a credential in `answer` — no API key, token, password or other secret. It is form \
+content typed by an operator, it travels through this client's logs and prompt history, and a \
+worker reads its own secrets from the credentials staged for it, never from a tool argument."
     )]
     pub(crate) async fn ask(
         &self,
         Parameters(args): Parameters<AskArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let message = args.message.trim();
-        if message.is_empty() {
+        let message = args
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty());
+        // An empty object submits nothing, so it is the same as no `answer`
+        // at all rather than a submit of zero fields.
+        let answer = args.answer.as_ref().filter(|answer| !answer.is_empty());
+        if message.is_none() && answer.is_none() {
             return Err(ErrorData::invalid_params(
-                "`message` must not be empty",
+                "send `message`, `answer`, or both",
                 None,
             ));
         }
@@ -147,11 +181,23 @@ impl WorkerMcpServer {
             return Ok(busy(&conversation_id));
         };
 
-        let payload = json!({ "text": message });
+        // The submit shape a parked card node reads its answers back out of,
+        // built by the one function the agent-to-agent `data` part goes
+        // through — so the two surfaces cannot answer an input request
+        // differently. The field ids are deliberately not validated here
+        // (contract §9.4): this server does not hold the parked card, and a
+        // wrong id already fails the way a wrong id fails from webchat.
+        let payload = match answer {
+            Some(answer) => answer_payload(answer, message),
+            // `message` is `Some` on this arm — the refusal above is what
+            // makes that true — and an empty text is the same turn either
+            // way, so this reads the value rather than asserting it.
+            None => json!({ "text": message.unwrap_or_default() }),
+        };
         // One event per turn that RAN — see the same comment in
-        // `a2a::rpc::send_message`. Everything refused above (an empty
-        // message, a bad conversation id, the limiter, a full turn gate) ran
-        // nothing and records nothing.
+        // `a2a::rpc::send_message`. Everything refused above (neither a
+        // message nor an answer, a bad conversation id, the limiter, a full
+        // turn gate) ran nothing and records nothing.
         let started = std::time::Instant::now();
         let outcome = self.ctx.runner.run(&session_hint, &user, &payload).await;
         let elapsed = started.elapsed();
@@ -261,7 +307,10 @@ impl ServerHandler for WorkerMcpServer {
             ))
             .with_instructions(format!(
                 "Talk to {}, a Greentic worker. Use `ask` to send a message; pass the \
-                 `conversation_id` it returns to continue the same conversation.",
+                 `conversation_id` it returns to continue the same conversation. When a \
+                 reply says `awaiting_input: true`, its `input_request` names the fields \
+                 the worker is waiting for — answer by calling `ask` again on the same \
+                 conversation with those field ids under `answer`.",
                 self.ctx.agent_name
             ))
     }

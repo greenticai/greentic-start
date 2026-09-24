@@ -66,6 +66,32 @@ pub(crate) fn input_request(prompt: &str, card: Option<&Value>) -> Value {
     json!({"prompt": prompt, "fields": fields, "actions": actions})
 }
 
+/// Build the flow payload that ANSWERS an [`input_request`].
+///
+/// The ONE builder both interop surfaces use, so an MCP `answer` and an
+/// agent-to-agent `data` part cannot reach the runtime in different shapes.
+/// `answer` is field id → value exactly as the caller sent it; `text` is the
+/// caller's own sentence when it sent one beside the answer (MCP only — an
+/// agent-to-agent message whose parts carry text never reaches this
+/// function, see `a2a::rpc::message_payload`).
+///
+/// The field ids are NOT checked against the card the turn parked on. This
+/// server does not hold that card here, and a wrong id already fails the way
+/// a wrong id fails from webchat — the flow does not route. A second, weaker
+/// copy of the runner's own routing check would only refuse valid submits
+/// (contract §9.4).
+pub(crate) fn answer_payload(answer: &Map<String, Value>, text: Option<&str>) -> Value {
+    let mut payload = Map::new();
+    // `text` first so the envelope reads the way the messaging ingress
+    // builds one; key order is cosmetic to serde_json's default map, and the
+    // runner reads both by name.
+    if let Some(text) = text {
+        payload.insert("text".into(), Value::String(text.to_string()));
+    }
+    payload.insert("metadata".into(), Value::Object(answer.clone()));
+    Value::Object(payload)
+}
+
 /// Every `Input.*` element in the card, in the order it is written.
 ///
 /// A plain recursive descent rather than a walk of the container keys

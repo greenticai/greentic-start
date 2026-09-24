@@ -266,7 +266,11 @@ fn message_payload(message: &Message) -> Result<Value, SendError> {
     }
     if let Some(data) = message.parts.iter().find_map(|p| p.data.as_ref()) {
         return Ok(match data {
-            Value::Object(map) if !map.is_empty() => json!({"metadata": data}),
+            // The same builder the MCP `answer` argument goes through, so
+            // the two surfaces cannot submit differently shaped answers.
+            Value::Object(map) if !map.is_empty() => {
+                crate::interop::input_request::answer_payload(map, None)
+            }
             other => json!({"text": other.to_string()}),
         });
     }

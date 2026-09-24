@@ -4699,6 +4699,19 @@ fn build_activity(
     welcome_hint: Option<WelcomeFlowHint>,
 ) -> Activity {
     let mut activity = match payload.get("text").and_then(Value::as_str) {
+        // `Activity::text` keeps ONLY the text. That is right for a plain
+        // message and silently lossy for `{"text": …, "metadata": …}` — the
+        // canonical ingress envelope shape, and what an MCP `answer` sent
+        // beside a `message` builds (worker-interop contract §9.4). A submit
+        // whose answers vanished here would resume the parked node with no
+        // fields and nothing red at any layer, so such a payload travels
+        // whole. `with_flow_type` restores the one property `Activity::text`
+        // sets and `Activity::custom` does not, and it is what flow
+        // resolution reads; the `action` that comes with `custom` is a
+        // tracing attribute and is read by nothing else.
+        Some(_) if payload.get("metadata").is_some() => {
+            Activity::custom("http.request", payload.clone()).with_flow_type("messaging")
+        }
         Some(text) => Activity::text(text),
         None => Activity::custom("http.request", payload.clone()),
     };
@@ -7321,6 +7334,32 @@ mod tests {
                 .and_then(Value::as_str),
             Some("about_card")
         );
+    }
+
+    /// An answer sent BESIDE a sentence (worker-interop contract §9.4) is the
+    /// canonical envelope shape, and `Activity::text` keeps only the text —
+    /// so a payload carrying both travels whole instead of resuming the
+    /// parked node with no fields and nothing red anywhere.
+    #[test]
+    fn a_text_payload_keeps_a_metadata_sibling() {
+        let both = json!({"text": "bill it annually", "metadata": {"plan": "pro"}});
+        let activity = build_activity(&both, "acme", None, Some("s1"), None, None);
+        assert_eq!(
+            activity
+                .payload()
+                .pointer("/metadata/plan")
+                .and_then(Value::as_str),
+            Some("pro"),
+            "the submitted fields must survive: {:?}",
+            activity.payload()
+        );
+        assert_eq!(
+            activity.payload().get("text").and_then(Value::as_str),
+            Some("bill it annually")
+        );
+        // Flow resolution reads the flow type, and it must still be the one
+        // `Activity::text` would have set.
+        assert_eq!(activity.flow_type(), Some("messaging"));
     }
 
     #[test]

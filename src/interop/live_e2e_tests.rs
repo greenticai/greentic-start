@@ -630,6 +630,10 @@ fn mcp_exposes_exactly_the_ask_tool_and_runs_a_turn() {
     let properties = &tools[0]["inputSchema"]["properties"];
     assert!(properties["message"].is_object(), "{list}");
     assert!(properties["conversation_id"].is_object(), "{list}");
+    // D12: an MCP caller has to be able to fill the fields an `input_request`
+    // names, so `answer` is part of the advertised schema — a client only
+    // ever learns about it from here.
+    assert!(properties["answer"].is_object(), "{list}");
 
     let call: Value = mcp_post(
         &base,
@@ -667,6 +671,86 @@ fn mcp_exposes_exactly_the_ask_tool_and_runs_a_turn() {
         Some(conversation.as_str()),
         "the caller's conversation id must be echoed, not replaced"
     );
+}
+
+/// **Contract D12, against a real parked flow.** The same submit that
+/// advances the flow as an agent-to-agent `data` part
+/// (`a_parked_card_flow_advances_across_turns`) must advance it as an MCP
+/// `answer` — that is the whole claim of the shared payload builder, and only
+/// a real runtime can settle it.
+///
+/// Requires the same `new-flow` card starter that test does, routed on
+/// `response.action`; `nextCardId` is deliberately not sent, so the submit has
+/// to route on its own.
+#[test]
+#[ignore = "needs a live greentic-start serving the new-flow card starter"]
+fn mcp_answers_a_parked_turn_with_the_fields_it_was_asked_for() {
+    let (base, token) = target();
+    let conversation = format!("live-e2e-mcp-answer-{}", ulid::Ulid::new());
+
+    let greeting: Value = mcp_post(
+        &base,
+        Some(&token),
+        "tools/call",
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+               "params":{"name":"ask","arguments":{"message":"hello",
+                                                   "conversation_id": conversation}}}),
+    )
+    .json()
+    .expect("json");
+    let parked = &greeting["result"]["structuredContent"];
+    assert_eq!(
+        parked["awaiting_input"],
+        json!(true),
+        "the entry card parks: {greeting}"
+    );
+    assert!(
+        parked["input_request"]["actions"].is_array(),
+        "the input request names the buttons to press: {greeting}"
+    );
+    let greeting_text = mcp_reply_text(&greeting["result"]);
+
+    // Press a button by its action id — the discriminator the flow routes on,
+    // and the only key this submit carries.
+    let advanced: Value = mcp_post(
+        &base,
+        Some(&token),
+        "tools/call",
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+               "params":{"name":"ask","arguments":{"conversation_id": conversation,
+                                                   "answer": {"action": "pick_billing"}}}}),
+    )
+    .json()
+    .expect("json");
+    assert_ne!(
+        advanced["result"]["isError"],
+        json!(true),
+        "an answer with no message is a valid submit: {advanced}"
+    );
+    assert_eq!(
+        advanced["result"]["structuredContent"]["conversation_id"].as_str(),
+        Some(conversation.as_str()),
+        "the answer stays on the conversation it was asked for: {advanced}"
+    );
+    assert_ne!(
+        mcp_reply_text(&advanced["result"]),
+        greeting_text,
+        "the submit must advance the flow off the entry card: {advanced}"
+    );
+}
+
+/// Every text content block of a `tools/call` result, joined.
+fn mcp_reply_text(result: &Value) -> String {
+    result["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 /// The `401` has to carry `resource_metadata`, or a client that discovered no
