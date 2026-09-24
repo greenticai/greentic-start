@@ -1,6 +1,15 @@
 //! The two request bindings: JSON-RPC 2.0 on `/a2a`, and the HTTP+JSON
-//! `SendMessage` on `/a2a/message:send`. Both run ONE turn synchronously and
-//! answer with a `Message` (contract D4: no task store).
+//! `SendMessage` on `/a2a/message:send`. Both run ONE turn synchronously.
+//!
+//! A turn that COMPLETED answers with a `Message` (contract D4: no task
+//! store). A turn that PARKED answers with a `Task` in `input-required`
+//! (contract D8): a `Message` carries no state, so the one fact that matters
+//! to a program — *I am waiting for you* — had nowhere protocol-native to
+//! live. `Task.id` is the conversation's `contextId` (D9), which is the one
+//! thing that can be resumed and needs no store to mint.
+//!
+//! `GetTask` still answers `-32001` for every id, this one included: see
+//! [`handle_jsonrpc`]'s `GET_TASK` arm.
 
 use async_trait::async_trait;
 use hyper::{StatusCode, header};
@@ -8,13 +17,14 @@ use serde_json::{Value, json};
 
 use greentic_runner_host::Activity;
 
+use super::super::input_request::INPUT_REQUEST_MEDIA_TYPE;
 use super::super::limits::{CHEAP_COST, TURN_COST};
 use super::super::metering::event::{Surface, usage_from_replies};
-use super::super::reply::{ReplyItem, project_replies};
+use super::super::reply::{ProjectedReply, ReplyItem, project_replies};
 use super::types::{
     CancelTaskRequest, GetTaskRequest, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     ListTasksRequest, ListTasksResponse, Message, Part, ProtocolVersion, Role, SendMessageRequest,
-    SendMessageResponse, codes, methods,
+    SendMessageResponse, Task, TaskState, TaskStatus, codes, methods,
 };
 use super::{
     A2aContext, A2aRequest, ADAPTIVE_CARD_MEDIA_TYPE, HttpResponse, json as json_response, plain,
@@ -116,7 +126,8 @@ async fn send_message(
     credential_id: &str,
     request: SendMessageRequest,
     runner: &dyn TurnRunner,
-) -> Result<Message, SendError> {
+) -> Result<SendMessageResponse, SendError> {
+    let wants_card = accepts_adaptive_card(&request);
     let payload = message_payload(&request.message)?;
     let context_id = match request.message.context_id.as_deref() {
         Some(id) => valid_context_id(id)
@@ -147,32 +158,96 @@ async fn send_message(
     }
     let replies = outcome.map_err(|_| SendError::Internal)?;
     let projected = project_replies(&replies, "a2a", ctx.tenant, ctx.bundle_id, &session_hint);
-    let mut parts = Vec::new();
-    for item in projected.items {
-        match item {
-            ReplyItem::Text(text) => parts.push(Part::text(text)),
-            ReplyItem::Card { card, fallback } => {
-                parts.push(Part::data(card, ADAPTIVE_CARD_MEDIA_TYPE));
-                parts.push(Part::text(fallback));
-            }
-        }
+    let awaiting = projected.awaiting_input;
+    let mut parts = reply_parts(&projected, wants_card);
+    if awaiting {
+        // The structured question, beside the prose one the card's fallback
+        // text already put in `parts` (contract §9.2).
+        parts.push(Part::data(
+            projected.input_request(),
+            INPUT_REQUEST_MEDIA_TYPE,
+        ));
     }
     if parts.is_empty() {
         parts.push(Part::text(""));
     }
-    Ok(Message {
+    let message = Message {
         message_id: ulid::Ulid::new().to_string(),
-        context_id: Some(context_id),
-        task_id: None,
+        context_id: Some(context_id.clone()),
+        // A parked turn's message belongs to the task below; a completed
+        // turn's belongs to no task, because none was created.
+        task_id: awaiting.then(|| context_id.clone()),
         role: Role::Agent,
         parts,
-        metadata: projected
-            .awaiting_input
-            .then(|| json!({"awaitingInput": true})),
+        // `status.state` is what a third-party client reads (D8). This flag
+        // is kept for the Greentic clients that shipped before it and is
+        // deliberately not the signal any new reader should use.
+        metadata: awaiting.then(|| json!({"awaitingInput": true})),
         extensions: Vec::new(),
         reference_task_ids: Vec::new(),
+    };
+    if !awaiting {
+        return Ok(SendMessageResponse::Message(message));
+    }
+    Ok(SendMessageResponse::Task(Task {
+        // D9: one conversation parks at most one turn, so the conversation
+        // names the one thing that can be resumed — and needs no store.
+        id: context_id.clone(),
+        context_id,
+        status: TaskStatus {
+            state: TaskState::InputRequired,
+            message: Some(message),
+            // The same RFC 3339 spelling the usage events use, so one
+            // process does not emit two.
+            timestamp: Some(crate::interop::metering::event::now_rfc3339()),
+        },
+        artifacts: Vec::new(),
+        history: Vec::new(),
+        metadata: None,
+    }))
+}
+
+/// The turn's own replies as message parts.
+///
+/// The Adaptive Card rides only when the caller asked for one
+/// ([`accepts_adaptive_card`], contract D10). Its plain-text fallback is
+/// pushed either way, so a caller that did not ask still reads the question.
+fn reply_parts(projected: &ProjectedReply, wants_card: bool) -> Vec<Part> {
+    let mut parts = Vec::new();
+    for item in &projected.items {
+        match item {
+            ReplyItem::Text(text) => parts.push(Part::text(text.clone())),
+            ReplyItem::Card { card, fallback } => {
+                if wants_card {
+                    parts.push(Part::data(card.clone(), ADAPTIVE_CARD_MEDIA_TYPE));
+                }
+                parts.push(Part::text(fallback.clone()));
+            }
+        }
+    }
+    parts
+}
+
+/// Whether this caller declared it can render an Adaptive Card (D10).
+///
+/// Both spellings are honoured: the media type this server stamps on the
+/// part (`…adaptive+json`) and the bare `…adaptive` the contract names. A
+/// caller that opts in with either means the same thing, and refusing one of
+/// them would fail by silently withholding the card.
+fn accepts_adaptive_card(request: &SendMessageRequest) -> bool {
+    let Some(configuration) = request.configuration.as_ref() else {
+        return false;
+    };
+    configuration.accepted_output_modes.iter().any(|mode| {
+        let mode = mode.trim();
+        mode.eq_ignore_ascii_case(ADAPTIVE_CARD_MEDIA_TYPE)
+            || mode.eq_ignore_ascii_case(BARE_ADAPTIVE_CARD_MEDIA_TYPE)
     })
 }
+
+/// [`ADAPTIVE_CARD_MEDIA_TYPE`] without the `+json` structured suffix — how
+/// the contract and most clients spell it.
+const BARE_ADAPTIVE_CARD_MEDIA_TYPE: &str = "application/vnd.microsoft.card.adaptive";
 
 /// The flow payload for an inbound message: its text parts joined, else its
 /// first `data` part (an Adaptive Card submit, lifted under `metadata` the way
@@ -261,7 +336,7 @@ pub(crate) async fn handle_jsonrpc(
                 }
             };
             match send_message(ctx, credential_id, parsed, runner).await {
-                Ok(message) => match serde_json::to_value(SendMessageResponse::Message(message)) {
+                Ok(answer) => match serde_json::to_value(answer) {
                     Ok(result) => rpc_ok(id, result),
                     Err(_) => rpc_error(id, codes::INTERNAL_ERROR, "internal error", None),
                 },
@@ -280,8 +355,31 @@ pub(crate) async fn handle_jsonrpc(
                 }
             }
         }
-        // Stateless (contract D4): no task is ever created, so no id can name
-        // one. The params are still parsed, so a malformed request is told so
+        // `-32001` for EVERY id, including one this server minted for a
+        // parked turn (D9). Contract §9.3 asks for such an id to resolve by
+        // reading the session the turn parked on; that is not reachable from
+        // here, and faking it would be worse than refusing:
+        //
+        // - the only seam to the runtime is `TurnRunner::run`, which runs a
+        //   turn — the one thing a poll must not do;
+        // - a wait is found by `find_wait_by_scope(ctx, user, scope)` in
+        //   greentic-runner-host, where `user` is a digest of
+        //   `<hint>::pack=<pack id>` and `scope` is the `ReplyScope` the
+        //   PARKING envelope carried. Neither the pack id nor that scope is
+        //   known here: the pack comes from dispatching the revision (which
+        //   also commits a session pin — a write on a read), and the scope is
+        //   built inside the host from the activity it never returns;
+        // - `revision_boot` gives each revision its OWN session store, so the
+        //   answer also depends on picking the same revision;
+        // - and every one of those four derivations fails SILENTLY to "no
+        //   wait found", which is this same `-32001`. A poll that answers
+        //   "gone" for a conversation that is in fact parked is worse than
+        //   one that never claimed to be able to answer.
+        //
+        // Closing it needs a lookup seam on the runtime side, not a second
+        // derivation of the key on this one.
+        //
+        // The params are still parsed, so a malformed request is told so
         // rather than being reported as a missing task.
         methods::GET_TASK => match serde_json::from_value::<GetTaskRequest>(params) {
             Ok(_) => rpc_error(id, codes::TASK_NOT_FOUND, "task not found", None),
@@ -395,7 +493,7 @@ pub(crate) async fn handle_rest_send(
         }
     };
     match send_message(ctx, credential_id, parsed, runner).await {
-        Ok(message) => match serde_json::to_vec(&SendMessageResponse::Message(message)) {
+        Ok(answer) => match serde_json::to_vec(&answer) {
             Ok(body) => json_response(StatusCode::OK, body),
             Err(_) => rest_error(
                 StatusCode::INTERNAL_SERVER_ERROR,

@@ -11,6 +11,7 @@ use greentic_deploy_spec::ids::DeploymentId;
 use super::*;
 use crate::interop::a2a::{A2aContext, A2aRequest, ADAPTIVE_CARD_MEDIA_TYPE};
 use crate::interop::config::{Credential, InteropConfig};
+use crate::interop::input_request::INPUT_REQUEST_MEDIA_TYPE;
 use crate::interop::limits::{RateLimiter, TurnGate};
 use crate::interop::metering::testkit::{StubAdmin, unreachable_metering};
 use crate::interop::metering::{Meter, TurnMetering};
@@ -218,24 +219,274 @@ async fn a_missing_context_id_is_minted_and_returned() {
     assert_eq!(runner.calls()[0].0, format!("a2a:c1:{context}"));
 }
 
+// ---------------------------------------------------------------------------
+// Asking the caller for more input (worker-interop contract §9)
+// ---------------------------------------------------------------------------
+
+/// The card a real parked turn renders: a required choice, an optional
+/// bounded number, a toggle, and a submit button whose `data.action` is what
+/// the flow routes on.
+fn parked_card() -> Value {
+    json!({
+        "type": "AdaptiveCard", "version": "1.6",
+        "fallbackText": "Which plan should I set up?",
+        "body": [
+            {"type": "Input.ChoiceSet", "id": "plan", "label": "Plan",
+             "isRequired": true, "isMultiSelect": false,
+             "choices": [{"title": "Basic", "value": "basic"},
+                         {"title": "Pro", "value": "pro"}]},
+            {"type": "Input.Number", "id": "seats", "label": "Seats",
+             "min": 1, "max": 100},
+            {"type": "Input.Toggle", "id": "trial", "title": "Start a trial"}
+        ],
+        "actions": [{"type": "Action.Submit", "title": "Confirm",
+                     "data": {"action": "confirm"}}]
+    })
+}
+
+fn parked_turn(card: Value) -> FakeRunner {
+    FakeRunner::replying(vec![Activity::custom(
+        "response",
+        json!({"status": "pending", "response": {"renderedCard": card}}),
+    )])
+}
+
+/// A `SendMessage` whose `configuration.acceptedOutputModes` names `mode`.
+fn send_params_accepting(context_id: &str, mode: &str) -> Value {
+    let mut params = send_params(Some(context_id));
+    params["configuration"] = json!({"acceptedOutputModes": ["text/plain", mode]});
+    params
+}
+
+/// **D8 and D11.** A parked turn answers with a `Task` in `input-required`,
+/// whose status message carries the question as prose AND as a structured
+/// input request derived from the card's own inputs.
 #[tokio::test]
-async fn a_parked_turn_with_a_card_sets_awaiting_input() {
+async fn a_parked_turn_answers_input_required_with_the_fields_it_wants() {
     let fixture = Fixture::new(config());
-    let card = json!({"type": "AdaptiveCard", "fallbackText": "Fill it in"});
+    let runner = parked_turn(parked_card());
+    let body = rpc("SendMessage", send_params(Some("ctx-parked")));
+    let value = body_json(rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await).await;
+
+    assert!(
+        value["result"].get("message").is_none(),
+        "a parked turn is not a completed message: {value}"
+    );
+    let task = &value["result"]["task"];
+    assert_eq!(task["status"]["state"], "TASK_STATE_INPUT_REQUIRED");
+    // D9: the conversation names the one thing that can be resumed.
+    assert_eq!(task["id"], "ctx-parked");
+    assert_eq!(task["contextId"], "ctx-parked");
+    assert!(task["status"]["timestamp"].is_string(), "{task}");
+
+    let parts = &task["status"]["message"]["parts"];
+    assert_eq!(
+        parts[0],
+        json!({"text": "Which plan should I set up?"}),
+        "the question in prose comes first: {parts}"
+    );
+    assert_eq!(
+        parts[1],
+        json!({
+            "data": {
+                "prompt": "Which plan should I set up?",
+                "fields": [
+                    {"id": "plan", "label": "Plan", "type": "choice", "required": true,
+                     "multiSelect": false,
+                     "choices": [{"value": "basic", "label": "Basic"},
+                                 {"value": "pro", "label": "Pro"}]},
+                    {"id": "seats", "label": "Seats", "type": "number",
+                     "required": false, "min": 1, "max": 100},
+                    {"id": "trial", "label": "Start a trial", "type": "boolean",
+                     "required": false}
+                ],
+                "actions": [{"id": "confirm", "label": "Confirm"}]
+            },
+            "mediaType": INPUT_REQUEST_MEDIA_TYPE
+        })
+    );
+    assert_eq!(
+        parts.as_array().map(Vec::len),
+        Some(2),
+        "and no card: {parts}"
+    );
+}
+
+/// A parked card carrying no input element still parks, and still says so —
+/// `fields: []` is an answer, not a missing one.
+#[tokio::test]
+async fn a_parked_card_with_no_inputs_still_asks_for_an_answer() {
+    let fixture = Fixture::new(config());
+    let card = json!({"type": "AdaptiveCard", "fallbackText": "Press continue",
+                      "body": [{"type": "TextBlock", "text": "Press continue"}]});
+    let runner = parked_turn(card);
+    let body = rpc("SendMessage", send_params(Some("c")));
+    let value = body_json(rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await).await;
+    let task = &value["result"]["task"];
+    assert_eq!(task["status"]["state"], "TASK_STATE_INPUT_REQUIRED");
+    assert_eq!(
+        task["status"]["message"]["parts"][1]["data"],
+        json!({"prompt": "Press continue", "fields": [], "actions": []})
+    );
+}
+
+/// **D8, the other half.** A turn that finished still answers with a
+/// `Message`, and — with no opt-in — with no card part at all.
+#[tokio::test]
+async fn a_completed_turn_answers_a_message_with_no_card_part() {
+    let fixture = Fixture::new(config());
+    let card = json!({"type": "AdaptiveCard", "fallbackText": "Your receipt"});
     let runner = FakeRunner::replying(vec![Activity::custom(
         "response",
-        json!({"status": "pending", "response": {"renderedCard": card.clone()}}),
+        json!({"outputs": {"result": {"renderedCard": card}}}),
     )]);
     let body = rpc("SendMessage", send_params(Some("c")));
     let value = body_json(rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await).await;
+    assert!(value["result"].get("task").is_none(), "{value}");
     let message = &value["result"]["message"];
-    assert_eq!(message["metadata"], json!({"awaitingInput": true}));
+    assert_eq!(message["parts"], json!([{"text": "Your receipt"}]));
+    assert!(message.get("metadata").is_none());
+    assert!(message.get("taskId").is_none());
+}
+
+/// **D10.** The card rides only for a caller that declared it accepts one,
+/// under either spelling of the media type. Its fallback text travels either
+/// way, so nobody loses the question.
+#[tokio::test]
+async fn the_card_arrives_only_for_a_caller_that_opted_in() {
+    let fixture = Fixture::new(config());
+    let card = parked_card();
+    for (params, wants_card) in [
+        (send_params(Some("c")), false),
+        (send_params_accepting("c", "application/json"), false),
+        (send_params_accepting("c", ADAPTIVE_CARD_MEDIA_TYPE), true),
+        (
+            send_params_accepting("c", "application/vnd.microsoft.card.adaptive"),
+            true,
+        ),
+    ] {
+        let runner = parked_turn(card.clone());
+        let body = rpc("SendMessage", params.clone());
+        let value =
+            body_json(rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await).await;
+        let parts = value["result"]["task"]["status"]["message"]["parts"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let card_parts: Vec<&Value> = parts
+            .iter()
+            .filter(|part| part["mediaType"] == ADAPTIVE_CARD_MEDIA_TYPE)
+            .collect();
+        assert_eq!(
+            card_parts.len(),
+            usize::from(wants_card),
+            "{params}: {parts:?}"
+        );
+        if wants_card {
+            assert_eq!(card_parts[0]["data"], card, "{params}");
+        }
+        assert!(
+            parts
+                .iter()
+                .any(|part| part["text"] == "Which plan should I set up?"),
+            "the question in prose is not optional: {params}"
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|part| part["mediaType"] == INPUT_REQUEST_MEDIA_TYPE),
+            "nor is the structured one: {params}"
+        );
+    }
+}
+
+/// A flow that FAILED is not a flow that is asking a question. It ends the
+/// turn, so it answers with a `Message` — never `input-required`, which
+/// would tell a calling agent to keep trying to answer a dead flow.
+#[tokio::test]
+async fn a_flow_error_is_not_a_question() {
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![Activity::custom(
+        "response",
+        json!({"metadata": {"error_kind": "component", "error_message": "API key is invalid"}}),
+    )]);
+    let body = rpc("SendMessage", send_params(Some("c")));
+    let value = body_json(rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await).await;
+    assert!(value["result"].get("task").is_none(), "{value}");
+    let message = &value["result"]["message"];
+    assert!(message.get("metadata").is_none());
+    let parts = message["parts"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !parts
+            .iter()
+            .any(|part| part["mediaType"] == INPUT_REQUEST_MEDIA_TYPE),
+        "a failure must not read as an input request: {parts:?}"
+    );
+    assert!(
+        parts[0]["text"].as_str().is_some_and(|t| !t.is_empty()),
+        "the categorized error still reaches the caller: {parts:?}"
+    );
+}
+
+/// **The round trip.** The caller answers the input request with a `data`
+/// part naming the field ids, and the turn that reaches the runner is the
+/// SUBMIT shape on the same conversation.
+///
+/// `{"metadata": {…}}` is not taken on trust from the contract: it is what
+/// `revision_serve::normalize_worker_payload` builds for a card submit on
+/// `/workers/invoke`, and greentic-runner-host's `submitted_fields` reads a
+/// resumed node's answers back out of `entry.input.metadata.*` (its own
+/// `submitted_fields_reads_metadata_on_the_wrapped_path` pins that side).
+/// `action` is deliberately among them: that key is the route discriminator
+/// the card button carries, which is why an input request's action id is
+/// taken from the button's own submit data.
+#[tokio::test]
+async fn the_answer_to_an_input_request_resumes_the_same_conversation() {
+    let fixture = Fixture::new(config());
+    let asking = parked_turn(parked_card());
+    let first = rpc("SendMessage", send_params(Some("ctx-round-trip")));
+    let value = body_json(rpc_call(&fixture, Some(BEARER), &request(&first), &asking).await).await;
+    let requested = &value["result"]["task"]["status"]["message"]["parts"][1]["data"];
+    let field_ids: Vec<&str> = requested["fields"]
+        .as_array()
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|field| field["id"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(field_ids, vec!["plan", "seats", "trial"]);
+    let action_id = requested["actions"][0]["id"].as_str().unwrap_or_default();
+
+    // Answer it: one `data` part, keyed by the ids just received.
+    let answer = json!({"plan": "pro", "seats": 3, "trial": true, "action": action_id});
+    let resuming = FakeRunner::replying(vec![Activity::text("Pro it is.")]);
+    let second = rpc(
+        "SendMessage",
+        json!({"message": {"messageId": "m-answer", "role": "ROLE_USER",
+                           "contextId": "ctx-round-trip",
+                           "parts": [{"data": answer.clone(),
+                                      "mediaType": INPUT_REQUEST_MEDIA_TYPE}]}}),
+    );
+    let value =
+        body_json(rpc_call(&fixture, Some(BEARER), &request(&second), &resuming).await).await;
     assert_eq!(
-        message["parts"],
-        json!([
-            {"data": card, "mediaType": ADAPTIVE_CARD_MEDIA_TYPE},
-            {"text": "Fill it in"}
-        ])
+        value["result"]["message"]["parts"],
+        json!([{"text": "Pro it is."}]),
+        "the resumed turn completed: {value}"
+    );
+
+    let calls = resuming.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].0, "a2a:c1:ctx-round-trip",
+        "the answer resumes the conversation the task named"
+    );
+    assert_eq!(
+        calls[0].2,
+        json!({"metadata": answer}),
+        "the submit shape a resumed card node reads its answers from"
     );
 }
 
@@ -389,6 +640,28 @@ async fn rest_send_uses_the_same_turn() {
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     let unauth = rest_call(&fixture, None, &request(&body), &runner).await;
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Both bindings, not only the JSON-RPC one: the HTTP+JSON `SendMessage`
+/// answers a parked turn with the same `Task`.
+#[tokio::test]
+async fn rest_send_answers_a_parked_turn_with_a_task() {
+    let fixture = Fixture::new(config());
+    let runner = parked_turn(parked_card());
+    let body = send_params(Some("rest-parked")).to_string().into_bytes();
+    let response = rest_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = body_json(response).await;
+    assert!(value.get("message").is_none(), "{value}");
+    assert_eq!(value["task"]["id"], "rest-parked");
+    assert_eq!(
+        value["task"]["status"]["state"],
+        "TASK_STATE_INPUT_REQUIRED"
+    );
+    assert_eq!(
+        value["task"]["status"]["message"]["parts"][1]["mediaType"],
+        INPUT_REQUEST_MEDIA_TYPE
+    );
 }
 
 // ---------------------------------------------------------------------------

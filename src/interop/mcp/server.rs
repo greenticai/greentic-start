@@ -184,33 +184,29 @@ impl WorkerMcpServer {
             &session_hint,
         );
         let mut texts: Vec<String> = Vec::new();
-        let mut cards: Vec<Value> = Vec::new();
-        for item in projected.items {
+        for item in &projected.items {
             match item {
-                ReplyItem::Text(text) => texts.push(text),
-                ReplyItem::Card { card, fallback } => {
-                    // The fallback is pushed as TEXT as well as the card being
-                    // returned structurally: an MCP client renders the text
-                    // content, and a caller that ignores `structuredContent`
-                    // must still read something.
-                    texts.push(fallback);
-                    cards.push(card);
-                }
+                ReplyItem::Text(text) => texts.push(text.clone()),
+                // Only the card's plain-text fallback. MCP has no
+                // `acceptedOutputModes`, so an MCP caller can never opt in to
+                // an Adaptive Card (contract D10) and never receives one: the
+                // question it is being asked travels as `input_request`
+                // below, which a model can actually fill in.
+                ReplyItem::Card { fallback, .. } => texts.push(fallback.clone()),
             }
         }
-        let mut structured = json!({ "conversation_id": conversation_id });
-        if !cards.is_empty()
-            && let Value::Object(map) = &mut structured
-        {
-            map.insert("cards".to_string(), Value::Array(cards));
-        }
-        // Additive, and not in the contract's shape: a parked flow is the one
-        // thing a caller cannot infer from the text, and the next `ask` with
-        // this `conversation_id` is what resumes it.
+        // `awaiting_input` is always present, true or false. A flag that
+        // exists only when set cannot be told apart from a server that does
+        // not report it, and "is this conversation waiting for me" is the one
+        // question the text cannot answer.
+        let mut structured = json!({
+            "conversation_id": conversation_id,
+            "awaiting_input": projected.awaiting_input,
+        });
         if projected.awaiting_input
             && let Value::Object(map) = &mut structured
         {
-            map.insert("awaiting_input".to_string(), Value::Bool(true));
+            map.insert("input_request".to_string(), projected.input_request());
         }
 
         let content = if texts.is_empty() {
@@ -233,9 +229,14 @@ impl WorkerMcpServer {
 
 /// A tool-level error carrying the conversation id, so a caller can retry the
 /// same conversation.
+///
+/// `awaiting_input` is present and `false` for the same reason it is on the
+/// success path: the key set must not depend on the outcome, or a caller has
+/// to tell "not waiting" apart from "did not say".
 fn failed(conversation_id: &str, message: &str) -> CallToolResult {
     let mut result = CallToolResult::error(vec![ContentBlock::text(message.to_string())]);
-    result.structured_content = Some(json!({ "conversation_id": conversation_id }));
+    result.structured_content =
+        Some(json!({ "conversation_id": conversation_id, "awaiting_input": false }));
     result
 }
 

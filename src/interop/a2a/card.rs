@@ -11,14 +11,12 @@ use hyper::body::Bytes;
 use hyper::{Response, StatusCode, header};
 use sha2::{Digest, Sha256};
 
+use super::super::input_request::INPUT_REQUEST_MEDIA_TYPE;
 use super::types::{
     AgentCapabilities, AgentCard, AgentInterface, AgentSkill, HttpAuthSecurityScheme,
     ProtocolVersion, SecurityRequirement, SecurityScheme, StringList,
 };
-use super::{
-    A2aContext, A2aRequest, ADAPTIVE_CARD_MEDIA_TYPE, CARD_CACHE_CONTROL, HttpResponse,
-    JSONRPC_PATH, plain,
-};
+use super::{A2aContext, A2aRequest, CARD_CACHE_CONTROL, HttpResponse, JSONRPC_PATH, plain};
 
 /// Synthesize the card from the staged `agent` object, falling back to the
 /// bundle id and a generic `converse` skill.
@@ -87,7 +85,12 @@ pub(crate) fn build_card(ctx: &A2aContext<'_>, base_url: &str) -> AgentCard {
             extended_agent_card: None,
         },
         default_input_modes: vec!["text/plain".into(), "application/json".into()],
-        default_output_modes: vec!["text/plain".into(), ADAPTIVE_CARD_MEDIA_TYPE.into()],
+        // The Adaptive Card is NOT here any more (contract D10): it is sent
+        // only to a caller that names it in `configuration.acceptedOutputModes`,
+        // so listing it as a DEFAULT output would promise every caller a part
+        // it will not receive. What a caller gets unasked is prose plus, when
+        // the turn parks, the structured input request.
+        default_output_modes: vec!["text/plain".into(), INPUT_REQUEST_MEDIA_TYPE.into()],
         skills,
         provider: None,
         documentation_url: None,

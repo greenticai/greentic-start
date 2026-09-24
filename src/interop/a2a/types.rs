@@ -280,8 +280,9 @@ pub(crate) struct Task {
 // Requests and responses
 // ---------------------------------------------------------------------------
 
-/// `SendMessageRequest`. `configuration` is accepted and ignored: this server
-/// always answers synchronously with a `Message` (contract D4).
+/// `SendMessageRequest`. Every turn runs synchronously; `configuration` is
+/// read for `acceptedOutputModes` alone (contract D10) and ignored otherwise
+/// — this server never defers, streams or pushes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SendMessageRequest {
@@ -297,6 +298,9 @@ pub(crate) struct SendMessageRequest {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SendMessageConfiguration {
+    /// The media types this caller can render. An Adaptive Card is sent ONLY
+    /// to a caller that names one here (contract D10); everything else is
+    /// advisory, since the turn's own prose is sent to everybody.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_output_modes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
