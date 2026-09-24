@@ -446,7 +446,10 @@ wat = "1"
 # registry and the patches for them are gone.
 #
 # What is left is ONE patch, for the three greentic-runner crates, because the
-# revision this binary needs is not published yet: f6ff5590 is the develop merge
+# revision this binary needs is not published yet: 79e516b5 is the develop merge
+# of greentic-runner#798 (`TenantRuntime::load_revision_with`,
+# `RevisionHostOptions::with_billing_meter`, `billing::WorkerUsageMeter` — the
+# per-unit worker-usage meter), and it descends from f6ff5590, the develop merge
 # of greentic-runner#792, which makes runner-host's session and flow-state
 # stores configurable (`storage::StorageConfig` + `HostBuilder::with_storage`)
 # — the surface `durable_state::resolve_storage_config` depends on. Its
@@ -476,9 +479,9 @@ wat = "1"
 # A patch section does not travel into a published crate, so this does not
 # change what a crates.io consumer resolves.
 #
-# TO UNWIND: once a dev-lane publish carries #792, delete this block and run
+# TO UNWIND: once a dev-lane publish carries #798 (and so #792), delete this block and run
 # `cargo update`.
 [patch.crates-io]
-greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "f6ff55903bff2c0df7fae68f982b62e27a3a2c5c" }
-greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "f6ff55903bff2c0df7fae68f982b62e27a3a2c5c" }
-greentic-aw-runtime = { git = "https://github.com/greenticai/greentic-runner", rev = "f6ff55903bff2c0df7fae68f982b62e27a3a2c5c" }
+greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "79e516b58b81fbf0dfbe64f1a39c1c83a906317e" }
+greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "79e516b58b81fbf0dfbe64f1a39c1c83a906317e" }
+greentic-aw-runtime = { git = "https://github.com/greenticai/greentic-runner", rev = "79e516b58b81fbf0dfbe64f1a39c1c83a906317e" }
