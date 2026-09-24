@@ -2071,7 +2071,15 @@ async fn serve_interop(
             &unit.config,
             unit.deployment_id,
             &unit.bundle_id,
-        ),
+        )
+        .map(|metering| {
+            metering.tokens_recorded_by_runtime(
+                activation
+                    .routing
+                    .runtime_metered
+                    .contains(unit.deployment_id, &unit.bundle_id),
+            )
+        }),
     };
     if route == crate::interop::a2a::A2aRoute::Card {
         if method != hyper::Method::GET {
@@ -2256,7 +2264,15 @@ async fn serve_mcp(
             &unit.config,
             unit.deployment_id,
             &unit.bundle_id,
-        ),
+        )
+        .map(|metering| {
+            metering.tokens_recorded_by_runtime(
+                activation
+                    .routing
+                    .runtime_metered
+                    .contains(unit.deployment_id, &unit.bundle_id),
+            )
+        }),
         agent_name: unit
             .config
             .agent
@@ -8074,6 +8090,7 @@ mod tests {
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
                 triggers: Default::default(),
+                runtime_metered: Default::default(),
             }),
         });
         let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -9186,6 +9203,7 @@ mod tests {
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
                 triggers: Default::default(),
+                runtime_metered: Default::default(),
             }),
         }
     }
@@ -9479,6 +9497,7 @@ mod tests {
                 bundle_index,
                 flow_index: crate::webchat_routing::FlowIndex::default(),
                 triggers: Default::default(),
+                runtime_metered: Default::default(),
             }),
         }
     }
@@ -10847,6 +10866,7 @@ mod tests {
             static_routes: live.routing.static_routes.clone(),
             flow_index: live.routing.flow_index.clone(),
             triggers: live.routing.triggers.clone(),
+            runtime_metered: live.routing.runtime_metered.clone(),
             // …and rebuilds the env-derived half.
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
@@ -10900,6 +10920,7 @@ mod tests {
             static_routes: live.routing.static_routes.clone(),
             flow_index: live.routing.flow_index.clone(),
             triggers: live.routing.triggers.clone(),
+            runtime_metered: live.routing.runtime_metered.clone(),
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: std::sync::Arc::default(),
@@ -11473,6 +11494,7 @@ mod tests {
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
             triggers: Default::default(),
+            runtime_metered: Default::default(),
         });
         let activation = Activation {
             host: base.host,
@@ -12498,6 +12520,7 @@ mod binary_update_tests {
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
                 triggers: Default::default(),
+                runtime_metered: Default::default(),
             }),
         }
     }
@@ -15280,6 +15303,7 @@ mod binary_update_tests {
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
                 triggers: Default::default(),
+                runtime_metered: Default::default(),
             }),
         }
     }

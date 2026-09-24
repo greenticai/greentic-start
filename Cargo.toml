@@ -157,6 +157,17 @@ version = "0.8"
 version = "4.5"
 features = ["derive"]
 
+# The agent runtime's billing surface: `billing::WorkerUsageMeter`, which
+# `crate::interop::metering::runtime_meter` builds per unit from the staged
+# `metering` block and hands to `TenantRuntime::load_revision_with`
+# (greentic-runner#798). runner-host does not re-export the crate. Same exact
+# requirement as runner-host's (see the runner-desktop block below for why it
+# is exact), so it is ONE crate with the copy runner-host pulls through its
+# `agentic-worker` feature. No features: `test-mock` stays dev-only (below).
+[dependencies.greentic-aw-runtime]
+version = "=1.2.0-dev.0"
+default-features = false
+
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
 # / `Revision` cross the deployer boundary, so resolution must not pick an
 # older deploy-spec. The same types also cross the `greentic-runner-host`

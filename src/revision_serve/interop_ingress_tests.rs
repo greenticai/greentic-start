@@ -136,6 +136,9 @@ enum Store {
     Empty,
     /// The backend cannot answer.
     Down,
+    /// A2A and MCP on, plus a staged `metering` block — the unit whose usage
+    /// is recorded (see `interop_ingress_metering_tests`).
+    Metered,
 }
 
 fn activation_with(store: Store) -> (Activation, DeploymentId) {
@@ -147,6 +150,20 @@ fn activation_with(store: Store) -> (Activation, DeploymentId) {
 /// has served.
 fn activation_counting(
     store: Store,
+) -> (
+    Activation,
+    DeploymentId,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    activation_built(store, false)
+}
+
+/// The activation, with the unit marked as carrying the runner's
+/// worker-usage meter (`runtime_metered`) when asked — what boot records for a
+/// unit it installed one for.
+fn activation_built(
+    store: Store,
+    runtime_metered: bool,
 ) -> (
     Activation,
     DeploymentId,
@@ -177,6 +194,22 @@ fn activation_counting(
         }
         Store::Empty => Arc::new(TestSecrets::with(HashMap::new(), Arc::clone(&reads))),
         Store::Down => Arc::new(TestSecrets::failing(Arc::clone(&reads))),
+        Store::Metered => {
+            let mut doc: Value = serde_json::from_slice(&staged_interop_config_with(
+                true,
+                true,
+                None,
+                Some("https://w.example/mcp"),
+            ))
+            .expect("staged doc");
+            doc["metering"] = json!({
+                "endpoint": "http://127.0.0.1:9/api/v1/ingest/worker-usage",
+                "token": "gtm_usage-token",
+            });
+            let mut entries = HashMap::new();
+            entries.insert(config_uri(), doc.to_string().into_bytes());
+            Arc::new(TestSecrets::with(entries, Arc::clone(&reads)))
+        }
     };
     let host = Arc::new(
         greentic_runner_host::HostBuilder::new()
@@ -226,6 +259,14 @@ fn activation_counting(
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
             triggers: Default::default(),
+            runtime_metered: if runtime_metered {
+                crate::interop::metering::runtime_meter::RuntimeMeteredDeployments::of([(
+                    deployment_id,
+                    BUNDLE.to_string(),
+                )])
+            } else {
+                Default::default()
+            },
         }),
     };
     (activation, deployment_id, reads)
@@ -1178,6 +1219,7 @@ fn activation_mounting(units: Vec<MountedUnit>) -> Activation {
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
             triggers: Default::default(),
+            runtime_metered: Default::default(),
         }),
     }
 }
@@ -1510,3 +1552,6 @@ async fn two_mounted_units_serve_two_independent_surfaces() {
         assert_eq!(response.json()["resource"], resource, "{path}");
     }
 }
+
+#[path = "interop_ingress_metering_tests.rs"]
+mod metering;

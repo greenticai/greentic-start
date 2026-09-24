@@ -41,6 +41,7 @@
 //!   the host).
 
 pub(crate) mod event;
+pub(crate) mod runtime_meter;
 mod sink;
 #[cfg(test)]
 pub(crate) mod testkit;
@@ -254,6 +255,11 @@ pub(crate) struct UnitMetering {
 pub(crate) struct TurnMetering {
     meter: Arc<Meter>,
     unit: UnitMetering,
+    /// `true` when the unit's loaded revision carries the runner's
+    /// worker-usage meter ([`runtime_meter`]), which already records every
+    /// LLM iteration this turn runs. The turn is then recorded with its
+    /// tokens ZEROED — see [`TurnMetering::tokens_recorded_by_runtime`].
+    runtime_records_tokens: bool,
 }
 
 impl TurnMetering {
@@ -289,7 +295,25 @@ impl TurnMetering {
                     .filter(|id| !id.trim().is_empty())
                     .unwrap_or_else(|| bundle_id.to_string()),
             },
+            runtime_records_tokens: false,
         })
+    }
+
+    /// Declare whether the runner's worker-usage meter records this unit's
+    /// LLM tokens (Phase 2 §7, double counting).
+    ///
+    /// Token usage has ONE source. When the runner meter is installed it
+    /// posts one `surface: "turn"` event per LLM iteration — the iterations an
+    /// interop turn runs included — so this reporter keeps posting its
+    /// per-turn event (surface, iterations, duration: the fact that an A2A or
+    /// MCP turn happened) with `tokens_in` / `tokens_out` set to `0`. The
+    /// admin forwarder skips a zero-quantity meter, so the turn stays visible
+    /// and its tokens are counted once. `false` (the default, and every unit
+    /// with no runner meter) records exactly what it always did.
+    #[must_use]
+    pub(crate) fn tokens_recorded_by_runtime(mut self, recorded: bool) -> Self {
+        self.runtime_records_tokens = recorded;
+        self
     }
 
     /// Record one turn. Synchronous, never fallible, never blocking.
@@ -300,6 +324,15 @@ impl TurnMetering {
         usage: TurnUsage,
         duration: Duration,
     ) {
+        let usage = if self.runtime_records_tokens {
+            TurnUsage {
+                tokens_in: 0,
+                tokens_out: 0,
+                ..usage
+            }
+        } else {
+            usage
+        };
         let event = UsageEvent {
             event_id: event::new_event_id(),
             occurred_at: event::now_rfc3339(),
