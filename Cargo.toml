@@ -193,7 +193,7 @@ default-features = false
 # greentic-start#625 and is what CLAUDE.md's `>=M.m.p-dev.RUNID` rule exists to
 # stop.
 [dependencies.greentic-deploy-spec]
-version = ">=1.2.0-dev.35763107359, <1.3.0-0"
+version = ">=1.2.0-dev.35969201904, <1.3.0-0"
 
 # Surfaces this crate consumes across the deployer boundary, each once its own
 # floor bump: `load_trust_root` (per-env trust root + operator key, #226),
@@ -206,12 +206,21 @@ version = ">=1.2.0-dev.35763107359, <1.3.0-0"
 # `revision_serve::check_plan_identity` calls instead of the local copy it
 # carried while the dev lane lacked the export).
 #
+# The floor is `35969201904` (greentic-deployer#613, `bf7b66e3`) because
+# `materialize_revision_from_bundle` runs `pack_config_stage` at BOOT: before
+# #613 it refused an Agentic Worker's `state/pack-configs/pack.dw.<slug>.json`
+# ("pack_id `pack.dw.<slug>` is not in the bundle's pack-list.lock", the wizard
+# locks it as `pack-dw-<slug>`). The designer's CLI deployer already carried
+# #613, so `op env up` staged the revision and the container then died before
+# binding its port -- a Cloud Run readiness timeout for every worker with any
+# setup answer (designer.demo, 2026-09-24).
+#
 # The RUNID is the publish this tree resolves and was verified against — see the
 # deploy-spec block above for why a dev-lane run id is a position in a sequence
 # and not an API marker, and why `>=1.2.0-dev` (i.e. `.0`) is not a floor at all.
 # deployer and deploy-spec publish together, so the two run ids match.
 [dependencies.greentic-deployer]
-version = ">=1.2.0-dev.35763107359, <1.3.0-0"
+version = ">=1.2.0-dev.35969201904, <1.3.0-0"
 default-features = false
 
 # Surfaces this crate consumes: the `signing` module (`verify_artifact_dsse` /
