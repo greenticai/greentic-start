@@ -249,9 +249,21 @@ fn accepts_adaptive_card(request: &SendMessageRequest) -> bool {
 /// the contract and most clients spell it.
 const BARE_ADAPTIVE_CARD_MEDIA_TYPE: &str = "application/vnd.microsoft.card.adaptive";
 
-/// The flow payload for an inbound message: its text parts joined, else its
-/// first `data` part (an Adaptive Card submit, lifted under `metadata` the way
-/// `/workers/invoke` lifts one), else a refusal.
+/// The flow payload for an inbound message: its text parts joined, its first
+/// object `data` part lifted under `metadata` (an Adaptive Card submit, the
+/// way `/workers/invoke` lifts one), or BOTH, else a refusal.
+///
+/// A text part used to beat a data part outright, and this function returned
+/// on the first text it found. That discarded the answer of any caller that
+/// filled in an input request AND said something about it — which is the
+/// commonest thing a model does — with nothing reported at any layer, the
+/// exact silent drop the MCP `answer` argument exists to remove (contract
+/// §9.4). Both now travel, through the same builder the MCP surface uses.
+///
+/// Every other combination keeps the payload it produced before: text alone
+/// is `{"text": …}`, an object data part alone is `{"metadata": …}`, a
+/// NON-object data part is still only a fallback for a message with no text
+/// at all, and no usable part is still a refusal.
 fn message_payload(message: &Message) -> Result<Value, SendError> {
     if message.parts.is_empty() {
         return Err(SendError::InvalidParams("message has no parts".into()));
@@ -261,16 +273,29 @@ fn message_payload(message: &Message) -> Result<Value, SendError> {
         .iter()
         .filter_map(|p| p.text.as_deref())
         .collect();
-    if !texts.is_empty() {
-        return Ok(json!({"text": texts.join("\n")}));
+    let text = (!texts.is_empty()).then(|| texts.join("\n"));
+    let data = message.parts.iter().find_map(|p| p.data.as_ref());
+    // Only an object is an ANSWER: it is field id → value, the shape a card
+    // submit travels in.
+    let answer = data.and_then(|data| match data {
+        Value::Object(map) if !map.is_empty() => Some(map),
+        _ => None,
+    });
+    match (answer, text) {
+        // The same builder the MCP `answer` argument goes through, so the two
+        // surfaces cannot submit differently shaped answers.
+        (Some(answer), text) => Ok(crate::interop::input_request::answer_payload(
+            answer,
+            text.as_deref(),
+        )),
+        (None, Some(text)) => Ok(json!({"text": text})),
+        // No text and nothing that reads as an answer: a non-object data part
+        // is all that is left to say.
+        (None, None) => match data {
+            Some(other) => Ok(json!({"text": other.to_string()})),
+            None => Err(SendError::ContentTypeNotSupported),
+        },
     }
-    if let Some(data) = message.parts.iter().find_map(|p| p.data.as_ref()) {
-        return Ok(match data {
-            Value::Object(map) if !map.is_empty() => json!({"metadata": data}),
-            other => json!({"text": other.to_string()}),
-        });
-    }
-    Err(SendError::ContentTypeNotSupported)
 }
 
 fn valid_context_id(id: &str) -> Option<&str> {

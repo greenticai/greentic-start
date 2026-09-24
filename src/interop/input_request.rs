@@ -42,8 +42,12 @@
 //!   from the card button's own submit `data.action` when it has one:
 //!   sending `{"action": "<that id>"}` is how a caller presses the button,
 //!   and a made-up id would route nowhere.
-//! - **A text part beats a data part.** `message_payload` joins text parts
-//!   first, so an answer must carry the `data` part ALONE.
+//! - **A text part no longer beats a data part.** It did until 2026-09-24,
+//!   and an answer sent beside a sentence lost its fields without a word.
+//!   `message_payload` now carries both — the answer under `metadata` and the
+//!   joined text beside it — so a caller may say something about what it is
+//!   submitting. A message with text and no usable data part, or a data part
+//!   and no text, produces exactly the payload it always did.
 
 use serde_json::{Map, Value, json};
 
@@ -64,6 +68,32 @@ pub(crate) fn input_request(prompt: &str, card: Option<&Value>) -> Value {
         collect_actions(card, &mut actions);
     }
     json!({"prompt": prompt, "fields": fields, "actions": actions})
+}
+
+/// Build the flow payload that ANSWERS an [`input_request`].
+///
+/// The ONE builder both interop surfaces use, so an MCP `answer` and an
+/// agent-to-agent `data` part cannot reach the runtime in different shapes.
+/// `answer` is field id → value exactly as the caller sent it; `text` is the
+/// caller's own sentence when it sent one beside the answer — an MCP
+/// `message` alongside an `answer`, or an agent-to-agent message carrying
+/// both a text part and a data part.
+///
+/// The field ids are NOT checked against the card the turn parked on. This
+/// server does not hold that card here, and a wrong id already fails the way
+/// a wrong id fails from webchat — the flow does not route. A second, weaker
+/// copy of the runner's own routing check would only refuse valid submits
+/// (contract §9.4).
+pub(crate) fn answer_payload(answer: &Map<String, Value>, text: Option<&str>) -> Value {
+    let mut payload = Map::new();
+    // `text` first so the envelope reads the way the messaging ingress
+    // builds one; key order is cosmetic to serde_json's default map, and the
+    // runner reads both by name.
+    if let Some(text) = text {
+        payload.insert("text".into(), Value::String(text.to_string()));
+    }
+    payload.insert("metadata".into(), Value::Object(answer.clone()));
+    Value::Object(payload)
 }
 
 /// Every `Input.*` element in the card, in the order it is written.

@@ -255,3 +255,35 @@ fn the_media_type_is_the_contracts_own() {
         "application/vnd.greentic.input-request+json"
     );
 }
+
+/// The one builder both surfaces answer through: the submitted fields under
+/// `metadata`, which is the shape a card submit travels in on this runtime.
+#[test]
+fn an_answer_is_submitted_under_metadata() {
+    let answer = json!({"plan": "pro", "seats": 3, "action": "confirm"});
+    let map = answer.as_object().cloned().unwrap_or_default();
+    assert_eq!(answer_payload(&map, None), json!({"metadata": answer}));
+}
+
+/// A sentence sent beside the answer is carried as the turn's text WITHOUT
+/// costing the caller its answer — the two are independent (contract D12),
+/// so neither may replace the other.
+#[test]
+fn a_sentence_beside_an_answer_does_not_replace_it() {
+    let answer = json!({"plan": "pro"});
+    let map = answer.as_object().cloned().unwrap_or_default();
+    let payload = answer_payload(&map, Some("bill it annually"));
+    assert_eq!(
+        payload,
+        json!({"text": "bill it annually", "metadata": answer})
+    );
+}
+
+/// Whatever a card input can hold, an answer can hold: nothing is flattened,
+/// stringified or dropped on the way through.
+#[test]
+fn an_answer_carries_arbitrary_json_verbatim() {
+    let answer = json!({"a": [1, {"b": null}], "c": {"d": {"e": true}}, "f": "x"});
+    let map = answer.as_object().cloned().unwrap_or_default();
+    assert_eq!(answer_payload(&map, None)["metadata"], answer);
+}

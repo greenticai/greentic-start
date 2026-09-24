@@ -171,7 +171,13 @@ impl PublicUrlCapture {
 /// Largest request body the revision ingress accepts, in bytes. Even on the
 /// loopback / local posture a cap is required so one oversized POST cannot
 /// exhaust memory before the JSON parse rejects it.
-const MAX_BODY_BYTES: usize = 1 << 20; // 1 MiB
+///
+/// `pub(crate)` because `/mcp` does NOT go through [`read_body_limited`] —
+/// the request is handed to `rmcp` whole and that transport reads its own
+/// body — so [`crate::interop::mcp::server::mcp_config`] configures itself
+/// from this same number. One constant, or the two surfaces of one ingress
+/// accept different-sized turns.
+pub(crate) const MAX_BODY_BYTES: usize = 1 << 20; // 1 MiB
 
 /// Activated host + routing as a single coherent unit. Requests bind to one
 /// `Arc<Activation>` at the top of [`serve`] and use the same `host` and
@@ -4715,6 +4721,19 @@ fn build_activity(
     welcome_hint: Option<WelcomeFlowHint>,
 ) -> Activity {
     let mut activity = match payload.get("text").and_then(Value::as_str) {
+        // `Activity::text` keeps ONLY the text. That is right for a plain
+        // message and silently lossy for `{"text": …, "metadata": …}` — the
+        // canonical ingress envelope shape, and what an MCP `answer` sent
+        // beside a `message` builds (worker-interop contract §9.4). A submit
+        // whose answers vanished here would resume the parked node with no
+        // fields and nothing red at any layer, so such a payload travels
+        // whole. `with_flow_type` restores the one property `Activity::text`
+        // sets and `Activity::custom` does not, and it is what flow
+        // resolution reads; the `action` that comes with `custom` is a
+        // tracing attribute and is read by nothing else.
+        Some(_) if payload.get("metadata").is_some() => {
+            Activity::custom("http.request", payload.clone()).with_flow_type("messaging")
+        }
         Some(text) => Activity::text(text),
         None => Activity::custom("http.request", payload.clone()),
     };
@@ -7300,6 +7319,29 @@ mod tests {
             activity.payload().get("text").and_then(Value::as_str),
             Some("hello there")
         );
+        // A text-only payload must keep taking the `Activity::text` path: the
+        // metadata-sibling arm below it is narrower than "any payload with a
+        // text key", and an arm that widened to this shape would change what
+        // every messaging turn dispatches as.
+        assert_eq!(activity.payload(), &payload);
+        assert!(activity.payload().get("metadata").is_none());
+        assert_eq!(
+            activity_kind(&activity),
+            "message",
+            "a text-only payload must still be a MESSAGE activity"
+        );
+    }
+
+    /// A payload with NO text keeps wrapping whole as a custom activity, and
+    /// keeps its absent flow type — the metadata-sibling arm must not reach
+    /// it and quietly relabel every answer-only submit as messaging.
+    #[test]
+    fn build_activity_metadata_without_text_stays_a_plain_custom_activity() {
+        let payload = json!({ "metadata": { "action": "confirm" } });
+        let activity = build_activity(&payload, "acme", None, Some("s1"), None, None);
+        assert_eq!(activity.payload(), &payload);
+        assert_eq!(activity.flow_type(), None);
+        assert_eq!(activity_kind(&activity), "custom");
     }
 
     #[test]
@@ -7311,6 +7353,19 @@ mod tests {
         assert_eq!(activity.session_id(), None);
         // The whole body is preserved for the entry flow to interpret.
         assert_eq!(activity.payload(), &payload);
+    }
+
+    /// The activity KIND, read through the public `Serialize` impl because
+    /// `Activity::action()` is `pub(crate)` upstream and there is no getter.
+    /// `"message"` is what [`Activity::text`] builds, `"custom"` what
+    /// [`Activity::custom`] does — the difference the metadata-sibling arm in
+    /// `build_activity` turns on, and the one a payload assertion alone
+    /// cannot see.
+    fn activity_kind(activity: &Activity) -> String {
+        serde_json::to_value(activity)
+            .ok()
+            .and_then(|value| value["kind"]["kind"].as_str().map(str::to_string))
+            .unwrap_or_default()
     }
 
     #[test]
@@ -7337,6 +7392,37 @@ mod tests {
                 .and_then(Value::as_str),
             Some("about_card")
         );
+    }
+
+    /// An answer sent BESIDE a sentence (worker-interop contract §9.4) is the
+    /// canonical envelope shape, and `Activity::text` keeps only the text —
+    /// so a payload carrying both travels whole instead of resuming the
+    /// parked node with no fields and nothing red anywhere.
+    #[test]
+    fn a_text_payload_keeps_a_metadata_sibling() {
+        let both = json!({"text": "bill it annually", "metadata": {"plan": "pro"}});
+        let activity = build_activity(&both, "acme", None, Some("s1"), None, None);
+        assert_eq!(
+            activity
+                .payload()
+                .pointer("/metadata/plan")
+                .and_then(Value::as_str),
+            Some("pro"),
+            "the submitted fields must survive: {:?}",
+            activity.payload()
+        );
+        assert_eq!(
+            activity.payload().get("text").and_then(Value::as_str),
+            Some("bill it annually")
+        );
+        // Flow resolution reads the flow type, and it must still be the one
+        // `Activity::text` would have set. The KIND is the one thing that
+        // does differ — `Activity::custom` is the only public constructor
+        // that keeps a whole payload — and it is read by nothing but a
+        // tracing span (checked against runner-host `f6ff5590`:
+        // `IngressEnvelope.action` reaches `FlowContext.action` and stops).
+        assert_eq!(activity.flow_type(), Some("messaging"));
+        assert_eq!(activity_kind(&activity), "custom");
     }
 
     #[test]

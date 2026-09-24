@@ -490,6 +490,85 @@ async fn the_answer_to_an_input_request_resumes_the_same_conversation() {
     );
 }
 
+/// **A sentence must not cost the caller its answer, on this surface either.**
+/// A text part beat a data part outright until 2026-09-24, so a caller that
+/// filled in the input request AND said something about it had its fields
+/// discarded with nothing reported anywhere — the same silent drop the MCP
+/// `answer` argument exists to remove (contract §9.4). The commonest sender of
+/// both is a model politely writing a line beside the form it just filled in.
+#[tokio::test]
+async fn a_text_part_beside_a_data_part_submits_both() {
+    let fixture = Fixture::new(config());
+    let answer = json!({"plan": "pro", "seats": 3, "action": "confirm"});
+    let resuming = FakeRunner::replying(vec![Activity::text("Pro it is.")]);
+    let body = rpc(
+        "SendMessage",
+        json!({"message": {"messageId": "m-both", "role": "ROLE_USER",
+                           "contextId": "ctx-both",
+                           "parts": [{"text": "sure, here you go"},
+                                     {"data": answer.clone(),
+                                      "mediaType": INPUT_REQUEST_MEDIA_TYPE}]}}),
+    );
+    let value = body_json(rpc_call(&fixture, Some(BEARER), &request(&body), &resuming).await).await;
+    assert_eq!(
+        value["result"]["message"]["parts"],
+        json!([{"text": "Pro it is."}]),
+        "the resumed turn completed: {value}"
+    );
+
+    let calls = resuming.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "a2a:c1:ctx-both");
+    assert_eq!(
+        calls[0].2,
+        json!({"text": "sure, here you go", "metadata": answer}),
+        "both parts reach the turn: the fields under `metadata`, the sentence beside them"
+    );
+}
+
+/// Everything that is NOT the both-parts case keeps the payload it produced
+/// before the rule changed. A non-object data part in particular is still
+/// only a fallback for a message carrying no text at all — it is not an
+/// answer, so it must not start riding alongside one.
+#[tokio::test]
+async fn every_other_part_combination_keeps_its_payload() {
+    let fixture = Fixture::new(config());
+    let cases = [
+        (
+            json!([{"text": "one"}, {"text": "two"}]),
+            json!({"text": "one\ntwo"}),
+        ),
+        (
+            json!([{"data": {"action": "confirm"}}]),
+            json!({"metadata": {"action": "confirm"}}),
+        ),
+        (
+            json!([{"data": "not an object"}]),
+            json!({"text": "\"not an object\""}),
+        ),
+        (
+            json!([{"text": "hello"}, {"data": "not an object"}]),
+            json!({"text": "hello"}),
+        ),
+        (
+            json!([{"text": "hello"}, {"data": {}}]),
+            json!({"text": "hello"}),
+        ),
+    ];
+    for (parts, expected) in cases {
+        let runner = FakeRunner::replying(vec![Activity::text("ok")]);
+        let body = rpc(
+            "SendMessage",
+            json!({"message": {"messageId": "m-shape", "role": "ROLE_USER",
+                               "contextId": "ctx-shape", "parts": parts}}),
+        );
+        let _ = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 1, "{parts}");
+        assert_eq!(calls[0].2, expected, "{parts}");
+    }
+}
+
 #[tokio::test]
 async fn no_or_wrong_bearer_is_401_and_runs_nothing() {
     let fixture = Fixture::new(config());
