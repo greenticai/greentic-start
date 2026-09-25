@@ -12,6 +12,8 @@ pub(crate) mod limits;
 pub(crate) mod mcp;
 pub(crate) mod metering;
 pub(crate) mod reply;
+pub(crate) mod structured_output;
+pub(crate) mod telemetry;
 
 /// Longest caller key accepted. A caller key is a session-namespace segment
 /// AND a rate-limit map key, so it is bounded on both counts.

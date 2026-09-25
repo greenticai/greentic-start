@@ -13,8 +13,10 @@ use crate::interop::a2a::{A2aContext, A2aRequest, ADAPTIVE_CARD_MEDIA_TYPE};
 use crate::interop::config::{Credential, InteropConfig};
 use crate::interop::input_request::INPUT_REQUEST_MEDIA_TYPE;
 use crate::interop::limits::{RateLimiter, TurnGate};
+use crate::interop::metering::event::Surface;
 use crate::interop::metering::testkit::{StubAdmin, unreachable_metering};
 use crate::interop::metering::{Meter, TurnMetering};
+use crate::interop::telemetry::{FieldValue, RequestTrace};
 
 const TOKEN: &str = "gtw_test-token";
 
@@ -64,11 +66,24 @@ fn config() -> InteropConfig {
     }
 }
 
+/// A trace for one request, attributed the way the ingress attributes one.
+fn trace() -> RequestTrace {
+    RequestTrace::new(
+        Surface::A2a,
+        greentic_telemetry::TelemetryCtx::new("default").with_bundle_id("support-bot"),
+    )
+}
+
 struct Fixture {
     config: InteropConfig,
     limiter: RateLimiter,
     turns: TurnGate,
     deployment_id: DeploymentId,
+    /// One fixture serves ONE request when a test asserts on the trace:
+    /// `RequestTrace` accumulates a request's facts and an outcome is
+    /// first-wins, so a second request through the same fixture would read
+    /// the first one's outcome.
+    trace: RequestTrace,
     meter: std::sync::Arc<Meter>,
 }
 
@@ -89,6 +104,7 @@ impl Fixture {
             limiter: RateLimiter::default(),
             turns: TurnGate::new(4),
             deployment_id: DeploymentId::new(),
+            trace: trace(),
             meter,
         }
     }
@@ -103,6 +119,7 @@ impl Fixture {
             limiter: &self.limiter,
             turns: &self.turns,
             now_ms: 0,
+            trace: &self.trace,
             metering: TurnMetering::for_unit(
                 &self.meter,
                 &self.config,
@@ -1019,5 +1036,545 @@ async fn no_turn_content_reaches_the_recorded_event() {
             "tokens_out",
         ],
         "a field was added to the recorded usage event: {wire}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Artifacts (A2A design §7: `artifact/result` -> structured Flow/Worker output)
+// ---------------------------------------------------------------------------
+
+/// A component output a flow produced. The shared reply shaper stringifies
+/// this into a text part, which is the prose an agent caller used to have to
+/// parse.
+fn structured_reply() -> Activity {
+    Activity::custom(
+        "response",
+        json!({"result": {"structured_content": {"order_id": "A-1", "total": 42}}}),
+    )
+}
+
+async fn send_structured(fixture: &Fixture, runner: &dyn TurnRunner) -> Value {
+    let body = rpc("SendMessage", send_params(Some("ctx-art")));
+    let response = rpc_call(fixture, Some(BEARER), &request(&body), runner).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    body_json(response).await
+}
+
+/// The gap this closes: the object the flow produced now travels as an
+/// artifact a caller can read, instead of only as the JSON string the shaper
+/// made of it.
+#[tokio::test]
+async fn a_turn_with_a_structured_output_answers_with_a_completed_task_carrying_it() {
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![structured_reply()]);
+    let value = send_structured(&fixture, &runner).await;
+    let task = &value["result"]["task"];
+    assert!(!task.is_null(), "expected a task: {value}");
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED");
+    assert_eq!(task["id"], "ctx-art");
+    assert_eq!(task["contextId"], "ctx-art");
+    let artifacts = task["artifacts"].as_array().expect("artifacts");
+    let structured: Vec<&Value> = artifacts
+        .iter()
+        .flat_map(|artifact| artifact["parts"].as_array().into_iter().flatten())
+        .filter(|part| part.get("data").is_some())
+        .collect();
+    assert_eq!(structured.len(), 1, "{artifacts:?}");
+    assert_eq!(
+        structured[0]["data"],
+        json!({"order_id": "A-1", "total": 42})
+    );
+    assert_eq!(structured[0]["mediaType"], "application/json");
+    // Every artifact is identified, or a caller cannot refer to one.
+    for artifact in artifacts {
+        assert!(
+            artifact["artifactId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "{artifact}"
+        );
+    }
+}
+
+/// The ratchet the doc on `artifacts_for` names: `greentic-aw-runtime`'s
+/// `a2a_source::task_reply` reads a COMPLETED task's answer out of the
+/// artifacts' text parts and ignores `status.message`, reporting a completed
+/// task with no text artifact to the model as a failure. A completed task
+/// whose prose lived only in `status.message` would turn every successful
+/// structured turn into a reported failure on our own caller, silently.
+#[tokio::test]
+async fn a_completed_task_always_carries_the_turns_prose_as_an_artifact() {
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![
+        Activity::custom("response", json!({"reply": "your order is ready"})),
+        structured_reply(),
+    ]);
+    let value = send_structured(&fixture, &runner).await;
+    let task = &value["result"]["task"];
+    assert_eq!(task["status"]["state"], "TASK_STATE_COMPLETED");
+    let artifact_text: Vec<String> = task["artifacts"]
+        .as_array()
+        .expect("artifacts")
+        .iter()
+        .flat_map(|artifact| artifact["parts"].as_array().into_iter().flatten())
+        .filter_map(|part| part["text"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        artifact_text
+            .iter()
+            .any(|text| text == "your order is ready"),
+        "the turn's own words are not readable from the artifacts: {artifact_text:?}"
+    );
+    // And the prose still rides `status.message`, so nothing a client reads
+    // today has moved.
+    assert_eq!(
+        task["status"]["message"]["parts"][0]["text"],
+        "your order is ready"
+    );
+}
+
+/// A prose-only turn is unchanged: a `Message`, no artifacts, no task.
+#[tokio::test]
+async fn a_prose_only_turn_answers_with_a_message_and_no_artifact() {
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![Activity::custom(
+        "response",
+        json!({"reply": "hi there"}),
+    )]);
+    let body = rpc("SendMessage", send_params(Some("ctx-plain")));
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    let value = body_json(response).await;
+    assert!(
+        value["result"]["task"].is_null(),
+        "a turn with nothing structured must not become a task: {value}"
+    );
+    let message = &value["result"]["message"];
+    assert_eq!(message["parts"], json!([{"text": "hi there"}]));
+    assert!(
+        message["taskId"].is_null(),
+        "no task was created: {message}"
+    );
+}
+
+/// Contract D10 holds through the new path: the card is not an artifact, not
+/// even for a caller that asked for one and so does receive it on the
+/// message.
+#[tokio::test]
+async fn no_artifact_carries_an_adaptive_card() {
+    let card = json!({"type": "AdaptiveCard", "version": "1.6",
+        "body": [{"type": "TextBlock", "text": "Your receipt"}]});
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![
+        Activity::custom(
+            "response",
+            json!({"outputs": {"result": {"renderedCard": card.clone()}}}),
+        ),
+        structured_reply(),
+    ]);
+    let mut params = send_params(Some("ctx-card"));
+    params["configuration"] = json!({"acceptedOutputModes": [ADAPTIVE_CARD_MEDIA_TYPE]});
+    let body = rpc("SendMessage", params);
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    let value = body_json(response).await;
+    let task = &value["result"]["task"];
+    // The opted-in caller still gets the card, on the message.
+    let message_media: Vec<&str> = task["status"]["message"]["parts"]
+        .as_array()
+        .expect("parts")
+        .iter()
+        .filter_map(|part| part["mediaType"].as_str())
+        .collect();
+    assert!(
+        message_media.contains(&ADAPTIVE_CARD_MEDIA_TYPE),
+        "{message_media:?}"
+    );
+    // And no artifact carries one, by media type or by content.
+    let artifacts = serde_json::to_string(&task["artifacts"]).expect("serialize");
+    assert!(!artifacts.contains(ADAPTIVE_CARD_MEDIA_TYPE), "{artifacts}");
+    assert!(!artifacts.contains("AdaptiveCard"), "{artifacts}");
+}
+
+/// A `structured_content` that is really card transport is not a structured
+/// output, so such a turn gains no artifact and stays a `Message`.
+#[tokio::test]
+async fn a_card_carried_under_the_structured_key_produces_no_task() {
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![Activity::custom(
+        "response",
+        json!({"result": {"structured_content": {
+            "renderedCard": {"type": "AdaptiveCard", "fallbackText": "Your receipt"}
+        }}}),
+    )]);
+    let body = rpc("SendMessage", send_params(Some("ctx-cardonly")));
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    let value = body_json(response).await;
+    assert!(value["result"]["task"].is_null(), "{value}");
+}
+
+/// D8 is untouched: a parked turn is still a `Task` in input-required whose
+/// message carries the question and the private `awaitingInput` flag, and a
+/// structured output riding along does not make it look completed.
+#[tokio::test]
+async fn a_parked_turn_with_a_structured_output_is_still_input_required() {
+    let card = json!({"type": "AdaptiveCard", "fallbackText": "Which plan?"});
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![
+        structured_reply(),
+        Activity::custom(
+            "response",
+            json!({"status": "pending", "response": {"renderedCard": card}}),
+        ),
+    ]);
+    let body = rpc("SendMessage", send_params(Some("ctx-park")));
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    let value = body_json(response).await;
+    let task = &value["result"]["task"];
+    assert_eq!(task["status"]["state"], "TASK_STATE_INPUT_REQUIRED");
+    assert_eq!(task["status"]["message"]["metadata"]["awaitingInput"], true);
+    assert_eq!(task["artifacts"].as_array().map(Vec::len), Some(1));
+    // The question is not restated as an output of a task that has produced
+    // no answer yet: the only artifact is the structured value.
+    let parts = task["artifacts"][0]["parts"].as_array().expect("parts");
+    assert_eq!(parts.len(), 1);
+    assert!(parts[0].get("data").is_some(), "{parts:?}");
+}
+
+/// A completed task's message must NOT carry the parked-turn flag, or a
+/// client that still reads it would treat an answer as a question.
+#[tokio::test]
+async fn a_completed_task_never_claims_to_be_awaiting_input() {
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![structured_reply()]);
+    let value = send_structured(&fixture, &runner).await;
+    let message = &value["result"]["task"]["status"]["message"];
+    assert!(message["metadata"].is_null(), "{message}");
+    assert_eq!(message["taskId"], "ctx-art");
+}
+
+/// A turn that ended at a failure answers exactly as it did before: the
+/// categorized error as a `Message`, and no artifact claiming a result.
+///
+/// The payload nests the structured value under `outputs` on purpose. The
+/// shared shaper reads only a TOP-LEVEL `result.structured_content`, and it
+/// reads it in the text fallback chain AHEAD of the flow-error branch \u2014 so a
+/// top-level one wins and the turn is not classified as a failure at all.
+/// (That precedence is the shaper's and predates this work; it is what a
+/// webchat user sees too.) Nesting it keeps the shaper on the flow-error
+/// branch while this module still finds the value, which is the only shape
+/// that can exercise the suppression.
+#[tokio::test]
+async fn a_failed_flow_produces_no_artifact_and_stays_a_message() {
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![Activity::custom(
+        "response",
+        json!({
+            "metadata": {"error_kind": "component", "error_message": "API key is invalid"},
+            "outputs": {"result": {"structured_content": {"partial": true}}}
+        }),
+    )]);
+    let body = rpc("SendMessage", send_params(Some("ctx-fail")));
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    let value = body_json(response).await;
+    assert!(value["result"]["task"].is_null(), "{value}");
+    let text = value["result"]["message"]["parts"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!text.is_empty(), "{value}");
+    assert!(
+        !text.contains("partial"),
+        "a failed turn must not present its partial value as an answer: {text}"
+    );
+}
+
+/// The REST binding answers with the same shape; it serializes the same
+/// `SendMessageResponse`.
+#[tokio::test]
+async fn the_rest_binding_answers_a_structured_turn_with_the_same_task() {
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![structured_reply()]);
+    let body = serde_json::to_vec(&send_params(Some("ctx-rest"))).expect("body");
+    let response = rest_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = body_json(response).await;
+    assert_eq!(value["task"]["status"]["state"], "TASK_STATE_COMPLETED");
+    assert!(
+        !value["task"]["artifacts"]
+            .as_array()
+            .expect("artifacts")
+            .is_empty()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-request telemetry (A2A design PR-15)
+// ---------------------------------------------------------------------------
+
+/// The fields the request's span will carry, as text, for assertions.
+fn traced(fixture: &Fixture) -> Vec<(&'static str, String)> {
+    fixture
+        .trace
+        .fields()
+        .into_iter()
+        .map(|(key, value)| {
+            let text = match value {
+                FieldValue::Text(text) => text,
+                FieldValue::Count(count) => count.to_string(),
+            };
+            (key, text)
+        })
+        .collect()
+}
+
+fn traced_value(fixture: &Fixture, key: &str) -> Option<String> {
+    traced(fixture)
+        .into_iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, value)| value)
+}
+
+/// Every refusal has to be tellable from every other one, or the only thing
+/// telemetry proves is that working requests work.
+#[tokio::test]
+async fn a_bad_bearer_is_traced_as_unauthenticated() {
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![]);
+    let body = rpc("SendMessage", send_params(None));
+    let response = rpc_call(&fixture, Some("Bearer wrong"), &request(&body), &runner).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        traced_value(&fixture, "interop.outcome").as_deref(),
+        Some("unauthenticated")
+    );
+    // Nothing ran, so nothing claims a turn duration, and no credential was
+    // verified to name.
+    assert!(traced_value(&fixture, "interop.turn_duration_ms").is_none());
+    assert!(traced_value(&fixture, "interop.credential_id").is_none());
+}
+
+#[tokio::test]
+async fn a_rate_limited_request_is_traced_as_rate_limited() {
+    let fixture = Fixture::new(config());
+    // Spend this credential's whole burst directly, so the one request this
+    // fixture's trace describes is the refused one.
+    while fixture
+        .limiter
+        .check("c1", crate::interop::limits::TURN_COST)
+        .is_ok()
+    {}
+    let runner = FakeRunner::replying(vec![Activity::text("hi")]);
+    let body = rpc("SendMessage", send_params(None));
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        traced_value(&fixture, "interop.outcome").as_deref(),
+        Some("rate_limited")
+    );
+    assert!(
+        runner.calls().is_empty(),
+        "a refused request must run no turn"
+    );
+}
+
+#[tokio::test]
+async fn a_version_this_server_does_not_speak_is_traced_as_such() {
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![]);
+    let body = rpc("SendMessage", send_params(None));
+    let req = A2aRequest {
+        version_header: Some("2.0"),
+        query: None,
+        if_none_match: None,
+        body: &body,
+    };
+    let _ = rpc_call(&fixture, Some(BEARER), &req, &runner).await;
+    assert_eq!(
+        traced_value(&fixture, "interop.outcome").as_deref(),
+        Some("version_unsupported")
+    );
+    assert_eq!(
+        traced_value(&fixture, "interop.rpc_error_code").as_deref(),
+        Some("-32009")
+    );
+}
+
+#[tokio::test]
+async fn a_turn_that_could_not_run_is_traced_apart_from_one_that_ran_and_failed() {
+    let fixture = Fixture::new(config());
+    let body = rpc("SendMessage", send_params(None));
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &FailingRunner).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        traced_value(&fixture, "interop.outcome").as_deref(),
+        Some("turn_failed")
+    );
+    assert_eq!(
+        traced_value(&fixture, "interop.rpc_error_code").as_deref(),
+        Some("-32603")
+    );
+
+    // A flow that RAN and ended at a failure is a different fact.
+    let ran = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![Activity::custom(
+        "response",
+        json!({"metadata": {"error_kind": "component", "error_message": "API key is invalid"}}),
+    )]);
+    let _ = rpc_call(&ran, Some(BEARER), &request(&body), &runner).await;
+    assert_eq!(
+        traced_value(&ran, "interop.outcome").as_deref(),
+        Some("flow_failed")
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_method_is_traced_by_its_code_and_never_by_its_name() {
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![]);
+    let body = rpc("DropTables--<script>", json!({}));
+    let _ = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    assert_eq!(
+        traced_value(&fixture, "interop.outcome").as_deref(),
+        Some("rejected")
+    );
+    assert_eq!(
+        traced_value(&fixture, "interop.rpc_error_code").as_deref(),
+        Some("-32601")
+    );
+    assert!(
+        traced_value(&fixture, "interop.method").is_none(),
+        "a method this server does not serve must not become a field"
+    );
+}
+
+/// A successful turn names its outcome, the task state it answered with, the
+/// credential that called it and how long the turn took.
+#[tokio::test]
+async fn a_completed_structured_turn_is_traced_with_its_task_state_and_artifacts() {
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![structured_reply()]);
+    let _ = send_structured(&fixture, &runner).await;
+    assert_eq!(
+        traced_value(&fixture, "interop.outcome").as_deref(),
+        Some("completed")
+    );
+    assert_eq!(
+        traced_value(&fixture, "interop.task_state").as_deref(),
+        Some("TASK_STATE_COMPLETED")
+    );
+    assert_eq!(
+        traced_value(&fixture, "interop.artifacts").as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        traced_value(&fixture, "interop.method").as_deref(),
+        Some("SendMessage")
+    );
+    assert_eq!(
+        traced_value(&fixture, "interop.credential_id").as_deref(),
+        Some("c1")
+    );
+    assert!(traced_value(&fixture, "interop.turn_duration_ms").is_some());
+    assert_eq!(
+        traced_value(&fixture, "gt.tenant").as_deref(),
+        Some("default")
+    );
+}
+
+/// A turn that answers with a `Message` names no task state, because no task
+/// was created — absent is the fact, not an empty string.
+#[tokio::test]
+async fn a_message_answer_names_no_task_state() {
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![Activity::text("hi")]);
+    let body = rpc("SendMessage", send_params(None));
+    let _ = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    assert_eq!(
+        traced_value(&fixture, "interop.outcome").as_deref(),
+        Some("completed")
+    );
+    assert!(traced_value(&fixture, "interop.task_state").is_none());
+}
+
+/// The one rule the whole module rests on: no caller-supplied string reaches
+/// a field. Asserted on the fields that ARE emitted, with every
+/// caller-controlled input made distinctive — the bearer, the message text,
+/// a card-submit answer, the conversation id and the method — and with the
+/// worker's own reply content made distinctive too.
+#[tokio::test]
+async fn no_caller_supplied_string_or_turn_content_reaches_a_field() {
+    let fixture = Fixture::new(config());
+    let runner = FakeRunner::replying(vec![
+        Activity::custom("response", json!({"reply": "REPLY-CONTENT-9"})),
+        Activity::custom(
+            "response",
+            json!({"result": {"structured_content": {"secret_field": "STRUCTURED-CONTENT-9"}}}),
+        ),
+    ]);
+    let params = json!({"message": {
+        "messageId": "MESSAGE-ID-9",
+        "contextId": "CONTEXT-ID-9",
+        "role": "ROLE_USER",
+        "parts": [
+            {"text": "INBOUND-TEXT-9"},
+            {"data": {"answer_field": "ANSWER-CONTENT-9"}}
+        ]
+    }});
+    let body = rpc("SendMessage", params);
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // The turn really ran and really answered, or this would prove nothing.
+    let value = body_json(response).await;
+    assert_eq!(
+        value["result"]["task"]["status"]["state"],
+        "TASK_STATE_COMPLETED"
+    );
+
+    let fields = traced(&fixture);
+    let wire = fields
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for secret in [
+        // The bearer, in both the header spelling and the bare token.
+        BEARER,
+        "gtw_test-token",
+        // Caller-supplied strings.
+        "MESSAGE-ID-9",
+        "CONTEXT-ID-9",
+        "INBOUND-TEXT-9",
+        "ANSWER-CONTENT-9",
+        // The worker's own words and the tenant's own data.
+        "REPLY-CONTENT-9",
+        "STRUCTURED-CONTENT-9",
+        "secret_field",
+    ] {
+        assert!(
+            !wire.contains(secret),
+            "`{secret}` reached a span field: {wire}"
+        );
+    }
+    // And no field BEYOND the closed list, so a field added anywhere between
+    // the request and the span is caught even when its value happens not to
+    // match a fixture string. `interop.route` and `interop.http_status` are
+    // absent because this test drives the HANDLER, as the whole file does;
+    // the ingress records those two and neither is caller text.
+    let mut keys: Vec<&str> = fields.iter().map(|(key, _)| *key).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "gt.bundle_id",
+            "gt.tenant",
+            "interop.artifacts",
+            "interop.credential_id",
+            "interop.duration_ms",
+            "interop.method",
+            "interop.outcome",
+            "interop.surface",
+            "interop.task_state",
+            "interop.turn_duration_ms",
+        ],
+        "a field was added to the request span: {wire}"
     );
 }

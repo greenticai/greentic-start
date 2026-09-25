@@ -13,6 +13,8 @@ use greentic_types::ChannelMessageEnvelope;
 use greentic_types::messaging::extensions::ext_keys;
 use serde_json::{Value, json};
 
+use super::structured_output::{self, StructuredOutput};
+
 /// One user-visible piece of a reply.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ReplyItem {
@@ -43,6 +45,16 @@ pub(crate) struct ProjectedReply {
     /// card parks with `None`, which is a question with no named fields —
     /// not the absence of a question.
     pub parked_card: Option<Value>,
+    /// The structured values the turn's nodes produced, in the order the
+    /// runtime appended them ([`super::structured_output`]).
+    ///
+    /// Read off the raw reply activities, NOT off [`Self::items`]: by the
+    /// time the shared shaper has run, a structured value has already been
+    /// stringified into a text part or dropped in favour of one. Nothing here
+    /// is derived from the prose — a turn that produced no structured value
+    /// carries an empty list, which is a different fact from producing an
+    /// empty one.
+    pub structured: Vec<StructuredOutput>,
 }
 
 impl ProjectedReply {
@@ -92,6 +104,11 @@ pub(crate) fn project_replies(
         if parks {
             projected.awaiting_input = true;
         }
+        // From the RAW payload, before the shaper has had a chance to
+        // stringify it into prose or drop it for a text sibling.
+        projected
+            .structured
+            .extend(structured_output::collect(reply.payload()));
         // Where THIS reply's items start, so the card it parked on can be
         // told apart from a card an earlier reply of the same turn rendered.
         let first_item = projected.items.len();
@@ -363,6 +380,66 @@ mod tests {
             got.flow_error,
             "a failed flow must be reportable as an error"
         );
+    }
+
+    /// The structured value is read off the RAW activity, so it survives the
+    /// shaper turning it into a text part.
+    #[test]
+    fn a_structured_output_is_projected_beside_the_prose_the_shaper_made_of_it() {
+        let reply = Activity::custom(
+            "response",
+            json!({"result": {"structured_content": {"temp_c": 21.3}}}),
+        );
+        let got = project(&[reply]);
+        assert_eq!(got.structured.len(), 1);
+        assert_eq!(got.structured[0].value, json!({"temp_c": 21.3}));
+        assert!(
+            !got.items.is_empty(),
+            "the prose the shaper produced is untouched"
+        );
+    }
+
+    /// The case that used to lose the object outright: `result.content[].text`
+    /// wins the shaper's `.or()` chain, so the structure reached nobody.
+    #[test]
+    fn a_structured_output_survives_a_text_sibling_that_beats_it_in_the_shaper() {
+        let reply = Activity::custom(
+            "response",
+            json!({"result": {
+                "content": [{"type": "text", "text": "21.3 degrees"}],
+                "structured_content": {"temp_c": 21.3}
+            }}),
+        );
+        let got = project(&[reply]);
+        assert_eq!(got.items, vec![ReplyItem::Text("21.3 degrees".into())]);
+        assert_eq!(got.structured.len(), 1);
+        assert_eq!(got.structured[0].value, json!({"temp_c": 21.3}));
+    }
+
+    #[test]
+    fn a_prose_only_turn_projects_no_structured_output() {
+        let reply = Activity::custom(
+            "response",
+            json!({"reply": "the answer", "trail": [], "terminated_by": "final"}),
+        );
+        assert!(project(&[reply]).structured.is_empty());
+    }
+
+    /// Two replies are two nodes, so two structured outputs, in order.
+    #[test]
+    fn each_reply_contributes_its_own_structured_output() {
+        let got = project(&[
+            Activity::custom(
+                "response",
+                json!({"result": {"structured_content": {"step": 1}}}),
+            ),
+            Activity::custom(
+                "response",
+                json!({"result": {"structured_content": {"step": 2}}}),
+            ),
+        ]);
+        let values: Vec<_> = got.structured.iter().map(|o| o.value.clone()).collect();
+        assert_eq!(values, vec![json!({"step": 1}), json!({"step": 2})]);
     }
 
     #[test]

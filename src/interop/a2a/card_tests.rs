@@ -11,6 +11,8 @@ use greentic_deploy_spec::ids::DeploymentId;
 use crate::interop::a2a::{A2aContext, A2aRequest};
 use crate::interop::config::{AgentMeta, AgentSkillMeta, Credential, InteropConfig};
 use crate::interop::limits::{RateLimiter, TurnGate};
+use crate::interop::metering::event::Surface;
+use crate::interop::telemetry::RequestTrace;
 
 const TOKEN: &str = "gtw_test-token";
 
@@ -26,11 +28,24 @@ fn config() -> InteropConfig {
     }
 }
 
+/// A trace for one request, attributed the way the ingress attributes one.
+fn trace() -> RequestTrace {
+    RequestTrace::new(
+        Surface::A2a,
+        greentic_telemetry::TelemetryCtx::new("default").with_bundle_id("support-bot"),
+    )
+}
+
 struct Fixture {
     config: InteropConfig,
     limiter: RateLimiter,
     turns: TurnGate,
     deployment_id: DeploymentId,
+    /// One fixture serves ONE request when a test asserts on the trace:
+    /// `RequestTrace` accumulates a request's facts and an outcome is
+    /// first-wins, so a second request through the same fixture would read
+    /// the first one's outcome.
+    trace: RequestTrace,
 }
 
 impl Fixture {
@@ -40,6 +55,7 @@ impl Fixture {
             limiter: RateLimiter::default(),
             turns: TurnGate::new(4),
             deployment_id: DeploymentId::new(),
+            trace: trace(),
         }
     }
 
@@ -53,6 +69,7 @@ impl Fixture {
             limiter: &self.limiter,
             turns: &self.turns,
             now_ms: 0,
+            trace: &self.trace,
             // The card is served before any authentication and runs no turn,
             // so there is nothing to meter on this path.
             metering: None,

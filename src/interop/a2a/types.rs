@@ -243,6 +243,30 @@ pub(crate) enum TaskState {
     AuthRequired,
 }
 
+impl TaskState {
+    /// The proto wire spelling, as a `&'static str`.
+    ///
+    /// Exists so telemetry can name the state it answered with without
+    /// serializing a value, and it is the SAME spelling serde emits —
+    /// `types_tests::every_task_state_wire_name_matches_its_serde_name` pins
+    /// that. A hand-written second vocabulary is exactly how the contract's
+    /// own §9.1 note describes this going wrong (`input-required` was written
+    /// where the wire says `TASK_STATE_INPUT_REQUIRED`).
+    pub(crate) const fn wire_name(self) -> &'static str {
+        match self {
+            TaskState::Unspecified => "TASK_STATE_UNSPECIFIED",
+            TaskState::Submitted => "TASK_STATE_SUBMITTED",
+            TaskState::Working => "TASK_STATE_WORKING",
+            TaskState::Completed => "TASK_STATE_COMPLETED",
+            TaskState::Failed => "TASK_STATE_FAILED",
+            TaskState::Canceled => "TASK_STATE_CANCELED",
+            TaskState::InputRequired => "TASK_STATE_INPUT_REQUIRED",
+            TaskState::Rejected => "TASK_STATE_REJECTED",
+            TaskState::AuthRequired => "TASK_STATE_AUTH_REQUIRED",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TaskStatus {
@@ -452,6 +476,32 @@ pub(crate) mod methods {
     pub(crate) const LIST_PUSH_CONFIGS: &str = "ListTaskPushNotificationConfigs";
     pub(crate) const DELETE_PUSH_CONFIG: &str = "DeleteTaskPushNotificationConfig";
     pub(crate) const GET_EXTENDED_AGENT_CARD: &str = "GetExtendedAgentCard";
+
+    /// Every name above, so a caller's method string can be matched to one of
+    /// ours without becoming one.
+    pub(crate) const ALL: &[&str] = &[
+        SEND_MESSAGE,
+        SEND_STREAMING_MESSAGE,
+        GET_TASK,
+        LIST_TASKS,
+        CANCEL_TASK,
+        SUBSCRIBE_TO_TASK,
+        CREATE_PUSH_CONFIG,
+        GET_PUSH_CONFIG,
+        LIST_PUSH_CONFIGS,
+        DELETE_PUSH_CONFIG,
+        GET_EXTENDED_AGENT_CARD,
+    ];
+
+    /// The `&'static str` for `requested`, when it names one of this
+    /// service's RPCs.
+    ///
+    /// Returning OUR copy rather than the caller's is the point: telemetry
+    /// records a method name, and a caller-supplied string is unbounded text
+    /// this server has no business putting in a trace index.
+    pub(crate) fn known(requested: &str) -> Option<&'static str> {
+        ALL.iter().copied().find(|name| *name == requested)
+    }
 }
 
 // ---------------------------------------------------------------------------

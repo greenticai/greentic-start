@@ -2053,6 +2053,12 @@ impl crate::interop::a2a::rpc::TurnRunner for IngressTurnRunner<'_> {
 }
 
 /// Serve one reserved interop path.
+///
+/// Every exit records the status it answered with on the request's own
+/// telemetry span (`crate::interop::telemetry`), which is emitted once when
+/// `trace` is dropped at the end of this function — refusals included, which
+/// is the whole reason the span exists beside the usage meter: the meter only
+/// ever records a turn that RAN.
 async fn serve_interop(
     req: Request<Incoming>,
     route: crate::interop::a2a::A2aRoute,
@@ -2061,6 +2067,32 @@ async fn serve_interop(
     activation: &Activation,
     method: &hyper::Method,
     headers: InteropRequestHeaders<'_>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let trace = crate::interop::telemetry::RequestTrace::new(
+        crate::interop::metering::event::Surface::A2a,
+        greentic_telemetry::TelemetryCtx::new(unit.tenant.clone())
+            .with_deployment_id(unit.deployment_id.to_string())
+            .with_bundle_id(unit.bundle_id.clone()),
+    );
+    trace.route(route.as_str());
+    let answered =
+        serve_interop_inner(req, route, unit, state, activation, method, headers, &trace).await;
+    match answered.as_ref() {
+        Ok(response) | Err(response) => trace.http_status(response.status().as_u16()),
+    }
+    answered
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_interop_inner(
+    req: Request<Incoming>,
+    route: crate::interop::a2a::A2aRoute,
+    unit: &InteropUnit,
+    state: &ServeState,
+    activation: &Activation,
+    method: &hyper::Method,
+    headers: InteropRequestHeaders<'_>,
+    trace: &crate::interop::telemetry::RequestTrace,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
     let base_url = interop_unit_base_url(state, unit);
     let ctx = crate::interop::a2a::A2aContext {
@@ -2086,9 +2118,11 @@ async fn serve_interop(
                     .contains(unit.deployment_id, &unit.bundle_id),
             )
         }),
+        trace,
     };
     if route == crate::interop::a2a::A2aRoute::Card {
         if method != hyper::Method::GET {
+            trace.outcome(crate::interop::telemetry::Outcome::Rejected);
             return Err(error_response(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "the agent card is served on GET",
@@ -2100,10 +2134,20 @@ async fn serve_interop(
             if_none_match: headers.if_none_match,
             body: &[],
         };
-        return Ok(crate::interop::a2a::card::card_response(&ctx, &request));
+        let response = crate::interop::a2a::card::card_response(&ctx, &request);
+        // The card handler answers `200` or `304`; the second is the
+        // caller's own `If-None-Match` matching, which is a hit worth telling
+        // apart from a rebuild.
+        trace.outcome(if response.status() == StatusCode::NOT_MODIFIED {
+            crate::interop::telemetry::Outcome::NotModified
+        } else {
+            crate::interop::telemetry::Outcome::Served
+        });
+        return Ok(response);
     }
 
     if method != hyper::Method::POST {
+        trace.outcome(crate::interop::telemetry::Outcome::Rejected);
         return Err(error_response(
             StatusCode::METHOD_NOT_ALLOWED,
             "this A2A endpoint requires POST",
@@ -2116,6 +2160,7 @@ async fn serve_interop(
     let credential_id = crate::interop::a2a::rpc::authenticate(&ctx, headers.authorization)
         .map_err(|response| *response)?;
     let body_bytes = read_body_limited(req).await.map_err(|_| {
+        trace.outcome(crate::interop::telemetry::Outcome::Rejected);
         error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request body exceeds the size limit",
