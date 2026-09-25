@@ -493,3 +493,43 @@ fn protocol_version_negotiates_on_major_minor() {
     }
     assert_eq!(ProtocolVersion::SUPPORTED.to_string(), "1.0");
 }
+
+/// `wire_name` exists so telemetry can name a task state without serializing
+/// one, and it is only safe while it IS the serde name. A second vocabulary
+/// is how the contract's own §9.1 note describes this going wrong.
+#[test]
+fn every_task_state_wire_name_matches_its_serde_name() {
+    for state in [
+        TaskState::Unspecified,
+        TaskState::Submitted,
+        TaskState::Working,
+        TaskState::Completed,
+        TaskState::Failed,
+        TaskState::Canceled,
+        TaskState::InputRequired,
+        TaskState::Rejected,
+        TaskState::AuthRequired,
+    ] {
+        assert_eq!(
+            serde_json::to_value(state).expect("serialize"),
+            json!(state.wire_name()),
+            "{state:?}"
+        );
+    }
+}
+
+/// A caller's method string becomes OUR `&'static str` or nothing at all.
+/// Nothing in between, because the return value is recorded in telemetry.
+#[test]
+fn only_a_method_this_server_serves_is_recognised() {
+    assert_eq!(methods::known("SendMessage"), Some(methods::SEND_MESSAGE));
+    assert_eq!(methods::known("GetTask"), Some(methods::GET_TASK));
+    for unknown in ["sendMessage", "message/send", "", "SendMessage "] {
+        assert_eq!(methods::known(unknown), None, "{unknown}");
+    }
+    assert_eq!(
+        methods::ALL.len(),
+        11,
+        "the eleven A2AService RPCs; a new one needs a handler arm too"
+    );
+}

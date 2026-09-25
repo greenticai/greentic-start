@@ -48,6 +48,16 @@ pub(crate) const REST_SEND_PATH: &str = "/a2a/message:send";
 /// Media type of an Adaptive Card `data` part.
 pub(crate) const ADAPTIVE_CARD_MEDIA_TYPE: &str = "application/vnd.microsoft.card.adaptive+json";
 
+/// Media type of an artifact part carrying a turn's structured output.
+///
+/// Plain `application/json`, deliberately NOT a `vnd.greentic.*` type like
+/// [`super::input_request::INPUT_REQUEST_MEDIA_TYPE`] beside it. That one
+/// names a document whose schema Greentic defines; this one is the flow's own
+/// object, whose schema is the flow author's and which Greentic neither
+/// defines nor reshapes. A Greentic media type here would promise a contract
+/// nothing on either side could honour.
+pub(crate) const STRUCTURED_OUTPUT_MEDIA_TYPE: &str = "application/json";
+
 /// The request header carrying the caller's protocol version. Its
 /// query-parameter alternative (`?A2A-Version=`) is read by the handlers.
 pub(crate) const VERSION_HEADER: &str = "a2a-version";
@@ -61,6 +71,19 @@ pub(crate) enum A2aRoute {
     Card,
     JsonRpc,
     RestSend,
+}
+
+impl A2aRoute {
+    /// The stable token this route is traced under. A fixed word per route,
+    /// never the request path — a path carries the unit's mount and whatever
+    /// else the caller sent.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            A2aRoute::Card => "agent_card",
+            A2aRoute::JsonRpc => "jsonrpc",
+            A2aRoute::RestSend => "rest_send",
+        }
+    }
 }
 
 /// Classify a request path. Exact matches only.
@@ -104,6 +127,11 @@ pub(crate) struct A2aContext<'a> {
     /// Where to record what this unit's turns spend. `None` is the whole off
     /// switch: a unit that stages no `metering` block has nothing to call.
     pub metering: Option<super::metering::TurnMetering>,
+    /// The ONE span this request emits, which every layer below records
+    /// fields on. Unlike [`Self::metering`] it is never optional: a refusal
+    /// spends nothing and must still be traceable, which is the whole reason
+    /// it is a second mechanism and not a second meter.
+    pub trace: &'a super::telemetry::RequestTrace,
 }
 
 /// The request facts the handlers read, gathered before the body is consumed.
