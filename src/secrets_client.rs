@@ -77,6 +77,11 @@ impl SecretsManager for SecretsClient {
 /// `canonicalize_dev_store_secret_uri`.
 const MCP_CATEGORY: &str = "mcp";
 const A2A_CATEGORY: &str = "a2a";
+/// SoRLa route documents (`secrets://default/<tenant>/_/sorla/<sor>`), keyed
+/// by a hyphenated capability-URI pack segment that greentic-designer mints
+/// and greentic-runner-host's `sorla_route::resolve_route` reads verbatim —
+/// see `canonicalize_dev_store_secret_uri`.
+const SORLA_CATEGORY: &str = "sorla";
 
 fn canonicalize_dev_store_secret_uri(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("secrets://")?;
@@ -84,16 +89,24 @@ fn canonicalize_dev_store_secret_uri(path: &str) -> Option<String> {
     if segments.len() != 5 {
         return None;
     }
-    // The `mcp` and `a2a` categories are exempt. greentic-designer-admin keys
-    // an MCP server's credential, and an external A2A agent's credential
+    // The `mcp`, `a2a` and `sorla` categories are exempt. greentic-designer-admin
+    // keys an MCP server's credential, and an external A2A agent's credential
     // (`secrets://default/<tenant>/<team>/a2a/<agent_id>`), by a hyphenated
-    // UUID and writes it VERBATIM; greentic-runner reads both verbatim
-    // (`greentic_aw_runtime::mcp_secrets`, and the a2a equivalent).
-    // Canonicalizing here (lowercase, and `-` to `_`) rewrote the lookup to
-    // `…/mcp/ff308b9c_951a_…` (or the a2a equivalent) and resolved nothing —
-    // silently, because an unresolved credential surfaces only as an ordinary
-    // node/dispatch error. Every other category keeps normalizing.
-    if matches!(segments[3], MCP_CATEGORY | A2A_CATEGORY) {
+    // UUID and writes it VERBATIM; greentic-designer keys a SoRLa route
+    // document (`secrets://default/<tenant>/_/sorla/<sor>`) by a hyphenated
+    // capability-URI pack segment, including the `<sor>.unit-<slug>-<hex>`
+    // per-unit form, and writes it VERBATIM too. greentic-runner reads all
+    // three verbatim (`greentic_aw_runtime::mcp_secrets`, the a2a equivalent,
+    // and `sorla_route::resolve_route`). Canonicalizing here (lowercase, and
+    // `-` to `_`) rewrote the lookup to `…/mcp/ff308b9c_951a_…` (or the a2a
+    // or sorla equivalent) and resolved nothing — silently, because an
+    // unresolved credential surfaces only as an ordinary node/dispatch error.
+    // Every other category keeps normalizing.
+    //
+    // greentic-deployer's `is_verbatim_category_rel_path`
+    // (`src/cli/secrets.rs`) is the writer that must list the same three
+    // categories, or a write and this read land on different keys.
+    if matches!(segments[3], MCP_CATEGORY | A2A_CATEGORY | SORLA_CATEGORY) {
         return None;
     }
 
@@ -161,6 +174,33 @@ mod mcp_uri_tests {
             canonicalize_dev_store_secret_uri(uri).as_deref(),
             Some("secrets://default/a2a/_/mypack/my_secret"),
             "a2a is only exempt as the category segment"
+        );
+    }
+
+    /// The `sorla` category is keyed by a hyphenated capability-URI pack
+    /// segment that greentic-designer writes VERBATIM
+    /// (`secrets://default/<tenant>/_/sorla/<sor>`). Canonicalizing it here
+    /// would rewrite the lookup to the underscored form and resolve nothing —
+    /// silently, since a missing route document surfaces only as an ordinary
+    /// SoRLa dispatch error.
+    #[test]
+    fn a_sorla_route_document_uri_is_left_verbatim() {
+        assert_eq!(
+            canonicalize_dev_store_secret_uri(
+                "secrets://default/default/_/sorla/landlord-tenant-sor"
+            ),
+            None,
+            "None means: look the URI up unchanged"
+        );
+    }
+
+    /// `sorla` only exempts the CATEGORY segment (index 3). A secret merely
+    /// NAMED `sorla` in a different category must still be canonicalized.
+    #[test]
+    fn a_key_merely_named_sorla_is_still_canonicalised() {
+        assert!(
+            canonicalize_dev_store_secret_uri("secrets://default/default/_/somepack/sorla-Key")
+                .is_some()
         );
     }
 }
@@ -279,6 +319,56 @@ mod tests {
             value,
             b"a2a-bearer-token".to_vec(),
             "a hyphenated a2a agent id must resolve without canonicalization"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn round_trips_a_sorla_route_document_under_its_hyphenated_sor_id() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let store_path = dir.path().join("secrets.env");
+        let store = DevStore::with_path(store_path.clone())?;
+        let shared_uri = "secrets://default/default/_/sorla/landlord-tenant-sor";
+        let unit_uri =
+            "secrets://default/default/_/sorla/landlord-tenant-sor.unit-abc-0123456789ab";
+        let seed = SeedDoc {
+            entries: vec![
+                SeedEntry {
+                    uri: shared_uri.to_string(),
+                    format: SecretFormat::Text,
+                    value: SeedValue::Text {
+                        text: r#"{"url":"https://sor.example","tenant":"landlord"}"#.to_string(),
+                    },
+                    description: None,
+                },
+                SeedEntry {
+                    uri: unit_uri.to_string(),
+                    format: SecretFormat::Text,
+                    value: SeedValue::Text {
+                        text: r#"{"url":"https://sor.example/unit-abc","tenant":"landlord"}"#
+                            .to_string(),
+                    },
+                    description: None,
+                },
+            ],
+        };
+        let runtime = Runtime::new()?;
+        let report =
+            runtime.block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
+        assert_eq!(report.ok, 2);
+
+        let client = SecretsClient::open_with_path(store_path)?;
+        let shared_value = runtime.block_on(async { client.read(shared_uri).await })?;
+        assert_eq!(
+            shared_value,
+            br#"{"url":"https://sor.example","tenant":"landlord"}"#.to_vec(),
+            "a hyphenated SoR id must resolve without canonicalization"
+        );
+        let unit_value = runtime.block_on(async { client.read(unit_uri).await })?;
+        assert_eq!(
+            unit_value,
+            br#"{"url":"https://sor.example/unit-abc","tenant":"landlord"}"#.to_vec(),
+            "the per-unit `<sor>.unit-<slug>-<hex>` form must resolve without canonicalization too"
         );
         Ok(())
     }
