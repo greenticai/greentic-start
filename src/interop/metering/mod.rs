@@ -41,6 +41,7 @@
 //!   the host).
 
 pub(crate) mod event;
+pub(crate) mod run_outcome;
 pub(crate) mod runtime_meter;
 mod sink;
 #[cfg(test)]

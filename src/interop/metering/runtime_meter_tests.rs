@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use greentic_aw_runtime::billing::WorkerUsageError;
-use greentic_deploy_spec::ids::DeploymentId;
+use greentic_deploy_spec::ids::{DeploymentId, RevisionId};
 use serde_json::json;
 
 use super::super::event::{Surface, TurnUsage};
@@ -48,15 +48,35 @@ fn installs_a_meter(options: &RevisionHostOptions) -> bool {
     rendered.contains("billing_meter: true")
 }
 
+/// Whether the options would hand the runtime a run-outcome sink. Same trick
+/// as [`installs_a_meter`]: the field is private upstream and its `Debug`
+/// renders `run_outcome_sink: <bool>` (unconditionally — the sink is not
+/// feature-gated).
+fn installs_a_sink(options: &RevisionHostOptions) -> bool {
+    let rendered = format!("{options:?}");
+    assert!(
+        rendered.contains("run_outcome_sink"),
+        "RevisionHostOptions' Debug does not report the run-outcome sink — the Debug \
+         changed upstream: {rendered}"
+    );
+    rendered.contains("run_outcome_sink: true")
+}
+
 #[test]
 fn a_staged_block_installs_the_worker_usage_meter() {
     let meter = worker_usage_meter(Some(&metering()), DeploymentId::new(), BUNDLE)
         .expect("a validated block builds a meter");
     assert!(meter.is_some());
 
-    let unit = host_options_for_unit(Some(&metering()), DeploymentId::new(), BUNDLE);
+    let unit = host_options_for_unit(
+        Some(&metering()),
+        DeploymentId::new(),
+        BUNDLE,
+        RevisionId::new(),
+    );
     assert!(unit.meters_usage);
     assert!(installs_a_meter(&unit.options));
+    assert!(installs_a_sink(&unit.options));
 }
 
 /// The meter is built from the block's OWN endpoint, tenant slug and the
@@ -83,9 +103,24 @@ fn an_absent_block_keeps_the_default_options() {
             .expect("absence is not an error")
             .is_none()
     );
-    let unit = host_options_for_unit(None, DeploymentId::new(), BUNDLE);
+    let unit = host_options_for_unit(None, DeploymentId::new(), BUNDLE, RevisionId::new());
     assert!(!unit.meters_usage);
     assert!(!installs_a_meter(&unit.options));
+    assert!(!installs_a_sink(&unit.options));
+}
+
+/// The two halves are decided independently: a block whose endpoint is not
+/// the worker-usage door still meters usage (the meter posts to it as staged)
+/// but installs no run-outcome sink, because the sibling door cannot be
+/// derived.
+#[test]
+fn an_underivable_run_outcome_door_keeps_the_meter_and_drops_only_the_sink() {
+    let mut block = metering();
+    block.endpoint = "https://admin.example/api/v1/ingest/other".into();
+    let unit = host_options_for_unit(Some(&block), DeploymentId::new(), BUNDLE, RevisionId::new());
+    assert!(unit.meters_usage);
+    assert!(installs_a_meter(&unit.options));
+    assert!(!installs_a_sink(&unit.options));
 }
 
 /// A constructor refusal is a value here and a warn in `host_options_for_unit`,
@@ -100,9 +135,18 @@ fn a_meter_that_cannot_be_built_leaves_the_revision_unmetered() {
         "{refusal:?}"
     );
 
-    let unit = host_options_for_unit(Some(&metering()), DeploymentId::new(), &too_long);
+    let unit = host_options_for_unit(
+        Some(&metering()),
+        DeploymentId::new(),
+        &too_long,
+        RevisionId::new(),
+    );
     assert!(!unit.meters_usage);
     assert!(!installs_a_meter(&unit.options));
+    assert!(
+        !installs_a_sink(&unit.options),
+        "the run-outcome door refuses the same over-long id"
+    );
 }
 
 #[test]
@@ -339,13 +383,25 @@ async fn boot_records_exactly_the_units_it_installed_a_meter_for() {
     let plain = DeploymentId::new();
     let mut decisions = UnitMeterDecisions::default();
     let options = decisions
-        .options_for_revision(&store, "local", TENANT, metered, BUNDLE)
+        .options_for_revision(&store, "local", TENANT, metered, BUNDLE, RevisionId::new())
         .await;
     assert!(installs_a_meter(&options));
+    assert!(
+        installs_a_sink(&options),
+        "a metered unit also reports run outcomes"
+    );
     let options = decisions
-        .options_for_revision(&store, "local", TENANT, plain, "plain-bot")
+        .options_for_revision(
+            &store,
+            "local",
+            TENANT,
+            plain,
+            "plain-bot",
+            RevisionId::new(),
+        )
         .await;
     assert!(!installs_a_meter(&options));
+    assert!(!installs_a_sink(&options), "no block, no run-outcome sink");
 
     let set = decisions.into_metered();
     assert!(set.contains(metered, BUNDLE));
