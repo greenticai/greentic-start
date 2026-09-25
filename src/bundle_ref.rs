@@ -1149,8 +1149,16 @@ mod tests {
 
     #[test]
     fn insecure_registries_honored_only_for_digest_gated_boot_fetch() {
-        // Single owner of this env var across the test module, so mutating it
-        // here is not racy with other tests.
+        // NOT the single owner of this env var, which is what the comment
+        // here used to claim: `insecure_registries_and_generic_credentials_
+        // resolve_independently` sets and removes it too, and cargo runs the
+        // two on different threads of ONE process. Whichever called
+        // `remove_var` first cleared the other's value, and the assertion
+        // below then read an unset variable and failed — as it did on CI on
+        // 2026-09-25, on a pull request that changed only a doc comment in
+        // another module. The comment asserting the safety property was the
+        // reason nobody looked: it said the race could not happen.
+        let _guard = crate::test_env_lock().lock().unwrap();
         unsafe {
             std::env::set_var("GREENTIC_OCI_INSECURE_REGISTRIES", "localhost:5000");
         }
