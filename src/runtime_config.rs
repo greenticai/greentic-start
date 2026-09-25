@@ -81,42 +81,23 @@ pub(crate) fn env_store_root(explicit: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
-fn env_dir(env_id: &str) -> anyhow::Result<PathBuf> {
-    let root = LocalFsStore::default_root()
-        .context("cannot determine the default environment store root (no home directory)")?;
-    env_dir_in(&root, env_id)
-}
-
-/// Loads and validates the materialized runtime-config for `env_id`.
+/// Loads and validates the materialized runtime-config for `env_id` under
+/// `env_root`.
 ///
-/// Returns `Ok(None)` when no runtime-config exists for the env (the common case
-/// today: nothing materializes the file until the operator handlers land). Returns
-/// `Err` when the file exists but is malformed, names the wrong schema or env, or
-/// references pack files that escape the env directory or are missing. An empty
-/// `revisions` block is accepted (N1.2): a freshly-initialized env that has not
-/// had any bundles attached is a valid input — the boot path activates the empty
+/// Returns `Ok(None)` when no runtime-config exists for the env. Returns `Err`
+/// when the file exists but is malformed, names the wrong schema or env, or
+/// references pack files that escape the env directory. An empty `revisions`
+/// block is accepted (N1.2): a freshly-initialized env that has not had any
+/// bundles attached is a valid input — the boot path activates the empty
 /// runtime and the listener still comes up.
-pub(crate) fn load(env_id: &str) -> anyhow::Result<Option<LoadedRuntimeConfig>> {
-    let dir = env_dir(env_id)?;
-    load_in_dir(&dir, env_id)
-}
-
-/// Same as [`load`], but synthesizes an empty [`LoadedRuntimeConfig`] when the
-/// file does not exist. Used by the N1.2 bundle-less boot path so a missing
-/// `runtime-config.json` and an empty-revisions one funnel through the same
-/// activation surface — both produce a listener that serves probes only until
-/// the first bundle is attached (hot-attach in N2).
-pub(crate) fn load_or_empty(env_id: &str) -> anyhow::Result<LoadedRuntimeConfig> {
-    Ok(load(env_id)?.unwrap_or_else(|| LoadedRuntimeConfig {
-        env_id: env_id.to_string(),
-        revisions: Vec::new(),
-    }))
-}
-
-/// Same as [`load`], but resolves the env directory under `env_root` instead
-/// of [`LocalFsStore::default_root`]. Used by [`crate::revision_health_gate`]
-/// (B9b) so the gate can target an arbitrary store root — required for in-
-/// process tests that don't want to write to the operator's real home dir.
+///
+/// There is deliberately no root-implicit variant any more: the boot path's
+/// post-pull re-load used one and so read the DEFAULT store's config while
+/// serving an overridden `--store-root`. Every caller names the root.
+///
+/// Used by [`crate::revision_health_gate`] (B9b) so the gate can target an
+/// arbitrary store root — required for in-process tests that don't want to
+/// write to the operator's real home dir.
 pub(crate) fn load_in(
     env_root: &Path,
     env_id: &str,
@@ -125,15 +106,15 @@ pub(crate) fn load_in(
     load_in_dir(&dir, env_id)
 }
 
-/// Same as [`load_or_empty`], but resolves the env directory under `env_root`
-/// instead of [`LocalFsStore::default_root`].
+/// Same as [`load_in`], but synthesizes an empty [`LoadedRuntimeConfig`] when
+/// the file does not exist, so a missing `runtime-config.json` and an
+/// empty-revisions one funnel through the same activation surface (N1.2).
 ///
-/// The bundle-less boot MUST use this whenever `--store-root` is supplied: its
-/// sibling `env_dir_in` already takes the root explicitly, so reading the
-/// config through the root-implicit `load_or_empty` would load
-/// `runtime-config.json` from the DEFAULT store while serving revisions out of
-/// the overridden one — a mismatch that produces a zero-revision boot rather
-/// than an error.
+/// The bundle-less boot reads through this with the SAME root it serves from
+/// (`--store-root`, else the default root) — both before and after the
+/// revision pull. Reading from any other root would load `runtime-config.json`
+/// from one store while serving revisions out of another, a mismatch that
+/// produces a zero-revision boot rather than an error.
 pub(crate) fn load_or_empty_in(
     env_root: &Path,
     env_id: &str,
@@ -622,9 +603,10 @@ mod tests {
 
     #[test]
     fn env_dir_rejects_traversal_segments() {
-        assert!(env_dir("..").is_err());
-        assert!(env_dir(".").is_err());
-        assert!(env_dir("a/b").is_err());
+        let root = Path::new("/greentic-store");
+        assert!(env_dir_in(root, "..").is_err());
+        assert!(env_dir_in(root, ".").is_err());
+        assert!(env_dir_in(root, "a/b").is_err());
     }
 
     // ---- symlink containment ---------------------------------------------

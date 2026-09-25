@@ -511,9 +511,9 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         let store_root = runtime_config::env_store_root(request.store_root.as_deref())
             .context("cannot determine the default environment store root (no home directory)")?;
         // Read the config from the SAME root we serve from. `env_dir_in` already
-        // takes the root explicitly; pairing it with the root-implicit
-        // `load_or_empty` would silently load the default store's config while
-        // serving the overridden store's revisions.
+        // takes the root explicitly; reading the config from any other root
+        // would silently load the default store's config while serving the
+        // overridden store's revisions.
         let rc = runtime_config::load_or_empty_in(&store_root, &env_id)?;
         let env_dir = runtime_config::env_dir_in(&store_root, &env_id)?;
 
@@ -787,21 +787,34 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // activation serves real revisions instead of probes only. A worker
         // whose packs already sit on a persisted volume has a non-empty
         // runtime-config and skips the pull.
+        //
+        // On a per-revision workload (`GREENTIC_REVISION_ID` set — Cloud Run
+        // units, K8s workers) a sibling unit's broken bundle is skipped rather
+        // than taking this process down with it; see
+        // `revision_pull::pull_and_materialize_bundle_revisions`.
         let rc = if rc.revisions.is_empty() {
+            let own_revision = revision_pull::own_revision_from_env();
             let pulled = revision_pull::pull_and_materialize_bundle_revisions(
                 &env_store,
                 &env_typed,
                 &env_dir,
                 &environment,
+                own_revision.as_deref(),
             )?;
-            if pulled > 0 {
+            if pulled.wrote_runtime_config() {
                 operator_log::info(
                     module_path!(),
                     format!(
-                        "materialized {pulled} revision(s) from bundle sources for env `{env_id}`"
+                        "materialized {} revision(s) from bundle sources for env `{env_id}` \
+                         ({} foreign revision(s) skipped)",
+                        pulled.materialized,
+                        pulled.skipped.len()
                     ),
                 );
-                runtime_config::load_or_empty(&env_id)?
+                // Same root the pull wrote to. This used to be the
+                // root-implicit `load_or_empty`, which read the DEFAULT store
+                // under `--store-root` and so booted zero revisions there.
+                runtime_config::load_or_empty_in(&store_root, &env_id)?
             } else {
                 rc
             }
