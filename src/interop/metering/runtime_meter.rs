@@ -61,10 +61,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use greentic_aw_runtime::billing::{WorkerUsageError, WorkerUsageMeter, WorkerUsageTarget};
-use greentic_deploy_spec::ids::DeploymentId;
+use greentic_deploy_spec::ids::{DeploymentId, RevisionId};
 use greentic_runner_host::runtime::RevisionHostOptions;
 
 use super::MeteringConfig;
+use super::run_outcome::run_outcome_sink;
 use crate::operator_log;
 
 /// Build the runner meter for one unit, or `None` when the unit stages no
@@ -102,25 +103,27 @@ pub(crate) struct UnitHostOptions {
     pub meters_usage: bool,
 }
 
-/// [`worker_usage_meter`], folded into [`RevisionHostOptions`], with a
-/// refusal turned into one operator line and NO meter.
+/// [`worker_usage_meter`] and [`super::run_outcome::run_outcome_sink`], folded
+/// into [`RevisionHostOptions`], with each refusal turned into one operator
+/// line and that half left out.
 ///
-/// An absent block yields `RevisionHostOptions::default()`, which is
-/// byte-for-byte what `TenantRuntime::load_revision` did.
+/// The two are decided independently: a unit whose run-outcome door cannot be
+/// derived still records its usage, and the reverse. An absent block yields
+/// `RevisionHostOptions::default()`, which is byte-for-byte what
+/// `TenantRuntime::load_revision` did.
 pub(crate) fn host_options_for_unit(
     metering: Option<&MeteringConfig>,
     deployment_id: DeploymentId,
     bundle_id: &str,
+    revision_id: RevisionId,
 ) -> UnitHostOptions {
-    match worker_usage_meter(metering, deployment_id, bundle_id) {
-        Ok(Some(meter)) => UnitHostOptions {
-            options: RevisionHostOptions::default().with_billing_meter(Arc::new(meter)),
-            meters_usage: true,
-        },
-        Ok(None) => UnitHostOptions {
-            options: RevisionHostOptions::default(),
-            meters_usage: false,
-        },
+    let mut options = RevisionHostOptions::default();
+    let meters_usage = match worker_usage_meter(metering, deployment_id, bundle_id) {
+        Ok(Some(meter)) => {
+            options = options.with_billing_meter(Arc::new(meter));
+            true
+        }
+        Ok(None) => false,
         Err(err) => {
             // `WorkerUsageError`'s messages name a field or the endpoint,
             // never the token.
@@ -131,11 +134,27 @@ pub(crate) fn host_options_for_unit(
                      runs without recording its LLM usage"
                 ),
             );
-            UnitHostOptions {
-                options: RevisionHostOptions::default(),
-                meters_usage: false,
-            }
+            false
         }
+    };
+    match run_outcome_sink(metering, deployment_id, bundle_id, revision_id) {
+        Ok(Some(sink)) => options = options.with_run_outcome_sink(Arc::new(sink)),
+        Ok(None) => {}
+        Err(err) => {
+            // `RunOutcomeRefusal`'s messages name a field or the endpoint,
+            // never the token.
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "run outcome reporting for unit `{bundle_id}` revision `{revision_id}` is \
+                     off: {err}; the revision runs without recording its run outcomes"
+                ),
+            );
+        }
+    }
+    UnitHostOptions {
+        options,
+        meters_usage,
     }
 }
 
@@ -173,8 +192,9 @@ pub(crate) struct UnitMeterDecisions {
 }
 
 impl UnitMeterDecisions {
-    /// The host options one revision of this unit loads with, recording the
-    /// unit as metered when they install the runner meter.
+    /// The host options one revision of this unit loads with — the runner
+    /// meter and the run-outcome sink, both from the unit's staged block —
+    /// recording the unit as metered when they install the runner meter.
     ///
     /// This is the ONE boot call: reading the block, building the meter and
     /// recording the decision happen together, so an activation cannot
@@ -186,9 +206,10 @@ impl UnitMeterDecisions {
         tenant: &str,
         deployment_id: DeploymentId,
         bundle_id: &str,
+        revision_id: RevisionId,
     ) -> RevisionHostOptions {
         let metering = self.metering_for(secrets, env, tenant, bundle_id).await;
-        let unit = host_options_for_unit(metering.as_ref(), deployment_id, bundle_id);
+        let unit = host_options_for_unit(metering.as_ref(), deployment_id, bundle_id, revision_id);
         if unit.meters_usage {
             self.metered.insert((deployment_id, bundle_id.to_string()));
         }

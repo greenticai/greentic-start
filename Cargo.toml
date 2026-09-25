@@ -466,7 +466,11 @@ wat = "1"
 # registry and the patches for them are gone.
 #
 # What is left is ONE patch, for the three greentic-runner crates, because the
-# revision this binary needs is not published yet: b1f82a18 is the develop merge
+# revision this binary needs is not published yet: 5a1b3684 is the develop merge
+# of greentic-runner#801 (`run_outcome::HttpRunOutcomeSink` +
+# `RevisionHostOptions::with_run_outcome_sink` — one run outcome per flow turn,
+# the deployed run audit; `interop::metering::run_outcome` installs it). It is
+# the direct child of b1f82a18, the develop merge
 # of greentic-runner#800 (`component == "a2a"` — the flow node that lets a plain
 # FLOW, not only an agentic worker, call an external agent). Without it `a2a` is
 # absent from `NATIVE_OP_KEYS`, so a deployed flow carrying that node has it
@@ -503,9 +507,9 @@ wat = "1"
 # A patch section does not travel into a published crate, so this does not
 # change what a crates.io consumer resolves.
 #
-# TO UNWIND: once a dev-lane publish carries #798 (and so #792), delete this block and run
+# TO UNWIND: once a dev-lane publish carries #801 (and so #800, #798, #792), delete this block and run
 # `cargo update`.
 [patch.crates-io]
-greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "b1f82a1868710b0740bf5b64385e4932b17f1451" }
-greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "b1f82a1868710b0740bf5b64385e4932b17f1451" }
-greentic-aw-runtime = { git = "https://github.com/greenticai/greentic-runner", rev = "b1f82a1868710b0740bf5b64385e4932b17f1451" }
+greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "5a1b368470ae54ec4cd0bcfc7c4a8e02a470524c" }
+greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "5a1b368470ae54ec4cd0bcfc7c4a8e02a470524c" }
+greentic-aw-runtime = { git = "https://github.com/greenticai/greentic-runner", rev = "5a1b368470ae54ec4cd0bcfc7c4a8e02a470524c" }

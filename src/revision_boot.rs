@@ -549,8 +549,9 @@ pub(crate) async fn activate_runtime_config(
         let state_host = state_host_from(Arc::clone(&state_store));
 
         // The unit's staged `metering` block, when present, also installs the
-        // runner's per-unit worker-usage meter for this revision; absent (or
-        // unbuildable) means default options, i.e. today's `load_revision`.
+        // runner's per-unit worker-usage meter and run-outcome sink (the
+        // deployed run audit) for this revision; absent (or unbuildable) means
+        // default options, i.e. today's `load_revision`.
         //
         // Keyed on the DEPLOYMENT's bundle id (`meta.bundle_id`, from the same
         // `Environment` entry the route table's `dep.bundle_id` comes from), so
@@ -563,6 +564,7 @@ pub(crate) async fn activate_runtime_config(
                 &meta.tenant,
                 deployment_id,
                 &meta.bundle_id,
+                revision_id,
             )
             .await;
 
