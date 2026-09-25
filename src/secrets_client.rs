@@ -79,8 +79,8 @@ const MCP_CATEGORY: &str = "mcp";
 const A2A_CATEGORY: &str = "a2a";
 /// SoRLa route documents (`secrets://default/<tenant>/_/sorla/<sor>`), keyed
 /// by a hyphenated capability-URI pack segment that greentic-designer mints
-/// and this crate's `sorla_route::resolve_route` reads verbatim — see
-/// `canonicalize_dev_store_secret_uri`.
+/// and greentic-runner-host's `sorla_route::resolve_route` reads verbatim —
+/// see `canonicalize_dev_store_secret_uri`.
 const SORLA_CATEGORY: &str = "sorla";
 
 fn canonicalize_dev_store_secret_uri(path: &str) -> Option<String> {
@@ -319,6 +319,56 @@ mod tests {
             value,
             b"a2a-bearer-token".to_vec(),
             "a hyphenated a2a agent id must resolve without canonicalization"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn round_trips_a_sorla_route_document_under_its_hyphenated_sor_id() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let store_path = dir.path().join("secrets.env");
+        let store = DevStore::with_path(store_path.clone())?;
+        let shared_uri = "secrets://default/default/_/sorla/landlord-tenant-sor";
+        let unit_uri =
+            "secrets://default/default/_/sorla/landlord-tenant-sor.unit-abc-0123456789ab";
+        let seed = SeedDoc {
+            entries: vec![
+                SeedEntry {
+                    uri: shared_uri.to_string(),
+                    format: SecretFormat::Text,
+                    value: SeedValue::Text {
+                        text: r#"{"url":"https://sor.example","tenant":"landlord"}"#.to_string(),
+                    },
+                    description: None,
+                },
+                SeedEntry {
+                    uri: unit_uri.to_string(),
+                    format: SecretFormat::Text,
+                    value: SeedValue::Text {
+                        text: r#"{"url":"https://sor.example/unit-abc","tenant":"landlord"}"#
+                            .to_string(),
+                    },
+                    description: None,
+                },
+            ],
+        };
+        let runtime = Runtime::new()?;
+        let report =
+            runtime.block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
+        assert_eq!(report.ok, 2);
+
+        let client = SecretsClient::open_with_path(store_path)?;
+        let shared_value = runtime.block_on(async { client.read(shared_uri).await })?;
+        assert_eq!(
+            shared_value,
+            br#"{"url":"https://sor.example","tenant":"landlord"}"#.to_vec(),
+            "a hyphenated SoR id must resolve without canonicalization"
+        );
+        let unit_value = runtime.block_on(async { client.read(unit_uri).await })?;
+        assert_eq!(
+            unit_value,
+            br#"{"url":"https://sor.example/unit-abc","tenant":"landlord"}"#.to_vec(),
+            "the per-unit `<sor>.unit-<slug>-<hex>` form must resolve without canonicalization too"
         );
         Ok(())
     }
