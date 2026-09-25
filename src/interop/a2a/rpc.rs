@@ -331,6 +331,25 @@ async fn send_message(
 /// what keeps contract D10 true here: an Adaptive Card rides `status.message`
 /// only, and only for a caller that declared it accepts one, so no artifact
 /// can carry one into a caller that did not ask.
+///
+/// # What our own client does with the rest
+///
+/// The paragraph above describes `task_reply` as reading text parts ONLY, and
+/// that stopped being the whole story in greentic-runner#802: it now appends
+/// each `application/json` `data` part as compact JSON after the prose, so the
+/// object a flow produced reaches the calling model instead of being dropped.
+/// Three consequences for anything changed here:
+///
+/// - the prose artifact is still REQUIRED, for the reason above — a task with
+///   neither prose nor a structured part is still reported as a failure;
+/// - the media type is matched EXACTLY on that side, so stamping a structured
+///   part with a vendor `+json` type would silently stop it reaching a caller;
+/// - the client's pin on this shape is `a_structured_answer_reaches_the_model_beside_the_prose`,
+///   in `greentic-aw-runtime`'s `a2a_source::tests::dispatch`, which
+///   hand-writes the wire JSON this function emits. It is in another
+///   repository and cannot fail this build, which is why the assertions HERE
+///   are made on the serialized value (`mediaType`, `artifactId`) rather than
+///   on the structs.
 fn artifacts_for(
     projected: &ProjectedReply,
     message_parts: &[Part],
