@@ -466,7 +466,26 @@ wat = "1"
 # registry and the patches for them are gone.
 #
 # What is left is ONE patch, for the three greentic-runner crates, because the
-# revision this binary needs is not published yet: 5a1b3684 is the develop merge
+# revision this binary needs is not published yet: b07fa100 is the develop merge
+# of greentic-runner#802, which makes our own A2A CLIENT read a completed task's
+# STRUCTURED artifacts and not only its prose. #639 made this binary ANSWER a
+# turn that produced `result.structured_content` with a Task whose artifacts
+# carry it (worker-interop contract D13); #802 is the other half, on the calling
+# side. Without it `a2a_source::task_reply` reads
+# `task.artifacts[].parts[].text` only, so a deployed worker calling another
+# Greentic worker receives the sentence and never the object the callee
+# deliberately produced — the call succeeds, the model answers from the prose
+# alone, and the missing result is indistinguishable from the callee not having
+# produced one. Nothing is red at any layer. Tracked as #642.
+#
+# Two rules #802 states at its own call site, because each is silent if
+# changed: the media type is matched EXACTLY (`application/json`), never by a
+# `+json` suffix, so an Adaptive Card
+# (`application/vnd.microsoft.card.adaptive+json`) cannot reach a model that
+# never asked for one (contract D10); and a task carrying a structured part and
+# no prose is ANSWERED rather than reported as having said nothing.
+#
+# It is the direct child of 5a1b3684, the develop merge
 # of greentic-runner#801 (`run_outcome::HttpRunOutcomeSink` +
 # `RevisionHostOptions::with_run_outcome_sink` — one run outcome per flow turn,
 # the deployed run audit; `interop::metering::run_outcome` installs it). It is
@@ -507,9 +526,9 @@ wat = "1"
 # A patch section does not travel into a published crate, so this does not
 # change what a crates.io consumer resolves.
 #
-# TO UNWIND: once a dev-lane publish carries #801 (and so #800, #798, #792), delete this block and run
-# `cargo update`.
+# TO UNWIND: once a dev-lane publish carries #802 (and so #801, #800, #798,
+# #792), delete this block and run `cargo update`.
 [patch.crates-io]
-greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "5a1b368470ae54ec4cd0bcfc7c4a8e02a470524c" }
-greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "5a1b368470ae54ec4cd0bcfc7c4a8e02a470524c" }
-greentic-aw-runtime = { git = "https://github.com/greenticai/greentic-runner", rev = "5a1b368470ae54ec4cd0bcfc7c4a8e02a470524c" }
+greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "b07fa100a9ffd04ef13ed49f4ee88de03fa038e9" }
+greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "b07fa100a9ffd04ef13ed49f4ee88de03fa038e9" }
+greentic-aw-runtime = { git = "https://github.com/greenticai/greentic-runner", rev = "b07fa100a9ffd04ef13ed49f4ee88de03fa038e9" }
