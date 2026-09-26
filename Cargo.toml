@@ -160,12 +160,12 @@ features = ["derive"]
 # The agent runtime's billing surface: `billing::WorkerUsageMeter`, which
 # `crate::interop::metering::runtime_meter` builds per unit from the staged
 # `metering` block and hands to `TenantRuntime::load_revision_with`
-# (greentic-runner#798). runner-host does not re-export the crate. Same exact
-# requirement as runner-host's (see the runner-desktop block below for why it
-# is exact), so it is ONE crate with the copy runner-host pulls through its
-# `agentic-worker` feature. No features: `test-mock` stays dev-only (below).
+# (greentic-runner#798). runner-host does not re-export the crate. Same
+# requirement as runner-host's (see the runner-desktop block below), so it is
+# ONE crate with the copy runner-host pulls through its `agentic-worker`
+# feature. No features: `test-mock` stays dev-only (below).
 [dependencies.greentic-aw-runtime]
-version = "=1.2.0-dev.0"
+version = ">=1.2.0-dev.36211472866, <1.3.0-0"
 default-features = false
 
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
@@ -236,26 +236,22 @@ version = ">=1.2.0-dev.35757697239, <1.3.0-0"
 default-features = false
 features = ["pack-fetch"]
 
-# `=1.2.0-dev.0` is NOT a floor and not a version anyone published: it is the
-# workspace version of the greentic-runner revision the `[patch.crates-io]`
-# section at the foot of this file names, and an exact requirement is what makes
-# cargo take the patch. With a lane RANGE here the registry's higher
-# `1.2.0-dev.<run id>` publishes win and the patch is silently unused — the
-# failure mode the patch block's own comment describes. Move this the day that
-# revision is published, not before.
+# Floor `1.2.0-dev.36211472866` is the dev-lane publish built from
+# greentic-runner b07fa100 (the develop merge of #802; that dev-publish run's
+# head_sha IS b07fa100). This crate resolved that revision from git through a
+# `[patch.crates-io]` section until it was published; the three runner crates
+# (runner-desktop, runner-host, greentic-aw-runtime) share the one floor so they
+# resolve as one revision. See the note at the foot of this file.
 #
 # The surface that forced the revision on this crate: `RunOptions::entry_node`
 # (greentic-runner#698), which the demo messaging host uses to name a flow node
 # as the flow's entry node.
 [dependencies.greentic-runner-desktop]
-version = "=1.2.0-dev.0"
+version = ">=1.2.0-dev.36211472866, <1.3.0-0"
 
-# `=1.2.0-dev.0` is an exact PATCH pin, not a floor — see the runner-desktop
-# block above for why a lane range here would silently discard the patch.
-#
-# The surfaces that accumulated as floor bumps while this WAS a floor, all of
-# them long since on the revision below, kept because each names a real failure
-# an older resolve produces:
+# Same floor as runner-desktop (see above). The surfaces that accumulated as
+# floor bumps, all of them carried by that publish, kept because each names a
+# real failure an older resolve produces:
 #   * #466 — `HostNode::from` no longer splits a resolved component symbol on
 #     its last dot when the operation is carried structurally; earlier publishes
 #     mis-resolve any dotted component id (`ai.greentic.component-templates` →
@@ -274,7 +270,7 @@ version = "=1.2.0-dev.0"
 #   * #792 — `storage::{StorageConfig, SessionBackend, StateBackend}` and
 #     `HostBuilder::with_storage`, which `crate::durable_state` is built on.
 [dependencies.greentic-runner-host]
-version = "=1.2.0-dev.0"
+version = ">=1.2.0-dev.36211472866, <1.3.0-0"
 # `greentic-llm-backend` routes every in-process `dw.agent` LLM call through
 # greentic-llm's multi-provider backend. Without it runner-host compiles the
 # OpenAI-only client (`agent_node.rs`, "built WITHOUT the greentic-llm-backend
@@ -423,9 +419,9 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 # agent_provenance's contract test drives the REAL `AgentRuntime::step` rather
 # than a hand-written trail. Dev-only: `test-mock` never reaches a release
 # build (edition-2024 resolver keeps dev-dependency features out of it). Same
-# version runner-host pins, resolved from the same git revision via the patch
-# below, so it is ONE crate with runner-host's, not a second copy.
-greentic-aw-runtime = { version = "=1.2.0-dev.0", features = ["test-mock"] }
+# requirement runner-host has, so it is ONE crate with runner-host's, not a
+# second copy.
+greentic-aw-runtime = { version = ">=1.2.0-dev.36211472866, <1.3.0-0", features = ["test-mock"] }
 # For `ExtensionRuntime::for_test()`. It must be the same SOURCE and a
 # compatible requirement to whatever greentic-aw-runtime declares, or the graph
 # holds two copies and the `ExtensionRuntime` handed across the boundary does
@@ -465,8 +461,9 @@ wat = "1"
 # dev lane is current, so every one of those crates now resolves from the
 # registry and the patches for them are gone.
 #
-# What is left is ONE patch, for the three greentic-runner crates, because the
-# revision this binary needs is not published yet: b07fa100 is the develop merge
+# The last patch, for the three greentic-runner crates, is gone too: they are
+# floored at `1.2.0-dev.36211472866`, the dev-lane publish built from exactly
+# b07fa100 (checked against that dev-publish run's head_sha). b07fa100 is the develop merge
 # of greentic-runner#802, which makes our own A2A CLIENT read a completed task's
 # STRUCTURED artifacts and not only its prose. #639 made this binary ANSWER a
 # turn that produced `result.structured_content` with a Task whose artifacts
@@ -499,9 +496,10 @@ wat = "1"
 # per-unit worker-usage meter), and from f6ff5590, the develop merge
 # of greentic-runner#792, which makes runner-host's session and flow-state
 # stores configurable (`storage::StorageConfig` + `HostBuilder::with_storage`)
-# — the surface `durable_state::resolve_storage_config` depends on. Its
-# workspace version is `1.2.0-dev.0`, which satisfies the dev-lane requirements
-# above, so the patch applies rather than being silently ignored.
+# — the surface `durable_state::resolve_storage_config` depends on. A patch
+# section does not travel into a published crate, so while it existed
+# `dev-publish` could not package this crate at all (`greentic-aw-runtime =
+# "=1.2.0-dev.0"` matches nothing on crates.io).
 #
 # HAZARD, recorded rather than fixed: `<1.3.0-0` does NOT exclude the
 # `1.2.0-research.N` line. Pre-release identifiers compare as strings, `"dev"`
@@ -522,13 +520,3 @@ wat = "1"
 # revived, revisit every range in this file BEFORE the next resolve — do not
 # assume the committed lock protects you, since a lock is only consulted with
 # `--locked`.
-#
-# A patch section does not travel into a published crate, so this does not
-# change what a crates.io consumer resolves.
-#
-# TO UNWIND: once a dev-lane publish carries #802 (and so #801, #800, #798,
-# #792), delete this block and run `cargo update`.
-[patch.crates-io]
-greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", rev = "b07fa100a9ffd04ef13ed49f4ee88de03fa038e9" }
-greentic-runner-desktop = { git = "https://github.com/greenticai/greentic-runner", rev = "b07fa100a9ffd04ef13ed49f4ee88de03fa038e9" }
-greentic-aw-runtime = { git = "https://github.com/greenticai/greentic-runner", rev = "b07fa100a9ffd04ef13ed49f4ee88de03fa038e9" }
