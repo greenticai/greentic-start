@@ -15136,13 +15136,21 @@ mod binary_update_tests {
                 } else if path == blob_path {
                     &blob_body
                 } else {
-                    let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                    let resp =
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = writer.write_all(resp.as_bytes());
                     continue;
                 };
 
+                // `Connection: close` is load-bearing: this server answers ONE
+                // request per accepted socket and then drops it. Without the
+                // header the client keeps the socket in its keep-alive pool and
+                // may send the next GET (`/plan.sig`) down a connection this
+                // loop has already closed, failing with "error sending request"
+                // — a race that made `c6_poll_cycle_stages_plan_and_swaps_binary`
+                // flaky in CI.
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     response_body.len(),
                 );
                 let _ = writer.write_all(resp.as_bytes());
