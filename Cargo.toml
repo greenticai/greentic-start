@@ -402,7 +402,7 @@ version = "2.5.2"
 
 [dependencies.tokio]
 version = "1"
-features = ["rt-multi-thread", "signal", "sync", "net", "macros"]
+features = ["rt-multi-thread", "signal", "sync", "net", "macros", "time"]
 
 [dependencies.tokio-stream]
 version = "0.1"
