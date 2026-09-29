@@ -62,6 +62,18 @@ fn installs_a_sink(options: &RevisionHostOptions) -> bool {
     rendered.contains("run_outcome_sink: true")
 }
 
+/// Whether the options would hand the runtime an HTTP approval inbox. Same
+/// trick again: upstream's `Debug` renders `approval_inbox: <bool>`.
+fn installs_an_inbox(options: &RevisionHostOptions) -> bool {
+    let rendered = format!("{options:?}");
+    assert!(
+        rendered.contains("approval_inbox"),
+        "RevisionHostOptions' Debug does not report the approval inbox — the Debug \
+         changed upstream: {rendered}"
+    );
+    rendered.contains("approval_inbox: true")
+}
+
 #[test]
 fn a_staged_block_installs_the_worker_usage_meter() {
     let meter = worker_usage_meter(Some(&metering()), DeploymentId::new(), BUNDLE)
@@ -77,6 +89,7 @@ fn a_staged_block_installs_the_worker_usage_meter() {
     assert!(unit.meters_usage);
     assert!(installs_a_meter(&unit.options));
     assert!(installs_a_sink(&unit.options));
+    assert!(installs_an_inbox(&unit.options));
 }
 
 /// The meter is built from the block's OWN endpoint, tenant slug and the
@@ -107,6 +120,7 @@ fn an_absent_block_keeps_the_default_options() {
     assert!(!unit.meters_usage);
     assert!(!installs_a_meter(&unit.options));
     assert!(!installs_a_sink(&unit.options));
+    assert!(!installs_an_inbox(&unit.options));
 }
 
 /// The two halves are decided independently: a block whose endpoint is not
@@ -121,6 +135,10 @@ fn an_underivable_run_outcome_door_keeps_the_meter_and_drops_only_the_sink() {
     assert!(unit.meters_usage);
     assert!(installs_a_meter(&unit.options));
     assert!(!installs_a_sink(&unit.options));
+    assert!(
+        !installs_an_inbox(&unit.options),
+        "the approval doors are derived the same way, so they are refused too"
+    );
 }
 
 /// A constructor refusal is a value here and a warn in `host_options_for_unit`,

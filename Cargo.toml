@@ -165,7 +165,7 @@ features = ["derive"]
 # ONE crate with the copy runner-host pulls through its `agentic-worker`
 # feature. No features: `test-mock` stays dev-only (below).
 [dependencies.greentic-aw-runtime]
-version = ">=1.2.0-dev.36211472866, <1.3.0-0"
+version = ">=1.2.0-dev.36574625149, <1.3.0-0"
 default-features = false
 
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
@@ -240,9 +240,14 @@ version = ">=1.2.0-dev.36501735929, <1.3.0-0"
 default-features = false
 features = ["pack-fetch"]
 
-# Floor `1.2.0-dev.36211472866` is the dev-lane publish built from
-# greentic-runner b07fa100 (the develop merge of #802; that dev-publish run's
-# head_sha IS b07fa100). This crate resolved that revision from git through a
+# Floor `1.2.0-dev.36574625149` is the dev-lane publish built from
+# greentic-runner 07d0d678 (the develop merge of #816; that dev-publish run's
+# head_sha IS 07d0d678). #816 is the HTTP approval rail: `ApprovalInboxTarget`,
+# `HttpApprovalDispatcher` and `RevisionHostOptions::with_approval_inbox`, which
+# `crate::interop::metering::approval_inbox` installs per unit. An older resolve
+# does not compile. (The earlier floor, 36211472866, was built from b07fa100,
+# the develop merge of #802.) Note the yanked `1.2.0-research` of these crates
+# would outrank every `-dev` build in this range were it not yanked. This crate resolved that revision from git through a
 # `[patch.crates-io]` section until it was published; the three runner crates
 # (runner-desktop, runner-host, greentic-aw-runtime) share the one floor so they
 # resolve as one revision. See the note at the foot of this file.
@@ -251,7 +256,7 @@ features = ["pack-fetch"]
 # (greentic-runner#698), which the demo messaging host uses to name a flow node
 # as the flow's entry node.
 [dependencies.greentic-runner-desktop]
-version = ">=1.2.0-dev.36211472866, <1.3.0-0"
+version = ">=1.2.0-dev.36574625149, <1.3.0-0"
 
 # Same floor as runner-desktop (see above). The surfaces that accumulated as
 # floor bumps, all of them carried by that publish, kept because each names a
@@ -274,7 +279,7 @@ version = ">=1.2.0-dev.36211472866, <1.3.0-0"
 #   * #792 — `storage::{StorageConfig, SessionBackend, StateBackend}` and
 #     `HostBuilder::with_storage`, which `crate::durable_state` is built on.
 [dependencies.greentic-runner-host]
-version = ">=1.2.0-dev.36211472866, <1.3.0-0"
+version = ">=1.2.0-dev.36574625149, <1.3.0-0"
 # `greentic-llm-backend` routes every in-process `dw.agent` LLM call through
 # greentic-llm's multi-provider backend. Without it runner-host compiles the
 # OpenAI-only client (`agent_node.rs`, "built WITHOUT the greentic-llm-backend
@@ -425,7 +430,7 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 # build (edition-2024 resolver keeps dev-dependency features out of it). Same
 # requirement runner-host has, so it is ONE crate with runner-host's, not a
 # second copy.
-greentic-aw-runtime = { version = ">=1.2.0-dev.36211472866, <1.3.0-0", features = ["test-mock"] }
+greentic-aw-runtime = { version = ">=1.2.0-dev.36574625149, <1.3.0-0", features = ["test-mock"] }
 # For `ExtensionRuntime::for_test()`. It must be the same SOURCE and a
 # compatible requirement to whatever greentic-aw-runtime declares, or the graph
 # holds two copies and the `ExtensionRuntime` handed across the boundary does
@@ -466,9 +471,10 @@ wat = "1"
 # registry and the patches for them are gone.
 #
 # The last patch, for the three greentic-runner crates, is gone too: they are
-# floored at `1.2.0-dev.36211472866`, the dev-lane publish built from exactly
-# b07fa100 (checked against that dev-publish run's head_sha). b07fa100 is the develop merge
-# of greentic-runner#802, which makes our own A2A CLIENT read a completed task's
+# floored at `1.2.0-dev.36574625149`, the dev-lane publish built from exactly
+# 07d0d678 (#816, the HTTP approval rail; checked against that dev-publish run's
+# head_sha). The floor before it, 36211472866, was built from b07fa100, the
+# develop merge of greentic-runner#802, which makes our own A2A CLIENT read a completed task's
 # STRUCTURED artifacts and not only its prose. #639 made this binary ANSWER a
 # turn that produced `result.structured_content` with a Task whose artifacts
 # carry it (worker-interop contract D13); #802 is the other half, on the calling

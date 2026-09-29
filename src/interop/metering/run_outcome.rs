@@ -35,7 +35,7 @@ use greentic_runner_host::run_outcome::{
 use super::MeteringConfig;
 
 /// The last path segment of the admin's worker-usage ingest door.
-const WORKER_USAGE_SEGMENT: &str = "worker-usage";
+pub(crate) const WORKER_USAGE_SEGMENT: &str = "worker-usage";
 /// The last path segment of its run-outcome sibling.
 const RUN_OUTCOME_SEGMENT: &str = "run-outcome";
 
@@ -56,27 +56,49 @@ pub(crate) enum RunOutcomeRefusal {
     Sink(#[from] RunOutcomeSinkError),
 }
 
-/// The run-outcome ingest URL beside a worker-usage one.
+/// Why a sibling door of the worker-usage ingest door could not be derived.
+/// Each caller maps it onto its own refusal, which names the door it wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SiblingDoorError {
+    /// The metering endpoint is not a URL.
+    Unparseable,
+    /// Its path does not END in `worker-usage`.
+    NotWorkerUsage,
+}
+
+/// The admin ingest URL whose last path segment is `segment`, beside a
+/// worker-usage one.
 ///
 /// Only the path's last segment changes; scheme, host, port, the rest of the
-/// path and any query are kept. A single trailing slash is tolerated.
-pub(crate) fn run_outcome_endpoint(worker_usage: &str) -> Result<String, RunOutcomeRefusal> {
-    let mut url = reqwest::Url::parse(worker_usage)
-        .map_err(|_| RunOutcomeRefusal::Unparseable(worker_usage.to_string()))?;
+/// path and any query are kept. A single trailing slash is tolerated. Shared
+/// by every door derived from the staged metering endpoint (run outcomes, the
+/// approval inbox), so they cannot disagree about what "beside" means.
+pub(crate) fn sibling_door(worker_usage: &str, segment: &str) -> Result<String, SiblingDoorError> {
+    let mut url = reqwest::Url::parse(worker_usage).map_err(|_| SiblingDoorError::Unparseable)?;
     let last = url
         .path_segments()
         .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
         .map(str::to_string);
     if last.as_deref() != Some(WORKER_USAGE_SEGMENT) {
-        return Err(RunOutcomeRefusal::NotWorkerUsage(worker_usage.to_string()));
+        return Err(SiblingDoorError::NotWorkerUsage);
     }
     {
         let mut segments = url
             .path_segments_mut()
-            .map_err(|()| RunOutcomeRefusal::NotWorkerUsage(worker_usage.to_string()))?;
-        segments.pop_if_empty().pop().push(RUN_OUTCOME_SEGMENT);
+            .map_err(|()| SiblingDoorError::NotWorkerUsage)?;
+        segments.pop_if_empty().pop().push(segment);
     }
     Ok(url.to_string())
+}
+
+/// The run-outcome ingest URL beside a worker-usage one (see [`sibling_door`]).
+pub(crate) fn run_outcome_endpoint(worker_usage: &str) -> Result<String, RunOutcomeRefusal> {
+    sibling_door(worker_usage, RUN_OUTCOME_SEGMENT).map_err(|err| match err {
+        SiblingDoorError::Unparseable => RunOutcomeRefusal::Unparseable(worker_usage.to_string()),
+        SiblingDoorError::NotWorkerUsage => {
+            RunOutcomeRefusal::NotWorkerUsage(worker_usage.to_string())
+        }
+    })
 }
 
 /// Where and as whom one revision's run outcomes are recorded, or `None` when
