@@ -2243,6 +2243,16 @@ fn extract_scope_from_route_match(
     Some((tenant?, team))
 }
 
+/// Provider ops whose output may carry a webchat `_greentic` block that must wake
+/// the WS pump. `send_typing` is here so a WS-connected browser sees the typing
+/// activity (docs/typing-signal.md).
+fn webchat_notify_op(op_name: &str) -> bool {
+    matches!(
+        op_name,
+        "directline_http" | "send_payload" | crate::typing::TYPING_OP
+    )
+}
+
 /// Wire the post-op callback on the runner host so successful webchat provider
 /// invocations are forwarded to the activity notifier. Filters by provider id
 /// and op name; events without `_greentic` metadata are dropped.
@@ -2253,11 +2263,11 @@ fn register_webchat_post_op_notifier(state: &Arc<HttpIngressState>) {
             if provider != "messaging-webchat" && provider != "messaging-webchat-gui" {
                 return;
             }
-            if op_name != "directline_http" && op_name != "send_payload" {
+            if !webchat_notify_op(op_name) {
                 operator_log::debug(
                     module_path!(),
                     format!(
-                        "[ws post-op-notifier] op={} provider={} skipped (not directline_http or send_payload)",
+                        "[ws post-op-notifier] op={} provider={} skipped (not a webchat activity op)",
                         op_name, provider,
                     ),
                 );
@@ -2446,6 +2456,17 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::runtime::Runtime;
+
+    #[test]
+    fn webchat_ws_notify_covers_send_typing() {
+        assert!(webchat_notify_op("directline_http"));
+        assert!(webchat_notify_op("send_payload"));
+        assert!(
+            webchat_notify_op("send_typing"),
+            "without it a WS-connected browser never sees the typing activity"
+        );
+        assert!(!webchat_notify_op("render_plan"));
+    }
 
     async fn test_state(domains: Vec<Domain>) -> Arc<HttpIngressState> {
         build_test_state(domains, None).await

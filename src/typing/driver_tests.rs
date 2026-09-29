@@ -202,7 +202,7 @@ fn blocking_waits_for_in_flight_send_before_returning() {
     let (fake, log) = blocking_fake(200);
     let turn_log = log.clone();
     let out = keep_typing_blocking(fake, input(), move || {
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(50));
         turn_log.lock().unwrap().push("turn-done");
         42
     });

@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use base64::Engine as _;
 use greentic_types::ChannelMessageEnvelope;
@@ -16,7 +17,7 @@ use crate::runner_host::{DemoRunnerHost, OperatorContext};
 
 pub(super) fn route_messaging_envelopes(
     bundle: &Path,
-    runner_host: &DemoRunnerHost,
+    runner_host: &Arc<DemoRunnerHost>,
     provider: &str,
     ctx: &OperatorContext,
     envelopes: Vec<ChannelMessageEnvelope>,
@@ -37,162 +38,181 @@ pub(super) fn route_messaging_envelopes(
         ),
     );
 
+    // Channel "is typing" signal (docs/typing-signal.md): decided once per batch from
+    // the provider's declared ops, never by invoking and catching the refusal.
+    let typing = crate::typing::LegacyTyping::prepare(runner_host, provider, ctx, || {
+        Ok(
+            build_injected_config(runner_host, Domain::Messaging, provider, ctx)?
+                .map(decode_injected_config_for_provider),
+        )
+    });
+
     for original in &envelopes {
-        let turn = resolve_turn(bundle, ctx, &pack_info, default_flow, original, || {
-            // Per-envelope Fast2Flow probe. A node target synthesizes the same
-            // metadata an Adaptive Card button click would produce —
-            // `routeToCardId` — so the existing card path renders the chosen
-            // card inside the default flow. A `pack/flow` target runs that
-            // flow from its entry. Continue / Respond / Deny still fall
-            // through; per-directive handling lands incrementally.
-            crate::fast2flow::try_for_request(
-                crate::fast2flow::Fast2FlowConfig::global(),
-                ctx,
-                &pack_info,
-                &app_pack_path,
-                original,
-                provider,
-            )
-            .and_then(|directive| apply_dispatch(directive, &pack_info, original, "fast2flow"))
-            // No usable deterministic dispatch. Try the embedded LLM fallback
-            // (greentic-start's own greentic-llm capability) before giving up.
-            .or_else(|| try_llm_fallback(ctx, &pack_info, &app_pack_path, original))
-        });
-        let flow = turn.flow;
-        let envelope = &turn.envelope;
-        let outputs = if let Some(route_to_card) = card_nav_target(envelope) {
-            // A target that names a FLOW NODE goes to the flow even when a card
-            // asset of the same name exists. Rendering the asset directly is
-            // faster but leaves the flow with no record of the card, so the
-            // node never runs, never parks awaiting the submit, and never
-            // attaches the user's `answers` — which every capture node
-            // downstream reads as `{{node.<card>.answers.<field>}}`.
-            let flow_node = flow.node_ids.iter().any(|n| n == route_to_card);
-            match read_card_from_pack(&app_pack_path, route_to_card).filter(|_| !flow_node) {
-                Some(mut card_json) => {
-                    operator_log::info(
-                        module_path!(),
-                        format!(
-                            "[demo messaging] card routing: {} -> card asset found",
-                            route_to_card
-                        ),
-                    );
-                    let from_id = envelope.from.as_ref().map(|f| f.id.as_str()).unwrap_or("?");
-                    crate::flow_log::log(
-                        "CARD",
-                        &format!(
-                            "pack={} routeToCardId={} tenant={} from={}",
-                            pack_info.pack_id, route_to_card, ctx.tenant, from_id
-                        ),
-                    );
-                    // Resolve {{i18n:KEY}} tokens from pack i18n bundle
-                    let locale = envelope
-                        .metadata
-                        .get("locale")
-                        .map(String::as_str)
-                        .unwrap_or("en");
-                    resolve_i18n_tokens(&mut card_json, &app_pack_path, locale);
-                    // Empty-string defaults for unmatched `${prefill_*}`
-                    // — keeps the literal text out of the rendered card.
-                    let mut effective_metadata = envelope.metadata.clone();
-                    ensure_prefill_defaults(&card_json, &mut effective_metadata);
-                    resolve_placeholders(&mut card_json, &effective_metadata);
-                    carry_form_data_to_actions(&mut card_json, &effective_metadata);
-                    let mut reply = envelope.clone();
-                    reply.metadata.insert(
-                        "adaptive_card".to_string(),
-                        serde_json::to_string(&card_json).unwrap_or_default(),
-                    );
-                    reply.text = None;
-                    vec![reply]
-                }
-                None => {
-                    // Enter the flow at the named node rather than restarting
-                    // at the entrypoint. A restart means the capture nodes
-                    // chained between two cards never run and the journey never
-                    // advances. This drives only the FIRST hop into the flow —
-                    // once a card has parked, the runner resumes it instead.
-                    let entry_node = route_to_card.clone();
-                    operator_log::info(
-                        module_path!(),
-                        format!(
-                            "[demo messaging] card routing: {entry_node} -> entering the app \
+        // Everything that makes up the turn — routing (Fast2Flow, LLM fallback), the
+        // flow run and ownership settling — runs with typing raised. Egress below
+        // starts only after typing has stopped.
+        let run_turn = || {
+            let turn = resolve_turn(bundle, ctx, &pack_info, default_flow, original, || {
+                // Per-envelope Fast2Flow probe. A node target synthesizes the same
+                // metadata an Adaptive Card button click would produce —
+                // `routeToCardId` — so the existing card path renders the chosen
+                // card inside the default flow. A `pack/flow` target runs that
+                // flow from its entry. Continue / Respond / Deny still fall
+                // through; per-directive handling lands incrementally.
+                crate::fast2flow::try_for_request(
+                    crate::fast2flow::Fast2FlowConfig::global(),
+                    ctx,
+                    &pack_info,
+                    &app_pack_path,
+                    original,
+                    provider,
+                )
+                .and_then(|directive| apply_dispatch(directive, &pack_info, original, "fast2flow"))
+                // No usable deterministic dispatch. Try the embedded LLM fallback
+                // (greentic-start's own greentic-llm capability) before giving up.
+                .or_else(|| try_llm_fallback(ctx, &pack_info, &app_pack_path, original))
+            });
+            let flow = turn.flow;
+            let envelope = &turn.envelope;
+            let outputs = if let Some(route_to_card) = card_nav_target(envelope) {
+                // A target that names a FLOW NODE goes to the flow even when a card
+                // asset of the same name exists. Rendering the asset directly is
+                // faster but leaves the flow with no record of the card, so the
+                // node never runs, never parks awaiting the submit, and never
+                // attaches the user's `answers` — which every capture node
+                // downstream reads as `{{node.<card>.answers.<field>}}`.
+                let flow_node = flow.node_ids.iter().any(|n| n == route_to_card);
+                match read_card_from_pack(&app_pack_path, route_to_card).filter(|_| !flow_node) {
+                    Some(mut card_json) => {
+                        operator_log::info(
+                            module_path!(),
+                            format!(
+                                "[demo messaging] card routing: {} -> card asset found",
+                                route_to_card
+                            ),
+                        );
+                        let from_id = envelope.from.as_ref().map(|f| f.id.as_str()).unwrap_or("?");
+                        crate::flow_log::log(
+                            "CARD",
+                            &format!(
+                                "pack={} routeToCardId={} tenant={} from={}",
+                                pack_info.pack_id, route_to_card, ctx.tenant, from_id
+                            ),
+                        );
+                        // Resolve {{i18n:KEY}} tokens from pack i18n bundle
+                        let locale = envelope
+                            .metadata
+                            .get("locale")
+                            .map(String::as_str)
+                            .unwrap_or("en");
+                        resolve_i18n_tokens(&mut card_json, &app_pack_path, locale);
+                        // Empty-string defaults for unmatched `${prefill_*}`
+                        // — keeps the literal text out of the rendered card.
+                        let mut effective_metadata = envelope.metadata.clone();
+                        ensure_prefill_defaults(&card_json, &mut effective_metadata);
+                        resolve_placeholders(&mut card_json, &effective_metadata);
+                        carry_form_data_to_actions(&mut card_json, &effective_metadata);
+                        let mut reply = envelope.clone();
+                        reply.metadata.insert(
+                            "adaptive_card".to_string(),
+                            serde_json::to_string(&card_json).unwrap_or_default(),
+                        );
+                        reply.text = None;
+                        vec![reply]
+                    }
+                    None => {
+                        // Enter the flow at the named node rather than restarting
+                        // at the entrypoint. A restart means the capture nodes
+                        // chained between two cards never run and the journey never
+                        // advances. This drives only the FIRST hop into the flow —
+                        // once a card has parked, the runner resumes it instead.
+                        let entry_node = route_to_card.clone();
+                        operator_log::info(
+                            module_path!(),
+                            format!(
+                                "[demo messaging] card routing: {entry_node} -> entering the app \
                              flow at that node (flow_node={flow_node})"
-                        ),
-                    );
-                    // The nav directive must not travel into the flow: the
-                    // adaptive-card component prefers an inbound nextCardId
-                    // over its node's own card asset, so leaving it in makes
-                    // the next card node fail with AC_ASSET_NOT_FOUND.
-                    let mut flow_envelope = envelope.clone();
-                    strip_card_nav_keys(&mut flow_envelope);
-                    run_app_flow_safe(
-                        runner_host,
-                        bundle,
-                        provider,
-                        ctx,
-                        &app_pack_path,
-                        &pack_info,
-                        flow,
-                        &flow_envelope,
-                        Some(&entry_node),
-                    )
+                            ),
+                        );
+                        // The nav directive must not travel into the flow: the
+                        // adaptive-card component prefers an inbound nextCardId
+                        // over its node's own card asset, so leaving it in makes
+                        // the next card node fail with AC_ASSET_NOT_FOUND.
+                        let mut flow_envelope = envelope.clone();
+                        strip_card_nav_keys(&mut flow_envelope);
+                        run_app_flow_safe(
+                            runner_host,
+                            bundle,
+                            provider,
+                            ctx,
+                            &app_pack_path,
+                            &pack_info,
+                            flow,
+                            &flow_envelope,
+                            Some(&entry_node),
+                        )
+                    }
                 }
-            }
-        } else if !turn.owns_conversation
-            && pack_info
-                .capabilities
-                .iter()
-                .any(|c| c == crate::fast2flow::FAST2FLOW_CAPABILITY)
-            && envelope
-                .text
-                .as_deref()
-                .is_some_and(|t| !t.trim().is_empty())
-        {
-            // The pack opted into Fast2Flow routing, the user sent free text,
-            // and no dispatch resolved (Fast2Flow returned Continue and
-            // didn't set routeToCardId). Surface a short error so we don't
-            // re-echo the welcome menu and confuse the user.
-            operator_log::info(
-                module_path!(),
-                format!(
-                    "[fast2flow] no dispatch for free text — emitting error reply pack={} text_len={}",
-                    pack_info.pack_id,
-                    envelope.text.as_deref().map(str::len).unwrap_or(0)
-                ),
-            );
-            let mut reply = envelope.clone();
-            reply.metadata.remove("adaptive_card");
-            reply.text = Some(
+            } else if !turn.owns_conversation
+                && pack_info
+                    .capabilities
+                    .iter()
+                    .any(|c| c == crate::fast2flow::FAST2FLOW_CAPABILITY)
+                && envelope
+                    .text
+                    .as_deref()
+                    .is_some_and(|t| !t.trim().is_empty())
+            {
+                // The pack opted into Fast2Flow routing, the user sent free text,
+                // and no dispatch resolved (Fast2Flow returned Continue and
+                // didn't set routeToCardId). Surface a short error so we don't
+                // re-echo the welcome menu and confuse the user.
+                operator_log::info(
+                    module_path!(),
+                    format!(
+                        "[fast2flow] no dispatch for free text — emitting error reply pack={} text_len={}",
+                        pack_info.pack_id,
+                        envelope.text.as_deref().map(str::len).unwrap_or(0)
+                    ),
+                );
+                let mut reply = envelope.clone();
+                reply.metadata.remove("adaptive_card");
+                reply.text = Some(
                 "I'm not sure what you meant. Tap one of the menu options or rephrase your request."
                     .to_string(),
             );
-            vec![reply]
-        } else {
-            run_app_flow_safe(
-                runner_host,
-                bundle,
-                provider,
-                ctx,
-                &app_pack_path,
-                &pack_info,
-                flow,
-                envelope,
-                None,
-            )
-        };
+                vec![reply]
+            } else {
+                run_app_flow_safe(
+                    runner_host,
+                    bundle,
+                    provider,
+                    ctx,
+                    &app_pack_path,
+                    &pack_info,
+                    flow,
+                    envelope,
+                    None,
+                )
+            };
 
-        if turn.owns_conversation {
-            // Keep the conversation with this flow while it is parked on it;
-            // give it back to routing once the flow has completed.
-            flow_owner::settle(
-                bundle,
-                ctx,
-                &pack_info.pack_id,
-                &flow.id,
-                &envelope.session_id,
-            );
-        }
+            if turn.owns_conversation {
+                // Keep the conversation with this flow while it is parked on it;
+                // give it back to routing once the flow has completed.
+                flow_owner::settle(
+                    bundle,
+                    ctx,
+                    &pack_info.pack_id,
+                    &flow.id,
+                    &envelope.session_id,
+                );
+            }
+            outputs
+        };
+        let outputs = match typing.as_ref() {
+            Some(typing) => typing.around(original, run_turn),
+            None => run_turn(),
+        };
 
         for mut out_envelope in outputs {
             if let Some(team) = &ctx.team {
@@ -1306,14 +1326,16 @@ mod tests {
         let secrets_handle =
             secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
                 .expect("secrets");
-        let runner_host = DemoRunnerHost::new(
-            dir.path().to_path_buf(),
-            &discovery,
-            None,
-            secrets_handle,
-            false,
-        )
-        .expect("runner host");
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(
+                dir.path().to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+            )
+            .expect("runner host"),
+        );
 
         let err = route_messaging_envelopes(
             dir.path(),
@@ -1347,14 +1369,16 @@ mod tests {
         let secrets_handle =
             secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
                 .expect("secrets");
-        let runner_host = DemoRunnerHost::new(
-            dir.path().to_path_buf(),
-            &discovery,
-            None,
-            secrets_handle,
-            false,
-        )
-        .expect("runner host");
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(
+                dir.path().to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+            )
+            .expect("runner host"),
+        );
 
         let mut card_routed = envelope();
         card_routed
@@ -1397,14 +1421,16 @@ mod tests {
         let secrets_handle =
             secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
                 .expect("secrets");
-        let runner_host = DemoRunnerHost::new(
-            dir.path().to_path_buf(),
-            &discovery,
-            None,
-            secrets_handle,
-            false,
-        )
-        .expect("runner host");
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(
+                dir.path().to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+            )
+            .expect("runner host"),
+        );
 
         let mut card_routed = envelope();
         card_routed

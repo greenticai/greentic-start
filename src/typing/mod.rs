@@ -5,6 +5,7 @@ use std::time::Duration;
 
 mod driver;
 mod dto;
+mod legacy;
 mod revision;
 mod schedule;
 
@@ -12,6 +13,7 @@ pub(crate) use driver::{
     BlockingTypingSender, TypingSender, keep_typing_blocking, keep_typing_while,
 };
 pub(crate) use dto::{SendTypingInV1, SendTypingOutV1};
+pub(crate) use legacy::LegacyTyping;
 pub(crate) use revision::{RevisionTypingSender, is_bot_self_message, typing_input_for};
 
 /// The OPTIONAL provider op. The host calls it only when the provider declares it.
