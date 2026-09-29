@@ -118,7 +118,7 @@ fn a_card_node_dispatch_still_routes_to_the_card_in_the_default_flow() {
         &original,
         RouteSource::Bm25,
     ) {
-        Some(Routed::Node(env, _)) => {
+        Ok(Routed::Node(env, _)) => {
             assert_eq!(
                 env.metadata.get("routeToCardId").map(String::as_str),
                 Some("refund_card")
@@ -142,7 +142,7 @@ fn a_flow_dispatch_routes_to_that_flow_without_a_card_target() {
         &original,
         RouteSource::Bm25,
     ) {
-        Some(Routed::Flow(flow, env, _)) => {
+        Ok(Routed::Flow(flow, env, _)) => {
             assert_eq!(flow.id, "refund");
             assert!(card_nav_target(&env).is_none());
             assert_eq!(
@@ -158,24 +158,72 @@ fn a_flow_dispatch_routes_to_that_flow_without_a_card_target() {
 fn directives_that_route_nothing_fall_through() {
     let info = pack_info();
     let original = envelope("conv-1");
-    let reply = IngressReply {
-        text: Some("hi".into()),
-        card_cbor: None,
-        status_code: Some(200),
-        reason_code: None,
-    };
     for directive in [
         ControlDirective::Continue,
-        ControlDirective::Respond { reply },
         dispatch(PACK, Some("missing"), None),
     ] {
-        assert!(apply_dispatch(directive, &info, &original, RouteSource::Bm25).is_none());
+        assert_eq!(
+            apply_dispatch(directive, &info, &original, RouteSource::Bm25).err(),
+            Some(Unrouted::NoMatch)
+        );
     }
+}
+
+fn reply(status: u16) -> IngressReply {
+    IngressReply {
+        text: Some("no".into()),
+        card_cbor: None,
+        status_code: Some(status),
+        reason_code: None,
+    }
+}
+
+#[test]
+fn deny_and_respond_are_unhandled_not_a_miss() {
+    let info = pack_info();
+    let original = envelope("conv-1");
+    for (directive, kind) in [
+        (ControlDirective::Deny { reply: reply(403) }, "deny"),
+        (ControlDirective::Respond { reply: reply(200) }, "respond"),
+    ] {
+        assert_eq!(
+            apply_dispatch(directive, &info, &original, RouteSource::Bm25).err(),
+            Some(Unrouted::Unhandled(kind))
+        );
+    }
+}
+
+#[test]
+fn an_llm_answer_routes_with_source_llm() {
+    let info = pack_info();
+    let original = envelope("conv-1");
+    match llm_route(Some(dispatch(PACK, Some("refund"), None)), &info, &original) {
+        Some(Routed::Flow(_, _, signal)) => assert_eq!(signal.source, RouteSource::Llm),
+        _ => panic!("expected a flow route"),
+    }
+    assert!(llm_route(None, &info, &original).is_none());
+}
+
+#[test]
+fn host_outcomes_keep_their_cause() {
+    use crate::fast2flow::RoutingOutcome;
+    let info = pack_info();
+    let original = envelope("conv-1");
+    let cause = |outcome| host_route(outcome, &info, &original).err();
+    assert_eq!(cause(RoutingOutcome::NoMatch), Some(Unrouted::NoMatch));
+    assert_eq!(
+        cause(RoutingOutcome::Failed("spawn x".into())),
+        Some(Unrouted::RouterFailed("spawn x".into()))
+    );
+    assert_eq!(
+        cause(RoutingOutcome::NotConfigured("gate".into())),
+        Some(Unrouted::RouterNotConfigured("gate".into()))
+    );
 }
 
 // ---- turn resolution and stickiness --------------------------------------
 
-fn probe_flow<'p>(info: &'p AppPackInfo, flow_id: &str) -> Option<Routed<'p>> {
+fn probe_flow<'p>(info: &'p AppPackInfo, flow_id: &str) -> Result<Routed<'p>, Unrouted> {
     apply_dispatch(
         dispatch(PACK, Some(flow_id), None),
         info,
@@ -218,7 +266,7 @@ fn a_dispatched_flow_keeps_the_conversation_until_it_completes() {
     let mut probed = false;
     let turn = resolve_turn(root, &c, &info, default_flow, &original, || {
         probed = true;
-        None
+        Err(Unrouted::NoMatch)
     });
     assert!(probed);
     assert_eq!(turn.flow.id, "default");
@@ -241,7 +289,7 @@ fn a_flow_that_completes_on_its_dispatch_turn_leaves_the_next_turn_to_routing() 
     let mut probed = false;
     resolve_turn(root, &c, &info, default_flow, &original, || {
         probed = true;
-        None
+        Err(Unrouted::NoMatch)
     });
     assert!(probed);
 }
@@ -251,7 +299,9 @@ fn without_a_dispatch_the_default_flow_runs_and_takes_no_ownership() {
     let dir = tempdir().expect("tempdir");
     let (root, c, info) = (dir.path(), ctx("demo"), pack_info());
     let original = envelope("conv-1");
-    let turn = resolve_turn(root, &c, &info, &info.flows[0], &original, || None);
+    let turn = resolve_turn(root, &c, &info, &info.flows[0], &original, || {
+        Err(Unrouted::NoMatch)
+    });
     assert_eq!(turn.flow.id, "default");
     assert!(!turn.owns_conversation);
     assert_eq!(turn.envelope.text, original.text);
@@ -286,11 +336,11 @@ fn one_conversations_owner_does_not_capture_another() {
     flow_owner::settle(root, &c, PACK, "refund", "conv-1");
 
     let turn = resolve_turn(root, &c, &info, &info.flows[0], &envelope("conv-2"), || {
-        None
+        Err(Unrouted::NoMatch)
     });
     assert_eq!(turn.flow.id, "default");
     let turn = resolve_turn(root, &c, &info, &info.flows[0], &envelope("conv-1"), || {
-        None
+        Err(Unrouted::NoMatch)
     });
     assert_eq!(turn.flow.id, "refund");
 }
@@ -309,7 +359,7 @@ fn ownership_does_not_cross_tenants() {
         &info,
         &info.flows[0],
         &envelope("conv-1"),
-        || None,
+        || Err(Unrouted::NoMatch),
     );
     assert_eq!(turn.flow.id, "default");
 }
@@ -499,91 +549,4 @@ fn an_owned_conversation_resumes_its_flow_with_or_without_the_opt_in() {
             "opt_in={opt_in}"
         );
     }
-}
-
-// ---- route signal on the turn (Ask 3) -------------------------------------
-
-fn signal_of(turn: &Turn<'_>) -> Option<serde_json::Value> {
-    let mut outputs = vec![turn.envelope.clone()];
-    fast2flow_turn::stamp_route(&mut outputs, turn.route.as_ref(), &turn.flow.id);
-    outputs[0]
-        .metadata
-        .get(fast2flow_turn::ROUTE_METADATA_KEY)
-        .map(|raw| serde_json::from_str(raw).expect("json"))
-}
-
-fn routed_turn<'p>(
-    root: &Path,
-    info: &'p AppPackInfo,
-    directive: ControlDirective,
-    source: RouteSource,
-) -> Turn<'p> {
-    let original = envelope("conv-1");
-    resolve_turn(root, &ctx("demo"), info, &info.flows[0], &original, || {
-        apply_dispatch(directive, info, &original, source)
-    })
-}
-
-#[test]
-fn a_bm25_flow_dispatch_stamps_the_flow() {
-    let dir = tempdir().expect("tempdir");
-    let info = pack_info();
-    let turn = routed_turn(
-        dir.path(),
-        &info,
-        dispatch(PACK, Some("refund"), None),
-        RouteSource::Bm25,
-    );
-    let signal = signal_of(&turn).expect("stamped");
-    assert_eq!(signal["flow"], "refund");
-    assert!(signal.get("node").is_none());
-    assert_eq!(signal["source"], "bm25");
-    assert!((signal["confidence"].as_f64().expect("number") - 0.9).abs() < 1e-6);
-}
-
-#[test]
-fn a_node_dispatch_stamps_the_node_and_the_default_flow() {
-    let dir = tempdir().expect("tempdir");
-    let info = pack_info();
-    let turn = routed_turn(
-        dir.path(),
-        &info,
-        dispatch(PACK, Some("refund"), Some("refund_card")),
-        RouteSource::Bm25,
-    );
-    let signal = signal_of(&turn).expect("stamped");
-    assert_eq!(signal["flow"], "default");
-    assert_eq!(signal["node"], "refund_card");
-    assert_eq!(signal["source"], "bm25");
-}
-
-#[test]
-fn an_llm_dispatch_stamps_source_llm() {
-    let dir = tempdir().expect("tempdir");
-    let info = pack_info();
-    let turn = routed_turn(
-        dir.path(),
-        &info,
-        dispatch(PACK, Some("refund"), None),
-        RouteSource::Llm,
-    );
-    assert_eq!(signal_of(&turn).expect("stamped")["source"], "llm");
-}
-
-#[test]
-fn default_flow_and_sticky_turns_carry_no_signal() {
-    let dir = tempdir().expect("tempdir");
-    let (root, c, info) = (dir.path(), ctx("demo"), pack_info());
-    let original = envelope("conv-1");
-
-    let default_turn = resolve_turn(root, &c, &info, &info.flows[0], &original, || None);
-    assert!(signal_of(&default_turn).is_none());
-
-    park(root, &c, PACK, "refund", "conv-1");
-    flow_owner::settle(root, &c, PACK, "refund", "conv-1");
-    let sticky = resolve_turn(root, &c, &info, &info.flows[0], &original, || {
-        panic!("a sticky turn is never routed")
-    });
-    assert_eq!(sticky.flow.id, "refund");
-    assert!(signal_of(&sticky).is_none());
 }

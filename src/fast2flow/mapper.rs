@@ -167,10 +167,13 @@ mod tests {
             &ctx(),
         );
         match mapped {
-            ControlDirective::Dispatch { target, .. } => {
+            ControlDirective::Dispatch {
+                target, confidence, ..
+            } => {
                 assert_eq!(target.pack, "support");
                 assert_eq!(target.flow.as_deref(), Some("refund_flow"));
                 assert!(target.node.is_none());
+                assert_eq!(confidence, Some(0.9));
             }
             other => panic!("expected dispatch, got {other:?}"),
         }

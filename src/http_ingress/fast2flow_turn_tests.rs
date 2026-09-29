@@ -43,7 +43,7 @@ fn channel_data_signal(out: &ChannelMessageEnvelope) -> Option<&JsonValue> {
 
 #[test]
 fn a_miss_without_the_opt_in_keeps_the_fixed_reply() {
-    let action = miss_action(false, &caps(&[FAST2FLOW_CAPABILITY]), Some("hello"));
+    let action = miss_action(false, &caps(&[FAST2FLOW_CAPABILITY]), Some("hello"), None);
     assert_eq!(action, MissAction::FixedReply);
 
     let reply = miss_reply(&envelope());
@@ -60,6 +60,7 @@ fn a_miss_with_the_opt_in_runs_the_default_flow() {
             FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY,
         ]),
         Some("hello"),
+        None,
     );
     assert_eq!(action, MissAction::DefaultFlowOnMiss);
 }
@@ -70,6 +71,7 @@ fn the_opt_in_alone_does_nothing_without_fast2flow() {
         false,
         &caps(&[FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY]),
         Some("hello"),
+        None,
     );
     assert_eq!(action, MissAction::RunDefaultFlow);
 }
@@ -84,7 +86,7 @@ fn an_owned_conversation_never_misses() {
         ]),
     ] {
         assert_eq!(
-            miss_action(true, &list, Some("hello")),
+            miss_action(true, &list, Some("hello"), None),
             MissAction::RunDefaultFlow
         );
     }
@@ -94,7 +96,10 @@ fn an_owned_conversation_never_misses() {
 fn blank_or_absent_text_is_not_a_miss() {
     let list = caps(&[FAST2FLOW_CAPABILITY]);
     for text in [None, Some(""), Some("   \n")] {
-        assert_eq!(miss_action(false, &list, text), MissAction::RunDefaultFlow);
+        assert_eq!(
+            miss_action(false, &list, text, None),
+            MissAction::RunDefaultFlow
+        );
     }
 }
 
@@ -201,4 +206,63 @@ fn an_unrouted_turn_carries_no_signal_even_when_the_inbound_forged_one() {
     assert!(metadata_signal(&outputs[0]).is_none());
     assert!(channel_data_signal(&outputs[0]).is_none());
     assert_eq!(outputs[0].extensions[ext_keys::CHANNEL_DATA]["other"], 1);
+}
+
+#[test]
+fn an_unhandled_directive_gets_the_fixed_reply_even_with_the_opt_in() {
+    let list = caps(&[
+        FAST2FLOW_CAPABILITY,
+        FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY,
+    ]);
+    let deny = Unrouted::Unhandled("deny");
+    assert_eq!(
+        miss_action(false, &list, Some("hello"), Some(&deny)),
+        MissAction::FixedReply
+    );
+    let failed = Unrouted::RouterFailed("exit 1".into());
+    assert_eq!(
+        miss_action(false, &list, Some("hello"), Some(&failed)),
+        MissAction::DefaultFlowOnMiss
+    );
+}
+
+#[test]
+fn probe_turn_keeps_the_host_cause_and_stops_on_unhandled() {
+    let failed = || Err::<u8, _>(Unrouted::RouterFailed("exit 1".into()));
+    assert_eq!(probe_turn(failed(), || None), failed());
+    assert_eq!(probe_turn(failed(), || Some(7)), Ok(7));
+    assert_eq!(
+        probe_turn(Err::<u8, _>(Unrouted::Unhandled("respond")), || {
+            panic!("no LLM after an unhandled directive")
+        }),
+        Err(Unrouted::Unhandled("respond"))
+    );
+}
+
+#[test]
+fn confidence_serialises_as_its_shortest_decimal() {
+    for (confidence, text) in [(0.92f32, "0.92"), (0.9f32, "0.9")] {
+        let signal = RouteSignal {
+            node: None,
+            confidence: Some(confidence),
+            source: RouteSource::Bm25,
+        };
+        let serialised = signal.to_json("f").to_string();
+        assert!(
+            serialised.contains(&format!("\"confidence\":{text},")),
+            "{serialised}"
+        );
+    }
+}
+
+#[test]
+fn confidence_outside_the_unit_interval_is_null() {
+    for confidence in [-0.1f32, 1.5] {
+        let signal = RouteSignal {
+            node: None,
+            confidence: Some(confidence),
+            source: RouteSource::Bm25,
+        };
+        assert_eq!(signal.to_json("f")["confidence"], JsonValue::Null);
+    }
 }

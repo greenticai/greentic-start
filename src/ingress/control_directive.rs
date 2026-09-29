@@ -209,9 +209,14 @@ mod tests {
             "target": "acme/default/pack-a/flow-x/node-y"
         }))
         .expect("directive");
-        let ControlDirective::Dispatch { target, .. } = directive else {
+        let ControlDirective::Dispatch {
+            target, confidence, ..
+        } = directive
+        else {
             panic!("expected dispatch");
         };
+        // A hook-emitted directive reports no router confidence.
+        assert_eq!(confidence, None);
         assert_eq!(target.tenant, "acme");
         assert_eq!(target.team.as_deref(), Some("default"));
         assert_eq!(target.pack, "pack-a");

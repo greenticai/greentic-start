@@ -1,13 +1,24 @@
 # Fast2Flow: routing misses and the route signal
 
-Applies to the legacy messaging ingress (`src/http_ingress/messaging.rs`).
-Decisions live in `src/http_ingress/fast2flow_turn.rs`.
+Applies ONLY to the legacy messaging ingress (`src/http_ingress/messaging.rs`,
+turn body in `messaging_turn.rs`). The revision-serve path does not run this
+code: there, neither the opt-in nor the route signal exists. Pure decisions
+live in `src/http_ingress/fast2flow_turn.rs`.
 
 ## What a routing miss does
 
 A turn is a **miss** when the app pack declares `greentic.cap.fast2flow.v1`,
 the user sent non-blank text, the conversation is not owned by a flow, and
 neither Fast2Flow (BM25 host) nor the LLM fallback produced a usable dispatch.
+The router's answer is one of: dispatched, no match, not configured (gate
+closed, no index path or no index — logged at debug), or **failed** (spawn
+error, non-zero exit, unparseable output — logged at `warn` with the reason).
+A failure behaves like a miss below, but the log names it as a failure.
+
+A Fast2Flow `Deny` or `Respond` is not handled on this path yet: it stops
+routing for the turn (the LLM fallback is NOT asked), logs a `warn`, and sends
+the fixed reply — with or without the opt-in. Before this change the LLM
+fallback was consulted after a `Deny`.
 
 | pack declares | on a miss |
 |---|---|
@@ -46,14 +57,16 @@ carries key `fast2flow`:
 
 | field | meaning |
 |---|---|
-| `flow` | the flow that ran the turn: the dispatched flow for a flow route, the default flow for a node route |
+| `flow` | the flow that ran the turn: the dispatched flow for a flow route, the default flow for a node route. When a node route is rendered straight from a card asset, no flow runs and `flow` still names the default flow |
 | `node` | present only for a node route (`routeToCardId`): the card node targeted |
-| `confidence` | the router's confidence, `null` when none (or non-finite) was reported |
+| `confidence` | the router's confidence as its shortest decimal (`0.92`, never `0.9200000166893005`); `null` when none was reported, or when it is non-finite or outside `[0, 1]` |
 | `source` | `"bm25"` (Fast2Flow host) or `"llm"` (LLM fallback) |
 
-Default-flow turns, sticky resumes and the fixed miss reply carry **no**
-signal: the key is removed from both places, so an inbound message cloned into
-a reply cannot forge one.
+Default-flow turns, sticky resumes, the fixed miss reply, and a routed turn
+whose flow FAILED (its reply is the error-fallback echo) carry **no** signal:
+the key is removed from both places, so an inbound message cloned into a reply
+cannot forge one. The removal also drops a `fast2flow` key a flow emitted
+itself — intentionally: the key is reserved for the router.
 
 The `channel_data` copy is the one a Direct Line (webchat) client sees: the
 webchat provider forwards `extensions["channel_data"]` as the activity's
