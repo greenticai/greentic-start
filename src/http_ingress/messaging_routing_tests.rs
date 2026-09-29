@@ -80,6 +80,7 @@ fn dispatch(pack: &str, flow: Option<&str>, node: Option<&str>) -> ControlDirect
             role: None,
             formats: Default::default(),
         }],
+        confidence: Some(0.9),
     }
 }
 
@@ -114,9 +115,9 @@ fn a_card_node_dispatch_still_routes_to_the_card_in_the_default_flow() {
         dispatch(PACK, Some("refund"), Some("refund_card")),
         &info,
         &original,
-        "test",
+        RouteSource::Bm25,
     ) {
-        Some(Routed::Node(env)) => {
+        Ok(Routed::Node(env, _)) => {
             assert_eq!(
                 env.metadata.get("routeToCardId").map(String::as_str),
                 Some("refund_card")
@@ -138,9 +139,9 @@ fn a_flow_dispatch_routes_to_that_flow_without_a_card_target() {
         dispatch(PACK, Some("refund"), None),
         &info,
         &original,
-        "test",
+        RouteSource::Bm25,
     ) {
-        Some(Routed::Flow(flow, env)) => {
+        Ok(Routed::Flow(flow, env, _)) => {
             assert_eq!(flow.id, "refund");
             assert!(card_nav_target(&env).is_none());
             assert_eq!(
@@ -156,29 +157,77 @@ fn a_flow_dispatch_routes_to_that_flow_without_a_card_target() {
 fn directives_that_route_nothing_fall_through() {
     let info = pack_info();
     let original = envelope("conv-1");
-    let reply = IngressReply {
-        text: Some("hi".into()),
-        card_cbor: None,
-        status_code: Some(200),
-        reason_code: None,
-    };
     for directive in [
         ControlDirective::Continue,
-        ControlDirective::Respond { reply },
         dispatch(PACK, Some("missing"), None),
     ] {
-        assert!(apply_dispatch(directive, &info, &original, "test").is_none());
+        assert_eq!(
+            apply_dispatch(directive, &info, &original, RouteSource::Bm25).err(),
+            Some(Unrouted::NoMatch)
+        );
     }
+}
+
+fn reply(status: u16) -> IngressReply {
+    IngressReply {
+        text: Some("no".into()),
+        card_cbor: None,
+        status_code: Some(status),
+        reason_code: None,
+    }
+}
+
+#[test]
+fn deny_and_respond_are_unhandled_not_a_miss() {
+    let info = pack_info();
+    let original = envelope("conv-1");
+    for (directive, kind) in [
+        (ControlDirective::Deny { reply: reply(403) }, "deny"),
+        (ControlDirective::Respond { reply: reply(200) }, "respond"),
+    ] {
+        assert_eq!(
+            apply_dispatch(directive, &info, &original, RouteSource::Bm25).err(),
+            Some(Unrouted::Unhandled(kind))
+        );
+    }
+}
+
+#[test]
+fn an_llm_answer_routes_with_source_llm() {
+    let info = pack_info();
+    let original = envelope("conv-1");
+    match llm_route(Some(dispatch(PACK, Some("refund"), None)), &info, &original) {
+        Some(Routed::Flow(_, _, signal)) => assert_eq!(signal.source, RouteSource::Llm),
+        _ => panic!("expected a flow route"),
+    }
+    assert!(llm_route(None, &info, &original).is_none());
+}
+
+#[test]
+fn host_outcomes_keep_their_cause() {
+    use crate::fast2flow::RoutingOutcome;
+    let info = pack_info();
+    let original = envelope("conv-1");
+    let cause = |outcome| host_route(outcome, &info, &original).err();
+    assert_eq!(cause(RoutingOutcome::NoMatch), Some(Unrouted::NoMatch));
+    assert_eq!(
+        cause(RoutingOutcome::Failed("spawn x".into())),
+        Some(Unrouted::RouterFailed("spawn x".into()))
+    );
+    assert_eq!(
+        cause(RoutingOutcome::NotConfigured("gate".into())),
+        Some(Unrouted::RouterNotConfigured("gate".into()))
+    );
 }
 
 // ---- turn resolution and stickiness --------------------------------------
 
-fn probe_flow<'p>(info: &'p AppPackInfo, flow_id: &str) -> Option<Routed<'p>> {
+fn probe_flow<'p>(info: &'p AppPackInfo, flow_id: &str) -> Result<Routed<'p>, Unrouted> {
     apply_dispatch(
         dispatch(PACK, Some(flow_id), None),
         info,
         &envelope("unused"),
-        "test",
+        RouteSource::Bm25,
     )
 }
 
@@ -216,7 +265,7 @@ fn a_dispatched_flow_keeps_the_conversation_until_it_completes() {
     let mut probed = false;
     let turn = resolve_turn(root, &c, &info, default_flow, &original, || {
         probed = true;
-        None
+        Err(Unrouted::NoMatch)
     });
     assert!(probed);
     assert_eq!(turn.flow.id, "default");
@@ -239,7 +288,7 @@ fn a_flow_that_completes_on_its_dispatch_turn_leaves_the_next_turn_to_routing() 
     let mut probed = false;
     resolve_turn(root, &c, &info, default_flow, &original, || {
         probed = true;
-        None
+        Err(Unrouted::NoMatch)
     });
     assert!(probed);
 }
@@ -249,7 +298,9 @@ fn without_a_dispatch_the_default_flow_runs_and_takes_no_ownership() {
     let dir = tempdir().expect("tempdir");
     let (root, c, info) = (dir.path(), ctx("demo"), pack_info());
     let original = envelope("conv-1");
-    let turn = resolve_turn(root, &c, &info, &info.flows[0], &original, || None);
+    let turn = resolve_turn(root, &c, &info, &info.flows[0], &original, || {
+        Err(Unrouted::NoMatch)
+    });
     assert_eq!(turn.flow.id, "default");
     assert!(!turn.owns_conversation);
     assert_eq!(turn.envelope.text, original.text);
@@ -265,7 +316,7 @@ fn a_card_node_turn_runs_the_default_flow_and_takes_no_ownership() {
             dispatch(PACK, Some("default"), Some("welcome")),
             &info,
             &original,
-            "test",
+            RouteSource::Bm25,
         )
     });
     assert_eq!(turn.flow.id, "default");
@@ -284,11 +335,11 @@ fn one_conversations_owner_does_not_capture_another() {
     flow_owner::settle(root, &c, PACK, "refund", "conv-1");
 
     let turn = resolve_turn(root, &c, &info, &info.flows[0], &envelope("conv-2"), || {
-        None
+        Err(Unrouted::NoMatch)
     });
     assert_eq!(turn.flow.id, "default");
     let turn = resolve_turn(root, &c, &info, &info.flows[0], &envelope("conv-1"), || {
-        None
+        Err(Unrouted::NoMatch)
     });
     assert_eq!(turn.flow.id, "refund");
 }
@@ -307,7 +358,7 @@ fn ownership_does_not_cross_tenants() {
         &info,
         &info.flows[0],
         &envelope("conv-1"),
-        || None,
+        || Err(Unrouted::NoMatch),
     );
     assert_eq!(turn.flow.id, "default");
 }
@@ -317,7 +368,14 @@ fn ownership_does_not_cross_tenants() {
 /// An app pack with a `default` and a `refund` messaging flow, neither
 /// declaring Fast2Flow. Enough for the ingress to choose and start a flow.
 fn write_two_flow_pack(pack_path: &Path) {
-    use greentic_types::pack_manifest::{PackFlowEntry, PackKind, PackManifest, PackSignatures};
+    write_two_flow_pack_with_caps(pack_path, &[]);
+}
+
+/// [`write_two_flow_pack`], declaring `caps` in the manifest.
+fn write_two_flow_pack_with_caps(pack_path: &Path, caps: &[&str]) {
+    use greentic_types::pack_manifest::{
+        ComponentCapability, PackFlowEntry, PackKind, PackManifest, PackSignatures,
+    };
     use greentic_types::{Flow, FlowId, FlowKind, PackId};
     use semver::Version;
 
@@ -352,7 +410,13 @@ fn write_two_flow_pack(pack_path: &Path) {
         components: Vec::new(),
         flows: vec![entry("default"), entry("refund")],
         dependencies: Vec::new(),
-        capabilities: Vec::new(),
+        capabilities: caps
+            .iter()
+            .map(|name| ComponentCapability {
+                name: name.to_string(),
+                description: None,
+            })
+            .collect(),
         secret_requirements: Vec::new(),
         signatures: PackSignatures::default(),
         bootstrap: None,
@@ -418,4 +482,68 @@ fn the_ingress_runs_the_default_flow_for_an_unowned_conversation() {
 
     assert_eq!(flows_run_by_ingress(root, &c, "conv-1"), vec!["default"]);
     assert!(!has_record(root, &c, PACK, "conv-1"));
+}
+
+// ---- routing miss through the ingress (Ask 1) -----------------------------
+
+/// A pack declaring Fast2Flow, and optionally the on-miss opt-in. The test
+/// environment has no routing index and no `llm:` instance, so every free-text
+/// turn is a routing miss.
+fn miss_fixture(opt_in: bool) -> (tempfile::TempDir, OperatorContext) {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("packs")).expect("packs");
+    let mut caps = vec![crate::fast2flow::FAST2FLOW_CAPABILITY];
+    if opt_in {
+        caps.push(crate::fast2flow::FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY);
+    }
+    write_two_flow_pack_with_caps(&root.join("packs/default.gtpack"), &caps);
+    (dir, ctx("demo"))
+}
+
+#[test]
+fn both_capabilities_reach_the_app_pack_info() {
+    let (dir, _) = miss_fixture(true);
+    let info = crate::messaging_app::load_app_pack_info(&dir.path().join("packs/default.gtpack"))
+        .expect("pack info");
+    for cap in [
+        crate::fast2flow::FAST2FLOW_CAPABILITY,
+        crate::fast2flow::FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY,
+    ] {
+        assert!(
+            info.capabilities.iter().any(|c| c == cap),
+            "{cap} missing from {:?}",
+            info.capabilities
+        );
+    }
+}
+
+#[test]
+fn a_miss_without_the_opt_in_runs_no_flow() {
+    let (dir, c) = miss_fixture(false);
+    assert!(flows_run_by_ingress(dir.path(), &c, "conv-1").is_empty());
+}
+
+#[test]
+fn a_miss_with_the_opt_in_runs_the_default_flow() {
+    let (dir, c) = miss_fixture(true);
+    assert_eq!(
+        flows_run_by_ingress(dir.path(), &c, "conv-1"),
+        vec!["default"]
+    );
+    assert!(!has_record(dir.path(), &c, PACK, "conv-1"));
+}
+
+#[test]
+fn an_owned_conversation_resumes_its_flow_with_or_without_the_opt_in() {
+    for opt_in in [false, true] {
+        let (dir, c) = miss_fixture(opt_in);
+        park(dir.path(), &c, PACK, "refund", "conv-1");
+        flow_owner::settle(dir.path(), &c, PACK, "refund", "conv-1");
+        assert_eq!(
+            flows_run_by_ingress(dir.path(), &c, "conv-1"),
+            vec!["refund"],
+            "opt_in={opt_in}"
+        );
+    }
 }

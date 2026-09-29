@@ -8,6 +8,17 @@ use crate::runner_host::OperatorContext;
 
 pub const FAST2FLOW_CAPABILITY: &str = "greentic.cap.fast2flow.v1";
 
+/// Opt-in companion to [`FAST2FLOW_CAPABILITY`]: when neither Fast2Flow nor the
+/// LLM fallback routes a free-text turn, run the pack's default flow with the
+/// original message instead of the fixed "I'm not sure what you meant" reply.
+///
+/// Absent (the default), a miss keeps the fixed reply, which is what card-menu
+/// packs rely on so the default flow does not re-echo their welcome menu.
+/// Read from the same pack manifest `capabilities` list as the gate above; it
+/// has no effect on a pack that does not also declare `FAST2FLOW_CAPABILITY`.
+pub const FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY: &str =
+    "greentic.cap.fast2flow.on_miss.default_flow.v1";
+
 /// Cheap, side-effect-free per-request check. Called on the inbound hot path.
 pub trait Fast2FlowGate: Send + Sync + std::fmt::Debug {
     fn is_enabled(&self, ctx: &OperatorContext, pack: &AppPackInfo) -> bool;
