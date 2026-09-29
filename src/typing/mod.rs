@@ -5,12 +5,14 @@ use std::time::Duration;
 
 mod driver;
 mod dto;
+mod revision;
 mod schedule;
 
 pub(crate) use driver::{
     BlockingTypingSender, TypingSender, keep_typing_blocking, keep_typing_while,
 };
 pub(crate) use dto::{SendTypingInV1, SendTypingOutV1};
+pub(crate) use revision::{RevisionTypingSender, is_bot_self_message, typing_input_for};
 
 /// The OPTIONAL provider op. The host calls it only when the provider declares it.
 pub(crate) const TYPING_OP: &str = "send_typing";
