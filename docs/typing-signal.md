@@ -80,16 +80,24 @@ awaited for at most `STOP_GRACE` (2 s) before egress (`render_plan` → `encode`
 `send_payload`) begins. So a refresh never lands after the reply unless the
 provider call outlives the grace, in which case it is abandoned and logged.
 
-- Deployed: the loop runs alongside the turn in the turn's own task
-  (`tokio::select!`), then `tokio::time::timeout(STOP_GRACE, …)`. Each send itself
-  runs on the blocking pool (`spawn_blocking` + `Handle::block_on`) and the loop
-  only awaits its `JoinHandle`: the provider call (`invoke_provider_for_revision` →
-  runner-host `run_on_wasi_thread`) joins a thread synchronously inside one poll,
-  so polled in the turn's task it would starve the turn and the grace timeout
-  could never fire.
-- Legacy: the loop runs on a detached thread; the turn's thread waits on a done
-  channel with `recv_timeout(STOP_GRACE)`. An abandoned thread sends nothing more
-  and exits when the hung call returns.
+Both paths run the typing loop on its OWN detached thread with std timers, never
+in the turn's task. The deployed turn (`handle_activity_for_revision`) and the
+deployed send (`invoke_provider_for_revision` → runner-host `run_on_wasi_thread`)
+each run sync WASM on a joined thread inside ONE poll, so a loop sharing a task or
+a `select!` with either is starved: the first release did exactly that, and an e2e
+run saw one send at +0.02 s and no refresh during a 6–12 s turn. A dedicated
+thread is also independent of how many runtime workers there are (a single-worker
+runtime blocked by the turn would stall a runtime timer).
+
+- Deployed: the caller awaits the turn directly; the loop drives the async sender
+  through the caller's runtime handle (`Handle::block_on` on the loop thread).
+  After the turn it drops the stop signal and awaits the loop's done signal with
+  `tokio::time::timeout(STOP_GRACE, …)`.
+- Legacy: same loop; the turn's thread waits with `recv_timeout(STOP_GRACE)`.
+
+An abandoned loop (a send hung past the grace) sends nothing more and exits when
+the hung call returns. Every send logs a `send_typing sending …` / `send_typing ok`
+debug line (operator log), so an e2e can see each one.
 
 ## Webchat WS notify
 

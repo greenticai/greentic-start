@@ -1,7 +1,7 @@
 use super::*;
 use crate::typing::{SendTypingInV1, SendTypingOutV1};
 use std::sync::Mutex;
-use tokio::time::{Instant, sleep};
+use std::time::Instant;
 
 fn input() -> SendTypingInV1 {
     SendTypingInV1 {
@@ -19,22 +19,9 @@ fn input() -> SendTypingInV1 {
     }
 }
 
-/// Paused-time tests launch each send with `tokio::spawn` (still off the turn's
-/// task); the blocking-pool launcher inhibits paused-time auto-advance.
-fn launch_task(sender: Arc<dyn TypingSender>, input: Arc<SendTypingInV1>) -> SendHandle {
-    tokio::spawn(async move { sender.send_typing(&input).await })
-}
-
-async fn run<S: TypingSender, F: std::future::Future>(
-    sender: &Arc<S>,
-    input: SendTypingInV1,
-    turn: F,
-) -> F::Output {
-    let sender: Arc<dyn TypingSender> = sender.clone();
-    keep_typing_while_with(sender, input, turn, launch_task, STOP_GRACE).await
-}
-
-/// Records (start, end) of every call; each call takes `latency`.
+/// Async sender that records (start, end) of every call; each call BLOCKS its thread
+/// for `latency`, like the real deployed provider call. Real clock throughout: the
+/// loop runs on its own thread with std timers.
 struct Fake {
     refresh: Option<u64>,
     latency: Duration,
@@ -43,10 +30,10 @@ struct Fake {
 }
 
 impl Fake {
-    fn new(refresh: Option<u64>, latency: Duration) -> Self {
+    fn new(refresh: Option<u64>, latency_ms: u64) -> Self {
         Self {
             refresh,
-            latency,
+            latency: Duration::from_millis(latency_ms),
             ok: true,
             calls: Mutex::new(Vec::new()),
         }
@@ -60,7 +47,7 @@ impl Fake {
 impl TypingSender for Fake {
     async fn send_typing(&self, _: &SendTypingInV1) -> anyhow::Result<SendTypingOutV1> {
         let start = Instant::now();
-        sleep(self.latency).await;
+        std::thread::sleep(self.latency);
         self.calls.lock().unwrap().push((start, Instant::now()));
         Ok(SendTypingOutV1 {
             v: 1,
@@ -71,93 +58,54 @@ impl TypingSender for Fake {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn refreshes_every_3500ms_until_the_turn_ends() {
-    let fake = Arc::new(Fake::new(Some(4000), Duration::ZERO));
+async fn run<F: std::future::Future>(fake: &Arc<Fake>, turn: F) -> F::Output {
+    let sender: Arc<dyn TypingSender> = fake.clone();
+    keep_typing_while(sender, input(), turn).await
+}
+
+fn ms(v: u64) -> Duration {
+    Duration::from_millis(v)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refreshes_on_the_clamped_interval_until_the_turn_ends() {
+    // refresh_after_ms 1500 -> interval 1000 ms; a 2.5 s turn sees sends at ~0, 1, 2 s.
+    let fake = Arc::new(Fake::new(Some(1500), 0));
     let t0 = Instant::now();
-    let out = run(&fake, input(), async {
-        sleep(Duration::from_secs(10)).await;
+    let out = run(&fake, async {
+        tokio::time::sleep(ms(2500)).await;
         7
     })
     .await;
+    let returned = Instant::now();
     assert_eq!(out, 7, "turn output passes through untouched");
-    let starts: Vec<_> = fake
-        .calls()
-        .iter()
-        .map(|(s, _)| s.duration_since(t0))
-        .collect();
-    assert_eq!(
-        starts,
-        vec![
-            Duration::ZERO,
-            Duration::from_millis(3500),
-            Duration::from_millis(7000)
-        ]
-    );
+    let calls = fake.calls();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(calls.iter().all(|(_, end)| *end <= returned));
+    let second = calls[1].0.duration_since(t0);
+    assert!(second >= ms(950) && second < ms(1500), "{second:?}");
 }
 
-#[tokio::test(start_paused = true)]
-async fn no_send_starts_after_the_turn_and_in_flight_send_finishes_first() {
-    // First call 0→1 s, next would start at 4.5 s; the turn ends at 4.0 s, so the stop
-    // wins the sleep and only ONE call happens.
-    let fake = Arc::new(Fake::new(Some(4000), Duration::from_secs(1)));
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_in_flight_send_is_awaited_before_the_driver_returns() {
+    // The send takes 400 ms; the turn ends at 100 ms, mid-flight.
+    let fake = Arc::new(Fake::new(Some(4000), 400));
     let t0 = Instant::now();
-    run(&fake, input(), sleep(Duration::from_secs(4))).await;
+    run(&fake, tokio::time::sleep(ms(100))).await;
     let returned = Instant::now();
     let calls = fake.calls();
     assert_eq!(calls.len(), 1);
-    assert!(calls.iter().all(|(_, end)| *end <= returned));
-    assert_eq!(returned.duration_since(t0), Duration::from_secs(4));
+    assert!(calls[0].1 <= returned, "the reply must not race the send");
+    assert!(returned.duration_since(t0) < ms(1500));
 }
 
-#[tokio::test(start_paused = true)]
-async fn an_in_flight_send_is_awaited_before_the_driver_returns() {
-    // Latency 2 s, refresh 3.5 s: calls start at 0 and 5.5; the turn ends at 6.0,
-    // mid-flight. The driver must return at 7.5 (end of that call), not 6.0.
-    let fake = Arc::new(Fake::new(Some(4000), Duration::from_secs(2)));
-    let t0 = Instant::now();
-    run(&fake, input(), sleep(Duration::from_secs(6))).await;
-    let calls = fake.calls();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(
-        Instant::now().duration_since(t0),
-        Duration::from_millis(7500)
-    );
-    assert!(calls.iter().all(|(_, end)| *end <= Instant::now()));
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_hung_send_delays_the_reply_by_at_most_the_grace() {
-    let fake = Arc::new(Fake::new(Some(4000), Duration::from_secs(600)));
-    let t0 = Instant::now();
-    run(&fake, input(), sleep(Duration::from_secs(1))).await;
-    assert_eq!(
-        Instant::now().duration_since(t0),
-        Duration::from_secs(1) + STOP_GRACE
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn hung_turn_stops_refreshing_at_the_cap() {
-    let fake = Arc::new(Fake::new(Some(4000), Duration::ZERO));
-    let t0 = Instant::now();
-    run(&fake, input(), sleep(Duration::from_secs(600))).await;
-    let starts: Vec<_> = fake
-        .calls()
-        .iter()
-        .map(|(s, _)| s.duration_since(t0))
-        .collect();
-    assert_eq!(starts.len(), 35, "0, 3.5, …, 119.0");
-    assert_eq!(*starts.last().unwrap(), Duration::from_millis(119_000));
-}
-
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_send_is_not_retried_and_the_turn_is_unaffected() {
-    let mut fake = Fake::new(Some(4000), Duration::ZERO);
+    let mut fake = Fake::new(Some(1500), 0);
     fake.ok = false;
     let fake = Arc::new(fake);
-    let out = run(&fake, input(), async {
-        sleep(Duration::from_secs(10)).await;
+    let out = run(&fake, async {
+        tokio::time::sleep(ms(1500)).await;
         "reply"
     })
     .await;
@@ -165,14 +113,14 @@ async fn a_failed_send_is_not_retried_and_the_turn_is_unaffected() {
     assert_eq!(fake.calls().len(), 1);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn absent_refresh_sends_exactly_once() {
-    let fake = Arc::new(Fake::new(None, Duration::ZERO));
-    run(&fake, input(), sleep(Duration::from_secs(30))).await;
+    let fake = Arc::new(Fake::new(None, 0));
+    run(&fake, tokio::time::sleep(ms(1500))).await;
     assert_eq!(fake.calls().len(), 1);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_erroring_sender_never_fails_the_turn() {
     struct Boom;
     #[async_trait::async_trait]
@@ -181,7 +129,10 @@ async fn an_erroring_sender_never_fails_the_turn() {
             anyhow::bail!("op `send_typing` failed")
         }
     }
-    assert_eq!(run(&Arc::new(Boom), input(), async { 3 }).await, 3);
+    assert_eq!(
+        keep_typing_while(Arc::new(Boom), input(), async { 3 }).await,
+        3
+    );
 }
 
 /// The deployed provider call blocks its thread (a synchronous join inside one
@@ -212,7 +163,6 @@ fn a_thread_blocking_send_neither_starves_the_turn_nor_outlives_the_grace() {
             tokio::time::sleep(turn).await;
             "reply"
         },
-        launch_on_blocking_pool,
         grace,
     ));
     let waited = started.elapsed();
@@ -316,5 +266,47 @@ fn blocking_hung_send_delays_the_reply_by_at_most_the_grace() {
     assert!(
         log.lock().unwrap().is_empty(),
         "the hung call is still in flight"
+    );
+}
+
+/// Regression (e2e on the released binary): the deployed turn future runs sync WASM
+/// on a joined thread, so it blocks its task inside ONE poll. The refresh must not
+/// share that task, or it never fires until the turn is over.
+#[test]
+fn a_turn_that_blocks_its_thread_still_gets_refreshed() {
+    struct Counts(Mutex<Vec<std::time::Instant>>);
+    #[async_trait::async_trait]
+    impl TypingSender for Counts {
+        async fn send_typing(&self, _: &SendTypingInV1) -> anyhow::Result<SendTypingOutV1> {
+            self.0.lock().unwrap().push(std::time::Instant::now());
+            Ok(SendTypingOutV1 {
+                v: 1,
+                ok: true,
+                error: None,
+                refresh_after_ms: Some(1500), // interval = 1000 ms
+            })
+        }
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let sender = Arc::new(Counts(Mutex::new(Vec::new())));
+    let returned = rt.block_on(keep_typing_while(sender.clone(), input(), async {
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        std::time::Instant::now()
+    }));
+    rt.shutdown_background();
+    let before = sender
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|t| **t <= returned)
+        .count();
+    assert!(
+        before >= 3,
+        "expected sends at ~0, 1, 2, 3 s during a 4 s thread-blocking turn; got {before}"
     );
 }
