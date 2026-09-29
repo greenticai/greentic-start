@@ -1,4 +1,5 @@
-//! Spawn the routing-host binary, pipe JSON in, parse JSON out. Fails open.
+//! Spawn the routing-host binary, pipe JSON in, parse JSON out. Fails open,
+//! with the reason in the `Err` so the caller can log that the router failed.
 //!
 //! FIXME(Phase-D-vlad): replace direct spawn with EnvPackRegistry dispatch
 //! once `EnvPackHandler` grows an invoke verb in greentic-deployer.
@@ -12,11 +13,13 @@ use std::process::{Command, Stdio};
 
 use super::contracts::{Fast2FlowHookInV1, Fast2FlowHookOutV1};
 
-pub fn invoke_routing_host(
+/// Run the routing host. `Err` carries a short, operator-readable reason
+/// (spawn failure, non-zero exit, unparseable stdout) — never message text.
+pub fn invoke_routing_host_detailed(
     host_bin: &Path,
     input: &Fast2FlowHookInV1,
-) -> Option<Fast2FlowHookOutV1> {
-    let payload = serde_json::to_vec(input).ok()?;
+) -> Result<Fast2FlowHookOutV1, String> {
+    let payload = serde_json::to_vec(input).map_err(|err| format!("encode host input: {err}"))?;
 
     // Explicitly forward our process env so FAST2FLOW_* tuning vars
     // (MIN_CONFIDENCE, POLICY_PATH, LLM_PROVIDER, …) reach the host.
@@ -27,16 +30,21 @@ pub fn invoke_routing_host(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .ok()?;
+        .map_err(|err| format!("spawn {}: {err}", host_bin.display()))?;
 
     {
-        let stdin = child.stdin.as_mut()?;
-        if stdin.write_all(&payload).is_err() {
-            return None;
-        }
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "host stdin unavailable".to_string())?;
+        stdin
+            .write_all(&payload)
+            .map_err(|err| format!("write host stdin: {err}"))?;
     }
 
-    let output = child.wait_with_output().ok()?;
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("wait for host: {err}"))?;
     // Surface anything the host wrote to stderr — policy-load failures,
     // FAST2FLOW_TRACE_POLICY output, RUST_LOG diagnostics — so we don't
     // silently drop the host's only feedback channel.
@@ -48,9 +56,10 @@ pub fn invoke_routing_host(
         }
     }
     if !output.status.success() {
-        return None;
+        return Err(format!("host exited with {}", output.status));
     }
-    serde_json::from_slice::<Fast2FlowHookOutV1>(&output.stdout).ok()
+    serde_json::from_slice::<Fast2FlowHookOutV1>(&output.stdout)
+        .map_err(|err| format!("unparseable host output: {err}"))
 }
 
 #[cfg(all(test, unix))]
@@ -92,15 +101,17 @@ mod tests {
 
     #[test]
     fn missing_binary_fails_open() {
-        let result =
-            invoke_routing_host(Path::new("/definitely/not/a/real/binary"), &sample_input());
-        assert!(result.is_none());
+        let result = invoke_routing_host_detailed(
+            Path::new("/definitely/not/a/real/binary"),
+            &sample_input(),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
     fn parses_continue_directive_from_fake_host() {
         let (_dir, bin) = fake_host_emitting(r#"{"directive":{"type":"continue"}}"#);
-        let out = invoke_routing_host(&bin, &sample_input()).expect("parsed");
+        let out = invoke_routing_host_detailed(&bin, &sample_input()).expect("parsed");
         assert_eq!(out.directive, RoutingDirective::Continue);
     }
 
@@ -109,7 +120,7 @@ mod tests {
         let (_dir, bin) = fake_host_emitting(
             r#"{"directive":{"type":"dispatch","target":"support/refund","confidence":0.91,"reason":"keyword match"}}"#,
         );
-        let out = invoke_routing_host(&bin, &sample_input()).expect("parsed");
+        let out = invoke_routing_host_detailed(&bin, &sample_input()).expect("parsed");
         match out.directive {
             RoutingDirective::Dispatch { target, .. } => assert_eq!(target, "support/refund"),
             other => panic!("expected dispatch, got {other:?}"),
@@ -117,9 +128,22 @@ mod tests {
     }
 
     #[test]
+    fn failures_name_their_reason() {
+        let spawn = invoke_routing_host_detailed(
+            Path::new("/definitely/not/a/real/binary"),
+            &sample_input(),
+        )
+        .expect_err("spawn fails");
+        assert!(spawn.starts_with("spawn "), "{spawn}");
+        let (_dir, bin) = fake_host_emitting("not valid json at all");
+        let parse = invoke_routing_host_detailed(&bin, &sample_input()).expect_err("parse fails");
+        assert!(parse.starts_with("unparseable host output"), "{parse}");
+    }
+
+    #[test]
     fn malformed_output_fails_open() {
         let (_dir, bin) = fake_host_emitting("not valid json at all");
-        let result = invoke_routing_host(&bin, &sample_input());
-        assert!(result.is_none());
+        let result = invoke_routing_host_detailed(&bin, &sample_input());
+        assert!(result.is_err());
     }
 }

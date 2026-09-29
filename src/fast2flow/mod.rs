@@ -19,8 +19,8 @@ pub mod mapper;
 
 pub use config::Fast2FlowConfig;
 pub use contracts::{Fast2FlowHookInV1, MessageEnvelope};
-pub use gate::{FAST2FLOW_CAPABILITY, Fast2FlowGate};
-pub use host_process::invoke_routing_host;
+pub use gate::{FAST2FLOW_CAPABILITY, FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY, Fast2FlowGate};
+pub use host_process::invoke_routing_host_detailed;
 pub use llm_router::try_llm_route;
 pub use mapper::map_directive_to_control;
 
@@ -54,7 +54,7 @@ pub fn resolve_index_path(
             ),
         );
     }
-    operator_log::info(
+    operator_log::debug(
         module_path!(),
         format!(
             "[fast2flow:gate] index_check path={} exists={exists}",
@@ -64,8 +64,30 @@ pub fn resolve_index_path(
     exists.then_some(index_path)
 }
 
+/// What the deterministic router made of one request.
+///
+/// Three different facts that used to share one `None`: the router answered
+/// "nothing matches", the router was never asked (not configured for this
+/// pack/deployment), and the router was asked and FAILED. A caller that treats
+/// the last as the first reports an outage as a user's unclear message.
+#[derive(Debug, Clone)]
+pub enum RoutingOutcome {
+    /// An actionable directive (`Dispatch`, `Respond` or `Deny`).
+    Directive(ControlDirective),
+    /// The router ran and returned `Continue`.
+    NoMatch,
+    /// The router was not asked: gate closed, no index path, or no index for
+    /// this scope. The reason is a short token, never message text.
+    NotConfigured(String),
+    /// The router was asked and failed (spawn, exit status, unparseable
+    /// output). Logged at `warn` where it is produced.
+    Failed(String),
+}
+
 /// Eligibility + invoke + map. Returns `Some` only for actionable
 /// directives; `None` means skip (ineligible, Continue, or error).
+/// Test convenience over [`route_request`], which tells those cases apart.
+#[cfg(test)]
 pub fn try_for_request(
     cfg: &Fast2FlowConfig,
     ctx: &OperatorContext,
@@ -74,9 +96,24 @@ pub fn try_for_request(
     envelope: &ChannelMessageEnvelope,
     provider: &str,
 ) -> Option<ControlDirective> {
+    match route_request(cfg, ctx, pack, pack_path, envelope, provider) {
+        RoutingOutcome::Directive(directive) => Some(directive),
+        _ => None,
+    }
+}
+
+/// Eligibility + invoke + map, with every non-dispatch outcome named.
+pub fn route_request(
+    cfg: &Fast2FlowConfig,
+    ctx: &OperatorContext,
+    pack: &AppPackInfo,
+    pack_path: &std::path::Path,
+    envelope: &ChannelMessageEnvelope,
+    provider: &str,
+) -> RoutingOutcome {
     let deploy_intent = cfg.has_deploy_intent();
     let gate_enabled = cfg.gate.is_enabled(ctx, pack);
-    operator_log::info(
+    operator_log::debug(
         module_path!(),
         format!(
             "[fast2flow:gate] enter tenant={} team={:?} pack={} caps={:?} deploy_intent={} gate_enabled={} text_len={}",
@@ -89,29 +126,33 @@ pub fn try_for_request(
             envelope.text.as_deref().map(str::len).unwrap_or(0)
         ),
     );
+    // "Not configured" is a property of the deployment, not of this turn, so
+    // it is logged at debug: a warn here would fire on every message.
     if !deploy_intent || !gate_enabled {
-        operator_log::info(
+        operator_log::debug(
             module_path!(),
             format!(
                 "[fast2flow:gate] skip reason=gate deploy_intent={deploy_intent} gate_enabled={gate_enabled}"
             ),
         );
-        return None;
+        return RoutingOutcome::NotConfigured("gate".to_string());
     }
     let indexes_path = match cfg.indexes_path.as_ref() {
         Some(p) => p,
         None => {
-            operator_log::info(
+            operator_log::debug(
                 module_path!(),
                 "[fast2flow:gate] skip reason=no_indexes_path",
             );
-            return None;
+            return RoutingOutcome::NotConfigured("no_indexes_path".to_string());
         }
     };
     let scope = scope_for(ctx);
     // Resolve (and materialize) the scope index; short-circuit before spawning
     // the host when it's absent. Shared with the embedded LLM fallback.
-    resolve_index_path(cfg, ctx, pack_path)?;
+    if resolve_index_path(cfg, ctx, pack_path).is_none() {
+        return RoutingOutcome::NotConfigured("no_index".to_string());
+    }
 
     let text = envelope.text.clone().unwrap_or_default();
     let locale = envelope
@@ -145,7 +186,25 @@ pub fn try_for_request(
         now_unix_ms,
     };
 
-    let out = invoke_routing_host(&cfg.host_bin, &input)?;
+    let out = match invoke_routing_host_detailed(&cfg.host_bin, &input) {
+        Ok(out) => out,
+        Err(reason) => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "[fast2flow] routing host failed tenant={} pack={} reason={reason}",
+                    ctx.tenant, pack.pack_id
+                ),
+            );
+            tracing::warn!(
+                target: "greentic.fast2flow",
+                tenant = %ctx.tenant,
+                reason = %reason,
+                "fast2flow routing host failed"
+            );
+            return RoutingOutcome::Failed(reason);
+        }
+    };
     let routing = out.directive;
     // Observability: surface the matcher's decision (target + confidence + reason)
     // before `map_directive_to_control` collapses it. Emitted via `tracing` so it
@@ -178,8 +237,8 @@ pub fn try_for_request(
     );
 
     match directive {
-        ControlDirective::Continue => None,
-        actionable => Some(actionable),
+        ControlDirective::Continue => RoutingOutcome::NoMatch,
+        actionable => RoutingOutcome::Directive(actionable),
     }
 }
 
@@ -442,6 +501,83 @@ mod tests {
                 result.is_none(),
                 "Continue directive maps to None so caller falls through"
             );
+        }
+
+        #[test]
+        fn route_request_tells_no_match_not_configured_and_failure_apart() {
+            let indexes = tempdir().expect("indexes dir");
+            place_index(indexes.path(), "acme:default");
+            let pack_path = std::path::Path::new("/nonexistent.gtpack");
+
+            let (_dir, host) = fake_host(r#"{"directive":{"type":"continue"}}"#);
+            let cfg = config_with(host, Some(indexes.path().to_path_buf()));
+            let outcome = route_request(
+                &cfg,
+                &ctx(),
+                &pack_with_fast2flow_cap(),
+                pack_path,
+                &envelope("hi"),
+                "webchat",
+            );
+            assert!(matches!(outcome, RoutingOutcome::NoMatch), "{outcome:?}");
+
+            let cfg = config_with(
+                PathBuf::from("/definitely/not/a/routing/host"),
+                Some(indexes.path().to_path_buf()),
+            );
+            let outcome = route_request(
+                &cfg,
+                &ctx(),
+                &pack_with_fast2flow_cap(),
+                pack_path,
+                &envelope("hi"),
+                "webchat",
+            );
+            assert!(
+                matches!(outcome, RoutingOutcome::Failed(ref r) if r.starts_with("spawn ")),
+                "{outcome:?}"
+            );
+
+            let empty = tempdir().expect("empty indexes");
+            let cfg = config_with(
+                PathBuf::from("/definitely/not/a/routing/host"),
+                Some(empty.path().to_path_buf()),
+            );
+            let outcome = route_request(
+                &cfg,
+                &ctx(),
+                &pack_with_fast2flow_cap(),
+                pack_path,
+                &envelope("hi"),
+                "webchat",
+            );
+            assert!(
+                matches!(outcome, RoutingOutcome::NotConfigured(ref r) if r == "no_index"),
+                "{outcome:?}"
+            );
+        }
+
+        #[test]
+        fn route_request_carries_the_host_confidence() {
+            let (_dir, host) = fake_host(
+                r#"{"directive":{"type":"dispatch","target":"sales-crm/pipeline_flow","confidence":0.9,"reason":"m"}}"#,
+            );
+            let indexes = tempdir().expect("indexes dir");
+            place_index(indexes.path(), "acme:default");
+            let cfg = config_with(host, Some(indexes.path().to_path_buf()));
+            match route_request(
+                &cfg,
+                &ctx(),
+                &pack_with_fast2flow_cap(),
+                std::path::Path::new("/nonexistent.gtpack"),
+                &envelope("pipeline"),
+                "webchat",
+            ) {
+                RoutingOutcome::Directive(ControlDirective::Dispatch { confidence, .. }) => {
+                    assert_eq!(confidence, Some(0.9));
+                }
+                other => panic!("expected dispatch, got {other:?}"),
+            }
         }
     }
 }

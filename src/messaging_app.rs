@@ -701,12 +701,25 @@ fn extract_capabilities(value: &CborValue) -> Vec<String> {
         _ => return caps,
     };
     let cap_names_table = symbol_table_array(map, "capability_names");
-    for entry in entries {
-        if let CborValue::Map(entry_map) = entry
-            && let Some(name) = resolve_capability_name(entry_map, cap_names_table)
-        {
-            caps.push(name);
-        }
+    for (index, entry) in entries.iter().enumerate() {
+        let dropped = match entry {
+            CborValue::Map(entry_map) => {
+                match resolve_capability_name(entry_map, cap_names_table) {
+                    Some(name) => {
+                        caps.push(name);
+                        continue;
+                    }
+                    None => "a name that is missing, not text, or an out-of-range symbol index",
+                }
+            }
+            _ => "not a {name, description} map",
+        };
+        // A malformed opt-in (e.g. a bare string where a map is expected) is
+        // otherwise ignored with no trace, and the pack silently loses it.
+        operator_log::warn(
+            module_path!(),
+            format!("[messaging_app] pack capability entry #{index} dropped: {dropped}"),
+        );
     }
     caps
 }
