@@ -138,6 +138,9 @@ mod topic_match;
 mod trace_stderr;
 mod tunnel_prompt;
 mod tunnel_state;
+// TEMPORARY: unused until the ingress paths are wired (removed in the wiring commit).
+#[allow(dead_code, unused_imports)]
+mod typing;
 mod warmup;
 mod webchat_routing;
 mod webhook_secret_resolver;
