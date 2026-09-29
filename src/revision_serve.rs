@@ -5431,6 +5431,9 @@ async fn dispatch_provider_route(
     let descriptor_pack_path = route_match.descriptor.pack_path.clone();
     let descriptor_pack_non_secret = route_match.descriptor.pack_non_secret.clone();
     let provider_op = route_match.descriptor.provider_op.clone();
+    // Decided once at revision activation from the provider's declared ops; the
+    // per-turn path never probes `send_typing` by invoking it.
+    let supports_typing = route_match.descriptor.supports_typing;
     let route_tenant = route_match.tenant.clone();
     let route_team = route_match.team.clone();
     let deployment_id = scope.deployment_id;
@@ -5878,6 +5881,7 @@ async fn dispatch_provider_route(
                     flow_target,
                     welcome_hint,
                     pipeline_notifier,
+                    supports_typing,
                 )
                 .await;
             }
@@ -5971,7 +5975,30 @@ async fn run_provider_inbound_pipeline(
     flow_target: Option<WelcomeFlowHint>,
     welcome_hint: Option<WelcomeFlowHint>,
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
+    supports_typing: bool,
 ) {
+    // Channel "is typing" signal (docs/typing-signal.md). Built once per batch and
+    // only when the provider declares `send_typing` and the kill switch is on. The
+    // config is the same per-pack override value `run_reply_egress` hands
+    // `send_payload`.
+    let typing_sender = (supports_typing && crate::typing::enabled()).then(|| {
+        Arc::new(crate::typing::RevisionTypingSender {
+            host: Arc::clone(&activation.host),
+            tenant: tenant.clone(),
+            deployment_id,
+            bundle_id: bundle_id.clone(),
+            revision_id,
+            provider_type: provider_type.clone(),
+            notifier: Arc::clone(&notifier),
+        }) as Arc<dyn crate::typing::TypingSender>
+    });
+    let typing_config = typing_sender.as_ref().and_then(|_| {
+        crate::messaging_egress::pack_config_overrides_as_json(
+            &activation.routing.deployment_config_overrides,
+            deployment_id,
+            &pack_id,
+        )
+    });
     for ingress in &envelopes {
         // Per-envelope flow targeting: if the envelope carries a
         // `flow_hint` metadata key (the provider echoing back the flow the
@@ -6012,17 +6039,30 @@ async fn run_provider_inbound_pipeline(
             envelope_hint,
             envelope_target,
         );
-        let replies = match activation
-            .host
-            .handle_activity_for_revision(
-                &tenant,
-                deployment_id,
-                bundle_id.clone(),
-                revision_id,
-                activity,
-            )
-            .await
-        {
+        let turn = activation.host.handle_activity_for_revision(
+            &tenant,
+            deployment_id,
+            bundle_id.clone(),
+            revision_id,
+            activity,
+        );
+        let typing_input = crate::typing::typing_input_for(
+            typing_sender.is_some(),
+            true,
+            &provider_type,
+            &tenant,
+            ingress,
+            typing_config.clone(),
+        );
+        let turn_result = match (&typing_sender, typing_input) {
+            (Some(sender), Some(input)) => {
+                crate::typing::keep_typing_while(Arc::clone(sender), input, turn).await
+            }
+            _ => turn.await,
+        };
+        // `keep_typing_while` has returned: no refresh can start after this point,
+        // so a typing indicator never lands after the reply below.
+        let replies = match turn_result {
             Ok(replies) => replies,
             Err(err) => {
                 operator_log::error(
@@ -6190,7 +6230,7 @@ async fn run_reply_egress(
 /// The metadata may appear at the top level (`send_payload`) or inside a
 /// base64-encoded `body_b64` field (`directline_http`). When absent the call
 /// is a no-op — non-webchat providers simply don't carry `_greentic`.
-async fn try_notify_webchat_activity(
+pub(crate) async fn try_notify_webchat_activity(
     notifier: &dyn crate::notifier::ActivityNotifier,
     output: &Value,
 ) {

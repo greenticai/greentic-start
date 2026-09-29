@@ -138,6 +138,7 @@ mod topic_match;
 mod trace_stderr;
 mod tunnel_prompt;
 mod tunnel_state;
+mod typing;
 mod warmup;
 mod webchat_routing;
 mod webhook_secret_resolver;

@@ -300,6 +300,11 @@ At startup, [src/lib.rs](/projects/ai/greentic-ng/greentic-start/src/lib.rs:115)
 
 Do not accidentally break these unless the contract is intentionally changing.
 
+### Typing signal
+
+- `GREENTIC_TYPING_SIGNAL` — default on; `0`/`false`/`no`/`off` stops every
+  `send_typing` call. See [docs/typing-signal.md](typing-signal.md).
+
 ### DirectLine session-token renewal
 
 The HTTP ingress fronts the webchat provider's `/v3/directline/...` endpoints and

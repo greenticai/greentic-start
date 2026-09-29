@@ -60,7 +60,7 @@ pub struct SendPayloadInV1 {
     pub config: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TenantHint {
     pub tenant: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

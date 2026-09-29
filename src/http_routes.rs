@@ -70,6 +70,12 @@ pub struct HttpRouteDescriptor {
     /// (see [`crate::revision_provider_config`]). `None` for legacy routes and
     /// for packs whose revision carries no non-secret config.
     pub pack_non_secret: Option<Arc<BTreeMap<String, serde_json::Value>>>,
+    /// Whether this route's provider declares the OPTIONAL `send_typing` op in its
+    /// `greentic.provider-extension.v1` `ops` — the same array the runner's
+    /// `declared_ops` allowlist check reads. Decided ONCE at revision activation so
+    /// the per-turn path never probes by invoking and catching the refusal. `false`
+    /// for legacy routes, which name no provider.
+    pub supports_typing: bool,
     /// Parsed segments from the pattern for matching.
     segments: Vec<RouteSegment>,
 }
@@ -120,6 +126,7 @@ pub(crate) fn descriptor_for_test(
         pack_path: PathBuf::from("<test-pack>"),
         scope,
         pack_non_secret: None,
+        supports_typing: false,
         segments: parse_route_pattern(pattern),
     }
 }
@@ -144,6 +151,7 @@ pub(crate) fn provider_descriptor_for_test(
         pack_path: PathBuf::from("<test-pack>"),
         scope: Some(scope),
         pack_non_secret: None,
+        supports_typing: false,
         segments: parse_route_pattern(pattern),
     }
 }
@@ -533,6 +541,9 @@ fn parse_http_routes_v1(
             // runtime-config-backed discovery stamps `Some(..)`.
             scope: None,
             pack_non_secret: None,
+            // Legacy http-routes.v1 names no provider; discovery may set it when a
+            // provider_type is inherited (see `discover_revision_routes`).
+            supports_typing: false,
             segments,
         });
     }
@@ -645,6 +656,17 @@ fn sole_ingest_http_provider_type(manifest: &PackManifest) -> Option<String> {
     Some(first.provider_type.clone())
 }
 
+/// Whether the manifest's `greentic.provider-extension.v1` declares `op` for the
+/// provider with `provider_type` — mirrors the runner's `declared_ops` allowlist.
+fn provider_declares_op(manifest: &PackManifest, provider_type: &str, op: &str) -> bool {
+    manifest.provider_extension_inline().is_some_and(|inline| {
+        inline
+            .providers
+            .iter()
+            .any(|p| p.provider_type == provider_type && p.ops.iter().any(|o| o == op))
+    })
+}
+
 fn synthesize_provider_routes_from_manifest(
     manifest: &PackManifest,
     pack_path: &Path,
@@ -686,6 +708,7 @@ fn synthesize_provider_routes_from_manifest(
                 pack_path: pack_path.to_path_buf(),
                 scope: Some(scope.clone()),
                 pack_non_secret: None,
+                supports_typing: provider.ops.iter().any(|op| op == crate::typing::TYPING_OP),
                 segments,
             });
         }
@@ -741,6 +764,8 @@ pub fn discover_revision_routes(
                         && let Some(pt) = pack_provider_type.as_deref()
                     {
                         route.provider_type = Some(pt.to_string());
+                        route.supports_typing =
+                            provider_declares_op(&manifest, pt, crate::typing::TYPING_OP);
                     }
                 }
                 routes.extend(declared);
@@ -1630,6 +1655,23 @@ pub(crate) mod tests {
         provider_types: &[&str],
         declared: &[(&str, &str)],
     ) {
+        write_provider_pack_with_declared_routes_and_ops(
+            path,
+            pack_id,
+            provider_types,
+            &["ingest_http", "send"],
+            declared,
+        );
+    }
+
+    /// [`write_provider_pack_with_declared_routes`] with the providers' `ops` chosen.
+    fn write_provider_pack_with_declared_routes_and_ops(
+        path: &Path,
+        pack_id: &str,
+        provider_types: &[&str],
+        ops: &[&str],
+        declared: &[(&str, &str)],
+    ) {
         use std::io::Write as _;
         use zip::write::FileOptions;
 
@@ -1639,7 +1681,7 @@ pub(crate) mod tests {
                 serde_json::json!({
                     "provider_type": provider_type,
                     "capabilities": [],
-                    "ops": ["ingest_http", "send"],
+                    "ops": ops,
                     "config_schema_ref": "config.schema.json",
                     "runtime": {
                         "component_ref": format!("{pack_id}-component"),
@@ -1852,5 +1894,85 @@ pub(crate) mod tests {
             "nothing rewrites a declared pattern; asserting the absence keeps this caveat \
              from being discovered in production",
         );
+    }
+
+    #[test]
+    fn supports_typing_follows_declared_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let with = dir.path().join("tg.gtpack");
+        write_provider_pack(
+            &with,
+            "tg",
+            "messaging.telegram.bot",
+            &["ingest_http", "send_payload", "send_typing"],
+        );
+        let without = dir.path().join("sl.gtpack");
+        write_provider_pack(
+            &without,
+            "sl",
+            "messaging.slack.api",
+            &["ingest_http", "send_payload"],
+        );
+        let scope = scope_for(DeploymentId::new(), RevisionId::new());
+        let routes = discover_revision_routes(&[with, without], &scope, &[]);
+        let by_type = |t: &str| {
+            routes
+                .iter()
+                .find(|r| r.provider_type.as_deref() == Some(t))
+                .unwrap()
+        };
+        assert!(by_type("messaging.telegram.bot").supports_typing);
+        assert!(
+            !by_type("messaging.slack.api").supports_typing,
+            "a provider that does not declare send_typing is never invoked for it"
+        );
+    }
+
+    #[test]
+    fn declared_route_inherits_supports_typing_from_its_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("wc.gtpack");
+        write_provider_pack_with_declared_routes_and_ops(
+            &pack,
+            "messaging-webchat-gui",
+            &["messaging.webchat-gui"],
+            &[
+                "ingest_http",
+                "directline_http",
+                "send_payload",
+                "send_typing",
+            ],
+            &[(
+                "/v3/directline/conversations/{id}/activities",
+                "directline_http",
+            )],
+        );
+        let scope = scope_for(DeploymentId::new(), RevisionId::new());
+        let routes = discover_revision_routes(&[pack], &scope, &[]);
+        let declared = routes
+            .iter()
+            .find(|r| r.provider_op == "directline_http")
+            .unwrap();
+        assert!(declared.supports_typing);
+    }
+
+    #[test]
+    fn declared_route_without_the_op_does_not_claim_typing() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("slack.gtpack");
+        write_provider_pack_with_declared_routes(
+            &pack,
+            "messaging-slack",
+            &["messaging.slack.api"],
+            &[("/webhook/slack/interactivity", INGEST_HTTP_OP)],
+        );
+        let scope = scope_for(DeploymentId::new(), RevisionId::new());
+        let routes = discover_revision_routes(&[pack], &scope, &[]);
+        assert!(routes.iter().all(|r| !r.supports_typing));
+    }
+
+    #[test]
+    fn legacy_routes_never_claim_typing() {
+        assert!(!descriptor_for_test("/x", &["POST"], Domain::Messaging, None).supports_typing);
     }
 }

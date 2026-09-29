@@ -127,6 +127,7 @@ Crate version 1.2.0-dev.0, edition 2024, Rust 1.95.0 (pinned via `rust-toolchain
 | `GREENTIC_RUNNER_SESSION_NAMESPACE` | Session keyspace prefix; defaults to `greentic:session:<env>`. Per-environment namespacing is the operator's job |
 | `GREENTIC_RUNNER_SESSION_WAIT_TTL_SECS` | How long a parked conversation survives (default `86400`; `0` disables expiry) |
 | `GREENTIC_REVISION_PIN_REDIS_URL` | Revision affinity. Set it whenever durable sessions are on and more than one revision serves traffic |
+| `GREENTIC_TYPING_SIGNAL` | Channel "is typing" signal via the optional provider op `send_typing`. Default on; `0`/`false`/`no`/`off` disable it. See [docs/typing-signal.md](docs/typing-signal.md) |
 
 ## Git Conventions
 
