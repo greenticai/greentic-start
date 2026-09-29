@@ -40,6 +40,7 @@
 //!   only to an `https` endpoint (or a loopback `http` one, which cannot leave
 //!   the host).
 
+pub(crate) mod approval_inbox;
 pub(crate) mod event;
 pub(crate) mod run_outcome;
 pub(crate) mod runtime_meter;

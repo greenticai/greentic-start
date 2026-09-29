@@ -65,6 +65,7 @@ use greentic_deploy_spec::ids::{DeploymentId, RevisionId};
 use greentic_runner_host::runtime::RevisionHostOptions;
 
 use super::MeteringConfig;
+use super::approval_inbox::approval_inbox_target;
 use super::run_outcome::run_outcome_sink;
 use crate::operator_log;
 
@@ -103,12 +104,13 @@ pub(crate) struct UnitHostOptions {
     pub meters_usage: bool,
 }
 
-/// [`worker_usage_meter`] and [`super::run_outcome::run_outcome_sink`], folded
-/// into [`RevisionHostOptions`], with each refusal turned into one operator
-/// line and that half left out.
+/// [`worker_usage_meter`], [`super::run_outcome::run_outcome_sink`] and
+/// [`super::approval_inbox::approval_inbox_target`], folded into
+/// [`RevisionHostOptions`], with each refusal turned into one operator line and
+/// that part left out.
 ///
-/// The two are decided independently: a unit whose run-outcome door cannot be
-/// derived still records its usage, and the reverse. An absent block yields
+/// The three are decided independently: a unit whose run-outcome or approval
+/// doors cannot be derived still records its usage, and the reverse. An absent block yields
 /// `RevisionHostOptions::default()`, which is byte-for-byte what
 /// `TenantRuntime::load_revision` did.
 pub(crate) fn host_options_for_unit(
@@ -148,6 +150,22 @@ pub(crate) fn host_options_for_unit(
                 format!(
                     "run outcome reporting for unit `{bundle_id}` revision `{revision_id}` is \
                      off: {err}; the revision runs without recording its run outcomes"
+                ),
+            );
+        }
+    }
+    match approval_inbox_target(metering) {
+        Ok(Some(target)) => options = options.with_approval_inbox(target),
+        Ok(None) => {}
+        Err(err) => {
+            // `ApprovalInboxRefusal`'s messages name a field or a URL, never
+            // the token.
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "the HTTP approval inbox for unit `{bundle_id}` is off: {err}; an approval \
+                     that needs a human fails at its node unless the NATS approval rail is \
+                     configured"
                 ),
             );
         }
