@@ -185,42 +185,9 @@ fn fetch_remote_bundle(reference: &str, allow_insecure: bool) -> anyhow::Result<
     // `OCI_USERNAME`/`OCI_PASSWORD` pair is honored, and it takes precedence
     // over the ambient AR token — see `resolve_pull_credentials`.
     let credentials = resolve_pull_credentials(&mapped_ref, generic_registry_credentials());
-    // `DefaultRegistryClient`'s two public constructors are mutually
-    // exclusive and neither field they set (transport protocol, auth) is
-    // reachable from outside the crate once built: `with_basic_auth` always
-    // builds on top of `default_client()`, which hardcodes HTTPS, and
-    // `with_insecure_registries` always builds with `Anonymous` auth baked
-    // in. There is no public way to combine them into one client, so a
-    // registry that is BOTH plain-HTTP and password-protected cannot be
-    // expressed through this type today — that is a gap in
-    // `greentic-distributor-client`'s public API, not something this call
-    // site works around. Credentials win when both apply (see below), which
-    // is the right default for the motivating case (an authenticated
-    // registry, almost always HTTPS) at the cost of leaving the plain-HTTP
-    // *and* authenticated combination unreachable until the client crate
-    // grows a combined constructor.
-    let fetcher: OciPackFetcher<DefaultRegistryClient> =
-        if let Some((username, password)) = credentials {
-            if !insecure_registries.is_empty() {
-                tracing::warn!(
-                    registries = ?insecure_registries,
-                    "GREENTIC_OCI_INSECURE_REGISTRIES is set but this pull is authenticated; \
-                     DefaultRegistryClient cannot combine basic auth with insecure transport, \
-                     so this pull stays HTTPS and will fail if the registry only serves plain HTTP"
-                );
-            }
-            OciPackFetcher::with_client(
-                DefaultRegistryClient::with_basic_auth(username, password),
-                opts,
-            )
-        } else if insecure_registries.is_empty() {
-            OciPackFetcher::new(opts)
-        } else {
-            OciPackFetcher::with_client(
-                DefaultRegistryClient::with_insecure_registries(insecure_registries),
-                opts,
-            )
-        };
+    let client = build_registry_client(credentials, insecure_registries.clone())?;
+    ensure_plain_http_honoured(&client, &mapped_ref, &insecure_registries)?;
+    let fetcher: OciPackFetcher<DefaultRegistryClient> = OciPackFetcher::with_client(client, opts);
     let fetched = rt
         .block_on(fetcher.fetch_pack_to_cache(&mapped_ref))
         .with_context(|| format!("fetch bundle reference {reference}"))?;
@@ -231,6 +198,71 @@ fn fetch_remote_bundle(reference: &str, allow_insecure: bool) -> anyhow::Result<
         path: fetched.path,
         kind,
     })
+}
+
+/// Build the registry client for one pull from its two independent axes:
+/// credentials (auth) and the insecure-registry allow-list (transport).
+///
+/// Until greentic-distributor-client PD5 (#278) these could not be combined:
+/// `with_basic_auth` always built an all-HTTPS client and
+/// `with_insecure_registries` always built an anonymous one, so an
+/// authenticated pull silently stayed HTTPS and a registry that was BOTH
+/// plain-HTTP and password-protected was unreachable. `try_with_insecure_transport`
+/// layers the transport onto an already-authenticated client, and refuses an
+/// allow-list entry that could never match a registry (a scheme, a path,
+/// userinfo, whitespace) instead of leaving that registry on HTTPS.
+///
+/// The anonymous branch keeps the unchecked `with_insecure_registries` it
+/// always used, so this change cannot fail a boot that works today.
+fn build_registry_client(
+    credentials: Option<(String, String)>,
+    insecure_registries: Vec<String>,
+) -> anyhow::Result<DefaultRegistryClient> {
+    match credentials {
+        Some((username, password)) if !insecure_registries.is_empty() => {
+            DefaultRegistryClient::with_basic_auth(username, password)
+                .try_with_insecure_transport(insecure_registries)
+                .context("GREENTIC_OCI_INSECURE_REGISTRIES")
+        }
+        Some((username, password)) => {
+            Ok(DefaultRegistryClient::with_basic_auth(username, password))
+        }
+        None if insecure_registries.is_empty() => Ok(DefaultRegistryClient::default()),
+        None => Ok(DefaultRegistryClient::with_insecure_registries(
+            insecure_registries,
+        )),
+    }
+}
+
+/// Refuse a pull whose registry the operator listed as plain-HTTP but which
+/// the client would nonetheless reach over HTTPS.
+///
+/// That combination used to be a `warn!` followed by an HTTPS attempt that
+/// failed later with a TLS error naming neither the allow-list nor the
+/// credentials. Failing here names both halves. The registry is compared the
+/// way `oci-client` resolves it from the reference, which is also how
+/// `uses_plain_http_for` matches it.
+fn ensure_plain_http_honoured(
+    client: &DefaultRegistryClient,
+    mapped_ref: &str,
+    insecure_registries: &[String],
+) -> anyhow::Result<()> {
+    if insecure_registries.is_empty() {
+        return Ok(());
+    }
+    let reference: greentic_distributor_client::oci_client::Reference = mapped_ref
+        .parse()
+        .with_context(|| format!("parse OCI reference {mapped_ref}"))?;
+    let registry = reference.resolve_registry();
+    let listed = insecure_registries.iter().any(|entry| entry == registry);
+    if listed && !client.uses_plain_http_for(registry) {
+        bail!(
+            "registry {registry} is listed in GREENTIC_OCI_INSECURE_REGISTRIES but this pull \
+             (authenticated: {}) would use HTTPS; refusing rather than failing later with a TLS error",
+            client.has_credentials()
+        );
+    }
+    Ok(())
 }
 
 /// Read the `GREENTIC_OCI_INSECURE_REGISTRIES` allow-list. Unset or empty
@@ -1850,10 +1882,8 @@ mod tests {
     /// when `insecure_registries_for_fetch` is empty (or clearing the
     /// insecure list whenever credentials are present), either of which
     /// would make this test fail while leaving each half's own test green.
-    /// `fetch_remote_bundle`'s doc comment records why `DefaultRegistryClient`
-    /// still can't combine both into a single network client — this test is
-    /// about the configuration RESOLUTION not silently dropping either half,
-    /// which is the part this crate controls.
+    /// `build_registry_client_combines_basic_auth_with_plain_http` below pins
+    /// that the two halves then land in ONE client.
     #[test]
     fn insecure_registries_and_generic_credentials_resolve_independently() {
         let _guard = crate::test_env_lock().lock().unwrap();
@@ -1882,5 +1912,101 @@ mod tests {
             std::env::remove_var("OCI_USERNAME");
             std::env::remove_var("OCI_PASSWORD");
         }
+    }
+
+    const TEST_PASSWORD: &str = "pl41n-http-s3cret";
+
+    fn creds() -> Option<(String, String)> {
+        Some(("robot".to_string(), TEST_PASSWORD.to_string()))
+    }
+
+    /// The case greentic-distributor-client PD5 made reachable: a registry
+    /// that is BOTH plain-HTTP and password-protected. Before, the credential
+    /// won and the pull silently stayed HTTPS.
+    #[test]
+    fn build_registry_client_combines_basic_auth_with_plain_http() {
+        let client = build_registry_client(creds(), vec!["registry.local:5000".to_string()])
+            .expect("bare host:port");
+        assert!(client.has_credentials());
+        assert!(client.uses_plain_http_for("registry.local:5000"));
+        assert!(!client.uses_plain_http_for("ghcr.io"));
+        ensure_plain_http_honoured(
+            &client,
+            "registry.local:5000/acme/demo:v1",
+            &["registry.local:5000".to_string()],
+        )
+        .expect("listed registry is plain HTTP");
+    }
+
+    #[test]
+    fn build_registry_client_keeps_https_without_an_allow_list() {
+        let authed = build_registry_client(creds(), Vec::new()).expect("client");
+        assert!(authed.has_credentials());
+        assert!(!authed.uses_plain_http_for("registry.local:5000"));
+
+        let anonymous = build_registry_client(None, Vec::new()).expect("client");
+        assert!(!anonymous.has_credentials());
+        assert!(!anonymous.uses_plain_http_for("registry.local:5000"));
+    }
+
+    #[test]
+    fn build_registry_client_anonymous_plain_http_is_unchanged() {
+        let client =
+            build_registry_client(None, vec!["registry.local:5000".to_string()]).expect("client");
+        assert!(!client.has_credentials());
+        assert!(client.uses_plain_http_for("registry.local:5000"));
+    }
+
+    /// A mistyped allow-list entry on an authenticated pull fails naming the
+    /// entry, never silently staying HTTPS — and never echoing the password.
+    #[test]
+    fn build_registry_client_refuses_a_malformed_entry_without_leaking_the_password() {
+        let err = build_registry_client(creds(), vec!["http://registry.local:5000".to_string()])
+            .err()
+            .expect("scheme-prefixed entry must be refused");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("http://registry.local:5000"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("GREENTIC_OCI_INSECURE_REGISTRIES"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(TEST_PASSWORD), "{rendered}");
+        assert!(!format!("{err:?}").contains(TEST_PASSWORD));
+    }
+
+    /// A listed registry the client would still reach over HTTPS is an ERROR,
+    /// not the warning-and-HTTPS-attempt it used to be.
+    #[test]
+    fn ensure_plain_http_honoured_refuses_a_listed_registry_on_https() {
+        let https_only = DefaultRegistryClient::with_basic_auth("robot", TEST_PASSWORD);
+        let err = ensure_plain_http_honoured(
+            &https_only,
+            "registry.local:5000/acme/demo:v1",
+            &["registry.local:5000".to_string()],
+        )
+        .expect_err("listed registry on HTTPS must be refused");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("registry.local:5000"), "{rendered}");
+        assert!(
+            rendered.contains("GREENTIC_OCI_INSECURE_REGISTRIES"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(TEST_PASSWORD), "{rendered}");
+    }
+
+    #[test]
+    fn ensure_plain_http_honoured_ignores_unlisted_registries_and_empty_lists() {
+        let https_only = DefaultRegistryClient::with_basic_auth("robot", TEST_PASSWORD);
+        ensure_plain_http_honoured(
+            &https_only,
+            "ghcr.io/acme/demo:v1",
+            &["registry.local:5000".to_string()],
+        )
+        .expect("unlisted registry stays HTTPS");
+        ensure_plain_http_honoured(&https_only, "registry.local:5000/acme/demo:v1", &[])
+            .expect("no allow-list, nothing to honour");
     }
 }
