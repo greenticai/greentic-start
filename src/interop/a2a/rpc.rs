@@ -13,7 +13,8 @@
 //! [`send_message`] for why that does not weaken D8, and
 //! [`artifacts_for`] for why the prose rides an artifact too.
 //!
-//! `GetTask` still answers `-32001` for every id, this one included: see
+//! Every `Task` answered here is snapshotted in [`super::tasks::TaskStore`],
+//! and `GetTask` answers that snapshot to the credential that created it: see
 //! [`handle_jsonrpc`]'s `GET_TASK` arm.
 
 use async_trait::async_trait;
@@ -275,12 +276,12 @@ async fn send_message(
         Outcome::Completed
     });
     ctx.trace.task_state(state.wire_name());
-    Ok(SendMessageResponse::Task(Task {
+    let task = Task {
         // D9: one conversation parks at most one turn, so the conversation
-        // names the one thing that can be resumed — and needs no store. A
-        // completed task is keyed the same way for the same reason: the
-        // stateless MVP (D4) has nothing else to mint an id from, and
-        // `GetTask` refuses every id including this one either way.
+        // names the one thing that can be resumed. A completed task is keyed
+        // the same way: the turn ran synchronously and there is nothing else
+        // to mint an id from. A later turn in the same conversation therefore
+        // REPLACES the stored snapshot, which is what `GetTask` should answer.
         id: context_id.clone(),
         context_id,
         status: TaskStatus {
@@ -293,7 +294,28 @@ async fn send_message(
         artifacts,
         history: Vec::new(),
         metadata: None,
-    }))
+    };
+    record_task(ctx, credential_id, &task);
+    Ok(SendMessageResponse::Task(task))
+}
+
+/// Snapshot `task` for a later `GetTask`. Never fails the turn: a snapshot
+/// that could not be kept only means a later poll answers `-32001`, which is
+/// what every poll answered before the store existed.
+fn record_task(ctx: &A2aContext<'_>, credential_id: &str, task: &Task) {
+    if let Err(reason) = ctx.tasks.put(
+        ctx.tenant,
+        ctx.deployment_id,
+        credential_id,
+        task,
+        std::time::Instant::now(),
+    ) {
+        tracing::warn!(
+            ?reason,
+            credential_id,
+            "a2a: task snapshot not stored; GetTask will not find it"
+        );
+    }
 }
 
 /// The artifacts one turn's answer carries.
@@ -584,34 +606,31 @@ pub(crate) async fn handle_jsonrpc(
                 }
             }
         }
-        // `-32001` for EVERY id, including one this server minted for a
-        // parked turn (D9). Contract §9.3 asks for such an id to resolve by
-        // reading the session the turn parked on; that is not reachable from
-        // here, and faking it would be worse than refusing:
+        // The snapshot `SendMessage` recorded for this credential, or
+        // `-32001`. It is read from [`super::tasks::TaskStore`] and NEVER
+        // derived from the runtime's session store: a poll must not run a
+        // turn, and the four derivations a session lookup would need (pack
+        // id, reply scope, revision, user digest) each fail silently to "no
+        // wait found". The store only repeats what this server already said.
         //
-        // - the only seam to the runtime is `TurnRunner::run`, which runs a
-        //   turn — the one thing a poll must not do;
-        // - a wait is found by `find_wait_by_scope(ctx, user, scope)` in
-        //   greentic-runner-host, where `user` is a digest of
-        //   `<hint>::pack=<pack id>` and `scope` is the `ReplyScope` the
-        //   PARKING envelope carried. Neither the pack id nor that scope is
-        //   known here: the pack comes from dispatching the revision (which
-        //   also commits a session pin — a write on a read), and the scope is
-        //   built inside the host from the activity it never returns;
-        // - `revision_boot` gives each revision its OWN session store, so the
-        //   answer also depends on picking the same revision;
-        // - and every one of those four derivations fails SILENTLY to "no
-        //   wait found", which is this same `-32001`. A poll that answers
-        //   "gone" for a conversation that is in fact parked is worse than
-        //   one that never claimed to be able to answer.
+        // A different credential, tenant or deployment misses exactly like an
+        // unknown id — never a "forbidden", which would confirm the id exists
+        // for somebody else. The request's own `tenant` field is ignored for
+        // the same reason: the verified credential is the only authority.
         //
-        // Closing it needs a lookup seam on the runtime side, not a second
-        // derivation of the key on this one.
-        //
-        // The params are still parsed, so a malformed request is told so
-        // rather than being reported as a missing task.
+        // `historyLength` is accepted and has nothing to trim: no task this
+        // server records carries history.
         methods::GET_TASK => match serde_json::from_value::<GetTaskRequest>(params) {
-            Ok(_) => rpc_error(ctx, id, codes::TASK_NOT_FOUND, "task not found", None),
+            Ok(request) => match lookup_task(ctx, credential_id, &request.id) {
+                Some(task) => match serde_json::to_value(&task) {
+                    Ok(result) => {
+                        ctx.trace.task_state(task.status.state.wire_name());
+                        rpc_ok(ctx, id, result)
+                    }
+                    Err(_) => rpc_error(ctx, id, codes::INTERNAL_ERROR, "internal error", None),
+                },
+                None => rpc_error(ctx, id, codes::TASK_NOT_FOUND, "task not found", None),
+            },
             Err(err) => rpc_error(
                 ctx,
                 id,
@@ -620,8 +639,22 @@ pub(crate) async fn handle_jsonrpc(
                 None,
             ),
         },
+        // Cancellation stays unsupported: a turn runs synchronously and has
+        // finished before its task is visible, and removing a park would need
+        // a runtime seam this surface does not have. A task this credential
+        // owns is `TaskNotCancelableError`, so a caller is not told a task it
+        // just polled does not exist; anything else is `-32001`.
         methods::CANCEL_TASK => match serde_json::from_value::<CancelTaskRequest>(params) {
-            Ok(_) => rpc_error(ctx, id, codes::TASK_NOT_FOUND, "task not found", None),
+            Ok(request) => match lookup_task(ctx, credential_id, &request.id) {
+                Some(_) => rpc_error(
+                    ctx,
+                    id,
+                    codes::TASK_NOT_CANCELABLE,
+                    "task cannot be canceled",
+                    None,
+                ),
+                None => rpc_error(ctx, id, codes::TASK_NOT_FOUND, "task not found", None),
+            },
             Err(err) => rpc_error(
                 ctx,
                 id,
@@ -674,6 +707,16 @@ pub(crate) async fn handle_jsonrpc(
         ),
         _ => rpc_error(ctx, id, codes::METHOD_NOT_FOUND, "method not found", None),
     }
+}
+
+fn lookup_task(ctx: &A2aContext<'_>, credential_id: &str, task_id: &str) -> Option<Task> {
+    ctx.tasks.get(
+        ctx.tenant,
+        ctx.deployment_id,
+        credential_id,
+        task_id,
+        std::time::Instant::now(),
+    )
 }
 
 fn rpc_ok(ctx: &A2aContext<'_>, id: JsonRpcId, result: Value) -> HttpResponse {

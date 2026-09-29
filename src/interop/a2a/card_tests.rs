@@ -40,6 +40,7 @@ struct Fixture {
     config: InteropConfig,
     limiter: RateLimiter,
     turns: TurnGate,
+    tasks: crate::interop::a2a::tasks::TaskStore,
     deployment_id: DeploymentId,
     /// One fixture serves ONE request when a test asserts on the trace:
     /// `RequestTrace` accumulates a request's facts and an outcome is
@@ -54,6 +55,7 @@ impl Fixture {
             config,
             limiter: RateLimiter::default(),
             turns: TurnGate::new(4),
+            tasks: crate::interop::a2a::tasks::TaskStore::default(),
             deployment_id: DeploymentId::new(),
             trace: trace(),
         }
@@ -68,6 +70,7 @@ impl Fixture {
             deployment_id: self.deployment_id,
             limiter: &self.limiter,
             turns: &self.turns,
+            tasks: &self.tasks,
             now_ms: 0,
             trace: &self.trace,
             // The card is served before any authentication and runs no turn,

@@ -15,10 +15,12 @@
 //! COMPLETED answers with a `Message`; a turn that PARKED answers with a
 //! `Task` in `input-required` whose id is the conversation's `contextId`
 //! (D8/D9), carrying the question as prose and as a structured input request
-//! ([`crate::interop::input_request`]). There is still no task store, so
-//! `GetTask`/`CancelTask` answer `TaskNotFoundError` for every id — including
-//! one this server minted; [`rpc::handle_jsonrpc`]'s `GetTask` arm records
-//! what would have to exist first. `ListTasks` answers an empty page.
+//! ([`crate::interop::input_request`]). Every `Task` a `SendMessage` answers
+//! with is snapshotted in a bounded in-memory [`tasks::TaskStore`], so
+//! `GetTask` resolves an id this server minted — for the credential that
+//! created it only — and answers `TaskNotFoundError` for anything else.
+//! `CancelTask` stays unsupported (`TaskNotCancelableError` for a known id).
+//! `ListTasks` answers an empty page.
 //!
 //! The conversation is `a2a:<credential id>:<contextId>`: namespaced by the
 //! caller's credential so two callers cannot resume each other's parked flow,
@@ -26,6 +28,7 @@
 
 pub(crate) mod card;
 pub(crate) mod rpc;
+pub(crate) mod tasks;
 pub(crate) mod types;
 
 use http_body_util::Full;
@@ -121,6 +124,9 @@ pub(crate) struct A2aContext<'a> {
     pub deployment_id: DeploymentId,
     pub limiter: &'a RateLimiter,
     pub turns: &'a TurnGate,
+    /// The tasks `SendMessage` answered with, so `GetTask` can resolve an id
+    /// this server minted. See [`tasks`].
+    pub tasks: &'a tasks::TaskStore,
     /// The wall clock the credential expiry is judged against, threaded in so
     /// a test can drive it.
     pub now_ms: u64,

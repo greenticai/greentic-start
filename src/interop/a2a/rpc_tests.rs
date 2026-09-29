@@ -78,6 +78,7 @@ struct Fixture {
     config: InteropConfig,
     limiter: RateLimiter,
     turns: TurnGate,
+    tasks: crate::interop::a2a::tasks::TaskStore,
     deployment_id: DeploymentId,
     /// One fixture serves ONE request when a test asserts on the trace:
     /// `RequestTrace` accumulates a request's facts and an outcome is
@@ -103,6 +104,7 @@ impl Fixture {
             config,
             limiter: RateLimiter::default(),
             turns: TurnGate::new(4),
+            tasks: crate::interop::a2a::tasks::TaskStore::default(),
             deployment_id: DeploymentId::new(),
             trace: trace(),
             meter,
@@ -118,6 +120,7 @@ impl Fixture {
             deployment_id: self.deployment_id,
             limiter: &self.limiter,
             turns: &self.turns,
+            tasks: &self.tasks,
             now_ms: 0,
             trace: &self.trace,
             metering: TurnMetering::for_unit(
@@ -600,7 +603,7 @@ async fn no_or_wrong_bearer_is_401_and_runs_nothing() {
 }
 
 #[tokio::test]
-async fn task_rpcs_answer_statelessly() {
+async fn task_rpcs_for_an_unknown_id_answer_not_found() {
     let fixture = Fixture::new(config());
     let runner = FakeRunner::replying(vec![]);
     let cases = [
@@ -1578,3 +1581,6 @@ async fn no_caller_supplied_string_or_turn_content_reaches_a_field() {
         "a field was added to the request span: {wire}"
     );
 }
+
+#[path = "rpc_task_tests.rs"]
+mod task_store;
