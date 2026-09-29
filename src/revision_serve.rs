@@ -5982,7 +5982,7 @@ async fn run_provider_inbound_pipeline(
     // config is the same per-pack override value `run_reply_egress` hands
     // `send_payload`.
     let typing_sender = (supports_typing && crate::typing::enabled()).then(|| {
-        crate::typing::RevisionTypingSender {
+        Arc::new(crate::typing::RevisionTypingSender {
             host: Arc::clone(&activation.host),
             tenant: tenant.clone(),
             deployment_id,
@@ -5990,7 +5990,7 @@ async fn run_provider_inbound_pipeline(
             revision_id,
             provider_type: provider_type.clone(),
             notifier: Arc::clone(&notifier),
-        }
+        }) as Arc<dyn crate::typing::TypingSender>
     });
     let typing_config = typing_sender.as_ref().and_then(|_| {
         crate::messaging_egress::pack_config_overrides_as_json(
@@ -6056,7 +6056,7 @@ async fn run_provider_inbound_pipeline(
         );
         let turn_result = match (&typing_sender, typing_input) {
             (Some(sender), Some(input)) => {
-                crate::typing::keep_typing_while(sender, &input, turn).await
+                crate::typing::keep_typing_while(Arc::clone(sender), input, turn).await
             }
             _ => turn.await,
         };

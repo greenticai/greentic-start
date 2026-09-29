@@ -80,8 +80,13 @@ awaited for at most `STOP_GRACE` (2 s) before egress (`render_plan` → `encode`
 `send_payload`) begins. So a refresh never lands after the reply unless the
 provider call outlives the grace, in which case it is abandoned and logged.
 
-- Deployed: the loop runs in the turn's own task (`tokio::select!`), then
-  `tokio::time::timeout(STOP_GRACE, …)`.
+- Deployed: the loop runs alongside the turn in the turn's own task
+  (`tokio::select!`), then `tokio::time::timeout(STOP_GRACE, …)`. Each send itself
+  runs on the blocking pool (`spawn_blocking` + `Handle::block_on`) and the loop
+  only awaits its `JoinHandle`: the provider call (`invoke_provider_for_revision` →
+  runner-host `run_on_wasi_thread`) joins a thread synchronously inside one poll,
+  so polled in the turn's task it would starve the turn and the grace timeout
+  could never fire.
 - Legacy: the loop runs on a detached thread; the turn's thread waits on a done
   channel with `recv_timeout(STOP_GRACE)`. An abandoned thread sends nothing more
   and exits when the hung call returns.
@@ -113,7 +118,10 @@ case-insensitive) stop every `send_typing` call.
 - The deployed capability mirrors the runner's `declared_ops` rather than asking
   it (the runner exposes no query). If the two ever diverge, the cost is one
   logged refusal per turn; no turn is affected.
-- An abandoned in-flight call (past the grace) can still reach the platform after
-  the reply; the platform clears it on its own timeout.
+- On BOTH paths an abandoned in-flight send (one hung past the grace) keeps
+  running detached and can still land after the reply. It is bounded to calls
+  hung past the grace; the platform clears the indicator on its own timeout, and
+  webchat hides it by not showing typing once a bot message has been stored since
+  the slot was set.
 - `messaging-3aigent-gui` is not in the legacy post-op notifier's provider filter
   (for any op, not only typing).

@@ -17,8 +17,27 @@ use super::schedule::{Next, SendOutcome, plan_next};
 use super::{STOP_GRACE, SendTypingInV1, SendTypingOutV1};
 
 #[async_trait::async_trait]
-pub(crate) trait TypingSender: Send + Sync {
+pub(crate) trait TypingSender: Send + Sync + 'static {
     async fn send_typing(&self, input: &SendTypingInV1) -> anyhow::Result<SendTypingOutV1>;
+}
+
+type SendHandle = tokio::task::JoinHandle<anyhow::Result<SendTypingOutV1>>;
+
+/// How one send is started OFF the turn's task. The production launcher is
+/// [`launch_on_blocking_pool`]; tests with paused time use a plain `tokio::spawn`.
+type Launch = fn(Arc<dyn TypingSender>, Arc<SendTypingInV1>) -> SendHandle;
+
+/// The deployed provider call (`RunnerHost::invoke_provider_for_revision` →
+/// `run_on_wasi_thread`) joins a thread synchronously inside ONE poll. Polled inside
+/// the turn's `select!` it would starve the turn and make the `STOP_GRACE` timeout
+/// unfireable, so every send runs on the blocking pool and the driver only awaits
+/// its `JoinHandle`.
+fn launch_on_blocking_pool(
+    sender: Arc<dyn TypingSender>,
+    input: Arc<SendTypingInV1>,
+) -> SendHandle {
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || handle.block_on(sender.send_typing(&input)))
 }
 
 /// Blocking twin of [`TypingSender`]. `'static` because the legacy driver runs it on a
@@ -50,15 +69,25 @@ fn classify(result: anyhow::Result<SendTypingOutV1>, provider: &str) -> SendOutc
     }
 }
 
-async fn drive(sender: &dyn TypingSender, input: &SendTypingInV1, mut stop: watch::Receiver<bool>) {
+async fn drive(
+    sender: Arc<dyn TypingSender>,
+    input: Arc<SendTypingInV1>,
+    launch: Launch,
+    mut stop: watch::Receiver<bool>,
+) {
     let started = tokio::time::Instant::now();
     loop {
         if *stop.borrow() {
             return;
         }
         // Deliberately NOT raced against `stop`: an in-flight send completes (or is
-        // dropped by the caller's STOP_GRACE timeout), so it cannot land after the reply.
-        let outcome = classify(sender.send_typing(input).await, &input.provider_type);
+        // abandoned by the caller's STOP_GRACE timeout), so it cannot land after the
+        // reply within the grace.
+        let result = match launch(Arc::clone(&sender), Arc::clone(&input)).await {
+            Ok(result) => result,
+            Err(err) => Err(anyhow::anyhow!("send_typing task failed: {err}")),
+        };
+        let outcome = classify(result, &input.provider_type);
         match plan_next(started.elapsed(), outcome) {
             Next::Stop(reason) => {
                 tracing::debug!(?reason, "typing signal stopped");
@@ -72,15 +101,27 @@ async fn drive(sender: &dyn TypingSender, input: &SendTypingInV1, mut stop: watc
     }
 }
 
-/// Runs `turn` and the typing loop in the CALLER's task (no spawn, so no `'static`
-/// bound and the caller's span is kept). Returns the turn's output untouched.
+/// Runs `turn` in the CALLER's task (its span is kept) alongside the typing loop,
+/// whose sends each run on the blocking pool. Returns the turn's output untouched,
+/// at most `STOP_GRACE` after the turn completes.
 pub(crate) async fn keep_typing_while<F: Future>(
-    sender: &dyn TypingSender,
-    input: &SendTypingInV1,
+    sender: Arc<dyn TypingSender>,
+    input: SendTypingInV1,
     turn: F,
 ) -> F::Output {
+    keep_typing_while_with(sender, input, turn, launch_on_blocking_pool, STOP_GRACE).await
+}
+
+async fn keep_typing_while_with<F: Future>(
+    sender: Arc<dyn TypingSender>,
+    input: SendTypingInV1,
+    turn: F,
+    launch: Launch,
+    grace: Duration,
+) -> F::Output {
+    let provider = input.provider_type.clone();
     let (stop_tx, stop_rx) = watch::channel(false);
-    let typing = drive(sender, input, stop_rx);
+    let typing = drive(sender, Arc::new(input), launch, stop_rx);
     tokio::pin!(turn);
     tokio::pin!(typing);
     let mut typing_done = false;
@@ -92,13 +133,12 @@ pub(crate) async fn keep_typing_while<F: Future>(
     };
     if !typing_done {
         let _ = stop_tx.send(true);
-        if tokio::time::timeout(STOP_GRACE, &mut typing).await.is_err() {
-            crate::operator_log::warn(
-                module_path!(),
-                format!(
-                    "send_typing still in flight {STOP_GRACE:?} after the turn; abandoned provider={}",
-                    input.provider_type
-                ),
+        if tokio::time::timeout(grace, &mut typing).await.is_err() {
+            // Dropping `typing` detaches the in-flight send; it may still land after
+            // the reply (bounded to calls hung past the grace).
+            tracing::debug!(
+                provider,
+                "send_typing still in flight {grace:?} after the turn; abandoned, may land late"
             );
         }
     }
