@@ -5,6 +5,7 @@ use base64::Engine as _;
 use greentic_types::ChannelMessageEnvelope;
 use serde_json::json;
 
+use super::fast2flow_turn::{self, MissAction, RouteSignal, RouteSource};
 use super::flow_owner;
 use crate::domains::Domain;
 use crate::ingress::control_directive::{ControlDirective, DispatchTarget};
@@ -67,14 +68,21 @@ pub(super) fn route_messaging_envelopes(
                     original,
                     provider,
                 )
-                .and_then(|directive| apply_dispatch(directive, &pack_info, original, "fast2flow"))
+                .and_then(|directive| {
+                    apply_dispatch(directive, &pack_info, original, RouteSource::Bm25)
+                })
                 // No usable deterministic dispatch. Try the embedded LLM fallback
                 // (greentic-start's own greentic-llm capability) before giving up.
                 .or_else(|| try_llm_fallback(ctx, &pack_info, &app_pack_path, original))
             });
             let flow = turn.flow;
             let envelope = &turn.envelope;
-            let outputs = if let Some(route_to_card) = card_nav_target(envelope) {
+            let miss = fast2flow_turn::miss_action(
+                turn.owns_conversation,
+                &pack_info.capabilities,
+                envelope.text.as_deref(),
+            );
+            let mut outputs = if let Some(route_to_card) = card_nav_target(envelope) {
                 // A target that names a FLOW NODE goes to the flow even when a card
                 // asset of the same name exists. Rendering the asset directly is
                 // faster but leaves the flow with no record of the card, so the
@@ -153,16 +161,7 @@ pub(super) fn route_messaging_envelopes(
                         )
                     }
                 }
-            } else if !turn.owns_conversation
-                && pack_info
-                    .capabilities
-                    .iter()
-                    .any(|c| c == crate::fast2flow::FAST2FLOW_CAPABILITY)
-                && envelope
-                    .text
-                    .as_deref()
-                    .is_some_and(|t| !t.trim().is_empty())
-            {
+            } else if miss == MissAction::FixedReply {
                 // The pack opted into Fast2Flow routing, the user sent free text,
                 // and no dispatch resolved (Fast2Flow returned Continue and
                 // didn't set routeToCardId). Surface a short error so we don't
@@ -170,19 +169,26 @@ pub(super) fn route_messaging_envelopes(
                 operator_log::info(
                     module_path!(),
                     format!(
-                        "[fast2flow] no dispatch for free text — emitting error reply pack={} text_len={}",
+                        "[fast2flow] no dispatch for free text — emitting fixed miss reply pack={} text_len={}",
                         pack_info.pack_id,
                         envelope.text.as_deref().map(str::len).unwrap_or(0)
                     ),
                 );
-                let mut reply = envelope.clone();
-                reply.metadata.remove("adaptive_card");
-                reply.text = Some(
-                "I'm not sure what you meant. Tap one of the menu options or rephrase your request."
-                    .to_string(),
-            );
-                vec![reply]
+                vec![fast2flow_turn::miss_reply(envelope)]
             } else {
+                if miss == MissAction::DefaultFlowOnMiss {
+                    // The pack declared the on-miss opt-in: the unrouted
+                    // message goes to the default flow, unchanged.
+                    operator_log::info(
+                        module_path!(),
+                        format!(
+                            "[fast2flow] no dispatch for free text — running default flow={} (on_miss opt-in) pack={} text_len={}",
+                            flow.id,
+                            pack_info.pack_id,
+                            envelope.text.as_deref().map(str::len).unwrap_or(0)
+                        ),
+                    );
+                }
                 run_app_flow_safe(
                     runner_host,
                     bundle,
@@ -195,6 +201,7 @@ pub(super) fn route_messaging_envelopes(
                     None,
                 )
             };
+            fast2flow_turn::stamp_route(&mut outputs, turn.route.as_ref(), &flow.id);
 
             if turn.owns_conversation {
                 // Keep the conversation with this flow while it is parked on it;
@@ -458,16 +465,16 @@ fn try_llm_fallback<'p>(
         app_pack_path,
     )?;
     let directive = crate::fast2flow::try_llm_route(cfg, ctx, &index_path, text)?;
-    apply_dispatch(directive, pack_info, original, "fast2flow:llm")
+    apply_dispatch(directive, pack_info, original, RouteSource::Llm)
 }
 
-/// What the router decided for one turn.
+/// What the router decided for one turn, and how it was decided.
 enum Routed<'p> {
     /// A card node inside the default flow; the envelope carries
     /// `routeToCardId`.
-    Node(ChannelMessageEnvelope),
+    Node(ChannelMessageEnvelope, RouteSignal),
     /// A whole flow of the app pack, run from its entry (greentic-start#590).
-    Flow(&'p app::AppFlowInfo, ChannelMessageEnvelope),
+    Flow(&'p app::AppFlowInfo, ChannelMessageEnvelope, RouteSignal),
 }
 
 /// One turn, resolved: which flow runs it, with which envelope.
@@ -480,6 +487,9 @@ struct Turn<'p> {
     /// in the flow that owns the conversation — never for default-flow or
     /// card-node turns, which behave exactly as before #590.
     owns_conversation: bool,
+    /// Set only when Fast2Flow or the LLM fallback routed THIS turn; stamped
+    /// on its replies. `None` for default-flow turns and sticky resumes.
+    route: Option<RouteSignal>,
 }
 
 /// Decide which flow runs this turn.
@@ -509,23 +519,27 @@ fn resolve_turn<'p>(
             flow: owner,
             envelope: original.clone(),
             owns_conversation: true,
+            route: None,
         };
     }
     match probe() {
-        Some(Routed::Node(envelope)) => Turn {
+        Some(Routed::Node(envelope, route)) => Turn {
             flow: default_flow,
             envelope,
             owns_conversation: false,
+            route: Some(route),
         },
-        Some(Routed::Flow(flow, envelope)) => Turn {
+        Some(Routed::Flow(flow, envelope, route)) => Turn {
             flow,
             envelope,
             owns_conversation: true,
+            route: Some(route),
         },
         None => Turn {
             flow: default_flow,
             envelope: original.clone(),
             owns_conversation: false,
+            route: None,
         },
     }
 }
@@ -536,11 +550,22 @@ fn apply_dispatch<'p>(
     directive: ControlDirective,
     pack_info: &'p app::AppPackInfo,
     original: &ChannelMessageEnvelope,
-    source: &str,
+    source: RouteSource,
 ) -> Option<Routed<'p>> {
-    let ControlDirective::Dispatch { target, entities } = directive else {
+    let ControlDirective::Dispatch {
+        target,
+        entities,
+        confidence,
+    } = directive
+    else {
         return None;
     };
+    let signal = |node: Option<String>| RouteSignal {
+        node,
+        confidence,
+        source,
+    };
+    let source = source.log_label();
     if let Some(node) = target.node.clone() {
         operator_log::info(
             module_path!(),
@@ -552,9 +577,11 @@ fn apply_dispatch<'p>(
             ),
         );
         let mut owned = original.clone();
-        owned.metadata.insert("routeToCardId".to_string(), node);
+        owned
+            .metadata
+            .insert("routeToCardId".to_string(), node.clone());
         inject_prefill_metadata(&mut owned, &entities);
-        return Some(Routed::Node(owned));
+        return Some(Routed::Node(owned, signal(Some(node))));
     }
     let Some(flow) = dispatch_flow(pack_info, &target) else {
         operator_log::info(
@@ -577,7 +604,7 @@ fn apply_dispatch<'p>(
     );
     let mut owned = original.clone();
     inject_prefill_metadata(&mut owned, &entities);
-    Some(Routed::Flow(flow, owned))
+    Some(Routed::Flow(flow, owned, signal(None)))
 }
 
 /// The flow a `pack/flow` target names, when it is a messaging flow of THIS

@@ -1,8 +1,8 @@
 //! Map Fast2Flow's `RoutingDirective` into the existing `ControlDirective`.
-//! Tenant/team inherit from the request context. Confidence + reason are not
-//! carried into `ControlDirective`; the caller (`try_for_request`) emits them
-//! via `tracing`/operator_log before this mapping, so the routing decision is
-//! observable without threading them through the dispatch type.
+//! Tenant/team inherit from the request context. Confidence is carried into
+//! `ControlDirective::Dispatch` (the messaging ingress stamps it on the reply);
+//! the reason is not — the caller (`try_for_request`) emits it via
+//! `tracing`/operator_log before this mapping.
 
 use crate::ingress::control_directive::{
     ControlDirective, DispatchTarget, IngressReply, PrefillEntity,
@@ -18,10 +18,14 @@ pub fn map_directive_to_control(
     match directive {
         RoutingDirective::Continue => ControlDirective::Continue,
         RoutingDirective::Dispatch {
-            target, entities, ..
+            target,
+            entities,
+            confidence,
+            ..
         } => match parse_target(&target, ctx) {
             Some(dispatch) => ControlDirective::Dispatch {
                 target: dispatch,
+                confidence: Some(confidence),
                 entities: entities
                     .into_iter()
                     .map(|e| PrefillEntity {

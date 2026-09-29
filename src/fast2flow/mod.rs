@@ -19,7 +19,7 @@ pub mod mapper;
 
 pub use config::Fast2FlowConfig;
 pub use contracts::{Fast2FlowHookInV1, MessageEnvelope};
-pub use gate::{FAST2FLOW_CAPABILITY, Fast2FlowGate};
+pub use gate::{FAST2FLOW_CAPABILITY, FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY, Fast2FlowGate};
 pub use host_process::invoke_routing_host;
 pub use llm_router::try_llm_route;
 pub use mapper::map_directive_to_control;

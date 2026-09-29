@@ -34,6 +34,11 @@ pub enum ControlDirective {
     Dispatch {
         target: DispatchTarget,
         entities: Vec<PrefillEntity>,
+        /// The router's confidence in `target`, when the router reports one
+        /// (Fast2Flow's BM25 host and its LLM fallback do; a hook-emitted
+        /// directive does not). Carried so the messaging ingress can stamp the
+        /// route on the reply; it never gates the dispatch here.
+        confidence: Option<f32>,
     },
     Respond {
         reply: IngressReply,
@@ -55,6 +60,7 @@ pub fn try_parse_control_directive(output: &JsonValue) -> Option<ControlDirectiv
             parse_dispatch(decoded.get("target")).map(|target| ControlDirective::Dispatch {
                 target,
                 entities: Vec::new(),
+                confidence: None,
             })
         }
         "respond" => Some(ControlDirective::Respond {
