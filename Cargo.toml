@@ -229,10 +229,14 @@ default-features = false
 # GREENTIC_OCI_INSECURE_REGISTRIES is set, so listed registries are pulled over
 # plain HTTP). Both have been on the dev lane for months.
 #
-# The RUNID is the publish this tree resolves and was verified against; see the
-# deploy-spec block for why that, and not an API-first-appearance number.
+# Floor `1.2.0-dev.36501735929` is an API marker, not only a verified-against
+# publish: it is the dev-lane publish of distributor-client #278 (PD5, merge
+# bf18ef48), which added `DefaultRegistryClient::try_with_insecure_transport`,
+# `uses_plain_http_for` and `has_credentials`. `bundle_ref::build_registry_client`
+# needs the first to pull from a registry that is BOTH plain-HTTP and
+# password-protected; `ensure_plain_http_honoured` needs the second.
 [dependencies.greentic-distributor-client]
-version = ">=1.2.0-dev.35757697239, <1.3.0-0"
+version = ">=1.2.0-dev.36501735929, <1.3.0-0"
 default-features = false
 features = ["pack-fetch"]
 
