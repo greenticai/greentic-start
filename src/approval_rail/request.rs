@@ -202,6 +202,20 @@ mod tests {
         );
     }
 
+    /// greentic-runner#814 appends a per-dispatch `::n=<32 hex>` nonce to every
+    /// approval correlation id. It must still parse as an approval gate, and
+    /// the id must be carried verbatim: the nonce is what lets the runner tell
+    /// two approvals in one conversation apart, so trimming it here would
+    /// publish the answer under an id no parked gate is waiting on.
+    #[test]
+    fn a_nonced_correlation_id_is_an_approval_gate_kept_verbatim() {
+        let id = "default::run=RUN-1::node=gate::n=0123456789abcdef0123456789abcdef";
+        let bytes =
+            serde_json::to_vec(&json!({"target": id, "operation": "request"})).expect("serialize");
+        assert_eq!(parse(None, &bytes).expect("parse").correlation_id, id);
+        assert_eq!(parse(Some(id), &bytes).expect("parse").correlation_id, id);
+    }
+
     #[test]
     fn only_a_request_operation_is_delivered() {
         for operation in ["response", "", "REQUEST"] {

@@ -40,7 +40,9 @@ pub struct ResponsePublication {
     /// Echoed back in the response's `Greentic-Correlation-Id` header — the
     /// designer routes on that header alone (contract §1).
     pub correlation_id: String,
-    /// The response body verbatim, `decision_token` included and unread.
+    /// The runner's `RuntimeDispatchResponse` envelope
+    /// (`{ok, output, events, error}`), carrying the component's answer
+    /// verbatim as `output` — `decision_token` included and unread.
     pub body: RailBody,
 }
 
@@ -136,7 +138,25 @@ fn publication_from(
 
     Ok(ResponsePublication {
         correlation_id,
-        body: RailBody::new(body.clone()),
+        body: RailBody::new(dispatch_response(body)),
+    })
+}
+
+/// Wrap the component's answer as the runner's `RuntimeDispatchResponse`.
+///
+/// The Slack component hands out the bare `{decision, resolved_by,
+/// decision_token, note}` answer, but the response subject is read by the
+/// runner's dispatch listener, which deserializes `RuntimeDispatchResponse`
+/// (`ok` is REQUIRED) and resumes the gate with `output`. Published bare, the
+/// decode failed and the click resumed nothing — with the approval envelope
+/// already removed from the inbound batch, so nothing anywhere was red. The
+/// shape is the one greentic-designer-admin's approval bridge publishes.
+fn dispatch_response(answer: &Value) -> Value {
+    serde_json::json!({
+        "ok": true,
+        "output": answer.clone(),
+        "events": [],
+        "error": null,
     })
 }
 
@@ -302,10 +322,13 @@ mod tests {
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].correlation_id, "default::run=RUN-1::node=gate");
         assert_eq!(
-            published[0].body.expose()["decision_token"],
+            published[0].body.expose()["output"]["decision_token"],
             "EXAMPLE-TOKEN-NOT-A-REAL-SECRET"
         );
-        assert_eq!(published[0].body.expose()["decision"], "approved");
+        assert_eq!(published[0].body.expose()["output"]["decision"], "approved");
+        assert_eq!(published[0].body.expose()["ok"], true);
+        assert_eq!(published[0].body.expose()["events"], json!([]));
+        assert!(published[0].body.expose()["error"].is_null());
 
         assert_eq!(
             envelopes.len(),
@@ -314,6 +337,25 @@ mod tests {
              decision marker, not something a human typed"
         );
         assert!(!envelopes[0].extensions.contains_key(RESPONSE_EXTENSION_KEY));
+    }
+
+    #[test]
+    fn the_published_body_is_what_the_runners_dispatch_listener_decodes() {
+        // The runner reads this subject as a `RuntimeDispatchResponse`, whose
+        // `ok` is required. A bare answer fails that decode and the click
+        // resumes nothing, so the bytes on the wire must round-trip into it.
+        let (published, _) =
+            take_approval_responses(&mut vec![envelope(Some(conformance_extension()))]);
+        let wire = published[0].body.to_wire_bytes().expect("wire bytes");
+        let decoded: greentic_types::RuntimeDispatchResponse =
+            serde_json::from_slice(&wire).expect("a RuntimeDispatchResponse");
+        assert!(decoded.ok);
+        assert_eq!(
+            decoded.output["decision_token"],
+            "EXAMPLE-TOKEN-NOT-A-REAL-SECRET"
+        );
+        assert!(decoded.events.is_empty());
+        assert!(decoded.error.is_none());
     }
 
     #[test]
@@ -335,14 +377,12 @@ mod tests {
         let (published, rejected) = take_approval_responses(&mut vec![envelope(Some(extension))]);
         assert!(rejected.is_empty());
         assert_eq!(
-            published[0].body.expose()["resolved_by"],
+            published[0].body.expose()["output"]["resolved_by"],
             Value::Null,
             "an unnamed vote must stay unnamed"
         );
         assert!(
-            published[0]
-                .body
-                .expose()
+            published[0].body.expose()["output"]
                 .get("resolved_by")
                 .is_some_and(Value::is_null),
             "the key must still be present and null, not dropped"
