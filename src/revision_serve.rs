@@ -2103,6 +2103,7 @@ async fn serve_interop_inner(
         deployment_id: unit.deployment_id,
         limiter: &state.interop.limiter,
         turns: &state.interop.turns,
+        tasks: &state.interop.a2a_tasks,
         now_ms: crate::ingress_auth::now_ms(),
         metering: crate::interop::metering::TurnMetering::for_unit(
             &state.interop.meter,

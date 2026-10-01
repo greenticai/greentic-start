@@ -456,6 +456,7 @@ pub(crate) mod codes {
     pub(crate) const INVALID_PARAMS: i64 = -32602;
     pub(crate) const INTERNAL_ERROR: i64 = -32603;
     pub(crate) const TASK_NOT_FOUND: i64 = -32001;
+    pub(crate) const TASK_NOT_CANCELABLE: i64 = -32002;
     pub(crate) const PUSH_NOTIFICATION_NOT_SUPPORTED: i64 = -32003;
     pub(crate) const UNSUPPORTED_OPERATION: i64 = -32004;
     pub(crate) const CONTENT_TYPE_NOT_SUPPORTED: i64 = -32005;
