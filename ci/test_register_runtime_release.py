@@ -57,13 +57,20 @@ class Tests(unittest.TestCase):
         self.assertEqual(b["rollback"], {"supported": True})
         self.assertNotIn("channel", b)
 
-    def test_invalid_inputs_exit_2(self):
+    def test_invalid_inputs_exit_2_when_armed(self):
         for over in ({"DIGEST": "sha256:ABC"}, {"DIGEST": "a" * 64},
                      {"VERSION": "v1.2.3"}, {"VERSION": "1.2"}):
             with mock.patch("urllib.request.urlopen") as u:
-                code, _ = self.run_main(**over)
+                code, _ = self.run_main(ADMIN="https://a", KEY="k", **over)
             self.assertEqual(code, 2, over)
             u.assert_not_called()
+
+    def test_invalid_inputs_only_warn_when_unarmed(self):
+        for armed in ({}, {"ADMIN": "https://a"}, {"ADMIN": "https://a", "KEY": "k", "DRY_RUN": "true"}):
+            for over in ({"DIGEST": ""}, {"DIGEST": "sha256:ABC"}, {"VERSION": "latest"}, {"VERSION": ""}):
+                with mock.patch("urllib.request.urlopen", side_effect=AssertionError):
+                    code, _ = self.run_main(**armed, **over)
+                self.assertEqual(code, 0, (armed, over))
 
     def test_unarmed_no_network(self):
         for over in ({}, {"ADMIN": "https://a"}, {"KEY": "k"}):

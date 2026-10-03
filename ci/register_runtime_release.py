@@ -9,8 +9,9 @@ workflow artifact. See docs/runtime-release-registration.md.
 Environment: DIGEST (sha256:<64 lowercase hex>, the image INDEX digest),
 VERSION (semver, no leading "v"), GITHUB_SHA, ADMIN, KEY, DRY_RUN, OUT.
 
-Exit codes: 0 success / unarmed / dry run; 1 admin refused (409 included) or
-transport error; 2 invalid input.
+Exit codes: 0 success / unarmed / dry run (invalid input only warns when
+unarmed); 1 admin refused (409 included) or transport error; 2 invalid input
+when armed.
 """
 import json
 import os
@@ -71,22 +72,28 @@ def main(env=None):
     digest = env.get("DIGEST", "")
     sha = env.get("GITHUB_SHA", "")
     out = env.get("OUT") or "release-request.json"
+    admin = env.get("ADMIN", "").strip()
+    key = env.get("KEY", "")
+    dry_run = env.get("DRY_RUN", "").strip().lower() == "true"
+    armed = bool(admin and key) and not dry_run
     try:
         body = build_request(version, digest, sha)
     except ValueError as err:
-        print(f"::error::{err}")
-        return 2
+        if armed:
+            print(f"::error::{err}")
+            return 2
+        # Unarmed must never fail the image publish.
+        print(f"::warning::release request not buildable (unarmed, ignored): {err}")
+        return 0
     payload = json.dumps(body, indent=2, sort_keys=True)
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(payload + "\n")
     print(payload)
 
-    admin = env.get("ADMIN", "").strip()
-    key = env.get("KEY", "")
-    if env.get("DRY_RUN", "").strip().lower() == "true":
+    if dry_run:
         print("::notice::dry run: release request written, nothing sent.")
         return 0
-    if not admin or not key:
+    if not armed:
         print(
             "::notice::RELEASE_ADMIN_URL / RELEASE_PUBLISHER_KEY not set: "
             "release not registered (unarmed)."

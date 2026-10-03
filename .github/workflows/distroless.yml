@@ -207,12 +207,14 @@ jobs:
       - name: Resolve image index digest
         id: index-digest
         run: |
-          set -euo pipefail
+          set -uo pipefail
           ref=$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
-          digest=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | jq -r .digest)
+          # Never fail the image publish here: an empty digest makes the
+          # registration step warn (unarmed) or fail (armed).
+          digest=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | jq -r .digest) || digest=""
           if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::could not resolve a sha256 index digest for $ref (got '$digest')"
-            exit 1
+            echo "::warning::could not resolve a sha256 index digest for $ref (got '$digest')"
+            digest=""
           fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Image index digest: $digest" >> "$GITHUB_STEP_SUMMARY"
