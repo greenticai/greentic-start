@@ -165,7 +165,7 @@ features = ["derive"]
 # ONE crate with the copy runner-host pulls through its `agentic-worker`
 # feature. No features: `test-mock` stays dev-only (below).
 [dependencies.greentic-aw-runtime]
-version = ">=1.2.0-dev.36747192269, <1.3.0-0"
+version = ">=1.2.0-dev.37141311769, <1.3.0-0"
 default-features = false
 
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
@@ -240,7 +240,10 @@ version = ">=1.2.0-dev.36501735929, <1.3.0-0"
 default-features = false
 features = ["pack-fetch"]
 
-# Floor `1.2.0-dev.36747192269` is the dev-lane publish built from
+# Floor `1.2.0-dev.37141311769` is the dev-lane publish built from greentic-runner
+# #823 (the `on_message` route arm: a menu card takes its default edge for a typed
+# message, so a deployed card flow stops re-showing its menu). The floor before it,
+# `1.2.0-dev.36747192269`, is the dev-lane publish built from
 # greentic-runner 5e9ab7da (the develop merge of #819; that dev-publish run's
 # head_sha IS 5e9ab7da). #819 stops runner-host writing its `.staged` marker
 # inside the extension directory it hands to the signature-checking loader, so
@@ -262,7 +265,7 @@ features = ["pack-fetch"]
 # (greentic-runner#698), which the demo messaging host uses to name a flow node
 # as the flow's entry node.
 [dependencies.greentic-runner-desktop]
-version = ">=1.2.0-dev.36747192269, <1.3.0-0"
+version = ">=1.2.0-dev.37141311769, <1.3.0-0"
 
 # Same floor as runner-desktop (see above). The surfaces that accumulated as
 # floor bumps, all of them carried by that publish, kept because each names a
@@ -285,7 +288,7 @@ version = ">=1.2.0-dev.36747192269, <1.3.0-0"
 #   * #792 — `storage::{StorageConfig, SessionBackend, StateBackend}` and
 #     `HostBuilder::with_storage`, which `crate::durable_state` is built on.
 [dependencies.greentic-runner-host]
-version = ">=1.2.0-dev.36747192269, <1.3.0-0"
+version = ">=1.2.0-dev.37141311769, <1.3.0-0"
 # `greentic-llm-backend` routes every in-process `dw.agent` LLM call through
 # greentic-llm's multi-provider backend. Without it runner-host compiles the
 # OpenAI-only client (`agent_node.rs`, "built WITHOUT the greentic-llm-backend
@@ -436,7 +439,7 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 # build (edition-2024 resolver keeps dev-dependency features out of it). Same
 # requirement runner-host has, so it is ONE crate with runner-host's, not a
 # second copy.
-greentic-aw-runtime = { version = ">=1.2.0-dev.36747192269, <1.3.0-0", features = ["test-mock"] }
+greentic-aw-runtime = { version = ">=1.2.0-dev.37141311769, <1.3.0-0", features = ["test-mock"] }
 # For `ExtensionRuntime::for_test()`. It must be the same SOURCE and a
 # compatible requirement to whatever greentic-aw-runtime declares, or the graph
 # holds two copies and the `ExtensionRuntime` handed across the boundary does
