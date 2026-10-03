@@ -5444,7 +5444,7 @@ async fn dispatch_provider_route(
     // DirectLine, apply the same pre/post processing the legacy path does:
     // path normalization, query augmentation, session-token preflight,
     // conversation dedup, streamUrl rewrite, POST /token validation.
-    let is_directline = provider_type.starts_with("messaging.webchat");
+    let is_directline = is_directline_request(&provider_type, path);
     let (dl_method, dl_path, dl_query_pairs, mut dl_headers, dl_forward_plan, dl_dedup_key);
     if is_directline {
         // Extract the provider-relative path from the full request path.
@@ -6662,6 +6662,47 @@ async fn read_provider_signing_key(
         );
     }
     outcome
+}
+
+/// Whether a revision-path request is Direct Line traffic, i.e. whether the A4
+/// pre/post-processing (path normalisation, session-token preflight,
+/// conversation dedup, `streamUrl` rewrite) applies to it.
+///
+/// Decided by ANY of: the provider's declared type (the `messaging.webchat`
+/// family), the request path carrying a `/v3/directline` segment, or the path
+/// being under the webchat route family `/v1/messaging/webchat/`. The type
+/// alone was the original rule, and it silently excluded every other provider
+/// that serves the same routes: the `messaging.3aigent-gui` pack is mounted at
+/// `/v1/messaging/webchat/{tenant}/{path*}` but is not named
+/// `messaging.webchat*`, so for it:
+///
+/// * `POST /token` got no `tenant`/`env` query from the route, so the provider
+///   minted a token for tenant `default` rather than the deployment's;
+/// * every `streamUrl` it returned stayed a site-relative path (and named that
+///   `default` tenant), so the browser's WebSocket got a 404 handshake and a
+///   reply that reached the server was never shown ("Send failed").
+///
+/// The route family is the protocol's own contract, not a naming convention,
+/// and `extract_webchat_session_hint` already keys conversation stickiness on
+/// the path rather than the provider's name.
+fn is_directline_request(provider_type: &str, path: &str) -> bool {
+    provider_type.starts_with("messaging.webchat")
+        || path.starts_with(WEBCHAT_ROUTE_PREFIX)
+        || path_carries_directline(path)
+}
+
+/// The URL prefix every Direct Line webchat provider is mounted under:
+/// `/v1/messaging/webchat/{tenant}/{path*}`.
+const WEBCHAT_ROUTE_PREFIX: &str = "/v1/messaging/webchat/";
+
+/// Whether `path` contains `/v3/directline` as a whole segment (end of the path
+/// or followed by `/`), so `/v3/directlinefoo` does not count.
+fn path_carries_directline(path: &str) -> bool {
+    const SEGMENT: &str = "/v3/directline";
+    path.match_indices(SEGMENT).any(|(idx, _)| {
+        let rest = &path[idx + SEGMENT.len()..];
+        rest.is_empty() || rest.starts_with('/')
+    })
 }
 
 /// Extract the DirectLine-relative path from a full request path.
@@ -10050,6 +10091,70 @@ mod tests {
     }
 
     // --- A4: DirectLine dispatch helpers unit tests -------------------------
+
+    // Category 0: is_directline_request
+
+    #[test]
+    fn webchat_family_provider_types_are_directline_whatever_the_path() {
+        for pt in [
+            "messaging.webchat",
+            "messaging.webchat.gui",
+            "messaging.webchat-gui",
+            "messaging.webchat.standard",
+        ] {
+            assert!(
+                is_directline_request(pt, "/v1/messaging/webchat/t/token"),
+                "{pt}"
+            );
+        }
+    }
+
+    /// The regression: a Direct Line provider that is not named
+    /// `messaging.webchat*` was excluded, so its `streamUrl` was never
+    /// rewritten and the chat could not receive replies.
+    #[test]
+    fn a_provider_named_otherwise_is_directline_when_the_path_says_so() {
+        for path in [
+            "/v1/messaging/webchat/greentic/claude-e2e-hello/v3/directline/conversations",
+            "/v1/messaging/webchat/greentic/v3/directline/conversations/abc/activities",
+            "/v3/directline/conversations",
+            "/v1/messaging/webchat/t/v3/directline",
+        ] {
+            assert!(
+                is_directline_request("messaging.3aigent-gui", path),
+                "{path}"
+            );
+        }
+    }
+
+    /// The `/token` and `/auth/config` half of the same regression: without the
+    /// route's `tenant` query the provider minted a token for tenant `default`.
+    #[test]
+    fn token_and_auth_config_under_the_webchat_route_family_are_directline() {
+        for path in [
+            "/v1/messaging/webchat/greentic/claude-e2e-hello/token",
+            "/v1/messaging/webchat/greentic/token",
+            "/v1/messaging/webchat/greentic/claude-e2e-hello/auth/config",
+        ] {
+            assert!(
+                is_directline_request("messaging.3aigent-gui", path),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_providers_and_lookalike_segments_are_not_directline() {
+        for (pt, path) in [
+            ("messaging.telegram", "/v1/messaging/telegram/t/webhook"),
+            ("messaging.slack", "/v1/messaging/slack/t/events"),
+            ("messaging.telegram", "/v1/messaging/webchatty/t/x"),
+            ("messaging.telegram", "/v3/directlinefoo/conversations"),
+            ("messaging.telegram", "/x/v3/directline-extra"),
+        ] {
+            assert!(!is_directline_request(pt, path), "{pt} {path}");
+        }
+    }
 
     // Category 1: extract_directline_provider_path
 
