@@ -7,6 +7,13 @@ name: publish-distroless
 # `merge` job then stitches the digests into one index under the tags above.
 # Same shape as `distroless-dev.yml`, which also build-checks both platforms on
 # pull requests that touch the image inputs.
+#
+# The `merge` job also builds a platform-release registration request for the
+# image INDEX digest (release-request.json, always uploaded). It is UNARMED:
+# it POSTs to the admin only when BOTH secrets RELEASE_ADMIN_URL and
+# RELEASE_PUBLISHER_KEY exist and register_dry_run is not true (empty on a tag
+# push). Arming steps: docs/runtime-release-registration.md. The dev lane
+# (`distroless-dev.yml`) is intentionally not registered.
 on:
   push:
     tags: ["v*"]
@@ -15,6 +22,10 @@ on:
       tag:
         description: "Existing v* tag to (re)build (e.g. v0.5.18)"
         required: true
+      register_dry_run:
+        description: "Only write release-request.json; never register with the admin"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -192,3 +203,45 @@ jobs:
             echo "::error::index $ref has platforms '$platforms', expected 'amd64,arm64'"
             exit 1
           fi
+
+      - name: Resolve image index digest
+        id: index-digest
+        run: |
+          set -uo pipefail
+          ref=$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          # Never fail the image publish here: an empty digest makes the
+          # registration step warn (unarmed) or fail (armed).
+          digest=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | jq -r .digest) || digest=""
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::warning::could not resolve a sha256 index digest for $ref (got '$digest')"
+            digest=""
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Image index digest: $digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@v4
+        id: checkout
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Register runtime release (unarmed)
+        # Secrets are not readable in `if:`; the script no-ops (exit 0) when
+        # either is empty or DRY_RUN is "true". A 409 fails the job.
+        env:
+          ADMIN: ${{ secrets.RELEASE_ADMIN_URL }}
+          KEY: ${{ secrets.RELEASE_PUBLISHER_KEY }}
+          DIGEST: ${{ steps.index-digest.outputs.digest }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GITHUB_SHA: ${{ steps.checkout.outputs.commit }}
+          DRY_RUN: ${{ inputs.register_dry_run || '' }}
+          OUT: release-request.json
+        run: python3 ci/register_runtime_release.py
+
+      - name: Upload release request
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-request
+          path: release-request.json
+          if-no-files-found: ignore
+          retention-days: 30
