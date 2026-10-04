@@ -130,6 +130,46 @@ is a real difference from the in-memory default.
 
 Parked **sessions** stay isolated per revision either way.
 
+## Resuming a WebChat conversation re-establishes its revision pin
+
+The conversation -> revision pin is a routing hint held in memory (or in Redis
+with `GREENTIC_REVISION_PIN_REDIS_URL`). It is created by `POST /conversations`
+and is gone after a restart, a redeploy, its TTL, or when another replica takes
+the request, while the conversation's durable state (see `state-sorla`) is not.
+The WebSocket stream used to answer `404 no revision pin for this conversation`
+in that situation, so a page that resumed a saved chat rendered an empty
+transcript and left new messages at "Sending", although every REST call worked.
+
+A pin is now re-established, lazily and idempotently, by two paths:
+
+* **WebSocket upgrade** (`.../conversations/{id}/stream?t=...`). The token is
+  verified first (signature, expiry, tenant, and a `conv` claim equal to the
+  path id; a conversation-less token is refused). Then the pin is created on a
+  weighted healthy revision of the CURRENT activation
+  (`RevisionDispatcher::establish_pin`).
+* **REST resume and posts** (`GET /conversations/{id}`, `POST`/`GET
+  .../activities`). After the provider answered 2xx for a caller whose token was
+  already bound to that conversation, the pin is committed with the same
+  insert-if-absent write. A conversation-less token never pins.
+
+Rules, inherited from the pin store's `try_pin`:
+
+* A live pin is never replaced. A conversation pinned to an older revision that
+  is still serving (a rolling deploy) stays on it.
+* Racing resumes converge on one revision and one stored pin.
+* Every write needs a verified token, a refused request leaves nothing behind,
+  and the store's own cardinality caps and TTL still bound memory.
+* With a shared pin store (Redis) any replica can establish the pin. With the
+  in-memory store each replica establishes its own on first contact, which is
+  harmless because the conversation's state is in the durable store.
+* The pin is on the *current* revision. With `stable_component_state: false`
+  that revision has a new keyspace, so a resumed conversation is a new one (the
+  documented default); with it on, the component state (the WebChat history)
+  carries over.
+
+Unchanged: a `GET` for a conversation the provider does not know still answers
+the provider's `404`, and nothing is pinned.
+
 ## Failure behaviour
 
 Two rules, and they differ deliberately:
