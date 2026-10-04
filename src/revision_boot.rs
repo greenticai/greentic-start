@@ -52,10 +52,12 @@ use crate::endpoint_admit::EndpointAdmit;
 use crate::http_routes::{
     HttpRouteDescriptor, HttpRouteTable, RevisionScope, discover_revision_routes,
 };
+use crate::operator_log;
 use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig, parse_ulid};
 use crate::revision_pin::RevisionPinStore;
 use crate::runtime_config::{LoadedRuntimeConfig, env_dir_in};
 use crate::secrets_gate::DynSecretsManager;
+use crate::sorla_state::{PROVIDER_PACK_ID, SorlaStateSelection};
 use crate::static_routes::{
     ActiveRouteTable, ReservedRouteSet, StaticRoutePlan, discover_revision_static_routes,
 };
@@ -531,15 +533,49 @@ pub(crate) async fn activate_runtime_config(
         // `crate::durable_state`.
         let (session_store, state_store) = match carried.get(&store_key).cloned() {
             Some(pair) => pair,
-            None => durable
-                .stores_for(&revision_namespace_suffix(&store_key))
-                .await
-                .with_context(|| {
-                    format!(
-                        "opening the conversation stores for revision `{}`",
-                        block.revision_id
-                    )
-                })?,
+            None => {
+                // `state-sorla` is selected by the revision carrying that pack's
+                // config; its token and door come from the unit's staged
+                // `metering` block. A selection that cannot be resolved fails
+                // the activation: the backend was named.
+                let sorla = match non_secret_by_pack_id.get(PROVIDER_PACK_ID) {
+                    None => None,
+                    Some(non_secret) => {
+                        let metering = meter_decisions
+                            .metering_for(
+                                host.secrets_manager().as_ref(),
+                                &secrets_env,
+                                &meta.tenant,
+                                &meta.bundle_id,
+                            )
+                            .await;
+                        let selection = SorlaStateSelection::resolve(non_secret, metering.as_ref())
+                            .with_context(|| {
+                                format!(
+                                    "resolving the state-sorla backend for revision `{}`",
+                                    block.revision_id
+                                )
+                            })?;
+                        operator_log::info(
+                            module_path!(),
+                            format!(
+                                "conversation state for revision `{}`: state-sorla door `{}`",
+                                block.revision_id, selection.door.base_url
+                            ),
+                        );
+                        Some(selection)
+                    }
+                };
+                durable
+                    .stores_for(&revision_namespace_suffix(&store_key), sorla.as_ref())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "opening the conversation stores for revision `{}`",
+                            block.revision_id
+                        )
+                    })?
+            }
         };
         retained.insert(
             store_key,

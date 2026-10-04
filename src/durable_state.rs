@@ -55,6 +55,9 @@ use greentic_runner_host::storage::{
     new_state_store, session_store_from_config, state_store_from_config,
 };
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
+
+use crate::sorla_state::{HttpStateStore, SorlaStateSelection};
 
 use crate::revision_pin::{PIN_REDIS_URL_ENV, redact_redis_url};
 
@@ -218,7 +221,7 @@ impl DurableStorage {
             return Ok(());
         }
         let session = self.session_backend_for("boot-probe")?;
-        build_stores(session, self.config.state.clone()).context(
+        build_stores(session, self.config.state.clone(), None, "boot-probe").context(
             "the configured conversation-state backend is unreachable; refusing to boot on \
              in-memory state, which would silently lose every parked conversation",
         )?;
@@ -235,13 +238,16 @@ impl DurableStorage {
     pub(crate) async fn stores_for(
         &self,
         namespace_suffix: &str,
+        sorla: Option<&SorlaStateSelection>,
     ) -> Result<(DynSessionStore, DynStateStore)> {
-        if !self.is_durable() {
+        if !self.is_durable() && sorla.is_none() {
             return Ok((new_session_store(), new_state_store()));
         }
         let session = self.session_backend_for(namespace_suffix)?;
         let state = self.config.state.clone();
-        tokio::task::spawn_blocking(move || build_stores(session, state))
+        let sorla = sorla.cloned();
+        let suffix = namespace_suffix.to_string();
+        tokio::task::spawn_blocking(move || build_stores(session, state, sorla.as_ref(), &suffix))
             .await
             .context("the durable store builder task failed")?
     }
@@ -322,6 +328,8 @@ fn hex12(digest: &[u8]) -> String {
 fn build_stores(
     session: SessionBackend,
     state: StateBackend,
+    sorla: Option<&SorlaStateSelection>,
+    revision_suffix: &str,
 ) -> Result<(DynSessionStore, DynStateStore)> {
     if let SessionBackend::Redis { url, .. } = &session {
         // rustls provider for `rediss://`; a no-op for plaintext URLs.
@@ -332,8 +340,19 @@ fn build_stores(
     }
     let session_store = session_store_from_config(&session)
         .context("failed to open the durable session store for a revision")?;
-    let state_store = state_store_from_config(&state)
-        .context("failed to open the durable flow-state store for a revision")?;
+    // `state-sorla` outranks the env-selected flow-state backend: it is named by
+    // the revision's own pack config, which is the more specific statement. It
+    // serves both the flow `state` operations and the WIT `state-store` import
+    // (runner-host backs both with this one store), and, unlike the Redis
+    // flow-state backend, it IS scoped per revision.
+    let state_store: DynStateStore = match sorla {
+        Some(selection) => Arc::new(
+            HttpStateStore::connect(selection, revision_suffix)
+                .context("failed to open the state-sorla store for a revision")?,
+        ),
+        None => state_store_from_config(&state)
+            .context("failed to open the durable flow-state store for a revision")?,
+    };
     Ok((session_store, state_store))
 }
 

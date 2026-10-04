@@ -79,7 +79,7 @@ const QUEUE_CAPACITY: usize = 1024;
 pub(crate) struct MeteringToken(String);
 
 impl MeteringToken {
-    fn expose(&self) -> &str {
+    pub(crate) fn expose(&self) -> &str {
         &self.0
     }
 }

@@ -39,6 +39,7 @@ mod endpoint_resolver;
 mod env_tunnel;
 mod gtunnel;
 mod gtunnel_agent;
+mod sorla_state;
 // `pub` (doc-hidden) so `tests/threshold_watcher.rs` can drive
 // `select_target_flows` and the event-routing types directly.
 #[doc(hidden)]

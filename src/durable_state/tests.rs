@@ -209,8 +209,8 @@ fn the_revision_keyspace_extends_the_operators_prefix() {
 #[tokio::test]
 async fn in_memory_storage_mints_independent_stores() {
     let storage = DurableStorage::in_memory();
-    let (session_a, _) = storage.stores_for("rev-a").await.expect("in-memory");
-    let (session_b, _) = storage.stores_for("rev-b").await.expect("in-memory");
+    let (session_a, _) = storage.stores_for("rev-a", None).await.expect("in-memory");
+    let (session_b, _) = storage.stores_for("rev-b", None).await.expect("in-memory");
     assert!(
         !std::sync::Arc::ptr_eq(&session_a, &session_b),
         "two revisions must not share one in-memory store"
@@ -420,7 +420,7 @@ async fn an_unreachable_configured_redis_fails_at_store_construction() {
     let storage = live_storage("redis://127.0.0.1:1");
     // `expect_err` is unavailable: the Ok side is a pair of `Arc<dyn …>` and
     // neither store trait is `Debug`.
-    let Err(err) = storage.stores_for("rev-unreachable").await else {
+    let Err(err) = storage.stores_for("rev-unreachable", None).await else {
         panic!("an unreachable Redis must not yield a working-looking store");
     };
     let rendered = format!("{err:#}");
@@ -459,14 +459,14 @@ async fn a_parked_conversation_survives_a_restart() {
     let envelope = envelope_for("user-1", "conv-1");
 
     // --- process lifetime 1: park ---
-    let (session, _state) = storage.stores_for(&suffix).await.expect("open");
+    let (session, _state) = storage.stores_for(&suffix, None).await.expect("open");
     FlowResumeStore::new(session)
         .save(&envelope, &wait_for("node-a"))
         .await
         .expect("park");
 
     // --- process lifetime 2: a brand-new store over the same keyspace ---
-    let (session_after_restart, _) = storage.stores_for(&suffix).await.expect("reopen");
+    let (session_after_restart, _) = storage.stores_for(&suffix, None).await.expect("reopen");
     let resumed = FlowResumeStore::new(session_after_restart)
         .fetch(&envelope)
         .await
@@ -478,7 +478,7 @@ async fn a_parked_conversation_survives_a_restart() {
     );
 
     // --- and a DIFFERENT revision, on the same Redis, still sees nothing ---
-    let (other_revision, _) = storage.stores_for(&other).await.expect("open other");
+    let (other_revision, _) = storage.stores_for(&other, None).await.expect("open other");
     assert!(
         FlowResumeStore::new(other_revision)
             .fetch(&envelope)
@@ -489,7 +489,10 @@ async fn a_parked_conversation_survives_a_restart() {
     );
 
     // Leave the keyspace clean for the next run.
-    let (session, _) = storage.stores_for(&suffix).await.expect("reopen to clear");
+    let (session, _) = storage
+        .stores_for(&suffix, None)
+        .await
+        .expect("reopen to clear");
     FlowResumeStore::new(session)
         .clear(&envelope)
         .await
