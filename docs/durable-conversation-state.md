@@ -204,6 +204,7 @@ needs wait indices and per-user listing that a key/value door cannot answer.
 | `default_ttl_seconds` | none | TTL on a write that names none. |
 | `request_timeout_ms` | `5000` | Per-request timeout (100 to 60000). |
 | `cache_max_entries` | `1024` | Bounded LRU read cache; `0` disables it. |
+| `stable_component_state` | `false` | Boolean (`true`/`false`, or the same strings). Opt-in: component state (WIT `state-store` keys that are not flow-shaped) is keyed per environment/unit instead of per revision, so it survives a redeploy. See "Surviving a redeploy". |
 
 The credential is the unit's `metering.token` (`gtm_`), never a config field,
 and no type here prints it. Wire contract: `POST {door}/read|write|delete` with
@@ -216,3 +217,38 @@ A door error on a write, or on a read the cache cannot answer, fails that
 operation. A cached read is served past its 30 s freshness window for up to 10
 minutes while the door is down, with a warning. Writes are never buffered. Keys
 are scoped per revision.
+
+### Atomic claims
+
+`StateStore::set_json_if_absent` (the WIT `state-store@1.1.0` `write-if-absent`)
+is a `POST {door}/write` with `"if_absent": true`: `201` = claimed, `409
+{"error":{"code":"already_exists"}}` = a live value exists (`Ok(false)`, and the
+read cache is invalidated, never filled with our value). Any other outcome,
+including a `204` (an old door that ignored the flag and **overwrote** the key),
+is an error: a door failure is never "claimed" and never "exists". The read
+cache is never consulted for the decision.
+
+### Surviving a redeploy: `stable_component_state`
+
+The per-revision suffix is `<revision id>-<digest of deployment, revision,
+tenant, team, customer, bundle>`, so every redeploy (a new revision) starts with
+an empty keyspace even on a durable door. Setting `stable_component_state: true`
+in the `state-sorla` pack config (read in `sorla_state/config.rs`; default
+`false`; it reaches the store through `SorlaStateConfig`, with the stable suffix
+`stable-<digest of deployment, tenant, team, customer, bundle>` passed down from
+`revision_boot`) moves **component state only** to that revision-independent
+namespace. Flow state (keys the runner composes as `pack/<pack>/flow/<flow>/...`)
+stays per revision in either mode, because the new revision's flow graph may not
+understand a snapshot the old one wrote.
+
+Risks, stated plainly:
+
+* During a rolling deploy two revisions are live and now **share** component
+  keys. New component code reading state written by old code (or the reverse)
+  is not protected; keep component state formats forward and backward
+  compatible.
+* The split is by key shape. A component key that happens to start with `pack/`
+  is treated as flow state and stays per revision (the safe direction).
+* WebChat's shared history is safe because its activity slots are claimed with
+  the atomic `write-if-absent`: two revisions cannot both own a slot. Plain
+  read-modify-write component state has no such guarantee.

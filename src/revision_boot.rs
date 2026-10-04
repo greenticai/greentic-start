@@ -195,6 +195,28 @@ fn revision_namespace_suffix(key: &RevisionStoreKey) -> String {
     ])
 }
 
+/// The revision-independent suffix for `state-sorla`'s opt-in
+/// `stable_component_state`: every field of the store key EXCEPT the revision id.
+///
+/// Destructured exhaustively for the same reason as [`revision_namespace_suffix`].
+fn stable_namespace_suffix(key: &RevisionStoreKey) -> String {
+    let RevisionStoreKey {
+        deployment_id,
+        revision_id: _,
+        tenant,
+        team,
+        customer_id,
+        bundle_id,
+    } = key;
+    crate::durable_state::stable_suffix(&[
+        deployment_id.as_str(),
+        tenant.as_str(),
+        team.as_str(),
+        customer_id.as_str(),
+        bundle_id.as_str(),
+    ])
+}
+
 /// A fresh, empty [`RevisionStores`] registry. One per running server, created
 /// at cold start and shared with the reload producer.
 pub(crate) fn new_revision_stores() -> RevisionStores {
@@ -582,7 +604,11 @@ pub(crate) async fn activate_runtime_config(
                     );
                 }
                 durable
-                    .stores_for(&revision_namespace_suffix(&store_key), sorla.as_ref())
+                    .stores_for(
+                        &revision_namespace_suffix(&store_key),
+                        &stable_namespace_suffix(&store_key),
+                        sorla.as_ref(),
+                    )
                     .await
                     .with_context(|| {
                         format!(
@@ -2223,6 +2249,63 @@ mod tests {
             "a customer_id change must NOT reuse the previous customer's stores — \
              the new customer would inherit the old one's sessions"
         );
+    }
+
+    /// The stable (opt-in) suffix ignores the revision id and nothing else, and
+    /// is never equal to the per-revision suffix.
+    #[test]
+    fn the_stable_suffix_ignores_only_the_revision() {
+        let base = RevisionStoreKey {
+            deployment_id: "dep-01".to_string(),
+            revision_id: "rev-01".to_string(),
+            tenant: "acme".to_string(),
+            team: "general".to_string(),
+            customer_id: "cust-01".to_string(),
+            bundle_id: "Support-Bot.v1".to_string(),
+        };
+        let next_revision = RevisionStoreKey {
+            revision_id: "rev-02".to_string(),
+            ..base.clone()
+        };
+        assert_eq!(
+            stable_namespace_suffix(&base),
+            stable_namespace_suffix(&next_revision)
+        );
+        assert_ne!(
+            revision_namespace_suffix(&base),
+            revision_namespace_suffix(&next_revision)
+        );
+        assert_ne!(
+            stable_namespace_suffix(&base),
+            revision_namespace_suffix(&base)
+        );
+        for mutant in [
+            RevisionStoreKey {
+                deployment_id: "dep-02".into(),
+                ..base.clone()
+            },
+            RevisionStoreKey {
+                tenant: "other".into(),
+                ..base.clone()
+            },
+            RevisionStoreKey {
+                team: "ops".into(),
+                ..base.clone()
+            },
+            RevisionStoreKey {
+                customer_id: "cust-02".into(),
+                ..base.clone()
+            },
+            RevisionStoreKey {
+                bundle_id: "Other.v1".into(),
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(
+                stable_namespace_suffix(&base),
+                stable_namespace_suffix(&mutant)
+            );
+        }
     }
 
     /// The durable keyspace has to separate exactly what the in-memory registry
