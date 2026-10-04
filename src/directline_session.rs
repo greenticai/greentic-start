@@ -361,6 +361,11 @@ pub struct ForwardPlan {
     /// On a 2xx response, parse `conversationId` from the body and `touch` the
     /// sliding window for it (used for `POST /v3/directline/conversations`).
     pub seed_from_response: bool,
+    /// The caller's token was already bound to the conversation in the URL
+    /// (`conv` claim equal to the path id), not a conversation-less bootstrap
+    /// token. Only such a request may (re-)establish the conversation's revision
+    /// pin after the provider accepts it.
+    pub token_bound_to_conversation: bool,
 }
 
 /// Outcome of screening a DirectLine request before it reaches the provider.
@@ -544,6 +549,7 @@ fn handle_activities(
     // conv-bound bearer so the provider's strict `exp`+conversation checks pass and
     // the client can adopt a properly-bound token (even if it sent a conv-less one).
     sessions.touch(conv_id);
+    let token_bound_to_conversation = claims.conv.as_deref() == Some(conv_id);
     claims.conv = Some(conv_id.to_string());
     let renewed = mint_token(&claims, key, sessions.ttl_secs());
     // POST = a user-typed message (low frequency) — always echo the renewed
@@ -555,6 +561,7 @@ fn handle_activities(
         rewrite_authorization: Some(format!("Bearer {renewed}")),
         inject_renewed_token: echo_renewed.then_some(renewed),
         seed_from_response: false,
+        token_bound_to_conversation,
     })
 }
 
@@ -598,6 +605,7 @@ fn handle_reconnect(
         return unauthorized("TokenExpired", "invalid token: Expired");
     }
     sessions.touch(conv_id);
+    let token_bound_to_conversation = claims.conv.as_deref() == Some(conv_id);
     // Forward a fresh conv-bound bearer so the provider's reconnect handler
     // accepts it; its response already carries a freshly issued token.
     claims.conv = Some(conv_id.to_string());
@@ -606,6 +614,7 @@ fn handle_reconnect(
         rewrite_authorization: Some(format!("Bearer {renewed}")),
         inject_renewed_token: None,
         seed_from_response: false,
+        token_bound_to_conversation,
     })
 }
 
@@ -650,6 +659,7 @@ fn handle_conversations_create(
         rewrite_authorization,
         inject_renewed_token: None,
         seed_from_response: true,
+        ..ForwardPlan::default()
     })
 }
 
@@ -1494,6 +1504,75 @@ mod tests {
             Some("conv-7")
         );
         assert!(sessions.is_alive("conv-7"));
+    }
+
+    fn forward_plan(method: Method, path: &str, token: &str) -> ForwardPlan {
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        match preflight(
+            &method,
+            path,
+            &auth(token),
+            SigningKey::Present(KEY),
+            &sessions,
+        ) {
+            Preflight::Forward(plan) => plan,
+            Preflight::Respond(_) => panic!("expected forward"),
+        }
+    }
+
+    #[test]
+    fn only_a_token_already_bound_to_the_conversation_may_repin() {
+        let now = now_secs();
+        let bound = make_token("alice", Some("conv-7"), now, now + 1800, KEY);
+        let unbound = make_token("alice", None, now, now + 1800, KEY);
+        for (method, path) in [
+            (Method::GET, "/v3/directline/conversations/conv-7"),
+            (
+                Method::POST,
+                "/v3/directline/conversations/conv-7/activities",
+            ),
+            (
+                Method::GET,
+                "/v3/directline/conversations/conv-7/activities",
+            ),
+        ] {
+            assert!(
+                forward_plan(method.clone(), path, &bound).token_bound_to_conversation,
+                "a bound token may re-pin {method} {path}"
+            );
+            assert!(
+                !forward_plan(method.clone(), path, &unbound).token_bound_to_conversation,
+                "a conversation-less token must not re-pin {method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_bound_to_another_conversation_is_refused_so_it_cannot_pin() {
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        let now = now_secs();
+        let other = make_token("alice", Some("conv-OTHER"), now, now + 1800, KEY);
+        for (method, path) in [
+            (Method::GET, "/v3/directline/conversations/conv-7"),
+            (
+                Method::POST,
+                "/v3/directline/conversations/conv-7/activities",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    preflight(
+                        &method,
+                        path,
+                        &auth(&other),
+                        SigningKey::Present(KEY),
+                        &sessions
+                    ),
+                    Preflight::Respond(_)
+                ),
+                "{method} {path} must be refused before it can reach the provider"
+            );
+        }
     }
 
     #[test]

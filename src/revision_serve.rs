@@ -5919,6 +5919,31 @@ async fn dispatch_provider_route(
             }
         }
 
+        // Resume: a conversation whose pin was lost (restart, redeploy, TTL, or
+        // a different replica) is served from durable state, but its WebSocket
+        // is refused unless a pin exists. Re-establish it when the provider
+        // ACCEPTED a conversation-scoped request (reconnect `GET
+        // /conversations/{id}`, `POST`/`GET .../activities`) for a caller whose
+        // token was already bound to that same conversation. The provider's 2xx
+        // is the proof the conversation exists; the bound token is the proof the
+        // caller owns it. `commit_pin` is insert-if-absent, so a live pin (an
+        // older revision still draining, or a racing request) is never replaced.
+        // The creating POST is handled above.
+        if succeeded
+            && !creates_conversation
+            && dl_forward_plan
+                .as_ref()
+                .is_some_and(|plan| plan.token_bound_to_conversation)
+            && let Some(hint) =
+                crate::session_hint_extractor::extract_webchat_session_hint(&dl_path)
+        {
+            activation
+                .routing
+                .dispatcher
+                .commit_pin(tenant, deployment_id, &hint, revision_id)
+                .await;
+        }
+
         // streamUrl rewrite: the provider returns a relative path, but
         // DirectLineJS requires an absolute ws:// URL that routes back through
         // the same bundle. BOTH responses that carry one need it: the create,
@@ -7132,10 +7157,12 @@ impl crate::websocket::pump::ActivitySource for RevisionActivitySource {
 
 /// Handle a WebSocket upgrade on the revision path.
 ///
-/// The conversation must already exist (created via REST `POST /conversations`)
-/// and be pinned to a revision. The WS pump reads activities from the SAME
-/// revision the REST conversation was pinned to — never re-dispatching — so
-/// the socket and the REST endpoint always see the same conversation state.
+/// The caller must hold a valid token bound to the conversation (minted by REST
+/// `POST /conversations`). The WS pump reads activities from the revision the
+/// conversation is pinned to, so the socket and the REST endpoint always see
+/// the same conversation state. When the pin is gone (restart, redeploy, TTL)
+/// it is re-established on the current revision after the token is verified,
+/// never replacing a live pin.
 async fn handle_websocket_upgrade(
     req: &mut Request<Incoming>,
     path: &str,
@@ -7206,30 +7233,9 @@ async fn handle_websocket_upgrade(
         })?
         .to_string();
 
-    // Look up the revision pin for this conversation. A5 critical invariant:
-    // the WS pump MUST read from the same revision the REST POST pinned to.
-    // The session hint format is `webchat:{conversation_id}`.
-    let session_hint = format!("webchat:{conv_id}");
-    let pinned = activation
-        .routing
-        .dispatcher
-        .lookup_pin(&tenant, deployment_id, &session_hint)
-        .await;
-
-    let (bundle_id, revision_id) = match pinned {
-        Some((bid, rid)) => (bid, rid),
-        None => {
-            // No pin means the conversation was never created via REST, or the
-            // pin expired. Either way, we cannot safely pick a revision.
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                "no revision pin for this conversation; create it via REST first",
-            ));
-        }
-    };
-
-    // Read the JWT signing key from the pinned revision's secrets. This path
-    // has no "auth is off" posture of its own — it always needs the actual
+    // Read the JWT signing key. The key is a provider-level secret, not a
+    // per-revision one, so it can be read before a revision is chosen. This
+    // path has no "auth is off" posture of its own — it always needs the actual
     // key bytes to validate the `?t=` token — so both a never-configured key
     // and one that could not be read refuse the same way.
     let team = "default";
@@ -7245,7 +7251,10 @@ async fn handle_websocket_upgrade(
         }
     };
 
-    // Validate the ?t= token.
+    // Validate the ?t= token. It must be signed by us, unexpired, bound to
+    // THIS conversation id (a conversation-less token is refused here) and to
+    // this tenant — so everything below acts only for a caller that holds a
+    // credential minted for this exact conversation.
     let ctx = match crate::websocket::validate_request_parts(
         req.uri(),
         req.headers(),
@@ -7255,6 +7264,37 @@ async fn handle_websocket_upgrade(
     ) {
         Ok(c) => c,
         Err(err) => return Ok(crate::websocket::refusal_response(&err)),
+    };
+
+    // Find the revision this conversation is pinned to. A5 critical invariant:
+    // the WS pump MUST read from the same revision the REST side serves it
+    // from. The session hint format is `webchat:{conversation_id}`.
+    //
+    // The pin lives in memory (or Redis) and is created by REST traffic, so it
+    // is gone after a restart, a redeploy or a TTL while the conversation's
+    // durable state is not. A caller holding a valid token bound to this
+    // conversation therefore re-establishes it, on the current revision and
+    // insert-if-absent: a live pin — an older revision still draining during a
+    // rolling deploy included — is never replaced, and racing upgrades converge
+    // on one pin. See docs/durable-conversation-state.md.
+    let session_hint = format!("webchat:{conv_id}");
+    let mut rng: rand::rngs::SmallRng = rand::make_rng();
+    let pinned = activation
+        .routing
+        .dispatcher
+        .establish_pin(&tenant, deployment_id, &session_hint, &mut rng)
+        .await;
+
+    let (bundle_id, revision_id) = match pinned {
+        Some((bid, rid)) => (bid, rid),
+        None => {
+            // No routable revision exists for this deployment, so there is
+            // nothing safe to pin to.
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "no revision is available to serve this conversation",
+            ));
+        }
     };
 
     // Resolve the provider's config from the pinned revision (#585), after
@@ -15645,6 +15685,230 @@ mod binary_update_tests {
 
         let _ = ws.close(None).await;
         accept_handle.abort();
+    }
+
+    /// Serve `activation` on a loopback listener through the real connection
+    /// pipeline, with the test activity source substituted for the provider.
+    async fn ws_serve_fixture(
+        activation: Activation,
+    ) -> (
+        Arc<ServeState>,
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let test_source = std::sync::Arc::new(TestActivitySource::new());
+        test_source.append("hello from replay");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let state = Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(activation)),
+            bound_addr: addr,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
+            activity_source_override: Some(
+                test_source as Arc<dyn crate::websocket::pump::ActivitySource>,
+            ),
+        });
+        let accept_state = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            while let Ok(accept) = listener.accept().await {
+                spawn_revision_connection(Ok(accept), &accept_state, true);
+            }
+        });
+        (state, addr, handle)
+    }
+
+    fn ws_status(
+        result: Result<
+            (
+                tokio_tungstenite::WebSocketStream<
+                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                >,
+                tokio_tungstenite::tungstenite::handshake::client::Response,
+            ),
+            tokio_tungstenite::tungstenite::Error,
+        >,
+    ) -> u16 {
+        match result {
+            Ok((_ws, response)) => response.status().as_u16(),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                response.status().as_u16()
+            }
+            Err(other) => panic!("unexpected websocket error: {other:?}"),
+        }
+    }
+
+    /// The bug this guards: after a restart / redeploy the page resumes a
+    /// conversation whose durable state is intact, and its stream WebSocket was
+    /// answered `404 no revision pin ... create it via REST first`, because the
+    /// pin lives in memory and only `POST /conversations` created it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ws_resume_without_a_pin_re_establishes_it() {
+        let (tenant, key) = ("test-tenant", b"repin-ws-key".as_slice());
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let rev_id = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("test.webchat");
+        let pin_store: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore> =
+            std::sync::Arc::new(crate::revision_pin::InMemoryPinStore::new());
+        let activation =
+            ws_test_activation("local", tenant, dep_id, rev_id, bundle_id, key, pin_store);
+        let (state, addr, accept) = ws_serve_fixture(activation).await;
+        let dispatcher = Arc::clone(&state.current().routing.dispatcher);
+        assert_eq!(
+            dispatcher
+                .lookup_pin(tenant, dep_id, "webchat:c-resume")
+                .await,
+            None,
+            "precondition: a fresh process holds no pin"
+        );
+
+        let token = issue_test_token("c-resume", tenant, key);
+        let url = format!(
+            "ws://{addr}/v1/messaging/webchat/{tenant}/v3/directline/conversations/c-resume/stream?t={token}&watermark=0"
+        );
+        let status = ws_status(tokio_tungstenite::connect_async(&url).await);
+        assert_eq!(status, 101, "resume must complete the handshake");
+        assert_eq!(
+            dispatcher
+                .lookup_pin(tenant, dep_id, "webchat:c-resume")
+                .await
+                .map(|(_, r)| r),
+            Some(rev_id),
+            "and leave the conversation pinned to the current revision"
+        );
+        accept.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ws_without_a_valid_token_for_this_conversation_cannot_pin() {
+        let (tenant, key) = ("test-tenant", b"repin-ws-key".as_slice());
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let rev_id = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("test.webchat");
+        let pin_store: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore> =
+            std::sync::Arc::new(crate::revision_pin::InMemoryPinStore::new());
+        let activation =
+            ws_test_activation("local", tenant, dep_id, rev_id, bundle_id, key, pin_store);
+        let (state, addr, accept) = ws_serve_fixture(activation).await;
+        let dispatcher = Arc::clone(&state.current().routing.dispatcher);
+        let base = format!(
+            "ws://{addr}/v1/messaging/webchat/{tenant}/v3/directline/conversations/c-victim/stream"
+        );
+
+        // Another conversation's token.
+        let other = issue_test_token("c-other", tenant, key);
+        assert_eq!(
+            ws_status(tokio_tungstenite::connect_async(format!("{base}?t={other}")).await),
+            403
+        );
+        // A token signed with a different key.
+        let forged = issue_test_token("c-victim", tenant, b"some-other-key");
+        assert_eq!(
+            ws_status(tokio_tungstenite::connect_async(format!("{base}?t={forged}")).await),
+            401
+        );
+        // A token for another tenant.
+        let foreign = issue_test_token("c-victim", "other-tenant", key);
+        assert_eq!(
+            ws_status(tokio_tungstenite::connect_async(format!("{base}?t={foreign}")).await),
+            403
+        );
+        // No token at all.
+        assert_eq!(
+            ws_status(tokio_tungstenite::connect_async(base.clone()).await),
+            401
+        );
+        assert_eq!(
+            dispatcher
+                .lookup_pin(tenant, dep_id, "webchat:c-victim")
+                .await,
+            None,
+            "no refused request may leave a pin behind"
+        );
+        accept.abort();
+    }
+
+    /// A conversation pinned to an older revision that is still serving (a
+    /// rolling deploy) keeps it: the resume path never steals a live pin.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ws_resume_keeps_an_existing_live_pin() {
+        let (tenant, key) = ("test-tenant", b"repin-ws-key".as_slice());
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let new_rev = greentic_deploy_spec::ids::RevisionId::new();
+        let old_rev = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("test.webchat");
+        let pin_store: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore> =
+            std::sync::Arc::new(crate::revision_pin::InMemoryPinStore::new());
+        let activation = ws_test_activation(
+            "local",
+            tenant,
+            dep_id,
+            new_rev,
+            bundle_id.clone(),
+            key,
+            pin_store,
+        );
+        activation
+            .routing
+            .dispatcher
+            .apply_traffic_split(
+                dep_id,
+                vec![
+                    crate::revision_dispatcher::RevisionEntry {
+                        revision_id: new_rev,
+                        bundle_id: bundle_id.clone(),
+                        weight_bps: 5_000,
+                    },
+                    crate::revision_dispatcher::RevisionEntry {
+                        revision_id: old_rev,
+                        bundle_id: bundle_id.clone(),
+                        weight_bps: 5_000,
+                    },
+                ],
+                bundle_id,
+                1,
+            )
+            .expect("second revision");
+        activation
+            .routing
+            .dispatcher
+            .commit_pin(tenant, dep_id, "webchat:c-old", old_rev)
+            .await;
+        let (state, addr, accept) = ws_serve_fixture(activation).await;
+
+        let token = issue_test_token("c-old", tenant, key);
+        let url = format!(
+            "ws://{addr}/v1/messaging/webchat/{tenant}/v3/directline/conversations/c-old/stream?t={token}&watermark=0"
+        );
+        assert_eq!(ws_status(tokio_tungstenite::connect_async(&url).await), 101);
+        assert_eq!(
+            state
+                .current()
+                .routing
+                .dispatcher
+                .lookup_pin(tenant, dep_id, "webchat:c-old")
+                .await
+                .map(|(_, r)| r),
+            Some(old_rev),
+            "the live pin to the older revision must survive the resume"
+        );
+        accept.abort();
     }
 
     /// Combined regression for the webchat token 502: the store is keyed the
