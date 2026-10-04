@@ -34,6 +34,8 @@ struct Door {
     /// Delay before answering.
     delay_ms: AtomicUsize,
     down: AtomicBool,
+    /// Simulates an OLD door: `if_absent` is ignored and the write answers 204.
+    ignore_if_absent: AtomicBool,
 }
 
 struct FakeDoor {
@@ -111,7 +113,9 @@ fn serve(door: Arc<Door>) -> FakeDoor {
                 let (status, payload) = respond(&door, &path, &body);
                 let reason = match status {
                     200 => "OK",
+                    201 => "Created",
                     204 => "No Content",
+                    409 => "Conflict",
                     404 => "Not Found",
                     _ => "Err",
                 };
@@ -146,6 +150,18 @@ fn respond(door: &Door, path: &str, body: &Value) -> (u16, String) {
             let bytes = B64
                 .decode(body["value"].as_str().unwrap_or(""))
                 .unwrap_or_default();
+            let claim = body["if_absent"].as_bool().unwrap_or(false)
+                && !door.ignore_if_absent.load(Ordering::SeqCst);
+            if claim {
+                if values.contains_key(&key) {
+                    return (
+                        409,
+                        json!({"error": {"code": "already_exists"}}).to_string(),
+                    );
+                }
+                values.insert(key, bytes);
+                return (201, String::new());
+            }
             values.insert(key, bytes);
             (204, String::new())
         }
@@ -191,7 +207,7 @@ fn key(k: &str) -> StateKey {
 }
 
 fn connect(base: &str, extra: Value) -> HttpStateStore {
-    HttpStateStore::connect(&selection(base, extra), "rev-a-123").expect("connect")
+    HttpStateStore::connect(&selection(base, extra), "rev-a-123", "stable-1").expect("connect")
 }
 
 // ---- config ----------------------------------------------------------------
@@ -317,8 +333,10 @@ fn a_write_reads_back_and_carries_the_bearer_and_a_revision_scoped_key() {
 #[test]
 fn two_revisions_never_share_a_door_key() {
     let fake = serve(Arc::default());
-    let a = HttpStateStore::connect(&selection(&fake.base, json!({})), "rev-a").expect("a");
-    let b = HttpStateStore::connect(&selection(&fake.base, json!({})), "rev-b").expect("b");
+    let a =
+        HttpStateStore::connect(&selection(&fake.base, json!({})), "rev-a", "stable-1").expect("a");
+    let b =
+        HttpStateStore::connect(&selection(&fake.base, json!({})), "rev-b", "stable-1").expect("b");
     a.set_json(&tenant("acme"), "runner", &key("k"), None, &json!(1), None)
         .expect("write a");
     assert_eq!(
@@ -552,9 +570,11 @@ fn a_failed_write_drops_the_cached_copy_so_it_cannot_answer_for_unknown_state() 
 fn the_boot_probe_fails_loudly_for_a_dead_or_unauthorised_door() {
     // Nothing listens on this port.
     let dead = "http://127.0.0.1:1/api/v1/ingest/state";
-    let Err(err) =
-        HttpStateStore::connect(&selection(dead, json!({"request_timeout_ms": 300})), "rev")
-    else {
+    let Err(err) = HttpStateStore::connect(
+        &selection(dead, json!({"request_timeout_ms": 300})),
+        "rev",
+        "stable-1",
+    ) else {
         panic!("a dead door must fail the connect");
     };
     let text = format!("{err:#}");
@@ -566,7 +586,7 @@ fn the_boot_probe_fails_loudly_for_a_dead_or_unauthorised_door() {
 
     let fake = serve(Arc::default());
     *fake.door.fail_with.lock().expect("lock") = Some(403);
-    assert!(HttpStateStore::connect(&selection(&fake.base, json!({})), "rev").is_err());
+    assert!(HttpStateStore::connect(&selection(&fake.base, json!({})), "rev", "stable-1").is_err());
 }
 
 #[test]
@@ -595,7 +615,7 @@ async fn durable_storage_builds_the_sorla_store_and_it_serves_state() {
     let storage = crate::durable_state::DurableStorage::in_memory();
     let selection = selection(&fake.base, json!({}));
     let (_session, state) = storage
-        .stores_for("rev-x", Some(&selection))
+        .stores_for("rev-x", "stable-x", Some(&selection))
         .await
         .expect("sorla store");
     let value = tokio::task::spawn_blocking(move || {
@@ -629,7 +649,7 @@ async fn durable_storage_builds_the_sorla_store_and_it_serves_state() {
     // And a door that is down fails the activation rather than falling back.
     fake.door.down.store(true, Ordering::SeqCst);
     let failed = crate::durable_state::DurableStorage::in_memory()
-        .stores_for("rev-y", Some(&selection))
+        .stores_for("rev-y", "stable-x", Some(&selection))
         .await;
     assert!(failed.is_err(), "no silent fallback to memory");
 }
@@ -684,4 +704,253 @@ fn carrying_the_pack_without_metering_refuses_instead_of_serving_memory() {
         super::select(&ids(&["state-sorla"]), None, None).unwrap_err(),
         StateConfigError::NoMetering
     );
+}
+
+// ---- claims (set_json_if_absent) --------------------------------------------
+
+fn claim(store: &HttpStateStore, k: &str, v: Value) -> greentic_types::GResult<bool> {
+    store.set_json_if_absent(&tenant("acme"), "runner", &key(k), &v, None)
+}
+
+fn read(store: &HttpStateStore, k: &str) -> Option<Value> {
+    store
+        .get_json(&tenant("acme"), "runner", &key(k), None)
+        .expect("read")
+}
+
+#[test]
+fn a_claim_wins_once_then_reports_the_key_exists() {
+    let fake = serve(Arc::default());
+    let store = connect(&fake.base, json!({}));
+    assert!(claim(&store, "slot", json!("first")).expect("claim"));
+    assert!(!claim(&store, "slot", json!("second")).expect("reclaim"));
+    assert_eq!(read(&store, "slot"), Some(json!("first")));
+}
+
+#[test]
+fn a_claim_carries_the_bearer_if_absent_and_a_revision_scoped_key() {
+    let fake = serve(Arc::default());
+    let store = connect(&fake.base, json!({"key_prefix": "chat"}));
+    assert!(claim(&store, "slot", json!(1)).expect("claim"));
+    let seen = fake.door.seen.lock().expect("seen");
+    let (path, auth, body) = seen
+        .iter()
+        .find(|(p, _, _)| p.ends_with("/write"))
+        .expect("write sent");
+    assert_eq!(path, "/api/v1/ingest/state/write");
+    assert_eq!(auth, &format!("Bearer {TOKEN}"));
+    assert_eq!(body["if_absent"], json!(true));
+    assert!(
+        body["key"]
+            .as_str()
+            .expect("key")
+            .starts_with("chat:rev-a-123:")
+    );
+}
+
+#[test]
+fn a_claimed_key_is_served_from_the_cache_without_another_door_hit() {
+    let fake = serve(Arc::default());
+    let store = connect(&fake.base, json!({}));
+    assert!(claim(&store, "slot", json!("mine")).expect("claim"));
+    let before = fake.door.hits.load(Ordering::SeqCst);
+    assert_eq!(read(&store, "slot"), Some(json!("mine")));
+    assert_eq!(fake.door.hits.load(Ordering::SeqCst), before);
+}
+
+#[test]
+fn a_lost_claim_never_caches_our_value_and_reads_the_doors() {
+    let fake = serve(Arc::default());
+    let winner = connect(&fake.base, json!({}));
+    let loser = connect(&fake.base, json!({}));
+    assert!(claim(&winner, "slot", json!("theirs")).expect("win"));
+    assert!(!claim(&loser, "slot", json!("ours")).expect("lose"));
+    assert_eq!(read(&loser, "slot"), Some(json!("theirs")));
+}
+
+#[test]
+fn a_lost_claim_invalidates_a_previously_cached_entry() {
+    let fake = serve(Arc::default());
+    let store = connect(&fake.base, json!({}));
+    let other = connect(&fake.base, json!({}));
+    other
+        .set_json(
+            &tenant("acme"),
+            "runner",
+            &key("slot"),
+            None,
+            &json!("v1"),
+            None,
+        )
+        .expect("seed");
+    // Cache v1 in `store`, then change the door's value behind its back.
+    assert_eq!(read(&store, "slot"), Some(json!("v1")));
+    other
+        .set_json(
+            &tenant("acme"),
+            "runner",
+            &key("slot"),
+            None,
+            &json!("v2"),
+            None,
+        )
+        .expect("overwrite");
+    assert!(!claim(&store, "slot", json!("ours")).expect("claim"));
+    assert_eq!(
+        read(&store, "slot"),
+        Some(json!("v2")),
+        "stale v1 was dropped"
+    );
+}
+
+#[test]
+fn door_failures_are_errors_never_claimed_or_exists() {
+    let fake = serve(Arc::default());
+    let store = connect(&fake.base, json!({}));
+    for status in [500u16, 503] {
+        *fake.door.fail_with.lock().expect("lock") = Some(status);
+        assert!(claim(&store, "slot", json!(1)).is_err(), "{status}");
+    }
+    for status in [401u16, 403] {
+        *fake.door.fail_with.lock().expect("lock") = Some(status);
+        assert!(claim(&store, "slot", json!(1)).is_err(), "{status}");
+    }
+    *fake.door.fail_with.lock().expect("lock") = None;
+    let slow = connect(&fake.base, json!({"request_timeout_ms": 200}));
+    fake.door.delay_ms.store(800, Ordering::SeqCst);
+    assert!(claim(&slow, "slot", json!(1)).is_err(), "timeout");
+    fake.door.delay_ms.store(0, Ordering::SeqCst);
+    // Nothing was claimed by any failed attempt.
+    assert!(claim(&store, "slot", json!(1)).expect("claim after recovery"));
+}
+
+#[test]
+fn a_204_to_a_claim_means_an_old_door_and_is_an_error() {
+    let fake = serve(Arc::default());
+    fake.door.ignore_if_absent.store(true, Ordering::SeqCst);
+    let store = connect(&fake.base, json!({}));
+    let err = claim(&store, "slot", json!(1)).expect_err("old door");
+    assert!(err.to_string().contains("ignores if_absent"), "{err}");
+    assert_eq!(read(&store, "slot").map(|_| ()), Some(()), "door holds it");
+}
+
+#[test]
+fn two_stores_with_separate_caches_racing_one_key_have_one_winner() {
+    let fake = serve(Arc::default());
+    let wins: usize = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let base = fake.base.clone();
+                scope.spawn(move || {
+                    let store = connect(&base, json!({}));
+                    usize::from(claim(&store, "slot", json!(i)).expect("claim"))
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("join")).sum()
+    });
+    assert_eq!(wins, 1);
+}
+
+#[test]
+fn a_claim_applies_the_default_ttl_and_an_explicit_one() {
+    let fake = serve(Arc::default());
+    let store = connect(&fake.base, json!({"default_ttl_seconds": 600}));
+    assert!(claim(&store, "a", json!(1)).expect("claim"));
+    store
+        .set_json_if_absent(&tenant("acme"), "runner", &key("b"), &json!(1), Some(30))
+        .expect("claim");
+    let seen = fake.door.seen.lock().expect("seen");
+    let ttl_of = |needle: &str| {
+        seen.iter()
+            .find(|(p, _, b)| {
+                p.ends_with("/write") && b["key"].as_str().is_some_and(|k| k.ends_with(needle))
+            })
+            .map(|(_, _, b)| b["ttl_secs"].clone())
+    };
+    assert_eq!(ttl_of(":a"), Some(json!(600)));
+    assert_eq!(ttl_of(":b"), Some(json!(30)));
+}
+
+// ---- stable component state (opt-in) ----------------------------------------
+
+fn stable_store(base: &str, revision: &str, stable: &str, on: bool) -> HttpStateStore {
+    let extra = json!({"stable_component_state": on});
+    HttpStateStore::connect(&selection(base, extra), revision, stable).expect("connect")
+}
+
+fn put(store: &HttpStateStore, k: &str, v: Value) {
+    store
+        .set_json(&tenant("acme"), "runner", &key(k), None, &v, None)
+        .expect("write");
+}
+
+#[test]
+fn by_default_component_state_is_per_revision() {
+    let fake = serve(Arc::default());
+    let a = stable_store(&fake.base, "rev-a", "stable-1", false);
+    let b = stable_store(&fake.base, "rev-b", "stable-1", false);
+    put(&a, "conv/1", json!("hello"));
+    assert_eq!(read(&b, "conv/1"), None);
+}
+
+#[test]
+fn opted_in_component_state_has_identical_door_keys_across_revisions() {
+    let fake = serve(Arc::default());
+    let a = stable_store(&fake.base, "rev-a", "stable-1", true);
+    let b = stable_store(&fake.base, "rev-b", "stable-1", true);
+    put(&a, "conv/1", json!("hello"));
+    assert_eq!(read(&b, "conv/1"), Some(json!("hello")));
+    assert!(
+        !claim(&b, "conv/1", json!("x")).expect("claim"),
+        "claims see it too"
+    );
+    let seen = fake.door.seen.lock().expect("seen");
+    let keys: Vec<_> = seen
+        .iter()
+        .filter(|(p, _, _)| p.ends_with("/write"))
+        .map(|(_, _, b)| b["key"].as_str().expect("k").to_string())
+        .collect();
+    assert_eq!(keys[0], keys[1]);
+    assert!(keys[0].contains("stable-1"), "{}", keys[0]);
+    assert!(!keys[0].contains("rev-"), "{}", keys[0]);
+}
+
+#[test]
+fn opted_in_flow_state_stays_per_revision_and_modes_do_not_collide() {
+    let fake = serve(Arc::default());
+    let a = stable_store(&fake.base, "rev-a", "stable-1", true);
+    let b = stable_store(&fake.base, "rev-b", "stable-1", true);
+    put(&a, "pack/p/flow/f/session/s", json!("flow-a"));
+    assert_eq!(
+        read(&b, "pack/p/flow/f/session/s"),
+        None,
+        "flow state isolated"
+    );
+    // A different environment's stable scope is a different keyspace.
+    let other_env = stable_store(&fake.base, "rev-a", "stable-2", true);
+    put(&a, "conv/1", json!("env1"));
+    assert_eq!(read(&other_env, "conv/1"), None);
+    // The default (per-revision) mode and the stable mode never share a key.
+    let default_mode = stable_store(&fake.base, "rev-a", "stable-1", false);
+    assert_eq!(read(&default_mode, "conv/1"), None);
+}
+
+#[test]
+fn stable_component_state_config_is_parsed_strictly() {
+    let on = |v: Value| {
+        let mut m = BTreeMap::new();
+        m.insert("stable_component_state".to_string(), v);
+        super::config::SorlaStateConfig::from_non_secret(&m)
+    };
+    assert!(
+        !super::config::SorlaStateConfig::from_non_secret(&BTreeMap::new())
+            .expect("d")
+            .stable_component_state
+    );
+    assert!(on(json!(true)).expect("b").stable_component_state);
+    assert!(on(json!("true")).expect("s").stable_component_state);
+    assert!(!on(json!("false")).expect("s").stable_component_state);
+    assert!(on(json!("maybe")).is_err());
+    assert!(on(json!(3)).is_err());
 }

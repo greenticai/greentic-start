@@ -221,7 +221,14 @@ impl DurableStorage {
             return Ok(());
         }
         let session = self.session_backend_for("boot-probe")?;
-        build_stores(session, self.config.state.clone(), None, "boot-probe").context(
+        build_stores(
+            session,
+            self.config.state.clone(),
+            None,
+            "boot-probe",
+            "stable-boot-probe",
+        )
+        .context(
             "the configured conversation-state backend is unreachable; refusing to boot on \
              in-memory state, which would silently lose every parked conversation",
         )?;
@@ -238,6 +245,7 @@ impl DurableStorage {
     pub(crate) async fn stores_for(
         &self,
         namespace_suffix: &str,
+        stable_suffix: &str,
         sorla: Option<&SorlaStateSelection>,
     ) -> Result<(DynSessionStore, DynStateStore)> {
         if !self.is_durable() && sorla.is_none() {
@@ -247,9 +255,12 @@ impl DurableStorage {
         let state = self.config.state.clone();
         let sorla = sorla.cloned();
         let suffix = namespace_suffix.to_string();
-        tokio::task::spawn_blocking(move || build_stores(session, state, sorla.as_ref(), &suffix))
-            .await
-            .context("the durable store builder task failed")?
+        let stable = stable_suffix.to_string();
+        tokio::task::spawn_blocking(move || {
+            build_stores(session, state, sorla.as_ref(), &suffix, &stable)
+        })
+        .await
+        .context("the durable store builder task failed")?
     }
 
     /// The session backend for one revision: the resolved keyspace with the
@@ -317,6 +328,18 @@ pub(crate) fn isolation_suffix(fields: &[&str]) -> String {
     format!("{readable}-{}", hex12(&digest))
 }
 
+/// The revision-INDEPENDENT suffix: the same digest construction, over the
+/// fields that identify the environment/unit (deployment, tenant, team,
+/// customer, bundle) and not the revision id. A leading `stable` marker keeps
+/// it from ever equalling a per-revision suffix.
+///
+/// Used only by `state-sorla`'s opt-in `stable_component_state`.
+pub(crate) fn stable_suffix(fields: &[&str]) -> String {
+    let mut all = vec!["stable"];
+    all.extend_from_slice(fields);
+    isolation_suffix(&all)
+}
+
 fn hex12(digest: &[u8]) -> String {
     digest
         .iter()
@@ -330,6 +353,7 @@ fn build_stores(
     state: StateBackend,
     sorla: Option<&SorlaStateSelection>,
     revision_suffix: &str,
+    stable_suffix: &str,
 ) -> Result<(DynSessionStore, DynStateStore)> {
     if let SessionBackend::Redis { url, .. } = &session {
         // rustls provider for `rediss://`; a no-op for plaintext URLs.
@@ -347,7 +371,7 @@ fn build_stores(
     // flow-state backend, it IS scoped per revision.
     let state_store: DynStateStore = match sorla {
         Some(selection) => Arc::new(
-            HttpStateStore::connect(selection, revision_suffix)
+            HttpStateStore::connect(selection, revision_suffix, stable_suffix)
                 .context("failed to open the state-sorla store for a revision")?,
         ),
         None => state_store_from_config(&state)

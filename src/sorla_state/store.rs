@@ -6,6 +6,7 @@
 //! |---|---|---|
 //! | `POST {door}/read` | `{"key"}` | `200 {"value":"<b64>"}` or `404` |
 //! | `POST {door}/write` | `{"key","value":"<b64>","ttl_secs"?}` | `204` |
+//! | `POST {door}/write` (claim) | `{"key","value":"<b64>","ttl_secs"?,"if_absent":true}` | `201` claimed, `409 {"error":{"code":"already_exists"}}` when a live value exists |
 //! | `POST {door}/delete` | `{"key"}` | `204` |
 //!
 //! The trait it implements, [`StateStore`], is synchronous, like the Redis
@@ -40,6 +41,11 @@ use crate::operator_log;
 const CACHE_FRESH_FOR: Duration = Duration::from_secs(30);
 /// How long past freshness an entry may still answer a read the door could not.
 const CACHE_STALE_GRACE: Duration = Duration::from_secs(600);
+/// Keys the runner composes for FLOW state start with this segment
+/// (`pack/<pack>/flow/<flow>/session/<hint>`, runner-host `derive_state_key`).
+/// Anything else under the `runner` prefix was named by a component through the
+/// WIT `state-store` import.
+const FLOW_STATE_KEY_PREFIX: &str = "pack/";
 /// The key the boot probe reads. Never written, so the probe leaves no litter.
 const PROBE_KEY: &str = "boot-probe";
 
@@ -146,8 +152,13 @@ pub(crate) struct HttpStateStore {
     write_url: String,
     delete_url: String,
     token: String,
-    /// `<key_prefix>:<revision suffix>` — folded into every door key.
+    /// `<key_prefix>:<revision suffix>` — folded into every door key, except
+    /// component state when [`Self::stable_namespace`] is set.
     namespace: String,
+    /// `<key_prefix>:<stable suffix>` — present only when the opt-in
+    /// `stable_component_state` is on. Component-state keys use it, so they
+    /// survive a redeploy; flow-state keys never do.
+    stable_namespace: Option<String>,
     default_ttl: Option<u32>,
     cache: Mutex<ReadCache>,
 }
@@ -168,13 +179,19 @@ impl HttpStateStore {
     /// ([`crate::durable_state::isolation_suffix`]). An unreachable or
     /// unauthorised door is an `Err`, never a store that fails later in front
     /// of a user — the contract `crate::durable_state` already holds Redis to.
+    ///
+    /// `stable_suffix` is the revision-independent digest
+    /// ([`crate::durable_state::stable_suffix`]); it is used only when the
+    /// selection opted in with `stable_component_state`.
     pub(crate) fn connect(
         selection: &SorlaStateSelection,
         revision_suffix: &str,
+        stable_suffix: &str,
     ) -> anyhow::Result<Self> {
         let store = Self::build(
             selection,
             revision_suffix,
+            stable_suffix,
             CACHE_FRESH_FOR,
             CACHE_STALE_GRACE,
         )?;
@@ -185,6 +202,7 @@ impl HttpStateStore {
     fn build(
         selection: &SorlaStateSelection,
         revision_suffix: &str,
+        stable_suffix: &str,
         fresh_for: Duration,
         stale_grace: Duration,
     ) -> anyhow::Result<Self> {
@@ -204,6 +222,9 @@ impl HttpStateStore {
                 &config.key_prefix,
                 revision_suffix,
             ),
+            stable_namespace: config.stable_component_state.then(|| {
+                crate::durable_state::revision_namespace(&config.key_prefix, stable_suffix)
+            }),
             default_ttl: config.default_ttl_seconds,
             cache: Mutex::new(ReadCache::new(
                 config.cache_max_entries,
@@ -220,7 +241,13 @@ impl HttpStateStore {
         fresh_for: Duration,
         stale_grace: Duration,
     ) -> anyhow::Result<Self> {
-        Self::build(selection, revision_suffix, fresh_for, stale_grace)
+        Self::build(
+            selection,
+            revision_suffix,
+            "stable-test",
+            fresh_for,
+            stale_grace,
+        )
     }
 
     /// One read of a key that is never written: `404` and `200` both prove the
@@ -236,8 +263,18 @@ impl HttpStateStore {
         })
     }
 
+    /// The door key for one entry.
+    ///
+    /// Per-revision by default. With `stable_component_state` on, a key that
+    /// is NOT flow-shaped (see [`FLOW_STATE_KEY_PREFIX`]) lives in the stable
+    /// namespace instead. A component key that merely happens to start with
+    /// `pack/` stays revision-scoped, which is the safe direction to be wrong.
     fn door_key(&self, tenant: &TenantCtx, prefix: &str, key: &StateKey) -> String {
-        format!("{}:{}", self.namespace, fqn(tenant, prefix, key))
+        let namespace = match &self.stable_namespace {
+            Some(stable) if !key.as_str().starts_with(FLOW_STATE_KEY_PREFIX) => stable,
+            _ => &self.namespace,
+        };
+        format!("{namespace}:{}", fqn(tenant, prefix, key))
     }
 
     fn post(&self, url: &str, body: &Value) -> Result<reqwest::blocking::Response, DoorError> {
@@ -253,6 +290,28 @@ impl HttpStateStore {
         match response.status() {
             status if status.is_success() => Ok(response),
             StatusCode::NOT_FOUND => Ok(response),
+            status @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
+                Err(DoorError::Rejected(status.as_u16()))
+            }
+            status => Err(DoorError::Status(status.as_u16())),
+        }
+    }
+
+    /// One claim request. Unlike [`Self::post`] this keeps `409` and `204` as
+    /// answers to be interpreted, because for a claim they mean "exists" and
+    /// "the door ignored `if_absent`".
+    fn post_claim(&self, body: &Value) -> Result<StatusCode, DoorError> {
+        let response = self
+            .client
+            .post(&self.write_url)
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .map_err(|err| DoorError::Transport(err.without_url().to_string()))?;
+        match response.status() {
+            status @ (StatusCode::CREATED | StatusCode::CONFLICT | StatusCode::NO_CONTENT) => {
+                Ok(status)
+            }
             status @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
                 Err(DoorError::Rejected(status.as_u16()))
             }
@@ -361,6 +420,64 @@ impl StateStore for HttpStateStore {
             Err(err) => {
                 // Whatever the door now holds is unknown, so a cached copy of
                 // the old value must not keep answering reads.
+                self.cache().remove(&door_key);
+                Err(err.into())
+            }
+        }
+    }
+
+    /// Atomic claim through the door's `if_absent` write.
+    ///
+    /// The read cache is never consulted for the decision (it can only be
+    /// stale), and it is only populated with a value this call proved it
+    /// wrote. Every failure invalidates the cached entry and is an `Err`: a
+    /// door failure is neither "claimed" nor "exists".
+    fn set_json_if_absent(
+        &self,
+        tenant: &TenantCtx,
+        prefix: &str,
+        key: &StateKey,
+        value: &Value,
+        ttl_secs: Option<u32>,
+    ) -> GResult<bool> {
+        let door_key = self.door_key(tenant, prefix, key);
+        let bytes = serde_json::to_vec(value).map_err(|err| internal(err.to_string()))?;
+        let mut body = json!({
+            "key": door_key,
+            "value": B64.encode(bytes),
+            "if_absent": true,
+        });
+        let ttl = match ttl_secs {
+            Some(0) => None,
+            Some(secs) => Some(secs),
+            None => self.default_ttl,
+        };
+        if let (Some(ttl), Some(object)) = (ttl, body.as_object_mut()) {
+            object.insert("ttl_secs".into(), json!(ttl));
+        }
+        match self.post_claim(&body) {
+            Ok(StatusCode::CREATED) => {
+                self.cache().put(door_key, value.clone());
+                Ok(true)
+            }
+            Ok(StatusCode::CONFLICT) => {
+                // The live value is not ours; never cache ours, and drop any
+                // copy that said otherwise.
+                self.cache().remove(&door_key);
+                Ok(false)
+            }
+            Ok(_) => {
+                // 204: an older door ignored `if_absent` and OVERWROTE the key.
+                self.cache().remove(&door_key);
+                operator_log::error(
+                    module_path!(),
+                    "state-sorla: the state door answered 204 to an if_absent write, so it ignores if_absent and overwrote the key; upgrade the admin",
+                );
+                Err(unavailable(
+                    "the state door ignores if_absent (answered 204 to a claim) and overwrote the key; the admin must be upgraded before conversation claims are safe",
+                ))
+            }
+            Err(err) => {
                 self.cache().remove(&door_key);
                 Err(err.into())
             }

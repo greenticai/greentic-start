@@ -58,6 +58,11 @@ pub(crate) struct SorlaStateConfig {
     pub request_timeout: Duration,
     /// `0` disables the read cache.
     pub cache_max_entries: usize,
+    /// `stable_component_state` (bool, default `false`): when on, component
+    /// state written through the WIT `state-store` import is keyed per
+    /// environment/unit instead of per revision, so it survives a redeploy.
+    /// Flow state stays per revision. See `store::HttpStateStore::door_key`.
+    pub stable_component_state: bool,
 }
 
 impl SorlaStateConfig {
@@ -117,12 +122,24 @@ impl SorlaStateConfig {
                 ));
             }
         };
+        let stable_component_state = match map.get("stable_component_state") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(Value::String(s)) if s.trim().is_empty() => false,
+            Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" => true,
+                "false" => false,
+                _ => return Err(field_error("stable_component_state", "must be a boolean")),
+            },
+            Some(_) => return Err(field_error("stable_component_state", "must be a boolean")),
+        };
         Ok(Self {
             endpoint: text("endpoint")?,
             key_prefix,
             default_ttl_seconds,
             request_timeout: Duration::from_millis(timeout_ms),
             cache_max_entries,
+            stable_component_state,
         })
     }
 }
