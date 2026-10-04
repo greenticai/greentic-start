@@ -197,3 +197,25 @@ fn is_safe(url: &str) -> bool {
         _ => false,
     }
 }
+
+/// Decide whether a revision selects `state-sorla`.
+///
+/// The pack LIST is the authority, not the pack config: the loader only keeps
+/// a pack's config when its non-secret map is non-empty, so a bundle that
+/// carries the pack but answered no question has no config entry at all, and
+/// keying on the config would silently serve memory. A config entry without the
+/// pack in the list (which the loader cannot produce) selects it too, since the
+/// operator wrote one. An empty or absent config means every default.
+///
+/// A selected backend without a usable metering block is refused ([`StateConfigError::NoMetering`]).
+pub(crate) fn select(
+    revision_pack_ids: &std::collections::BTreeSet<String>,
+    non_secret: Option<&BTreeMap<String, Value>>,
+    metering: Option<&MeteringConfig>,
+) -> Result<Option<SorlaStateSelection>, StateConfigError> {
+    if !revision_pack_ids.contains(PROVIDER_PACK_ID) && non_secret.is_none() {
+        return Ok(None);
+    }
+    let empty = BTreeMap::new();
+    SorlaStateSelection::resolve(non_secret.unwrap_or(&empty), metering).map(Some)
+}

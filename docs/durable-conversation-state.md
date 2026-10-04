@@ -187,8 +187,11 @@ runner-host. `state-sorla` is a third backend for it, beside memory and Redis:
 a key/value client of the admin's state door, so a deployed worker holds no
 database credential at all.
 
-A revision selects it by carrying a **`state-sorla` pack config**
-(`pack-config.v1.non_secret`, pack id `state-sorla`). Naming nothing leaves the
+A revision selects it by **carrying the `state-sorla` pack** in its pinned
+pack list (`pack-list.lock`), whether or not the pack has any config: the loader
+keeps a pack config only when it is non-empty, so the list is what is read. An
+empty or absent config means all defaults. A revision with the pack and no
+`metering` block refuses activation. Naming nothing leaves the
 behaviour above untouched. It overrides `GREENTIC_RUNNER_STATE_BACKEND` for that
 revision. It does **not** replace the session store: parked-conversation
 snapshots stay on `GREENTIC_RUNNER_SESSION_BACKEND`, because the session trait

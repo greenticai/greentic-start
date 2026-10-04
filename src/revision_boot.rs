@@ -57,7 +57,7 @@ use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig, p
 use crate::revision_pin::RevisionPinStore;
 use crate::runtime_config::{LoadedRuntimeConfig, env_dir_in};
 use crate::secrets_gate::DynSecretsManager;
-use crate::sorla_state::{PROVIDER_PACK_ID, SorlaStateSelection};
+use crate::sorla_state::{PROVIDER_PACK_ID, select as select_sorla_state};
 use crate::static_routes::{
     ActiveRouteTable, ReservedRouteSet, StaticRoutePlan, discover_revision_static_routes,
 };
@@ -538,34 +538,49 @@ pub(crate) async fn activate_runtime_config(
                 // config; its token and door come from the unit's staged
                 // `metering` block. A selection that cannot be resolved fails
                 // the activation: the backend was named.
-                let sorla = match non_secret_by_pack_id.get(PROVIDER_PACK_ID) {
-                    None => None,
-                    Some(non_secret) => {
-                        let metering = meter_decisions
-                            .metering_for(
-                                host.secrets_manager().as_ref(),
-                                &secrets_env,
-                                &meta.tenant,
-                                &meta.bundle_id,
-                            )
-                            .await;
-                        let selection = SorlaStateSelection::resolve(non_secret, metering.as_ref())
-                            .with_context(|| {
-                                format!(
-                                    "resolving the state-sorla backend for revision `{}`",
-                                    block.revision_id
-                                )
-                            })?;
-                        operator_log::info(
-                            module_path!(),
-                            format!(
-                                "conversation state for revision `{}`: state-sorla door `{}`",
-                                block.revision_id, selection.door.base_url
-                            ),
-                        );
-                        Some(selection)
-                    }
+                let pack_ids = read_revision_pack_ids(&revision_id, &block.pack_list_refs)
+                    .with_context(|| {
+                        format!(
+                            "reading the pinned pack ids of revision `{}`",
+                            block.revision_id
+                        )
+                    })?;
+                let carries_sorla = pack_ids.contains(PROVIDER_PACK_ID)
+                    || non_secret_by_pack_id.contains_key(PROVIDER_PACK_ID);
+                let metering = if carries_sorla {
+                    meter_decisions
+                        .metering_for(
+                            host.secrets_manager().as_ref(),
+                            &secrets_env,
+                            &meta.tenant,
+                            &meta.bundle_id,
+                        )
+                        .await
+                } else {
+                    None
                 };
+                let sorla = select_sorla_state(
+                    &pack_ids,
+                    non_secret_by_pack_id
+                        .get(PROVIDER_PACK_ID)
+                        .map(|m| m.as_ref()),
+                    metering.as_ref(),
+                )
+                .with_context(|| {
+                    format!(
+                        "resolving the state-sorla backend for revision `{}`",
+                        block.revision_id
+                    )
+                })?;
+                if let Some(selection) = &sorla {
+                    operator_log::info(
+                        module_path!(),
+                        format!(
+                            "conversation state for revision `{}`: state-sorla door `{}`",
+                            block.revision_id, selection.door.base_url
+                        ),
+                    );
+                }
                 durable
                     .stores_for(&revision_namespace_suffix(&store_key), sorla.as_ref())
                     .await
@@ -817,6 +832,33 @@ fn deployment_index(env: &Environment) -> HashMap<String, DeploymentMeta> {
 /// `lock_paths` are the already-resolved absolute lock paths from B0. The lock's
 /// own `revision_id` must match `expected` so a misplaced or cross-revision lock
 /// is rejected rather than silently activated.
+/// The manifest pack ids pinned by a revision's `pack-list.lock` files.
+///
+/// Unlike the per-pack configs, this does not depend on a pack having answered
+/// any question, so it is what "the revision carries pack X" is read from.
+fn read_revision_pack_ids(
+    expected: &RevisionId,
+    lock_paths: &[PathBuf],
+) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let mut ids = std::collections::BTreeSet::new();
+    for lock_path in lock_paths {
+        let bytes = std::fs::read(lock_path)
+            .with_context(|| format!("reading pack-list.lock `{}`", lock_path.display()))?;
+        let lock: PackListLock = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing pack-list.lock `{}`", lock_path.display()))?;
+        if &lock.revision_id != expected {
+            bail!(
+                "pack-list.lock `{}` pins revision `{}` but is referenced by revision `{}`",
+                lock_path.display(),
+                lock.revision_id,
+                expected
+            );
+        }
+        ids.extend(lock.packs.iter().map(|pack| pack.pack_id.to_string()));
+    }
+    Ok(ids)
+}
+
 fn read_revision_pack_refs(
     env_dir: &Path,
     expected: &RevisionId,
@@ -1384,6 +1426,30 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].path, pack_abs.canonicalize().unwrap());
         assert_eq!(refs[0].digest, "sha256:deadbeef");
+    }
+
+    #[test]
+    fn pack_ids_come_from_the_lock_not_from_pack_configs() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let rev = RevisionId::new();
+        let lock = PackListLock {
+            schema: SchemaVersion::new(SchemaVersion::PACK_LIST_LOCK_V1),
+            revision_id: rev,
+            packs: ["messaging-webchat-gui", "state-sorla"]
+                .iter()
+                .map(|id| LockedPack {
+                    pack_id: PackId::new(*id),
+                    path: PathBuf::from(format!("packs/{id}.gtpack")),
+                    digest: "sha256:00".to_string(),
+                })
+                .collect(),
+        };
+        let lock_path = write_lock(env_dir, "revisions/r/pack-list.lock", &lock);
+        let ids = read_revision_pack_ids(&rev, std::slice::from_ref(&lock_path)).unwrap();
+        assert!(ids.contains("state-sorla"), "{ids:?}");
+        assert!(ids.contains("messaging-webchat-gui"));
+        assert!(read_revision_pack_ids(&RevisionId::new(), &[lock_path]).is_err());
     }
 
     #[test]

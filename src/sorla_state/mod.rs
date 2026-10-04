@@ -34,7 +34,7 @@
 pub(crate) mod config;
 mod store;
 
-pub(crate) use config::{PROVIDER_PACK_ID, SorlaStateSelection};
+pub(crate) use config::{PROVIDER_PACK_ID, SorlaStateSelection, select};
 pub(crate) use store::HttpStateStore;
 
 #[cfg(test)]

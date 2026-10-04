@@ -633,3 +633,55 @@ async fn durable_storage_builds_the_sorla_store_and_it_serves_state() {
         .await;
     assert!(failed.is_err(), "no silent fallback to memory");
 }
+
+// ---- selection by pack list -----------------------------------------------
+
+fn ids(list: &[&str]) -> std::collections::BTreeSet<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn carrying_the_pack_selects_the_backend_even_with_no_config_at_all() {
+    let metering = metering_at("http://127.0.0.1:1/api/v1/ingest/state");
+    let selected = super::select(
+        &ids(&["messaging-webchat-gui", "state-sorla"]),
+        None,
+        Some(&metering),
+    )
+    .expect("resolves")
+    .expect("selected");
+    assert_eq!(selected.config.key_prefix, "greentic-state");
+    assert_eq!(
+        selected.door.base_url,
+        "http://127.0.0.1:1/api/v1/ingest/state"
+    );
+    // An explicitly empty map is the same thing as no map.
+    let empty = BTreeMap::new();
+    assert!(
+        super::select(&ids(&["state-sorla"]), Some(&empty), Some(&metering))
+            .expect("resolves")
+            .is_some()
+    );
+}
+
+#[test]
+fn a_revision_without_the_pack_keeps_the_existing_state_backend() {
+    let metering = metering_at("http://127.0.0.1:1/api/v1/ingest/state");
+    assert!(
+        super::select(
+            &ids(&["messaging-webchat-gui", "state-memory"]),
+            None,
+            Some(&metering)
+        )
+        .expect("not an error")
+        .is_none()
+    );
+}
+
+#[test]
+fn carrying_the_pack_without_metering_refuses_instead_of_serving_memory() {
+    assert_eq!(
+        super::select(&ids(&["state-sorla"]), None, None).unwrap_err(),
+        StateConfigError::NoMetering
+    );
+}
