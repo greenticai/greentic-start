@@ -178,3 +178,41 @@ GREENTIC_DURABLE_TEST_REDIS_URL=redis://127.0.0.1:6398 \
 `greentic-runner-host` must be built with its `session-redis` feature, which is
 on by its default feature set and therefore on in this binary. A build without
 it **refuses** a Redis session backend rather than falling back to memory.
+
+## `state-sorla`: component state through the admin's HTTP door
+
+The WIT `greentic:state/state-store` import a provider such as WebChat uses, and
+the flow `state` operations, are served by one [`StateStore`] inside
+runner-host. `state-sorla` is a third backend for it, beside memory and Redis:
+a key/value client of the admin's state door, so a deployed worker holds no
+database credential at all.
+
+A revision selects it by **carrying the `state-sorla` pack** in its pinned
+pack list (`pack-list.lock`), whether or not the pack has any config: the loader
+keeps a pack config only when it is non-empty, so the list is what is read. An
+empty or absent config means all defaults. A revision with the pack and no
+`metering` block refuses activation. Naming nothing leaves the
+behaviour above untouched. It overrides `GREENTIC_RUNNER_STATE_BACKEND` for that
+revision. It does **not** replace the session store: parked-conversation
+snapshots stay on `GREENTIC_RUNNER_SESSION_BACKEND`, because the session trait
+needs wait indices and per-user listing that a key/value door cannot answer.
+
+| Config field | Default | Meaning |
+|---|---|---|
+| `endpoint` | derived | Door base URL. Absent: the unit's staged `metering.endpoint` with `worker-usage` swapped for `state`. https, or http on loopback only. |
+| `key_prefix` | `greentic-state` | Front of every door key; the revision's isolation suffix follows it. |
+| `default_ttl_seconds` | none | TTL on a write that names none. |
+| `request_timeout_ms` | `5000` | Per-request timeout (100 to 60000). |
+| `cache_max_entries` | `1024` | Bounded LRU read cache; `0` disables it. |
+
+The credential is the unit's `metering.token` (`gtm_`), never a config field,
+and no type here prints it. Wire contract: `POST {door}/read|write|delete` with
+`{"key"}` / `{"key","value":"<b64>","ttl_secs"?}`, `read` answering
+`200 {"value":"<b64>"}` or `404`.
+
+Rules: a named backend that cannot be built, or whose door fails the activation
+probe (a read of a key that is never written), **fails the revision activation**.
+A door error on a write, or on a read the cache cannot answer, fails that
+operation. A cached read is served past its 30 s freshness window for up to 10
+minutes while the door is down, with a warning. Writes are never buffered. Keys
+are scoped per revision.

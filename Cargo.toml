@@ -362,6 +362,13 @@ features = ["providers-dev", "providers-vault"]
 [dependencies.greentic-setup]
 version = ">=1.2.0-dev.34019087428, <1.3.0-0"
 
+[dependencies.greentic-state]
+# Implements `greentic_state::StateStore` for the `state-sorla` HTTP backend
+# (`crate::sorla_state`). The same crate runner-host resolves for its own
+# `DynStateStore`, so it is ONE copy: a trait object from here type-checks as the
+# runner's store. Same requirement as runner-host's.
+version = ">=1.2.0-dev, <1.3.0-0"
+
 [dependencies.greentic-telemetry]
 # Consumes `RolloutEvent` + `emit_rollout_event` (C5.1) and `TelemetryCtx::kv()`
 # carrying `gt.pack_id` (which runner-host's C5.4 export path needs, and which
