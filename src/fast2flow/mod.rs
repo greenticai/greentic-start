@@ -18,6 +18,7 @@ pub mod host_process;
 pub mod llm_router;
 pub mod mapper;
 pub(crate) mod probe;
+pub(crate) mod revision_packs;
 pub(crate) mod turn;
 
 pub use config::Fast2FlowConfig;

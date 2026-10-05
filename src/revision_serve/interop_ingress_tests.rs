@@ -258,6 +258,7 @@ fn activation_built(
             static_routes: crate::static_routes::ActiveRouteTable::default(),
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
+            app_packs: Default::default(),
             triggers: Default::default(),
             runtime_metered: if runtime_metered {
                 crate::interop::metering::runtime_meter::RuntimeMeteredDeployments::of([(
@@ -1218,6 +1219,7 @@ fn activation_mounting(units: Vec<MountedUnit>) -> Activation {
             static_routes: crate::static_routes::ActiveRouteTable::default(),
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
+            app_packs: Default::default(),
             triggers: Default::default(),
             runtime_metered: Default::default(),
         }),

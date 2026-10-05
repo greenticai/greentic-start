@@ -2630,6 +2630,7 @@ mod tests {
             static_routes: ActiveRouteTable::default(),
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
+            app_packs: Default::default(),
             triggers: Default::default(),
             runtime_metered: Default::default(),
         };
@@ -2678,6 +2679,7 @@ mod tests {
             static_routes: ActiveRouteTable::default(),
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
+            app_packs: Default::default(),
             triggers: Default::default(),
             runtime_metered: Default::default(),
         };
