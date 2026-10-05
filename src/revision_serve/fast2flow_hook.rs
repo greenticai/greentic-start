@@ -11,8 +11,9 @@
 //! * which index scope — `revision_index_scope(..)`, so two revisions never
 //!   share (or serve each other) an intent index;
 //! * precedence — an explicit target (URL/header-named flow, or the
-//!   envelope's `flow_hint`) always wins; Fast2Flow only replaces the
-//!   bundle-default FALLBACK target;
+//!   envelope's `flow_hint`) naming a NON-default flow always wins; a target
+//!   naming the default flow is a fallback like no target at all, and only a
+//!   fallback is replaced by Fast2Flow (see [`is_default_target`]);
 //! * ownership — a conversation parked in a flow resumes that flow and is
 //!   never re-routed (see [`parked_flow`]);
 //! * no LLM fallback: revision mode has no `bundle.yaml` `llm:` block and no
@@ -122,14 +123,24 @@ pub(super) async fn plan_revision_turn_with(
     explicit: Option<WelcomeFlowHint>,
     fallback: Option<WelcomeFlowHint>,
 ) -> RevisionTurn {
+    let app = activation
+        .routing
+        .app_packs
+        .get_shared(scope.bundle_id.as_str(), scope.revision_id);
+    let bundle_default = activation
+        .routing
+        .flow_index
+        .default_flow_for_bundle(scope.bundle_id.as_str())
+        .map(|(pack_id, flow_id)| WelcomeFlowHint {
+            pack_id: pack_id.to_string(),
+            flow_id: flow_id.to_string(),
+        });
+    let (explicit, fallback) =
+        demote_default_target(explicit, fallback, bundle_default.as_ref(), app.as_deref());
     if let Some(turn) = explicit_passthrough(scope, explicit, ingress) {
         return turn;
     }
-    let Some(app) = activation
-        .routing
-        .app_packs
-        .get_shared(scope.bundle_id.as_str(), scope.revision_id)
-    else {
+    let Some(app) = app else {
         log_skip(scope, SkipReason::NoAppPack);
         return RevisionTurn::passthrough(fallback, ingress);
     };
@@ -149,7 +160,8 @@ pub(super) async fn plan_revision_turn_with(
 /// Why the hook did not probe a turn, for the skip log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum SkipReason {
-    /// A URL/header-named flow or the envelope's `flow_hint` always wins.
+    /// A URL/header-named flow or the envelope's `flow_hint` naming a
+    /// non-default flow always wins.
     ExplicitTarget,
     /// The serving revision has no app pack (nothing to route within).
     NoAppPack,
@@ -200,8 +212,47 @@ fn log_skip(scope: &TurnScope<'_>, reason: SkipReason) {
     }
 }
 
-/// An explicit target (URL/header-named flow, or the envelope's `flow_hint`)
-/// is never routed: `Some(passthrough)` when there is one, logged.
+/// Whether `target` merely names the DEFAULT flow: the bundle's registered
+/// default, or the app pack's own default (`select_app_flow`).
+///
+/// Such a target is not a deliberate selection. The webchat provider stores
+/// the `X-Greentic-Flow` header a conversation was opened with and copies it
+/// into `metadata["flow_hint"]` on every activity, so a conversation opened
+/// against the default flow carries a "hint" on every turn; reading that as
+/// explicit would switch Fast2Flow off for the whole conversation.
+pub(super) fn is_default_target(
+    target: &WelcomeFlowHint,
+    bundle_default: Option<&WelcomeFlowHint>,
+    app: Option<&RevisionAppPack>,
+) -> bool {
+    if bundle_default == Some(target) {
+        return true;
+    }
+    app.is_some_and(|app| {
+        target.pack_id == app.pack_id
+            && select_app_flow(&app.info).is_ok_and(|flow| flow.id == target.flow_id)
+    })
+}
+
+/// Demote an explicit target that only names the default flow to the
+/// FALLBACK, which Fast2Flow may replace. A target naming any other flow stays
+/// explicit and wins. A conversation parked in a non-default flow still
+/// resumes it: the parked-flow check runs before the probe.
+pub(super) fn demote_default_target(
+    explicit: Option<WelcomeFlowHint>,
+    fallback: Option<WelcomeFlowHint>,
+    bundle_default: Option<&WelcomeFlowHint>,
+    app: Option<&RevisionAppPack>,
+) -> (Option<WelcomeFlowHint>, Option<WelcomeFlowHint>) {
+    match explicit {
+        Some(target) if is_default_target(&target, bundle_default, app) => (None, Some(target)),
+        other => (other, fallback),
+    }
+}
+
+/// An explicit target (URL/header-named flow, or the envelope's `flow_hint`,
+/// naming a flow other than the default) is never routed: `Some(passthrough)`
+/// when there is one, logged.
 pub(super) fn explicit_passthrough(
     scope: &TurnScope<'_>,
     explicit: Option<WelcomeFlowHint>,

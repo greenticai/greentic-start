@@ -27,16 +27,16 @@ use crate::fast2flow::{
 };
 use crate::messaging_app::{AppFlowInfo, AppPackInfo};
 
-const TENANT: &str = "acme";
-const TEAM: &str = "default";
-const PACK: &str = "sales-crm";
-const BUNDLE: &str = "sales-bundle";
-const DISPATCH_FLOW: &str =
+pub(super) const TENANT: &str = "acme";
+pub(super) const TEAM: &str = "default";
+pub(super) const PACK: &str = "sales-crm";
+pub(super) const BUNDLE: &str = "sales-bundle";
+pub(super) const DISPATCH_FLOW: &str =
     r#"{"type":"dispatch","target":"sales-crm/pipeline_flow","confidence":0.9,"reason":"m"}"#;
-const CONTINUE: &str = r#"{"type":"continue"}"#;
+pub(super) const CONTINUE: &str = r#"{"type":"continue"}"#;
 
 /// A routing host answering `directive`, and the file it touches when run.
-struct StubHost {
+pub(super) struct StubHost {
     _dir: TempDir,
     bin: PathBuf,
     marker: PathBuf,
@@ -62,20 +62,20 @@ impl StubHost {
         }
     }
 
-    fn invoked(&self) -> bool {
+    pub(super) fn invoked(&self) -> bool {
         self.marker.exists()
     }
 }
 
-struct Fixture {
-    host: StubHost,
+pub(super) struct Fixture {
+    pub(super) host: StubHost,
     indexes: TempDir,
-    revision_id: RevisionId,
+    pub(super) revision_id: RevisionId,
     bundle_id: BundleId,
 }
 
 impl Fixture {
-    fn new(directive: &str) -> Self {
+    pub(super) fn new(directive: &str) -> Self {
         let revision_id = RevisionId::new();
         let indexes = tempdir().expect("indexes");
         // The index lives ONLY in this revision's scope, so a probe under any
@@ -91,7 +91,7 @@ impl Fixture {
         }
     }
 
-    fn cfg(&self) -> Fast2FlowConfig {
+    pub(super) fn cfg(&self) -> Fast2FlowConfig {
         Fast2FlowConfig {
             host_bin: self.host.bin.clone(),
             registry_path: PathBuf::from("/tmp/registry"),
@@ -101,7 +101,7 @@ impl Fixture {
         }
     }
 
-    fn scope(&self) -> TurnScope<'_> {
+    pub(super) fn scope(&self) -> TurnScope<'_> {
         TurnScope {
             tenant: TENANT,
             team: Some(TEAM),
@@ -113,7 +113,7 @@ impl Fixture {
         }
     }
 
-    fn app(&self, caps: &[&str]) -> Arc<RevisionAppPack> {
+    pub(super) fn app(&self, caps: &[&str]) -> Arc<RevisionAppPack> {
         Arc::new(RevisionAppPack {
             pack_id: PACK.to_string(),
             pack_path: PathBuf::from("/nonexistent.gtpack"),
@@ -144,7 +144,7 @@ impl Fixture {
     }
 }
 
-fn flow(id: &str) -> AppFlowInfo {
+pub(super) fn flow(id: &str) -> AppFlowInfo {
     AppFlowInfo {
         id: id.to_string(),
         kind: "messaging".to_string(),
@@ -153,18 +153,18 @@ fn flow(id: &str) -> AppFlowInfo {
     }
 }
 
-fn target(flow_id: &str) -> WelcomeFlowHint {
+pub(super) fn target(flow_id: &str) -> WelcomeFlowHint {
     WelcomeFlowHint {
         pack_id: PACK.to_string(),
         flow_id: flow_id.to_string(),
     }
 }
 
-fn default_target() -> WelcomeFlowHint {
+pub(super) fn default_target() -> WelcomeFlowHint {
     target("default")
 }
 
-fn envelope(text: &str) -> ChannelMessageEnvelope {
+pub(super) fn envelope(text: &str) -> ChannelMessageEnvelope {
     serde_json::from_value(json!({
         "id": "msg-1",
         "tenant": {
@@ -570,6 +570,20 @@ async fn a_parked_conversation_resumes_its_flow_and_is_never_routed() {
 // --- helpers: an Activation carrying one revision's app pack ---------------
 
 fn activation_with_app(fx: &Fixture, caps: &[&str]) -> super::Activation {
+    activation_with(
+        fx,
+        fx.app(caps),
+        crate::webchat_routing::FlowIndex::default(),
+    )
+}
+
+/// An activation serving `app` for the fixture's revision, with `flow_index`
+/// (which carries the bundle's default flow).
+pub(super) fn activation_with(
+    fx: &Fixture,
+    app: Arc<RevisionAppPack>,
+    flow_index: crate::webchat_routing::FlowIndex,
+) -> super::Activation {
     use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig};
     let host = Arc::new(
         greentic_runner_host::HostBuilder::new()
@@ -583,7 +597,6 @@ fn activation_with_app(fx: &Fixture, caps: &[&str]) -> super::Activation {
             .build()
             .expect("host"),
     );
-    let app = fx.app(caps);
     let mut app_packs = crate::fast2flow::revision_packs::RevisionAppPacks::default();
     app_packs.insert_revision(
         BUNDLE,
@@ -602,7 +615,7 @@ fn activation_with_app(fx: &Fixture, caps: &[&str]) -> super::Activation {
             deployment_config_overrides: Arc::default(),
             static_routes: crate::static_routes::ActiveRouteTable::default(),
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
-            flow_index: crate::webchat_routing::FlowIndex::default(),
+            flow_index,
             app_packs,
             triggers: Default::default(),
             runtime_metered: Default::default(),

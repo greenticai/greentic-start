@@ -11,9 +11,20 @@ revision-serve one (`src/revision_serve/fast2flow_hook.rs`, used without
 * The app pack is the one of the revision serving the turn
   (`RevisionIngressRouting::app_packs`), and the intent index lives in a
   per-revision scope (`revision_index_scope`, `<tenant>:<team>--<hex>`).
-* An explicit target wins: a URL/header-named flow or a valid envelope
-  `flow_hint` is never re-routed. Fast2Flow only replaces the bundle-default
-  fallback target.
+* Precedence. A target that names a flow OTHER than the default flow (a
+  URL/header-named flow, or a valid envelope `flow_hint`) is a deliberate
+  selection: it always wins and is never probed
+  (`[fast2flow:gate] skip path=revision reason=explicit_target`, info once per
+  revision). A target that names the DEFAULT flow — the bundle's registered
+  default, or the app pack's own (`default` > `main` > sole messaging flow) —
+  is treated exactly like no target: Fast2Flow may replace it, and nothing
+  extra is logged. This matters because the webchat provider stores the
+  `X-Greentic-Flow` header a conversation was opened with and copies it into
+  `flow_hint` on every activity of that conversation; a conversation opened
+  against the default flow would otherwise never be routed. Mechanism:
+  `fast2flow_hook::is_default_target` / `demote_default_target`. A
+  conversation parked in any flow still resumes it (next bullet), because the
+  parked-flow check runs before the probe.
 * A conversation parked in a flow resumes that flow and is not probed. On this
   path the runner keys a parked snapshot by the flow the turn was pinned to,
   so the hook checks each messaging flow of the app pack in the revision's

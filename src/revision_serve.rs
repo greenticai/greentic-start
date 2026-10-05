@@ -5669,7 +5669,8 @@ async fn dispatch_provider_route(
     // fails resolution with "flow type messaging is ambiguous" and never reaches
     // the hint. See `dispatch_provider_events`.
     // `flow_target_explicit`: the target was NAMED (URL/header), so Fast2Flow
-    // must not replace it; a bundle-default fallback it may.
+    // must not replace it unless it names the default flow (decided in
+    // `fast2flow_hook::demote_default_target`); a bundle-default fallback it may.
     let (flow_target, flow_target_explicit) = {
         let url_flow_id = webchat_target.and_then(|t| t.flow_id.as_deref());
         let bundle_id_str = scope.bundle_id.as_str();
@@ -6060,9 +6061,9 @@ async fn run_provider_inbound_pipeline(
                 None
             }
         });
-        // Fast2Flow (fast2flow_hook): an explicit target wins; only the
-        // bundle-default fallback may be re-routed, and a miss may become the
-        // fixed reply without running a flow.
+        // Fast2Flow (fast2flow_hook): an explicit target naming a non-default
+        // flow wins; the default-flow target (named or not) may be re-routed,
+        // and a miss may become the fixed reply without running a flow.
         let (explicit, fallback) = fast2flow_hook::split_targets(
             flow_hint_target,
             flow_target.clone(),
@@ -16145,3 +16146,7 @@ mod fast2flow_hook;
 #[cfg(test)]
 #[path = "revision_serve/fast2flow_hook_tests.rs"]
 mod fast2flow_hook_tests;
+
+#[cfg(test)]
+#[path = "revision_serve/fast2flow_hook_default_hint_tests.rs"]
+mod fast2flow_hook_default_hint_tests;
