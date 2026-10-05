@@ -767,3 +767,38 @@ async fn a_node_route_with_no_resolvable_default_flow_stamps_nothing() {
         Some("deal_card")
     );
 }
+
+// --- final fixes I-3: skip reasons are logged ------------------------------
+
+#[test]
+fn an_explicit_target_skip_logs_its_reason() {
+    let _env = crate::test_env_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    crate::operator_log::reset_for_tests();
+    let dir = tempdir().expect("log dir");
+    crate::operator_log::init(dir.path().to_path_buf(), crate::operator_log::Level::Info)
+        .expect("init");
+    let fx = Fixture::new(CONTINUE);
+    let ingress = envelope("hello");
+    let turn = explicit_passthrough(&fx.scope(), Some(default_target()), &ingress)
+        .expect("an explicit target passes through");
+    assert_eq!(turn.target, Some(default_target()));
+    assert!(explicit_passthrough(&fx.scope(), None, &ingress).is_none());
+    let log = std::fs::read_to_string(dir.path().join("system.log")).expect("system.log");
+    crate::operator_log::reset_for_tests();
+    assert!(
+        log.contains("[fast2flow:gate] skip path=revision reason=explicit_target"),
+        "{log}"
+    );
+}
+
+#[test]
+fn a_skip_reason_is_logged_at_info_once_per_revision_and_reason() {
+    let fx = Fixture::new(CONTINUE);
+    let scope = fx.scope();
+    let seen = crate::fast2flow::index_refresh::WarnOnce::default();
+    assert!(first_skip(&seen, &scope, SkipReason::ExplicitTarget));
+    assert!(!first_skip(&seen, &scope, SkipReason::ExplicitTarget));
+    assert!(first_skip(&seen, &scope, SkipReason::NoAppPack));
+}

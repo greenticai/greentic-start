@@ -122,14 +122,15 @@ pub(super) async fn plan_revision_turn_with(
     explicit: Option<WelcomeFlowHint>,
     fallback: Option<WelcomeFlowHint>,
 ) -> RevisionTurn {
-    if explicit.is_some() {
-        return RevisionTurn::passthrough(explicit, ingress);
+    if let Some(turn) = explicit_passthrough(scope, explicit, ingress) {
+        return turn;
     }
     let Some(app) = activation
         .routing
         .app_packs
         .get_shared(scope.bundle_id.as_str(), scope.revision_id)
     else {
+        log_skip(scope, SkipReason::NoAppPack);
         return RevisionTurn::passthrough(fallback, ingress);
     };
     let store = activation
@@ -143,6 +144,72 @@ pub(super) async fn plan_revision_turn_with(
         )
         .map(|runtime| Arc::clone(runtime.session_store()));
     plan_for_app(cfg.clone(), app, store, scope, ingress, fallback).await
+}
+
+/// Why the hook did not probe a turn, for the skip log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum SkipReason {
+    /// A URL/header-named flow or the envelope's `flow_hint` always wins.
+    ExplicitTarget,
+    /// The serving revision has no app pack (nothing to route within).
+    NoAppPack,
+}
+
+impl SkipReason {
+    fn token(self) -> &'static str {
+        match self {
+            Self::ExplicitTarget => "explicit_target",
+            Self::NoAppPack => "no_app_pack",
+        }
+    }
+}
+
+/// Revisions/reasons already logged at info.
+static SKIPS_LOGGED: std::sync::LazyLock<
+    crate::fast2flow::index_refresh::WarnOnce<(String, RevisionId, SkipReason)>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// `true` the first time this (bundle, revision, reason) skips a turn.
+pub(super) fn first_skip(
+    seen: &crate::fast2flow::index_refresh::WarnOnce<(String, RevisionId, SkipReason)>,
+    scope: &TurnScope<'_>,
+    reason: SkipReason,
+) -> bool {
+    seen.first((
+        scope.bundle_id.as_str().to_string(),
+        scope.revision_id,
+        reason,
+    ))
+}
+
+/// Log why the hook skipped a turn: at info the first time per (bundle,
+/// revision, reason) — that is the line an operator checking why a deployed
+/// revision does not route looks for — and at debug after that, since these
+/// reasons hold for every turn of the revision.
+fn log_skip(scope: &TurnScope<'_>, reason: SkipReason) {
+    let line = format!(
+        "[fast2flow:gate] skip path=revision reason={} bundle={} revision={}",
+        reason.token(),
+        scope.bundle_id.as_str(),
+        scope.revision_id
+    );
+    if first_skip(&SKIPS_LOGGED, scope, reason) {
+        operator_log::info(module_path!(), format!("{line} (logged once at info)"));
+    } else {
+        operator_log::debug(module_path!(), line);
+    }
+}
+
+/// An explicit target (URL/header-named flow, or the envelope's `flow_hint`)
+/// is never routed: `Some(passthrough)` when there is one, logged.
+pub(super) fn explicit_passthrough(
+    scope: &TurnScope<'_>,
+    explicit: Option<WelcomeFlowHint>,
+    ingress: &ChannelMessageEnvelope,
+) -> Option<RevisionTurn> {
+    let explicit = explicit?;
+    log_skip(scope, SkipReason::ExplicitTarget);
+    Some(RevisionTurn::passthrough(Some(explicit), ingress))
 }
 
 /// [`plan_revision_turn`] once the app pack and the revision's session store
@@ -164,7 +231,7 @@ pub(super) async fn plan_for_app(
         operator_log::debug(
             module_path!(),
             format!(
-                "[fast2flow:gate] skip path=revision reason=gate pack={} revision={}",
+                "[fast2flow:gate] skip path=revision reason=not_opted_in pack={} revision={}",
                 app.pack_id, scope.revision_id
             ),
         );
