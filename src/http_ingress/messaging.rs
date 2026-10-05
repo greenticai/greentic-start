@@ -5,9 +5,16 @@ use base64::Engine as _;
 use greentic_types::ChannelMessageEnvelope;
 use serde_json::json;
 
-use super::fast2flow_turn::{self, RouteSignal, RouteSource, Unrouted};
 use super::flow_owner;
 use crate::domains::Domain;
+#[cfg(test)]
+use crate::fast2flow::dispatch::dispatch_flow;
+use crate::fast2flow::dispatch::{self as f2f_dispatch, RouteDecision};
+use crate::fast2flow::probe::{self as f2f_probe, ProbeInputs};
+#[cfg(test)]
+use crate::fast2flow::turn::RouteSource;
+use crate::fast2flow::turn::{RouteSignal, Unrouted};
+#[cfg(test)]
 use crate::ingress::control_directive::{ControlDirective, DispatchTarget};
 use crate::ingress_dispatch::build_injected_config;
 use crate::messaging_app as app;
@@ -48,6 +55,16 @@ pub(super) fn route_messaging_envelopes(
         )
     });
 
+    let probe_inputs = ProbeInputs {
+        cfg: crate::fast2flow::Fast2FlowConfig::global(),
+        ctx,
+        pack: &pack_info,
+        pack_path: &app_pack_path,
+        index_scope: None,
+        provider,
+        llm: crate::llm::config(),
+    };
+
     for original in &envelopes {
         // Everything that makes up the turn — routing (Fast2Flow, LLM fallback), the
         // flow run and ownership settling — runs with typing raised. Egress below
@@ -61,29 +78,11 @@ pub(super) fn route_messaging_envelopes(
                 &app_pack_path,
                 original,
                 || {
-                    // Per-envelope Fast2Flow probe. A node target synthesizes the
-                    // same metadata an Adaptive Card button click would produce —
-                    // `routeToCardId` — so the existing card path renders the
-                    // chosen card inside the default flow. A `pack/flow` target
-                    // runs that flow from its entry. `Deny`/`Respond` stop routing
-                    // for the turn and get the fixed reply (not yet handled on this
-                    // path); anything else unrouted falls to the embedded LLM
-                    // fallback (greentic-start's own greentic-llm capability).
-                    let host = host_route(
-                        crate::fast2flow::route_request(
-                            crate::fast2flow::Fast2FlowConfig::global(),
-                            ctx,
-                            &pack_info,
-                            &app_pack_path,
-                            original,
-                            provider,
-                        ),
-                        &pack_info,
-                        original,
-                    );
-                    fast2flow_turn::probe_turn(host, || {
-                        try_llm_fallback(ctx, &pack_info, &app_pack_path, original)
-                    })
+                    // Per-envelope Fast2Flow probe (host router, then the
+                    // embedded LLM fallback) — see `fast2flow::probe::probe`.
+                    // Its owned decision is mapped back onto this pack's flows.
+                    f2f_probe::probe(&probe_inputs, original)
+                        .and_then(|decision| routed(decision, &pack_info))
                 },
                 &mut |flow, envelope, entry_node| {
                     run_app_flow_safe(
@@ -276,109 +275,28 @@ pub(crate) fn decode_injected_config_for_provider(config: serde_json::Value) -> 
     serde_json::Value::Object(decoded)
 }
 
-/// Drop intent-extracted entities into `envelope.metadata` so the
-/// existing `${placeholder}` substitution step can wire them into card
-/// fields. The shape is intentionally generic — no per-kind code lives
-/// here. Each entity contributes:
-///
-/// * `prefill_<kind>` — the canonical `normalized` value.
-/// * `prefill_<kind>_<role>` — when the entity carries a role tag
-///   (e.g. `prefill_location_from`, `prefill_location_to`).
-/// * `prefill_<kind>_<format>` — for every entry in the entity's
-///   `formats` map (e.g. an `iso` variant of a `YYYYMMDD` date, set
-///   by the routing host so this layer stays kind-agnostic).
-///
-/// Card authors opt in per field via `value: "${prefill_<key>}"`. The
-/// runtime never assumes which fields exist or which entities will
-/// arrive — every entity surfaces under the same naming convention.
-fn inject_prefill_metadata(
-    envelope: &mut ChannelMessageEnvelope,
-    entities: &[crate::ingress::control_directive::PrefillEntity],
-) {
-    for entity in entities {
-        envelope.metadata.insert(
-            format!("prefill_{}", entity.kind),
-            entity.normalized.clone(),
-        );
-        if let Some(role) = entity.role.as_deref() {
-            envelope.metadata.insert(
-                format!("prefill_{}_{}", entity.kind, role),
-                entity.normalized.clone(),
-            );
-        }
-        for (format_name, value) in &entity.formats {
-            envelope.metadata.insert(
-                format!("prefill_{}_{}", entity.kind, format_name),
-                value.clone(),
-            );
-        }
-    }
-}
-
-/// Embedded LLM routing fallback: when the deterministic tier yields no usable
-/// dispatch for a Fast2Flow-capable pack and the bundle declared an `llm:`
-/// instance (with `fast2flow` enabled), ask [`crate::llm`] to pick a card or a
-/// flow and route it exactly as a host dispatch is routed ([`apply_dispatch`]).
-/// Needs no external binary, so it works embedded. `None` ⇒ fall through.
-fn try_llm_fallback<'p>(
-    ctx: &OperatorContext,
-    pack_info: &'p app::AppPackInfo,
-    app_pack_path: &Path,
-    original: &ChannelMessageEnvelope,
-) -> Option<Routed<'p>> {
-    // The bundle's shared `llm:` instance, with the Fast2Flow consumer enabled.
-    let cfg = crate::llm::config()?;
-    if !cfg.fast2flow {
-        return None;
-    }
-    if !pack_info
-        .capabilities
-        .iter()
-        .any(|c| c == crate::fast2flow::FAST2FLOW_CAPABILITY)
-    {
-        return None;
-    }
-    let text = original
-        .text
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())?;
-    let index_path = crate::fast2flow::resolve_index_path(
-        crate::fast2flow::Fast2FlowConfig::global(),
-        ctx,
-        app_pack_path,
-    )?;
-    llm_route(
-        crate::fast2flow::try_llm_route(cfg, ctx, &index_path, text),
-        pack_info,
-        original,
-    )
-}
-
 /// Route an LLM router answer; every route it produces is `RouteSource::Llm`.
+#[cfg(test)]
 fn llm_route<'p>(
     directive: Option<ControlDirective>,
     pack_info: &'p app::AppPackInfo,
     original: &ChannelMessageEnvelope,
 ) -> Option<Routed<'p>> {
-    apply_dispatch(directive?, pack_info, original, RouteSource::Llm).ok()
+    routed(
+        f2f_dispatch::llm_route(directive, pack_info, original)?,
+        pack_info,
+    )
+    .ok()
 }
 
 /// Map the host router's outcome onto a route or the reason there is none.
+#[cfg(test)]
 fn host_route<'p>(
     outcome: crate::fast2flow::RoutingOutcome,
     pack_info: &'p app::AppPackInfo,
     original: &ChannelMessageEnvelope,
 ) -> Result<Routed<'p>, Unrouted> {
-    use crate::fast2flow::RoutingOutcome;
-    match outcome {
-        RoutingOutcome::Directive(directive) => {
-            apply_dispatch(directive, pack_info, original, RouteSource::Bm25)
-        }
-        RoutingOutcome::NoMatch => Err(Unrouted::NoMatch),
-        RoutingOutcome::NotConfigured(reason) => Err(Unrouted::RouterNotConfigured(reason)),
-        RoutingOutcome::Failed(reason) => Err(Unrouted::RouterFailed(reason)),
-    }
+    f2f_dispatch::host_route(outcome, pack_info, original).and_then(|d| routed(d, pack_info))
 }
 
 /// What the router decided for one turn, and how it was decided.
@@ -463,104 +381,34 @@ fn resolve_turn<'p>(
     }
 }
 
-/// Turn a router directive into a route, or the reason there is none.
-///
-/// `Continue` and a `Dispatch` naming nothing this pack can run are
-/// [`Unrouted::NoMatch`] (the next fallback gets the turn, as before #590).
-/// `Deny` and `Respond` are [`Unrouted::Unhandled`]: routing stops for the turn.
+/// Turn a router directive into a route, or the reason there is none
+/// (see [`f2f_dispatch::apply_dispatch`]).
+#[cfg(test)]
 fn apply_dispatch<'p>(
     directive: ControlDirective,
     pack_info: &'p app::AppPackInfo,
     original: &ChannelMessageEnvelope,
     source: RouteSource,
 ) -> Result<Routed<'p>, Unrouted> {
-    let (target, entities, confidence) = match directive {
-        ControlDirective::Dispatch {
-            target,
-            entities,
-            confidence,
-        } => (target, entities, confidence),
-        ControlDirective::Continue => return Err(Unrouted::NoMatch),
-        ControlDirective::Deny { .. } | ControlDirective::Respond { .. } => {
-            let kind = if matches!(directive, ControlDirective::Deny { .. }) {
-                "deny"
-            } else {
-                "respond"
-            };
-            operator_log::warn(
-                module_path!(),
-                format!(
-                    "[{}] {kind} directive is not handled on the messaging path yet — \
-                     routing stops for this turn and the fixed reply is sent (pack={})",
-                    source.log_label(),
-                    pack_info.pack_id
-                ),
-            );
-            return Err(Unrouted::Unhandled(kind));
-        }
-    };
-    let signal = |node: Option<String>| RouteSignal {
-        node,
-        confidence,
-        source,
-    };
-    let source = source.log_label();
-    if let Some(node) = target.node.clone() {
-        operator_log::info(
-            module_path!(),
-            format!(
-                "[{source}] dispatch -> routeToCardId={node} entities={} (pack={} flow={:?})",
-                entities.len(),
-                target.pack,
-                target.flow
-            ),
-        );
-        let mut owned = original.clone();
-        owned
-            .metadata
-            .insert("routeToCardId".to_string(), node.clone());
-        inject_prefill_metadata(&mut owned, &entities);
-        return Ok(Routed::Node(owned, signal(Some(node))));
-    }
-    let Some(flow) = dispatch_flow(pack_info, &target) else {
-        operator_log::info(
-            module_path!(),
-            format!(
-                "[{source}] dispatch to pack={} flow={:?} names no messaging flow of app pack {}; ignored",
-                target.pack, target.flow, pack_info.pack_id
-            ),
-        );
-        return Err(Unrouted::NoMatch);
-    };
-    operator_log::info(
-        module_path!(),
-        format!(
-            "[{source}] dispatch -> flow={} entities={} (pack={})",
-            flow.id,
-            entities.len(),
-            target.pack
-        ),
-    );
-    let mut owned = original.clone();
-    inject_prefill_metadata(&mut owned, &entities);
-    Ok(Routed::Flow(flow, owned, signal(None)))
+    f2f_dispatch::apply_dispatch(directive, pack_info, original, source)
+        .and_then(|d| routed(d, pack_info))
 }
 
-/// The flow a `pack/flow` target names, when it is a messaging flow of THIS
-/// app pack. A node target (`pack/flow/node`) is a card route, not a flow
-/// route, and a target for another pack is not ours to run.
-fn dispatch_flow<'p>(
-    pack_info: &'p app::AppPackInfo,
-    target: &DispatchTarget,
-) -> Option<&'p app::AppFlowInfo> {
-    if target.node.is_some() || target.pack != pack_info.pack_id {
-        return None;
+/// Map an owned [`RouteDecision`] onto this path's borrowed [`Routed`]: a flow
+/// decision names its flow by id, resolved here against the same pack with the
+/// same lookup the decision was made with, so it always resolves. Should it
+/// not, the turn is unrouted rather than run in a flow nobody chose.
+fn routed(decision: RouteDecision, pack_info: &app::AppPackInfo) -> Result<Routed<'_>, Unrouted> {
+    match decision {
+        RouteDecision::Node { envelope, signal } => Ok(Routed::Node(envelope, signal)),
+        RouteDecision::Flow {
+            flow_id,
+            envelope,
+            signal,
+        } => f2f_dispatch::messaging_flow(pack_info, &flow_id)
+            .map(|flow| Routed::Flow(flow, envelope, signal))
+            .ok_or(Unrouted::NoMatch),
     }
-    let flow_id = target.flow.as_deref()?;
-    pack_info
-        .flows
-        .iter()
-        .find(|f| f.id == flow_id && f.kind.eq_ignore_ascii_case("messaging"))
 }
 
 /// Insert empty-string defaults for any unmatched `${prefill_*}`

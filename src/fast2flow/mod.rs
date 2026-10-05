@@ -12,10 +12,13 @@ use crate::runner_host::OperatorContext;
 
 pub mod config;
 pub mod contracts;
+pub(crate) mod dispatch;
 pub mod gate;
 pub mod host_process;
 pub mod llm_router;
 pub mod mapper;
+pub(crate) mod probe;
+pub(crate) mod turn;
 
 pub use config::Fast2FlowConfig;
 pub use contracts::{Fast2FlowHookInV1, MessageEnvelope};
@@ -31,17 +34,27 @@ pub fn scope_for(ctx: &OperatorContext) -> String {
     format!("{}:{}", ctx.tenant, team)
 }
 
+/// The override when given, else the default [`scope_for`].
+fn effective_scope(ctx: &OperatorContext, scope: Option<&str>) -> String {
+    scope.map_or_else(|| scope_for(ctx), str::to_string)
+}
+
 /// Resolve `<indexes_path>/<scope>/index.json`, materializing it from the
 /// pack's `assets/intent-index.json` when absent. Returns the index file path
 /// when present (or just materialized), else `None`. Shared by the host probe
 /// and the embedded LLM fallback so both route against the same catalog.
+///
+/// `scope` overrides the index scope: `None` is the default `<tenant>:<team>`
+/// ([`scope_for`]); `Some` names the scope directory under `indexes_path`
+/// verbatim.
 pub fn resolve_index_path(
     cfg: &Fast2FlowConfig,
     ctx: &OperatorContext,
     pack_path: &std::path::Path,
+    scope: Option<&str>,
 ) -> Option<std::path::PathBuf> {
     let indexes_path = cfg.indexes_path.as_ref()?;
-    let scope = scope_for(ctx);
+    let scope = effective_scope(ctx, scope);
     let index_path = indexes_path.join(&scope).join("index.json");
     let mut exists = index_path.is_file();
     if !exists && materialize_index_from_pack(pack_path, &index_path) {
@@ -102,7 +115,10 @@ pub fn try_for_request(
     }
 }
 
-/// Eligibility + invoke + map, with every non-dispatch outcome named.
+/// Eligibility + invoke + map, with every non-dispatch outcome named, in the
+/// default scope. Test convenience over [`route_request_in_scope`], which
+/// every caller goes through.
+#[cfg(test)]
 pub fn route_request(
     cfg: &Fast2FlowConfig,
     ctx: &OperatorContext,
@@ -110,6 +126,22 @@ pub fn route_request(
     pack_path: &std::path::Path,
     envelope: &ChannelMessageEnvelope,
     provider: &str,
+) -> RoutingOutcome {
+    route_request_in_scope(cfg, ctx, pack, pack_path, envelope, provider, None)
+}
+
+/// Eligibility + invoke + map, with every non-dispatch outcome named.
+///
+/// `scope_override` overrides the index scope (see [`resolve_index_path`]);
+/// `None` keeps the default `<tenant>:<team>` scope.
+pub fn route_request_in_scope(
+    cfg: &Fast2FlowConfig,
+    ctx: &OperatorContext,
+    pack: &AppPackInfo,
+    pack_path: &std::path::Path,
+    envelope: &ChannelMessageEnvelope,
+    provider: &str,
+    scope_override: Option<&str>,
 ) -> RoutingOutcome {
     let deploy_intent = cfg.has_deploy_intent();
     let gate_enabled = cfg.gate.is_enabled(ctx, pack);
@@ -147,10 +179,10 @@ pub fn route_request(
             return RoutingOutcome::NotConfigured("no_indexes_path".to_string());
         }
     };
-    let scope = scope_for(ctx);
+    let scope = effective_scope(ctx, scope_override);
     // Resolve (and materialize) the scope index; short-circuit before spawning
     // the host when it's absent. Shared with the embedded LLM fallback.
-    if resolve_index_path(cfg, ctx, pack_path).is_none() {
+    if resolve_index_path(cfg, ctx, pack_path, scope_override).is_none() {
         return RoutingOutcome::NotConfigured("no_index".to_string());
     }
 
