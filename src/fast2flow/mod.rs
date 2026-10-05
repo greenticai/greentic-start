@@ -77,6 +77,7 @@ pub fn resolve_index_path(
         ),
         index_refresh::IndexSync::Unchanged
         | index_refresh::IndexSync::NoPackIndex
+        | index_refresh::IndexSync::OwnedByOtherPack
         | index_refresh::IndexSync::WriteFailed => {}
     }
     let exists = index_path.is_file();

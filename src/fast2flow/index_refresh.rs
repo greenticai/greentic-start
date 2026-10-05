@@ -11,14 +11,36 @@
 //! in the same directory and renamed over the old one, so a probe reading the
 //! index concurrently sees the whole old index or the whole new one — never a
 //! truncated file. An identical index is left untouched (no write at all).
+//!
+//! One scope can be resolved by more than one pack: the legacy
+//! `<tenant>:<team>` scope is shared by every app pack of a tenant/team.
+//! Refreshing on every difference would make two such packs overwrite each
+//! other's index every turn. So the pack that installed an index is recorded
+//! in a marker beside it ([`SOURCE_MARKER`], the canonical pack path), and
+//! only that pack may replace it. Another pack keeps the installed index (the
+//! first-wins behaviour of the old copy-if-absent) and is reported once per
+//! (scope, pack). An index with no marker was installed by an older build and
+//! is treated as the resolving pack's own; a marker naming a pack that no
+//! longer exists is taken over, since nothing can resolve that pack any more.
+//!
+//! The index and the marker are two renames, not one. Two packs creating one
+//! scope at the same instant can leave the marker naming the pack whose index
+//! lost the race; the next turn of the marked pack then replaces the index,
+//! so the scope converges on one pack instead of thrashing.
 
+use std::collections::HashSet;
+use std::hash::Hash;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use sha2::{Digest, Sha256};
 
 /// The pack entry the index is read from.
 const PACK_INDEX_ENTRY: &str = "assets/intent-index.json";
+
+/// Beside `index.json`: the canonical path of the pack that installed it.
+pub(crate) const SOURCE_MARKER: &str = ".index-source";
 
 /// What [`sync_index_from_pack`] did to the installed index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,21 +54,50 @@ pub(crate) enum IndexSync {
     /// The pack carries no readable index. Any installed index is kept
     /// (it may have been placed by an operator or an external deployer).
     NoPackIndex,
+    /// The installed index belongs to a different pack that shares this
+    /// scope; it is kept. Reported once per (scope, pack).
+    OwnedByOtherPack,
     /// The pack has an index but writing it failed; the installed index (if
     /// any) is untouched. The reason is logged where it is produced.
     WriteFailed,
 }
 
-/// Make `target_index` hold exactly the pack's `assets/intent-index.json`.
+/// Make `target_index` hold the pack's `assets/intent-index.json`, unless the
+/// installed index belongs to another pack sharing the scope.
 pub(crate) fn sync_index_from_pack(pack_path: &Path, target_index: &Path) -> IndexSync {
     let Some(pack_index) = read_pack_index(pack_path) else {
         return IndexSync::NoPackIndex;
     };
+    let source = canonical(pack_path);
+    let marker = marker_path(target_index);
     let existed = target_index.is_file();
+    if existed
+        && let Some(owner) = installed_owner(&marker)
+        && owner != source
+        && owner.exists()
+    {
+        if CONFLICTS.first((target_index.to_path_buf(), source.clone())) {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "[fast2flow:gate] index {} belongs to pack {}; pack {} shares the scope and is routed against it (reported once)",
+                    target_index.display(),
+                    owner.display(),
+                    source.display()
+                ),
+            );
+        }
+        return IndexSync::OwnedByOtherPack;
+    }
+    let owner_recorded = installed_owner(&marker).as_deref() == Some(source.as_path());
     if existed
         && let Ok(installed) = std::fs::read(target_index)
         && Sha256::digest(&installed) == Sha256::digest(&pack_index)
     {
+        if !owner_recorded {
+            // A legacy index (no marker) that already matches: adopt it.
+            let _ = write_atomically(&marker, source.to_string_lossy().as_bytes());
+        }
         return IndexSync::Unchanged;
     }
     if let Err(err) = write_atomically(target_index, &pack_index) {
@@ -58,6 +109,9 @@ pub(crate) fn sync_index_from_pack(pack_path: &Path, target_index: &Path) -> Ind
             ),
         );
         return IndexSync::WriteFailed;
+    }
+    if !owner_recorded {
+        let _ = write_atomically(&marker, source.to_string_lossy().as_bytes());
     }
     if let Some(parent) = target_index.parent() {
         let latest = parent.join("latest");
@@ -72,6 +126,51 @@ pub(crate) fn sync_index_from_pack(pack_path: &Path, target_index: &Path) -> Ind
     } else {
         IndexSync::Created
     }
+}
+
+/// Process-wide "already reported" set for scope/pack conflicts.
+static CONFLICTS: LazyLock<WarnOnce<(PathBuf, PathBuf)>> = LazyLock::new(WarnOnce::default);
+
+/// Remembers which keys were already reported, so a condition that holds on
+/// every turn is logged once, not per turn.
+pub(crate) struct WarnOnce<K> {
+    seen: Mutex<HashSet<K>>,
+}
+
+impl<K> Default for WarnOnce<K> {
+    fn default() -> Self {
+        Self {
+            seen: Mutex::new(HashSet::new()),
+        }
+    }
+}
+
+impl<K: Eq + Hash> WarnOnce<K> {
+    /// `true` the first time `key` is seen.
+    pub(crate) fn first(&self, key: K) -> bool {
+        match self.seen.lock() {
+            Ok(mut seen) => seen.insert(key),
+            // A poisoned set only means a panic elsewhere; reporting again is
+            // harmless, staying silent is not.
+            Err(poisoned) => poisoned.into_inner().insert(key),
+        }
+    }
+}
+
+fn marker_path(target_index: &Path) -> PathBuf {
+    target_index.with_file_name(SOURCE_MARKER)
+}
+
+fn canonical(pack_path: &Path) -> PathBuf {
+    std::fs::canonicalize(pack_path).unwrap_or_else(|_| pack_path.to_path_buf())
+}
+
+/// The pack recorded as the installed index's source; `None` when there is no
+/// (readable, non-empty) marker — an index installed by an older build.
+fn installed_owner(marker: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(marker).ok()?;
+    let raw = raw.trim();
+    (!raw.is_empty()).then(|| PathBuf::from(raw))
 }
 
 /// The pack's index bytes, or `None` when the pack or the entry is unreadable.

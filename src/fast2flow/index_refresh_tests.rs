@@ -107,7 +107,14 @@ fn no_temp_file_is_left_behind() {
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(names, vec!["index.json".to_string(), "latest".to_string()]);
+    assert_eq!(
+        names,
+        vec![
+            SOURCE_MARKER.to_string(),
+            "index.json".to_string(),
+            "latest".to_string()
+        ]
+    );
 }
 
 /// A probe reading the index while another replaces it sees the whole old
@@ -147,4 +154,95 @@ fn a_concurrent_reader_never_sees_a_partial_index() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let reads = reader.join().expect("reader must not panic");
     assert!(reads > 0);
+}
+
+/// Two different packs resolving to one shared (legacy `<tenant>:<team>`)
+/// scope: the first one installed keeps the index, the second neither
+/// overwrites it nor flips it back and forth on every turn.
+#[test]
+fn two_packs_sharing_a_scope_do_not_thrash() {
+    let dir = tempdir().expect("dir");
+    let (a, b) = (dir.path().join("a.gtpack"), dir.path().join("b.gtpack"));
+    write_pack(&a, br#"{"pack":"a"}"#);
+    write_pack(&b, br#"{"pack":"b"}"#);
+    let target = dir.path().join("acme:default").join("index.json");
+
+    assert_eq!(sync_index_from_pack(&a, &target), IndexSync::Created);
+    for _ in 0..3 {
+        assert_eq!(
+            sync_index_from_pack(&b, &target),
+            IndexSync::OwnedByOtherPack
+        );
+        assert_eq!(sync_index_from_pack(&a, &target), IndexSync::Unchanged);
+    }
+    assert_eq!(std::fs::read(&target).expect("index"), br#"{"pack":"a"}"#);
+}
+
+/// The owning pack updated in place still refreshes the index even after a
+/// second pack asked for the same scope.
+#[test]
+fn the_owning_pack_still_refreshes_when_another_shares_the_scope() {
+    let dir = tempdir().expect("dir");
+    let (a, b) = (dir.path().join("a.gtpack"), dir.path().join("b.gtpack"));
+    write_pack(&a, br#"{"pack":"a1"}"#);
+    write_pack(&b, br#"{"pack":"b"}"#);
+    let target = dir.path().join("scope").join("index.json");
+    sync_index_from_pack(&a, &target);
+    sync_index_from_pack(&b, &target);
+
+    write_pack(&a, br#"{"pack":"a2"}"#);
+    assert_eq!(sync_index_from_pack(&a, &target), IndexSync::Replaced);
+    assert_eq!(std::fs::read(&target).expect("index"), br#"{"pack":"a2"}"#);
+}
+
+/// An index installed by an older build carries no source marker; it is
+/// treated as the resolving pack's own, so an updated pack replaces it.
+#[test]
+fn a_legacy_index_without_a_marker_is_replaced_when_different() {
+    let dir = tempdir().expect("dir");
+    let pack = dir.path().join("p.gtpack");
+    write_pack(&pack, br#"{"v":"new"}"#);
+    let target = dir.path().join("scope").join("index.json");
+    std::fs::create_dir_all(target.parent().expect("parent")).expect("dir");
+    std::fs::write(&target, br#"{"v":"old"}"#).expect("seed legacy index");
+
+    assert_eq!(sync_index_from_pack(&pack, &target), IndexSync::Replaced);
+    assert_eq!(std::fs::read(&target).expect("index"), br#"{"v":"new"}"#);
+    // ...and from now on it is owned: another pack cannot take it.
+    let other = dir.path().join("other.gtpack");
+    write_pack(&other, br#"{"v":"other"}"#);
+    assert_eq!(
+        sync_index_from_pack(&other, &target),
+        IndexSync::OwnedByOtherPack
+    );
+}
+
+/// A marker naming a pack that no longer exists cannot cause thrash (nothing
+/// can resolve it any more), so the scope is taken over rather than stranded.
+#[test]
+fn a_scope_whose_owning_pack_is_gone_is_taken_over() {
+    let dir = tempdir().expect("dir");
+    let (old, new) = (dir.path().join("v1.gtpack"), dir.path().join("v2.gtpack"));
+    write_pack(&old, br#"{"v":1}"#);
+    write_pack(&new, br#"{"v":2}"#);
+    let target = dir.path().join("scope").join("index.json");
+    sync_index_from_pack(&old, &target);
+    std::fs::remove_file(&old).expect("remove old pack");
+
+    assert_eq!(sync_index_from_pack(&new, &target), IndexSync::Replaced);
+    assert_eq!(std::fs::read(&target).expect("index"), br#"{"v":2}"#);
+}
+
+#[test]
+fn a_conflict_is_reported_once_per_scope_and_pack() {
+    let key = |s: &str| {
+        (
+            std::path::PathBuf::from(s),
+            std::path::PathBuf::from("pack"),
+        )
+    };
+    let seen = WarnOnce::default();
+    assert!(seen.first(key("/x/scope-a")));
+    assert!(!seen.first(key("/x/scope-a")));
+    assert!(seen.first(key("/x/scope-b")));
 }
