@@ -194,6 +194,15 @@ fn write_atomically(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .prefix(".index-refresh-")
         .tempfile_in(parent)?;
     tmp.write_all(bytes)?;
+    // `tempfile` creates 0600; the index is read by the routing host, which a
+    // deployer may run as another uid sharing the indexes path. Match what the
+    // previous plain `fs::write` produced under the usual 022 umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o644))?;
+    }
     tmp.as_file().sync_all()?;
     tmp.persist(target).map_err(|err| err.error)?;
     Ok(())

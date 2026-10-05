@@ -246,3 +246,27 @@ fn a_conflict_is_reported_once_per_scope_and_pack() {
     assert!(!seen.first(key("/x/scope-a")));
     assert!(seen.first(key("/x/scope-b")));
 }
+
+/// Readable by other uids sharing `GREENTIC_FAST2FLOW_INDEXES_PATH`, as the
+/// old `fs::write` (umask default) was — `tempfile` alone creates 0600.
+#[cfg(unix)]
+#[test]
+fn written_files_are_world_readable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().expect("dir");
+    let pack = dir.path().join("p.gtpack");
+    write_pack(&pack, br#"{"v":1}"#);
+    let target = dir.path().join("scope").join("index.json");
+    sync_index_from_pack(&pack, &target);
+    write_pack(&pack, br#"{"v":2}"#);
+    assert_eq!(sync_index_from_pack(&pack, &target), IndexSync::Replaced);
+
+    let parent = target.parent().expect("parent");
+    for name in ["index.json", "latest", SOURCE_MARKER] {
+        let mode = std::fs::metadata(parent.join(name))
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644, "{name}: {mode:o}");
+    }
+}
