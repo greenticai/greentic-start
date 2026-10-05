@@ -4128,7 +4128,10 @@ async fn dispatch_provider_route(
     // BEFORE it consults the hint: a bundle with more than one messaging flow
     // fails resolution with "flow type messaging is ambiguous" and never reaches
     // the hint. See `dispatch_provider_events`.
-    let flow_target = {
+    // `flow_target_explicit`: the target was NAMED (URL/header), so Fast2Flow
+    // must not replace it unless it names the default flow (decided in
+    // `fast2flow_hook::demote_default_target`); a bundle-default fallback it may.
+    let (flow_target, flow_target_explicit) = {
         let url_flow_id = webchat_target.and_then(|t| t.flow_id.as_deref());
         let bundle_id_str = scope.bundle_id.as_str();
         let named = url_flow_id.or(flow_header).and_then(|flow_id| {
@@ -4156,7 +4159,8 @@ async fn dispatch_provider_route(
         // which is ambiguous for exactly the multi-flow bundles this targeting
         // exists for. Only the webchat classifier's own routes get this; a
         // generic provider webhook keeps the runner's resolution untouched.
-        named.or_else(|| {
+        let explicit = named.is_some();
+        let target = named.or_else(|| {
             webchat_target?;
             activation
                 .routing
@@ -4166,7 +4170,8 @@ async fn dispatch_provider_route(
                     pack_id: pack_id.to_string(),
                     flow_id: flow_id.to_string(),
                 })
-        })
+        });
+        (target, explicit)
     };
     // An explicitly targeted flow also overrides the endpoint's configured
     // welcome_flow on first contact.
@@ -4266,11 +4271,13 @@ async fn dispatch_provider_route(
         let pipeline_tenant = tenant.to_string();
         let pipeline_provider = provider_type.clone();
         let pipeline_bundle = bundle_id.clone();
+        let pipeline_team = route_team.clone();
         let pipeline_notifier = Arc::clone(&state.notifier);
         tokio::spawn(async move {
             run_provider_inbound_pipeline(
                 pipeline_activation,
                 pipeline_tenant,
+                pipeline_team,
                 deployment_id,
                 pipeline_bundle,
                 revision_id,
@@ -4279,6 +4286,7 @@ async fn dispatch_provider_route(
                 ingress_envelopes,
                 endpoint_id,
                 flow_target,
+                flow_target_explicit,
                 welcome_hint,
                 pipeline_notifier,
             )
@@ -4351,6 +4359,7 @@ async fn dispatch_provider_route(
 async fn run_provider_inbound_pipeline(
     activation: Arc<Activation>,
     tenant: String,
+    team: String,
     deployment_id: DeploymentId,
     bundle_id: BundleId,
     revision_id: RevisionId,
@@ -4359,6 +4368,7 @@ async fn run_provider_inbound_pipeline(
     envelopes: Vec<ChannelMessageEnvelope>,
     endpoint_id: Option<String>,
     flow_target: Option<WelcomeFlowHint>,
+    flow_target_explicit: bool,
     welcome_hint: Option<WelcomeFlowHint>,
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
 ) {
@@ -4368,52 +4378,71 @@ async fn run_provider_inbound_pipeline(
         // conversation was opened against), validate it against the FlowIndex
         // and override the request-level target. Unknown flow ids warn and
         // fall back to the request-level target (fail open).
-        let envelope_target = ingress
-            .metadata
-            .get("flow_hint")
-            .and_then(|flow_id| {
-                let flow_id = flow_id.trim();
-                if flow_id.is_empty() {
-                    return None;
-                }
-                let bid = bundle_id.as_str();
-                if let Some(pid) = activation.routing.flow_index.pack_id_for_flow(bid, flow_id) {
-                    Some(WelcomeFlowHint {
-                        pack_id: pid.to_string(),
-                        flow_id: flow_id.to_string(),
-                    })
-                } else {
-                    tracing::warn!(
-                        flow_id,
-                        bundle_id = bid,
-                        "envelope flow_hint metadata does not match any known flow; \
+        let flow_hint_target = ingress.metadata.get("flow_hint").and_then(|flow_id| {
+            let flow_id = flow_id.trim();
+            if flow_id.is_empty() {
+                return None;
+            }
+            let bid = bundle_id.as_str();
+            if let Some(pid) = activation.routing.flow_index.pack_id_for_flow(bid, flow_id) {
+                Some(WelcomeFlowHint {
+                    pack_id: pid.to_string(),
+                    flow_id: flow_id.to_string(),
+                })
+            } else {
+                tracing::warn!(
+                    flow_id,
+                    bundle_id = bid,
+                    "envelope flow_hint metadata does not match any known flow; \
                          falling back to request-level hint",
-                    );
-                    None
-                }
-            })
-            .or_else(|| flow_target.clone());
-        let envelope_hint = envelope_target.clone().or_else(|| welcome_hint.clone());
-
-        let activity = envelope_to_activity(
-            ingress,
-            &tenant,
-            endpoint_id.as_deref(),
-            envelope_hint,
-            envelope_target,
+                );
+                None
+            }
+        });
+        // Fast2Flow (fast2flow_hook): an explicit target naming a non-default
+        // flow wins; the default-flow target (named or not) may be re-routed,
+        // and a miss may become the fixed reply without running a flow.
+        let (explicit, fallback) = fast2flow_hook::split_targets(
+            flow_hint_target,
+            flow_target.clone(),
+            flow_target_explicit,
         );
-        let replies = match activation
-            .host
-            .handle_activity_for_revision(
+        let turn_scope = fast2flow_hook::TurnScope {
+            tenant: &tenant,
+            team: Some(team.as_str()),
+            deployment_id,
+            bundle_id: &bundle_id,
+            revision_id,
+            provider: &provider_type,
+            endpoint_id: endpoint_id.as_deref(),
+        };
+        let run_turn = |envelope: ChannelMessageEnvelope, target: Option<WelcomeFlowHint>| {
+            let hint = target.clone().or_else(|| welcome_hint.clone());
+            let activity =
+                envelope_to_activity(&envelope, &tenant, endpoint_id.as_deref(), hint, target);
+            activation.host.handle_activity_for_revision(
                 &tenant,
                 deployment_id,
                 bundle_id.clone(),
                 revision_id,
                 activity,
             )
-            .await
+        };
+        let reply_envelopes = match fast2flow_hook::run_planned_turn(
+            fast2flow_hook::plan_revision_turn(
+                &activation,
+                &turn_scope,
+                ingress,
+                explicit,
+                fallback,
+            )
+            .await,
+            run_turn,
+            |reply| build_reply_envelopes(ingress, reply, &pack_id, &tenant),
+        )
+        .await
         {
-            Ok(replies) => replies,
+            Ok(envelopes) => envelopes,
             Err(err) => {
                 operator_log::error(
                     module_path!(),
@@ -4426,35 +4455,31 @@ async fn run_provider_inbound_pipeline(
             }
         };
 
-        for reply in replies {
-            // One reply payload can fan out to several envelopes (e.g.
-            // `messages[]`), so ship each shaped envelope in turn.
-            for reply_envelope in build_reply_envelopes(ingress, &reply, &pack_id, &tenant) {
-                match run_reply_egress(
-                    &activation,
-                    &tenant,
-                    deployment_id,
-                    bundle_id.clone(),
-                    revision_id,
-                    &pack_id,
-                    &provider_type,
-                    &reply_envelope,
-                )
-                .await
-                {
-                    Ok(send_outcome) => {
-                        try_notify_webchat_activity(notifier.as_ref(), &send_outcome).await;
-                    }
-                    Err(err) => {
-                        operator_log::error(
-                            module_path!(),
-                            format!(
-                                "provider {provider_type} egress failed for deployment \
+        for reply_envelope in reply_envelopes {
+            match run_reply_egress(
+                &activation,
+                &tenant,
+                deployment_id,
+                bundle_id.clone(),
+                revision_id,
+                &pack_id,
+                &provider_type,
+                &reply_envelope,
+            )
+            .await
+            {
+                Ok(send_outcome) => {
+                    try_notify_webchat_activity(notifier.as_ref(), &send_outcome).await;
+                }
+                Err(err) => {
+                    operator_log::error(
+                        module_path!(),
+                        format!(
+                            "provider {provider_type} egress failed for deployment \
                                  {deployment_id} revision {revision_id} (reply id={}): {err:#}",
-                                reply_envelope.id
-                            ),
-                        );
-                    }
+                            reply_envelope.id
+                        ),
+                    );
                 }
             }
         }
@@ -7214,6 +7239,7 @@ mod tests {
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
+                app_packs: Default::default(),
             }),
         }
     }
@@ -7410,6 +7436,7 @@ mod tests {
                 static_routes: crate::static_routes::ActiveRouteTable::from_plan(&plan),
                 bundle_index,
                 flow_index: crate::webchat_routing::FlowIndex::default(),
+                app_packs: Default::default(),
             }),
         }
     }
@@ -8583,6 +8610,7 @@ mod tests {
             http_routes: live.routing.http_routes.clone(),
             static_routes: live.routing.static_routes.clone(),
             flow_index: live.routing.flow_index.clone(),
+            app_packs: live.routing.app_packs.clone(),
             // …and rebuilds the env-derived half.
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
@@ -8635,6 +8663,7 @@ mod tests {
             http_routes: live.routing.http_routes.clone(),
             static_routes: live.routing.static_routes.clone(),
             flow_index: live.routing.flow_index.clone(),
+            app_packs: live.routing.app_packs.clone(),
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: std::sync::Arc::default(),
@@ -9199,6 +9228,7 @@ mod tests {
             static_routes: crate::static_routes::ActiveRouteTable::default(),
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
+            app_packs: Default::default(),
         });
         let activation = Activation {
             host: base.host,
@@ -10119,6 +10149,7 @@ mod binary_update_tests {
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
+                app_packs: Default::default(),
             }),
         }
     }
@@ -11070,6 +11101,7 @@ mod binary_update_tests {
                 static_routes: crate::static_routes::ActiveRouteTable::default(),
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
+                app_packs: Default::default(),
             }),
         }
     }
@@ -11296,3 +11328,14 @@ mod binary_update_tests {
         assert_eq!(value, b"signing-key");
     }
 }
+
+#[path = "revision_serve/fast2flow_hook.rs"]
+mod fast2flow_hook;
+
+#[cfg(test)]
+#[path = "revision_serve/fast2flow_hook_tests.rs"]
+mod fast2flow_hook_tests;
+
+#[cfg(test)]
+#[path = "revision_serve/fast2flow_hook_default_hint_tests.rs"]
+mod fast2flow_hook_default_hint_tests;

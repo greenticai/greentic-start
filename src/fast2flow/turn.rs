@@ -4,19 +4,19 @@
 //! * what a free-text turn does when routing resolved nothing ([`miss_action`]);
 //! * how a routed turn is reported on its replies ([`RouteSignal`]).
 //!
-//! Kept out of `messaging.rs` so they can be tested without a runner host.
-//! Scope: the legacy messaging ingress (`http_ingress/messaging.rs`) only; the
-//! revision-serve path does not run this code.
+//! Path-neutral: kept free of any ingress so it can be tested without a
+//! runner host, and so the legacy messaging ingress
+//! (`http_ingress/messaging.rs`) and the revision-serve path can share one copy.
 
 use greentic_types::ChannelMessageEnvelope;
 use greentic_types::messaging::extensions::ext_keys;
 use serde_json::{Value as JsonValue, json};
 
-use crate::fast2flow::{FAST2FLOW_CAPABILITY, FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY};
+use super::{FAST2FLOW_CAPABILITY, FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY};
 
 /// The fixed reply a Fast2Flow pack gets on a routing miss, unless it opted
 /// into [`FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY`].
-pub(super) const MISS_REPLY_TEXT: &str =
+pub(crate) const MISS_REPLY_TEXT: &str =
     "I'm not sure what you meant. Tap one of the menu options or rephrase your request.";
 
 /// Reply key carrying the route signal: in `metadata` as a JSON string, and in
@@ -27,12 +27,24 @@ pub(super) const MISS_REPLY_TEXT: &str =
 /// its encoder reads a fixed allow-list — while it forwards
 /// `extensions["channel_data"]` as the activity's `channelData`. That is the
 /// same seam `crate::agent_provenance` uses for `greenticProvenance`.
-pub(super) const ROUTE_METADATA_KEY: &str = "fast2flow";
+pub(crate) const ROUTE_METADATA_KEY: &str = "fast2flow";
+
+/// Metadata keys that name where a card button navigates next, in precedence
+/// order. A turn carrying one is a card submit: it navigates, and is never
+/// routed by Fast2Flow nor answered with the fixed miss reply.
+pub(crate) const CARD_NAV_META_KEYS: &[&str] = &["routeToCardId", "toCardId", "nextCardId"];
+
+/// The card-navigation target an envelope carries, if any.
+pub(crate) fn card_nav_target(envelope: &ChannelMessageEnvelope) -> Option<&String> {
+    CARD_NAV_META_KEYS
+        .iter()
+        .find_map(|key| envelope.metadata.get(*key))
+}
 
 /// Why a routed-eligible turn was NOT routed. Only the log line differs between
 /// the first three; [`Unrouted::Unhandled`] also changes what the turn does.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Unrouted {
+pub(crate) enum Unrouted {
     /// The router ran and found nothing (and so did the LLM fallback).
     NoMatch,
     /// The router was not asked: gate closed, no index path or no index.
@@ -46,7 +58,7 @@ pub(super) enum Unrouted {
 
 impl Unrouted {
     /// A short description for operator logs. Never message text.
-    pub(super) fn describe(&self) -> String {
+    pub(crate) fn describe(&self) -> String {
         match self {
             Self::NoMatch => "no dispatch".to_string(),
             Self::RouterNotConfigured(reason) => format!("router not configured ({reason})"),
@@ -62,7 +74,7 @@ impl Unrouted {
 /// for the turn: consulting the LLM there would let a model override a policy
 /// refusal. Any other miss asks the LLM, and when that finds nothing too the
 /// HOST's cause is kept — a failed router must not be reported as "no match".
-pub(super) fn probe_turn<T>(
+pub(crate) fn probe_turn<T>(
     host: Result<T, Unrouted>,
     llm: impl FnOnce() -> Option<T>,
 ) -> Result<T, Unrouted> {
@@ -75,7 +87,7 @@ pub(super) fn probe_turn<T>(
 
 /// What an unrouted turn (no card target, no dispatched flow) does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum MissAction {
+pub(crate) enum MissAction {
     /// Not a Fast2Flow miss — the default flow runs, exactly as before.
     RunDefaultFlow,
     /// A Fast2Flow miss on a pack that did not opt in: the fixed reply, so a
@@ -94,7 +106,7 @@ pub(super) enum MissAction {
 /// gets the fixed reply, opt-in or not. Otherwise a turn is a Fast2Flow miss
 /// when the pack declares [`FAST2FLOW_CAPABILITY`] and the user sent non-blank
 /// text — whatever the cause (no match, router not configured, router failed).
-pub(super) fn miss_action(
+pub(crate) fn miss_action(
     owns_conversation: bool,
     capabilities: &[String],
     text: Option<&str>,
@@ -119,7 +131,7 @@ pub(super) fn miss_action(
 }
 
 /// The fixed miss reply, addressed like the inbound message.
-pub(super) fn miss_reply(envelope: &ChannelMessageEnvelope) -> ChannelMessageEnvelope {
+pub(crate) fn miss_reply(envelope: &ChannelMessageEnvelope) -> ChannelMessageEnvelope {
     let mut reply = envelope.clone();
     reply.metadata.remove("adaptive_card");
     reply.text = Some(MISS_REPLY_TEXT.to_string());
@@ -128,7 +140,7 @@ pub(super) fn miss_reply(envelope: &ChannelMessageEnvelope) -> ChannelMessageEnv
 
 /// Which router produced a dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RouteSource {
+pub(crate) enum RouteSource {
     /// Fast2Flow's deterministic (BM25) routing host.
     Bm25,
     /// The embedded LLM fallback.
@@ -137,7 +149,7 @@ pub(super) enum RouteSource {
 
 impl RouteSource {
     /// Prefix used in operator log lines (unchanged from before this type).
-    pub(super) fn log_label(self) -> &'static str {
+    pub(crate) fn log_label(self) -> &'static str {
         match self {
             Self::Bm25 => "fast2flow",
             Self::Llm => "fast2flow:llm",
@@ -154,12 +166,12 @@ impl RouteSource {
 
 /// How a routed turn was routed, stamped on every reply of that turn.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct RouteSignal {
+pub(crate) struct RouteSignal {
     /// The card node a node dispatch (`routeToCardId`) targeted; `None` for a
     /// whole-flow dispatch.
-    pub(super) node: Option<String>,
-    pub(super) confidence: Option<f32>,
-    pub(super) source: RouteSource,
+    pub(crate) node: Option<String>,
+    pub(crate) confidence: Option<f32>,
+    pub(crate) source: RouteSource,
 }
 
 impl RouteSignal {
@@ -174,7 +186,7 @@ impl RouteSignal {
     /// the router's value as its shortest decimal (`0.92`, not the f32 noise
     /// `0.9200000166893005`), and `null` when none was reported or it is
     /// non-finite or outside `[0, 1]`. `source` is `"bm25"` or `"llm"`.
-    pub(super) fn to_json(&self, flow_id: &str) -> JsonValue {
+    pub(crate) fn to_json(&self, flow_id: &str) -> JsonValue {
         let confidence = self
             .confidence
             .filter(|c| c.is_finite() && (0.0..=1.0).contains(c))
@@ -205,7 +217,7 @@ impl RouteSignal {
 /// both, because a reply is often a clone of the inbound envelope and an
 /// inbound message must not be able to forge a routing signal. That removal
 /// also drops a `fast2flow` key a flow emitted itself; this is intentional.
-pub(super) fn stamp_route(
+pub(crate) fn stamp_route(
     outputs: &mut [ChannelMessageEnvelope],
     signal: Option<&RouteSignal>,
     flow_id: &str,
@@ -263,5 +275,5 @@ fn json_type(value: &JsonValue) -> &'static str {
 }
 
 #[cfg(test)]
-#[path = "fast2flow_turn_tests.rs"]
+#[path = "turn_tests.rs"]
 mod tests;

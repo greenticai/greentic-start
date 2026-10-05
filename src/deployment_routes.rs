@@ -301,6 +301,11 @@ pub struct RevisionIngressRouting {
     /// Webchat flow index: bundle_id -> set of flow ids. Built from pack
     /// manifests read during the activation loop.
     pub(crate) flow_index: crate::webchat_routing::FlowIndex,
+    /// Fast2Flow app pack of each loaded revision, keyed by
+    /// `(bundle_id, revision_id)` — per revision, not per bundle, so a turn
+    /// probes the pack of the revision actually serving it. Pack-derived like
+    /// `flow_index`, so a routing-only reload carries it over unchanged.
+    pub(crate) app_packs: crate::fast2flow::revision_packs::RevisionAppPacks,
 }
 
 /// Strip a trailing `:port` from a host header value. IPv6 literals are bracketed

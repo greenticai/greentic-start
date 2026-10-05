@@ -3231,6 +3231,7 @@ mod tests {
             static_routes: crate::static_routes::ActiveRouteTable::from_plan(&plan),
             bundle_index,
             flow_index: crate::webchat_routing::FlowIndex::default(),
+            app_packs: Default::default(),
         }
     }
 

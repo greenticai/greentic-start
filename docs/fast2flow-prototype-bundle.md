@@ -9,7 +9,50 @@ Status: **shipped**. The opt-in surface described below now lives on `main`:
   back to `<temp_dir>/greentic-fast2flow-indexes` and the
   pack-fallback materializer reads `assets/intent-index.json` straight
   from the `.gtpack` (still allowed for k8s/cloud deployers to pin via
-  the env var).
+  the env var). The installed `<scope>/index.json` is compared with the
+  pack's by content on every turn and replaced (atomically) when the pack
+  that installed it ships a different index, so updating a pack in place
+  re-routes against its new catalog. Ownership is recorded in a
+  `<scope>/.index-source` marker (the pack's canonical path):
+  - another pack sharing the scope (the legacy `<tenant>:<team>` scope)
+    never replaces it — first installed wins, reported once;
+  - an index with **no** marker that matches the pack's is adopted (the
+    marker is written);
+  - an unmarked index that differs is told apart by the `scope` it records
+    about itself. A copy left by a greentic-start older than the marker is
+    the pack's `assets/intent-index.json` verbatim, so it records the pack
+    author's scope (the same string as the current pack's index) and not
+    the directory it sits in: it is adopted and refreshed automatically,
+    logged once at info. An index built by the greentic-fast2flow indexer
+    (`build_index`, or `bundle index` then `cp` into `<tenant>:<team>/`)
+    records the scope it was built for, which is its directory: it is kept
+    as operator/deployer-placed, warned once per scope. So is anything whose
+    origin cannot be read (no `scope`, unparseable, or a scope that is
+    neither);
+  - old copies exist only under the legacy `<tenant>:<team>` directories of
+    the `--bundle` path. Revision-serve scopes (`<tenant>:<team>--<hex>`) are
+    fresh per revision and never carry one;
+  - one case cannot be told apart: a pack whose index records exactly the
+    scope directory it is installed under (e.g. a pack index with
+    `"scope": "demo:default"` served as tenant `demo`, team `default`). An
+    indexer run for that scope looks the same, whatever its
+    `generated_at_ms` says (the indexer CLI's `index build --now-unix-ms`
+    defaults to 0, so a zero timestamp proves nothing). It is kept; delete
+    the installed index once, or set the override below;
+  - a pack author who changed the index's `scope` string between versions
+    leaves the old copy unrecognisable: it is classified unknown and kept
+    (same remedy);
+  - `GREENTIC_FAST2FLOW_INDEX_REFRESH_UNMARKED=1` (`1`/`true`/`yes`/`on`;
+    anything else or unset = off) is an override that lets the pack adopt
+    and replace ANY unmarked differing index, including a deployer's.
+- `GREENTIC_FAST2FLOW_TIME_BUDGET_MS` (default `500`) is the only timeout
+  greentic-start passes the routing host, and it bounds the whole turn
+  **including the LLM tier**: the host's LLM fallback
+  (`FAST2FLOW_LLM_PROVIDER`, configured on the host) gets whatever is left
+  after the deterministic match. At 500 ms a remote or ollama model
+  usually times out and the turn becomes a no-match; set e.g. `5000` to
+  give it room (it delays that turn's reply). Absent, unparseable or `0`
+  means the default.
 - Worked example:
   [greentic-demo / apps/pet-daycare-app](https://github.com/greenticai/greentic-demo/tree/main/apps/pet-daycare-app).
 
