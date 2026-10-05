@@ -9,7 +9,18 @@ Status: **shipped**. The opt-in surface described below now lives on `main`:
   back to `<temp_dir>/greentic-fast2flow-indexes` and the
   pack-fallback materializer reads `assets/intent-index.json` straight
   from the `.gtpack` (still allowed for k8s/cloud deployers to pin via
-  the env var).
+  the env var). The installed `<scope>/index.json` is compared with the
+  pack's by content on every turn and replaced (atomically) when the pack
+  ships a different index, so updating a pack in place re-routes against
+  its new catalog.
+- `GREENTIC_FAST2FLOW_TIME_BUDGET_MS` (default `500`) is the only timeout
+  greentic-start passes the routing host, and it bounds the whole turn
+  **including the LLM tier**: the host's LLM fallback
+  (`FAST2FLOW_LLM_PROVIDER`, configured on the host) gets whatever is left
+  after the deterministic match. At 500 ms a remote or ollama model
+  usually times out and the turn becomes a no-match; set e.g. `5000` to
+  give it room (it delays that turn's reply). Absent, unparseable or `0`
+  means the default.
 - Worked example:
   [greentic-demo / apps/pet-daycare-app](https://github.com/greenticai/greentic-demo/tree/main/apps/pet-daycare-app).
 

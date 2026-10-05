@@ -6,8 +6,19 @@ use std::sync::{Arc, OnceLock};
 use super::gate::{AlwaysEnabledGate, AnyGate, BundleCapabilityGate, Fast2FlowGate};
 
 // Env vars: HOST_BIN (default greentic-fast2flow-routing-host),
-// REGISTRY_PATH (default /mnt/registry), INDEXES_PATH (unset = hard-skip),
-// TIME_BUDGET_MS (default 500), FORCE_ENABLE (any non-empty = AlwaysEnabledGate).
+// REGISTRY_PATH (default /mnt/registry), INDEXES_PATH (unset = per-process
+// temp dir), TIME_BUDGET_MS (default 500), FORCE_ENABLE (any non-empty =
+// AlwaysEnabledGate).
+//
+// TIME_BUDGET_MS is the ONLY timeout greentic-start hands the routing host,
+// and it bounds the whole turn, LLM tier included: the host runs its filters
+// and deterministic match first and gives its LLM fallback
+// (FAST2FLOW_LLM_PROVIDER, set on the host) whatever is left of the budget.
+// At the default 500 ms a remote or local (ollama) model usually gets no
+// answer back in time, and the turn falls through as a no-match. Raise this
+// to give the LLM tier room, e.g. GREENTIC_FAST2FLOW_TIME_BUDGET_MS=5000; it
+// is per turn and blocks that turn's reply. Absent, unparseable or 0 means
+// the default (0 would make the host answer `continue` to every message).
 const ENV_HOST_BIN: &str = "GREENTIC_FAST2FLOW_HOST_BIN";
 const ENV_REGISTRY_PATH: &str = "GREENTIC_FAST2FLOW_REGISTRY_PATH";
 const ENV_INDEXES_PATH: &str = "GREENTIC_FAST2FLOW_INDEXES_PATH";
@@ -60,10 +71,7 @@ impl Fast2FlowConfig {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| std::env::temp_dir().join("greentic-fast2flow-indexes")),
         );
-        let time_budget_ms = std::env::var(ENV_TIME_BUDGET)
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_TIME_BUDGET_MS);
+        let time_budget_ms = parse_time_budget_ms(std::env::var(ENV_TIME_BUDGET).ok().as_deref());
 
         let mut gates: Vec<Arc<dyn Fast2FlowGate>> = vec![Arc::new(BundleCapabilityGate)];
         if std::env::var(ENV_FORCE_ENABLE)
@@ -94,6 +102,50 @@ impl Fast2FlowConfig {
     /// hook. Kept as a public surface for forward-compat.
     pub fn has_deploy_intent(&self) -> bool {
         self.indexes_path.is_some()
+    }
+}
+
+/// `GREENTIC_FAST2FLOW_TIME_BUDGET_MS` as the budget to send: absent,
+/// unparseable or zero is the default, never a value the host would read as
+/// "route nothing".
+fn parse_time_budget_ms(raw: Option<&str>) -> u64 {
+    match raw.map(str::trim).map(str::parse::<u64>) {
+        Some(Ok(ms)) if ms > 0 => ms,
+        None => DEFAULT_TIME_BUDGET_MS,
+        Some(_) => {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "[fast2flow] {ENV_TIME_BUDGET}={:?} is not a positive integer; using {DEFAULT_TIME_BUDGET_MS} ms",
+                    raw.unwrap_or_default()
+                ),
+            );
+            DEFAULT_TIME_BUDGET_MS
+        }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_budget_is_unchanged() {
+        assert_eq!(DEFAULT_TIME_BUDGET_MS, 500);
+        assert_eq!(parse_time_budget_ms(None), 500);
+    }
+
+    #[test]
+    fn a_valid_override_is_applied() {
+        assert_eq!(parse_time_budget_ms(Some("5000")), 5000);
+        assert_eq!(parse_time_budget_ms(Some(" 1500 ")), 1500);
+    }
+
+    #[test]
+    fn an_invalid_or_zero_override_falls_back_to_the_default() {
+        for raw in ["", "0", "-5", "abc", "1.5", "500ms"] {
+            assert_eq!(parse_time_budget_ms(Some(raw)), 500, "{raw:?}");
+        }
     }
 }
 
