@@ -36,7 +36,7 @@ use crate::fast2flow::Fast2FlowConfig;
 use crate::fast2flow::dispatch::RouteDecision;
 use crate::fast2flow::probe::{ProbeInputs, TurnPlan, plan_turn};
 use crate::fast2flow::revision_packs::{RevisionAppPack, revision_index_scope};
-use crate::fast2flow::turn::{RouteSignal, stamp_route};
+use crate::fast2flow::turn::{RouteSignal, card_nav_target, stamp_route};
 use crate::messaging_app::select_app_flow;
 use crate::operator_log;
 use crate::runner_host::OperatorContext;
@@ -218,6 +218,18 @@ pub(super) async fn plan_for_app(
             module_path!(),
             "[fast2flow] revision runtime not loaded; parked-flow check skipped",
         ),
+    }
+
+    // A card submit navigates (the runner's card_nav turns the key into an
+    // entry node, or the adaptive-card component renders the card). It is
+    // never routed nor answered with the miss reply — the legacy path's
+    // `card_nav_target`-first rule, shared.
+    if let Some(card) = card_nav_target(ingress) {
+        operator_log::debug(
+            module_path!(),
+            format!("[fast2flow] card navigation to {card}; routing skipped"),
+        );
+        return RevisionTurn::passthrough(fallback, ingress);
     }
 
     let index_scope = revision_index_scope(

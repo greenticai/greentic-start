@@ -578,18 +578,10 @@ const ROUTING_META_KEYS: &[&str] = &[
     "mcp_operation",
 ];
 
-/// Metadata keys that name where to navigate next, in precedence order.
-///
-/// A subset of [`ROUTING_META_KEYS`]: those carry other non-form values
-/// (`locale`, `adaptive_card`) that downstream nodes still need.
-const CARD_NAV_META_KEYS: &[&str] = &["routeToCardId", "toCardId", "nextCardId"];
-
-/// Read the card-navigation target from an envelope, if it carries one.
-fn card_nav_target(envelope: &ChannelMessageEnvelope) -> Option<&String> {
-    CARD_NAV_META_KEYS
-        .iter()
-        .find_map(|key| envelope.metadata.get(*key))
-}
+// `CARD_NAV_META_KEYS` (a subset of [`ROUTING_META_KEYS`]) and
+// `card_nav_target` live in `crate::fast2flow::turn`, shared with the
+// revision-serve path so both treat a card submit the same way.
+use crate::fast2flow::turn::{CARD_NAV_META_KEYS, card_nav_target};
 
 /// Drop the card-navigation directives from an envelope bound for the app flow.
 ///

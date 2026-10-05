@@ -29,6 +29,18 @@ pub(crate) const MISS_REPLY_TEXT: &str =
 /// same seam `crate::agent_provenance` uses for `greenticProvenance`.
 pub(crate) const ROUTE_METADATA_KEY: &str = "fast2flow";
 
+/// Metadata keys that name where a card button navigates next, in precedence
+/// order. A turn carrying one is a card submit: it navigates, and is never
+/// routed by Fast2Flow nor answered with the fixed miss reply.
+pub(crate) const CARD_NAV_META_KEYS: &[&str] = &["routeToCardId", "toCardId", "nextCardId"];
+
+/// The card-navigation target an envelope carries, if any.
+pub(crate) fn card_nav_target(envelope: &ChannelMessageEnvelope) -> Option<&String> {
+    CARD_NAV_META_KEYS
+        .iter()
+        .find_map(|key| envelope.metadata.get(*key))
+}
+
 /// Why a routed-eligible turn was NOT routed. Only the log line differs between
 /// the first three; [`Unrouted::Unhandled`] also changes what the turn does.
 #[derive(Debug, Clone, PartialEq, Eq)]

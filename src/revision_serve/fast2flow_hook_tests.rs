@@ -637,3 +637,37 @@ fn the_gate_enter_line_is_logged_at_info_on_the_revision_path() {
         "{log}"
     );
 }
+
+// --- fix 1: a card submit navigates, never routed nor fixed-replied --------
+
+#[tokio::test]
+async fn a_card_submit_on_an_opted_in_pack_is_passed_through_unprobed() {
+    for key in crate::fast2flow::turn::CARD_NAV_META_KEYS {
+        for directive in [CONTINUE, DISPATCH_FLOW] {
+            let fx = Fixture::new(directive);
+            // A button submit carries its label as text plus the nav key.
+            let mut submit = envelope("Show pipeline");
+            submit
+                .metadata
+                .insert((*key).to_string(), "deal_card".to_string());
+            let turn = plan_for_app(
+                fx.cfg(),
+                fx.app(&[FAST2FLOW_CAPABILITY]),
+                Some(new_session_store()),
+                &fx.scope(),
+                &submit,
+                Some(default_target()),
+            )
+            .await;
+            assert!(!fx.host.invoked(), "{key}: a card submit is not probed");
+            assert!(turn.fixed_reply.is_none(), "{key}: no fixed reply");
+            assert!(turn.signal.is_none(), "{key}: not a routed turn");
+            assert_eq!(turn.target, Some(default_target()), "{key}: not retargeted");
+            assert_eq!(
+                turn.envelope.metadata.get(*key).map(String::as_str),
+                Some("deal_card"),
+                "{key}: the runner still sees the nav key"
+            );
+        }
+    }
+}
