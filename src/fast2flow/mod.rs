@@ -12,15 +12,22 @@ use crate::runner_host::OperatorContext;
 
 pub mod config;
 pub mod contracts;
+pub(crate) mod dispatch;
 pub mod gate;
 pub mod host_process;
+pub(crate) mod index_refresh;
 pub mod llm_router;
 pub mod mapper;
+pub(crate) mod probe;
+pub(crate) mod revision_packs;
+#[cfg(all(test, unix))]
+pub(crate) mod test_script;
+pub(crate) mod turn;
 
 pub use config::Fast2FlowConfig;
 pub use contracts::{Fast2FlowHookInV1, MessageEnvelope};
-pub use gate::{FAST2FLOW_CAPABILITY, Fast2FlowGate};
-pub use host_process::invoke_routing_host;
+pub use gate::{FAST2FLOW_CAPABILITY, FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY, Fast2FlowGate};
+pub use host_process::invoke_routing_host_detailed;
 pub use llm_router::try_llm_route;
 pub use mapper::map_directive_to_control;
 
@@ -31,30 +38,53 @@ pub fn scope_for(ctx: &OperatorContext) -> String {
     format!("{}:{}", ctx.tenant, team)
 }
 
-/// Resolve `<indexes_path>/<scope>/index.json`, materializing it from the
-/// pack's `assets/intent-index.json` when absent. Returns the index file path
-/// when present (or just materialized), else `None`. Shared by the host probe
-/// and the embedded LLM fallback so both route against the same catalog.
+/// The override when given, else the default [`scope_for`].
+fn effective_scope(ctx: &OperatorContext, scope: Option<&str>) -> String {
+    scope.map_or_else(|| scope_for(ctx), str::to_string)
+}
+
+/// Resolve `<indexes_path>/<scope>/index.json`, keeping it in step with the
+/// pack's `assets/intent-index.json`: created when absent, replaced
+/// atomically when the pack's content differs, untouched when identical (see
+/// [`index_refresh`]). Returns the index file path when present, else `None`.
+/// Shared by the host probe and the embedded LLM fallback so both route
+/// against the same catalog.
+///
+/// `scope` overrides the index scope: `None` is the default `<tenant>:<team>`
+/// ([`scope_for`]); `Some` names the scope directory under `indexes_path`
+/// verbatim.
 pub fn resolve_index_path(
     cfg: &Fast2FlowConfig,
     ctx: &OperatorContext,
     pack_path: &std::path::Path,
+    scope: Option<&str>,
 ) -> Option<std::path::PathBuf> {
     let indexes_path = cfg.indexes_path.as_ref()?;
-    let scope = scope_for(ctx);
+    let scope = effective_scope(ctx, scope);
     let index_path = indexes_path.join(&scope).join("index.json");
-    let mut exists = index_path.is_file();
-    if !exists && materialize_index_from_pack(pack_path, &index_path) {
-        exists = true;
-        operator_log::info(
+    match index_refresh::sync_index_from_pack(pack_path, &index_path) {
+        index_refresh::IndexSync::Created => operator_log::info(
             module_path!(),
             format!(
                 "[fast2flow:gate] materialized index from pack -> {}",
                 index_path.display()
             ),
-        );
+        ),
+        index_refresh::IndexSync::Replaced => operator_log::info(
+            module_path!(),
+            format!(
+                "[fast2flow:gate] refreshed index from updated pack -> {}",
+                index_path.display()
+            ),
+        ),
+        index_refresh::IndexSync::Unchanged
+        | index_refresh::IndexSync::NoPackIndex
+        | index_refresh::IndexSync::OwnedByOtherPack
+        | index_refresh::IndexSync::DeployerPlaced
+        | index_refresh::IndexSync::WriteFailed => {}
     }
-    operator_log::info(
+    let exists = index_path.is_file();
+    operator_log::debug(
         module_path!(),
         format!(
             "[fast2flow:gate] index_check path={} exists={exists}",
@@ -64,8 +94,30 @@ pub fn resolve_index_path(
     exists.then_some(index_path)
 }
 
+/// What the deterministic router made of one request.
+///
+/// Three different facts that used to share one `None`: the router answered
+/// "nothing matches", the router was never asked (not configured for this
+/// pack/deployment), and the router was asked and FAILED. A caller that treats
+/// the last as the first reports an outage as a user's unclear message.
+#[derive(Debug, Clone)]
+pub enum RoutingOutcome {
+    /// An actionable directive (`Dispatch`, `Respond` or `Deny`).
+    Directive(ControlDirective),
+    /// The router ran and returned `Continue`.
+    NoMatch,
+    /// The router was not asked: gate closed, no index path, or no index for
+    /// this scope. The reason is a short token, never message text.
+    NotConfigured(String),
+    /// The router was asked and failed (spawn, exit status, unparseable
+    /// output). Logged at `warn` where it is produced.
+    Failed(String),
+}
+
 /// Eligibility + invoke + map. Returns `Some` only for actionable
 /// directives; `None` means skip (ineligible, Continue, or error).
+/// Test convenience over [`route_request`], which tells those cases apart.
+#[cfg(test)]
 pub fn try_for_request(
     cfg: &Fast2FlowConfig,
     ctx: &OperatorContext,
@@ -74,9 +126,43 @@ pub fn try_for_request(
     envelope: &ChannelMessageEnvelope,
     provider: &str,
 ) -> Option<ControlDirective> {
+    match route_request(cfg, ctx, pack, pack_path, envelope, provider) {
+        RoutingOutcome::Directive(directive) => Some(directive),
+        _ => None,
+    }
+}
+
+/// Eligibility + invoke + map, with every non-dispatch outcome named, in the
+/// default scope. Test convenience over [`route_request_in_scope`], which
+/// every caller goes through.
+#[cfg(test)]
+pub fn route_request(
+    cfg: &Fast2FlowConfig,
+    ctx: &OperatorContext,
+    pack: &AppPackInfo,
+    pack_path: &std::path::Path,
+    envelope: &ChannelMessageEnvelope,
+    provider: &str,
+) -> RoutingOutcome {
+    route_request_in_scope(cfg, ctx, pack, pack_path, envelope, provider, None)
+}
+
+/// Eligibility + invoke + map, with every non-dispatch outcome named.
+///
+/// `scope_override` overrides the index scope (see [`resolve_index_path`]);
+/// `None` keeps the default `<tenant>:<team>` scope.
+pub fn route_request_in_scope(
+    cfg: &Fast2FlowConfig,
+    ctx: &OperatorContext,
+    pack: &AppPackInfo,
+    pack_path: &std::path::Path,
+    envelope: &ChannelMessageEnvelope,
+    provider: &str,
+    scope_override: Option<&str>,
+) -> RoutingOutcome {
     let deploy_intent = cfg.has_deploy_intent();
     let gate_enabled = cfg.gate.is_enabled(ctx, pack);
-    operator_log::info(
+    operator_log::debug(
         module_path!(),
         format!(
             "[fast2flow:gate] enter tenant={} team={:?} pack={} caps={:?} deploy_intent={} gate_enabled={} text_len={}",
@@ -89,29 +175,33 @@ pub fn try_for_request(
             envelope.text.as_deref().map(str::len).unwrap_or(0)
         ),
     );
+    // "Not configured" is a property of the deployment, not of this turn, so
+    // it is logged at debug: a warn here would fire on every message.
     if !deploy_intent || !gate_enabled {
-        operator_log::info(
+        operator_log::debug(
             module_path!(),
             format!(
                 "[fast2flow:gate] skip reason=gate deploy_intent={deploy_intent} gate_enabled={gate_enabled}"
             ),
         );
-        return None;
+        return RoutingOutcome::NotConfigured("gate".to_string());
     }
     let indexes_path = match cfg.indexes_path.as_ref() {
         Some(p) => p,
         None => {
-            operator_log::info(
+            operator_log::debug(
                 module_path!(),
                 "[fast2flow:gate] skip reason=no_indexes_path",
             );
-            return None;
+            return RoutingOutcome::NotConfigured("no_indexes_path".to_string());
         }
     };
-    let scope = scope_for(ctx);
+    let scope = effective_scope(ctx, scope_override);
     // Resolve (and materialize) the scope index; short-circuit before spawning
     // the host when it's absent. Shared with the embedded LLM fallback.
-    resolve_index_path(cfg, ctx, pack_path)?;
+    if resolve_index_path(cfg, ctx, pack_path, scope_override).is_none() {
+        return RoutingOutcome::NotConfigured("no_index".to_string());
+    }
 
     let text = envelope.text.clone().unwrap_or_default();
     let locale = envelope
@@ -145,7 +235,32 @@ pub fn try_for_request(
         now_unix_ms,
     };
 
-    let out = invoke_routing_host(&cfg.host_bin, &input)?;
+    let out = match invoke_routing_host_detailed(&cfg.host_bin, &input) {
+        Ok(out) => out,
+        Err(reason) => {
+            let line = format!(
+                "[fast2flow] routing host failed tenant={} pack={} reason={reason}",
+                ctx.tenant, pack.pack_id
+            );
+            // A host that is down fails every turn alike: warn once per
+            // (scope, reason), debug after that.
+            if HOST_FAILURES_LOGGED.first((input.scope.clone(), reason.clone())) {
+                operator_log::warn(
+                    module_path!(),
+                    format!("{line} (reported once per scope and reason)"),
+                );
+                tracing::warn!(
+                    target: "greentic.fast2flow",
+                    tenant = %ctx.tenant,
+                    reason = %reason,
+                    "fast2flow routing host failed"
+                );
+            } else {
+                operator_log::debug(module_path!(), line);
+            }
+            return RoutingOutcome::Failed(reason);
+        }
+    };
     let routing = out.directive;
     // Observability: surface the matcher's decision (target + confidence + reason)
     // before `map_directive_to_control` collapses it. Emitted via `tracing` so it
@@ -178,50 +293,20 @@ pub fn try_for_request(
     );
 
     match directive {
-        ControlDirective::Continue => None,
-        actionable => Some(actionable),
+        ControlDirective::Continue => RoutingOutcome::NoMatch,
+        actionable => RoutingOutcome::Directive(actionable),
     }
 }
+
+/// (scope, reason) pairs already warned about as a failed routing host.
+static HOST_FAILURES_LOGGED: std::sync::LazyLock<index_refresh::WarnOnce<(String, String)>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Human-readable operator.log line for a fast2flow dispatch decision. Kept as a
 /// pure helper so the exact wire format (which downstream log scrapers / e2e
 /// tests grep for) is pinned by a unit test.
 fn format_dispatch_log(target: &str, confidence: f32, reason: &str) -> String {
     format!("[fast2flow] dispatch target={target} confidence={confidence:.3} reason={reason:?}")
-}
-
-/// Copy `assets/intent-index.json` out of the pack zip into `target_index`.
-fn materialize_index_from_pack(
-    pack_path: &std::path::Path,
-    target_index: &std::path::Path,
-) -> bool {
-    let Ok(file) = std::fs::File::open(pack_path) else {
-        return false;
-    };
-    let Ok(mut archive) = zip::ZipArchive::new(file) else {
-        return false;
-    };
-    let mut buf = Vec::new();
-    {
-        let Ok(mut entry) = archive.by_name("assets/intent-index.json") else {
-            return false;
-        };
-        if std::io::Read::read_to_end(&mut entry, &mut buf).is_err() {
-            return false;
-        }
-    }
-    if let Some(parent) = target_index.parent()
-        && std::fs::create_dir_all(parent).is_err()
-    {
-        return false;
-    }
-    if std::fs::write(target_index, &buf).is_err() {
-        return false;
-    }
-    if let Some(parent) = target_index.parent() {
-        let _ = std::fs::write(parent.join("latest"), "index.json\n");
-    }
-    true
 }
 
 #[cfg(test)]
@@ -270,7 +355,6 @@ mod tests {
         use crate::ingress::control_directive::ControlDirective;
         use crate::messaging_app::{AppFlowInfo, AppPackInfo};
         use serde_json::json;
-        use std::os::unix::fs::PermissionsExt;
         use std::path::PathBuf;
         use std::sync::Arc;
         use tempfile::{TempDir, tempdir};
@@ -321,11 +405,10 @@ mod tests {
         fn fake_host(body: &str) -> (TempDir, PathBuf) {
             let dir = tempdir().expect("tempdir");
             let path = dir.path().join("fake-host.sh");
-            let script = format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{body}'\n");
-            std::fs::write(&path, script).expect("write");
-            let mut perms = std::fs::metadata(&path).expect("meta").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("perms");
+            crate::fast2flow::test_script::write_executable_script(
+                &path,
+                &format!("cat > /dev/null\nprintf '%s' '{body}'\n"),
+            );
             (dir, path)
         }
 
@@ -441,6 +524,83 @@ mod tests {
                 result.is_none(),
                 "Continue directive maps to None so caller falls through"
             );
+        }
+
+        #[test]
+        fn route_request_tells_no_match_not_configured_and_failure_apart() {
+            let indexes = tempdir().expect("indexes dir");
+            place_index(indexes.path(), "acme:default");
+            let pack_path = std::path::Path::new("/nonexistent.gtpack");
+
+            let (_dir, host) = fake_host(r#"{"directive":{"type":"continue"}}"#);
+            let cfg = config_with(host, Some(indexes.path().to_path_buf()));
+            let outcome = route_request(
+                &cfg,
+                &ctx(),
+                &pack_with_fast2flow_cap(),
+                pack_path,
+                &envelope("hi"),
+                "webchat",
+            );
+            assert!(matches!(outcome, RoutingOutcome::NoMatch), "{outcome:?}");
+
+            let cfg = config_with(
+                PathBuf::from("/definitely/not/a/routing/host"),
+                Some(indexes.path().to_path_buf()),
+            );
+            let outcome = route_request(
+                &cfg,
+                &ctx(),
+                &pack_with_fast2flow_cap(),
+                pack_path,
+                &envelope("hi"),
+                "webchat",
+            );
+            assert!(
+                matches!(outcome, RoutingOutcome::Failed(ref r) if r.starts_with("spawn ")),
+                "{outcome:?}"
+            );
+
+            let empty = tempdir().expect("empty indexes");
+            let cfg = config_with(
+                PathBuf::from("/definitely/not/a/routing/host"),
+                Some(empty.path().to_path_buf()),
+            );
+            let outcome = route_request(
+                &cfg,
+                &ctx(),
+                &pack_with_fast2flow_cap(),
+                pack_path,
+                &envelope("hi"),
+                "webchat",
+            );
+            assert!(
+                matches!(outcome, RoutingOutcome::NotConfigured(ref r) if r == "no_index"),
+                "{outcome:?}"
+            );
+        }
+
+        #[test]
+        fn route_request_carries_the_host_confidence() {
+            let (_dir, host) = fake_host(
+                r#"{"directive":{"type":"dispatch","target":"sales-crm/pipeline_flow","confidence":0.9,"reason":"m"}}"#,
+            );
+            let indexes = tempdir().expect("indexes dir");
+            place_index(indexes.path(), "acme:default");
+            let cfg = config_with(host, Some(indexes.path().to_path_buf()));
+            match route_request(
+                &cfg,
+                &ctx(),
+                &pack_with_fast2flow_cap(),
+                std::path::Path::new("/nonexistent.gtpack"),
+                &envelope("pipeline"),
+                "webchat",
+            ) {
+                RoutingOutcome::Directive(ControlDirective::Dispatch { confidence, .. }) => {
+                    assert_eq!(confidence, Some(0.9));
+                }
+                other => panic!("expected dispatch, got {other:?}"),
+            }
         }
     }
 }

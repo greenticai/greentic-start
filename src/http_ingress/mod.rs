@@ -1,6 +1,7 @@
 mod admin_relay;
 mod conv_dedup;
 mod directline_session;
+mod flow_owner;
 mod helpers;
 mod messaging;
 pub mod websocket;
@@ -2551,6 +2552,7 @@ mod tests {
             static_routes: ActiveRouteTable::default(),
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
+            app_packs: Default::default(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
@@ -2597,6 +2599,7 @@ mod tests {
             static_routes: ActiveRouteTable::default(),
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
+            app_packs: Default::default(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));

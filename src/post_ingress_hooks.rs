@@ -698,6 +698,7 @@ mod tests {
                     node: None,
                 },
                 entities: Vec::new(),
+                confidence: None,
             }),
             "dispatch"
         );
@@ -726,6 +727,7 @@ mod tests {
             ControlDirective::Dispatch {
                 target: target.clone(),
                 entities: Vec::new(),
+                confidence: None,
             },
             |_, _, _, _, dispatch_target| {
                 called = true;
@@ -740,6 +742,7 @@ mod tests {
         let target_json = directive_target_for_audit(&ControlDirective::Dispatch {
             target,
             entities: Vec::new(),
+            confidence: None,
         })
         .expect("target json");
         assert_eq!(target_json["tenant"], "demo");

@@ -50,6 +50,7 @@ use crate::deployment_routes::{
     DeploymentRouteTable, RevisionIngressRouting, deployment_config_overrides_from_environment,
 };
 use crate::endpoint_admit::EndpointAdmit;
+use crate::fast2flow::revision_packs::{AppPackInfoCache, RevisionAppPacks};
 use crate::http_routes::{
     HttpRouteDescriptor, HttpRouteTable, RevisionScope, discover_revision_routes,
 };
@@ -317,11 +318,9 @@ pub(crate) async fn activate_runtime_config(
     let mut static_plan = StaticRoutePlan::default();
     let reserved_routes = ReservedRouteSet::operator_defaults();
 
-    // Webchat flow index: bundle_id -> set of flow ids. Populated from pack
-    // manifests in the activation loop, deduped per bundle_id so two revisions
-    // of the same bundle do not re-read (they share the same pack set).
-    let mut flow_index = crate::webchat_routing::FlowIndex::default();
-    let mut flow_indexed_bundles: HashSet<String> = HashSet::new();
+    // Webchat flow index (bundle_id -> flow ids, deduped per bundle) and the
+    // Fast2Flow app-pack index (per revision). See `RevisionPackIndexing`.
+    let mut pack_indexing = RevisionPackIndexing::default();
 
     // Snapshot the carried stores rather than draining the registry: if this
     // activation fails partway, the registry must still hold what the LIVE host
@@ -392,53 +391,9 @@ pub(crate) async fn activate_runtime_config(
             &reserved_routes,
         ));
 
-        // Webchat flow index: read each pack's flows and register them under
-        // the bundle id. Skipped when the bundle has already been indexed by
-        // an earlier revision of the same bundle (several revisions of one
-        // bundle share the same pack set and therefore the same flows).
-        if flow_indexed_bundles.insert(block.bundle_id.clone()) {
-            for pack_path in &pack_paths {
-                match crate::messaging_app::load_app_pack_info(pack_path) {
-                    Ok(info) => {
-                        let flow_ids: Vec<String> =
-                            info.flows.iter().map(|f| f.id.clone()).collect();
-                        if !flow_ids.is_empty() {
-                            flow_index.register_bundle_flows(
-                                &block.bundle_id,
-                                &info.pack_id,
-                                &flow_ids,
-                            );
-                            // The `/{tenant}/{bundle}` URL form targets the
-                            // bundle's default flow. Reuse the pack-level
-                            // convention (`default` > `main` > sole messaging
-                            // flow) so this URL and the legacy app path agree
-                            // on what "default" means. Packs with several
-                            // messaging flows and no conventional entry point
-                            // simply register none.
-                            match crate::messaging_app::select_app_flow(&info) {
-                                Ok(default_flow) => flow_index.register_bundle_default_flow(
-                                    &block.bundle_id,
-                                    &info.pack_id,
-                                    &default_flow.id,
-                                ),
-                                Err(err) => tracing::debug!(
-                                    pack = %info.pack_id,
-                                    bundle_id = %block.bundle_id,
-                                    "no default webchat flow for pack: {err:#}"
-                                ),
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::debug!(
-                            pack = %pack_path.display(),
-                            bundle_id = %block.bundle_id,
-                            "skipping flow index for pack: {err:#}"
-                        );
-                    }
-                }
-            }
-        }
+        // Webchat flow index (deduped per bundle) and the Fast2Flow
+        // per-revision app-pack index, from one read of each pack manifest.
+        pack_indexing.index_revision(&block.bundle_id, revision_id, &pack_paths);
 
         // Session isolation: give each revision its OWN session and state store
         // rather than sharing the host's. The session/resume/state backend keys
@@ -528,7 +483,8 @@ pub(crate) async fn activate_runtime_config(
         deployment_config_overrides: Arc::new(deployment_config_overrides_from_environment(env)),
         static_routes: ActiveRouteTable::from_plan(&static_plan),
         bundle_index,
-        flow_index,
+        flow_index: pack_indexing.flow_index,
+        app_packs: pack_indexing.app_packs,
     };
 
     // Commit only now that every revision loaded: `retained` holds exactly the
@@ -541,6 +497,71 @@ pub(crate) async fn activate_runtime_config(
     Ok(RuntimeConfigActivation { host, routing })
 }
 
+/// The two pack-manifest-derived routing indexes built during activation.
+///
+/// * `flow_index` — webchat flows, registered under the bundle id. Skipped
+///   when the bundle has already been indexed by an earlier revision of the
+///   same bundle (several revisions of one bundle normally share the same
+///   pack set and therefore the same flows).
+/// * `app_packs` — the Fast2Flow app pack of EACH revision, keyed by
+///   `(bundle_id, revision_id)` and never deduped per bundle: during a traffic
+///   split two revisions may pin different packs, and a probe must route
+///   against the pack of the revision serving the turn.
+///
+/// Both read pack manifests through one [`AppPackInfoCache`], so a pack file
+/// is read once per activation however many revisions pin it.
+#[derive(Default)]
+pub(crate) struct RevisionPackIndexing {
+    pub(crate) flow_index: crate::webchat_routing::FlowIndex,
+    pub(crate) app_packs: RevisionAppPacks,
+    flow_indexed_bundles: HashSet<String>,
+    infos: AppPackInfoCache,
+}
+
+impl RevisionPackIndexing {
+    pub(crate) fn index_revision(
+        &mut self,
+        bundle_id: &str,
+        revision_id: RevisionId,
+        pack_paths: &[PathBuf],
+    ) {
+        let infos = self.infos.infos(pack_paths);
+        if self.flow_indexed_bundles.insert(bundle_id.to_string()) {
+            for (_, info) in &infos {
+                let flow_ids: Vec<String> = info.flows.iter().map(|f| f.id.clone()).collect();
+                if flow_ids.is_empty() {
+                    continue;
+                }
+                self.flow_index
+                    .register_bundle_flows(bundle_id, &info.pack_id, &flow_ids);
+                // The `/{tenant}/{bundle}` URL form targets the bundle's
+                // default flow. Reuse the pack-level convention (`default` >
+                // `main` > sole messaging flow) so this URL and the legacy app
+                // path agree on what "default" means. Packs with several
+                // messaging flows and no conventional entry point simply
+                // register none.
+                match crate::messaging_app::select_app_flow(info) {
+                    Ok(default_flow) => self.flow_index.register_bundle_default_flow(
+                        bundle_id,
+                        &info.pack_id,
+                        &default_flow.id,
+                    ),
+                    Err(err) => tracing::debug!(
+                        pack = %info.pack_id,
+                        bundle_id = %bundle_id,
+                        "no default webchat flow for pack: {err:#}"
+                    ),
+                }
+            }
+        }
+        self.app_packs.insert_revision(
+            bundle_id,
+            revision_id,
+            infos.iter().map(|(path, info)| (path.as_path(), info)),
+        );
+    }
+}
+
 /// Rebuild only the env-derived half of [`RevisionIngressRouting`], carrying the
 /// pack- and revision-derived half over from `prev` untouched.
 ///
@@ -550,7 +571,7 @@ pub(crate) async fn activate_runtime_config(
 /// |---|---|
 /// | `deployment_routes`, `bundle_index`, `endpoint_admit`, `deployment_config_overrides` | the `Environment` alone — rebuilt here |
 /// | `dispatcher` | the runtime-config + pin store — carried over |
-/// | `http_routes`, `static_routes`, `flow_index` | pack manifests on disk — carried over |
+/// | `http_routes`, `static_routes`, `flow_index`, `app_packs` | pack manifests on disk — carried over |
 ///
 /// Carrying the `dispatcher` `Arc` over is not merely an optimization: it is
 /// what leaves session pins and sticky cookies valid across the swap, since no
@@ -572,6 +593,7 @@ pub(crate) fn reactivate_routing_only(
         http_routes: prev.http_routes.clone(),
         static_routes: prev.static_routes.clone(),
         flow_index: prev.flow_index.clone(),
+        app_packs: prev.app_packs.clone(),
         deployment_routes,
         bundle_index,
         endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),
@@ -2134,5 +2156,116 @@ mod tests {
             chain.contains("no pinned packs"),
             "expected the matching scope to pass the guard and reach pack reading, got: {chain}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Fast2Flow on revision-serve: the per-revision app-pack index.
+    // ---------------------------------------------------------------
+
+    /// Boot's pack loop indexes the app pack of EVERY revision, while the
+    /// webchat flow index keeps its per-bundle dedup.
+    #[test]
+    fn boot_indexes_the_app_pack_of_every_revision_of_a_bundle() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.gtpack");
+        let b = dir.path().join("b.gtpack");
+        write_app_pack(&a, "sales-v1");
+        write_app_pack(&b, "sales-v2");
+        let (rev_a, rev_b) = (RevisionId::new(), RevisionId::new());
+
+        let mut index = RevisionPackIndexing::default();
+        index.index_revision("fast2flow", rev_a, std::slice::from_ref(&a));
+        index.index_revision("fast2flow", rev_b, std::slice::from_ref(&b));
+
+        let got_a = index.app_packs.get("fast2flow", rev_a).expect("rev a");
+        let got_b = index.app_packs.get("fast2flow", rev_b).expect("rev b");
+        assert_eq!((got_a.pack_id.as_str(), &got_a.pack_path), ("sales-v1", &a));
+        assert_eq!((got_b.pack_id.as_str(), &got_b.pack_path), ("sales-v2", &b));
+        // The flow index is still deduped per bundle: the first revision wins.
+        assert_eq!(
+            index.flow_index.default_flow_for_bundle("fast2flow"),
+            Some(("sales-v1", "default"))
+        );
+    }
+
+    /// A routing-only reload carries the app-pack index like `flow_index`.
+    #[test]
+    fn routing_only_reload_carries_app_packs() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.gtpack");
+        write_app_pack(&a, "sales");
+        let rev = RevisionId::new();
+        let mut index = RevisionPackIndexing::default();
+        index.index_revision("fast2flow", rev, std::slice::from_ref(&a));
+
+        let env = routing_delta_env();
+        let prev = RevisionIngressRouting {
+            dispatcher: Arc::new(RevisionDispatcher::new(RevisionDispatcherConfig::new(
+                "reload-test",
+                [0u8; 32],
+            ))),
+            http_routes: HttpRouteTable::from_descriptors(Vec::new()),
+            deployment_routes: DeploymentRouteTable::default(),
+            endpoint_admit: Arc::new(EndpointAdmit::default()),
+            deployment_config_overrides: Arc::default(),
+            static_routes: ActiveRouteTable::default(),
+            bundle_index: crate::webchat_routing::BundleIndex::empty(),
+            flow_index: index.flow_index,
+            app_packs: index.app_packs,
+        };
+        let next = reactivate_routing_only(&prev, &env);
+        let got = next.app_packs.get("fast2flow", rev).expect("carried");
+        assert_eq!(got.pack_id, "sales");
+        assert_eq!(got.pack_path, a);
+    }
+
+    /// An app pack whose only flow is `default`.
+    fn write_app_pack(path: &Path, pack_id: &str) {
+        use greentic_types::pack_manifest::{
+            PackFlowEntry, PackKind, PackManifest, PackSignatures,
+        };
+        use greentic_types::{Flow, FlowId, FlowKind};
+        use std::io::Write;
+
+        let flow_id = FlowId::new("default").unwrap();
+        let manifest = PackManifest {
+            agents: Default::default(),
+            schema_version: "pack-v1".into(),
+            pack_id: greentic_types::PackId::new(pack_id).unwrap(),
+            name: Some(pack_id.into()),
+            version: semver::Version::parse("0.1.0").unwrap(),
+            kind: PackKind::Application,
+            publisher: "demo".into(),
+            components: Vec::new(),
+            flows: vec![PackFlowEntry {
+                id: flow_id.clone(),
+                kind: FlowKind::Messaging,
+                flow: Flow {
+                    schema_version: "flow-v1".to_string(),
+                    id: flow_id,
+                    kind: FlowKind::Messaging,
+                    entrypoints: std::collections::BTreeMap::from([(
+                        "default".to_string(),
+                        serde_json::Value::Null,
+                    )]),
+                    nodes: Default::default(),
+                    metadata: Default::default(),
+                },
+                tags: vec![],
+                entrypoints: vec!["default".to_string()],
+            }],
+            dependencies: Vec::new(),
+            capabilities: Vec::new(),
+            secret_requirements: Vec::new(),
+            signatures: PackSignatures::default(),
+            bootstrap: None,
+            extensions: None,
+        };
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        zip.start_file("manifest.cbor", zip::write::FileOptions::<()>::default())
+            .unwrap();
+        zip.write_all(&greentic_types::encode_pack_manifest(&manifest).unwrap())
+            .unwrap();
+        zip.finish().unwrap();
     }
 }

@@ -1,5 +1,14 @@
 # syntax=docker/dockerfile:1.7
 
+# Optional Fast2Flow routing host (OFF by default). Empty = the image is built
+# exactly as before: the final stage is `runtime` and the fetch stage below is
+# never run. Setting it selects `runtime-fast2flow-routing-host` instead (see
+# the final FROM at the bottom). The routing host is a COMMERCIAL binary from
+# the PRIVATE greentic-biz/greentic-fast2flow releases: baking it into an image
+# is a licensing decision, and an anonymous fetch from that repo is a 404.
+# See docs/fast2flow-routing-host-image.md.
+ARG FAST2FLOW_ROUTING_HOST_VERSION=
+
 FROM rust:1.95-bookworm AS build
 
 WORKDIR /app
@@ -52,13 +61,57 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && echo "${CLOUDFLARED_SHA256}  /cloudflared" | sha256sum -c - \
     && chmod 0755 /cloudflared
 
+# Fast2Flow routing host — static musl build from a greentic-fast2flow release
+# (asset `greentic-fast2flow-routing-host-v<ver>-<arch>-unknown-linux-musl.tar.gz`).
+# Only built when FAST2FLOW_ROUTING_HOST_VERSION is set. The digest is the one
+# pinned HERE, per arch, and checked with `sha256sum -c`; the release's own
+# `.sha256` sidecar is never trusted at build time. No credential is baked in:
+# the release repo is private, so a real build needs either a BASE_URL that
+# serves the asset (an internal mirror) or a BuildKit secret mount added to
+# this RUN — deliberately not added here.
+FROM debian:bookworm-slim AS fast2flow-routing-host
+ARG TARGETARCH
+ARG FAST2FLOW_ROUTING_HOST_VERSION
+ARG FAST2FLOW_ROUTING_HOST_SHA256_AMD64=
+ARG FAST2FLOW_ROUTING_HOST_SHA256_ARM64=
+ARG FAST2FLOW_ROUTING_HOST_BASE_URL=https://github.com/greentic-biz/greentic-fast2flow/releases/download
+RUN set -eu \
+    && [ -n "${FAST2FLOW_ROUTING_HOST_VERSION}" ] \
+       || { echo "FAST2FLOW_ROUTING_HOST_VERSION is empty" >&2; exit 1; } \
+    && case "${TARGETARCH}" in \
+      amd64) triple=x86_64-unknown-linux-musl; sha="${FAST2FLOW_ROUTING_HOST_SHA256_AMD64}" ;; \
+      arm64) triple=aarch64-unknown-linux-musl; sha="${FAST2FLOW_ROUTING_HOST_SHA256_ARM64}" ;; \
+      *) echo "unsupported TARGETARCH '${TARGETARCH}'" >&2; exit 1 ;; \
+    esac \
+    && printf '%s' "${sha}" | grep -Eq '^[0-9a-f]{64}$' \
+       || { echo "FAST2FLOW_ROUTING_HOST_SHA256_* for ${TARGETARCH} must be a 64-hex sha256" >&2; exit 1; } \
+    && apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && v="${FAST2FLOW_ROUTING_HOST_VERSION#v}" \
+    && asset="greentic-fast2flow-routing-host-v${v}-${triple}.tar.gz" \
+    && curl -fsSL "${FAST2FLOW_ROUTING_HOST_BASE_URL}/v${v}/${asset}" -o /routing-host.tar.gz \
+    && echo "${sha}  /routing-host.tar.gz" | sha256sum -c - \
+    && mkdir -p /extract \
+    && tar -xzf /routing-host.tar.gz -C /extract \
+    && install -m 0755 /extract/greentic-fast2flow-routing-host /greentic-fast2flow-routing-host
+
 # static-debian12:nonroot ships ca-certificates + a uid-65532 nonroot user and
 # no shell. The musl-static binary needs no runtime apt layer; squashfs-tools is
 # gone because bundle_ref.rs reads SquashFS in-process via `backhand` (P0.4).
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
 COPY --from=build /out/greentic-start /usr/local/bin/greentic-start
 COPY --from=cloudflared /cloudflared /usr/local/bin/cloudflared
 
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/greentic-start"]
+
+# /usr/local/bin is on the image PATH, so greentic-start finds the host by its
+# bare default name; GREENTIC_FAST2FLOW_HOST_BIN still overrides it.
+FROM runtime AS runtime-fast2flow-routing-host
+COPY --from=fast2flow-routing-host /greentic-fast2flow-routing-host /usr/local/bin/greentic-fast2flow-routing-host
+
+# Final image: `runtime` unless FAST2FLOW_ROUTING_HOST_VERSION is non-empty.
+# BuildKit builds only the stages the selected one depends on, so with the
+# default the fetch stage never runs and the image is today's.
+FROM runtime${FAST2FLOW_ROUTING_HOST_VERSION:+-fast2flow-routing-host}

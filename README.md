@@ -190,3 +190,5 @@ That document is the operational guide for:
 This repository focuses on lifecycle execution for Greentic bundles. It is not the place for every product-level behavior in the broader platform.
 
 If you need deeper ownership boundaries, see [docs/ownership.md](docs/ownership.md).
+
+Fast2Flow routing needs the separate, commercial `greentic-fast2flow-routing-host` binary on greentic-start's `PATH` (or `GREENTIC_FAST2FLOW_HOST_BIN`). How it is found, how `gtc install` puts it there, and the opt-in, off-by-default way to copy it into the distroless image: [docs/fast2flow-routing-host-image.md](docs/fast2flow-routing-host-image.md).
