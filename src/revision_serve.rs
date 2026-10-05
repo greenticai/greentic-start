@@ -6077,52 +6077,53 @@ async fn run_provider_inbound_pipeline(
             provider: &provider_type,
             endpoint_id: endpoint_id.as_deref(),
         };
-        let planned = fast2flow_hook::plan_revision_turn(
-            &activation,
-            &turn_scope,
-            ingress,
-            explicit,
-            fallback,
-        )
-        .await;
-
         let run_turn = |envelope: ChannelMessageEnvelope, target: Option<WelcomeFlowHint>| {
             let hint = target.clone().or_else(|| welcome_hint.clone());
             let activity =
                 envelope_to_activity(&envelope, &tenant, endpoint_id.as_deref(), hint, target);
-            let turn = activation.host.handle_activity_for_revision(
+            activation.host.handle_activity_for_revision(
                 &tenant,
                 deployment_id,
                 bundle_id.clone(),
                 revision_id,
                 activity,
-            );
-            let typing_input = crate::typing::typing_input_for(
-                typing_sender.is_some(),
-                true,
-                &provider_type,
-                &tenant,
-                ingress,
-                typing_config.clone(),
-            );
-            let typing_sender = typing_sender.clone();
-            async move {
-                match (&typing_sender, typing_input) {
-                    (Some(sender), Some(input)) => {
-                        crate::typing::keep_typing_while(Arc::clone(sender), input, turn).await
-                    }
-                    _ => turn.await,
-                }
-            }
+            )
         };
+        // The whole turn — the Fast2Flow probe included, as on the legacy
+        // path — runs inside the typing indicator, so a slow routing host
+        // shows "typing" instead of a silent pause before the flow starts.
+        let planned_turn = async {
+            let planned = fast2flow_hook::plan_revision_turn(
+                &activation,
+                &turn_scope,
+                ingress,
+                explicit,
+                fallback,
+            )
+            .await;
+            fast2flow_hook::run_planned_turn(planned, run_turn, |reply| {
+                build_reply_envelopes(ingress, reply, &pack_id, &tenant)
+            })
+            .await
+        };
+        let typing_input = crate::typing::typing_input_for(
+            typing_sender.is_some(),
+            true,
+            &provider_type,
+            &tenant,
+            ingress,
+            typing_config.clone(),
+        );
         // `keep_typing_while` has returned: no refresh can start after this point,
         // so a typing indicator never lands after the reply below. One reply
         // payload can fan out to several envelopes (e.g. `messages[]`).
-        let reply_envelopes = match fast2flow_hook::run_planned_turn(planned, run_turn, |reply| {
-            build_reply_envelopes(ingress, reply, &pack_id, &tenant)
-        })
-        .await
-        {
+        let turn_result = match (&typing_sender, typing_input) {
+            (Some(sender), Some(input)) => {
+                crate::typing::keep_typing_while(Arc::clone(sender), input, planned_turn).await
+            }
+            _ => planned_turn.await,
+        };
+        let reply_envelopes = match turn_result {
             Ok(envelopes) => envelopes,
             Err(err) => {
                 operator_log::error(
