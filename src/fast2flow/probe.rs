@@ -82,21 +82,49 @@ pub(crate) fn probe(
     turn::probe_turn(host, || llm_fallback(i, envelope))
 }
 
+/// What an unrouted turn does when the router could not be asked or failed
+/// (`Unrouted::RouterNotConfigured` / `Unrouted::RouterFailed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnRouterFailure {
+    /// The miss policy applies, as for a genuine no-match. The legacy
+    /// ingress's behaviour; it reaches the policy through [`plan_from`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    MissPolicy,
+    /// The default flow runs (fail open). The revision-serve path: a turn that
+    /// worked before Fast2Flow must not break when the routing host binary is
+    /// absent, crashes, times out, or the pack ships no intent index.
+    DefaultFlow,
+}
+
 /// [`probe`] plus the miss policy ([`plan_from`]).
 ///
 /// A conversation owned by a flow is never routed: the probe is not run and
 /// the plan is the default flow (the caller resumes the owning flow).
-// Wired into the revision-serve ingress by the next change.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn plan_turn(
     i: &ProbeInputs<'_>,
     envelope: &ChannelMessageEnvelope,
     owns_conversation: bool,
+    on_router_failure: OnRouterFailure,
 ) -> TurnPlan {
     if owns_conversation {
         return TurnPlan::DefaultFlow { on_miss: false };
     }
-    plan_from(&i.pack.capabilities, envelope, probe(i, envelope))
+    let outcome = probe(i, envelope);
+    if on_router_failure == OnRouterFailure::DefaultFlow
+        && let Err(cause @ (Unrouted::RouterFailed(_) | Unrouted::RouterNotConfigured(_))) =
+            &outcome
+    {
+        crate::operator_log::warn(
+            module_path!(),
+            format!(
+                "[fast2flow] {} — running the default flow (fail open) pack={}",
+                cause.describe(),
+                i.pack.pack_id
+            ),
+        );
+        return TurnPlan::DefaultFlow { on_miss: false };
+    }
+    plan_from(&i.pack.capabilities, envelope, outcome)
 }
 
 /// The miss policy ([`turn::miss_action`]) applied to a probe outcome: the

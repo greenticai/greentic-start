@@ -34,7 +34,7 @@ use greentic_types::ChannelMessageEnvelope;
 use super::Activation;
 use crate::fast2flow::Fast2FlowConfig;
 use crate::fast2flow::dispatch::RouteDecision;
-use crate::fast2flow::probe::{ProbeInputs, TurnPlan, plan_turn};
+use crate::fast2flow::probe::{OnRouterFailure, ProbeInputs, TurnPlan, plan_turn};
 use crate::fast2flow::revision_packs::{RevisionAppPack, revision_index_scope};
 use crate::fast2flow::turn::{RouteSignal, card_nav_target, stamp_route};
 use crate::messaging_app::select_app_flow;
@@ -251,7 +251,12 @@ pub(super) async fn plan_for_app(
             provider: &provider,
             llm: None,
         };
-        plan_turn(&inputs, &probe_envelope, false)
+        plan_turn(
+            &inputs,
+            &probe_envelope,
+            false,
+            OnRouterFailure::DefaultFlow,
+        )
     })
     .await;
     let plan = match planned {

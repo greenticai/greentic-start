@@ -19,6 +19,17 @@ revision-serve one (`src/revision_serve/fast2flow_hook.rs`, used without
   so the hook checks each messaging flow of the app pack in the revision's
   session store before probing.
 * No LLM fallback: revision mode has no `bundle.yaml` `llm:` block.
+* A card submit (`routeToCardId` / `toCardId` / `nextCardId`) navigates; it is
+  never probed nor answered with the fixed reply (same rule as legacy).
+* **Failure modes diverge from legacy here.** When the router could not be
+  asked or failed — routing host binary missing, crashing, timing out
+  (`router FAILED`), or the pack ships no `assets/intent-index.json`
+  (`router not configured (no_index)`) — the revision path runs the default
+  flow (fail open, logged at warn), so a turn that worked before Fast2Flow
+  keeps working when the host is absent. Only a genuine no-match (the router
+  ran and answered `Continue`) gets the miss policy below. The legacy path is
+  unchanged: there every unrouted cause is a miss. Mechanism:
+  `fast2flow::probe::OnRouterFailure`.
 * `[fast2flow:gate] enter path=revision ...` is logged at INFO.
 * **Behaviour change for existing revision deployments:** a pack that declares
   `greentic.cap.fast2flow.v1` now gets the fixed miss reply for free text that

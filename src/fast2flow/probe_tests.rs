@@ -113,7 +113,12 @@ fn plan(
         provider: "webchat",
         llm: None,
     };
-    plan_turn(&inputs, &envelope(text), owns_conversation)
+    plan_turn(
+        &inputs,
+        &envelope(text),
+        owns_conversation,
+        OnRouterFailure::MissPolicy,
+    )
 }
 
 const DISPATCH_FLOW: &str =
@@ -292,7 +297,7 @@ fn the_llm_fallback_gates_run_in_order_before_the_index_is_read() {
             provider: "webchat",
             llm: llm_cfg.as_ref(),
         };
-        let plan = plan_turn(&inputs, &envelope(text), false);
+        let plan = plan_turn(&inputs, &envelope(text), false, OnRouterFailure::MissPolicy);
         let materialized = indexes.path().join(scope).join("index.json").is_file();
         (materialized, plan)
     };
@@ -312,4 +317,32 @@ fn the_llm_fallback_gates_run_in_order_before_the_index_is_read() {
     // The llm abstained (no candidates); the host's cause stands, so the
     // miss policy applies exactly as for a host miss.
     assert!(matches!(plan, TurnPlan::FixedReply(_)), "{plan:?}");
+}
+
+/// The legacy ingress's policy is unchanged: a failed router degrades like a
+/// miss; only `OnRouterFailure::DefaultFlow` (the revision path) fails open.
+#[test]
+fn a_failed_router_is_a_miss_unless_the_caller_fails_open() {
+    let idx = indexes(SCOPE);
+    let cfg = config(PathBuf::from("/definitely/not/a/routing/host"), &idx);
+    let ctx = ctx();
+    let info = pack(&[FAST2FLOW_CAPABILITY]);
+    let inputs = ProbeInputs {
+        cfg: &cfg,
+        ctx: &ctx,
+        pack: &info,
+        pack_path: Path::new("/nonexistent.gtpack"),
+        index_scope: None,
+        provider: "webchat",
+        llm: None,
+    };
+    let env = envelope("hello?");
+    assert!(matches!(
+        plan_turn(&inputs, &env, false, OnRouterFailure::MissPolicy),
+        TurnPlan::FixedReply(_)
+    ));
+    assert_eq!(
+        plan_turn(&inputs, &env, false, OnRouterFailure::DefaultFlow),
+        TurnPlan::DefaultFlow { on_miss: false }
+    );
 }

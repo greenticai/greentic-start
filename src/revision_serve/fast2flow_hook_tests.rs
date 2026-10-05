@@ -671,3 +671,74 @@ async fn a_card_submit_on_an_opted_in_pack_is_passed_through_unprobed() {
         }
     }
 }
+
+// --- fix 2: router failures fail open on the revision path ------------------
+
+/// A routing host that exits non-zero.
+fn crashing_host() -> (TempDir, PathBuf) {
+    let dir = tempdir().expect("tempdir");
+    let bin = dir.path().join("crash.sh");
+    std::fs::write(&bin, "#!/bin/sh\ncat > /dev/null\nexit 3\n").expect("write");
+    let mut perms = std::fs::metadata(&bin).expect("meta").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&bin, perms).expect("perms");
+    (dir, bin)
+}
+
+async fn plan_with_cfg(fx: &Fixture, cfg: Fast2FlowConfig, text: &str) -> RevisionTurn {
+    plan_for_app(
+        cfg,
+        fx.app(&[FAST2FLOW_CAPABILITY]),
+        Some(new_session_store()),
+        &fx.scope(),
+        &envelope(text),
+        Some(default_target()),
+    )
+    .await
+}
+
+fn assert_default_flow_unstamped(turn: &RevisionTurn) {
+    assert_eq!(turn.target, Some(default_target()));
+    assert!(turn.fixed_reply.is_none(), "no fixed reply: {turn:?}");
+    assert!(turn.signal.is_none(), "no signal: {turn:?}");
+}
+
+#[tokio::test]
+async fn a_missing_routing_host_runs_the_default_flow() {
+    let fx = Fixture::new(CONTINUE);
+    let mut cfg = fx.cfg();
+    cfg.host_bin = PathBuf::from("/definitely/not/a/routing/host");
+    assert_default_flow_unstamped(&plan_with_cfg(&fx, cfg, "hello?").await);
+}
+
+#[tokio::test]
+async fn a_crashing_routing_host_runs_the_default_flow() {
+    let fx = Fixture::new(CONTINUE);
+    let (_dir, bin) = crashing_host();
+    let mut cfg = fx.cfg();
+    cfg.host_bin = bin;
+    assert_default_flow_unstamped(&plan_with_cfg(&fx, cfg, "hello?").await);
+}
+
+#[tokio::test]
+async fn a_pack_without_an_intent_index_runs_the_default_flow() {
+    let fx = Fixture::new(DISPATCH_FLOW);
+    let empty = tempdir().expect("empty indexes");
+    let mut cfg = fx.cfg();
+    cfg.indexes_path = Some(empty.path().to_path_buf());
+    let turn = plan_with_cfg(&fx, cfg, "hello?").await;
+    assert!(!fx.host.invoked(), "no index: the host is not asked");
+    assert_default_flow_unstamped(&turn);
+}
+
+#[tokio::test]
+async fn a_genuine_no_match_keeps_the_fixed_reply() {
+    let fx = Fixture::new(CONTINUE);
+    let turn = plan_with_cfg(&fx, fx.cfg(), "hello?").await;
+    assert!(fx.host.invoked());
+    assert!(turn.target.is_none());
+    assert_eq!(
+        turn.fixed_reply.as_ref().and_then(|r| r.text.as_deref()),
+        Some(MISS_REPLY_TEXT)
+    );
+}
