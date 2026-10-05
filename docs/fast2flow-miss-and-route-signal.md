@@ -1,9 +1,30 @@
 # Fast2Flow: routing misses and the route signal
 
-Applies ONLY to the legacy messaging ingress (`src/http_ingress/messaging.rs`,
-turn body in `messaging_turn.rs`). The revision-serve path does not run this
-code: there, neither the opt-in nor the route signal exists. Pure decisions
-live in `src/http_ingress/fast2flow_turn.rs`.
+Applies to BOTH messaging ingresses: the legacy one (`src/http_ingress/messaging.rs`,
+turn body in `messaging_turn.rs`, used when started WITH `--bundle`) and the
+revision-serve one (`src/revision_serve/fast2flow_hook.rs`, used without
+`--bundle`). Both decide a turn through `src/fast2flow/probe.rs`
+(`plan_turn` / `plan_from`); pure decisions live in `src/fast2flow/turn.rs`.
+
+### Revision-serve specifics
+
+* The app pack is the one of the revision serving the turn
+  (`RevisionIngressRouting::app_packs`), and the intent index lives in a
+  per-revision scope (`revision_index_scope`, `<tenant>:<team>--<hex>`).
+* An explicit target wins: a URL/header-named flow or a valid envelope
+  `flow_hint` is never re-routed. Fast2Flow only replaces the bundle-default
+  fallback target.
+* A conversation parked in a flow resumes that flow and is not probed. On this
+  path the runner keys a parked snapshot by the flow the turn was pinned to,
+  so the hook checks each messaging flow of the app pack in the revision's
+  session store before probing.
+* No LLM fallback: revision mode has no `bundle.yaml` `llm:` block.
+* `[fast2flow:gate] enter path=revision ...` is logged at INFO.
+* **Behaviour change for existing revision deployments:** a pack that declares
+  `greentic.cap.fast2flow.v1` now gets the fixed miss reply for free text that
+  routes nowhere (before, the default flow ran). Declare
+  `greentic.cap.fast2flow.on_miss.default_flow.v1` to keep running the default
+  flow. This is the same behaviour the legacy path has always had.
 
 ## What a routing miss does
 

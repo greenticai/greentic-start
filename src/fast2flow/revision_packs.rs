@@ -12,10 +12,6 @@
 //! reads ([`AppPackInfoCache`] reads each pack path once per activation), and
 //! carried unchanged by a routing-only reload.
 
-// The revision-serve Fast2Flow hook that reads this index lands separately;
-// until then the lookup side is exercised by tests only.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,6 +29,7 @@ pub(crate) struct RevisionAppPack {
     pub pack_id: String,
     pub pack_path: PathBuf,
     pub info: AppPackInfo,
+    #[cfg_attr(not(test), allow(dead_code))] // diagnostics/tests
     pub revision_id: RevisionId,
 }
 
@@ -45,16 +42,31 @@ pub(crate) struct RevisionAppPacks {
 
 impl RevisionAppPacks {
     /// The app pack of `revision_id` of `bundle_id`, if that revision has one.
+    #[cfg_attr(not(test), allow(dead_code))] // production reads `get_shared`
     pub(crate) fn get(&self, bundle_id: &str, revision_id: RevisionId) -> Option<&RevisionAppPack> {
         self.by_revision
             .get(&(bundle_id.to_string(), revision_id))
             .map(Arc::as_ref)
     }
 
+    /// [`get`](Self::get), shared: the revision-serve hook moves the entry
+    /// onto a blocking thread for the routing-host probe.
+    pub(crate) fn get_shared(
+        &self,
+        bundle_id: &str,
+        revision_id: RevisionId,
+    ) -> Option<Arc<RevisionAppPack>> {
+        self.by_revision
+            .get(&(bundle_id.to_string(), revision_id))
+            .cloned()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn len(&self) -> usize {
         self.by_revision.len()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.by_revision.is_empty()
     }
