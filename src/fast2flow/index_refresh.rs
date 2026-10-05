@@ -19,9 +19,15 @@
 //! in a marker beside it ([`SOURCE_MARKER`], the canonical pack path), and
 //! only that pack may replace it. Another pack keeps the installed index (the
 //! first-wins behaviour of the old copy-if-absent) and is reported once per
-//! (scope, pack). An index with no marker was installed by an older build and
-//! is treated as the resolving pack's own; a marker naming a pack that no
-//! longer exists is taken over, since nothing can resolve that pack any more.
+//! (scope, pack). A marker naming a pack that no longer exists is taken over,
+//! since nothing can resolve that pack any more.
+//!
+//! An index with NO marker was placed by someone else: an operator or an
+//! external deployer pinning `GREENTIC_FAST2FLOW_INDEXES_PATH`, or a build
+//! older than the marker. If it matches the pack's index it is adopted (the
+//! marker is written). If it differs it is kept and reported once per scope;
+//! set `GREENTIC_FAST2FLOW_INDEX_REFRESH_UNMARKED=1` to let the pack adopt and
+//! replace it instead (what an index left by an older build needs).
 //!
 //! The index and the marker are two renames, not one. Two packs creating one
 //! scope at the same instant can leave the marker naming the pack whose index
@@ -42,6 +48,19 @@ const PACK_INDEX_ENTRY: &str = "assets/intent-index.json";
 /// Beside `index.json`: the canonical path of the pack that installed it.
 pub(crate) const SOURCE_MARKER: &str = ".index-source";
 
+/// Opt-in: let a pack replace an unmarked index that differs from its own.
+pub(crate) const ENV_REFRESH_UNMARKED: &str = "GREENTIC_FAST2FLOW_INDEX_REFRESH_UNMARKED";
+
+/// `1`/`true`/`yes`/`on` (trimmed, any case) enable; anything else, or unset,
+/// keeps an unmarked index.
+fn parse_refresh_unmarked(raw: Option<&str>) -> bool {
+    raw.map(str::trim).is_some_and(|v| {
+        ["1", "true", "yes", "on"]
+            .iter()
+            .any(|on| v.eq_ignore_ascii_case(on))
+    })
+}
+
 /// What [`sync_index_from_pack`] did to the installed index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexSync {
@@ -57,14 +76,26 @@ pub(crate) enum IndexSync {
     /// The installed index belongs to a different pack that shares this
     /// scope; it is kept. Reported once per (scope, pack).
     OwnedByOtherPack,
+    /// An index with no source marker that differs from the pack's: placed by
+    /// an operator, a deployer or an older build. Kept (reported once per
+    /// scope) unless [`ENV_REFRESH_UNMARKED`] opts in.
+    DeployerPlaced,
     /// The pack has an index but writing it failed; the installed index (if
     /// any) is untouched. The reason is logged where it is produced.
     WriteFailed,
 }
 
 /// Make `target_index` hold the pack's `assets/intent-index.json`, unless the
-/// installed index belongs to another pack sharing the scope.
+/// installed index belongs to another pack sharing the scope or was placed by
+/// someone else (see the module doc). Reads [`ENV_REFRESH_UNMARKED`].
 pub(crate) fn sync_index_from_pack(pack_path: &Path, target_index: &Path) -> IndexSync {
+    let refresh_unmarked =
+        parse_refresh_unmarked(std::env::var(ENV_REFRESH_UNMARKED).ok().as_deref());
+    sync_index_with(pack_path, target_index, refresh_unmarked)
+}
+
+/// [`sync_index_from_pack`] with the unmarked-index opt-in passed explicitly.
+fn sync_index_with(pack_path: &Path, target_index: &Path, refresh_unmarked: bool) -> IndexSync {
     let Some(pack_index) = read_pack_index(pack_path) else {
         return IndexSync::NoPackIndex;
     };
@@ -89,16 +120,31 @@ pub(crate) fn sync_index_from_pack(pack_path: &Path, target_index: &Path) -> Ind
         }
         return IndexSync::OwnedByOtherPack;
     }
-    let owner_recorded = installed_owner(&marker).as_deref() == Some(source.as_path());
+    let owner = installed_owner(&marker);
+    let owner_recorded = owner.as_deref() == Some(source.as_path());
     if existed
         && let Ok(installed) = std::fs::read(target_index)
         && Sha256::digest(&installed) == Sha256::digest(&pack_index)
     {
         if !owner_recorded {
-            // A legacy index (no marker) that already matches: adopt it.
+            // An unmarked (or orphaned) index that already matches: adopt it.
             let _ = write_atomically(&marker, source.to_string_lossy().as_bytes());
         }
         return IndexSync::Unchanged;
+    }
+    if existed && owner.is_none() && !refresh_unmarked {
+        if UNMARKED.first(target_index.to_path_buf()) {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "[fast2flow:gate] index {} has no {SOURCE_MARKER} marker and differs from pack {}'s; \
+                     keeping it as operator/deployer-placed. Set {ENV_REFRESH_UNMARKED}=1 to let the pack replace it (reported once)",
+                    target_index.display(),
+                    source.display()
+                ),
+            );
+        }
+        return IndexSync::DeployerPlaced;
     }
     if let Err(err) = write_atomically(target_index, &pack_index) {
         report_write_failure(target_index, &err);
@@ -138,6 +184,9 @@ fn report_write_failure(target_index: &Path, err: &std::io::Error) -> bool {
     }
     first
 }
+
+/// Process-wide "already reported" set for kept unmarked indexes.
+static UNMARKED: LazyLock<WarnOnce<PathBuf>> = LazyLock::new(WarnOnce::default);
 
 /// Process-wide "already reported" set for failed index writes.
 static WRITE_FAILURES: LazyLock<WarnOnce<(PathBuf, std::io::ErrorKind)>> =

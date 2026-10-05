@@ -195,10 +195,38 @@ fn the_owning_pack_still_refreshes_when_another_shares_the_scope() {
     assert_eq!(std::fs::read(&target).expect("index"), br#"{"pack":"a2"}"#);
 }
 
-/// An index installed by an older build carries no source marker; it is
-/// treated as the resolving pack's own, so an updated pack replaces it.
+/// An index with no source marker that differs from the pack's was placed
+/// by an operator or an external deployer (or an older build): it is kept,
+/// not overwritten, unless `GREENTIC_FAST2FLOW_INDEX_REFRESH_UNMARKED` opts in.
 #[test]
-fn a_legacy_index_without_a_marker_is_replaced_when_different() {
+fn an_unmarked_differing_index_is_kept_as_deployer_placed() {
+    let dir = tempdir().expect("dir");
+    let pack = dir.path().join("p.gtpack");
+    write_pack(&pack, br#"{"v":"pack"}"#);
+    let target = dir.path().join("scope").join("index.json");
+    std::fs::create_dir_all(target.parent().expect("parent")).expect("dir");
+    std::fs::write(&target, br#"{"v":"deployer"}"#).expect("seed deployer index");
+
+    for _ in 0..2 {
+        assert_eq!(
+            sync_index_with(&pack, &target, false),
+            IndexSync::DeployerPlaced
+        );
+    }
+    assert_eq!(
+        std::fs::read(&target).expect("index"),
+        br#"{"v":"deployer"}"#
+    );
+    assert!(
+        !target.with_file_name(SOURCE_MARKER).exists(),
+        "a kept deployer index is not claimed by the pack"
+    );
+}
+
+/// With the opt-in, an unmarked differing index is adopted and replaced, and
+/// from then on it is owned: another pack cannot take it.
+#[test]
+fn the_opt_in_replaces_an_unmarked_differing_index() {
     let dir = tempdir().expect("dir");
     let pack = dir.path().join("p.gtpack");
     write_pack(&pack, br#"{"v":"new"}"#);
@@ -206,15 +234,47 @@ fn a_legacy_index_without_a_marker_is_replaced_when_different() {
     std::fs::create_dir_all(target.parent().expect("parent")).expect("dir");
     std::fs::write(&target, br#"{"v":"old"}"#).expect("seed legacy index");
 
-    assert_eq!(sync_index_from_pack(&pack, &target), IndexSync::Replaced);
+    assert_eq!(sync_index_with(&pack, &target, true), IndexSync::Replaced);
     assert_eq!(std::fs::read(&target).expect("index"), br#"{"v":"new"}"#);
-    // ...and from now on it is owned: another pack cannot take it.
     let other = dir.path().join("other.gtpack");
     write_pack(&other, br#"{"v":"other"}"#);
     assert_eq!(
-        sync_index_from_pack(&other, &target),
+        sync_index_with(&other, &target, true),
         IndexSync::OwnedByOtherPack
     );
+}
+
+/// An unmarked index identical to the pack's is adopted (the marker is
+/// written) without rewriting the index, opt-in or not.
+#[test]
+fn an_unmarked_identical_index_is_adopted() {
+    let dir = tempdir().expect("dir");
+    let pack = dir.path().join("p.gtpack");
+    write_pack(&pack, br#"{"v":1}"#);
+    let target = dir.path().join("scope").join("index.json");
+    std::fs::create_dir_all(target.parent().expect("parent")).expect("dir");
+    std::fs::write(&target, br#"{"v":1}"#).expect("seed");
+
+    assert_eq!(sync_index_with(&pack, &target, false), IndexSync::Unchanged);
+    let owner = std::fs::read_to_string(target.with_file_name(SOURCE_MARKER)).expect("marker");
+    assert_eq!(
+        std::path::PathBuf::from(owner.trim()),
+        std::fs::canonicalize(&pack).expect("canonical")
+    );
+    // Adopted: a later pack update now refreshes it.
+    write_pack(&pack, br#"{"v":2}"#);
+    assert_eq!(sync_index_with(&pack, &target, false), IndexSync::Replaced);
+}
+
+#[test]
+fn the_unmarked_refresh_flag_parses_defensively() {
+    for on in ["1", "true", "TRUE", " yes ", "on"] {
+        assert!(parse_refresh_unmarked(Some(on)), "{on:?}");
+    }
+    for off in ["", "0", "false", "no", "off", "2", "enable"] {
+        assert!(!parse_refresh_unmarked(Some(off)), "{off:?}");
+    }
+    assert!(!parse_refresh_unmarked(None));
 }
 
 /// A marker naming a pack that no longer exists cannot cause thrash (nothing

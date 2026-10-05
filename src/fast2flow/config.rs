@@ -8,7 +8,9 @@ use super::gate::{AlwaysEnabledGate, AnyGate, BundleCapabilityGate, Fast2FlowGat
 // Env vars: HOST_BIN (default greentic-fast2flow-routing-host),
 // REGISTRY_PATH (default /mnt/registry), INDEXES_PATH (unset = per-process
 // temp dir), TIME_BUDGET_MS (default 500), FORCE_ENABLE (any non-empty =
-// AlwaysEnabledGate).
+// AlwaysEnabledGate), INDEX_REFRESH_UNMARKED (`1`/`true`/`yes`/`on` lets a
+// pack replace an unmarked index that differs from its own; read in
+// `index_refresh`).
 //
 // TIME_BUDGET_MS is the ONLY timeout greentic-start hands the routing host,
 // and it bounds the whole turn, LLM tier included: the host runs its filters

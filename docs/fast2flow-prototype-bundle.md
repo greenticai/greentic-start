@@ -11,8 +11,18 @@ Status: **shipped**. The opt-in surface described below now lives on `main`:
   from the `.gtpack` (still allowed for k8s/cloud deployers to pin via
   the env var). The installed `<scope>/index.json` is compared with the
   pack's by content on every turn and replaced (atomically) when the pack
-  ships a different index, so updating a pack in place re-routes against
-  its new catalog.
+  that installed it ships a different index, so updating a pack in place
+  re-routes against its new catalog. Ownership is recorded in a
+  `<scope>/.index-source` marker (the pack's canonical path):
+  - another pack sharing the scope (the legacy `<tenant>:<team>` scope)
+    never replaces it — first installed wins, reported once;
+  - an index with **no** marker (placed by an operator or a deployer, or
+    left by a build older than the marker) is kept when it differs from the
+    pack's, reported once per scope, and adopted when identical;
+  - `GREENTIC_FAST2FLOW_INDEX_REFRESH_UNMARKED=1` (`1`/`true`/`yes`/`on`;
+    anything else or unset = off) lets the pack adopt and replace an
+    unmarked differing index — set it once to move indexes left by an
+    older build onto their pack.
 - `GREENTIC_FAST2FLOW_TIME_BUDGET_MS` (default `500`) is the only timeout
   greentic-start passes the routing host, and it bounds the whole turn
   **including the LLM tier**: the host's LLM fallback
