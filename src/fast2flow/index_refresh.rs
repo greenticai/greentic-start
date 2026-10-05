@@ -25,9 +25,11 @@
 //! An index with NO marker was placed by someone else: an operator or an
 //! external deployer pinning `GREENTIC_FAST2FLOW_INDEXES_PATH`, or a build
 //! older than the marker. If it matches the pack's index it is adopted (the
-//! marker is written). If it differs it is kept and reported once per scope;
-//! set `GREENTIC_FAST2FLOW_INDEX_REFRESH_UNMARKED=1` to let the pack adopt and
-//! replace it instead (what an index left by an older build needs).
+//! marker is written). If it differs, the `scope` it records tells the two
+//! apart ([`UnmarkedOrigin`]): a copy left by an older greentic-start records
+//! the pack's own scope and is adopted and refreshed; anything else is kept
+//! and reported once per scope. `GREENTIC_FAST2FLOW_INDEX_REFRESH_UNMARKED=1`
+//! remains an override that lets the pack replace any unmarked index.
 //!
 //! The index and the marker are two renames, not one. Two packs creating one
 //! scope at the same instant can leave the marker naming the pack whose index
@@ -76,9 +78,10 @@ pub(crate) enum IndexSync {
     /// The installed index belongs to a different pack that shares this
     /// scope; it is kept. Reported once per (scope, pack).
     OwnedByOtherPack,
-    /// An index with no source marker that differs from the pack's: placed by
-    /// an operator, a deployer or an older build. Kept (reported once per
-    /// scope) unless [`ENV_REFRESH_UNMARKED`] opts in.
+    /// An index with no source marker that differs from the pack's and is not
+    /// recognisably a copy left by an older greentic-start (see
+    /// [`UnmarkedOrigin`]): placed by an operator or a deployer. Kept
+    /// (reported once per scope) unless [`ENV_REFRESH_UNMARKED`] opts in.
     DeployerPlaced,
     /// The pack has an index but writing it failed; the installed index (if
     /// any) is untouched. The reason is logged where it is produced.
@@ -122,9 +125,13 @@ fn sync_index_with(pack_path: &Path, target_index: &Path, refresh_unmarked: bool
     }
     let owner = installed_owner(&marker);
     let owner_recorded = owner.as_deref() == Some(source.as_path());
-    if existed
-        && let Ok(installed) = std::fs::read(target_index)
-        && Sha256::digest(&installed) == Sha256::digest(&pack_index)
+    let installed = if existed {
+        std::fs::read(target_index).ok()
+    } else {
+        None
+    };
+    if let Some(installed) = &installed
+        && Sha256::digest(installed) == Sha256::digest(&pack_index)
     {
         if !owner_recorded {
             // An unmarked (or orphaned) index that already matches: adopt it.
@@ -133,18 +140,44 @@ fn sync_index_with(pack_path: &Path, target_index: &Path, refresh_unmarked: bool
         return IndexSync::Unchanged;
     }
     if existed && owner.is_none() && !refresh_unmarked {
-        if UNMARKED.first(target_index.to_path_buf()) {
-            crate::operator_log::warn(
-                module_path!(),
-                format!(
-                    "[fast2flow:gate] index {} has no {SOURCE_MARKER} marker and differs from pack {}'s; \
-                     keeping it as operator/deployer-placed. Set {ENV_REFRESH_UNMARKED}=1 to let the pack replace it (reported once)",
-                    target_index.display(),
-                    source.display()
-                ),
-            );
+        let scope_dir = target_index
+            .parent()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let origin = installed
+            .as_deref()
+            .map_or(UnmarkedOrigin::Unknown, |installed| {
+                unmarked_origin(installed, &pack_index, &scope_dir)
+            });
+        if origin == UnmarkedOrigin::OlderStartCopy {
+            if UNMARKED.first(target_index.to_path_buf()) {
+                crate::operator_log::info(
+                    module_path!(),
+                    format!(
+                        "[fast2flow:gate] index {} has no {SOURCE_MARKER} marker and records the pack's own scope, \
+                         not its directory's: a copy left by an older greentic-start. Pack {} adopts and refreshes it (reported once)",
+                        target_index.display(),
+                        source.display()
+                    ),
+                );
+            }
+        } else {
+            if UNMARKED.first(target_index.to_path_buf()) {
+                crate::operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "[fast2flow:gate] index {} has no {SOURCE_MARKER} marker and differs from pack {}'s; \
+                         keeping it as operator/deployer-placed ({}). Delete it, or set {ENV_REFRESH_UNMARKED}=1, \
+                         to let the pack replace it (reported once)",
+                        target_index.display(),
+                        source.display(),
+                        origin.describe()
+                    ),
+                );
+            }
+            return IndexSync::DeployerPlaced;
         }
-        return IndexSync::DeployerPlaced;
     }
     if let Err(err) = write_atomically(target_index, &pack_index) {
         report_write_failure(target_index, &err);
@@ -275,3 +308,68 @@ fn write_atomically(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 #[path = "index_refresh_tests.rs"]
 mod tests;
+
+/// Where an installed index with no [`SOURCE_MARKER`] came from, read from the
+/// `scope` it records about itself.
+///
+/// Every index the greentic-fast2flow indexer writes records the scope it was
+/// built FOR, and is installed under that scope's directory:
+/// `fast2flow_indexer::build_index` writes `<root>/<scope>/index.json` with
+/// `"scope": "<scope>"`, and `greentic-fast2flow bundle index` writes
+/// `"scope": "<tenant>:<team>"` for `cp index.json <root>/<tenant>:<team>/`.
+/// An older greentic-start (before the marker) copied the pack's
+/// `assets/intent-index.json` verbatim, so that copy records the scope the
+/// pack AUTHOR wrote — the same string the current pack's index records — and
+/// not the directory (a revision scope, `<tenant>:<team>--<hex>`, is never an
+/// author's choice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnmarkedOrigin {
+    /// Records the pack's scope and not its directory's: a copy of (an older
+    /// version of) the pack's index. Adopted and refreshed.
+    OlderStartCopy,
+    /// Records its directory's scope: built for this scope by the indexer or a
+    /// deployer. Kept. Also when the pack's scope string IS the directory,
+    /// since the two origins then look the same.
+    BuiltForScope,
+    /// No readable scope, or a scope that is neither. Kept.
+    Unknown,
+}
+
+impl UnmarkedOrigin {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::OlderStartCopy => "a copy of the pack's index",
+            Self::BuiltForScope => "it records this scope, as an indexer-built index does",
+            Self::Unknown => "its origin cannot be told from its contents",
+        }
+    }
+}
+
+/// Classify an unmarked installed index; see [`UnmarkedOrigin`].
+pub(crate) fn unmarked_origin(
+    installed: &[u8],
+    pack_index: &[u8],
+    scope_dir: &str,
+) -> UnmarkedOrigin {
+    let Some(installed_scope) = recorded_scope(installed) else {
+        return UnmarkedOrigin::Unknown;
+    };
+    if installed_scope == scope_dir {
+        return UnmarkedOrigin::BuiltForScope;
+    }
+    match recorded_scope(pack_index) {
+        Some(pack_scope) if pack_scope == installed_scope => UnmarkedOrigin::OlderStartCopy,
+        _ => UnmarkedOrigin::Unknown,
+    }
+}
+
+/// The non-empty top-level `scope` string an index manifest records.
+fn recorded_scope(bytes: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let scope = value.get("scope")?.as_str()?.trim();
+    (!scope.is_empty()).then(|| scope.to_string())
+}
+
+#[cfg(test)]
+#[path = "index_refresh_origin_tests.rs"]
+mod origin_tests;

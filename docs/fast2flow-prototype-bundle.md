@@ -16,13 +16,27 @@ Status: **shipped**. The opt-in surface described below now lives on `main`:
   `<scope>/.index-source` marker (the pack's canonical path):
   - another pack sharing the scope (the legacy `<tenant>:<team>` scope)
     never replaces it — first installed wins, reported once;
-  - an index with **no** marker (placed by an operator or a deployer, or
-    left by a build older than the marker) is kept when it differs from the
-    pack's, reported once per scope, and adopted when identical;
+  - an index with **no** marker that matches the pack's is adopted (the
+    marker is written);
+  - an unmarked index that differs is told apart by the `scope` it records
+    about itself. A copy left by a greentic-start older than the marker is
+    the pack's `assets/intent-index.json` verbatim, so it records the pack
+    author's scope (the same string as the current pack's index) and not
+    the directory it sits in: it is adopted and refreshed automatically,
+    logged once at info. An index built by the greentic-fast2flow indexer
+    (`build_index`, or `bundle index` then `cp` into `<tenant>:<team>/`)
+    records the scope it was built for, which is its directory: it is kept
+    as operator/deployer-placed, warned once per scope. So is anything whose
+    origin cannot be read (no `scope`, unparseable, or a scope that is
+    neither);
+  - one case cannot be told apart: a pack whose index records exactly the
+    scope directory it is installed under (e.g. a pack index with
+    `"scope": "demo:default"` on the legacy `demo:default` scope). It is
+    kept; delete the installed index once, or use the override below.
+    Revision-serve scopes (`<tenant>:<team>--<hex>`) never hit this case;
   - `GREENTIC_FAST2FLOW_INDEX_REFRESH_UNMARKED=1` (`1`/`true`/`yes`/`on`;
-    anything else or unset = off) lets the pack adopt and replace an
-    unmarked differing index — set it once to move indexes left by an
-    older build onto their pack.
+    anything else or unset = off) is an override that lets the pack adopt
+    and replace ANY unmarked differing index, including a deployer's.
 - `GREENTIC_FAST2FLOW_TIME_BUDGET_MS` (default `500`) is the only timeout
   greentic-start passes the routing host, and it bounds the whole turn
   **including the LLM tier**: the host's LLM fallback

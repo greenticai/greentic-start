@@ -9,8 +9,9 @@ use super::gate::{AlwaysEnabledGate, AnyGate, BundleCapabilityGate, Fast2FlowGat
 // REGISTRY_PATH (default /mnt/registry), INDEXES_PATH (unset = per-process
 // temp dir), TIME_BUDGET_MS (default 500), FORCE_ENABLE (any non-empty =
 // AlwaysEnabledGate), INDEX_REFRESH_UNMARKED (`1`/`true`/`yes`/`on` lets a
-// pack replace an unmarked index that differs from its own; read in
-// `index_refresh`).
+// pack replace ANY unmarked index that differs from its own — an override:
+// a copy left by an older greentic-start is already recognised and refreshed
+// without it; read in `index_refresh`).
 //
 // TIME_BUDGET_MS is the ONLY timeout greentic-start hands the routing host,
 // and it bounds the whole turn, LLM tier included: the host runs its filters
