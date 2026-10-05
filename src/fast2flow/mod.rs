@@ -15,6 +15,7 @@ pub mod contracts;
 pub(crate) mod dispatch;
 pub mod gate;
 pub mod host_process;
+pub(crate) mod index_refresh;
 pub mod llm_router;
 pub mod mapper;
 pub(crate) mod probe;
@@ -40,10 +41,12 @@ fn effective_scope(ctx: &OperatorContext, scope: Option<&str>) -> String {
     scope.map_or_else(|| scope_for(ctx), str::to_string)
 }
 
-/// Resolve `<indexes_path>/<scope>/index.json`, materializing it from the
-/// pack's `assets/intent-index.json` when absent. Returns the index file path
-/// when present (or just materialized), else `None`. Shared by the host probe
-/// and the embedded LLM fallback so both route against the same catalog.
+/// Resolve `<indexes_path>/<scope>/index.json`, keeping it in step with the
+/// pack's `assets/intent-index.json`: created when absent, replaced
+/// atomically when the pack's content differs, untouched when identical (see
+/// [`index_refresh`]). Returns the index file path when present, else `None`.
+/// Shared by the host probe and the embedded LLM fallback so both route
+/// against the same catalog.
 ///
 /// `scope` overrides the index scope: `None` is the default `<tenant>:<team>`
 /// ([`scope_for`]); `Some` names the scope directory under `indexes_path`
@@ -57,17 +60,26 @@ pub fn resolve_index_path(
     let indexes_path = cfg.indexes_path.as_ref()?;
     let scope = effective_scope(ctx, scope);
     let index_path = indexes_path.join(&scope).join("index.json");
-    let mut exists = index_path.is_file();
-    if !exists && materialize_index_from_pack(pack_path, &index_path) {
-        exists = true;
-        operator_log::info(
+    match index_refresh::sync_index_from_pack(pack_path, &index_path) {
+        index_refresh::IndexSync::Created => operator_log::info(
             module_path!(),
             format!(
                 "[fast2flow:gate] materialized index from pack -> {}",
                 index_path.display()
             ),
-        );
+        ),
+        index_refresh::IndexSync::Replaced => operator_log::info(
+            module_path!(),
+            format!(
+                "[fast2flow:gate] refreshed index from updated pack -> {}",
+                index_path.display()
+            ),
+        ),
+        index_refresh::IndexSync::Unchanged
+        | index_refresh::IndexSync::NoPackIndex
+        | index_refresh::IndexSync::WriteFailed => {}
     }
+    let exists = index_path.is_file();
     operator_log::debug(
         module_path!(),
         format!(
@@ -280,40 +292,6 @@ pub fn route_request_in_scope(
 /// tests grep for) is pinned by a unit test.
 fn format_dispatch_log(target: &str, confidence: f32, reason: &str) -> String {
     format!("[fast2flow] dispatch target={target} confidence={confidence:.3} reason={reason:?}")
-}
-
-/// Copy `assets/intent-index.json` out of the pack zip into `target_index`.
-fn materialize_index_from_pack(
-    pack_path: &std::path::Path,
-    target_index: &std::path::Path,
-) -> bool {
-    let Ok(file) = std::fs::File::open(pack_path) else {
-        return false;
-    };
-    let Ok(mut archive) = zip::ZipArchive::new(file) else {
-        return false;
-    };
-    let mut buf = Vec::new();
-    {
-        let Ok(mut entry) = archive.by_name("assets/intent-index.json") else {
-            return false;
-        };
-        if std::io::Read::read_to_end(&mut entry, &mut buf).is_err() {
-            return false;
-        }
-    }
-    if let Some(parent) = target_index.parent()
-        && std::fs::create_dir_all(parent).is_err()
-    {
-        return false;
-    }
-    if std::fs::write(target_index, &buf).is_err() {
-        return false;
-    }
-    if let Some(parent) = target_index.parent() {
-        let _ = std::fs::write(parent.join("latest"), "index.json\n");
-    }
-    true
 }
 
 #[cfg(test)]

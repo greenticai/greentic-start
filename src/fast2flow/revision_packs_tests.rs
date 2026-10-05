@@ -263,4 +263,23 @@ fn each_revision_materializes_its_own_index() {
         r#"{"rev":"new"}"#
     );
     assert_eq!(path_new, indexes.path().join(&scope_new).join("index.json"));
+
+    // Updating one revision's pack refreshes that revision's index only.
+    write_pack(
+        &old,
+        "sales",
+        &["default"],
+        Some(r#"{"rev":"old-updated"}"#),
+    );
+    let refreshed = crate::fast2flow::resolve_index_path(&cfg, &ctx, &old, Some(&scope_old))
+        .expect("old index");
+    assert_eq!(refreshed, path_old);
+    assert_eq!(
+        std::fs::read_to_string(&path_old).expect("old"),
+        r#"{"rev":"old-updated"}"#
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path_new).expect("new"),
+        r#"{"rev":"new"}"#
+    );
 }
