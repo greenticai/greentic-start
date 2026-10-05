@@ -19,7 +19,7 @@ use super::gate::{AlwaysEnabledGate, AnyGate, BundleCapabilityGate, Fast2FlowGat
 // to give the LLM tier room, e.g. GREENTIC_FAST2FLOW_TIME_BUDGET_MS=5000; it
 // is per turn and blocks that turn's reply. Absent, unparseable or 0 means
 // the default (0 would make the host answer `continue` to every message).
-const ENV_HOST_BIN: &str = "GREENTIC_FAST2FLOW_HOST_BIN";
+pub(crate) const ENV_HOST_BIN: &str = "GREENTIC_FAST2FLOW_HOST_BIN";
 const ENV_REGISTRY_PATH: &str = "GREENTIC_FAST2FLOW_REGISTRY_PATH";
 const ENV_INDEXES_PATH: &str = "GREENTIC_FAST2FLOW_INDEXES_PATH";
 const ENV_TIME_BUDGET: &str = "GREENTIC_FAST2FLOW_TIME_BUDGET_MS";

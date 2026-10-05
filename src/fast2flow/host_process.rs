@@ -8,10 +8,52 @@
 //! FIXME(wasm-runtime): support the `fast2flow.gtpack` wasm component mode.
 
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::LazyLock;
 
+use super::config::ENV_HOST_BIN;
 use super::contracts::{Fast2FlowHookInV1, Fast2FlowHookOutV1};
+use super::index_refresh::WarnOnce;
+
+/// Host binaries already reported as missing, so a pack that opted into
+/// Fast2Flow on a host without the routing host says so ONCE per process
+/// rather than only as a per-turn `spawn …: No such file` line.
+static MISSING_HOSTS: LazyLock<WarnOnce<PathBuf>> = LazyLock::new(WarnOnce::default);
+
+/// Operator-facing explanation of a routing host that could not be found:
+/// where it was looked for and the two ways to fix it.
+fn missing_host_hint(host_bin: &Path) -> String {
+    let looked_up = if host_bin
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
+    {
+        "at that path"
+    } else {
+        "on PATH"
+    };
+    format!(
+        "[fast2flow] routing host binary not found: {} (looked up {looked_up}). \
+         A pack opted into Fast2Flow, but greentic-start cannot spawn its routing host, \
+         so routing is skipped on every turn (fail-open). Install \
+         greentic-fast2flow-routing-host on the PATH greentic-start runs with \
+         (gtc install writes to $CARGO_HOME/bin, default ~/.cargo/bin) or set \
+         {ENV_HOST_BIN} to its absolute path. Reported once per process.",
+        host_bin.display()
+    )
+}
+
+/// Warn once per host path that the routing host is missing. Returns whether
+/// this call logged. Changes nothing about the turn: the caller still fails open.
+fn report_missing_host(seen: &WarnOnce<PathBuf>, host_bin: &Path) -> bool {
+    let first = seen.first(host_bin.to_path_buf());
+    if first {
+        let hint = missing_host_hint(host_bin);
+        crate::operator_log::warn(module_path!(), hint.clone());
+        tracing::warn!(target: "greentic.fast2flow", "{hint}");
+    }
+    first
+}
 
 /// Run the routing host. `Err` carries a short, operator-readable reason
 /// (spawn failure, non-zero exit, unparseable stdout) — never message text.
@@ -30,7 +72,12 @@ pub fn invoke_routing_host_detailed(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| format!("spawn {}: {err}", host_bin.display()))?;
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                report_missing_host(&MISSING_HOSTS, host_bin);
+            }
+            format!("spawn {}: {err}", host_bin.display())
+        })?;
 
     {
         let stdin = child
@@ -135,6 +182,37 @@ mod tests {
         let (_dir, bin) = fake_host_emitting("not valid json at all");
         let parse = invoke_routing_host_detailed(&bin, &sample_input()).expect_err("parse fails");
         assert!(parse.starts_with("unparseable host output"), "{parse}");
+    }
+
+    #[test]
+    fn a_missing_host_is_reported_once_per_path() {
+        let seen = WarnOnce::default();
+        let bare = Path::new("greentic-fast2flow-routing-host");
+        assert!(report_missing_host(&seen, bare));
+        assert!(!report_missing_host(&seen, bare));
+        let explicit = Path::new("/opt/f2f/greentic-fast2flow-routing-host");
+        assert!(report_missing_host(&seen, explicit));
+        assert!(!report_missing_host(&seen, explicit));
+    }
+
+    #[test]
+    fn the_missing_host_hint_names_where_it_looked_and_the_override() {
+        let bare = missing_host_hint(Path::new("greentic-fast2flow-routing-host"));
+        assert!(bare.contains("looked up on PATH"), "{bare}");
+        assert!(bare.contains("GREENTIC_FAST2FLOW_HOST_BIN"), "{bare}");
+        assert!(bare.contains("~/.cargo/bin"), "{bare}");
+        let explicit = missing_host_hint(Path::new("/opt/f2f/host"));
+        assert!(explicit.contains("/opt/f2f/host"), "{explicit}");
+        assert!(explicit.contains("looked up at that path"), "{explicit}");
+    }
+
+    #[test]
+    fn a_missing_host_still_fails_open_after_it_was_reported() {
+        let bin = Path::new("/definitely/not/a/real/binary-reported");
+        for _ in 0..2 {
+            let err = invoke_routing_host_detailed(bin, &sample_input()).expect_err("fails open");
+            assert!(err.starts_with("spawn "), "{err}");
+        }
     }
 
     #[test]
