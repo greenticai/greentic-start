@@ -7,8 +7,8 @@ use serde_json::{Value as JsonValue, json};
 use tempfile::tempdir;
 
 use super::*;
+use crate::fast2flow::turn::{MISS_REPLY_TEXT, ROUTE_METADATA_KEY};
 use crate::fast2flow::{FAST2FLOW_CAPABILITY, FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY};
-use crate::http_ingress::fast2flow_turn::{MISS_REPLY_TEXT, ROUTE_METADATA_KEY};
 use crate::http_ingress::flow_owner::test_support::park;
 use crate::ingress::control_directive::{DispatchTarget, IngressReply};
 use crate::messaging_app::{AppFlowInfo, AppPackInfo};

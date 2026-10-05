@@ -9,8 +9,8 @@ use std::path::Path;
 
 use greentic_types::ChannelMessageEnvelope;
 
-use super::fast2flow_turn::{self, MissAction, Unrouted};
 use super::*;
+use crate::fast2flow::turn::{self as fast2flow_turn, Unrouted};
 
 /// What running an app flow produced for one turn.
 pub(super) struct FlowRun {
@@ -47,16 +47,9 @@ pub(super) fn turn_outputs<'p>(
     let turn = resolve_turn(bundle, ctx, pack_info, default_flow, original, probe);
     let flow = turn.flow;
     let envelope = &turn.envelope;
-    let miss = fast2flow_turn::miss_action(
-        turn.owns_conversation,
-        &pack_info.capabilities,
-        envelope.text.as_deref(),
-        turn.unrouted.as_ref(),
-    );
     let cause = turn
-        .unrouted
-        .as_ref()
-        .map(Unrouted::describe)
+        .cause
+        .clone()
         .unwrap_or_else(|| "no dispatch".to_string());
     let text_len = envelope.text.as_deref().map(str::len).unwrap_or(0);
 
@@ -100,7 +93,7 @@ pub(super) fn turn_outputs<'p>(
                 run_flow(flow, &flow_envelope, Some(&entry_node))
             }
         }
-    } else if miss == MissAction::FixedReply {
+    } else if let Some(reply) = turn.fixed_reply.clone() {
         // A Fast2Flow pack, free text, no route — or a Deny/Respond this path
         // does not handle yet. Surface a short reply so we don't re-echo the
         // welcome menu and confuse the user.
@@ -111,9 +104,9 @@ pub(super) fn turn_outputs<'p>(
                 pack_info.pack_id
             ),
         );
-        FlowRun::ok(vec![fast2flow_turn::miss_reply(envelope)])
+        FlowRun::ok(vec![reply])
     } else {
-        if miss == MissAction::DefaultFlowOnMiss {
+        if turn.on_miss {
             // The pack declared the on-miss opt-in: the unrouted message goes
             // to the default flow, unchanged. A failed router degrades here
             // too, and the log says it failed rather than "no dispatch".

@@ -63,6 +63,33 @@ pub struct RoutingEntity {
 mod tests {
     use super::*;
 
+    /// The routing host derives its index scope from `messaging_endpoint_id`
+    /// when the request carries one, IGNORING `scope`
+    /// (`fast2flow_contracts::Fast2FlowHookInV1::effective_scope`, greentic-fast2flow
+    /// `ec88623`). This mirror has no such field, so the scope this crate
+    /// sends — the revision-qualified one on the revision-serve path — is the
+    /// one the host reads.
+    #[test]
+    fn the_hook_input_never_carries_a_messaging_endpoint_id() {
+        let input = Fast2FlowHookInV1 {
+            scope: "acme:default--00".to_string(),
+            envelope: MessageEnvelope {
+                text: "hi".to_string(),
+                channel: None,
+                provider: Some("webchat".to_string()),
+            },
+            session_active: false,
+            input_locale: "en".to_string(),
+            time_budget_ms: 500,
+            registry_path: "/r".to_string(),
+            indexes_path: "/i".to_string(),
+            now_unix_ms: 0,
+        };
+        let wire = serde_json::to_value(&input).unwrap();
+        assert!(wire.get("messaging_endpoint_id").is_none(), "{wire}");
+        assert_eq!(wire["scope"], "acme:default--00");
+    }
+
     #[test]
     fn directive_continue_round_trips() {
         let out: Fast2FlowHookOutV1 =
