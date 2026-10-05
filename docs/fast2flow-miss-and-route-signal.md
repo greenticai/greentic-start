@@ -22,8 +22,9 @@ revision-serve one (`src/revision_serve/fast2flow_hook.rs`, used without
 * A card submit (`routeToCardId` / `toCardId` / `nextCardId`) navigates; it is
   never probed nor answered with the fixed reply (same rule as legacy).
 * **Failure modes diverge from legacy here.** When the router could not be
-  asked or failed — routing host binary missing, crashing, timing out
-  (`router FAILED`), or the pack ships no `assets/intent-index.json`
+  asked or failed — routing host binary missing, crashing, or still running
+  at `GREENTIC_FAST2FLOW_TIME_BUDGET_MS` + 500 ms (greentic-start then kills
+  the host's process group; `router FAILED: host timed out after … ms`), or the pack ships no `assets/intent-index.json`
   (`router not configured (no_index)`) — the revision path runs the default
   flow (fail open, logged at warn), so a turn that worked before Fast2Flow
   keeps working when the host is absent. Only a genuine no-match (the router
@@ -44,7 +45,8 @@ the user sent non-blank text, the conversation is not owned by a flow, and
 neither Fast2Flow (BM25 host) nor the LLM fallback produced a usable dispatch.
 The router's answer is one of: dispatched, no match, not configured (gate
 closed, no index path or no index — logged at debug), or **failed** (spawn
-error, non-zero exit, unparseable output — logged at `warn` with the reason).
+error, non-zero exit, unparseable output, or a host killed for running past
+its time budget plus a 500 ms grace — logged at `warn` with the reason).
 A failure behaves like a miss below, but the log names it as a failure.
 
 A Fast2Flow `Deny` or `Respond` is not handled on this path yet: it stops
