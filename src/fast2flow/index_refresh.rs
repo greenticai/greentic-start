@@ -101,13 +101,7 @@ pub(crate) fn sync_index_from_pack(pack_path: &Path, target_index: &Path) -> Ind
         return IndexSync::Unchanged;
     }
     if let Err(err) = write_atomically(target_index, &pack_index) {
-        crate::operator_log::warn(
-            module_path!(),
-            format!(
-                "[fast2flow:gate] index write failed path={} err={err}",
-                target_index.display()
-            ),
-        );
+        report_write_failure(target_index, &err);
         return IndexSync::WriteFailed;
     }
     if !owner_recorded {
@@ -127,6 +121,27 @@ pub(crate) fn sync_index_from_pack(pack_path: &Path, target_index: &Path) -> Ind
         IndexSync::Created
     }
 }
+
+/// Log a failed index write once per (index path, error kind): a read-only
+/// or full indexes path fails the same way on every turn. Returns whether
+/// this call logged.
+fn report_write_failure(target_index: &Path, err: &std::io::Error) -> bool {
+    let first = WRITE_FAILURES.first((target_index.to_path_buf(), err.kind()));
+    if first {
+        crate::operator_log::warn(
+            module_path!(),
+            format!(
+                "[fast2flow:gate] index write failed path={} err={err} (reported once per error kind)",
+                target_index.display()
+            ),
+        );
+    }
+    first
+}
+
+/// Process-wide "already reported" set for failed index writes.
+static WRITE_FAILURES: LazyLock<WarnOnce<(PathBuf, std::io::ErrorKind)>> =
+    LazyLock::new(WarnOnce::default);
 
 /// Process-wide "already reported" set for scope/pack conflicts.
 static CONFLICTS: LazyLock<WarnOnce<(PathBuf, PathBuf)>> = LazyLock::new(WarnOnce::default);

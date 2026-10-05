@@ -270,3 +270,23 @@ fn written_files_are_world_readable() {
         assert_eq!(mode & 0o777, 0o644, "{name}: {mode:o}");
     }
 }
+
+/// A write that keeps failing (read-only or full indexes path) is reported
+/// once per scope and error kind, not on every turn.
+#[test]
+fn a_persistent_write_failure_is_reported_once() {
+    let dir = tempdir().expect("dir");
+    let pack = dir.path().join("p.gtpack");
+    write_pack(&pack, br#"{"v":1}"#);
+    // The scope "directory" is a plain file, so the index can never be written.
+    let blocker = dir.path().join("scope");
+    std::fs::write(&blocker, b"not a directory").expect("blocker");
+    let target = blocker.join("index.json");
+
+    assert_eq!(sync_index_from_pack(&pack, &target), IndexSync::WriteFailed);
+    assert_eq!(sync_index_from_pack(&pack, &target), IndexSync::WriteFailed);
+    let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let other = dir.path().join("elsewhere").join("index.json");
+    assert!(report_write_failure(&other, &err), "first report logs");
+    assert!(!report_write_failure(&other, &err), "repeat is silent");
+}
