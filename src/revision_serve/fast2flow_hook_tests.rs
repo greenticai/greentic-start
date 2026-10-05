@@ -4,7 +4,6 @@
 //! runner's real `FlowResumeStore`, and the real `build_reply_envelopes`.
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,17 +48,13 @@ impl StubHost {
         let bin = dir.path().join("fake-host.sh");
         let marker = dir.path().join("invoked");
         let body = format!(r#"{{"directive":{directive}}}"#);
-        std::fs::write(
+        crate::fast2flow::test_script::write_executable_script(
             &bin,
-            format!(
-                "#!/bin/sh\ncat > /dev/null\ntouch '{}'\nprintf '%s' '{body}'\n",
+            &format!(
+                "cat > /dev/null\ntouch '{}'\nprintf '%s' '{body}'\n",
                 marker.display()
             ),
-        )
-        .expect("write");
-        let mut perms = std::fs::metadata(&bin).expect("meta").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&bin, perms).expect("perms");
+        );
         Self {
             _dir: dir,
             bin,
@@ -678,10 +673,7 @@ async fn a_card_submit_on_an_opted_in_pack_is_passed_through_unprobed() {
 fn crashing_host() -> (TempDir, PathBuf) {
     let dir = tempdir().expect("tempdir");
     let bin = dir.path().join("crash.sh");
-    std::fs::write(&bin, "#!/bin/sh\ncat > /dev/null\nexit 3\n").expect("write");
-    let mut perms = std::fs::metadata(&bin).expect("meta").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&bin, perms).expect("perms");
+    crate::fast2flow::test_script::write_executable_script(&bin, "cat > /dev/null\nexit 3\n");
     (dir, bin)
 }
 

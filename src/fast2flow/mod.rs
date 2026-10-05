@@ -20,6 +20,8 @@ pub mod llm_router;
 pub mod mapper;
 pub(crate) mod probe;
 pub(crate) mod revision_packs;
+#[cfg(all(test, unix))]
+pub(crate) mod test_script;
 pub(crate) mod turn;
 
 pub use config::Fast2FlowConfig;
@@ -341,7 +343,6 @@ mod tests {
         use crate::ingress::control_directive::ControlDirective;
         use crate::messaging_app::{AppFlowInfo, AppPackInfo};
         use serde_json::json;
-        use std::os::unix::fs::PermissionsExt;
         use std::path::PathBuf;
         use std::sync::Arc;
         use tempfile::{TempDir, tempdir};
@@ -393,11 +394,10 @@ mod tests {
         fn fake_host(body: &str) -> (TempDir, PathBuf) {
             let dir = tempdir().expect("tempdir");
             let path = dir.path().join("fake-host.sh");
-            let script = format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{body}'\n");
-            std::fs::write(&path, script).expect("write");
-            let mut perms = std::fs::metadata(&path).expect("meta").permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).expect("perms");
+            crate::fast2flow::test_script::write_executable_script(
+                &path,
+                &format!("cat > /dev/null\nprintf '%s' '{body}'\n"),
+            );
             (dir, path)
         }
 

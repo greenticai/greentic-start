@@ -66,8 +66,6 @@ pub fn invoke_routing_host_detailed(
 mod tests {
     use super::super::contracts::{MessageEnvelope, RoutingDirective};
     use super::*;
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     fn sample_input() -> Fast2FlowHookInV1 {
@@ -91,11 +89,10 @@ mod tests {
     fn fake_host_emitting(body: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("fake-routing-host.sh");
-        let mut f = std::fs::File::create(&path).expect("create");
-        writeln!(f, "#!/bin/sh\ncat > /dev/null\nprintf '%s' '{body}'").expect("write");
-        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).expect("perms");
+        crate::fast2flow::test_script::write_executable_script(
+            &path,
+            &format!("cat > /dev/null\nprintf '%s' '{body}'\n"),
+        );
         (dir, path)
     }
 

@@ -2,7 +2,6 @@
 //! prints a fixed `Fast2FlowHookOutV1`), the pattern of `mod.rs`'s
 //! `tests::end_to_end`.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -67,14 +66,10 @@ fn fake_host(directive: &str) -> (TempDir, PathBuf) {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("fake-host.sh");
     let body = format!(r#"{{"directive":{directive}}}"#);
-    std::fs::write(
+    crate::fast2flow::test_script::write_executable_script(
         &path,
-        format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{body}'\n"),
-    )
-    .expect("write");
-    let mut perms = std::fs::metadata(&path).expect("meta").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).expect("perms");
+        &format!("cat > /dev/null\nprintf '%s' '{body}'\n"),
+    );
     (dir, path)
 }
 
