@@ -10,7 +10,7 @@ use crate::domains::Domain;
 #[cfg(test)]
 use crate::fast2flow::dispatch::dispatch_flow;
 use crate::fast2flow::dispatch::{self as f2f_dispatch, RouteDecision};
-use crate::fast2flow::probe::{self as f2f_probe, ProbeInputs};
+use crate::fast2flow::probe::{self as f2f_probe, ProbeInputs, TurnPlan};
 #[cfg(test)]
 use crate::fast2flow::turn::RouteSource;
 use crate::fast2flow::turn::{RouteSignal, Unrouted};
@@ -321,8 +321,13 @@ struct Turn<'p> {
     /// Set only when Fast2Flow or the LLM fallback routed THIS turn; stamped
     /// on its replies. `None` for default-flow turns and sticky resumes.
     route: Option<RouteSignal>,
-    /// Why routing produced nothing; `None` when routed or sticky.
-    unrouted: Option<Unrouted>,
+    /// The fixed miss reply to send instead of running a flow
+    /// ([`f2f_probe::plan_from`] decided it).
+    fixed_reply: Option<ChannelMessageEnvelope>,
+    /// The default flow runs because the pack opted into running it on a miss.
+    on_miss: bool,
+    /// Why routing produced nothing, for the log; `None` when routed or sticky.
+    cause: Option<String>,
 }
 
 /// Decide which flow runs this turn.
@@ -353,31 +358,43 @@ fn resolve_turn<'p>(
             envelope: original.clone(),
             owns_conversation: true,
             route: None,
-            unrouted: None,
+            fixed_reply: None,
+            on_miss: false,
+            cause: None,
         };
     }
-    match probe() {
-        Ok(Routed::Node(envelope, route)) => Turn {
+    let outcome = probe();
+    let cause = outcome.as_ref().err().map(Unrouted::describe);
+    let unrouted = |fixed_reply, on_miss| Turn {
+        flow: default_flow,
+        envelope: original.clone(),
+        owns_conversation: false,
+        route: None,
+        fixed_reply,
+        on_miss,
+        cause: cause.clone(),
+    };
+    match f2f_probe::plan_from(&pack_info.capabilities, original, outcome) {
+        TurnPlan::Routed(Routed::Node(envelope, route)) => Turn {
             flow: default_flow,
             envelope,
             owns_conversation: false,
             route: Some(route),
-            unrouted: None,
+            fixed_reply: None,
+            on_miss: false,
+            cause: None,
         },
-        Ok(Routed::Flow(flow, envelope, route)) => Turn {
+        TurnPlan::Routed(Routed::Flow(flow, envelope, route)) => Turn {
             flow,
             envelope,
             owns_conversation: true,
             route: Some(route),
-            unrouted: None,
+            fixed_reply: None,
+            on_miss: false,
+            cause: None,
         },
-        Err(unrouted) => Turn {
-            flow: default_flow,
-            envelope: original.clone(),
-            owns_conversation: false,
-            route: None,
-            unrouted: Some(unrouted),
-        },
+        TurnPlan::DefaultFlow { on_miss } => unrouted(None, on_miss),
+        TurnPlan::FixedReply(reply) => unrouted(Some(reply), false),
     }
 }
 
@@ -405,9 +422,29 @@ fn routed(decision: RouteDecision, pack_info: &app::AppPackInfo) -> Result<Route
             flow_id,
             envelope,
             signal,
-        } => f2f_dispatch::messaging_flow(pack_info, &flow_id)
-            .map(|flow| Routed::Flow(flow, envelope, signal))
-            .ok_or(Unrouted::NoMatch),
+        } => match f2f_dispatch::messaging_flow(pack_info, &flow_id) {
+            Some(flow) => Ok(Routed::Flow(flow, envelope, signal)),
+            None => {
+                // Unreachable: the decision was made against this same pack
+                // with this same lookup. Loud in debug builds; in release the
+                // turn degrades to unrouted rather than running a flow nobody
+                // chose.
+                debug_assert!(
+                    false,
+                    "fast2flow flow decision {flow_id} does not resolve in pack {}",
+                    pack_info.pack_id
+                );
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "[fast2flow] flow decision {flow_id} does not resolve in pack {}; \
+                         treating the turn as unrouted",
+                        pack_info.pack_id
+                    ),
+                );
+                Err(Unrouted::NoMatch)
+            }
+        },
     }
 }
 

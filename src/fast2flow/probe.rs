@@ -37,12 +37,16 @@ pub(crate) struct ProbeInputs<'a> {
 }
 
 /// What a turn does, decided before any flow runs.
-// Consumed by the revision-serve ingress, wired in a follow-up change.
-#[cfg_attr(not(test), allow(dead_code))]
+///
+/// Generic over the route type so the legacy ingress, which maps a
+/// [`RouteDecision`] onto its own borrowed flow, shares the ONE miss policy
+/// ([`plan_from`]) with the revision-serve path.
+// One value per turn, moved once; boxing the reply buys nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum TurnPlan {
+pub(crate) enum TurnPlan<T = RouteDecision> {
     /// Fast2Flow or the LLM fallback routed the turn.
-    Routed(RouteDecision),
+    Routed(T),
     /// The default flow runs with the original message. `on_miss` is set when
     /// it runs because the pack opted into
     /// [`super::FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY`] on a routing miss.
@@ -78,10 +82,11 @@ pub(crate) fn probe(
     turn::probe_turn(host, || llm_fallback(i, envelope))
 }
 
-/// [`probe`] plus the miss policy ([`turn::miss_action`]).
+/// [`probe`] plus the miss policy ([`plan_from`]).
 ///
 /// A conversation owned by a flow is never routed: the probe is not run and
 /// the plan is the default flow (the caller resumes the owning flow).
+// Wired into the revision-serve ingress by the next change.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn plan_turn(
     i: &ProbeInputs<'_>,
@@ -91,13 +96,23 @@ pub(crate) fn plan_turn(
     if owns_conversation {
         return TurnPlan::DefaultFlow { on_miss: false };
     }
-    let unrouted = match probe(i, envelope) {
-        Ok(decision) => return TurnPlan::Routed(decision),
+    plan_from(&i.pack.capabilities, envelope, probe(i, envelope))
+}
+
+/// The miss policy ([`turn::miss_action`]) applied to a probe outcome: the
+/// single place an unrouted turn becomes the default flow or the fixed reply.
+pub(crate) fn plan_from<T>(
+    capabilities: &[String],
+    envelope: &ChannelMessageEnvelope,
+    outcome: Result<T, Unrouted>,
+) -> TurnPlan<T> {
+    let unrouted = match outcome {
+        Ok(route) => return TurnPlan::Routed(route),
         Err(unrouted) => unrouted,
     };
     match turn::miss_action(
         false,
-        &i.pack.capabilities,
+        capabilities,
         envelope.text.as_deref(),
         Some(&unrouted),
     ) {

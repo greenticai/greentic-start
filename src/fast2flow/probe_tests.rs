@@ -234,3 +234,82 @@ fn an_index_scope_override_reads_that_scope_only() {
         TurnPlan::FixedReply(_)
     ));
 }
+
+/// A pack zip shipping `assets/intent-index.json` with no candidates: reaching
+/// the index materializes it, and `try_llm_route` then abstains offline.
+fn pack_with_index(dir: &Path) -> PathBuf {
+    use std::io::Write as _;
+    let path = dir.join("app.gtpack");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).expect("pack"));
+    zip.start_file(
+        "assets/intent-index.json",
+        zip::write::FileOptions::<()>::default(),
+    )
+    .expect("entry");
+    zip.write_all(b"{\"entries\":[]}").expect("write");
+    zip.finish().expect("finish");
+    path
+}
+
+fn llm(fast2flow: bool) -> BundleLlmConfig {
+    BundleLlmConfig {
+        provider: "ollama".to_string(),
+        model: None,
+        api_key_secret: None,
+        base_url: Some("http://127.0.0.1:9".to_string()),
+        fast2flow,
+        fast2flow_llm_min_confidence: None,
+    }
+}
+
+/// The injected-LLM fallback is consulted only past its gates, in order:
+/// an `llm` instance, its `fast2flow` flag, the pack capability, non-blank
+/// text. Only then does it resolve (and so materialize) the scope index — the
+/// side effect this test observes. The host gate is closed (an empty
+/// `AnyGate`), so the host probe never materializes the index itself.
+#[test]
+fn the_llm_fallback_gates_run_in_order_before_the_index_is_read() {
+    let scope = "acme:llm-gates";
+    let reached = |llm_cfg: Option<BundleLlmConfig>, caps: &[&str], text: &str| {
+        let work = tempdir().expect("work");
+        let pack_path = pack_with_index(work.path());
+        let indexes = tempdir().expect("indexes");
+        let cfg = Fast2FlowConfig {
+            host_bin: PathBuf::from("/definitely/not/a/routing/host"),
+            registry_path: PathBuf::from("/tmp/registry"),
+            indexes_path: Some(indexes.path().to_path_buf()),
+            time_budget_ms: 500,
+            gate: Arc::new(crate::fast2flow::gate::AnyGate::new(Vec::new())),
+        };
+        let ctx = ctx();
+        let info = pack(caps);
+        let inputs = ProbeInputs {
+            cfg: &cfg,
+            ctx: &ctx,
+            pack: &info,
+            pack_path: &pack_path,
+            index_scope: Some(scope),
+            provider: "webchat",
+            llm: llm_cfg.as_ref(),
+        };
+        let plan = plan_turn(&inputs, &envelope(text), false);
+        let materialized = indexes.path().join(scope).join("index.json").is_file();
+        (materialized, plan)
+    };
+    let cap = [FAST2FLOW_CAPABILITY];
+
+    let (hit, _) = reached(None, &cap, "refund please");
+    assert!(!hit, "no llm instance: the fallback is not consulted");
+    let (hit, _) = reached(Some(llm(false)), &cap, "refund please");
+    assert!(!hit, "fast2flow: false reserves the llm for other uses");
+    let (hit, plan) = reached(Some(llm(true)), &[], "refund please");
+    assert!(!hit, "a pack without the capability never asks the llm");
+    assert_eq!(plan, TurnPlan::DefaultFlow { on_miss: false });
+    let (hit, _) = reached(Some(llm(true)), &cap, "   ");
+    assert!(!hit, "blank text is not routed");
+    let (hit, plan) = reached(Some(llm(true)), &cap, "refund please");
+    assert!(hit, "every gate passed: the fallback reads the scope index");
+    // The llm abstained (no candidates); the host's cause stands, so the
+    // miss policy applies exactly as for a host miss.
+    assert!(matches!(plan, TurnPlan::FixedReply(_)), "{plan:?}");
+}
