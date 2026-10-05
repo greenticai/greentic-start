@@ -114,17 +114,36 @@ pub(crate) fn plan_turn(
         && let Err(cause @ (Unrouted::RouterFailed(_) | Unrouted::RouterNotConfigured(_))) =
             &outcome
     {
-        crate::operator_log::warn(
-            module_path!(),
-            format!(
-                "[fast2flow] {} — running the default flow (fail open) pack={}",
-                cause.describe(),
-                i.pack.pack_id
-            ),
+        let scope = super::effective_scope(i.ctx, i.index_scope);
+        let line = format!(
+            "[fast2flow] {} — running the default flow (fail open) pack={}",
+            cause.describe(),
+            i.pack.pack_id
         );
+        if first_fail_open(&FAIL_OPEN_LOGGED, &scope, cause) {
+            crate::operator_log::warn(
+                module_path!(),
+                format!("{line} (reported once per scope and cause)"),
+            );
+        } else {
+            crate::operator_log::debug(module_path!(), line);
+        }
         return TurnPlan::DefaultFlow { on_miss: false };
     }
     plan_from(&i.pack.capabilities, envelope, outcome)
+}
+
+/// (scope, cause) pairs already warned about by [`plan_turn`]'s fail-open.
+static FAIL_OPEN_LOGGED: std::sync::LazyLock<super::index_refresh::WarnOnce<(String, String)>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// `true` the first time this scope fails open for this cause.
+fn first_fail_open(
+    seen: &super::index_refresh::WarnOnce<(String, String)>,
+    scope: &str,
+    cause: &Unrouted,
+) -> bool {
+    seen.first((scope.to_string(), cause.describe()))
 }
 
 /// The miss policy ([`turn::miss_action`]) applied to a probe outcome: the

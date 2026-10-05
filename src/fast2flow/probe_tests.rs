@@ -341,3 +341,16 @@ fn a_failed_router_is_a_miss_unless_the_caller_fails_open() {
         TurnPlan::DefaultFlow { on_miss: false }
     );
 }
+
+/// A router that is down fails every turn the same way: the fail-open warn is
+/// logged once per (scope, cause), not on every message.
+#[test]
+fn a_fail_open_cause_is_warned_once_per_scope() {
+    let seen = crate::fast2flow::index_refresh::WarnOnce::default();
+    let failed = Unrouted::RouterFailed("host timed out after 1000 ms".to_string());
+    let not_configured = Unrouted::RouterNotConfigured("no_index".to_string());
+    assert!(first_fail_open(&seen, "acme:default", &failed));
+    assert!(!first_fail_open(&seen, "acme:default", &failed));
+    assert!(first_fail_open(&seen, "acme:default", &not_configured));
+    assert!(first_fail_open(&seen, "acme:other", &failed));
+}

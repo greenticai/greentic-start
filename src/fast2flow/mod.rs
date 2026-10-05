@@ -238,19 +238,26 @@ pub fn route_request_in_scope(
     let out = match invoke_routing_host_detailed(&cfg.host_bin, &input) {
         Ok(out) => out,
         Err(reason) => {
-            operator_log::warn(
-                module_path!(),
-                format!(
-                    "[fast2flow] routing host failed tenant={} pack={} reason={reason}",
-                    ctx.tenant, pack.pack_id
-                ),
+            let line = format!(
+                "[fast2flow] routing host failed tenant={} pack={} reason={reason}",
+                ctx.tenant, pack.pack_id
             );
-            tracing::warn!(
-                target: "greentic.fast2flow",
-                tenant = %ctx.tenant,
-                reason = %reason,
-                "fast2flow routing host failed"
-            );
+            // A host that is down fails every turn alike: warn once per
+            // (scope, reason), debug after that.
+            if HOST_FAILURES_LOGGED.first((input.scope.clone(), reason.clone())) {
+                operator_log::warn(
+                    module_path!(),
+                    format!("{line} (reported once per scope and reason)"),
+                );
+                tracing::warn!(
+                    target: "greentic.fast2flow",
+                    tenant = %ctx.tenant,
+                    reason = %reason,
+                    "fast2flow routing host failed"
+                );
+            } else {
+                operator_log::debug(module_path!(), line);
+            }
             return RoutingOutcome::Failed(reason);
         }
     };
@@ -290,6 +297,10 @@ pub fn route_request_in_scope(
         actionable => RoutingOutcome::Directive(actionable),
     }
 }
+
+/// (scope, reason) pairs already warned about as a failed routing host.
+static HOST_FAILURES_LOGGED: std::sync::LazyLock<index_refresh::WarnOnce<(String, String)>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Human-readable operator.log line for a fast2flow dispatch decision. Kept as a
 /// pure helper so the exact wire format (which downstream log scrapers / e2e
