@@ -151,7 +151,7 @@ fn sync_index_with(pack_path: &Path, target_index: &Path, refresh_unmarked: bool
                 unmarked_origin(installed, &pack_index, &scope_dir)
             });
         if origin == UnmarkedOrigin::OlderStartCopy {
-            if UNMARKED.first(target_index.to_path_buf()) {
+            if ADOPTED.first(target_index.to_path_buf()) {
                 crate::operator_log::info(
                     module_path!(),
                     format!(
@@ -220,6 +220,10 @@ fn report_write_failure(target_index: &Path, err: &std::io::Error) -> bool {
 
 /// Process-wide "already reported" set for kept unmarked indexes.
 static UNMARKED: LazyLock<WarnOnce<PathBuf>> = LazyLock::new(WarnOnce::default);
+
+/// Process-wide "already reported" set for adopted older-start copies. Separate
+/// from [`UNMARKED`] so reporting one never suppresses the other.
+static ADOPTED: LazyLock<WarnOnce<PathBuf>> = LazyLock::new(WarnOnce::default);
 
 /// Process-wide "already reported" set for failed index writes.
 static WRITE_FAILURES: LazyLock<WarnOnce<(PathBuf, std::io::ErrorKind)>> =
@@ -320,8 +324,12 @@ mod tests;
 /// An older greentic-start (before the marker) copied the pack's
 /// `assets/intent-index.json` verbatim, so that copy records the scope the
 /// pack AUTHOR wrote — the same string the current pack's index records — and
-/// not the directory (a revision scope, `<tenant>:<team>--<hex>`, is never an
-/// author's choice).
+/// not the directory.
+///
+/// Old copies exist only under legacy `<tenant>:<team>` directories (the
+/// `--bundle` path); revision scopes are fresh per revision and never carry
+/// one. `generated_at_ms == 0` is NOT a signal: the indexer CLI's
+/// `index build --now-unix-ms` defaults to 0, so indexer output carries it too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnmarkedOrigin {
     /// Records the pack's scope and not its directory's: a copy of (an older

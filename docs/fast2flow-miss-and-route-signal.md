@@ -22,9 +22,12 @@ revision-serve one (`src/revision_serve/fast2flow_hook.rs`, used without
   `X-Greentic-Flow` header a conversation was opened with and copies it into
   `flow_hint` on every activity of that conversation; a conversation opened
   against the default flow would otherwise never be routed. Mechanism:
-  `fast2flow_hook::is_default_target` / `demote_default_target`. A
-  conversation parked in any flow still resumes it (next bullet), because the
-  parked-flow check runs before the probe.
+  `fast2flow_hook::is_default_target` / `demote_default_target`. Since such a
+  turn is treated like no target, a conversation opened on the default flow
+  can now get the on-miss fixed reply (see below) instead of the default flow
+  for free text that routes nowhere — intended. A conversation parked in a
+  flow resumes it (next bullet), because the parked-flow check runs before
+  the probe; an explicit hint naming a non-default flow still wins over both.
 * A conversation parked in a flow resumes that flow and is not probed. On this
   path the runner keys a parked snapshot by the flow the turn was pinned to,
   so the hook checks each messaging flow of the app pack in the revision's

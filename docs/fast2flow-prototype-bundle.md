@@ -29,11 +29,19 @@ Status: **shipped**. The opt-in surface described below now lives on `main`:
     as operator/deployer-placed, warned once per scope. So is anything whose
     origin cannot be read (no `scope`, unparseable, or a scope that is
     neither);
+  - old copies exist only under the legacy `<tenant>:<team>` directories of
+    the `--bundle` path. Revision-serve scopes (`<tenant>:<team>--<hex>`) are
+    fresh per revision and never carry one;
   - one case cannot be told apart: a pack whose index records exactly the
     scope directory it is installed under (e.g. a pack index with
-    `"scope": "demo:default"` on the legacy `demo:default` scope). It is
-    kept; delete the installed index once, or use the override below.
-    Revision-serve scopes (`<tenant>:<team>--<hex>`) never hit this case;
+    `"scope": "demo:default"` served as tenant `demo`, team `default`). An
+    indexer run for that scope looks the same, whatever its
+    `generated_at_ms` says (the indexer CLI's `index build --now-unix-ms`
+    defaults to 0, so a zero timestamp proves nothing). It is kept; delete
+    the installed index once, or set the override below;
+  - a pack author who changed the index's `scope` string between versions
+    leaves the old copy unrecognisable: it is classified unknown and kept
+    (same remedy);
   - `GREENTIC_FAST2FLOW_INDEX_REFRESH_UNMARKED=1` (`1`/`true`/`yes`/`on`;
     anything else or unset = off) is an override that lets the pack adopt
     and replace ANY unmarked differing index, including a deployer's.
