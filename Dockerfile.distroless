@@ -1,13 +1,17 @@
 # syntax=docker/dockerfile:1.7
 
-# Optional Fast2Flow routing host (OFF by default). Empty = the image is built
-# exactly as before: the final stage is `runtime` and the fetch stage below is
-# never run. Setting it selects `runtime-fast2flow-routing-host` instead (see
-# the final FROM at the bottom). The routing host is a COMMERCIAL binary from
-# the PRIVATE greentic-biz/greentic-fast2flow releases: baking it into an image
-# is a licensing decision, and an anonymous fetch from that repo is a 404.
+# Fast2Flow routing host (ON by default). The image ships the static musl
+# `greentic-fast2flow-routing-host` from the public greenticai/greentic-fast2flow
+# releases at /usr/local/bin, where greentic-start's bare-name lookup finds it.
+# The binary is COMMERCIAL software (license: Commercial): the image carries it,
+# a pack only uses it when it declares `greentic.cap.fast2flow.v1`.
+# To build the image WITHOUT it, pass an empty version:
+#   --build-arg FAST2FLOW_ROUTING_HOST_VERSION=
+# The final stage is then `runtime` and the fetch stage below is never run, so
+# the image is the one built before this stage existed.
+# Bump the version and BOTH sha256 ARGs (in the fetch stage) together.
 # See docs/fast2flow-routing-host-image.md.
-ARG FAST2FLOW_ROUTING_HOST_VERSION=
+ARG FAST2FLOW_ROUTING_HOST_VERSION=1.1.2
 
 FROM rust:1.95-bookworm AS build
 
@@ -63,18 +67,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 
 # Fast2Flow routing host — static musl build from a greentic-fast2flow release
 # (asset `greentic-fast2flow-routing-host-v<ver>-<arch>-unknown-linux-musl.tar.gz`).
-# Only built when FAST2FLOW_ROUTING_HOST_VERSION is set. The digest is the one
+# Skipped when FAST2FLOW_ROUTING_HOST_VERSION is empty. The digest is the one
 # pinned HERE, per arch, and checked with `sha256sum -c`; the release's own
-# `.sha256` sidecar is never trusted at build time. No credential is baked in:
-# the release repo is private, so a real build needs either a BASE_URL that
-# serves the asset (an internal mirror) or a BuildKit secret mount added to
-# this RUN — deliberately not added here.
+# `.sha256` sidecar is never trusted at build time. The release repo is public,
+# so the fetch is anonymous and no credential is involved.
 FROM debian:bookworm-slim AS fast2flow-routing-host
 ARG TARGETARCH
 ARG FAST2FLOW_ROUTING_HOST_VERSION
-ARG FAST2FLOW_ROUTING_HOST_SHA256_AMD64=
-ARG FAST2FLOW_ROUTING_HOST_SHA256_ARM64=
-ARG FAST2FLOW_ROUTING_HOST_BASE_URL=https://github.com/greentic-biz/greentic-fast2flow/releases/download
+ARG FAST2FLOW_ROUTING_HOST_SHA256_AMD64=98e6fd06fbf809e338e6512598fa491295afab5308b05a7d8509e26b939af5c7
+ARG FAST2FLOW_ROUTING_HOST_SHA256_ARM64=82e40b6afecfd214aa919d8469d0f4b27bb3d3815504322ee3dd3dce5024686e
+ARG FAST2FLOW_ROUTING_HOST_BASE_URL=https://github.com/greenticai/greentic-fast2flow/releases/download
 RUN set -eu \
     && [ -n "${FAST2FLOW_ROUTING_HOST_VERSION}" ] \
        || { echo "FAST2FLOW_ROUTING_HOST_VERSION is empty" >&2; exit 1; } \
@@ -106,12 +108,17 @@ COPY --from=cloudflared /cloudflared /usr/local/bin/cloudflared
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/greentic-start"]
 
-# /usr/local/bin is on the image PATH, so greentic-start finds the host by its
-# bare default name; GREENTIC_FAST2FLOW_HOST_BIN still overrides it.
+# /usr/local/bin is on the base image's PATH (distroless static-debian12 sets
+# PATH=/usr/local/sbin:/usr/local/bin:...), so greentic-start's bare-name
+# lookup would find the host anyway. The absolute path is set as well so the
+# lookup does not depend on a PATH an orchestrator may replace; an operator's
+# own GREENTIC_FAST2FLOW_HOST_BIN still overrides it.
 FROM runtime AS runtime-fast2flow-routing-host
 COPY --from=fast2flow-routing-host /greentic-fast2flow-routing-host /usr/local/bin/greentic-fast2flow-routing-host
+ENV GREENTIC_FAST2FLOW_HOST_BIN=/usr/local/bin/greentic-fast2flow-routing-host
 
-# Final image: `runtime` unless FAST2FLOW_ROUTING_HOST_VERSION is non-empty.
-# BuildKit builds only the stages the selected one depends on, so with the
-# default the fetch stage never runs and the image is today's.
+# Final image: `runtime-fast2flow-routing-host` by default; plain `runtime`
+# when FAST2FLOW_ROUTING_HOST_VERSION is empty. BuildKit builds only the stages
+# the selected one depends on, so with an empty version the fetch stage never
+# runs.
 FROM runtime${FAST2FLOW_ROUTING_HOST_VERSION:+-fast2flow-routing-host}
