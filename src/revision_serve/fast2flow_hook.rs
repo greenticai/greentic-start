@@ -284,16 +284,33 @@ pub(super) async fn plan_for_app(
             fixed_reply: None,
         },
         TurnPlan::Routed(RouteDecision::Node { envelope, signal }) => {
-            let target = fallback.or_else(|| default_flow.clone());
-            let flow_id = target
-                .as_ref()
-                .map(|t| t.flow_id.clone())
-                .unwrap_or_default();
-            RevisionTurn {
-                target,
-                envelope,
-                signal: Some((signal, flow_id)),
-                fixed_reply: None,
+            match fallback.or_else(|| default_flow.clone()) {
+                Some(target) => {
+                    let flow_id = target.flow_id.clone();
+                    RevisionTurn {
+                        target: Some(target),
+                        envelope,
+                        signal: Some((signal, flow_id)),
+                        fixed_reply: None,
+                    }
+                }
+                // No flow the node could run in: the runner resolves the
+                // flow itself, and an empty flow id must not be stamped.
+                None => {
+                    operator_log::info(
+                        module_path!(),
+                        format!(
+                            "[fast2flow] node route with no resolvable default flow in pack={}; no route signal",
+                            app.pack_id
+                        ),
+                    );
+                    RevisionTurn {
+                        target: None,
+                        envelope,
+                        signal: None,
+                        fixed_reply: None,
+                    }
+                }
             }
         }
         TurnPlan::DefaultFlow { on_miss } => {

@@ -742,3 +742,36 @@ async fn a_genuine_no_match_keeps_the_fixed_reply() {
         Some(MISS_REPLY_TEXT)
     );
 }
+
+// --- minor (b): a node route with no default flow is not stamped ------------
+
+#[tokio::test]
+async fn a_node_route_with_no_resolvable_default_flow_stamps_nothing() {
+    let fx = Fixture::new(
+        r#"{"type":"dispatch","target":"sales-crm/alpha/deal_card","confidence":0.8,"reason":"m"}"#,
+    );
+    // Two messaging flows, neither `default` nor `main`: no default resolves,
+    // and a generic (non-webchat) route has no fallback target.
+    let app = Arc::new(RevisionAppPack {
+        pack_id: PACK.to_string(),
+        pack_path: PathBuf::from("/nonexistent.gtpack"),
+        info: AppPackInfo {
+            pack_id: PACK.to_string(),
+            flows: vec![flow("alpha"), flow("beta")],
+            capabilities: vec![FAST2FLOW_CAPABILITY.to_string()],
+        },
+        revision_id: fx.revision_id,
+    });
+    let turn = plan_for_app(fx.cfg(), app, None, &fx.scope(), &envelope("deal"), None).await;
+    assert!(fx.host.invoked());
+    assert!(turn.target.is_none());
+    assert!(turn.signal.is_none(), "an empty flow id is never stamped");
+    assert!(turn.fixed_reply.is_none());
+    assert_eq!(
+        turn.envelope
+            .metadata
+            .get("routeToCardId")
+            .map(String::as_str),
+        Some("deal_card")
+    );
+}
