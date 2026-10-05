@@ -62,6 +62,7 @@ fn agent_config() -> AgentConfig {
         }),
         conversational: false,
         opening_message: None,
+        on_text_while_parked: Default::default(),
     }
 }
 
