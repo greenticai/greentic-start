@@ -110,6 +110,7 @@ mod secret_requirements;
 mod secret_value;
 mod secrets_backend;
 mod secrets_client;
+mod secrets_door;
 mod secrets_gate;
 mod secrets_manager;
 mod secrets_provider_binding;

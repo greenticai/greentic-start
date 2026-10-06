@@ -345,6 +345,24 @@ pub(crate) async fn activate_runtime_config(
         }
     }
 
+    // Units whose staged ingress document sets `secrets_door` keep their
+    // credentials in the admin: pull them into the dev store this host reads
+    // BEFORE anything can ask for one. A flagged unit that cannot be served
+    // fails the activation (cold start and reload alike); an unflagged one
+    // costs nothing.
+    crate::secrets_door::hydrate_for_activation(
+        secrets.as_ref(),
+        &crate::resolve_env(None),
+        rc.revisions.iter().filter_map(|block| {
+            deployments
+                .get(block.deployment_id.as_str())
+                .map(|meta| (meta.tenant.as_str(), meta.bundle_id.as_str()))
+        }),
+        &crate::secrets_door::DoorPolicy::default(),
+    )
+    .await
+    .context("hydrating deployed secrets from the admin secrets door")?;
+
     // One minimal HostConfig per tenant. Flow-type bindings (routing) are not
     // needed to load + key packs into ActivePacks — they get enriched when the
     // ingress consumer lands (B3). The secrets backend is supplied by the caller
@@ -2039,6 +2057,67 @@ mod tests {
         assert!(
             chain.contains("no pinned packs"),
             "expected to reach pack reading (host built with provided secrets), got: {chain}"
+        );
+    }
+
+    #[test]
+    fn activate_fails_when_a_flagged_unit_cannot_reach_its_secrets_door() {
+        // A unit whose staged ingress document sets `secrets_door` keeps its
+        // credentials in the admin. With the door unreachable, activation must
+        // fail BEFORE any pack is read, naming the door — not run keyless.
+        let dir = tempdir().unwrap();
+        seed_env_dir(dir.path());
+        let dep_id = DeploymentId::new();
+        let env = make_env(vec![make_deployment(
+            dep_id,
+            "acme",
+            "cust",
+            "fast2flow",
+            BundleDeploymentStatus::Active,
+        )]);
+        let rc = single_revision_rc(&dep_id);
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let doc = serde_json::json!({
+            "v": 1,
+            "tenant_slug": "acme",
+            "secrets_door": true,
+            "metering": {
+                "endpoint": format!("http://127.0.0.1:{port}/api/v1/ingest/worker-usage"),
+                "token": "gtm_activation-test",
+            },
+        });
+        let uri =
+            crate::ingress_auth::ingress_secret_uri(&crate::resolve_env(None), "acme", "fast2flow");
+        let secrets: DynSecretsManager = Arc::new(crate::test_fixtures::FakeSecrets(
+            std::collections::HashMap::from([(uri, doc.to_string().into_bytes())]),
+        ));
+
+        let err = match block_on(activate_runtime_config(
+            dir.path(),
+            &rc,
+            secrets,
+            None,
+            &env,
+            dummy_resolver(),
+            dummy_pin_store(),
+            &new_revision_stores(),
+            &DurableStorage::in_memory(),
+        )) {
+            Ok(_) => panic!("expected activation to fail at the secrets door"),
+            Err(e) => e,
+        };
+        let chain = format!("{err:#}");
+        assert!(chain.contains("secrets door"), "got: {chain}");
+        assert!(
+            !chain.contains("gtm_activation-test"),
+            "token leaked: {chain}"
+        );
+        assert!(
+            !chain.contains("no pinned packs"),
+            "must fail before pack reading: {chain}"
         );
     }
 

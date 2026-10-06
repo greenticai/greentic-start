@@ -89,6 +89,32 @@ before a user hits a silent "missing secret." Changing the scheme requires a new
 plan verified on **both binaries** (setup + start), **both backends** (local
 dev-store + cloud vault), and public.
 
+## Secrets hydrated from the admin (`secrets_door`)
+
+A unit whose staged ingress document (`secrets://<env>/<tenant>/_/ingress/<bundle>`)
+carries `"secrets_door": true` keeps its credentials in the admin rather than in
+the shipped dev store (Cloud Run caps that store at 64 KiB). At revision
+activation, after the document is read, start calls the admin door once and
+writes the answer into the dev store it already serves from:
+
+- `POST <metering.endpoint with worker-usage → secrets>/read-all`, bearer = the
+  unit's metering token, body `{}`, optional `If-None-Match`.
+- `200 {"secrets":[{"path":"<team>/<category>/<name>","value","encoding":"utf8|base64"}],"etag"}`;
+  each entry lands at `secrets://default/<tenant>/<path>` — env pinned to
+  `default`, path verbatim, i.e. the address `read_secret_for_unit` walks.
+- A flagged unit **fails closed**: an unreachable, unauthorised (401/403) or
+  absent (404) door, or a flag with no usable `metering` block, fails the
+  activation (cold start and reload) after 4 attempts with 0.5 s doubling
+  backoff. Absent or `false` flag: no call, no change.
+- Values are never logged or put in an error; a malformed entry writes nothing.
+- A rotation takes effect on the next activation; a `304` on a reload skips the
+  write. Entries removed in the admin are not deleted from the running store.
+
+Code: `src/secrets_door.rs`. A start predating the field ignores it (the
+ingress parser does not reject unknown fields), so the designer must not stop
+writing a unit's secrets to the store until the unit's runtime is known to
+hydrate.
+
 ## Diagnosing a "missing secret"
 
 1. Grep the runtime log for `WASM secrets read` — the requested URI, each
