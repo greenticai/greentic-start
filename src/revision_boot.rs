@@ -388,6 +388,7 @@ pub(crate) async fn activate_runtime_config(
     // propagate to the caller the same way `discover_from_bundle` does on the
     // bundle path.
     let mut static_plan = StaticRoutePlan::default();
+    let mut setup_surfaces = crate::setup_surface::SetupSurfaceTable::default();
     let reserved_routes = ReservedRouteSet::operator_defaults();
 
     // Webchat flow index (bundle_id -> flow ids, deduped per bundle) and the
@@ -482,6 +483,10 @@ pub(crate) async fn activate_runtime_config(
             &pack_paths,
             &scope,
             &reserved_routes,
+        ));
+        setup_surfaces.extend(crate::setup_surface::discover_revision_setup_surfaces(
+            &pack_paths,
+            &scope,
         ));
 
         // Webchat flow index (deduped per bundle) and the Fast2Flow
@@ -662,7 +667,8 @@ pub(crate) async fn activate_runtime_config(
         deployment_routes,
         endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),
         deployment_config_overrides: Arc::new(deployment_config_overrides_from_environment(env)),
-        static_routes: ActiveRouteTable::from_plan(&static_plan),
+        static_routes: ActiveRouteTable::from_plan(&static_plan)
+            .with_setup_surfaces(setup_surfaces),
         bundle_index,
         flow_index: pack_indexing.flow_index,
         app_packs: pack_indexing.app_packs,

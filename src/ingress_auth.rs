@@ -244,6 +244,49 @@ pub(crate) fn decide_generic(
     }
 }
 
+/// The HTTP answer for a refusing [`GenericGate`] verdict, or `None` for
+/// `Allow`. One place builds it so every surface the D7 gate protects (the
+/// generic JSON ingress, the provider setup surface, on both the revision and
+/// the legacy listener) answers identically: `401` + `WWW-Authenticate:
+/// Bearer`, or `503` when the credential store could not answer.
+pub(crate) fn refusal(
+    gate: &GenericGate,
+    config: &Result<Option<InteropConfig>, ConfigUnavailable>,
+    bundle_id: &str,
+) -> Option<hyper::Response<http_body_util::Full<hyper::body::Bytes>>> {
+    use crate::http_helpers::error_response;
+    use hyper::{StatusCode, header};
+    match gate {
+        GenericGate::Allow => None,
+        GenericGate::Unauthorized => {
+            let mut response = error_response(
+                StatusCode::UNAUTHORIZED,
+                "a bearer credential is required for this ingress",
+            );
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Bearer"),
+            );
+            Some(response)
+        }
+        GenericGate::Unavailable => {
+            if let Err(ConfigUnavailable(message)) = config {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "generic ingress credential for unit `{bundle_id}` could not be read: \
+                         {message}"
+                    ),
+                );
+            }
+            Some(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the ingress credential store is unavailable",
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

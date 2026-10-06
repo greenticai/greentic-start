@@ -1690,6 +1690,32 @@ async fn serve(
         revision_id: outcome.revision_id,
     };
 
+    // Provider setup surface (`greentic.setup.web-component.v1`): the wizard
+    // page AND its API. Nothing here is signed by a platform, and the API can
+    // start a real action (a device-code login), so a non-loopback caller
+    // needs the unit's bearer — the same gate, credential and fail-closed
+    // rules as the generic JSON ingress. Checked BEFORE the static route and
+    // the provider-route arm so both are covered; webhook ingress paths are
+    // never declared by a setup descriptor and are untouched.
+    let is_setup_surface = activation
+        .routing
+        .static_routes
+        .setup_surfaces()
+        .match_request(&effective_path, Some(&scope))
+        .is_some();
+    if is_setup_surface {
+        gate_generic_ingress(
+            &state,
+            &activation,
+            &tenant,
+            scope.bundle_id.as_str(),
+            peer_is_loopback,
+            authorization_header.as_deref(),
+        )
+        .await
+        .map_err(crate::setup_surface::harden_response)?;
+    }
+
     // A3: revision-scoped static routes. Checked AFTER reserved operator
     // paths (probes, /chat, /workers/invoke, /v1/updates/notify) which all
     // short-circuited above, and AFTER deployment-route resolution, but
@@ -1720,6 +1746,11 @@ async fn serve(
                 crate::static_handler::serve_static_route_from_pack(&route_match, &effective_path)
             }
         };
+        let response = if is_setup_surface {
+            crate::setup_surface::harden_response(response)
+        } else {
+            response
+        };
         return Ok(with_cors(response));
     }
 
@@ -1737,7 +1768,7 @@ async fn serve(
         &method,
     ) {
         Admission::ProviderRoute => {
-            return dispatch_provider_route(
+            let outcome = dispatch_provider_route(
                 Arc::clone(&activation),
                 Arc::clone(&state),
                 &tenant,
@@ -1755,6 +1786,14 @@ async fn serve(
                 flow_header.as_deref(),
             )
             .await;
+            return if is_setup_surface {
+                match outcome {
+                    Ok(response) => Ok(crate::setup_surface::harden_response(response)),
+                    Err(response) => Err(crate::setup_surface::harden_response(response)),
+                }
+            } else {
+                outcome
+            };
         }
         Admission::MethodNotAllowed => {
             return Err(error_response(
@@ -2463,40 +2502,16 @@ async fn gate_generic_ingress(
         return Ok(());
     }
     let config = load_unit_config_cached(state, activation, tenant, bundle_id).await;
-    match crate::ingress_auth::decide_generic(
+    let gate = crate::ingress_auth::decide_generic(
         peer_is_loopback,
         gate_enabled,
         &config,
         authorization,
         crate::ingress_auth::now_ms(),
-    ) {
-        crate::ingress_auth::GenericGate::Allow => Ok(()),
-        crate::ingress_auth::GenericGate::Unauthorized => {
-            let mut response = error_response(
-                StatusCode::UNAUTHORIZED,
-                "a bearer credential is required for this ingress",
-            );
-            response.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                header::HeaderValue::from_static("Bearer"),
-            );
-            Err(response)
-        }
-        crate::ingress_auth::GenericGate::Unavailable => {
-            if let Err(crate::ingress_auth::ConfigUnavailable(message)) = &config {
-                operator_log::warn(
-                    module_path!(),
-                    format!(
-                        "generic ingress credential for unit `{bundle_id}` could not be read: \
-                         {message}"
-                    ),
-                );
-            }
-            Err(error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the ingress credential store is unavailable",
-            ))
-        }
+    );
+    match crate::ingress_auth::refusal(&gate, &config, bundle_id) {
+        None => Ok(()),
+        Some(response) => Err(response),
     }
 }
 

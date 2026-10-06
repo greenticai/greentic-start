@@ -149,6 +149,10 @@ pub struct StaticRouteMatch<'a> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ActiveRouteTable {
     routes: Vec<StaticRouteDescriptor>,
+    /// Provider setup surfaces (`greentic.setup.web-component.v1`) of the same
+    /// packs. Rides on this table so it travels with the static routes through
+    /// activation and routing-only reloads.
+    setup_surfaces: crate::setup_surface::SetupSurfaceTable,
 }
 
 impl ActiveRouteTable {
@@ -160,7 +164,23 @@ impl ActiveRouteTable {
                 .cmp(&a.route_segments.len())
                 .then_with(|| a.public_path.cmp(&b.public_path))
         });
-        Self { routes }
+        Self {
+            routes,
+            setup_surfaces: Default::default(),
+        }
+    }
+
+    /// Attach the setup surfaces discovered beside the static routes.
+    pub fn with_setup_surfaces(
+        mut self,
+        surfaces: crate::setup_surface::SetupSurfaceTable,
+    ) -> Self {
+        self.setup_surfaces = surfaces;
+        self
+    }
+
+    pub(crate) fn setup_surfaces(&self) -> &crate::setup_surface::SetupSurfaceTable {
+        &self.setup_surfaces
     }
 
     pub fn routes(&self) -> &[StaticRouteDescriptor] {
@@ -381,7 +401,7 @@ pub fn discover_revision_static_routes(
 
 /// Open one `.gtpack`, read `manifest.cbor`, and decode it. Single IO+decode
 /// site so a pack is opened at most once per discovery pass.
-fn read_pack_manifest(pack_path: &Path) -> anyhow::Result<PackManifest> {
+pub(crate) fn read_pack_manifest(pack_path: &Path) -> anyhow::Result<PackManifest> {
     let file = std::fs::File::open(pack_path)?;
     let mut archive = ZipArchive::new(file)?;
     let mut manifest_entry = archive.by_name("manifest.cbor").map_err(|err| {
@@ -475,7 +495,7 @@ pub fn cache_control_value(strategy: &CacheStrategy) -> Option<String> {
     }
 }
 
-fn collect_runtime_pack_paths(bundle_root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+pub(crate) fn collect_runtime_pack_paths(bundle_root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut by_path = BTreeMap::new();
     let discover = if bundle_root.join("greentic.demo.yaml").exists() {
         domains::discover_provider_packs_cbor_only
