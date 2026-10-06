@@ -4,6 +4,7 @@ mod directline_session;
 mod flow_owner;
 mod helpers;
 mod messaging;
+mod setup_gate;
 pub(crate) use messaging::decode_injected_config_for_provider;
 pub mod websocket;
 
@@ -109,7 +110,9 @@ impl HttpIngressServer {
             for warning in &static_route_plan.warnings {
                 operator_log::warn(module_path!(), format!("static route warning: {warning}"));
             }
-            let table = ActiveRouteTable::from_plan(&static_route_plan);
+            let table = ActiveRouteTable::from_plan(&static_route_plan).with_setup_surfaces(
+                crate::setup_surface::discover_bundle_setup_surfaces(runner_host.bundle_root()),
+            );
             if !table.is_empty() {
                 operator_log::info(
                     module_path!(),
@@ -305,10 +308,12 @@ impl HttpIngressServer {
                         tokio::select! {
                             _ = &mut shutdown => break,
                             accept = listener.accept() => match accept {
-                                Ok((stream, _peer)) => {
+                                Ok((stream, peer)) => {
                                     let connection_state = state.clone();
                                     tokio::spawn(async move {
-                                        let service = service_fn(move |req| {
+                                        let service = service_fn(move |mut req| {
+                                            req.extensions_mut()
+                                                .insert(setup_gate::PeerAddr(peer));
                                             handle_request(req, connection_state.clone())
                                         });
                                         let http = Http1Builder::new();
@@ -452,6 +457,32 @@ where
 }
 
 async fn handle_request_inner<B>(
+    req: Request<B>,
+    state: Arc<HttpIngressState>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    // Provider setup surface: D7 bearer gate for non-loopback peers (see
+    // `setup_gate`), and anti-framing headers on whatever answers. A CORS
+    // preflight carries no credentials and is left to the router.
+    if req.method() != Method::OPTIONS {
+        let path = req.uri().path().to_string();
+        let is_setup_surface = setup_gate::gate(&req, &path, &state)
+            .await
+            .map_err(crate::setup_surface::harden_response)?;
+        if is_setup_surface {
+            return match route_request(req, state).await {
+                Ok(response) => Ok(crate::setup_surface::harden_response(response)),
+                Err(response) => Err(crate::setup_surface::harden_response(response)),
+            };
+        }
+    }
+    route_request(req, state).await
+}
+
+async fn route_request<B>(
     req: Request<B>,
     state: Arc<HttpIngressState>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>>
@@ -3020,6 +3051,147 @@ mod tests {
         let body =
             runtime.block_on(async { response.into_body().collect().await.unwrap().to_bytes() });
         assert!(String::from_utf8_lossy(&body).contains("<html>ok</html>"));
+    }
+
+    /// Legacy `--bundle` listener: a provider setup surface needs the D7
+    /// bearer from a non-loopback peer, and answers with anti-framing headers.
+    #[test]
+    fn legacy_setup_surface_is_gated_for_non_loopback_peers() {
+        use sha2::{Digest, Sha256};
+        let runtime = Runtime::new().unwrap();
+        let dir = tempdir().unwrap();
+        let discovery = crate::discovery::discover(dir.path()).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(
+                dir.path().to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+            )
+            .unwrap(),
+        );
+        std::fs::create_dir_all(dir.path().join("site")).unwrap();
+        std::fs::write(
+            dir.path().join("site").join("index.html"),
+            "<html>wiz</html>",
+        )
+        .unwrap();
+        let route = StaticRouteDescriptor {
+            route_id: "wiz".to_string(),
+            pack_id: "wiz".to_string(),
+            pack_path: dir.path().to_path_buf(),
+            public_path: "/wiz".to_string(),
+            source_root: "site".to_string(),
+            index_file: Some("index.html".to_string()),
+            spa_fallback: Some("index.html".to_string()),
+            tenant_scoped: false,
+            team_scoped: false,
+            cache_strategy: CacheStrategy::None,
+            route_segments: vec![RouteScopeSegment::Literal("wiz".to_string())],
+            scope: None,
+        };
+        // The unit credential, staged where the revision listener reads it.
+        let bundle = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let uri =
+            crate::ingress_auth::ingress_secret_uri(&crate::resolve_env(None), "default", &bundle);
+        let digest: String = Sha256::digest(b"tok")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let doc = serde_json::json!({
+            "v": 1, "a2a": false, "mcp": false, "tenant_slug": "t",
+            "credentials": [{"id": "c1", "sha256": digest}],
+        });
+        runtime
+            .block_on(
+                runner_host
+                    .secrets_manager()
+                    .write(&uri, doc.to_string().as_bytes()),
+            )
+            .unwrap();
+        let notifier = runtime
+            .block_on(crate::notifier::build_notifier(
+                crate::notifier::NotifierConfig::default(),
+            ))
+            .expect("build notifier");
+        let state = Arc::new(HttpIngressState {
+            runner_host,
+            domains: vec![],
+            active_route_table: ActiveRouteTable::from_plan(&StaticRoutePlan {
+                routes: vec![route],
+                warnings: vec![],
+                blocking_failures: vec![],
+            })
+            .with_setup_surfaces(crate::setup_surface::SetupSurfaceTable::for_tests(
+                &["/wiz", "/api/wiz/{tenant}"],
+                None,
+            )),
+            http_route_table: HttpRouteTable::default(),
+            revision_routing: None,
+            admin_relay: None,
+            notifier,
+            session_manager: Arc::new(websocket::SessionManager::new(
+                websocket::WsLimits::default(),
+            )),
+            webchat_provider: "messaging-webchat".to_string(),
+            conversation_dedup: Arc::new(ConversationDedupCache::new()),
+            directline_sessions: Arc::new(directline_session::DirectLineSessions::from_env()),
+        });
+        let run = |method: Method, path: &str, peer: Option<&str>, bearer: Option<&str>| {
+            let mut req = empty_request(method, path);
+            if let Some(peer) = peer {
+                req.extensions_mut()
+                    .insert(setup_gate::PeerAddr(peer.parse().unwrap()));
+            }
+            if let Some(token) = bearer {
+                req.headers_mut().insert(
+                    hyper::header::AUTHORIZATION,
+                    format!("Bearer {token}").parse().unwrap(),
+                );
+            }
+            let (Ok(response) | Err(response)) =
+                runtime.block_on(handle_request_inner(req, state.clone()));
+            response
+        };
+        let remote = Some("203.0.113.9:5000");
+        // No bearer: GET page, GET api state, POST api next -> 401.
+        for (method, path) in [
+            (Method::GET, "/wiz/"),
+            (Method::GET, "/api/wiz/demo"),
+            (Method::POST, "/api/wiz/demo/next"),
+        ] {
+            let response = run(method, path, remote, None);
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(response.headers()["www-authenticate"], "Bearer");
+        }
+        // Unknown peer is treated as remote; wrong bearer is refused.
+        assert_eq!(
+            run(Method::GET, "/wiz/", None, None).status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            run(Method::GET, "/wiz/", remote, Some("nope")).status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // Valid bearer and loopback both reach the page, with anti-framing.
+        for (peer, bearer) in [(remote, Some("tok")), (Some("127.0.0.1:5000"), None)] {
+            let response = run(Method::GET, "/wiz/", peer, bearer);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-frame-options"], "DENY");
+            assert_eq!(
+                response.headers()["content-security-policy"],
+                "frame-ancestors 'none'"
+            );
+        }
     }
 
     #[test]

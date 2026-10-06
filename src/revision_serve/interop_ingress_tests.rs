@@ -169,6 +169,18 @@ fn activation_built(
     DeploymentId,
     Arc<std::sync::atomic::AtomicUsize>,
 ) {
+    activation_full(store, runtime_metered, |_| Default::default())
+}
+
+fn activation_full(
+    store: Store,
+    runtime_metered: bool,
+    static_routes: impl FnOnce(&RevisionScope) -> crate::static_routes::ActiveRouteTable,
+) -> (
+    Activation,
+    DeploymentId,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
     let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let secrets: greentic_runner_host::secrets::DynSecretsManager = match store {
         Store::Config(a2a) => {
@@ -227,12 +239,18 @@ fn activation_built(
 
     let deployment_id = DeploymentId::new();
     let bundle_id = BundleId::new(BUNDLE);
+    let revision_id = RevisionId::new();
+    let static_routes = static_routes(&RevisionScope {
+        deployment_id,
+        bundle_id: bundle_id.clone(),
+        revision_id,
+    });
     let dispatcher = RevisionDispatcher::new(RevisionDispatcherConfig::new("interop", [0u8; 32]));
     dispatcher
         .apply_traffic_split(
             deployment_id,
             vec![RevisionEntry {
-                revision_id: RevisionId::new(),
+                revision_id,
                 bundle_id: bundle_id.clone(),
                 weight_bps: 10_000,
             }],
@@ -255,7 +273,7 @@ fn activation_built(
             )]),
             endpoint_admit: Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: Arc::default(),
-            static_routes: crate::static_routes::ActiveRouteTable::default(),
+            static_routes,
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
             app_packs: Default::default(),
@@ -1557,3 +1575,158 @@ async fn two_mounted_units_serve_two_independent_surfaces() {
 
 #[path = "interop_ingress_metering_tests.rs"]
 mod metering;
+
+// ---------------------------------------------------------------------------
+// Provider setup surface (`greentic.setup.web-component.v1`)
+// ---------------------------------------------------------------------------
+
+/// A unit whose pack serves a setup page at `/v1/web/p/setup/{tenant}` and a
+/// wizard API under `/v1/messaging/setup/p/{tenant}`, plus an ordinary static
+/// page at `/v1/web/webchat/{tenant}` that no setup descriptor declares.
+fn setup_activation(store: Store) -> (Activation, tempfile::TempDir) {
+    use crate::setup_surface::SetupSurfaceTable;
+    use crate::static_routes::{
+        ActiveRouteTable, CacheStrategy, RouteScopeSegment, StaticRouteDescriptor, StaticRoutePlan,
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (root, body) in [
+        ("assets/setup", "<html>setup</html>"),
+        ("assets/chat", "<html>chat</html>"),
+    ] {
+        let root = dir.path().join("pack").join(root);
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("index.html"), body).expect("write");
+    }
+    let pack_path = dir.path().join("pack");
+    let (activation, _, _) = activation_full(store, false, |scope| {
+        let descriptor = |id: &str, segs: [&str; 3], root: &str| StaticRouteDescriptor {
+            route_id: id.to_string(),
+            pack_id: id.to_string(),
+            pack_path: pack_path.clone(),
+            public_path: format!("/v1/web/{}/{}/{{tenant}}", segs[0], segs[1]).replace("//", "/"),
+            source_root: root.to_string(),
+            index_file: Some("index.html".to_string()),
+            spa_fallback: None,
+            tenant_scoped: true,
+            team_scoped: false,
+            cache_strategy: CacheStrategy::None,
+            route_segments: vec![
+                RouteScopeSegment::Literal("v1".into()),
+                RouteScopeSegment::Literal("web".into()),
+                RouteScopeSegment::Literal(segs[0].into()),
+                RouteScopeSegment::Literal(segs[1].into()),
+                RouteScopeSegment::Tenant,
+            ],
+            scope: Some(scope.clone()),
+        };
+        let mut setup = descriptor("setup", ["p", "setup", ""], "assets/setup");
+        setup.public_path = "/v1/web/p/setup/{tenant}".to_string();
+        let mut chat = descriptor("chat", ["other", "x", ""], "assets/chat");
+        chat.public_path = "/v1/web/other/x/{tenant}".to_string();
+        ActiveRouteTable::from_plan(&StaticRoutePlan {
+            routes: vec![setup, chat],
+            ..Default::default()
+        })
+        .with_setup_surfaces(SetupSurfaceTable::for_tests(
+            &[
+                "/v1/web/p/setup/{tenant}",
+                "/v1/messaging/setup/p/{tenant}",
+                "/v1/messaging/setup/p/{tenant}/oauth/{kind}/start",
+            ],
+            Some(scope.clone()),
+        ))
+    });
+    (activation, dir)
+}
+
+const SETUP_PAGE: &str = "/v1/web/p/setup/demo/";
+const SETUP_STATE: &str = "/v1/messaging/setup/p/demo";
+const SETUP_NEXT: &str = "/v1/messaging/setup/p/demo/next";
+const CHAT_PAGE: &str = "/v1/web/other/x/demo/";
+
+#[tokio::test]
+async fn a_remote_setup_request_without_a_bearer_is_401_whatever_it_is() {
+    let (activation, _dir) = setup_activation(Store::Config(false));
+    let state = state_with(activation, interop_replying(vec![Activity::text("hi")]));
+    for request in [
+        get(SETUP_PAGE, &[]),
+        get(SETUP_STATE, &[]),
+        post(SETUP_NEXT, &[], "{}"),
+    ] {
+        let response = exchange(&state, false, &request).await;
+        assert_eq!(response.status, 401, "{request}");
+        assert_eq!(response.header("www-authenticate"), Some("Bearer"));
+        assert_eq!(response.header("x-frame-options"), Some("DENY"));
+    }
+}
+
+#[tokio::test]
+async fn a_wrong_bearer_is_refused_on_the_setup_surface() {
+    let (activation, _dir) = setup_activation(Store::Config(false));
+    let state = state_with(activation, interop_replying(vec![Activity::text("hi")]));
+    let wrong = ("Authorization", "Bearer gtw_not-the-token");
+    for request in [get(SETUP_PAGE, &[wrong]), post(SETUP_NEXT, &[wrong], "{}")] {
+        assert_eq!(exchange(&state, false, &request).await.status, 401);
+    }
+}
+
+#[tokio::test]
+async fn a_valid_bearer_reaches_the_setup_page_with_anti_framing_headers() {
+    let (activation, _dir) = setup_activation(Store::Config(false));
+    let state = state_with(activation, interop_replying(vec![Activity::text("hi")]));
+    let response = exchange(&state, false, &get(SETUP_PAGE, &[AUTH])).await;
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    assert!(response.body.contains("setup"), "{}", response.body);
+    assert_eq!(response.header("x-frame-options"), Some("DENY"));
+    assert_eq!(
+        response.header("content-security-policy"),
+        Some("frame-ancestors 'none'")
+    );
+}
+
+#[tokio::test]
+async fn a_loopback_peer_reaches_the_setup_surface_without_a_bearer() {
+    let (activation, _dir) = setup_activation(Store::Empty);
+    let state = state_with(activation, interop_replying(vec![Activity::text("hi")]));
+    let response = exchange(&state, true, &get(SETUP_PAGE, &[])).await;
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    assert_eq!(response.header("x-frame-options"), Some("DENY"));
+}
+
+#[tokio::test]
+async fn an_unreadable_credential_store_is_503_on_the_setup_surface() {
+    let (activation, _dir) = setup_activation(Store::Down);
+    let state = state_with(activation, interop_replying(vec![Activity::text("hi")]));
+    assert_eq!(
+        exchange(&state, false, &get(SETUP_PAGE, &[AUTH]))
+            .await
+            .status,
+        503
+    );
+}
+
+#[tokio::test]
+async fn the_host_local_escape_hatch_reopens_the_setup_surface() {
+    let (activation, _dir) = setup_activation(Store::Empty);
+    let state = state_with(
+        activation,
+        crate::interop::InteropState {
+            generic_auth_enabled: false,
+            ..interop_replying(vec![Activity::text("hi")])
+        },
+    );
+    assert_eq!(
+        exchange(&state, false, &get(SETUP_PAGE, &[])).await.status,
+        200
+    );
+}
+
+#[tokio::test]
+async fn a_static_route_no_setup_descriptor_declares_is_not_gated() {
+    let (activation, _dir) = setup_activation(Store::Config(false));
+    let state = state_with(activation, interop_replying(vec![Activity::text("hi")]));
+    let response = exchange(&state, false, &get(CHAT_PAGE, &[])).await;
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    assert!(response.body.contains("chat"));
+    assert_eq!(response.header("x-frame-options"), None);
+}

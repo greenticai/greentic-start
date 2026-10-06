@@ -118,6 +118,7 @@ mod seed_copy;
 mod services;
 mod session_hint_extractor;
 mod setup_input;
+mod setup_surface;
 mod setup_to_formspec;
 mod startup_contract;
 mod state_layout;
