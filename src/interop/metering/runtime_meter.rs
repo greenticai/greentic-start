@@ -68,6 +68,7 @@ use super::MeteringConfig;
 use super::approval_inbox::approval_inbox_target;
 use super::run_outcome::run_outcome_sink;
 use super::user_ledger::user_ledger_target;
+use crate::artifacts::host_access::HostArtifactAccess;
 use crate::operator_log;
 
 /// Build the runner meter for one unit, or `None` when the unit stages no
@@ -120,6 +121,7 @@ pub(crate) fn host_options_for_unit(
     deployment_id: DeploymentId,
     bundle_id: &str,
     revision_id: RevisionId,
+    artifacts: Option<&HostArtifactAccess>,
 ) -> UnitHostOptions {
     let mut options = RevisionHostOptions::default();
     let meters_usage = match worker_usage_meter(metering, deployment_id, bundle_id) {
@@ -187,10 +189,39 @@ pub(crate) fn host_options_for_unit(
             );
         }
     }
+    if let Some(access) = artifacts {
+        options = with_artifacts(options, access, bundle_id);
+    }
     UnitHostOptions {
         options,
         meters_usage,
     }
+}
+
+/// The agent's artifact READER and the extensions' artifact PORT, both over
+/// the door this unit's activation probed (attachments on). A unit with
+/// attachments off gets neither: its agent reads the runner's fixed notice and
+/// its extensions are told `unsupported`. A reader that cannot be built is one
+/// warning with a fixed code; the revision still loads.
+fn with_artifacts(
+    mut options: RevisionHostOptions,
+    access: &HostArtifactAccess,
+    bundle_id: &str,
+) -> RevisionHostOptions {
+    match access.reader() {
+        Ok(reader) => options = options.with_artifact_reader(reader),
+        Err(_) => {
+            // Fixed code only: never the door URL, never the token.
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "artifact reader for unit `{bundle_id}` is off (artifact_reader_unavailable); \
+                     the agent sees a fixed notice for each attachment"
+                ),
+            );
+        }
+    }
+    options.with_ext_artifact_port(access.port())
 }
 
 /// The units whose loaded revisions carry the runner's worker-usage meter,
@@ -229,11 +260,17 @@ pub(crate) struct UnitMeterDecisions {
 impl UnitMeterDecisions {
     /// The host options one revision of this unit loads with — the runner
     /// meter and the run-outcome sink, both from the unit's staged block —
-    /// recording the unit as metered when they install the runner meter.
+    /// recording the unit as metered when they install the runner meter —
+    /// plus the artifact reader and port when `artifacts` is given (the unit's
+    /// activation turned attachments on; see [`host_options_for_unit`]).
     ///
     /// This is the ONE boot call: reading the block, building the meter and
     /// recording the decision happen together, so an activation cannot
     /// install a meter without the interop reporter learning of it.
+    // Each argument names the unit, the store it is read from, or the
+    // artifact access its activation decided; grouping them would only move
+    // the same eight values into a struct built at the one call site.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn options_for_revision(
         &mut self,
         secrets: &dyn greentic_secrets_lib::SecretsManager,
@@ -242,9 +279,16 @@ impl UnitMeterDecisions {
         deployment_id: DeploymentId,
         bundle_id: &str,
         revision_id: RevisionId,
+        artifacts: Option<&HostArtifactAccess>,
     ) -> RevisionHostOptions {
         let metering = self.metering_for(secrets, env, tenant, bundle_id).await;
-        let unit = host_options_for_unit(metering.as_ref(), deployment_id, bundle_id, revision_id);
+        let unit = host_options_for_unit(
+            metering.as_ref(),
+            deployment_id,
+            bundle_id,
+            revision_id,
+            artifacts,
+        );
         if unit.meters_usage {
             self.metered.insert((deployment_id, bundle_id.to_string()));
         }

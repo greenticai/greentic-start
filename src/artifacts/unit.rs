@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use greentic_deploy_spec::ids::{DeploymentId, RevisionId};
 
+use super::host_access::HostArtifactAccess;
 use super::ingest::Pipeline;
 
 /// Why a unit runs without attachments. Each is reported to the agent per
@@ -29,8 +30,24 @@ impl Off {
 }
 
 pub(crate) enum UnitAttachments {
-    Enabled { pipeline: Arc<Pipeline> },
+    Enabled {
+        pipeline: Arc<Pipeline>,
+        /// The agent reader and extension port over the SAME door the
+        /// pipeline writes through.
+        host: HostArtifactAccess,
+    },
     Off(Off),
+}
+
+impl UnitAttachments {
+    /// What this unit's runner gets from its door; `None` when attachments
+    /// are off, so the agent gets no reader and extensions no port.
+    pub(crate) fn host_access(&self) -> Option<&HostArtifactAccess> {
+        match self {
+            UnitAttachments::Enabled { host, .. } => Some(host),
+            UnitAttachments::Off(_) => None,
+        }
+    }
 }
 
 /// Each loaded revision's decision. A revision missing from it is treated as

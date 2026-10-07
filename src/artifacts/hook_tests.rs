@@ -35,6 +35,13 @@ async fn an_enabled_unit_stores_attachments_under_a_conversation_key() {
             store.clone(),
             FakeFetcher::new(vec![ok(png(1))]),
         )),
+        host: crate::artifacts::host_access::HostArtifactAccess::new(
+            store.clone(),
+            crate::artifacts::boot::Door {
+                url: "https://admin.example/api/v1/ingest/artifacts".into(),
+                token: "gtm_t".into(),
+            },
+        ),
     };
     let mut envs = vec![inline_envelope()];
     prepare(Some(&unit), &mut envs, &slack()).await;

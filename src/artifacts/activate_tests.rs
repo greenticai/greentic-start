@@ -90,3 +90,36 @@ async fn a_reachable_door_turns_attachments_on() {
     assert!(matches!(got, UnitAttachments::Enabled { .. }));
     assert!(stub.count() >= 1, "the probe reached the door");
 }
+
+/// The agent reader an enabled unit hands its runner asks the door this
+/// activation probed, with this unit's staged token; an off unit hands none.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_enabled_units_reader_uses_the_probed_door_and_the_staged_token() {
+    let body = r#"{"error":{"code":"not_found"}}"#;
+    let stub = StubAdmin::answering("HTTP/1.1 404 Not Found", "", body).await;
+    let got = activate(
+        "rev-1",
+        Some(&staged_at(port_of(&stub))),
+        Arc::new(NoSecrets),
+    )
+    .await
+    .expect("activates");
+    let probes = stub.count();
+    let reader = got
+        .host_access()
+        .expect("attachments on")
+        .reader()
+        .expect("reader");
+    let id = "artifact://cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let _ = reader.get(id).await;
+    let raw = stub.received();
+    let last = raw.get(probes).expect("the reader reached the door");
+    assert!(
+        last.starts_with("POST /api/v1/ingest/artifacts/get "),
+        "{last}"
+    );
+    assert!(last.contains(&format!("Bearer {TEST_TOKEN}")), "{last}");
+
+    let off = activate("rev-1", None, Arc::new(NoSecrets)).await.unwrap();
+    assert!(off.host_access().is_none());
+}

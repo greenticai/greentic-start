@@ -12,6 +12,7 @@ pub(crate) mod extract;
 pub(crate) mod fetch;
 pub(crate) mod fetch_ref;
 pub(crate) mod hook;
+pub(crate) mod host_access;
 pub(crate) mod host_policy;
 pub(crate) mod ingest;
 pub(crate) mod instance_check;
@@ -22,6 +23,7 @@ pub(crate) mod off;
 pub(crate) mod origin;
 pub(crate) mod pdf_isolation;
 pub(crate) mod pdf_limits;
+pub(crate) mod port;
 pub(crate) mod provenance;
 pub(crate) mod quota_key;
 pub(crate) mod secrets;
@@ -55,6 +57,8 @@ mod fetcher_tests;
 #[cfg(test)]
 mod hook_tests;
 #[cfg(test)]
+mod host_access_tests;
+#[cfg(test)]
 mod host_policy_tests;
 #[cfg(test)]
 mod ingest_blocking_tests;
@@ -78,6 +82,8 @@ mod origin_tests;
 mod pdf_fixture;
 #[cfg(all(test, target_os = "linux"))]
 mod pdf_isolation_tests;
+#[cfg(test)]
+mod port_tests;
 #[cfg(test)]
 mod proxy_testkit;
 #[cfg(test)]

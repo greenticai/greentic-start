@@ -50,3 +50,33 @@ fn every_provider_route_body_is_read_under_the_ingress_limits() {
     let peer = at("crate::http_ingress::limits::PeerIp(peer.ip())");
     assert!(peer < body);
 }
+
+/// The agent reader and the extension port each unit's runtime loads with
+/// come from THAT revision's own attachments decision (its own door and
+/// token), taken just before its host options are built, and nowhere else:
+/// never a host-wide `HostBuilder` port (the revision path never reads one),
+/// never another unit's door.
+#[test]
+fn each_revision_loads_with_the_artifact_access_its_own_activation_decided() {
+    const BOOT: &str = include_str!("../revision_boot.rs");
+    let find = |needle: &str| {
+        assert_eq!(
+            BOOT.matches(needle).count(),
+            1,
+            "`{needle}` must appear exactly once in revision_boot.rs"
+        );
+        BOOT.find(needle).unwrap_or_default()
+    };
+    let decided = find("let unit_attachments = crate::artifacts::activate::activate(");
+    let taken = find("let unit_artifacts = unit_attachments.host_access().cloned();");
+    let passed =
+        find("                unit_artifacts.as_ref(),\n            )\n            .await;");
+    let loaded = find("let runtime = TenantRuntime::load_revision_with(");
+    assert!(decided < taken && taken < passed && passed < loaded);
+    for host_wide in ["with_ext_artifact_port", "with_artifact_reader"] {
+        assert!(
+            !BOOT.contains(host_wide),
+            "`{host_wide}` belongs on the unit's RevisionHostOptions, not in revision_boot.rs"
+        );
+    }
+}

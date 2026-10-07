@@ -97,6 +97,7 @@ fn a_staged_block_installs_the_worker_usage_meter() {
         DeploymentId::new(),
         BUNDLE,
         RevisionId::new(),
+        None,
     );
     assert!(unit.meters_usage);
     assert!(installs_a_meter(&unit.options));
@@ -129,7 +130,7 @@ fn an_absent_block_keeps_the_default_options() {
             .expect("absence is not an error")
             .is_none()
     );
-    let unit = host_options_for_unit(None, DeploymentId::new(), BUNDLE, RevisionId::new());
+    let unit = host_options_for_unit(None, DeploymentId::new(), BUNDLE, RevisionId::new(), None);
     assert!(!unit.meters_usage);
     assert!(!installs_a_meter(&unit.options));
     assert!(!installs_a_sink(&unit.options));
@@ -145,7 +146,13 @@ fn an_absent_block_keeps_the_default_options() {
 fn an_underivable_run_outcome_door_keeps_the_meter_and_drops_only_the_sink() {
     let mut block = metering();
     block.endpoint = "https://admin.example/api/v1/ingest/other".into();
-    let unit = host_options_for_unit(Some(&block), DeploymentId::new(), BUNDLE, RevisionId::new());
+    let unit = host_options_for_unit(
+        Some(&block),
+        DeploymentId::new(),
+        BUNDLE,
+        RevisionId::new(),
+        None,
+    );
     assert!(unit.meters_usage);
     assert!(installs_a_meter(&unit.options));
     assert!(!installs_a_sink(&unit.options));
@@ -176,6 +183,7 @@ fn a_meter_that_cannot_be_built_leaves_the_revision_unmetered() {
         DeploymentId::new(),
         &too_long,
         RevisionId::new(),
+        None,
     );
     assert!(!unit.meters_usage);
     assert!(!installs_a_meter(&unit.options));
@@ -423,7 +431,15 @@ async fn boot_records_exactly_the_units_it_installed_a_meter_for() {
     let plain = DeploymentId::new();
     let mut decisions = UnitMeterDecisions::default();
     let options = decisions
-        .options_for_revision(&store, "local", TENANT, metered, BUNDLE, RevisionId::new())
+        .options_for_revision(
+            &store,
+            "local",
+            TENANT,
+            metered,
+            BUNDLE,
+            RevisionId::new(),
+            None,
+        )
         .await;
     assert!(installs_a_meter(&options));
     assert!(
@@ -438,6 +454,7 @@ async fn boot_records_exactly_the_units_it_installed_a_meter_for() {
             plain,
             "plain-bot",
             RevisionId::new(),
+            None,
         )
         .await;
     assert!(!installs_a_meter(&options));
@@ -446,4 +463,81 @@ async fn boot_records_exactly_the_units_it_installed_a_meter_for() {
     let set = decisions.into_metered();
     assert!(set.contains(metered, BUNDLE));
     assert!(!set.contains(plain, "plain-bot"));
+}
+
+/// Whether the options would hand the runtime the agent's artifact reader /
+/// the extensions' artifact port. Same `Debug` trick as above.
+fn installs_artifacts(options: &RevisionHostOptions) -> (bool, bool) {
+    let rendered = format!("{options:?}");
+    assert!(
+        rendered.contains("artifact_reader") && rendered.contains("ext_artifact_port"),
+        "RevisionHostOptions' Debug does not report the artifact reader/port — \
+         greentic-runner-host lost its `agentic-worker` feature, or the Debug changed: {rendered}"
+    );
+    (
+        rendered.contains("artifact_reader: true"),
+        rendered.contains("ext_artifact_port: true"),
+    )
+}
+
+fn artifact_access(token: &str) -> crate::artifacts::host_access::HostArtifactAccess {
+    let door = "https://admin.example/api/v1/ingest/artifacts".to_string();
+    let store = crate::artifacts::store::HttpArtifactStore::new(
+        door.clone(),
+        token.into(),
+        Duration::from_secs(2),
+    )
+    .expect("client");
+    crate::artifacts::host_access::HostArtifactAccess::new(
+        Arc::new(store),
+        crate::artifacts::boot::Door {
+            url: door,
+            token: token.into(),
+        },
+    )
+}
+
+#[test]
+fn a_unit_with_attachments_gets_the_agent_reader_and_the_extension_port() {
+    let access = artifact_access(TOKEN);
+    let unit = host_options_for_unit(
+        Some(&metering()),
+        DeploymentId::new(),
+        BUNDLE,
+        RevisionId::new(),
+        Some(&access),
+    );
+    assert_eq!(installs_artifacts(&unit.options), (true, true));
+    assert!(
+        !format!("{:?}", unit.options).contains(TOKEN),
+        "the options never print the token"
+    );
+}
+
+#[test]
+fn a_unit_without_attachments_gets_neither() {
+    for metering in [Some(metering()), None] {
+        let unit = host_options_for_unit(
+            metering.as_ref(),
+            DeploymentId::new(),
+            BUNDLE,
+            RevisionId::new(),
+            None,
+        );
+        assert_eq!(installs_artifacts(&unit.options), (false, false));
+    }
+}
+
+#[test]
+fn a_reader_that_cannot_be_built_leaves_the_port_and_the_revision_alone() {
+    let access = artifact_access("tok\nen");
+    let unit = host_options_for_unit(
+        Some(&metering()),
+        DeploymentId::new(),
+        BUNDLE,
+        RevisionId::new(),
+        Some(&access),
+    );
+    assert_eq!(installs_artifacts(&unit.options), (false, true));
+    assert!(installs_a_meter(&unit.options), "the rest still installs");
 }

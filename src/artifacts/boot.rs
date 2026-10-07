@@ -35,6 +35,7 @@ pub(crate) enum SelectError {
 }
 
 /// The door and the token to present to it.
+#[derive(Clone)]
 pub(crate) struct Door {
     pub url: String,
     pub token: String,

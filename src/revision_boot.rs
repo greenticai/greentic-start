@@ -645,6 +645,10 @@ pub(crate) async fn activate_runtime_config(
                 ),
             );
         }
+        // The agent's artifact reader and the extensions' artifact port come
+        // from THIS revision's own decision, over the door it just probed:
+        // never another unit's door, never a host-wide port.
+        let unit_artifacts = unit_attachments.host_access().cloned();
         attachments.insert((deployment_id, revision_id), Arc::new(unit_attachments));
 
         let unit_options = meter_decisions
@@ -655,6 +659,7 @@ pub(crate) async fn activate_runtime_config(
                 deployment_id,
                 &meta.bundle_id,
                 revision_id,
+                unit_artifacts.as_ref(),
             )
             .await;
 

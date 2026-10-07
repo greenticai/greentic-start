@@ -10,6 +10,7 @@ use crate::interop::metering::MeteringConfig;
 
 use super::boot::{DoorProbe, door_for, probe_door};
 use super::fetch::{HttpFetcher, SecretLookup};
+use super::host_access::HostArtifactAccess;
 use super::ingest::Pipeline;
 use super::store::{ArtifactStore, HttpArtifactStore};
 use super::unit::{Off, UnitAttachments};
@@ -46,17 +47,19 @@ pub(crate) async fn activate(
             // which may be gone by the first message, and a connection the
             // probe pooled there would be dead.
             drop(http);
-            let serving = HttpArtifactStore::new(door.url.clone(), door.token, DOOR_TIMEOUT)
-                .map_err(|_| {
-                    anyhow!("the artifacts door client could not be built; refusing to serve")
-                })
-                .with_context(refusal)?;
+            let serving =
+                HttpArtifactStore::new(door.url.clone(), door.token.clone(), DOOR_TIMEOUT)
+                    .map_err(|_| {
+                        anyhow!("the artifacts door client could not be built; refusing to serve")
+                    })
+                    .with_context(refusal)?;
             let store: Arc<dyn ArtifactStore> = Arc::new(serving);
             let fetcher = HttpFetcher::new(secrets)
                 .map_err(|_| anyhow!("the attachment download client could not be built"))
                 .with_context(refusal)?;
-            let pipeline = Arc::new(Pipeline::new(store, Arc::new(fetcher)));
-            Ok(UnitAttachments::Enabled { pipeline })
+            let pipeline = Arc::new(Pipeline::new(Arc::clone(&store), Arc::new(fetcher)));
+            let host = HostArtifactAccess::new(store, door);
+            Ok(UnitAttachments::Enabled { pipeline, host })
         }
     }
 }
