@@ -214,7 +214,7 @@ fn fetch_remote_bundle(reference: &str, allow_insecure: bool) -> anyhow::Result<
 ///
 /// The anonymous branch keeps the unchecked `with_insecure_registries` it
 /// always used, so this change cannot fail a boot that works today.
-fn build_registry_client(
+pub(crate) fn build_registry_client(
     credentials: Option<(String, String)>,
     insecure_registries: Vec<String>,
 ) -> anyhow::Result<DefaultRegistryClient> {
@@ -242,7 +242,7 @@ fn build_registry_client(
 /// credentials. Failing here names both halves. The registry is compared the
 /// way `oci-client` resolves it from the reference, which is also how
 /// `uses_plain_http_for` matches it.
-fn ensure_plain_http_honoured(
+pub(crate) fn ensure_plain_http_honoured(
     client: &DefaultRegistryClient,
     mapped_ref: &str,
     insecure_registries: &[String],
@@ -267,7 +267,7 @@ fn ensure_plain_http_honoured(
 
 /// Read the `GREENTIC_OCI_INSECURE_REGISTRIES` allow-list. Unset or empty
 /// yields an empty list (HTTPS for every registry, the default).
-fn insecure_oci_registries_from_env() -> Vec<String> {
+pub(crate) fn insecure_oci_registries_from_env() -> Vec<String> {
     std::env::var("GREENTIC_OCI_INSECURE_REGISTRIES")
         .ok()
         .map(|raw| parse_insecure_registries(&raw))
@@ -1097,7 +1097,7 @@ fn artifact_registry_token(reference: &str) -> Option<String> {
 /// the intended caller of this path is `greentic-deployer`, which is expected
 /// to supply these two generic variables directly, so replicating untested
 /// GHCR-specific surface would add risk with no known caller.
-fn generic_registry_credentials() -> Option<(String, String)> {
+pub(crate) fn generic_registry_credentials() -> Option<(String, String)> {
     let username = std::env::var("OCI_USERNAME")
         .ok()
         .filter(|value| !value.is_empty());
@@ -1129,7 +1129,7 @@ fn generic_registry_credentials() -> Option<(String, String)> {
 /// (a real network call) when `generic` is `None`, so passing
 /// `generic = Some(..)` proves explicit-wins by construction — the closure is
 /// never run — identically on GCP and off it.
-fn resolve_pull_credentials(
+pub(crate) fn resolve_pull_credentials(
     reference: &str,
     generic: Option<(String, String)>,
 ) -> Option<(String, String)> {

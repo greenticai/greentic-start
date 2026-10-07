@@ -117,6 +117,7 @@ Crate version 1.2.0-dev.0, edition 2024, Rust 1.95.0 (pinned via `rust-toolchain
 | `GREENTIC_APPROVAL_DESTINATION` | Conversation approval requests are delivered to (a DM or a private approver channel). No default: the bridge fails closed without one |
 | `GREENTIC_LLM_API_KEY` | LLM provider key for fast2flow routing; keyless for Ollama |
 | `GREENTIC_CACHE_DIR` | Component cache root (set automatically by warmup) |
+| `GREENTIC_SEED_DIR` | Read-only env-store seed copied into the writable store at boot (Cloud Run). A seed `environment.json` may be a pointer to an OCI artifact to escape the 64 KiB secret cap; see [docs/seed-pointer.md](docs/seed-pointer.md) |
 | `GREENTIC_DEV_SECRETS_PATH` | Override path for dev-mode secrets store |
 | `GREENTIC_ADMIN_LISTEN` | Admin-relay listen address |
 | `GREENTIC_DIRECTLINE_TOKEN_TTL_SECS` | DirectLine session-token base TTL (seconds, clamped `[60, 604800]`, default `1800`) |
