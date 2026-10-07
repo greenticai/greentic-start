@@ -13,8 +13,9 @@
 //! - a wall-clock deadline, after which it is killed;
 //! - a cap on the bytes read back, and a page limit enforced by the worker.
 //!
-//! At most [`MAX_CONCURRENT_WORKERS`] workers run at once, so a burst of PDFs
-//! cannot multiply the memory limit. Every failure — no worker configured,
+//! Workers run one at a time by default (see [`super::pdf_limits`] for the
+//! limits and their overrides), so a burst of PDFs cannot multiply the memory
+//! limit. Every failure — no worker configured,
 //! spawn failure, crash, timeout, oversized or unframed output — is an empty
 //! text, never an error that could fail the turn. Isolation is Linux-only; on
 //! other platforms a PDF yields no text rather than being parsed in-process.
@@ -26,44 +27,29 @@ use std::sync::{Condvar, Mutex, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use super::extract::truncate_chars;
-use super::limits::{MAX_FILE_BYTES, MAX_TEXT_CHARS};
+use super::limits::MAX_FILE_BYTES;
+pub(crate) use super::pdf_limits::*;
 
 /// First argument that turns this binary into the PDF worker.
 pub(crate) const WORKER_ARG: &str = "__greentic-artifact-pdf-text";
 /// Prefix of every worker answer. Output without it is not extracted text.
 pub(crate) const FRAME: &[u8] = b"GREENTIC-PDF-TEXT/1\n";
-/// A PDF with more pages than this yields no text.
-pub(crate) const MAX_PDF_PAGES: usize = 300;
-const MAX_CONCURRENT_WORKERS: usize = 2;
 const POLL: Duration = Duration::from_millis(10);
 /// `RLIMIT_NOFILE` of the worker: stdin, stdout, stderr and a little slack.
 #[cfg(target_os = "linux")]
 const WORKER_MAX_FILES: libc::rlim_t = 16;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Limits {
-    /// `RLIMIT_DATA` of the worker, in bytes.
-    pub data_bytes: u64,
-    /// `RLIMIT_CPU` of the worker, in seconds.
-    pub cpu_secs: u64,
-    /// Wall-clock deadline, also the longest wait for a free worker slot.
-    pub wall: Duration,
-    pub max_pages: usize,
-    pub max_chars: usize,
-}
-
-impl Limits {
-    pub(crate) const PRODUCTION: Limits = Limits {
-        data_bytes: 768 * 1024 * 1024,
-        cpu_secs: 15,
-        wall: Duration::from_secs(30),
-        max_pages: MAX_PDF_PAGES,
-        max_chars: MAX_TEXT_CHARS,
-    };
-}
-
 static WORKER_PROGRAM: OnceLock<PathBuf> = OnceLock::new();
-static GATE: Gate = Gate::new(MAX_CONCURRENT_WORKERS);
+static PRODUCTION: OnceLock<Limits> = OnceLock::new();
+static GATE: OnceLock<Gate> = OnceLock::new();
+
+fn production_limits() -> &'static Limits {
+    PRODUCTION.get_or_init(Limits::production)
+}
+
+fn gate() -> &'static Gate {
+    GATE.get_or_init(|| Gate::new(worker_slots(std::env::var(SLOTS_ENV).ok().as_deref())))
+}
 
 /// Enable PDF extraction by naming this process's own executable as the
 /// worker. Called by the binary's entry point only: a library consumer whose
@@ -80,11 +66,11 @@ pub(crate) fn enable_worker_from_current_exe() {
     }
 }
 
-/// Text of a PDF, at most [`MAX_TEXT_CHARS`] characters, extracted by the
+/// Text of a PDF, at most [`super::limits::MAX_TEXT_CHARS`] characters, extracted by the
 /// isolated worker. Empty when extraction is not enabled or fails.
 pub(crate) fn pdf_text(bytes: &[u8]) -> String {
     match WORKER_PROGRAM.get() {
-        Some(program) => run_worker(program, &[WORKER_ARG], bytes, &Limits::PRODUCTION),
+        Some(program) => run_worker(program, &[WORKER_ARG], bytes, production_limits()),
         None => String::new(),
     }
 }
@@ -93,14 +79,14 @@ pub(crate) fn pdf_text(bytes: &[u8]) -> String {
 /// Exposed for the real-binary test only.
 #[doc(hidden)]
 pub fn pdf_text_via(program: &Path, bytes: &[u8]) -> String {
-    run_worker(program, &[WORKER_ARG], bytes, &Limits::PRODUCTION)
+    run_worker(program, &[WORKER_ARG], bytes, production_limits())
 }
 
 /// Run `program args…` as a worker: feed `bytes` on stdin, return the framed
 /// text it prints, or an empty string on any failure.
 #[cfg(target_os = "linux")]
 pub(crate) fn run_worker(program: &Path, args: &[&str], bytes: &[u8], limits: &Limits) -> String {
-    let Some(_slot) = GATE.acquire(limits.wall) else {
+    let Some(_slot) = gate().acquire(limits.wall) else {
         tracing::debug!("no free PDF worker slot; attachment carries no text");
         return String::new();
     };
@@ -287,7 +273,7 @@ fn worker_main() -> i32 {
     {
         return 1;
     }
-    let limits = Limits::PRODUCTION;
+    let limits = Limits::DEFAULT;
     let text = worker_extract(&input, limits.max_pages, limits.max_chars);
     let mut out = std::io::stdout().lock();
     match out

@@ -76,7 +76,7 @@ fn fast() -> Limits {
     Limits {
         wall: Duration::from_secs(2),
         max_chars: 1_000,
-        ..Limits::PRODUCTION
+        ..Limits::DEFAULT
     }
 }
 
@@ -149,7 +149,7 @@ fn the_worker_runs_under_resource_limits() {
         "printf '{}'; printf '%s %s %s %s %s' \"$(ulimit -d)\" \"$(ulimit -t)\" \"$(ulimit -f)\" \"$(ulimit -c)\" \"$(ulimit -n)\"",
         frame_for_shell()
     );
-    let limits = Limits::PRODUCTION;
+    let limits = Limits::DEFAULT;
     let expected = format!("{} {} 0 0 16", limits.data_bytes / 1024, limits.cpu_secs);
     assert_eq!(
         sh(
@@ -265,4 +265,49 @@ fn a_dropped_child_guard_kills_and_reaps_the_worker() {
     assert!(started.elapsed() < Duration::from_secs(5));
     // Reaped, not a zombie: the pid no longer exists.
     assert!(!Path::new(&format!("/proc/{pid}")).exists());
+}
+
+// --- Production limits and their environment overrides -----------------------
+
+#[test]
+fn defaults_fit_a_small_container() {
+    // Deployed containers may have 512 MiB-1 GiB; one worker at 320 MiB.
+    assert_eq!(Limits::DEFAULT.data_bytes, 320 * 1024 * 1024);
+    assert_eq!(DEFAULT_WORKER_SLOTS, 1);
+}
+
+#[test]
+fn the_memory_override_is_clamped_and_falls_back_on_garbage() {
+    assert_eq!(worker_mem_mb(None), 320);
+    assert_eq!(worker_mem_mb(Some("512")), 512);
+    assert_eq!(worker_mem_mb(Some(" 128 ")), 128);
+    assert_eq!(worker_mem_mb(Some("8")), 64);
+    assert_eq!(worker_mem_mb(Some("99999")), 1024);
+    for garbage in ["", "lots", "-5", "1.5", "320MB"] {
+        assert_eq!(worker_mem_mb(Some(garbage)), 320, "{garbage:?}");
+    }
+}
+
+#[test]
+fn the_slot_override_is_clamped_and_falls_back_on_garbage() {
+    assert_eq!(worker_slots(None), 1);
+    assert_eq!(worker_slots(Some("3")), 3);
+    assert_eq!(worker_slots(Some("0")), 1);
+    assert_eq!(worker_slots(Some("64")), 4);
+    for garbage in ["", "two", "-1"] {
+        assert_eq!(worker_slots(Some(garbage)), 1, "{garbage:?}");
+    }
+}
+
+#[test]
+fn limits_with_a_memory_override_change_only_the_memory() {
+    let limits = Limits::with_mem_mb(512);
+    assert_eq!(limits.data_bytes, 512 * 1024 * 1024);
+    assert_eq!(
+        Limits {
+            data_bytes: Limits::DEFAULT.data_bytes,
+            ..limits
+        },
+        Limits::DEFAULT
+    );
 }

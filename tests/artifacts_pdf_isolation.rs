@@ -40,9 +40,9 @@ fn a_small_inflating_pdf_is_read_by_the_real_worker() {
 
 #[test]
 fn a_decompression_bomb_is_contained_by_the_worker() {
-    // ~6.5 MiB of PDF inflating to ~1 GiB, past the worker's 768 MiB data
-    // limit: the worker dies before it gets to the text, the host gets an
-    // empty text, promptly, and keeps running.
+    // ~6.5 MiB of PDF inflating to ~1033 MiB, past the worker's 320 MiB data
+    // limit (and past the 1024 MiB ceiling of its override): the worker dies
+    // before it gets to the text, the host gets an empty text, promptly.
     let bomb = pdf_fixture::zlib_bomb(SURVIVED, 4_200_000);
     assert!(bomb.len() < 10 * 1024 * 1024);
     let pdf = pdf_fixture::flate_content_pdf(&bomb);

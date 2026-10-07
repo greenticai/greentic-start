@@ -10,6 +10,7 @@
 pub(crate) mod extract;
 pub(crate) mod limits;
 pub(crate) mod pdf_isolation;
+pub(crate) mod pdf_limits;
 pub(crate) mod sniff;
 
 #[cfg(test)]
