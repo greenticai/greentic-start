@@ -8,6 +8,9 @@
 #![allow(dead_code)]
 
 pub(crate) mod limits;
+pub(crate) mod sniff;
 
 #[cfg(test)]
 mod limits_tests;
+#[cfg(test)]
+mod sniff_tests;
