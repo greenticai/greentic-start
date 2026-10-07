@@ -3,6 +3,9 @@ mod conv_dedup;
 mod directline_session;
 mod flow_owner;
 mod helpers;
+pub(crate) mod limits;
+#[cfg(test)]
+mod limits_tests;
 mod messaging;
 mod setup_gate;
 pub(crate) use messaging::decode_injected_config_for_provider;

@@ -35,3 +35,18 @@ fn the_hook_runs_in_the_detached_pipeline_before_the_first_turn() {
     let turns = at("    for ingress in &envelopes {\n        // Per-envelope flow targeting");
     assert!(pipeline < hook && hook < turns);
 }
+
+#[test]
+fn foreign_whatsapp_numbers_are_dropped_before_the_pipeline_is_spawned() {
+    let intercept = at("crate::approval_rail::intercept_inbound(");
+    let check = at("crate::artifacts::instance_check::drop_foreign_numbers(");
+    let spawn = at("run_provider_inbound_pipeline(\n                    pipeline_activation,");
+    assert!(intercept < check && check < spawn);
+}
+
+#[test]
+fn every_provider_route_body_is_read_under_the_ingress_limits() {
+    let body = at("crate::http_ingress::limits::read_ingress_body(req, &effective_path)");
+    let peer = at("crate::http_ingress::limits::PeerIp(peer.ip())");
+    assert!(peer < body);
+}

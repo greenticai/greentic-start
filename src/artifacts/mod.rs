@@ -14,6 +14,7 @@ pub(crate) mod fetch_ref;
 pub(crate) mod hook;
 pub(crate) mod host_policy;
 pub(crate) mod ingest;
+pub(crate) mod instance_check;
 pub(crate) mod label;
 pub(crate) mod legacy;
 pub(crate) mod limits;
@@ -65,6 +66,8 @@ mod ingest_provenance_tests;
 mod ingest_testkit;
 #[cfg(test)]
 mod ingest_tests;
+#[cfg(test)]
+mod instance_check_tests;
 #[cfg(test)]
 mod legacy_tests;
 #[cfg(test)]

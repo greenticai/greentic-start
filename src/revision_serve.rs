@@ -1079,7 +1079,9 @@ fn spawn_revision_connection(
             let connection_state = Arc::clone(state);
             let peer_is_loopback = peer_is_loopback_trusted(trust_loopback_peers, peer.ip());
             tokio::spawn(async move {
-                let service = service_fn(move |req| {
+                let service = service_fn(move |mut req: Request<Incoming>| {
+                    req.extensions_mut()
+                        .insert(crate::http_ingress::limits::PeerIp(peer.ip()));
                     handle_connection(req, connection_state.clone(), peer_is_loopback)
                 });
                 let io = TokioIo::new(stream);
@@ -1574,12 +1576,13 @@ async fn serve(
         .await);
     }
 
-    let body_bytes = read_body_limited(req).await.map_err(|_| {
-        error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "request body exceeds the size limit",
-        )
-    })?;
+    // Per-route caps and the upload limiter (`crate::http_ingress::limits`);
+    // an upload slot is held until this request is answered.
+    let crate::http_ingress::limits::IngressBody {
+        bytes: body_bytes,
+        _slot: _upload_slot,
+        ..
+    } = crate::http_ingress::limits::read_ingress_body(req, &effective_path).await?;
 
     // Phase D.3: the body is read as raw bytes; the strict JSON parse is
     // deferred until we know this is the generic-JSON branch (provider
@@ -5770,6 +5773,8 @@ async fn dispatch_provider_route(
             "provider config could not be resolved",
         )
     })?;
+    let configured_number =
+        crate::artifacts::instance_check::configured_number(provider_config.as_ref());
 
     let http_in = build_provider_http_in(
         &provider_type,
@@ -5853,6 +5858,13 @@ async fn dispatch_provider_route(
             &mut result.messaging_envelopes,
         );
     }
+    // Host checklist 14: a WhatsApp envelope for another business number than
+    // this instance's is dropped before it can reach any turn or fetch.
+    crate::artifacts::instance_check::drop_foreign_numbers(
+        &provider_type,
+        configured_number.as_deref(),
+        &mut result.messaging_envelopes,
+    );
 
     // `result.events` are EventEnvelopeV1 (event-fabric) emissions. The
     // legacy `dispatch_http_ingress` routes these only for `Domain::Events`
@@ -16200,3 +16212,7 @@ mod fast2flow_hook_tests;
 #[cfg(test)]
 #[path = "revision_serve/fast2flow_hook_default_hint_tests.rs"]
 mod fast2flow_hook_default_hint_tests;
+
+#[cfg(test)]
+#[path = "revision_serve/upload_http_in_tests.rs"]
+mod upload_http_in_tests;
