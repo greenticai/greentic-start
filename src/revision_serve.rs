@@ -4786,7 +4786,11 @@ fn build_activity(
     // Every caller of this function hands it JSON a client wrote, so a caller
     // block in it is a claim, never a verification. Only the provider route
     // (`envelope_to_activity`) may carry one — see `client_caller`.
-    let payload = &client_caller::without_client_caller(payload);
+    let mut payload = client_caller::without_client_caller(payload);
+    // Likewise a stored-attachment reference or a host note: only the host's
+    // inbound pipeline (provider route) writes those.
+    crate::artifacts::provenance::strip_reserved_json(&mut payload);
+    let payload = &payload;
     let mut activity = match payload.get("text").and_then(Value::as_str) {
         // `Activity::text` keeps ONLY the text. That is right for a plain
         // message and silently lossy for `{"text": …, "metadata": …}` — the
