@@ -7,10 +7,18 @@
 // later step; until then only the tests reach them.
 #![allow(dead_code)]
 
+pub(crate) mod extract;
 pub(crate) mod limits;
+pub(crate) mod pdf_isolation;
 pub(crate) mod sniff;
 
 #[cfg(test)]
+mod extract_tests;
+#[cfg(test)]
 mod limits_tests;
+#[cfg(test)]
+mod pdf_fixture;
+#[cfg(all(test, target_os = "linux"))]
+mod pdf_isolation_tests;
 #[cfg(test)]
 mod sniff_tests;

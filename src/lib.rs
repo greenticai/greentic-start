@@ -13,6 +13,12 @@ mod agent_provenance;
 #[doc(hidden)]
 pub mod approval_rail;
 mod artifacts;
+/// Test-only access to the isolated PDF text worker, for
+/// `tests/artifacts_pdf_isolation.rs`, which drives the real binary.
+#[doc(hidden)]
+pub mod artifacts_test_support {
+    pub use crate::artifacts::pdf_isolation::pdf_text_via;
+}
 mod bin_resolver;
 mod bundle_config;
 mod bundle_ref;
@@ -359,6 +365,12 @@ fn stop_env_runtime(env_dir: &std::path::Path, env_id: &str) -> anyhow::Result<(
 }
 
 pub fn run_from_env() -> anyhow::Result<()> {
+    // Re-executed as the isolated PDF text worker (src/artifacts): do that and
+    // nothing else, before any argument parsing or runtime start-up.
+    if let Some(code) = artifacts::pdf_isolation::run_worker_if_invoked() {
+        std::process::exit(code);
+    }
+    artifacts::pdf_isolation::enable_worker_from_current_exe();
     let raw_tail: Vec<String> = std::env::args().skip(1).collect();
     let tunnel_explicit = raw_tail.iter().any(|a| {
         a.starts_with("--cloudflared") || a.starts_with("--ngrok") || a.starts_with("--gtunnel")
