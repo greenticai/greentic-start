@@ -468,3 +468,49 @@ fn padded_answer(n: usize) -> String {
     let pad = "x".repeat(n);
     format!("{},\"pad\":\"{pad}\"}}", &OK_BODY[..OK_BODY.len() - 1])
 }
+
+// --- conversation_id length (the door refuses more than 128 bytes) -----------
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(s.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_conversation_id_up_to_128_bytes_is_sent_as_is() {
+    let id = "c".repeat(128);
+    let stub = StubAdmin::answering(OK, "", OK_BODY).await;
+    let mut req = request(b"x");
+    req.conversation_id = Some(&id);
+    client(&stub).put(req).await.unwrap();
+    assert_eq!(stub.last_body()["conversation_id"], id.as_str());
+}
+
+#[tokio::test]
+async fn a_longer_conversation_id_is_sent_as_its_stable_sha256() {
+    let id = format!("whatsapp:{}", "9".repeat(200));
+    let stub = StubAdmin::answering(OK, "", OK_BODY).await;
+    for _ in 0..2 {
+        let mut req = request(b"x");
+        req.conversation_id = Some(&id);
+        client(&stub).put(req).await.unwrap();
+        let sent = stub.last_body()["conversation_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(sent, sha256_hex(&id));
+        assert_eq!(sent.len(), 64);
+    }
+    // A multibyte id over the byte limit but under 128 characters too.
+    let wide = "é".repeat(100);
+    let mut req = request(b"x");
+    req.conversation_id = Some(&wide);
+    client(&stub).put(req).await.unwrap();
+    assert_eq!(
+        stub.last_body()["conversation_id"],
+        sha256_hex(&wide).as_str()
+    );
+}
