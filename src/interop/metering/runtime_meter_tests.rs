@@ -74,6 +74,18 @@ fn installs_an_inbox(options: &RevisionHostOptions) -> bool {
     rendered.contains("approval_inbox: true")
 }
 
+/// Whether the options would hand the runtime a per-end-user ledger. Same
+/// trick again: upstream's `Debug` renders `user_ledger: <bool>`.
+fn installs_a_ledger(options: &RevisionHostOptions) -> bool {
+    let rendered = format!("{options:?}");
+    assert!(
+        rendered.contains("user_ledger"),
+        "RevisionHostOptions' Debug does not report the user ledger — greentic-runner-host \
+         lost its `agentic-worker` feature, or the Debug changed upstream: {rendered}"
+    );
+    rendered.contains("user_ledger: true")
+}
+
 #[test]
 fn a_staged_block_installs_the_worker_usage_meter() {
     let meter = worker_usage_meter(Some(&metering()), DeploymentId::new(), BUNDLE)
@@ -90,6 +102,7 @@ fn a_staged_block_installs_the_worker_usage_meter() {
     assert!(installs_a_meter(&unit.options));
     assert!(installs_a_sink(&unit.options));
     assert!(installs_an_inbox(&unit.options));
+    assert!(installs_a_ledger(&unit.options));
 }
 
 /// The meter is built from the block's OWN endpoint, tenant slug and the
@@ -121,6 +134,7 @@ fn an_absent_block_keeps_the_default_options() {
     assert!(!installs_a_meter(&unit.options));
     assert!(!installs_a_sink(&unit.options));
     assert!(!installs_an_inbox(&unit.options));
+    assert!(!installs_a_ledger(&unit.options));
 }
 
 /// The two halves are decided independently: a block whose endpoint is not
@@ -138,6 +152,10 @@ fn an_underivable_run_outcome_door_keeps_the_meter_and_drops_only_the_sink() {
     assert!(
         !installs_an_inbox(&unit.options),
         "the approval doors are derived the same way, so they are refused too"
+    );
+    assert!(
+        !installs_a_ledger(&unit.options),
+        "the ledger door is derived the same way, so it is refused too"
     );
 }
 
@@ -164,6 +182,10 @@ fn a_meter_that_cannot_be_built_leaves_the_revision_unmetered() {
     assert!(
         !installs_a_sink(&unit.options),
         "the run-outcome door refuses the same over-long id"
+    );
+    assert!(
+        installs_a_ledger(&unit.options),
+        "the ledger door does not depend on the bundle id, so it is still installed"
     );
 }
 
