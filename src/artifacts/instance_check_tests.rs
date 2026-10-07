@@ -21,13 +21,35 @@ fn a_change_naming_another_number_is_dropped_and_the_first_proceeds() {
 }
 
 #[test]
-fn an_envelope_without_a_number_is_dropped_too() {
-    let mut envs = vec![bare_envelope(), wa("unknown")];
+fn an_envelope_without_a_number_proceeds_without_its_media_references() {
+    // No number to compare: the MESSAGE is not provably foreign, so it is
+    // served; its media is fetched with this instance's token, so its fetch
+    // references are removed (fail closed for media only).
+    let mut env = bare_envelope();
+    env.attachments = vec![greentic_types::Attachment {
+        mime_type: "image/jpeg".into(),
+        url: Some("https://lookaside.example/media".into()),
+        name: Some("p.jpg".into()),
+        size_bytes: None,
+        content: None,
+    }];
+    env.extensions.insert(
+        "attachment_fetch".into(),
+        json!([{ "kind": "whatsapp_media", "media_id": "m1" }]),
+    );
+    let mut envs = vec![env, wa("111")];
     assert_eq!(
         drop_foreign_numbers("messaging.whatsapp", Some("111"), &mut envs),
-        2
+        0
     );
-    assert!(envs.is_empty());
+    assert_eq!(envs.len(), 2, "no message is dropped");
+    assert!(!envs[0].extensions.contains_key("attachment_fetch"));
+    assert!(envs[0].attachments[0].url.is_none());
+    assert_eq!(
+        envs[0].attachments.len(),
+        1,
+        "the slot stays, to be reported"
+    );
 }
 
 #[test]
