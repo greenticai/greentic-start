@@ -44,7 +44,13 @@ fn private_loopback_link_local_and_special_ranges_are_not_public() {
         "::10.0.0.1",
         "::127.0.0.1",
         "64:ff9b::a00:1",
+        "64:ff9b::7f00:1",
+        "64:ff9b::a9fe:a9fe",
         "64:ff9b:1::1",
+        "::ffff:0:808:808",
+        "::ffff:0:a00:1",
+        "fec0::1",
+        "feff::1",
         "2002:a00:1::",
         "2001::1",
         "2001:db8::1",
@@ -65,6 +71,8 @@ fn ordinary_addresses_are_public() {
         "2606:4700:4700::1111",
         "2a03:2880:f12f:83:face:b00c::25de",
         "::ffff:8.8.8.8",
+        // NAT64 well-known prefix: judged by the embedded IPv4 address.
+        "64:ff9b::808:808",
     ] {
         assert!(is_public_ip(ip(s)), "{s} must be public");
     }

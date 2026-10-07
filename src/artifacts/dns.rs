@@ -52,13 +52,21 @@ fn is_public_v6(v6: Ipv6Addr) -> bool {
         return is_public_v4(mapped);
     }
     let s = v6.segments();
+    // NAT64 well-known prefix 64:ff9b::/96 reaches the IPv4 address in its low
+    // 32 bits, so that address decides.
+    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        let [.., a, b, c, d] = v6.octets();
+        return is_public_v4(Ipv4Addr::new(a, b, c, d));
+    }
     !(v6.is_loopback()
         || v6.is_unspecified()
         || v6.is_multicast()
         || s[..6].iter().all(|&x| x == 0) // ::/96, IPv4-compatible (embeds a v4)
+        || s[..5] == [0, 0, 0, 0, 0xffff] // ::ffff:0:0/96, SIIT (embeds a v4)
         || (s[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
         || (s[0] & 0xffc0) == 0xfe80 // link local fe80::/10
-        || (s[0] == 0x64 && s[1] == 0xff9b) // NAT64 64:ff9b::/32 and 64:ff9b:1::/48
+        || (s[0] & 0xffc0) == 0xfec0 // site local fec0::/10 (deprecated)
+        || (s[0] == 0x64 && s[1] == 0xff9b) // NAT64 local-use 64:ff9b:1::/48 and the rest
         || (s[0] == 0x100 && s[1..4].iter().all(|&x| x == 0)) // discard 100::/64
         || (s[0] == 0x2001 && s[1] < 0x200) // IETF special 2001::/23 (Teredo, ORCHID…)
         || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
