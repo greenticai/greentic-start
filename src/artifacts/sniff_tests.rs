@@ -161,3 +161,40 @@ fn rejections_have_fixed_descriptions() {
     );
     assert_eq!(Rejection::Empty.describe(), "the file is empty");
 }
+
+// --- Text that happens to start with a binary format's magic bytes ----------
+
+#[test]
+fn text_that_starts_like_a_binary_format_is_still_text() {
+    // `infer` matches "BM" as BMP, "MZ" as a Windows executable and "%!PS" as
+    // PostScript. Valid UTF-8 with no NUL is decided by the text rules.
+    assert_eq!(
+        detect(b"BMW sales,2026\nAudi,12\nVW,40\n").unwrap().mime,
+        "text/csv"
+    );
+    assert_eq!(
+        detect(b"MZ is the old DOS signature.").unwrap().mime,
+        "text/plain"
+    );
+    assert_eq!(
+        detect(b"%!PS-Adobe-3.0\n%%EOF\n").unwrap().mime,
+        "text/plain"
+    );
+    assert_eq!(
+        detect(b"-----BEGIN NOTES-----\nhello\n-----END NOTES-----\n")
+            .unwrap()
+            .mime,
+        "text/plain"
+    );
+}
+
+#[test]
+fn binary_formats_outside_the_allow_list_stay_refused() {
+    // A real 2x1 24-bit BMP and an EXE header: binary, so never text.
+    let mut bmp =
+        b"BM\x3e\0\0\0\0\0\0\0\x36\0\0\0\x28\0\0\0\x02\0\0\0\x01\0\0\0\x01\0\x18\0".to_vec();
+    bmp.extend_from_slice(&[0; 24]);
+    assert!(matches!(detect(&bmp), Err(Rejection::Unsupported)));
+    let exe = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00\xb8";
+    assert!(matches!(detect(exe), Err(Rejection::Unsupported)));
+}

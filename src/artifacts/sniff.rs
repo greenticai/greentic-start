@@ -6,6 +6,19 @@
 //! refused. A text file whose first meaningful character opens a tag (after any
 //! mix of byte-order marks and whitespace) is markup — HTML, XML or SVG — and
 //! is refused too, because that is exactly the prefix a browser sniffs.
+//!
+//! Known false positive: a Markdown or text file that itself opens with a tag
+//! (`<details>…`, `<p align=center>`) is refused as markup. Accepted on
+//! purpose: telling such a file from HTML needs a parser, and the cost of
+//! refusing it is a note to the user.
+//!
+//! A file `infer` recognises as a format outside the allow-list is still
+//! checked as text, because short signatures collide with prose (`BMW sales,…`
+//! matches BMP). Binary content fails the text rules (invalid UTF-8 or a NUL).
+//! Image polyglots (a valid GIF header followed by HTML) are accepted as
+//! images; they are safe only because artifacts are served with the sniffed
+//! type, `X-Content-Type-Options: nosniff` and `Content-Disposition:
+//! attachment` (the serving rule in the host plan, Task 8c).
 
 use infer::MatcherType;
 
@@ -66,7 +79,10 @@ pub(crate) fn detect(bytes: &[u8]) -> Result<Detected, Rejection> {
                 mime: "application/pdf",
                 kind: Kind::Document,
             }),
-            _ => Err(Rejection::Unsupported),
+            // Not on the allow-list. Short magic numbers ("BM", "MZ", "%!PS")
+            // also start ordinary text, so valid UTF-8 without NUL goes to
+            // the text rules; real binary is refused there.
+            _ => detect_text(bytes),
         };
     }
     detect_text(bytes)
