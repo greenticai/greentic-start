@@ -86,7 +86,8 @@ pub(crate) struct DoorPolicy {
 impl DoorPolicy {
     pub(crate) fn budget(&self) -> Budget {
         Budget {
-            deadline: Instant::now() + self.total_budget,
+            total: self.total_budget,
+            clock: Clock::Real(Instant::now()),
         }
     }
 }
@@ -94,12 +95,46 @@ impl DoorPolicy {
 /// The retry time left in one activation. One per activation, passed to every
 /// unit, so N units behind a dead door cost one budget, not N of them.
 pub(crate) struct Budget {
-    deadline: Instant,
+    total: Duration,
+    clock: Clock,
+}
+
+/// Where a [`Budget`] reads elapsed time and how it waits. `Manual` exists so a
+/// test can spend a budget by sleeping without any real-time margin.
+enum Clock {
+    Real(Instant),
+    #[cfg(test)]
+    Manual(Mutex<Duration>),
 }
 
 impl Budget {
     fn remaining(&self) -> Duration {
-        self.deadline.saturating_duration_since(Instant::now())
+        let elapsed = match &self.clock {
+            Clock::Real(start) => start.elapsed(),
+            #[cfg(test)]
+            Clock::Manual(elapsed) => *elapsed.lock().unwrap_or_else(PoisonError::into_inner),
+        };
+        self.total.saturating_sub(elapsed)
+    }
+
+    async fn sleep(&self, wait: Duration) {
+        match &self.clock {
+            Clock::Real(_) => tokio::time::sleep(wait).await,
+            #[cfg(test)]
+            Clock::Manual(elapsed) => {
+                let mut elapsed = elapsed.lock().unwrap_or_else(PoisonError::into_inner);
+                *elapsed += wait;
+            }
+        }
+    }
+
+    /// A budget whose time only moves when something sleeps on it.
+    #[cfg(test)]
+    pub(crate) fn manual(total: Duration) -> Self {
+        Self {
+            total,
+            clock: Clock::Manual(Mutex::new(Duration::ZERO)),
+        }
     }
 }
 
@@ -503,7 +538,7 @@ async fn fetch_with_retry(
             .retry_after()
             .map_or(backoff, |after| after.max(backoff))
             .min(remaining);
-        tokio::time::sleep(wait).await;
+        budget.sleep(wait).await;
         backoff = backoff.saturating_mul(2);
         attempt += 1;
     }

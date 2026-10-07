@@ -434,7 +434,7 @@ async fn units_share_one_retry_budget() {
         attempts: 5,
         backoff: Duration::from_millis(40),
         request_timeout: Duration::from_secs(2),
-        total_budget: Duration::from_millis(100),
+        total_budget: Duration::from_millis(100), // unused: the manual budget below governs
     };
     let a = serve(vec![
         ("HTTP/1.1 503 Service Unavailable", "", String::new()),
@@ -452,13 +452,16 @@ async fn units_share_one_retry_budget() {
     stage(&store, "acme", "budget-a", &a.endpoint(), Some(true));
     stage(&store, "acme", "budget-b", &b.endpoint(), Some(true));
 
-    let result = hydrate_for_activation(
-        &store,
-        ENV,
-        [("acme", "budget-a"), ("acme", "budget-b")],
-        &policy,
-    )
-    .await;
+    // A manual clock: time moves only when a retry sleeps, so no real-time
+    // margin can change the outcome.
+    let budget = Budget::manual(Duration::from_millis(100));
+    let mut result = Ok(Hydration::NotRequested);
+    for unit in ["budget-a", "budget-b"] {
+        result = hydrate_unit(&store, ENV, "acme", unit, &policy, &budget).await;
+        if result.is_err() {
+            break;
+        }
+    }
 
     assert!(result.is_err(), "B's door never answers");
     assert_eq!(a.hits(), 3);
