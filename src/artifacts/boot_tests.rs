@@ -103,7 +103,8 @@ async fn a_failing_door_refuses_activation() {
 
 #[tokio::test]
 async fn a_token_without_the_purpose_activates_without_attachments() {
-    let stub = StubAdmin::answering("HTTP/1.1 403 Forbidden", "", "{}").await;
+    let body = r#"{"error":{"code":"purpose_not_granted"}}"#;
+    let stub = StubAdmin::answering("HTTP/1.1 403 Forbidden", "", body).await;
     assert_eq!(
         probe_door(&store_at(&stub.url), &stub.url).await.unwrap(),
         DoorProbe::NotGranted
@@ -112,10 +113,38 @@ async fn a_token_without_the_purpose_activates_without_attachments() {
 
 #[tokio::test]
 async fn a_reachable_door_enables_attachments() {
-    let stub = StubAdmin::answering("HTTP/1.1 404 Not Found", "", "{}").await;
+    let body = r#"{"error":{"code":"not_found"}}"#;
+    let stub = StubAdmin::answering("HTTP/1.1 404 Not Found", "", body).await;
     assert_eq!(
         probe_door(&store_at(&stub.url), &stub.url).await.unwrap(),
         DoorProbe::Enabled
     );
     assert!(stub.count() >= 1, "the probe reached the door");
+}
+
+#[tokio::test]
+async fn any_other_403_or_404_refuses_activation_naming_the_door() {
+    for (status, body) in [
+        ("HTTP/1.1 403 Forbidden", "{}"),
+        (
+            "HTTP/1.1 403 Forbidden",
+            r#"{"error":{"code":"invalid_usage_token"}}"#,
+        ),
+        ("HTTP/1.1 404 Not Found", "{}"),
+        ("HTTP/1.1 404 Not Found", "<html>no route</html>"),
+    ] {
+        let stub = StubAdmin::answering(status, "", body).await;
+        let err = probe_door(&store_at(&stub.url), &stub.url)
+            .await
+            .expect_err(status);
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("artifacts door") && text.contains("refusing to serve"),
+            "{text}"
+        );
+        assert!(
+            !text.contains(TEST_TOKEN) && !text.contains("no route"),
+            "{text}"
+        );
+    }
 }

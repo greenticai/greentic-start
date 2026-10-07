@@ -35,6 +35,10 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(3);
 /// Largest success answer read from the door (its answers are a few hundred
 /// bytes).
 const MAX_ANSWER_BYTES: usize = 64 * 1024;
+/// Largest error answer read for its code.
+const MAX_ERROR_BYTES: usize = 8 * 1024;
+const PURPOSE_NOT_GRANTED: &str = "purpose_not_granted";
+const NOT_FOUND_CODE: &str = "not_found";
 
 pub(crate) struct PutRequest<'a> {
     pub name: &'a str,
@@ -58,12 +62,18 @@ pub(crate) struct Stored {
 pub(crate) enum StoreError {
     #[error("the artifact door rejected this unit's credential ({0})")]
     Rejected(u16),
+    /// `403 purpose_not_granted`: the token is valid and carries no
+    /// `artifacts` purpose. Any other `403` is [`StoreError::Rejected`].
+    #[error("this unit's credential carries no artifacts purpose")]
+    NotGranted,
     #[error("the artifact door refused the file as too large")]
     TooLarge,
     #[error("the artifact door does not accept this file type")]
     Unsupported,
     #[error("the artifact quota for this conversation is exhausted")]
     Quota,
+    /// `404 not_found`, written by the door itself. A `404` without that code
+    /// (no such route, a proxy page) is [`StoreError::Unavailable`].
     #[error("the artifact door has no such artifact")]
     NotFound,
     #[error("the artifact door is unavailable: {0}")]
@@ -193,10 +203,17 @@ impl HttpArtifactStore {
             | StatusCode::GATEWAY_TIMEOUT => {
                 return Attempt::Retry(unavailable(), retry_after(response.headers()));
             }
-            s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
-                Err(StoreError::Rejected(s.as_u16()))
-            }
-            StatusCode::NOT_FOUND => Err(StoreError::NotFound),
+            StatusCode::UNAUTHORIZED => Err(StoreError::Rejected(401)),
+            StatusCode::FORBIDDEN => match door_code(response).await.as_deref() {
+                Some(PURPOSE_NOT_GRANTED) => Err(StoreError::NotGranted),
+                _ => Err(StoreError::Rejected(403)),
+            },
+            StatusCode::NOT_FOUND => match door_code(response).await.as_deref() {
+                Some(NOT_FOUND_CODE) => Err(StoreError::NotFound),
+                _ => Err(StoreError::Unavailable(
+                    "the door answered 404 without its own error code".into(),
+                )),
+            },
             StatusCode::PAYLOAD_TOO_LARGE => Err(StoreError::TooLarge),
             StatusCode::UNSUPPORTED_MEDIA_TYPE => Err(StoreError::Unsupported),
             StatusCode::UNPROCESSABLE_ENTITY => Err(StoreError::Quota),
@@ -235,9 +252,10 @@ impl ArtifactStore for HttpArtifactStore {
 
     async fn probe(&self) -> Result<(), StoreError> {
         // A get for a well-formed id that cannot exist (the admin refuses a
-        // malformed one with `400 invalid_id` before any lookup): 404 proves the door is up and the
-        // token is accepted; 401/403 prove the opposite (403 = no `artifacts`
-        // purpose).
+        // malformed one with `400 invalid_id` before any lookup): the door's
+        // own `404 not_found` proves it is up and accepts the token; a bare
+        // 404 is no door at all; 401/403 prove the opposite (`403
+        // purpose_not_granted` = no `artifacts` purpose).
         match self
             .send(&get_url(&self.door), &GetBody { id: PROBE_ID })
             .await
@@ -259,6 +277,23 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .parse()
         .ok()?;
     Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER))
+}
+
+/// The door's own error code (`{"error":{"code":"…"}}`), or `None` for any
+/// other body. Only compared against known codes; never put in a message.
+async fn door_code(response: reqwest::Response) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        error: Inner,
+    }
+    #[derive(serde::Deserialize)]
+    struct Inner {
+        code: String,
+    }
+    let raw = read_capped_body(response, MAX_ERROR_BYTES).await.ok()?;
+    serde_json::from_slice::<Body>(&raw)
+        .ok()
+        .map(|b| b.error.code)
 }
 
 /// A success answer, read chunk by chunk and refused past `cap` bytes.

@@ -460,8 +460,9 @@ fn store_note(err: StoreError) -> Note {
             "quota_exceeded",
             "the storage quota for this conversation is used up",
         ),
-        StoreError::Rejected(_) | StoreError::Unavailable(_) | StoreError::NotFound => {
-            Note::new("door_unavailable", "it could not be stored right now")
-        }
+        StoreError::Rejected(_)
+        | StoreError::NotGranted
+        | StoreError::Unavailable(_)
+        | StoreError::NotFound => Note::new("door_unavailable", "it could not be stored right now"),
     }
 }

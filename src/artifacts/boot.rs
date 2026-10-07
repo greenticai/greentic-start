@@ -5,7 +5,7 @@
 //! cleartext off the host, cannot be reached, or rejects the token refuses
 //! activation with a message naming the door. There is no in-memory or
 //! "attachments off" fallback for those; the only way a unit with a metering
-//! block runs without attachments is the door saying `403`, i.e. its token
+//! block runs without attachments is the door saying `403 purpose_not_granted`, i.e. its token
 //! never carried the `artifacts` purpose (the unit did not opt in).
 
 use crate::interop::metering::MeteringConfig;
@@ -82,12 +82,14 @@ fn is_safe(url: &str) -> bool {
 pub(crate) enum DoorProbe {
     /// The door is up and the token carries the `artifacts` purpose.
     Enabled,
-    /// The door answered `403`: the token has no `artifacts` purpose, so this
-    /// unit never asked for attachments. It activates without them.
+    /// The door answered `403 purpose_not_granted`: the token has no
+    /// `artifacts` purpose, so this unit never asked for attachments. It
+    /// activates without them (warned once, here).
     NotGranted,
 }
 
-/// Probe the door once at activation. Anything but success or `403` refuses
+/// Probe the door once at activation. Anything but the door's own `404
+/// not_found` or `403 purpose_not_granted` refuses
 /// activation: an unreachable door, a `401` (a bad token is a
 /// misconfiguration, not an opt-out), a `5xx`. The error names the door and
 /// never the token.
@@ -97,7 +99,13 @@ pub(crate) async fn probe_door(
 ) -> anyhow::Result<DoorProbe> {
     match store.probe().await {
         Ok(()) => Ok(DoorProbe::Enabled),
-        Err(StoreError::Rejected(403)) => Ok(DoorProbe::NotGranted),
+        Err(StoreError::NotGranted) => {
+            tracing::warn!(
+                "this unit's credential carries no artifacts purpose; inbound attachments are \
+                 disabled and each one is reported to the agent as not received"
+            );
+            Ok(DoorProbe::NotGranted)
+        }
         Err(err) => Err(anyhow::anyhow!(
             "the artifacts door `{door_url}` is not usable: {err}; refusing to serve, because \
              inbound files would otherwise be lost without a trace"

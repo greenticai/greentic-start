@@ -41,6 +41,7 @@ pub(super) fn request(bytes: &[u8]) -> PutRequest<'_> {
 pub(super) fn kind(err: &StoreError) -> &'static str {
     match err {
         StoreError::Rejected(_) => "Rejected",
+        StoreError::NotGranted => "NotGranted",
         StoreError::TooLarge => "TooLarge",
         StoreError::Unsupported => "Unsupported",
         StoreError::Quota => "Quota",
@@ -88,7 +89,7 @@ async fn final_statuses_map_to_typed_errors_without_retry() {
         ("HTTP/1.1 400 Bad Request", "Unavailable"),
         ("HTTP/1.1 401 Unauthorized", "Rejected"),
         ("HTTP/1.1 403 Forbidden", "Rejected"),
-        ("HTTP/1.1 404 Not Found", "NotFound"),
+        ("HTTP/1.1 404 Not Found", "Unavailable"),
         ("HTTP/1.1 413 Payload Too Large", "TooLarge"),
         ("HTTP/1.1 415 Unsupported Media Type", "Unsupported"),
         ("HTTP/1.1 422 Unprocessable Entity", "Quota"),
@@ -99,6 +100,45 @@ async fn final_statuses_map_to_typed_errors_without_retry() {
         let err = client(&stub).put(request(b"x")).await.unwrap_err();
         assert_eq!(kind(&err), want, "{status}");
         assert_eq!(stub.count(), 1, "{status} must not be retried");
+    }
+}
+
+pub(super) fn coded(code: &str) -> String {
+    format!(r#"{{"error":{{"code":"{code}"}}}}"#)
+}
+
+#[tokio::test]
+async fn the_doors_own_error_code_decides_403_and_404() {
+    let cases = [
+        (
+            "HTTP/1.1 403 Forbidden",
+            coded("purpose_not_granted"),
+            "NotGranted",
+        ),
+        ("HTTP/1.1 403 Forbidden", coded("forbidden"), "Rejected"),
+        (
+            "HTTP/1.1 403 Forbidden",
+            "<html>proxy</html>".to_string(),
+            "Rejected",
+        ),
+        ("HTTP/1.1 404 Not Found", coded("not_found"), "NotFound"),
+        // A 404 the door did not write (no route, a proxy page) is not
+        // "this artifact does not exist".
+        ("HTTP/1.1 404 Not Found", "{}".to_string(), "Unavailable"),
+        (
+            "HTTP/1.1 404 Not Found",
+            coded("route_not_found"),
+            "Unavailable",
+        ),
+    ];
+    for (status, body, want) in cases {
+        let stub = StubAdmin::answering(status, "", &body).await;
+        let err = client(&stub).put(request(b"x")).await.unwrap_err();
+        assert_eq!(kind(&err), want, "{status} {body}");
+        assert!(
+            !format!("{err}").contains("proxy"),
+            "no body text in errors"
+        );
     }
 }
 
@@ -202,8 +242,13 @@ async fn an_unreadable_success_is_unavailable() {
 
 #[tokio::test]
 async fn probe_accepts_404_and_refuses_auth_failures() {
-    let ok = StubAdmin::answering("HTTP/1.1 404 Not Found", "", "{}").await;
+    let ok = StubAdmin::answering("HTTP/1.1 404 Not Found", "", &coded("not_found")).await;
     assert!(client(&ok).probe().await.is_ok());
+    let no_route = StubAdmin::answering("HTTP/1.1 404 Not Found", "", "{}").await;
+    assert!(
+        client(&no_route).probe().await.is_err(),
+        "a bare 404 is no door"
+    );
     assert!(
         ok.received()
             .join("\n")
