@@ -121,12 +121,17 @@ writes the answer into the dev store it already serves from:
 - Values are never logged or put in an error; a malformed entry writes nothing.
 - A rotation takes effect on the next activation; a `304` on a reload skips the
   write. Paths written on one hydration but absent from the next answer are
-  deleted from the store.
+  deleted from the dev store for real: `SecretsClient::delete` rewrites the store
+  file without the entry (`DevStore::copy_excluding`, under the store's lock,
+  published by atomic rename; no ciphertext survives), serialised against this
+  process's own writes. Another process writing the same file is not covered.
 - **Values may be encrypted by the designer before the admin stores them.** A
   value (after `encoding` is decoded) starting `gtcenc1:` is
   `gtcenc1:` + base64(`nonce(12) || AES-256-GCM ciphertext+tag`), opened with the
   32-byte key (base64) the unit's dev store holds at
-  `secrets://default/<tenant>/_/door/key` (read through the host's secrets
+  `secrets://<ingress env>/<tenant>/_/door/key` first (the deployer's `op secrets put
+  default/_/door/key` writes the `door` category into the store's own env, `local`),
+  then `secrets://default/<tenant>/_/door/key` (read through the host's secrets
   manager before anything is written). AAD =
   `"gtc-door-v1\0" tenant "\0" unit "\0" path`. **Start does not know the
   designer's environment id** (neither the door answer nor the staged ingress

@@ -34,7 +34,8 @@
 //!   before the admin sees it; a decoded value starting with `gtcenc1:` is
 //!   `gtcenc1:` + base64(`nonce(12) || AES-256-GCM ciphertext+tag`), opened with
 //!   the 32-byte key (base64) the unit's dev store holds at
-//!   `secrets://default/<tenant>/_/door/key`. The AAD is
+//!   `secrets://<ingress env>/<tenant>/_/door/key` (the env the deployer writes the
+//!   `door` category into), then `secrets://default/<tenant>/_/door/key`. The AAD is
 //!   `"gtc-door-v1\0" tenant "\0" unit "\0" path`: start does not know the
 //!   designer's environment id (the door answer and the staged ingress document
 //!   carry none), so the env id is NOT part of it. The door does not say whether
@@ -466,7 +467,7 @@ pub(crate) async fn hydrate_unit(
 
     let mut decoded = decode_all(tenant, entries)?;
     if decoded.iter().any(|d| d.value.starts_with(ENC_PREFIX)) {
-        let key = load_door_key(secrets, tenant).await?;
+        let key = load_door_key(secrets, ingress_env, tenant).await?;
         for secret in &mut decoded {
             if secret.value.starts_with(ENC_PREFIX) {
                 secret.value = open_value(&key, tenant, bundle_id, &secret.path, &secret.value)?;
@@ -692,20 +693,49 @@ const NONCE_LEN: usize = 12;
 /// The 32-byte value-sealing key. Deliberately no `Debug`.
 struct DoorKey([u8; 32]);
 
-fn door_key_uri(tenant: &str) -> String {
-    format!("secrets://{ENV_SEGMENT}/{tenant}/_/door/key")
+/// Where the sealing key may live, in the order they are tried. The deployer's
+/// `op secrets put default/_/door/key` lands in the store's own env (`door` is
+/// not in its default-env category list), i.e. the env the ingress document is
+/// read under; `default` is where the runner-scoped categories live.
+fn door_key_uris(ingress_env: &str, tenant: &str) -> Vec<String> {
+    let mut envs = vec![ingress_env];
+    if ingress_env != ENV_SEGMENT {
+        envs.push(ENV_SEGMENT);
+    }
+    envs.into_iter()
+        .map(|env| format!("secrets://{env}/{tenant}/_/door/key"))
+        .collect()
 }
 
-/// Read the key from the same store the host reads. Its address is the only
+/// Read the key from the same store the host reads. Addresses are the only
 /// thing a message may name.
-async fn load_door_key(secrets: &dyn SecretsManager, tenant: &str) -> anyhow::Result<DoorKey> {
-    let uri = door_key_uri(tenant);
-    let raw = secrets.read(&uri).await.map_err(|err| {
-        anyhow::anyhow!(
+async fn load_door_key(
+    secrets: &dyn SecretsManager,
+    ingress_env: &str,
+    tenant: &str,
+) -> anyhow::Result<DoorKey> {
+    let uris = door_key_uris(ingress_env, tenant);
+    let mut last = String::new();
+    let mut found = None;
+    for uri in &uris {
+        match secrets.read(uri).await {
+            Ok(raw) => {
+                found = Some((uri, raw));
+                break;
+            }
+            Err(err) => last = err.to_string(),
+        }
+    }
+    let Some((uri, raw)) = found else {
+        bail!(
             "the secrets door returned encrypted values but the decryption key could not be \
-             read at `{uri}` ({err})"
-        )
-    })?;
+             read at {} ({last})",
+            uris.iter()
+                .map(|uri| format!("`{uri}`"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        );
+    };
     let bad = || {
         anyhow::anyhow!(
             "the secrets door decryption key at `{uri}` is not base64 of exactly 32 bytes"

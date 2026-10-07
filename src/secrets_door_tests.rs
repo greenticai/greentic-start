@@ -779,8 +779,13 @@ fn seal(key: &[u8; 32], tenant: &str, unit: &str, path: &str, plain: &[u8]) -> S
 
 const KEY: [u8; 32] = [42u8; 32];
 
+/// Where the deployer writes `op secrets put default/_/door/key`: the store's
+/// own env (`local`), not `default`.
 fn put_key(store: &MemStore, tenant: &str, key: &[u8]) {
-    store.put(&door_key_uri(tenant), B64.encode(key).as_bytes());
+    store.put(
+        &format!("secrets://{ENV}/{tenant}/_/door/key"),
+        B64.encode(key).as_bytes(),
+    );
 }
 
 async fn encrypted_unit(bundle: &str, entries: Vec<serde_json::Value>) -> (MemStore, StubDoor) {
@@ -879,6 +884,7 @@ async fn a_missing_or_malformed_key_fails_without_echoing_it() {
     let (store, _door) =
         encrypted_unit("enc-nokey", vec![json!({"path":"_/mcp/t","value":sealed})]).await;
     let text = chain(&run(&store, "acme", "enc-nokey").await.unwrap_err());
+    assert!(text.contains("secrets://local/acme/_/door/key"), "{text}");
     assert!(text.contains("secrets://default/acme/_/door/key"), "{text}");
     assert!(store.written().is_empty());
 
@@ -892,4 +898,152 @@ async fn a_missing_or_malformed_key_fails_without_echoing_it() {
     let text = chain(&run(&store, "acme", "enc-shortkey").await.unwrap_err());
     assert!(text.contains("exactly 32 bytes"), "{text}");
     assert!(!text.contains(&B64.encode([1u8; 16])), "{text}");
+}
+
+#[tokio::test]
+async fn the_key_is_found_at_either_env_ingress_env_first() {
+    let sealed = seal(&KEY, "acme", "key-env", "_/mcp/t", b"s3cret");
+    let (store, _door) =
+        encrypted_unit("key-env", vec![json!({"path":"_/mcp/t","value":sealed})]).await;
+    // Only the `default` address holds a key: still found.
+    store.put(
+        "secrets://default/acme/_/door/key",
+        B64.encode(KEY).as_bytes(),
+    );
+    assert_eq!(
+        run(&store, "acme", "key-env").await.unwrap(),
+        Hydration::Written(1)
+    );
+
+    // Both exist: the ingress env's wins (a wrong default one is ignored).
+    let sealed = seal(&KEY, "acme", "key-env2", "_/mcp/t", b"s3cret");
+    let (store, _door) =
+        encrypted_unit("key-env2", vec![json!({"path":"_/mcp/t","value":sealed})]).await;
+    put_key(&store, "acme", &KEY);
+    store.put(
+        "secrets://default/acme/_/door/key",
+        B64.encode([5u8; 32]).as_bytes(),
+    );
+    assert_eq!(
+        run(&store, "acme", "key-env2").await.unwrap(),
+        Hydration::Written(1)
+    );
+}
+
+fn real_store(dir: &tempfile::TempDir) -> crate::secrets_client::SecretsClient {
+    crate::secrets_client::SecretsClient::open_with_path(dir.path().join(".dev.secrets.env"))
+        .expect("open dev store")
+}
+
+async fn stage_real(store: &impl SecretsManager, bundle: &str, door: &StubDoor) {
+    let doc = json!({
+        "v": 1, "tenant_slug": "acme", "secrets_door": true,
+        "metering": { "endpoint": door.endpoint(), "token": TOKEN },
+    });
+    store
+        .write(
+            &crate::ingress_auth::ingress_secret_uri(ENV, "acme", bundle),
+            doc.to_string().as_bytes(),
+        )
+        .await
+        .expect("stage ingress");
+}
+
+#[tokio::test]
+async fn an_encrypted_value_opens_with_a_key_written_the_way_the_deployer_writes_it() {
+    let sealed = seal(&KEY, "acme", "real-key", "_/mcp/t", b"s3cret");
+    let door = serve(vec![ok(json!({
+        "secrets": [{"path": "_/mcp/t", "value": sealed}], "etag": "e"
+    }))])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = real_store(&dir);
+    stage_real(&store, "real-key", &door).await;
+    // `op secrets put default/_/door/key` -> secrets://local/default/_/door/key
+    // (tenant `acme` here, since the hydrate tenant is what the address uses).
+    store
+        .write(
+            &format!("secrets://{ENV}/acme/_/door/key"),
+            B64.encode(KEY).as_bytes(),
+        )
+        .await
+        .unwrap();
+    let policy = fast();
+    assert_eq!(
+        hydrate_unit(&store, ENV, "acme", "real-key", &policy, &policy.budget())
+            .await
+            .unwrap(),
+        Hydration::Written(1)
+    );
+    assert_eq!(
+        store.read("secrets://default/acme/_/mcp/t").await.unwrap(),
+        b"s3cret"
+    );
+}
+
+#[tokio::test]
+async fn the_real_dev_store_really_deletes_stale_secrets() {
+    let door = serve(vec![
+        ok(json!({"secrets":[
+            {"path":"_/mcp/keep","value":"1"},
+            {"path":"_/mcp/drop","value":"2"},
+        ],"etag":"e1"})),
+        ok(json!({"secrets":[{"path":"_/mcp/keep","value":"1b"}],"etag":"e2"})),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = real_store(&dir);
+    stage_real(&store, "real-stale", &door).await;
+    let policy = fast();
+    for _ in 0..2 {
+        hydrate_unit(&store, ENV, "acme", "real-stale", &policy, &policy.budget())
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        store.read("secrets://default/acme/_/mcp/drop").await,
+        Err(SecretError::NotFound(_))
+    ));
+    assert_eq!(
+        store
+            .read("secrets://default/acme/_/mcp/keep")
+            .await
+            .unwrap(),
+        b"1b"
+    );
+    // Everything else in the store survived the rewrite.
+    assert!(
+        store
+            .read(&crate::ingress_auth::ingress_secret_uri(
+                ENV,
+                "acme",
+                "real-stale"
+            ))
+            .await
+            .is_ok()
+    );
+    let litter: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+        .collect();
+    assert!(litter.is_empty(), "no temp file is left behind");
+}
+
+#[tokio::test]
+async fn deleting_an_absent_entry_from_the_real_store_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = real_store(&dir);
+    store
+        .write("secrets://default/acme/_/mcp/a", b"x")
+        .await
+        .unwrap();
+    store
+        .delete("secrets://default/acme/_/mcp/nope")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.read("secrets://default/acme/_/mcp/a").await.unwrap(),
+        b"x"
+    );
 }
