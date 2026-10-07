@@ -12,6 +12,8 @@ pub(crate) mod limits;
 pub(crate) mod pdf_isolation;
 pub(crate) mod pdf_limits;
 pub(crate) mod sniff;
+pub(crate) mod store;
+pub(crate) mod wire;
 
 #[cfg(test)]
 mod extract_tests;
@@ -23,3 +25,5 @@ mod pdf_fixture;
 mod pdf_isolation_tests;
 #[cfg(test)]
 mod sniff_tests;
+#[cfg(test)]
+mod store_tests;

@@ -32,6 +32,11 @@ pub(crate) struct StubAdmin {
 
 impl StubAdmin {
     pub(crate) async fn answering(status_line: &str, extra_headers: &str, body: &str) -> Self {
+        Self::answering_in_turn(&[(status_line, extra_headers, body)]).await
+    }
+
+    /// Answers `responses` in order, one per request; the last one repeats.
+    pub(crate) async fn answering_in_turn(responses: &[(&str, &str, &str)]) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -40,17 +45,30 @@ impl StubAdmin {
         let raw = Arc::new(std::sync::Mutex::new(Vec::new()));
         let counted = Arc::clone(&requests);
         let collected = Arc::clone(&raw);
-        let response = format!(
-            "{status_line}\r\nContent-Type: application/json\r\n{extra_headers}\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
+        let mut turn = 0usize;
+        let responses: Arc<Vec<String>> = Arc::new(
+            responses
+                .iter()
+                .map(|(status_line, extra_headers, body)| {
+                    format!(
+                        "{status_line}\r\nContent-Type: application/json\r\n{extra_headers}\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                })
+                .collect(),
         );
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                let response = response.clone();
+                let response = responses
+                    .get(turn)
+                    .or(responses.last())
+                    .cloned()
+                    .unwrap_or_default();
+                turn += 1;
                 let counted = Arc::clone(&counted);
                 let collected = Arc::clone(&collected);
                 tokio::spawn(async move {
