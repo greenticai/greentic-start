@@ -96,7 +96,8 @@ async fn redirects_are_returned_not_followed() {
 #[tokio::test]
 async fn transport_errors_name_no_url_or_token() {
     let client = AttachmentClient::loopback_for_tests(Duration::from_millis(300)).unwrap();
-    let port = crate::interop::metering::testkit::closed_port().await;
+    let closed = crate::interop::metering::testkit::closed_port().await;
+    let port = closed.port;
     let err = client
         .get(
             &url(&format!("http://127.0.0.1:{port}/file/botSECRET/x")),

@@ -268,3 +268,27 @@ async fn debug_never_names_the_token() {
     let rendered = format!("{port:?}");
     assert!(!rendered.contains(TEST_TOKEN), "{rendered}");
 }
+
+/// A unit whose re-probe ended `purpose_not_granted` keeps the port it was
+/// loaded with; that port now answers `unsupported` at once: no door call, no
+/// warning per call. While the door is merely down, or attachments are on,
+/// the port still asks the door.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_port_of_a_unit_without_the_purpose_answers_unsupported_without_a_door_call() {
+    use super::unit::{Off, UnitAttachments, UnitCell};
+
+    let stub = ok_stub().await;
+    let cell = Arc::new(UnitCell::new(UnitAttachments::Off(Off::DoorUnavailable)));
+    let port = Arc::new(DoorArtifactPort::new(store_for(&stub)).gated_by(&cell));
+    put_blocking(Arc::clone(&port), Some(TEST_TENANT), hey())
+        .await
+        .expect("a door that was down is still asked");
+    assert_eq!(stub.count(), 1);
+
+    cell.set(UnitAttachments::Off(Off::NotGranted));
+    let err = put_blocking(port, Some(TEST_TENANT), hey())
+        .await
+        .expect_err("not granted");
+    assert!(matches!(err, ArtifactPortError::Unsupported), "{err:?}");
+    assert_eq!(stub.count(), 1, "no door call once the unit is not granted");
+}

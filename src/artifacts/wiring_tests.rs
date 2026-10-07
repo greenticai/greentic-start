@@ -69,10 +69,15 @@ fn each_revision_loads_with_the_artifact_access_its_own_activation_decided() {
     };
     let decided = find("crate::artifacts::activate::activate_all(");
     let taken = find("host: unit_artifacts,");
+    // Bound to the revision's own live cell, so a re-probe that ends
+    // `purpose_not_granted` reaches the port it was loaded with.
+    let cell = find("let unit_cell = Arc::new(crate::artifacts::unit::UnitCell::new(unit_state));");
+    let bound = find("unit_artifacts.map(|access| access.bound_to(&unit_cell));");
     let passed =
         find("                unit_artifacts.as_ref(),\n            )\n            .await;");
     let loaded = find("let runtime = TenantRuntime::load_revision_with(");
     assert!(decided < taken && taken < passed && passed < loaded);
+    assert!(taken < cell && cell < bound && bound < passed);
     for host_wide in ["with_ext_artifact_port", "with_artifact_reader"] {
         assert!(
             !BOOT.contains(host_wide),

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -55,7 +55,8 @@ async fn no_metering_block_means_no_door() {
 /// not take the unit down: it serves without attachments and recovers.
 #[tokio::test]
 async fn a_dead_door_runs_the_unit_without_attachments_and_recovers_later() {
-    let got = activate_at(closed_port().await)
+    let closed = closed_port().await;
+    let got = activate_at(closed.port)
         .await
         .expect("a door that is down is not a misconfiguration");
     assert!(matches!(
@@ -163,21 +164,22 @@ async fn an_enabled_units_reader_uses_the_probed_door_and_the_staged_token() {
     assert!(last.contains(&format!("Bearer {TEST_TOKEN}")), "{last}");
 }
 
-/// Revisions are probed side by side: one hanging door per revision costs
-/// one budget in total, not one per revision.
-#[tokio::test]
+/// Revisions are probed side by side (at most `PROBE_CONCURRENCY` at once):
+/// four hanging doors cost two budgets in total, not four. Virtual time, so
+/// a loaded machine cannot make it flaky.
+#[tokio::test(start_paused = true)]
 async fn revisions_are_probed_in_parallel_and_each_probe_is_bounded() {
     let mut items = Vec::new();
     for n in 0..4 {
         items.push((n, format!("rev-{n}"), Some(staged_at(silent_peer().await))));
     }
     let budget = Duration::from_millis(500);
-    let started = Instant::now();
+    let started = tokio::time::Instant::now();
     let got = within_ceiling(activate_all(items, Arc::new(NoSecrets), budget))
         .await
         .expect("hanging doors are unavailable, not refusals");
     assert!(
-        started.elapsed() < Duration::from_millis(1500),
+        started.elapsed() <= budget * 2 + Duration::from_millis(100),
         "took {:?}",
         started.elapsed()
     );

@@ -74,7 +74,8 @@ async fn a_failing_telegram_download_never_prints_the_bot_token() {
 
 #[tokio::test]
 async fn a_refused_connection_to_telegram_never_prints_the_bot_token() {
-    let port = closed_port().await;
+    let closed = closed_port().await;
+    let port = closed.port;
     let r = reference();
     let err = fetcher_against(format!("http://127.0.0.1:{port}"))
         .fetch(&origin_of(&r), &r)

@@ -87,7 +87,8 @@ async fn probe(stub_url: &str) -> anyhow::Result<DoorProbe> {
 /// without attachments while the door recovers.
 #[tokio::test]
 async fn a_dead_door_is_unavailable_not_a_refusal() {
-    let url = format!("http://127.0.0.1:{}/ingest/artifacts", closed_port().await);
+    let closed = closed_port().await;
+    let url = format!("http://127.0.0.1:{}/ingest/artifacts", closed.port);
     assert!(matches!(
         probe(&url).await.unwrap(),
         DoorProbe::Unavailable(_)

@@ -96,7 +96,7 @@ fn is_safe(url: &str) -> bool {
 }
 
 /// What the boot probe found.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DoorProbe {
     /// The door is up and the token carries the `artifacts` purpose.
     Enabled,

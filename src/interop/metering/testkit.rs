@@ -167,16 +167,26 @@ pub(crate) async fn silent_peer() -> u16 {
     port
 }
 
-/// A loopback port with nothing listening on it, so a connection to it is
-/// REFUSED rather than dropped — the one transport failure that needs no
-/// waiting at all.
-pub(crate) async fn closed_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
+/// A loopback port nothing listens on, so a connection to it is REFUSED
+/// rather than dropped — the one transport failure that needs no waiting at
+/// all. The port stays BOUND (never listening) for as long as the returned
+/// guard lives, so no other test or process can take it in between: drop the
+/// guard only when the test is done.
+pub(crate) struct ClosedPort {
+    pub(crate) port: u16,
+    _held: tokio::net::TcpSocket,
+}
+
+pub(crate) async fn closed_port() -> ClosedPort {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket
+        .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
         .expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
-    port
+    let port = socket.local_addr().expect("addr").port();
+    ClosedPort {
+        port,
+        _held: socket,
+    }
 }
 
 /// A ready-made queue item aimed at `endpoint`.
@@ -208,6 +218,14 @@ pub(crate) fn metering_for(endpoint: &str) -> MeteringConfig {
         endpoint: endpoint.into(),
         token: MeteringToken(TEST_TOKEN.into()),
         tenant_slug: TEST_TENANT.into(),
+    }
+}
+
+/// [`metering_for`] with a token of the caller's choosing.
+pub(crate) fn metering_with_token(endpoint: &str, token: &str) -> MeteringConfig {
+    MeteringConfig {
+        token: MeteringToken(token.into()),
+        ..metering_for(endpoint)
     }
 }
 

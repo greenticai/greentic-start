@@ -680,6 +680,7 @@ pub(crate) async fn activate_runtime_config(
                 crate::artifacts::recovery::RECOVERY_BACKOFF,
             );
         }
+        let unit_artifacts = unit_artifacts.map(|access| access.bound_to(&unit_cell));
         attachments.insert((deployment_id, revision_id), unit_cell);
 
         // The agent's artifact reader and the extensions' artifact port come

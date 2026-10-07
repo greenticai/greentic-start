@@ -103,3 +103,31 @@ async fn an_unusable_token_builds_no_reader_and_debug_never_names_the_token() {
     let rendered = format!("{:?}", access(&stub, "gtm_secret-token"));
     assert!(!rendered.contains("gtm_secret-token"), "{rendered}");
 }
+
+/// The port a unit is loaded with follows the unit's LIVE decision: bound to
+/// a cell that turns `NotGranted`, it answers `unsupported` without a call.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bound_port_follows_the_units_live_decision() {
+    use greentic_ext_runtime::host_ports::ArtifactPortError;
+
+    use super::unit::{Off, UnitAttachments, UnitCell};
+
+    let stub = StubAdmin::answering("HTTP/1.1 200 OK", "", "{}").await;
+    let cell = Arc::new(UnitCell::new(UnitAttachments::Off(Off::NotGranted)));
+    let port = access(&stub, "gtm_token-a").bound_to(&cell).port();
+    let ctx = HostCallContext {
+        tenant: Some(TEST_TENANT.into()),
+        ..Default::default()
+    };
+    let request = ArtifactPutRequest {
+        bytes: b"hey".to_vec(),
+        mime_type: "text/plain".into(),
+        name: "a.txt".into(),
+    };
+    let err = tokio::task::spawn_blocking(move || port.put("greentic.media", &ctx, request))
+        .await
+        .expect("join")
+        .expect_err("not granted");
+    assert!(matches!(err, ArtifactPortError::Unsupported), "{err:?}");
+    assert_eq!(stub.count(), 0);
+}

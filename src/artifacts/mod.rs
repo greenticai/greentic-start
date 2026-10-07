@@ -35,6 +35,8 @@ pub(crate) mod unserved;
 pub(crate) mod wire;
 
 #[cfg(test)]
+mod activate_dedup_tests;
+#[cfg(test)]
 mod activate_tests;
 #[cfg(test)]
 mod boot_tests;

@@ -17,13 +17,14 @@
 //!   runs on a runtime that may be gone by the time an extension runs), and
 //!   refuses a current-thread runtime or no runtime instead of panicking.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use greentic_ext_runtime::host_ports::{
     ArtifactPort, ArtifactPortError, ArtifactPutRequest, HostCallContext,
 };
 
 use super::store::{ArtifactStore, PutRequest, StoreError, is_artifact_id};
+use super::unit::{Off, UnitAttachments, UnitCell};
 use crate::operator_log;
 
 /// Largest file an extension may store (the door's per-artifact cap).
@@ -35,6 +36,10 @@ const FALLBACK_NAME: &str = "file";
 
 pub(crate) struct DoorArtifactPort {
     store: Arc<dyn ArtifactStore>,
+    /// The unit's live decision. A re-probe that ends `purpose_not_granted`
+    /// replaces it after the port was installed; from then on the port says
+    /// `unsupported` without asking the door (and without a warning per call).
+    unit: Option<Weak<UnitCell>>,
 }
 
 impl std::fmt::Debug for DoorArtifactPort {
@@ -45,7 +50,20 @@ impl std::fmt::Debug for DoorArtifactPort {
 
 impl DoorArtifactPort {
     pub(crate) fn new(store: Arc<dyn ArtifactStore>) -> Self {
-        Self { store }
+        Self { store, unit: None }
+    }
+
+    /// Reads `cell` on every call (see [`Self::unit`]).
+    pub(crate) fn gated_by(mut self, cell: &Arc<UnitCell>) -> Self {
+        self.unit = Some(Arc::downgrade(cell));
+        self
+    }
+
+    fn not_granted(&self) -> bool {
+        self.unit
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|cell| matches!(*cell.current(), UnitAttachments::Off(Off::NotGranted)))
     }
 }
 
@@ -67,6 +85,9 @@ impl ArtifactPort for DoorArtifactPort {
         ctx: &HostCallContext,
         request: ArtifactPutRequest,
     ) -> Result<String, ArtifactPortError> {
+        if self.not_granted() {
+            return Err(ArtifactPortError::Unsupported);
+        }
         if ctx
             .tenant
             .as_deref()
