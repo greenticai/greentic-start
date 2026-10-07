@@ -20,6 +20,7 @@ use serde::Serialize;
 use tokio::sync::Semaphore;
 
 use super::wire::{GetBody, PutBody, PutResponse, get_url, put_url};
+pub(crate) use super::wire::{PROBE_ID, is_artifact_id};
 
 pub(crate) const ARTIFACTS_SEGMENT: &str = "artifacts";
 /// Requests in flight per client.
@@ -204,6 +205,11 @@ impl ArtifactStore for HttpArtifactStore {
             .json()
             .await
             .map_err(|_| StoreError::Unavailable("the door's answer was unreadable".into()))?;
+        if !is_artifact_id(&parsed.id) {
+            return Err(StoreError::Unavailable(
+                "the door answered a malformed artifact id".into(),
+            ));
+        }
         Ok(Stored {
             id: parsed.id,
             sha256: parsed.sha256,
@@ -214,16 +220,12 @@ impl ArtifactStore for HttpArtifactStore {
     }
 
     async fn probe(&self) -> Result<(), StoreError> {
-        // A get for an id that cannot exist: 404 proves the door is up and the
+        // A get for a well-formed id that cannot exist (the admin refuses a
+        // malformed one with `400 invalid_id` before any lookup): 404 proves the door is up and the
         // token is accepted; 401/403 prove the opposite (403 = no `artifacts`
         // purpose).
         match self
-            .send(
-                &get_url(&self.door),
-                &GetBody {
-                    id: "artifact://probe",
-                },
-            )
+            .send(&get_url(&self.door), &GetBody { id: PROBE_ID })
             .await
         {
             Ok(_) | Err(StoreError::NotFound) => Ok(()),

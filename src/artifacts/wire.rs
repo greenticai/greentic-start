@@ -6,6 +6,21 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use serde::{Deserialize, Serialize};
 
+const ID_SCHEME: &str = "artifact://";
+
+/// A well-formed id that no artifact can have (all-zero digest): the probe
+/// asks for it so the admin's id check passes and the lookup answers `404`.
+pub(crate) const PROBE_ID: &str =
+    "artifact://0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The admin's id rule (`media::id::parse_id`): `artifact://` + exactly 64
+/// lowercase hex characters.
+pub(crate) fn is_artifact_id(id: &str) -> bool {
+    id.strip_prefix(ID_SCHEME).is_some_and(|hex| {
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
 pub(super) fn put_url(door: &str) -> String {
     format!("{}/put", door.trim_end_matches('/'))
 }

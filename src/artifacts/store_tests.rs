@@ -9,7 +9,8 @@ use crate::interop::metering::testkit::{StubAdmin, TEST_TOKEN, silent_peer};
 use super::store::*;
 
 const OK: &str = "HTTP/1.1 200 OK";
-const OK_BODY: &str = r#"{"id":"artifact://abc","sha256":"ff","size_bytes":3,"kind":"document","mime_type":"text/plain"}"#;
+const OK_ID: &str = "artifact://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const OK_BODY: &str = r#"{"id":"artifact://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","sha256":"ff","size_bytes":3,"kind":"document","mime_type":"text/plain"}"#;
 
 fn client_for(url: &str) -> HttpArtifactStore {
     HttpArtifactStore::new(
@@ -50,7 +51,7 @@ fn kind(err: &StoreError) -> &'static str {
 async fn put_posts_to_put_with_bearer_base64_and_conversation() {
     let stub = StubAdmin::answering(OK, "", OK_BODY).await;
     let stored = client(&stub).put(request(b"hey")).await.unwrap();
-    assert_eq!(stored.id, "artifact://abc");
+    assert_eq!(stored.id, OK_ID);
     assert_eq!(stored.kind, "document");
     assert_eq!(stored.mime_type, "text/plain");
     let raw = stub.received().join("\n");
@@ -112,7 +113,7 @@ async fn retryable_statuses_are_retried_then_succeed() {
         ])
         .await;
         let stored = client(&stub).put(request(b"x")).await.unwrap();
-        assert_eq!(stored.id, "artifact://abc", "{status}");
+        assert_eq!(stored.id, OK_ID, "{status}");
         assert_eq!(stub.count(), 2, "{status}");
     }
 }
@@ -267,4 +268,94 @@ async fn slow_door() -> (String, Arc<AtomicUsize>) {
         }
     });
     (format!("http://127.0.0.1:{port}/ingest"), max_seen)
+}
+
+// --- Artifact ids, as the admin parses them ----------------------------------
+
+/// The admin's `media::id::parse_id`, copied verbatim (greentic-designer-admin,
+/// `src/media/id.rs`): `artifact://` + exactly 64 lowercase hex characters.
+fn admin_parse_id(id: &str) -> Option<&str> {
+    let hex = id.strip_prefix("artifact://")?;
+    (hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))).then_some(hex)
+}
+
+#[test]
+fn the_probe_id_is_well_formed_for_the_admin() {
+    assert!(admin_parse_id(PROBE_ID).is_some(), "{PROBE_ID}");
+}
+
+#[test]
+fn the_client_id_rule_matches_the_admins() {
+    let good = format!("artifact://{}", "a1".repeat(32));
+    for id in [
+        good.as_str(),
+        PROBE_ID,
+        OK_ID,
+        "artifact://probe",
+        "artifact://",
+        &format!("artifact://{}", "A1".repeat(32)),
+        &format!("artifact://{}", "a".repeat(63)),
+        &format!("artifact://{}", "a".repeat(65)),
+        &format!("artifact:/{}", "a".repeat(64)),
+        &format!(" artifact://{}", "a".repeat(64)),
+        &format!("artifact://{}é", "a".repeat(62)),
+        &format!("artifact://{}g", "a".repeat(63)),
+    ] {
+        assert_eq!(is_artifact_id(id), admin_parse_id(id).is_some(), "{id:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_probe_passes_a_door_that_validates_ids_like_the_admin() {
+    let (url, ids) = admin_like_get_door().await;
+    client_for(&url).probe().await.unwrap();
+    assert_eq!(ids.lock().unwrap().as_slice(), [PROBE_ID.to_string()]);
+}
+
+#[tokio::test]
+async fn a_put_answer_with_a_malformed_id_is_refused() {
+    let stub = StubAdmin::answering(
+        OK,
+        "",
+        r#"{"id":"artifact://abc","sha256":"ff","size_bytes":3,"kind":"document","mime_type":"text/plain"}"#,
+    )
+    .await;
+    let err = client(&stub).put(request(b"x")).await.unwrap_err();
+    assert_eq!(kind(&err), "Unavailable");
+}
+
+/// A `/get` door that behaves like the admin's: `400 invalid_id` for an id
+/// `parse_id` refuses, `404 not_found` for a well-formed id it does not hold.
+async fn admin_like_get_door() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&ids);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16384];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                let raw = String::from_utf8_lossy(&buf[..read]).to_string();
+                let body = raw.split("\r\n\r\n").nth(1).unwrap_or_default();
+                let id = serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|v| v["id"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                let (status, answer) = if admin_parse_id(&id).is_some() {
+                    ("404 Not Found", r#"{"error":{"code":"not_found"}}"#)
+                } else {
+                    ("400 Bad Request", r#"{"error":{"code":"invalid_id"}}"#)
+                };
+                seen.lock().unwrap().push(id);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}/ingest/artifacts"), ids)
 }
