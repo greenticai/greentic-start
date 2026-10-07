@@ -271,3 +271,41 @@ fn an_unparseable_location_is_refused() {
         Blocked::BadLocation
     );
 }
+
+#[test]
+fn a_telegram_download_follows_no_redirect_at_all() {
+    // The bot token is in the URL path, so even a same-host hop is refused.
+    let from = url("https://api.telegram.org/file/bot123:abc/photos/x.jpg");
+    for location in [
+        "/file/bot123:abc/photos/y.jpg",
+        "https://api.telegram.org/elsewhere",
+        "https://tenant.sharepoint.com/f",
+    ] {
+        assert_eq!(
+            prod()
+                .redirect(&from, location, Some("TELEGRAM_BOT_TOKEN"))
+                .unwrap_err(),
+            Blocked::NoRedirect,
+            "{location}"
+        );
+    }
+}
+
+#[test]
+fn fragment_backslash_and_percent_encoding_tricks_resolve_to_the_real_host() {
+    let p = prod();
+    for u in [
+        "https://evil.com#@files.slack.com/x",
+        "https://evil.com\\@files.slack.com/x",
+        "https://evil.com\\files.slack.com/x",
+        "https://evil.com?@files.slack.com/x",
+        "https://files.slack.com%2eevil.example/x",
+    ] {
+        assert_eq!(p.check(&url(u), SLACK), Err(Blocked::HostNotAllowed), "{u}");
+    }
+    // Percent-encoding of the real host decodes to the real host, which is
+    // also the host the client connects to.
+    let encoded = url("https://files%2eslack%2ecom/x");
+    assert_eq!(encoded.host_str(), Some("files.slack.com"));
+    assert!(p.check(&encoded, SLACK).is_ok());
+}

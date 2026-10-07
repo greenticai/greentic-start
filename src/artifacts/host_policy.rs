@@ -32,6 +32,11 @@ const CREDENTIAL_HOSTS: &[(&str, &[&str])] = &[
     ("TELEGRAM_BOT_TOKEN", &["api.telegram.org"]),
 ];
 
+/// Credentials carried IN the download URL (Telegram puts the bot token in the
+/// path), so a redirect would replay them to wherever it points: never follow
+/// one, whatever the target.
+const NO_REDIRECT_CREDENTIALS: &[&str] = &["TELEGRAM_BOT_TOKEN"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Blocked {
     NotHttps,
@@ -42,6 +47,8 @@ pub(crate) enum Blocked {
     UnknownCredential,
     /// A redirect `Location` that is not a URL.
     BadLocation,
+    /// A redirect for a credential whose URL itself carries the secret.
+    NoRedirect,
 }
 
 /// Where a redirect may go, and whether the credential goes with it.
@@ -137,6 +144,9 @@ impl HostPolicy {
         location: &str,
         credential: Option<&'a str>,
     ) -> Result<Hop<'a>, Blocked> {
+        if credential.is_some_and(|name| NO_REDIRECT_CREDENTIALS.contains(&name)) {
+            return Err(Blocked::NoRedirect);
+        }
         let url = from.join(location).map_err(|_| Blocked::BadLocation)?;
         if let Some(name) = credential
             && self.check(&url, Some(name)).is_ok()
