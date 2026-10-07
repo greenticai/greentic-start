@@ -47,6 +47,7 @@ pub(crate) mod runtime_meter;
 mod sink;
 #[cfg(test)]
 pub(crate) mod testkit;
+pub(crate) mod user_ledger;
 
 use std::sync::Arc;
 use std::sync::Mutex;

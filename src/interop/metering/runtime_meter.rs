@@ -67,6 +67,7 @@ use greentic_runner_host::runtime::RevisionHostOptions;
 use super::MeteringConfig;
 use super::approval_inbox::approval_inbox_target;
 use super::run_outcome::run_outcome_sink;
+use super::user_ledger::user_ledger_target;
 use crate::operator_log;
 
 /// Build the runner meter for one unit, or `None` when the unit stages no
@@ -104,13 +105,14 @@ pub(crate) struct UnitHostOptions {
     pub meters_usage: bool,
 }
 
-/// [`worker_usage_meter`], [`super::run_outcome::run_outcome_sink`] and
-/// [`super::approval_inbox::approval_inbox_target`], folded into
+/// [`worker_usage_meter`], [`super::run_outcome::run_outcome_sink`],
+/// [`super::approval_inbox::approval_inbox_target`] and
+/// [`super::user_ledger::user_ledger_target`], folded into
 /// [`RevisionHostOptions`], with each refusal turned into one operator line and
 /// that part left out.
 ///
-/// The three are decided independently: a unit whose run-outcome or approval
-/// doors cannot be derived still records its usage, and the reverse. An absent block yields
+/// The four are decided independently: a unit whose run-outcome, approval or
+/// ledger doors cannot be derived still records its usage, and the reverse. An absent block yields
 /// `RevisionHostOptions::default()`, which is byte-for-byte what
 /// `TenantRuntime::load_revision` did.
 pub(crate) fn host_options_for_unit(
@@ -166,6 +168,21 @@ pub(crate) fn host_options_for_unit(
                     "the HTTP approval inbox for unit `{bundle_id}` is off: {err}; an approval \
                      that needs a human fails at its node unless the NATS approval rail is \
                      configured"
+                ),
+            );
+        }
+    }
+    match user_ledger_target(metering) {
+        Ok(Some(target)) => options = options.with_user_ledger(target),
+        Ok(None) => {}
+        Err(err) => {
+            // `UserLedgerRefusal`'s messages name a field or a URL, never the
+            // token.
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "the per-end-user ledger for unit `{bundle_id}` is off: {err}; the \
+                     revision runs without reading or writing it"
                 ),
             );
         }

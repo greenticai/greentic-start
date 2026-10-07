@@ -2686,9 +2686,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-aw-runtime"
-version = "1.2.0-dev.37349538821"
+version = "1.2.0-dev.37554921045"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "def03ed5db83bc328dd73ccdea442f222f2cd47bcffbf99259dc45b210d82fe7"
+checksum = "1971461919eb9fe9150589273c3849aaffc38b6b60b34b15e3ef20d7fed6491c"
 dependencies = [
  "anyhow",
  "async-nats 0.46.0",
@@ -2724,6 +2724,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "unicode-normalization",
  "url",
  "uuid",
  "zip 8.6.0",
@@ -3578,9 +3579,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "1.2.0-dev.37349538821"
+version = "1.2.0-dev.37554921045"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bb5640e5142de309ef21a42988849fbf9f35607e152b03503affee415fb3723"
+checksum = "b78af53066adfbd14e56eb67fc894a3b201a5ff05890e2c051162229ab5c7c6d"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -3599,9 +3600,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "1.2.0-dev.37349538821"
+version = "1.2.0-dev.37554921045"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc590c099d095d821bd2ea9976f271bfe5e44fcf77cf7213ca3b1e8d3a73bd6"
+checksum = "ba5bc5d482fa16fa83fbf9b21ef10566d6a49f0690a5abea01707b5b8c3a816a"
 dependencies = [
  "anyhow",
  "arc-swap",
