@@ -13,18 +13,25 @@ use crate::interop::metering::run_outcome::{SiblingDoorError, sibling_door};
 
 use super::store::{ARTIFACTS_SEGMENT, ArtifactStore, StoreError};
 
+/// No variant carries the endpoint: a staged URL may hold a credential, and a
+/// refusal is logged.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum SelectError {
     #[error(
-        "the metering endpoint `{0}` does not end in `/worker-usage`, so the artifacts door \
-         beside it cannot be derived; refusing to serve"
+        "the metering endpoint does not end in `/worker-usage`, so the artifacts door beside it \
+         cannot be derived; refusing to serve"
     )]
-    Endpoint(String),
+    Endpoint,
     #[error(
-        "the artifacts door `{0}` is not https and not loopback http; refusing to send a token \
-         and refusing to serve"
+        "the artifacts door is not https and not loopback http; refusing to send a token and \
+         refusing to serve"
     )]
-    UnsafeEndpoint(String),
+    UnsafeEndpoint,
+    #[error(
+        "the metering endpoint carries credentials, a query or a fragment; refusing to derive \
+         the artifacts door from it and refusing to serve"
+    )]
+    CarriesSecrets,
 }
 
 /// The door and the token to present to it.
@@ -48,14 +55,20 @@ pub(crate) fn door_for(metering: Option<&MeteringConfig>) -> Result<Option<Door>
     let Some(metering) = metering else {
         return Ok(None);
     };
+    let parsed = reqwest::Url::parse(&metering.endpoint).map_err(|_| SelectError::Endpoint)?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(SelectError::CarriesSecrets);
+    }
     let url = sibling_door(&metering.endpoint, ARTIFACTS_SEGMENT).map_err(|e| match e {
-        SiblingDoorError::Unparseable | SiblingDoorError::NotWorkerUsage => {
-            SelectError::Endpoint(metering.endpoint.clone())
-        }
+        SiblingDoorError::Unparseable | SiblingDoorError::NotWorkerUsage => SelectError::Endpoint,
     })?;
     let url = url.trim_end_matches('/').to_string();
     if !is_safe(&url) {
-        return Err(SelectError::UnsafeEndpoint(url));
+        return Err(SelectError::UnsafeEndpoint);
     }
     Ok(Some(Door {
         url,

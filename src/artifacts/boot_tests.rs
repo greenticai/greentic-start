@@ -30,7 +30,7 @@ fn the_door_is_the_sibling_of_worker_usage() {
 #[test]
 fn a_foreign_endpoint_is_refused_not_guessed() {
     for bad in ["https://admin.example/other", "not a url"] {
-        assert!(matches!(door(bad), Err(SelectError::Endpoint(_))), "{bad}");
+        assert!(matches!(door(bad), Err(SelectError::Endpoint)), "{bad}");
     }
 }
 
@@ -40,11 +40,10 @@ fn cleartext_http_off_the_host_is_refused() {
         "http://admin.example/api/v1/ingest/worker-usage",
         "http://127.0.0.1.evil.example/api/v1/ingest/worker-usage",
         "http://localhost.evil.example/api/v1/ingest/worker-usage",
-        "http://localhost@evil.example/api/v1/ingest/worker-usage",
         "ftp://admin.example/api/v1/ingest/worker-usage",
     ] {
         assert!(
-            matches!(door(bad), Err(SelectError::UnsafeEndpoint(_))),
+            matches!(door(bad), Err(SelectError::UnsafeEndpoint)),
             "{bad}"
         );
     }
@@ -146,5 +145,30 @@ async fn any_other_403_or_404_refuses_activation_naming_the_door() {
             !text.contains(TEST_TOKEN) && !text.contains("no route"),
             "{text}"
         );
+    }
+}
+
+#[test]
+fn a_door_url_with_credentials_or_a_query_is_refused_without_printing_it() {
+    for bad in [
+        "https://user:hunter2@admin.example/api/v1/ingest/worker-usage",
+        "https://hunter2@admin.example/api/v1/ingest/worker-usage",
+        "https://admin.example/api/v1/ingest/worker-usage?key=hunter2",
+        "https://admin.example/api/v1/ingest/worker-usage#hunter2",
+        "http://hunter2@127.0.0.1:9/api/v1/ingest/worker-usage",
+        "http://localhost@evil.example/api/v1/ingest/worker-usage",
+    ] {
+        let err = door(bad).err().unwrap_or_else(|| panic!("{bad} accepted"));
+        let text = err.to_string();
+        assert!(text.contains("refusing to serve"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
+    }
+    // No refusal prints the endpoint it refused.
+    for bad in [
+        "https://admin.example/other",
+        "http://admin.example/api/v1/ingest/worker-usage",
+    ] {
+        let text = door(bad).err().unwrap().to_string();
+        assert!(!text.contains("admin.example"), "{text}");
     }
 }
