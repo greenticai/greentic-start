@@ -117,10 +117,15 @@ pub(crate) struct PublicOnlyResolver {
 }
 
 impl PublicOnlyResolver {
-    pub(crate) fn new() -> Self {
-        Self::with_lookup(SystemLookup)
+    /// Private: the only production use is [`with_public_only_resolver`], so
+    /// no client can hold this resolver without the rest of the safe setup.
+    fn new() -> Self {
+        Self {
+            lookup: std::sync::Arc::new(SystemLookup),
+        }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_lookup(lookup: impl Lookup + 'static) -> Self {
         Self {
             lookup: std::sync::Arc::new(lookup),
@@ -136,4 +141,10 @@ impl Resolve for PublicOnlyResolver {
             Ok(Box::new(addrs.into_iter()) as Addrs)
         })
     }
+}
+
+/// `builder` resolving every name through [`PublicOnlyResolver`]. Used only by
+/// [`super::client::attachment_client`].
+pub(super) fn with_public_only_resolver(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder.dns_resolver(std::sync::Arc::new(PublicOnlyResolver::new()))
 }

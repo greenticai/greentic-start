@@ -94,6 +94,10 @@ impl HostPolicy {
         }
     }
 
+    /// Mandatory for every attachment URL and every redirect hop, before any
+    /// connection: the HTTP connector does not ask the resolver about an
+    /// IP-literal host, so this check is what stops one.
+    /// [`super::client::AttachmentClient::get`] calls it.
     pub(crate) fn check(&self, url: &Url, credential: Option<&str>) -> Result<(), Blocked> {
         #[cfg(test)]
         if self.loopback

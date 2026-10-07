@@ -7,6 +7,7 @@
 // later step; until then only the tests reach them.
 #![allow(dead_code)]
 
+pub(crate) mod client;
 pub(crate) mod dns;
 pub(crate) mod extract;
 pub(crate) mod host_policy;
@@ -17,6 +18,8 @@ pub(crate) mod sniff;
 pub(crate) mod store;
 pub(crate) mod wire;
 
+#[cfg(test)]
+mod client_tests;
 #[cfg(test)]
 mod dns_tests;
 #[cfg(test)]
