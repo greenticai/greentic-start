@@ -67,8 +67,8 @@ fn each_revision_loads_with_the_artifact_access_its_own_activation_decided() {
         );
         BOOT.find(needle).unwrap_or_default()
     };
-    let decided = find("let unit_attachments = crate::artifacts::activate::activate(");
-    let taken = find("let unit_artifacts = unit_attachments.host_access().cloned();");
+    let decided = find("crate::artifacts::activate::activate_all(");
+    let taken = find("host: unit_artifacts,");
     let passed =
         find("                unit_artifacts.as_ref(),\n            )\n            .await;");
     let loaded = find("let runtime = TenantRuntime::load_revision_with(");
@@ -79,4 +79,21 @@ fn each_revision_loads_with_the_artifact_access_its_own_activation_decided() {
             "`{host_wide}` belongs on the unit's RevisionHostOptions, not in revision_boot.rs"
         );
     }
+}
+
+/// A door that is down at boot leaves the revision serving and owes a
+/// background re-probe holding the revision's OWN cell (weakly).
+#[test]
+fn a_revision_whose_door_is_down_gets_a_re_probe_over_its_own_cell() {
+    const BOOT: &str = include_str!("../revision_boot.rs");
+    let spawn = BOOT
+        .find(
+            "        if let Some(recovery) = unit_recovery {\n            \
+             crate::artifacts::recovery::spawn_recovery(\n                Arc::downgrade(&unit_cell),",
+        )
+        .expect("the re-probe is spawned over this revision's cell");
+    let insert = BOOT
+        .find("attachments.insert((deployment_id, revision_id), unit_cell);")
+        .expect("the same cell is what the table serves");
+    assert!(spawn < insert);
 }

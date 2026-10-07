@@ -1,12 +1,16 @@
 //! Which door a unit's artifacts go to, derived from its staged metering
 //! block, and the boot probe that decides whether a revision may serve.
 //!
-//! Fail closed: a door that cannot be derived, would carry the token in
-//! cleartext off the host, cannot be reached, or rejects the token refuses
-//! activation with a message naming the door. There is no in-memory or
-//! "attachments off" fallback for those; the only way a unit with a metering
-//! block runs without attachments is the door saying `403 purpose_not_granted`, i.e. its token
-//! never carried the `artifacts` purpose (the unit did not opt in).
+//! Only a MISCONFIGURATION refuses activation: a door that cannot be derived,
+//! would carry the token in cleartext off the host, or is derived from an
+//! endpoint carrying credentials, and a token the door rejects (`401`). A door
+//! that is merely not usable right now (unreachable, `5xx`, `429`, a bare
+//! `404`, a probe that ran out of time) does not take the unit down: the unit
+//! serves without attachments, every file is reported to the agent as not
+//! read, and a background re-probe turns attachments on once the door
+//! answers (`super::recovery`). The designer refuses to DEPLOY a unit whose
+//! door is missing; this only rides out cold starts and short outages.
+//! `403 purpose_not_granted` means the unit did not opt in.
 
 use crate::interop::metering::MeteringConfig;
 use crate::interop::metering::run_outcome::{SiblingDoorError, sibling_door};
@@ -100,18 +104,23 @@ pub(crate) enum DoorProbe {
     /// `artifacts` purpose, so this unit never asked for attachments. It
     /// activates without them (warned once, here).
     NotGranted,
+    /// The door cannot be used right now; carries a fixed code for the log.
+    Unavailable(&'static str),
 }
 
-/// Probe the door once at activation. Anything but the door's own `404
-/// not_found` or `403 purpose_not_granted` refuses
-/// activation: an unreachable door, a `401` (a bad token is a
-/// misconfiguration, not an opt-out), a `5xx`. The error names the door and
-/// never the token.
+/// Probe the door once, within `budget` end to end (the client's own retries
+/// included). Only a rejected token (`401`) is an error: the door is there and
+/// says the unit's credential is wrong, which no waiting fixes. The error
+/// names the door and never the token.
 pub(crate) async fn probe_door(
     store: &dyn ArtifactStore,
     door_url: &str,
+    budget: std::time::Duration,
 ) -> anyhow::Result<DoorProbe> {
-    match store.probe().await {
+    let Ok(answer) = tokio::time::timeout(budget, store.probe()).await else {
+        return Ok(DoorProbe::Unavailable("timeout"));
+    };
+    match answer {
         Ok(()) => Ok(DoorProbe::Enabled),
         Err(StoreError::NotGranted) => {
             tracing::warn!(
@@ -120,9 +129,15 @@ pub(crate) async fn probe_door(
             );
             Ok(DoorProbe::NotGranted)
         }
-        Err(err) => Err(anyhow::anyhow!(
+        Err(err @ StoreError::Rejected(401)) => Err(anyhow::anyhow!(
             "the artifacts door `{door_url}` is not usable: {err}; refusing to serve, because \
-             inbound files would otherwise be lost without a trace"
+             the unit's credential is wrong and inbound files would otherwise be lost"
         )),
+        Err(StoreError::Rejected(_)) => Ok(DoorProbe::Unavailable("rejected")),
+        Err(StoreError::Unavailable(_)) => Ok(DoorProbe::Unavailable("unavailable")),
+        Err(StoreError::NotFound) => Ok(DoorProbe::Enabled),
+        Err(StoreError::TooLarge | StoreError::Unsupported | StoreError::Quota) => {
+            Ok(DoorProbe::Unavailable("unexpected_answer"))
+        }
     }
 }

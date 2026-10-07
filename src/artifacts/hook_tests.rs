@@ -35,13 +35,6 @@ async fn an_enabled_unit_stores_attachments_under_a_conversation_key() {
             store.clone(),
             FakeFetcher::new(vec![ok(png(1))]),
         )),
-        host: crate::artifacts::host_access::HostArtifactAccess::new(
-            store.clone(),
-            crate::artifacts::boot::Door {
-                url: "https://admin.example/api/v1/ingest/artifacts".into(),
-                token: "gtm_t".into(),
-            },
-        ),
     };
     let mut envs = vec![inline_envelope()];
     prepare(Some(&unit), &mut envs, &slack()).await;
@@ -67,6 +60,10 @@ async fn a_unit_without_attachments_tells_the_agent_and_keeps_no_bytes() {
         (None, "storage"),
         (Some(UnitAttachments::Off(Off::NoDoor)), "storage"),
         (Some(UnitAttachments::Off(Off::NotGranted)), "not enabled"),
+        (
+            Some(UnitAttachments::Off(Off::DoorUnavailable)),
+            "temporarily unavailable",
+        ),
     ] {
         let mut envs = vec![inline_envelope()];
         envs[0].attachments[1].url = Some(forged());

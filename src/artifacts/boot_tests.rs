@@ -4,6 +4,8 @@ use crate::interop::metering::testkit::{StubAdmin, TEST_TOKEN, closed_port, mete
 
 use super::boot::*;
 use super::store::HttpArtifactStore;
+use super::time_testkit::within_ceiling;
+use crate::interop::metering::testkit::silent_peer;
 
 fn door(endpoint: &str) -> Result<Option<Door>, SelectError> {
     door_for(Some(&metering_for(endpoint)))
@@ -75,13 +77,32 @@ fn store_at(url: &str) -> HttpArtifactStore {
         .with_backoff(Duration::from_millis(5))
 }
 
+const BUDGET: Duration = Duration::from_secs(3);
+
+async fn probe(stub_url: &str) -> anyhow::Result<DoorProbe> {
+    within_ceiling(probe_door(&store_at(stub_url), stub_url, BUDGET)).await
+}
+
+/// A door that is down for now is not a misconfiguration: the unit runs
+/// without attachments while the door recovers.
 #[tokio::test]
-async fn a_dead_door_refuses_activation_and_names_it_without_the_token() {
+async fn a_dead_door_is_unavailable_not_a_refusal() {
     let url = format!("http://127.0.0.1:{}/ingest/artifacts", closed_port().await);
-    let err = probe_door(&store_at(&url), &url).await.err().unwrap();
+    assert!(matches!(
+        probe(&url).await.unwrap(),
+        DoorProbe::Unavailable(_)
+    ));
+}
+
+#[tokio::test]
+async fn an_unauthorised_token_refuses_activation_naming_the_door_not_the_token() {
+    let stub = StubAdmin::answering("HTTP/1.1 401 Unauthorized", "", "{}").await;
+    let err = probe(&stub.url)
+        .await
+        .expect_err("a bad token is a misconfiguration");
     let text = format!("{err:#}");
     assert!(
-        text.contains("artifacts door") && text.contains(&url),
+        text.contains("artifacts door") && text.contains(&stub.url),
         "{text}"
     );
     assert!(text.contains("refusing to serve"), "{text}");
@@ -89,63 +110,55 @@ async fn a_dead_door_refuses_activation_and_names_it_without_the_token() {
 }
 
 #[tokio::test]
-async fn an_unauthorised_token_refuses_activation() {
-    let stub = StubAdmin::answering("HTTP/1.1 401 Unauthorized", "", "{}").await;
-    assert!(probe_door(&store_at(&stub.url), &stub.url).await.is_err());
+async fn transient_door_answers_are_unavailable() {
+    for (status, body) in [
+        ("HTTP/1.1 500 Internal Server Error", "{}"),
+        ("HTTP/1.1 502 Bad Gateway", "{}"),
+        ("HTTP/1.1 429 Too Many Requests", "{}"),
+        (
+            "HTTP/1.1 503 Service Unavailable",
+            r#"{"error":{"code":"artifact_busy"}}"#,
+        ),
+        ("HTTP/1.1 404 Not Found", "{}"),
+        ("HTTP/1.1 404 Not Found", "<html>no route</html>"),
+        ("HTTP/1.1 403 Forbidden", "{}"),
+    ] {
+        let stub = StubAdmin::answering(status, "", body).await;
+        assert!(
+            matches!(probe(&stub.url).await.unwrap(), DoorProbe::Unavailable(_)),
+            "{status} {body}"
+        );
+    }
 }
 
+/// A door that accepts the connection and never answers is bounded by the
+/// probe budget, not by the client's per-attempt timeout times its retries.
 #[tokio::test]
-async fn a_failing_door_refuses_activation() {
-    let stub = StubAdmin::answering("HTTP/1.1 500 Internal Server Error", "", "{}").await;
-    assert!(probe_door(&store_at(&stub.url), &stub.url).await.is_err());
+async fn a_hanging_door_is_bounded_by_the_probe_budget() {
+    let url = format!("http://127.0.0.1:{}/ingest/artifacts", silent_peer().await);
+    let store =
+        HttpArtifactStore::new(url.clone(), TEST_TOKEN.into(), Duration::from_secs(30)).unwrap();
+    let started = std::time::Instant::now();
+    let got = within_ceiling(probe_door(&store, &url, Duration::from_millis(300)))
+        .await
+        .unwrap();
+    assert!(matches!(got, DoorProbe::Unavailable("timeout")), "{got:?}");
+    assert!(started.elapsed() < Duration::from_secs(3));
 }
 
 #[tokio::test]
 async fn a_token_without_the_purpose_activates_without_attachments() {
     let body = r#"{"error":{"code":"purpose_not_granted"}}"#;
     let stub = StubAdmin::answering("HTTP/1.1 403 Forbidden", "", body).await;
-    assert_eq!(
-        probe_door(&store_at(&stub.url), &stub.url).await.unwrap(),
-        DoorProbe::NotGranted
-    );
+    assert_eq!(probe(&stub.url).await.unwrap(), DoorProbe::NotGranted);
 }
 
 #[tokio::test]
 async fn a_reachable_door_enables_attachments() {
     let body = r#"{"error":{"code":"not_found"}}"#;
     let stub = StubAdmin::answering("HTTP/1.1 404 Not Found", "", body).await;
-    assert_eq!(
-        probe_door(&store_at(&stub.url), &stub.url).await.unwrap(),
-        DoorProbe::Enabled
-    );
+    assert_eq!(probe(&stub.url).await.unwrap(), DoorProbe::Enabled);
     assert!(stub.count() >= 1, "the probe reached the door");
-}
-
-#[tokio::test]
-async fn any_other_403_or_404_refuses_activation_naming_the_door() {
-    for (status, body) in [
-        ("HTTP/1.1 403 Forbidden", "{}"),
-        (
-            "HTTP/1.1 403 Forbidden",
-            r#"{"error":{"code":"invalid_usage_token"}}"#,
-        ),
-        ("HTTP/1.1 404 Not Found", "{}"),
-        ("HTTP/1.1 404 Not Found", "<html>no route</html>"),
-    ] {
-        let stub = StubAdmin::answering(status, "", body).await;
-        let err = probe_door(&store_at(&stub.url), &stub.url)
-            .await
-            .expect_err(status);
-        let text = format!("{err:#}");
-        assert!(
-            text.contains("artifacts door") && text.contains("refusing to serve"),
-            "{text}"
-        );
-        assert!(
-            !text.contains(TEST_TOKEN) && !text.contains("no route"),
-            "{text}"
-        );
-    }
 }
 
 #[test]

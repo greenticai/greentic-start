@@ -434,6 +434,45 @@ pub(crate) async fn activate_runtime_config(
     let mut meter_decisions =
         crate::interop::metering::runtime_meter::UnitMeterDecisions::default();
     let mut attachments = HashMap::new();
+    // Inbound attachments, decided for every revision (carried ones included)
+    // from the unit's staged metering block, all doors probed side by side
+    // (each probe bounded), before any revision loads. A misconfigured door
+    // refuses the activation; a door that is down for now leaves the unit
+    // serving without attachments until a background re-probe turns them on.
+    let mut activated_attachments = {
+        let mut planned = Vec::with_capacity(rc.revisions.len());
+        for block in &rc.revisions {
+            let meta = deployments
+                .get(block.deployment_id.as_str())
+                .expect("deployment validated in the loop above");
+            let deployment_id = DeploymentId(parse_ulid(&block.deployment_id, "deployment_id")?);
+            let revision_id = RevisionId(parse_ulid(&block.revision_id, "revision_id")?);
+            let unit_metering = meter_decisions
+                .metering_for(
+                    host.secrets_manager().as_ref(),
+                    &secrets_env,
+                    &meta.tenant,
+                    &meta.bundle_id,
+                )
+                .await;
+            planned.push((
+                (deployment_id, revision_id),
+                block.revision_id.clone(),
+                unit_metering,
+            ));
+        }
+        let secrets: Arc<dyn crate::artifacts::fetch::SecretLookup> =
+            Arc::new(crate::artifacts::secrets::HostSecrets::new(
+                host.secrets_manager(),
+                secrets_env.clone(),
+            ));
+        crate::artifacts::activate::activate_all(
+            planned,
+            secrets,
+            crate::artifacts::activate::PROBE_BUDGET,
+        )
+        .await?
+    };
     for block in &rc.revisions {
         // Both lookups are infallible: the validation loop above proved every
         // block's deployment is present, and registered a host config for its
@@ -613,28 +652,15 @@ pub(crate) async fn activate_runtime_config(
         // `Environment` entry the route table's `dep.bundle_id` comes from), so
         // boot and the serve path name the unit from ONE value. It equals
         // `block.bundle_id` by the cross-check in the validation loop above.
-        // Inbound attachments, decided for every revision (carried ones
-        // included) from the unit's staged metering block. A unit that stages
-        // the door and cannot use it does not activate.
-        let unit_metering = meter_decisions
-            .metering_for(
-                host.secrets_manager().as_ref(),
-                &secrets_env,
-                &meta.tenant,
-                &meta.bundle_id,
-            )
-            .await;
-        let unit_attachments = crate::artifacts::activate::activate(
-            &block.revision_id,
-            unit_metering.as_ref(),
-            Arc::new(crate::artifacts::secrets::HostSecrets::new(
-                host.secrets_manager(),
-                secrets_env.clone(),
-            )),
-        )
-        .await?;
+        let crate::artifacts::activate::ActivatedUnit {
+            state: unit_state,
+            host: unit_artifacts,
+            recovery: unit_recovery,
+        } = activated_attachments
+            .remove(&(deployment_id, revision_id))
+            .expect("every revision was activated in the pass above");
         if matches!(
-            unit_attachments,
+            unit_state,
             crate::artifacts::unit::UnitAttachments::Enabled { .. }
         ) {
             operator_log::info(
@@ -645,12 +671,19 @@ pub(crate) async fn activate_runtime_config(
                 ),
             );
         }
-        // The agent's artifact reader and the extensions' artifact port come
-        // from THIS revision's own decision, over the door it just probed:
-        // never another unit's door, never a host-wide port.
-        let unit_artifacts = unit_attachments.host_access().cloned();
-        attachments.insert((deployment_id, revision_id), Arc::new(unit_attachments));
+        let unit_cell = Arc::new(crate::artifacts::unit::UnitCell::new(unit_state));
+        if let Some(recovery) = unit_recovery {
+            crate::artifacts::recovery::spawn_recovery(
+                Arc::downgrade(&unit_cell),
+                recovery,
+                crate::artifacts::recovery::RECOVERY_BACKOFF,
+            );
+        }
+        attachments.insert((deployment_id, revision_id), unit_cell);
 
+        // The agent's artifact reader and the extensions' artifact port come
+        // from THIS revision's own decision, over its own door: never another
+        // unit's door, never a host-wide port.
         let unit_options = meter_decisions
             .options_for_revision(
                 host.secrets_manager().as_ref(),

@@ -2,11 +2,10 @@
 //! the inbound path reads it from.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use greentic_deploy_spec::ids::{DeploymentId, RevisionId};
 
-use super::host_access::HostArtifactAccess;
 use super::ingest::Pipeline;
 
 /// Why a unit runs without attachments. Each is reported to the agent per
@@ -17,6 +16,10 @@ pub(crate) enum Off {
     NoDoor,
     /// The door answered `403 purpose_not_granted`: the unit did not opt in.
     NotGranted,
+    /// The door could not be used at activation (down, `5xx`, `429`, a bare
+    /// `404`, a probe that ran out of time). The unit serves without
+    /// attachments while a background re-probe waits for the door.
+    DoorUnavailable,
 }
 
 impl Off {
@@ -25,27 +28,42 @@ impl Off {
         match self {
             Off::NoDoor => "this worker has no file storage configured",
             Off::NotGranted => "file attachments are not enabled for this worker",
+            Off::DoorUnavailable => "file storage is temporarily unavailable for this worker",
         }
     }
 }
 
 pub(crate) enum UnitAttachments {
-    Enabled {
-        pipeline: Arc<Pipeline>,
-        /// The agent reader and extension port over the SAME door the
-        /// pipeline writes through.
-        host: HostArtifactAccess,
-    },
+    Enabled { pipeline: Arc<Pipeline> },
     Off(Off),
 }
 
-impl UnitAttachments {
-    /// What this unit's runner gets from its door; `None` when attachments
-    /// are off, so the agent gets no reader and extensions no port.
-    pub(crate) fn host_access(&self) -> Option<&HostArtifactAccess> {
-        match self {
-            UnitAttachments::Enabled { host, .. } => Some(host),
-            UnitAttachments::Off(_) => None,
+/// One revision's decision, which a background re-probe may replace once
+/// ([`super::recovery`]): `Off(DoorUnavailable)` -> `Enabled` or
+/// `Off(NotGranted)`. Readers take a snapshot per request.
+pub(crate) struct UnitCell {
+    state: RwLock<Arc<UnitAttachments>>,
+}
+
+impl UnitCell {
+    pub(crate) fn new(state: UnitAttachments) -> Self {
+        Self {
+            state: RwLock::new(Arc::new(state)),
+        }
+    }
+
+    pub(crate) fn current(&self) -> Arc<UnitAttachments> {
+        match self.state.read() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    pub(crate) fn set(&self, state: UnitAttachments) {
+        let next = Arc::new(state);
+        match self.state.write() {
+            Ok(mut guard) => *guard = next,
+            Err(poisoned) => *poisoned.into_inner() = next,
         }
     }
 }
@@ -53,10 +71,10 @@ impl UnitAttachments {
 /// Each loaded revision's decision. A revision missing from it is treated as
 /// [`Off::NoDoor`] by the hook.
 #[derive(Clone, Default)]
-pub(crate) struct AttachmentsTable(Arc<HashMap<(DeploymentId, RevisionId), Arc<UnitAttachments>>>);
+pub(crate) struct AttachmentsTable(Arc<HashMap<(DeploymentId, RevisionId), Arc<UnitCell>>>);
 
 impl AttachmentsTable {
-    pub(crate) fn new(entries: HashMap<(DeploymentId, RevisionId), Arc<UnitAttachments>>) -> Self {
+    pub(crate) fn new(entries: HashMap<(DeploymentId, RevisionId), Arc<UnitCell>>) -> Self {
         Self(Arc::new(entries))
     }
 
@@ -65,7 +83,9 @@ impl AttachmentsTable {
         deployment_id: DeploymentId,
         revision_id: RevisionId,
     ) -> Option<Arc<UnitAttachments>> {
-        self.0.get(&(deployment_id, revision_id)).cloned()
+        self.0
+            .get(&(deployment_id, revision_id))
+            .map(|cell| cell.current())
     }
 }
 
