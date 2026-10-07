@@ -148,8 +148,7 @@ fn supervise(
     let cap = (FRAME.len() + limits.max_chars.saturating_mul(4) + 1) as u64;
     let (sender, answer) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let _ = stdout.take(cap).read_to_end(&mut out);
+        let out = read_capped(stdout, cap).unwrap_or_default();
         let _ = sender.send(out);
     });
 
@@ -181,6 +180,14 @@ fn supervise(
         &String::from_utf8_lossy(text),
         limits.max_chars,
     ))
+}
+
+/// At most `cap` bytes of `reader`: it is never asked for more, so a worker
+/// that floods its output costs the host `cap` bytes, not the flood.
+pub(crate) fn read_capped(reader: impl Read, cap: u64) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    reader.take(cap).read_to_end(&mut out)?;
+    Ok(out)
 }
 
 #[cfg(target_os = "linux")]

@@ -203,3 +203,46 @@ fn frame_for_shell() -> String {
         .unwrap()
         .replace('\n', "\\n")
 }
+
+// --- The bounded read of the worker's answer ---------------------------------
+
+/// An endless stream of `x` that fails the test if anyone asks it for more
+/// than `limit` bytes in total: the read cap must stop asking, not just stop
+/// keeping.
+struct Endless {
+    served: u64,
+    limit: u64,
+}
+
+impl std::io::Read for Endless {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        assert!(
+            self.served + buf.len() as u64 <= self.limit,
+            "asked for {} bytes after {} served",
+            buf.len(),
+            self.served
+        );
+        buf.fill(b'x');
+        self.served += buf.len() as u64;
+        Ok(buf.len())
+    }
+}
+
+#[test]
+fn reading_the_answer_stops_at_the_cap() {
+    let cap = 100_000;
+    let out = read_capped(
+        Endless {
+            served: 0,
+            limit: cap + 8192,
+        },
+        cap,
+    )
+    .unwrap();
+    assert_eq!(out.len() as u64, cap);
+}
+
+#[test]
+fn a_short_answer_is_read_whole() {
+    assert_eq!(read_capped(&b"hello"[..], 100).unwrap(), b"hello");
+}
