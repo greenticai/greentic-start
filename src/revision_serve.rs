@@ -4780,6 +4780,10 @@ fn build_activity(
     endpoint: Option<&str>,
     welcome_hint: Option<WelcomeFlowHint>,
 ) -> Activity {
+    // Every caller of this function hands it JSON a client wrote, so a caller
+    // block in it is a claim, never a verification. Only the provider route
+    // (`envelope_to_activity`) may carry one — see `client_caller`.
+    let payload = &client_caller::without_client_caller(payload);
     let mut activity = match payload.get("text").and_then(Value::as_str) {
         // `Activity::text` keeps ONLY the text. That is right for a plain
         // message and silently lossy for `{"text": …, "metadata": …}` — the
@@ -16157,6 +16161,9 @@ mod interop_ingress_tests;
 
 #[path = "revision_serve/fast2flow_hook.rs"]
 mod fast2flow_hook;
+
+#[path = "revision_serve/client_caller.rs"]
+mod client_caller;
 
 #[cfg(test)]
 #[path = "revision_serve/fast2flow_hook_tests.rs"]
