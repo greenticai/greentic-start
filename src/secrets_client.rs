@@ -9,6 +9,40 @@ use std::path::{Path, PathBuf};
 
 use crate::secret_name;
 
+/// Serialises this process's own store rewrites. A delete publishes a rewritten
+/// file by rename, so a write racing it would be lost; writes and deletes from
+/// this client therefore take this lock. Another PROCESS writing the same file
+/// is not covered (none does on a deployed runtime).
+static STORE_MUTATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Hard-remove `uri` from the dev store file: `DevStore::copy_excluding` writes
+/// a sanitised copy under the store's own advisory lock (no ciphertext of the
+/// entry survives) and the copy replaces the store by atomic rename. An absent
+/// entry is a no-op.
+fn remove_entry(store_path: &Path, uri: &str) -> SecretResult<()> {
+    let backend = |err: &dyn std::fmt::Display| SecretError::Backend(err.to_string().into());
+    if !store_path.exists() {
+        return Ok(());
+    }
+    let mut tmp_name = store_path.as_os_str().to_owned();
+    tmp_name.push(format!(
+        ".delete-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let tmp = PathBuf::from(tmp_name);
+    if let Err(err) = DevStore::copy_excluding(store_path, &tmp, &[uri]) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(backend(&err));
+    }
+    std::fs::rename(&tmp, store_path).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp);
+        backend(&err)
+    })
+}
+
 pub struct SecretsClient {
     store_path: PathBuf,
 }
@@ -53,6 +87,7 @@ impl SecretsManager for SecretsClient {
     }
 
     async fn write(&self, path: &str, bytes: &[u8]) -> SecretResult<()> {
+        let _guard = STORE_MUTATION.lock().await;
         let store = DevStore::with_path(self.store_path.clone())
             .map_err(|err| SecretError::Backend(err.to_string().into()))?;
         let canonical_path = canonicalize_dev_store_secret_uri(path);
@@ -66,10 +101,10 @@ impl SecretsManager for SecretsClient {
             .map_err(|err| SecretError::Backend(err.to_string().into()))
     }
 
-    async fn delete(&self, _: &str) -> SecretResult<()> {
-        Err(SecretError::Permission(
-            "dev secrets store is read-only".into(),
-        ))
+    async fn delete(&self, path: &str) -> SecretResult<()> {
+        let uri = canonicalize_dev_store_secret_uri(path).unwrap_or_else(|| path.to_string());
+        let _guard = STORE_MUTATION.lock().await;
+        remove_entry(&self.store_path, &uri)
     }
 }
 

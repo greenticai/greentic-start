@@ -3888,6 +3888,7 @@ dependencies = [
  "rand 0.10.2",
  "redis",
  "reqwest 0.13.4",
+ "ring",
  "rmcp",
  "rpassword",
  "rustls",

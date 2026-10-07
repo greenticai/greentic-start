@@ -94,6 +94,12 @@ pub(crate) struct InteropConfig {
     /// Where to record what a turn spent (§8.1). **Absent means metering is
     /// off**, which is every deployment staged before it existed.
     pub metering: Option<super::metering::MeteringConfig>,
+    /// The unit's deployed secrets live in the admin, not the shipped dev
+    /// store: activation hydrates them through the secrets door (see
+    /// `crate::secrets_door`). **Absent means off**, which is every document
+    /// staged before the field existed; a build that predates the field
+    /// ignores it (unknown fields are not rejected).
+    pub secrets_door: bool,
 }
 
 /// Wire form of one credential, before validation.
@@ -126,6 +132,8 @@ struct RawConfig {
     agent: Option<Value>,
     #[serde(default)]
     metering: Option<Value>,
+    #[serde(default)]
+    secrets_door: bool,
 }
 
 /// Parse the staged bytes. `None` means "treat as absent": the document is not
@@ -201,6 +209,7 @@ pub(crate) fn parse(bytes: &[u8], unit: &str) -> Option<InteropConfig> {
         mcp_resource: non_empty(raw.mcp_resource),
         agent,
         metering,
+        secrets_door: raw.secrets_door,
     })
 }
 
