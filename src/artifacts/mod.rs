@@ -13,6 +13,7 @@ pub(crate) mod extract;
 pub(crate) mod fetch;
 pub(crate) mod fetch_ref;
 pub(crate) mod host_policy;
+pub(crate) mod ingest;
 pub(crate) mod limits;
 pub(crate) mod pdf_isolation;
 pub(crate) mod pdf_limits;
@@ -32,6 +33,12 @@ mod fetch_tests;
 mod fetcher_tests;
 #[cfg(test)]
 mod host_policy_tests;
+#[cfg(test)]
+mod ingest_bounds_tests;
+#[cfg(test)]
+mod ingest_testkit;
+#[cfg(test)]
+mod ingest_tests;
 #[cfg(test)]
 mod limits_tests;
 #[cfg(test)]

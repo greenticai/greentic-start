@@ -1,0 +1,409 @@
+//! Per-envelope attachment ingest: fetch, sniff, store, extract, rewrite.
+//!
+//! One attachment failing never fails the envelope and never removes or
+//! reorders anything: the slot keeps its place with `url = null` and a note
+//! (master plan C1). `attachments`, `extensions["artifacts"]` and
+//! `extensions["attachment_notes"]` stay parallel by index.
+//!
+//! Bounds, each enforced here:
+//! - at most [`MAX_FILES`] referenced attachments are processed, the rest get a
+//!   `quota_exceeded` note;
+//! - at most [`MAX_MESSAGE_BYTES`] of new content per message;
+//! - the whole message gets [`MESSAGE_DEADLINE`]: a fetch or a put past it is a
+//!   note, text extraction past it only loses the derived text;
+//! - text extraction runs in `spawn_blocking` (a PDF waits on a worker
+//!   process) and the derived text is at most [`MAX_TEXT_CHARS`] characters.
+//!
+//! A note's `message` is `"<label>: not read, <reason>"`: a cleaned file label
+//! and a fixed reason, never a URL, a token, a status body or a provider id.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
+use greentic_types::{Attachment, ChannelMessageEnvelope};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::time::{Instant, timeout_at};
+
+use super::extract::{extract_text, truncate_chars};
+use super::fetch::{FetchError, Fetcher};
+use super::fetch_ref::{EXTENSION_KEY as FETCH_KEY, FetchRef, parse_refs};
+use super::limits::{MAX_FILE_BYTES, MAX_FILES, MAX_MESSAGE_BYTES, MAX_TEXT_CHARS};
+use super::sniff::{Kind, detect};
+use super::store::{ArtifactStore, PutRequest, StoreError, Stored};
+
+pub(crate) const ARTIFACTS_KEY: &str = "artifacts";
+pub(crate) const NOTES_KEY: &str = "attachment_notes";
+/// Time one message's attachments may take in all, fetches and puts included.
+pub(crate) const MESSAGE_DEADLINE: Duration = Duration::from_secs(120);
+/// Longest label, in bytes, sent to the door (its limit is 255; the derived
+/// text adds `.txt`).
+const MAX_LABEL_BYTES: usize = 200;
+
+/// Extracts document text; blocking. The production one is [`extract_text`].
+pub(crate) type Extractor = Arc<dyn Fn(&[u8], &str) -> Option<String> + Send + Sync>;
+
+/// A failure, in the closed vocabulary of master C1.
+#[derive(Debug)]
+pub(crate) struct Note {
+    pub code: &'static str,
+    pub reason: &'static str,
+}
+
+impl Note {
+    const fn new(code: &'static str, reason: &'static str) -> Self {
+        Self { code, reason }
+    }
+
+    pub(crate) fn to_value(&self, label: &str) -> Value {
+        json!({ "code": self.code, "message": format!("{label}: not read, {}", self.reason) })
+    }
+}
+
+const TOO_MANY: Note = Note::new("quota_exceeded", "only 5 files per message are accepted");
+const MESSAGE_TOO_LARGE: Note = Note::new(
+    "too_large",
+    "the message's files together exceed the allowed size",
+);
+const FILE_TOO_LARGE: Note = Note::new("too_large", "the file is larger than the allowed size");
+const BAD_INLINE: Note = Note::new("fetch_failed", "the attached data could not be read");
+const OUT_OF_TIME: Note = Note::new("fetch_failed", "reading the message's files took too long");
+const STORE_OUT_OF_TIME: Note = Note::new("door_unavailable", "it could not be stored in time");
+
+type Done = (Stored, Option<String>);
+
+pub(crate) struct Pipeline {
+    store: Arc<dyn ArtifactStore>,
+    fetcher: Arc<dyn Fetcher>,
+    message_cap: u64,
+    deadline: Duration,
+    extractor: Extractor,
+}
+
+impl Pipeline {
+    pub(crate) fn new(store: Arc<dyn ArtifactStore>, fetcher: Arc<dyn Fetcher>) -> Self {
+        Self {
+            store,
+            fetcher,
+            message_cap: MAX_MESSAGE_BYTES,
+            deadline: MESSAGE_DEADLINE,
+            extractor: Arc::new(extract_text),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_message_cap(mut self, cap: u64) -> Self {
+        self.message_cap = cap;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_extractor(mut self, extractor: Extractor) -> Self {
+        self.extractor = extractor;
+        self
+    }
+
+    /// Rewrites `envelope` in place. Does nothing (not one byte changes) when
+    /// no attachment carries a usable fetch reference.
+    pub(crate) async fn process(
+        &self,
+        envelope: &mut ChannelMessageEnvelope,
+        conversation_id: Option<&str>,
+    ) {
+        if envelope.attachments.is_empty() {
+            return;
+        }
+        let refs = parse_refs(&envelope.extensions);
+        if refs.iter().all(Option::is_none) {
+            return; // no provider asked for a fetch: leave the envelope alone
+        }
+        let deadline = Instant::now() + self.deadline;
+        let count = envelope.attachments.len();
+        let mut meta = vec![Value::Null; count];
+        let mut notes = vec![Value::Null; count];
+        let mut budget = Budget {
+            total: 0,
+            seen: HashMap::new(),
+        };
+        let mut attempted = 0usize;
+
+        for (index, attachment) in envelope.attachments.iter_mut().enumerate() {
+            let Some(reference) = refs.get(index).cloned().flatten() else {
+                continue; // no usable reference for this slot: untouched
+            };
+            let label = display_label(attachment.name.as_deref(), index);
+            let outcome = if attempted >= MAX_FILES {
+                Err(TOO_MANY)
+            } else if Instant::now() >= deadline {
+                attempted += 1;
+                Err(OUT_OF_TIME)
+            } else {
+                attempted += 1;
+                self.one(
+                    &reference,
+                    attachment,
+                    &label,
+                    conversation_id,
+                    deadline,
+                    &mut budget,
+                )
+                .await
+            };
+            // An inline payload must never stay in the envelope, stored or not.
+            attachment.content = None;
+            match outcome {
+                Ok((stored, text_ref)) => {
+                    attachment.url = Some(stored.id.clone());
+                    attachment.mime_type = stored.mime_type.clone();
+                    attachment.size_bytes = Some(stored.size_bytes);
+                    meta[index] = json!({
+                        "sha256": stored.sha256,
+                        "kind": stored.kind,
+                        "text_ref": text_ref,
+                    });
+                }
+                Err(note) => {
+                    attachment.url = None;
+                    notes[index] = note.to_value(&label);
+                }
+            }
+        }
+
+        let failed = notes.iter().filter(|n| !n.is_null()).count();
+        tracing::info!(
+            attachments = count,
+            processed = attempted,
+            failed,
+            "inbound attachments ingested"
+        );
+        envelope.extensions.remove(FETCH_KEY);
+        envelope
+            .extensions
+            .insert(ARTIFACTS_KEY.into(), Value::Array(meta));
+        if failed > 0 {
+            envelope
+                .extensions
+                .insert(NOTES_KEY.into(), Value::Array(notes));
+        }
+    }
+
+    async fn one(
+        &self,
+        reference: &FetchRef,
+        attachment: &Attachment,
+        label: &str,
+        conversation_id: Option<&str>,
+        deadline: Instant,
+        budget: &mut Budget,
+    ) -> Result<Done, Note> {
+        let bytes = match reference {
+            FetchRef::Inline => decode_inline(attachment.content.as_ref())?,
+            other => {
+                timeout_at(deadline, self.fetcher.fetch(other))
+                    .await
+                    .map_err(|_| OUT_OF_TIME)?
+                    .map_err(fetch_note)?
+                    .bytes
+            }
+        };
+        let key = Sha256::digest(&bytes).to_vec();
+        if let Some(done) = budget.seen.get(&key) {
+            return Ok(done.clone());
+        }
+        let size = bytes.len() as u64;
+        if budget.total + size > self.message_cap {
+            return Err(MESSAGE_TOO_LARGE);
+        }
+        let detected = detect(&bytes).map_err(|r| Note::new("unsupported_type", r.describe()))?;
+        let put = PutRequest {
+            name: label,
+            mime: detected.mime,
+            bytes: &bytes,
+            derived_from: None,
+            conversation_id,
+        };
+        let stored = timeout_at(deadline, self.store.put(put))
+            .await
+            .map_err(|_| STORE_OUT_OF_TIME)?
+            .map_err(store_note)?;
+        budget.total += size;
+        let text_ref = match detected.kind {
+            Kind::Document => {
+                self.text_artifact(
+                    bytes,
+                    detected.mime,
+                    label,
+                    &stored.id,
+                    conversation_id,
+                    deadline,
+                )
+                .await
+            }
+            Kind::Image => None,
+        };
+        let done = (stored, text_ref);
+        budget.seen.insert(key, done.clone());
+        Ok(done)
+    }
+
+    /// The derived text artifact's id, or `None` when there is no text, the
+    /// time ran out, or the door did not take it. The original stays stored
+    /// either way.
+    async fn text_artifact(
+        &self,
+        bytes: Vec<u8>,
+        mime: &'static str,
+        label: &str,
+        source_id: &str,
+        conversation_id: Option<&str>,
+        deadline: Instant,
+    ) -> Option<String> {
+        let extractor = self.extractor.clone();
+        // One closure, start to finish: a PDF worker's death signal is tied to
+        // the thread that spawned it.
+        let job = tokio::task::spawn_blocking(move || extractor(&bytes, mime));
+        let text = match timeout_at(deadline, job).await {
+            Ok(Ok(Some(text))) if !text.is_empty() => truncate_chars(&text, MAX_TEXT_CHARS),
+            Ok(Ok(_)) => return None,
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!(
+                    "document text extraction did not finish; the file is kept without text"
+                );
+                return None;
+            }
+        };
+        let name = format!("{label}.txt");
+        let put = PutRequest {
+            name: &name,
+            mime: "text/plain",
+            bytes: text.as_bytes(),
+            derived_from: Some(source_id),
+            conversation_id,
+        };
+        match timeout_at(deadline, self.store.put(put)).await {
+            Ok(Ok(stored)) => Some(stored.id),
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!(
+                    "the derived text could not be stored; the file is kept without text"
+                );
+                None
+            }
+        }
+    }
+}
+
+struct Budget {
+    /// Bytes of distinct content stored so far in this message.
+    total: u64,
+    /// Content already stored in this message, by SHA-256.
+    seen: HashMap<Vec<u8>, Done>,
+}
+
+/// A label safe for the door and for a note: the last path component, without
+/// control or invisible format characters or leading dots, at most
+/// [`MAX_LABEL_BYTES`] bytes; `attachment <n>` when nothing usable is left.
+/// Mirrors the admin's name rule so the door never refuses it.
+pub(crate) fn display_label(name: Option<&str>, index: usize) -> String {
+    let last = name
+        .unwrap_or_default()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default();
+    let kept: String = last
+        .chars()
+        .filter(|c| !c.is_control() && !is_invisible_format(*c))
+        .collect();
+    let cleaned = kept.trim().trim_start_matches('.').trim_start();
+    let mut end = cleaned.len().min(MAX_LABEL_BYTES);
+    while !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = cleaned[..end].trim_end();
+    if cut.is_empty() {
+        format!("attachment {}", index + 1)
+    } else {
+        cut.to_string()
+    }
+}
+
+/// Bidi controls, zero-width characters and the BOM (the admin's list).
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Inline payloads: a standard-base64 string, or an object with
+/// `data_base64`. Nothing else. The length is checked before decoding so a
+/// huge string never allocates a decoded copy.
+fn decode_inline(content: Option<&Value>) -> Result<Vec<u8>, Note> {
+    let raw = match content {
+        Some(Value::String(s)) => s.as_str(),
+        Some(Value::Object(o)) => o
+            .get("data_base64")
+            .and_then(Value::as_str)
+            .ok_or(BAD_INLINE)?,
+        _ => return Err(BAD_INLINE),
+    };
+    let raw = raw.trim();
+    if raw.len() as u64 > MAX_FILE_BYTES.div_ceil(3) * 4 {
+        return Err(FILE_TOO_LARGE);
+    }
+    let bytes = B64.decode(raw).map_err(|_| BAD_INLINE)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(FILE_TOO_LARGE);
+    }
+    Ok(bytes)
+}
+
+fn fetch_note(err: FetchError) -> Note {
+    match err {
+        FetchError::TooLarge => FILE_TOO_LARGE,
+        FetchError::MissingCredential => Note::new(
+            "fetch_failed",
+            "the channel credential needed to download it is not available",
+        ),
+        FetchError::Denied(_) => Note::new("fetch_failed", "the channel refused the download"),
+        FetchError::Status(_) | FetchError::Transport(_) => {
+            Note::new("fetch_failed", "the download failed")
+        }
+        FetchError::BadReference => Note::new(
+            "fetch_failed",
+            "the channel's file reference could not be resolved",
+        ),
+        FetchError::BlockedHost => Note::new("fetch_failed", "the download address is not allowed"),
+        FetchError::TooManyRedirects => {
+            Note::new("fetch_failed", "the download was redirected too many times")
+        }
+    }
+}
+
+fn store_note(err: StoreError) -> Note {
+    match err {
+        StoreError::TooLarge => FILE_TOO_LARGE,
+        StoreError::Unsupported => Note::new("unsupported_type", "this file type is not supported"),
+        StoreError::Quota => Note::new(
+            "quota_exceeded",
+            "the storage quota for this conversation is used up",
+        ),
+        StoreError::Rejected(_) | StoreError::Unavailable(_) | StoreError::NotFound => {
+            Note::new("door_unavailable", "it could not be stored right now")
+        }
+    }
+}
