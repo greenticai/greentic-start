@@ -758,3 +758,138 @@ fn the_flag_parses_and_defaults_off() {
             .is_empty()
     );
 }
+
+// ---- client-side encrypted values -------------------------------------------
+
+fn seal(key: &[u8; 32], tenant: &str, unit: &str, path: &str, plain: &[u8]) -> String {
+    use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+    let nonce_bytes = [7u8; 12];
+    let k = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).unwrap());
+    let mut buf = plain.to_vec();
+    k.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(nonce_bytes),
+        Aad::from(door_aad(tenant, unit, path)),
+        &mut buf,
+    )
+    .unwrap();
+    let mut body = nonce_bytes.to_vec();
+    body.extend(buf);
+    format!("gtcenc1:{}", B64.encode(body))
+}
+
+const KEY: [u8; 32] = [42u8; 32];
+
+fn put_key(store: &MemStore, tenant: &str, key: &[u8]) {
+    store.put(&door_key_uri(tenant), B64.encode(key).as_bytes());
+}
+
+async fn encrypted_unit(bundle: &str, entries: Vec<serde_json::Value>) -> (MemStore, StubDoor) {
+    let door = serve(vec![ok(json!({"secrets": entries, "etag": "e"}))]).await;
+    let store = MemStore::default();
+    stage(&store, "acme", bundle, &door.endpoint(), Some(true));
+    (store, door)
+}
+
+#[tokio::test]
+async fn encrypted_and_plain_values_round_trip_together() {
+    let (store, _door) = encrypted_unit(
+        "enc-ok",
+        vec![
+            json!({"path":"_/mcp/sealed","value":seal(&KEY,"acme","enc-ok","_/mcp/sealed",b"s3cret")}),
+            json!({"path":"_/mcp/shared","value":seal(&KEY,"acme","_env","_/mcp/shared",b"env-wide")}),
+            json!({"path":"_/mcp/plain","value":"as-is"}),
+            json!({"path":"_/mcp/b64","value":B64.encode(
+                seal(&KEY,"acme","enc-ok","_/mcp/b64",b"\x00\xff").as_bytes()
+            ),"encoding":"base64"}),
+        ],
+    )
+    .await;
+    put_key(&store, "acme", &KEY);
+
+    assert_eq!(
+        run(&store, "acme", "enc-ok").await.unwrap(),
+        Hydration::Written(4)
+    );
+    let read = |p: &str| store.get(&format!("secrets://default/acme/{p}")).unwrap();
+    assert_eq!(read("_/mcp/sealed"), b"s3cret");
+    assert_eq!(read("_/mcp/shared"), b"env-wide");
+    assert_eq!(read("_/mcp/plain"), b"as-is");
+    assert_eq!(read("_/mcp/b64"), b"\x00\xff");
+}
+
+#[tokio::test]
+async fn plain_values_need_no_key() {
+    let (store, _door) = encrypted_unit(
+        "enc-plain",
+        vec![json!({"path":"_/mcp/plain","value":"as-is"})],
+    )
+    .await;
+    assert_eq!(
+        run(&store, "acme", "enc-plain").await.unwrap(),
+        Hydration::Written(1)
+    );
+}
+
+#[tokio::test]
+async fn a_tampered_value_fails_and_writes_nothing() {
+    let sealed = seal(&KEY, "acme", "enc-tamper", "_/mcp/t", b"s3cret");
+    let mut raw = B64.decode(&sealed["gtcenc1:".len()..]).unwrap();
+    let last = raw.len() - 1;
+    raw[last] ^= 1;
+    let tampered = format!("gtcenc1:{}", B64.encode(raw));
+    let (store, _door) = encrypted_unit(
+        "enc-tamper",
+        vec![
+            json!({"path":"_/mcp/plain","value":"as-is"}),
+            json!({"path":"_/mcp/t","value":tampered}),
+        ],
+    )
+    .await;
+    put_key(&store, "acme", &KEY);
+    let text = chain(&run(&store, "acme", "enc-tamper").await.unwrap_err());
+    assert!(text.contains("could not be decrypted"), "{text}");
+    assert!(store.written().is_empty());
+}
+
+#[tokio::test]
+async fn a_value_sealed_for_another_path_tenant_unit_or_key_fails() {
+    for (bundle, sealed_for, key) in [
+        ("enc-aad-path", ("acme", "enc-aad-path", "_/mcp/other"), KEY),
+        (
+            "enc-aad-tenant",
+            ("other", "enc-aad-tenant", "_/mcp/t"),
+            KEY,
+        ),
+        ("enc-aad-unit", ("acme", "someone-else", "_/mcp/t"), KEY),
+        ("enc-aad-key", ("acme", "enc-aad-key", "_/mcp/t"), [9u8; 32]),
+    ] {
+        let sealed = seal(&key, sealed_for.0, sealed_for.1, sealed_for.2, b"s3cret");
+        let (store, _door) =
+            encrypted_unit(bundle, vec![json!({"path":"_/mcp/t","value":sealed})]).await;
+        put_key(&store, "acme", &KEY);
+        let text = chain(&run(&store, "acme", bundle).await.unwrap_err());
+        assert!(text.contains("could not be decrypted"), "{bundle}: {text}");
+        assert!(store.written().is_empty(), "{bundle}");
+    }
+}
+
+#[tokio::test]
+async fn a_missing_or_malformed_key_fails_without_echoing_it() {
+    let sealed = seal(&KEY, "acme", "enc-nokey", "_/mcp/t", b"s3cret");
+    let (store, _door) =
+        encrypted_unit("enc-nokey", vec![json!({"path":"_/mcp/t","value":sealed})]).await;
+    let text = chain(&run(&store, "acme", "enc-nokey").await.unwrap_err());
+    assert!(text.contains("secrets://default/acme/_/door/key"), "{text}");
+    assert!(store.written().is_empty());
+
+    let sealed = seal(&KEY, "acme", "enc-shortkey", "_/mcp/t", b"s3cret");
+    let (store, _door) = encrypted_unit(
+        "enc-shortkey",
+        vec![json!({"path":"_/mcp/t","value":sealed})],
+    )
+    .await;
+    put_key(&store, "acme", &[1u8; 16]);
+    let text = chain(&run(&store, "acme", "enc-shortkey").await.unwrap_err());
+    assert!(text.contains("exactly 32 bytes"), "{text}");
+    assert!(!text.contains(&B64.encode([1u8; 16])), "{text}");
+}

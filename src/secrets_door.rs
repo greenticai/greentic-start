@@ -30,6 +30,18 @@
 //!   `metering` block to authenticate with — fails the ACTIVATION, naming the
 //!   door, after bounded retries with backoff. The same trade `state-sorla`
 //!   makes for its state door.
+//! - **Values may be client-side encrypted.** The designer seals each value
+//!   before the admin sees it; a decoded value starting with `gtcenc1:` is
+//!   `gtcenc1:` + base64(`nonce(12) || AES-256-GCM ciphertext+tag`), opened with
+//!   the 32-byte key (base64) the unit's dev store holds at
+//!   `secrets://default/<tenant>/_/door/key`. The AAD is
+//!   `"gtc-door-v1\0" tenant "\0" unit "\0" path`: start does not know the
+//!   designer's environment id (the door answer and the staged ingress document
+//!   carry none), so the env id is NOT part of it. The door does not say whether
+//!   a row is unit-scoped or environment-shared, so a value is tried with the
+//!   unit's bundle id and then with `_env`. A value without the prefix is
+//!   written as is. A missing key, bad key, wrong AAD or tag failure fails the
+//!   activation; no key or value is ever put in a message.
 //! - **Only runner-scoped categories belong here.** The door writes at env
 //!   `default`, where the runner reads `mcp`, `a2a`, `llm`, `knowledge` and
 //!   `sorla`. Pack-scoped extension secrets and the generated webchat
@@ -254,6 +266,7 @@ fn is_safe(url: &str) -> bool {
 
 /// One validated secret, ready to write. Deliberately no `Debug`.
 struct Decoded {
+    path: String,
     uri: String,
     value: Vec<u8>,
 }
@@ -451,7 +464,15 @@ pub(crate) async fn hydrate_unit(
         );
     }
 
-    let decoded = decode_all(tenant, entries)?;
+    let mut decoded = decode_all(tenant, entries)?;
+    if decoded.iter().any(|d| d.value.starts_with(ENC_PREFIX)) {
+        let key = load_door_key(secrets, tenant).await?;
+        for secret in &mut decoded {
+            if secret.value.starts_with(ENC_PREFIX) {
+                secret.value = open_value(&key, tenant, bundle_id, &secret.path, &secret.value)?;
+            }
+        }
+    }
     let count = decoded.len();
     for secret in &decoded {
         secrets
@@ -653,11 +674,90 @@ fn decode_all(tenant: &str, entries: Vec<RawEntry>) -> anyhow::Result<Vec<Decode
                 ),
             };
             Ok(Decoded {
+                path: entry.path.clone(),
                 uri: format!("secrets://{ENV_SEGMENT}/{tenant}/{}", entry.path),
                 value,
             })
         })
         .collect()
+}
+
+/// Marks a value the designer sealed before the admin stored it.
+const ENC_PREFIX: &[u8] = b"gtcenc1:";
+const AAD_DOMAIN: &str = "gtc-door-v1";
+/// Scope name for an environment-shared row (no unit).
+const ENV_SHARED_UNIT: &str = "_env";
+const NONCE_LEN: usize = 12;
+
+/// The 32-byte value-sealing key. Deliberately no `Debug`.
+struct DoorKey([u8; 32]);
+
+fn door_key_uri(tenant: &str) -> String {
+    format!("secrets://{ENV_SEGMENT}/{tenant}/_/door/key")
+}
+
+/// Read the key from the same store the host reads. Its address is the only
+/// thing a message may name.
+async fn load_door_key(secrets: &dyn SecretsManager, tenant: &str) -> anyhow::Result<DoorKey> {
+    let uri = door_key_uri(tenant);
+    let raw = secrets.read(&uri).await.map_err(|err| {
+        anyhow::anyhow!(
+            "the secrets door returned encrypted values but the decryption key could not be \
+             read at `{uri}` ({err})"
+        )
+    })?;
+    let bad = || {
+        anyhow::anyhow!(
+            "the secrets door decryption key at `{uri}` is not base64 of exactly 32 bytes"
+        )
+    };
+    let text = std::str::from_utf8(&raw).map_err(|_| bad())?;
+    let bytes = B64.decode(text.trim()).map_err(|_| bad())?;
+    let key: [u8; 32] = bytes.try_into().map_err(|_| bad())?;
+    Ok(DoorKey(key))
+}
+
+fn door_aad(tenant: &str, unit: &str, path: &str) -> Vec<u8> {
+    format!("{AAD_DOMAIN}\0{tenant}\0{unit}\0{path}").into_bytes()
+}
+
+/// Open one `gtcenc1:` value, trying the unit scope and then the
+/// environment-shared one.
+fn open_value(
+    key: &DoorKey,
+    tenant: &str,
+    bundle_id: &str,
+    path: &str,
+    value: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+    let fail = || {
+        anyhow::anyhow!(
+            "door secret `{path}` could not be decrypted (wrong key, wrong scope or a tampered \
+             value)"
+        )
+    };
+    let body = B64.decode(&value[ENC_PREFIX.len()..]).map_err(|_| {
+        anyhow::anyhow!("door secret `{path}` is marked encrypted but is not base64")
+    })?;
+    if body.len() < NONCE_LEN + AES_256_GCM.tag_len() {
+        return Err(fail());
+    }
+    let (nonce_bytes, sealed) = body.split_at(NONCE_LEN);
+    let unbound = UnboundKey::new(&AES_256_GCM, &key.0).map_err(|_| fail())?;
+    let opener = LessSafeKey::new(unbound);
+    for unit in [bundle_id, ENV_SHARED_UNIT] {
+        let nonce = Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| fail())?;
+        // `open_in_place` may clobber its buffer on failure, so each try gets a
+        // fresh copy.
+        let mut buffer = sealed.to_vec();
+        if let Ok(plain) =
+            opener.open_in_place(nonce, Aad::from(door_aad(tenant, unit, path)), &mut buffer)
+        {
+            return Ok(plain.to_vec());
+        }
+    }
+    Err(fail())
 }
 
 /// `<team|_>/<category>/<name>`: exactly three non-empty segments, none of

@@ -122,6 +122,22 @@ writes the answer into the dev store it already serves from:
 - A rotation takes effect on the next activation; a `304` on a reload skips the
   write. Paths written on one hydration but absent from the next answer are
   deleted from the store.
+- **Values may be encrypted by the designer before the admin stores them.** A
+  value (after `encoding` is decoded) starting `gtcenc1:` is
+  `gtcenc1:` + base64(`nonce(12) || AES-256-GCM ciphertext+tag`), opened with the
+  32-byte key (base64) the unit's dev store holds at
+  `secrets://default/<tenant>/_/door/key` (read through the host's secrets
+  manager before anything is written). AAD =
+  `"gtc-door-v1\0" tenant "\0" unit "\0" path`. **Start does not know the
+  designer's environment id** (neither the door answer nor the staged ingress
+  document carries it), so the env id is not in the AAD; the designer must seal
+  without it. The door does not say whether a row is unit-scoped or
+  environment-shared, so start tries the unit's bundle id, then `_env`. A value
+  without the prefix is written as is. A missing or malformed key, a wrong
+  scope/path/tenant or a tampered value fails the activation and nothing is
+  written; messages name the key's address and the secret's path, never a key or
+  value. AES-GCM comes from `ring` (already in the tree via rustls); `aes-gcm`
+  is not.
 - **Only runner-scoped categories belong in the door.** It writes at env
   `default`, where the runner reads `mcp`, `a2a`, `llm`, `knowledge` and
   `sorla`. Pack-scoped extension secrets and the generated webchat
