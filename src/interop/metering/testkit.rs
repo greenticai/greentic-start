@@ -201,6 +201,16 @@ pub(crate) fn queued(endpoint: &str) -> Queued {
     }
 }
 
+/// A staged block with this exact `endpoint`, for tests that judge what is
+/// derived from the endpoint rather than what is sent to it.
+pub(crate) fn metering_for(endpoint: &str) -> MeteringConfig {
+    MeteringConfig {
+        endpoint: endpoint.into(),
+        token: MeteringToken(TEST_TOKEN.into()),
+        tenant_slug: TEST_TENANT.into(),
+    }
+}
+
 /// A staged block naming an endpoint nothing listens on.
 ///
 /// For the tests that inspect the QUEUE rather than a stub: they run against
