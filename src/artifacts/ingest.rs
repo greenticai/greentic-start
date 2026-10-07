@@ -90,6 +90,8 @@ const UNVERIFIED: Note = Note::new(
     "fetch_failed",
     "files from this channel are not supported yet",
 );
+/// For a slot whose reference this host withheld (`FetchRef::Withheld`).
+const WITHHELD: Note = Note::new("fetch_failed", "the file could not be retrieved");
 const STORE_OUT_OF_TIME: Note = Note::new("door_unavailable", "it could not be stored in time");
 
 type Done = (Stored, Option<String>);
@@ -278,6 +280,9 @@ impl Pipeline {
             conversation_id,
             deadline,
         } = turn;
+        if matches!(reference, FetchRef::Withheld) {
+            return Err(WITHHELD);
+        }
         // The fetcher refuses this too; refusing here keeps the rule
         // independent of the fetcher.
         if !origin.channel().allows(reference) {

@@ -27,6 +27,11 @@ use super::store::{ArtifactStore, PutRequest, StoreError, is_artifact_id};
 use super::unit::{Off, UnitAttachments, UnitCell};
 use crate::operator_log;
 
+/// Bounds one extension `put` end to end, the store's retries included: a
+/// tool waiting on a door that is down gets `unavailable` after this, never
+/// the store's full retry span (three 20 s attempts).
+pub(crate) const PORT_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Largest file an extension may store (the door's per-artifact cap).
 pub(crate) const MAX_PUT_BYTES: usize = 10 * 1024 * 1024;
 /// Longest name sent to the door, in bytes.
@@ -40,6 +45,7 @@ pub(crate) struct DoorArtifactPort {
     /// replaces it after the port was installed; from then on the port says
     /// `unsupported` without asking the door (and without a warning per call).
     unit: Option<Weak<UnitCell>>,
+    budget: std::time::Duration,
 }
 
 impl std::fmt::Debug for DoorArtifactPort {
@@ -50,7 +56,17 @@ impl std::fmt::Debug for DoorArtifactPort {
 
 impl DoorArtifactPort {
     pub(crate) fn new(store: Arc<dyn ArtifactStore>) -> Self {
-        Self { store, unit: None }
+        Self {
+            store,
+            unit: None,
+            budget: PORT_BUDGET,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_budget(mut self, budget: std::time::Duration) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// Reads `cell` on every call (see [`Self::unit`]).
@@ -106,17 +122,19 @@ impl ArtifactPort for DoorArtifactPort {
                 "artifact put needs a multi-thread async runtime",
             ));
         };
+        let put = self.store.put(PutRequest {
+            name: &name,
+            mime: &mime,
+            bytes: &request.bytes,
+            derived_from: None,
+            // A tool call belongs to no conversation here: the door applies
+            // the per-tenant byte quota only.
+            conversation_id: None,
+        });
         let stored = tokio::task::block_in_place(|| {
-            handle.block_on(self.store.put(PutRequest {
-                name: &name,
-                mime: &mime,
-                bytes: &request.bytes,
-                derived_from: None,
-                // A tool call belongs to no conversation here: the door applies
-                // the per-tenant byte quota only.
-                conversation_id: None,
-            }))
+            handle.block_on(async { tokio::time::timeout(self.budget, put).await })
         })
+        .map_err(|_| map_error(extension_id, StoreError::Unavailable("timeout".into())))?
         .map_err(|err| map_error(extension_id, err))?;
         if !is_artifact_id(&stored.id) {
             return Err(unavailable("the artifacts door answered an invalid id"));

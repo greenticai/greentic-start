@@ -114,3 +114,30 @@ async fn forged_host_fields_are_removed_on_every_unit() {
         assert!(!envs[0].extensions.contains_key("artifacts"));
     }
 }
+
+/// Same rule as the legacy path: a unit that runs without attachments carries
+/// NO inline bytes on, not even for a slot that has no fetch reference.
+#[tokio::test]
+async fn an_off_unit_carries_no_inline_bytes_even_without_a_fetch_reference() {
+    for unit in [
+        None,
+        Some(UnitAttachments::Off(Off::NoDoor)),
+        Some(UnitAttachments::Off(Off::NotGranted)),
+        Some(UnitAttachments::Off(Off::DoorUnavailable)),
+    ] {
+        for refs in [None, Some(json!([null]))] {
+            let mut env = envelope(1);
+            env.extensions.remove("attachment_fetch");
+            if let Some(refs) = refs.clone() {
+                env.extensions.insert("attachment_fetch".into(), refs);
+            }
+            env.attachments[0].content = Some(json!("aGV5"));
+            let mut envs = vec![env];
+            prepare(unit.as_ref(), &mut envs, &slack()).await;
+            assert!(
+                envs[0].attachments[0].content.is_none(),
+                "inline bytes stayed ({refs:?})"
+            );
+        }
+    }
+}

@@ -279,7 +279,7 @@ impl Fetcher for HttpFetcher {
                 return self.fetch_whatsapp(scope, media_id).await;
             }
             // Bytes already in the envelope: the pipeline stores them itself.
-            FetchRef::Inline => return Err(FetchError::BadReference),
+            FetchRef::Inline | FetchRef::Withheld => return Err(FetchError::BadReference),
         };
         Ok(Fetched { bytes })
     }

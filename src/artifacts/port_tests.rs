@@ -292,3 +292,29 @@ async fn a_port_of_a_unit_without_the_purpose_answers_unsupported_without_a_door
     assert!(matches!(err, ArtifactPortError::Unsupported), "{err:?}");
     assert_eq!(stub.count(), 1, "no door call once the unit is not granted");
 }
+
+/// A tool must not hang on a door that is down: the whole put (the store's
+/// retries included) is bounded by the port's budget, at most 20 s, and then
+/// answers `unavailable`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_put_to_a_door_that_never_answers_ends_within_the_ports_budget() {
+    use super::port::PORT_BUDGET;
+    use super::time_testkit::within_ceiling;
+    use crate::interop::metering::testkit::silent_peer;
+
+    assert!(PORT_BUDGET <= Duration::from_secs(20));
+    let port_no = silent_peer().await;
+    let store: Arc<dyn ArtifactStore> = Arc::new(
+        HttpArtifactStore::new(
+            format!("http://127.0.0.1:{port_no}/ingest/artifacts"),
+            TEST_TOKEN.into(),
+            Duration::from_secs(30),
+        )
+        .expect("client"),
+    );
+    let port = Arc::new(DoorArtifactPort::new(store).with_budget(Duration::from_millis(300)));
+    let err = within_ceiling(put_blocking(port, Some(TEST_TENANT), hey()))
+        .await
+        .expect_err("a silent door is unavailable");
+    assert!(matches!(err, ArtifactPortError::Unavailable(_)), "{err:?}");
+}

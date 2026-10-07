@@ -75,7 +75,7 @@ impl Channel {
             }
             FetchRef::TelegramFile { .. } => self == Channel::Telegram,
             FetchRef::WhatsappMedia { .. } => self == Channel::Whatsapp,
-            FetchRef::Public { .. } | FetchRef::Inline => true,
+            FetchRef::Public { .. } | FetchRef::Inline | FetchRef::Withheld => true,
         }
     }
 }

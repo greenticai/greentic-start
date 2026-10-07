@@ -337,5 +337,8 @@ impl UnitMeterDecisions {
 }
 
 #[cfg(test)]
+#[path = "runtime_meter_artifacts_tests.rs"]
+mod runtime_meter_artifacts_tests;
+#[cfg(test)]
 #[path = "runtime_meter_tests.rs"]
 mod runtime_meter_tests;

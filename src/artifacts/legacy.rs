@@ -19,12 +19,8 @@ pub(crate) fn declare_unserved(envelopes: &mut [ChannelMessageEnvelope]) -> usiz
         if !envelope.attachments.is_empty() {
             with_attachments += 1;
         }
+        // Clears every slot's inline bytes too, reference or not.
         refuse_all(envelope, Off::NoDoor);
-        // A slot without a fetch reference may still carry the request's own
-        // bytes: they never travel on either.
-        for attachment in &mut envelope.attachments {
-            attachment.content = None;
-        }
     }
     if with_attachments > 0 {
         crate::operator_log::warn(

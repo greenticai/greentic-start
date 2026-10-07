@@ -4,13 +4,14 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// The door refuses a `conversation_id` longer than this many bytes.
 pub(crate) const MAX_CONVERSATION_ID_BYTES: usize = 128;
+// What is sent is a SHA-256 in hex: it must fit.
+const _: () = assert!(64 <= MAX_CONVERSATION_ID_BYTES);
 
 const ID_SCHEME: &str = "artifact://";
 
@@ -43,7 +44,7 @@ pub(super) struct PutBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_from: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<Cow<'a, str>>,
+    pub conversation_id: Option<String>,
 }
 
 impl<'a> PutBody<'a> {
@@ -64,19 +65,18 @@ impl<'a> PutBody<'a> {
     }
 }
 
-/// The id the door keys its per-conversation quota on: `id` itself when it
-/// fits the door's limit, else its SHA-256 in lowercase hex (64 characters),
-/// so the same conversation always maps to the same key.
-pub(crate) fn door_conversation_id(id: &str) -> Cow<'_, str> {
-    if id.len() <= MAX_CONVERSATION_ID_BYTES {
-        return Cow::Borrowed(id);
-    }
+/// The id the door keys its per-conversation quota on: ALWAYS the SHA-256 of
+/// the host's quota key, in lowercase hex (64 characters, inside the door's
+/// [`MAX_CONVERSATION_ID_BYTES`]). The key is injective (escaped parts), so
+/// the hash is too for any practical purpose, and the door never sees what
+/// the key is made of (a WhatsApp sender is a phone number).
+pub(crate) fn door_conversation_id(id: &str) -> String {
     let digest = Sha256::digest(id.as_bytes());
     let mut hex = String::with_capacity(64);
     for byte in digest {
         hex.push_str(&format!("{byte:02x}"));
     }
-    Cow::Owned(hex)
+    hex
 }
 
 #[derive(Serialize)]

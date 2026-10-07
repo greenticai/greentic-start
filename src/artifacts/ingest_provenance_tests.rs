@@ -218,3 +218,16 @@ async fn an_unverified_request_resolves_no_remote_reference_but_keeps_inline_byt
     // The request's own bytes need no outbound fetch: they are stored.
     assert_eq!(env.attachments[1].url.as_deref(), Some("artifact://id1"));
 }
+
+/// Forged host fields arrive per request, so the warning is said once per
+/// process and later occurrences are counted at debug: a client that keeps
+/// sending them cannot flood the operator log.
+#[test]
+fn stripped_fields_are_warned_once_then_counted() {
+    let seen = super::provenance::Occurrences::new();
+    assert!(!seen.record(0), "nothing removed, nothing said");
+    assert!(seen.record(2), "the first occurrence is warned");
+    assert!(!seen.record(1), "later ones are not");
+    assert!(!seen.record(5));
+    assert_eq!(seen.total(), 8);
+}

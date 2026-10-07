@@ -16,11 +16,11 @@ use super::*;
 use crate::interop::config::InteropConfig;
 
 const ENDPOINT: &str = "https://admin.example/api/v1/ingest/worker-usage";
-const TOKEN: &str = "gtm_staged-usage-token";
+pub(super) const TOKEN: &str = "gtm_staged-usage-token";
 const TENANT: &str = "acme";
-const BUNDLE: &str = "support-bot";
+pub(super) const BUNDLE: &str = "support-bot";
 
-fn metering() -> MeteringConfig {
+pub(super) fn metering() -> MeteringConfig {
     MeteringConfig {
         endpoint: ENDPOINT.into(),
         token: MeteringToken(TOKEN.into()),
@@ -38,7 +38,7 @@ fn metering() -> MeteringConfig {
 /// `operala-in-process` (Cargo.toml), and `host_options_for_unit` would not
 /// compile without it; the assertion below turns a silent loss of the feature
 /// (every option reading "no meter") into a loud failure.
-fn installs_a_meter(options: &RevisionHostOptions) -> bool {
+pub(super) fn installs_a_meter(options: &RevisionHostOptions) -> bool {
     let rendered = format!("{options:?}");
     assert!(
         rendered.contains("billing_meter"),
@@ -463,81 +463,4 @@ async fn boot_records_exactly_the_units_it_installed_a_meter_for() {
     let set = decisions.into_metered();
     assert!(set.contains(metered, BUNDLE));
     assert!(!set.contains(plain, "plain-bot"));
-}
-
-/// Whether the options would hand the runtime the agent's artifact reader /
-/// the extensions' artifact port. Same `Debug` trick as above.
-fn installs_artifacts(options: &RevisionHostOptions) -> (bool, bool) {
-    let rendered = format!("{options:?}");
-    assert!(
-        rendered.contains("artifact_reader") && rendered.contains("ext_artifact_port"),
-        "RevisionHostOptions' Debug does not report the artifact reader/port — \
-         greentic-runner-host lost its `agentic-worker` feature, or the Debug changed: {rendered}"
-    );
-    (
-        rendered.contains("artifact_reader: true"),
-        rendered.contains("ext_artifact_port: true"),
-    )
-}
-
-fn artifact_access(token: &str) -> crate::artifacts::host_access::HostArtifactAccess {
-    let door = "https://admin.example/api/v1/ingest/artifacts".to_string();
-    let store = crate::artifacts::store::HttpArtifactStore::new(
-        door.clone(),
-        token.into(),
-        Duration::from_secs(2),
-    )
-    .expect("client");
-    crate::artifacts::host_access::HostArtifactAccess::new(
-        Arc::new(store),
-        crate::artifacts::boot::Door {
-            url: door,
-            token: token.into(),
-        },
-    )
-}
-
-#[test]
-fn a_unit_with_attachments_gets_the_agent_reader_and_the_extension_port() {
-    let access = artifact_access(TOKEN);
-    let unit = host_options_for_unit(
-        Some(&metering()),
-        DeploymentId::new(),
-        BUNDLE,
-        RevisionId::new(),
-        Some(&access),
-    );
-    assert_eq!(installs_artifacts(&unit.options), (true, true));
-    assert!(
-        !format!("{:?}", unit.options).contains(TOKEN),
-        "the options never print the token"
-    );
-}
-
-#[test]
-fn a_unit_without_attachments_gets_neither() {
-    for metering in [Some(metering()), None] {
-        let unit = host_options_for_unit(
-            metering.as_ref(),
-            DeploymentId::new(),
-            BUNDLE,
-            RevisionId::new(),
-            None,
-        );
-        assert_eq!(installs_artifacts(&unit.options), (false, false));
-    }
-}
-
-#[test]
-fn a_reader_that_cannot_be_built_leaves_the_port_and_the_revision_alone() {
-    let access = artifact_access("tok\nen");
-    let unit = host_options_for_unit(
-        Some(&metering()),
-        DeploymentId::new(),
-        BUNDLE,
-        RevisionId::new(),
-        Some(&access),
-    );
-    assert_eq!(installs_artifacts(&unit.options), (false, true));
-    assert!(installs_a_meter(&unit.options), "the rest still installs");
 }

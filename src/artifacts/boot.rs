@@ -135,9 +135,13 @@ pub(crate) async fn probe_door(
         )),
         Err(StoreError::Rejected(_)) => Ok(DoorProbe::Unavailable("rejected")),
         Err(StoreError::Unavailable(_)) => Ok(DoorProbe::Unavailable("unavailable")),
-        Err(StoreError::NotFound) => Ok(DoorProbe::Enabled),
-        Err(StoreError::TooLarge | StoreError::Unsupported | StoreError::Quota) => {
-            Ok(DoorProbe::Unavailable("unexpected_answer"))
-        }
+        // `probe()` itself reads the door's own `404 not_found` as up, so a
+        // `NotFound` here is an answer no probe should produce.
+        Err(
+            StoreError::NotFound
+            | StoreError::TooLarge
+            | StoreError::Unsupported
+            | StoreError::Quota,
+        ) => Ok(DoorProbe::Unavailable("unexpected_answer")),
     }
 }

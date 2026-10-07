@@ -64,7 +64,9 @@ async fn put_posts_to_put_with_bearer_base64_and_conversation() {
             .contains(&format!("authorization: bearer {TEST_TOKEN}"))
     );
     assert!(!raw.contains("\"op\""), "the door has no op field");
-    assert!(raw.contains(r#""conversation_id":"conv-1""#));
+    // Sent as the key's SHA-256, never the key (store_retry_tests).
+    assert!(raw.contains(r#""conversation_id":""#));
+    assert!(!raw.contains("conv-1"));
     assert!(raw.contains(r#""data_base64":"aGV5""#)); // base64("hey")
     assert!(raw.contains(r#""mime_type":"text/plain""#));
     assert!(!raw.contains("derived_from"));

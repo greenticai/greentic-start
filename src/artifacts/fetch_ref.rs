@@ -15,11 +15,25 @@ pub(crate) const EXTENSION_KEY: &str = "attachment_fetch";
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum FetchRef {
-    Bearer { url: String, secret_key: String },
-    TelegramFile { file_id: String },
-    WhatsappMedia { media_id: String },
-    Public { url: String },
+    Bearer {
+        url: String,
+        secret_key: String,
+    },
+    TelegramFile {
+        file_id: String,
+    },
+    WhatsappMedia {
+        media_id: String,
+    },
+    Public {
+        url: String,
+    },
     Inline,
+    /// Written by THIS host (`super::instance_check`) in place of a reference
+    /// it will not resolve: the slot is reported with a neutral
+    /// `fetch_failed` note and nothing is fetched. A provider writing it only
+    /// earns its own file that note.
+    Withheld,
 }
 
 impl FetchRef {
@@ -33,7 +47,7 @@ impl FetchRef {
             FetchRef::Public { url } => url.starts_with("https://"),
             FetchRef::TelegramFile { file_id } => is_safe_id(file_id),
             FetchRef::WhatsappMedia { media_id } => is_safe_id(media_id),
-            FetchRef::Inline => true,
+            FetchRef::Inline | FetchRef::Withheld => true,
         }
     }
 }

@@ -8,12 +8,41 @@
 //! of the agent. So every one of them is removed BEFORE the pipeline runs;
 //! whatever is there afterwards was written by this host.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use greentic_types::ChannelMessageEnvelope;
 use reqwest::Url;
 
 use super::ingest::{ARTIFACTS_KEY, NOTES_KEY};
 
 const ARTIFACT_SCHEME: &str = "artifact";
+
+/// How often forged host fields were removed, per source. They arrive per
+/// request, so the operator is told once per process and every later
+/// occurrence is counted at debug: a client sending them on every request
+/// cannot flood the log.
+pub(crate) struct Occurrences(AtomicU64);
+
+impl Occurrences {
+    pub(crate) const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    /// Adds `removed`; `true` when this is the first occurrence (warn it).
+    pub(crate) fn record(&self, removed: usize) -> bool {
+        if removed == 0 {
+            return false;
+        }
+        self.0.fetch_add(removed as u64, Ordering::Relaxed) == 0
+    }
+
+    pub(crate) fn total(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+static FROM_PROVIDERS: Occurrences = Occurrences::new();
+static FROM_CLIENTS: Occurrences = Occurrences::new();
 
 /// Removes provider-written host fields. Returns how many attachment urls
 /// were cleared (for a count-only log line). Leaves every other byte alone.
@@ -27,10 +56,17 @@ pub(crate) fn strip_reserved(envelope: &mut ChannelMessageEnvelope) -> usize {
             cleared += 1;
         }
     }
-    if cleared > 0 {
+    if FROM_PROVIDERS.record(cleared) {
         tracing::warn!(
             cleared,
-            "a provider sent artifact references the host did not create; they were removed"
+            "a provider sent artifact references the host did not create; they were removed \
+             (later occurrences are counted at debug)"
+        );
+    } else if cleared > 0 {
+        tracing::debug!(
+            cleared,
+            total = FROM_PROVIDERS.total(),
+            "provider-written artifact references removed"
         );
     }
     cleared
@@ -81,10 +117,17 @@ pub(crate) fn strip_reserved_json(payload: &mut serde_json::Value) -> usize {
     if let Some(metadata) = payload.get_mut("metadata") {
         removed += strip_scope(metadata);
     }
-    if removed > 0 {
+    if FROM_CLIENTS.record(removed) {
         tracing::warn!(
             removed,
-            "a request body carried attachment fields only the host may write; they were removed"
+            "a request body carried attachment fields only the host may write; they were \
+             removed (later occurrences are counted at debug)"
+        );
+    } else if removed > 0 {
+        tracing::debug!(
+            removed,
+            total = FROM_CLIENTS.total(),
+            "client-written attachment fields removed"
         );
     }
     removed

@@ -186,3 +186,30 @@ fn a_door_url_with_credentials_or_a_query_is_refused_without_printing_it() {
         assert!(!text.contains("admin.example"), "{text}");
     }
 }
+
+/// `probe()` reads the door's own `404 not_found` as "up"; a store that
+/// still answers `NotFound` to a probe is not proof of anything, so it is an
+/// unexpected answer, never "enabled".
+#[tokio::test]
+async fn a_probe_answering_not_found_is_not_taken_as_enabled() {
+    struct AnswersNotFound;
+
+    #[async_trait::async_trait]
+    impl super::store::ArtifactStore for AnswersNotFound {
+        async fn put(
+            &self,
+            _: super::store::PutRequest<'_>,
+        ) -> Result<super::store::Stored, super::store::StoreError> {
+            Err(super::store::StoreError::NotFound)
+        }
+
+        async fn probe(&self) -> Result<(), super::store::StoreError> {
+            Err(super::store::StoreError::NotFound)
+        }
+    }
+
+    let found = probe_door(&AnswersNotFound, "https://door", Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(found, DoorProbe::Unavailable("unexpected_answer"));
+}

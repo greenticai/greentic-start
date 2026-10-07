@@ -10,10 +10,11 @@ use super::ingest::{ARTIFACTS_KEY, NOTES_KEY, Note};
 use super::label::display_label;
 use super::unit::Off;
 
-/// Every slot with a usable fetch reference gets `url = null`, its content
-/// cleared and a `door_unavailable` note; the fetch references are removed.
-/// Slots without a reference and envelopes without attachments are left as
-/// they are. Provider drop counters still become notes.
+/// Every slot with a usable fetch reference gets `url = null` and a
+/// `door_unavailable` note; the fetch references are removed. EVERY slot's
+/// inline content is cleared, reference or not: a unit without attachments
+/// never carries the request's bytes on. Envelopes without attachments are
+/// left as they are. Provider drop counters still become notes.
 pub(crate) fn refuse_all(envelope: &mut ChannelMessageEnvelope, off: Off) {
     let refs = parse_refs(&envelope.extensions);
     if refs.iter().any(Option::is_some) {
@@ -35,6 +36,9 @@ pub(crate) fn refuse_all(envelope: &mut ChannelMessageEnvelope, off: Off) {
         envelope
             .extensions
             .insert(NOTES_KEY.into(), Value::Array(notes));
+    }
+    for attachment in &mut envelope.attachments {
+        attachment.content = None;
     }
     append_drop_notes(envelope);
 }

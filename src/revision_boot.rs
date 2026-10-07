@@ -445,7 +445,12 @@ pub(crate) async fn activate_runtime_config(
         for block in &rc.revisions {
             let meta = deployments
                 .get(block.deployment_id.as_str())
-                .expect("deployment validated in the loop above");
+                .ok_or_else(|| {
+                    anyhow!(
+                        "deployment `{}` vanished between validation and activation",
+                        block.deployment_id
+                    )
+                })?;
             let deployment_id = DeploymentId(parse_ulid(&block.deployment_id, "deployment_id")?);
             let revision_id = RevisionId(parse_ulid(&block.revision_id, "revision_id")?);
             let unit_metering = meter_decisions
@@ -659,7 +664,12 @@ pub(crate) async fn activate_runtime_config(
             recovery: unit_recovery,
         } = activated_attachments
             .remove(&(deployment_id, revision_id))
-            .expect("every revision was activated in the pass above");
+            .ok_or_else(|| {
+                anyhow!(
+                    "revision `{}` has no attachments decision from the activation pass",
+                    block.revision_id
+                )
+            })?;
         if matches!(
             unit_state,
             crate::artifacts::unit::UnitAttachments::Enabled { .. }

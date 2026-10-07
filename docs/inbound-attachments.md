@@ -95,7 +95,9 @@ checked from the base64 length before decoding, the bytes are re-sniffed, and
 The per-conversation quota key is `channel family + pack id + envelope channel
 + sender + session id` (each part escaped). It includes the sender, so in a
 group conversation the 50 MiB is per sender. The admin's per-tenant byte quota
-is what bounds a WebChat client that rotates its sender id.
+is what bounds a WebChat client that rotates its sender id. The door never
+sees the key: the host sends its SHA-256 (64 hex characters) as
+`conversation_id`, because on WhatsApp the sender is a phone number.
 
 v1 types, decided from the bytes, never from a header or the provider's field
 (`application/octet-stream` means unknown): `image/jpeg`, `image/png`,
@@ -132,7 +134,11 @@ and `/artifacts/get`, authenticated with the unit's metering token
 (`Authorization: Bearer gtm_...`) carrying the `artifacts` purpose. The tenant
 comes from the token; nothing in a request names one.
 
-At activation every revision is probed in parallel (8 s budget each):
+At activation each distinct door (URL and token) is probed ONCE, however
+many revisions share it; at most 3 probes run at a time (the admin runs four
+transfers per process and refuses the rest); each probe has an 8 s budget and
+the whole pass a 10 s deadline, after which a door not yet probed counts as
+unavailable (and recovers in the background):
 
 | Probe answer | Revision state | Effect |
 |---|---|---|
@@ -145,9 +151,15 @@ At activation every revision is probed in parallel (8 s budget each):
 
 `Off(DoorUnavailable)` re-probes in the background: 30 s, doubling to 5 min,
 then every 5 min, with no give-up. On success the unit switches to `Enabled`
-without a restart; on `purpose_not_granted` it settles on `Off(NotGranted)`.
+without a restart; on `purpose_not_granted` it settles on `Off(NotGranted)`
+(one warning, code `purpose_not_granted`, naming the revision). A `401`
+during a re-probe is warned ONCE (code `rejected_token`, naming the revision),
+the unit stays off and the re-probe keeps going: a redeploy with a valid token
+fixes it.
 The agent reader and the extension port are installed for a door-down unit
-too, so they work as soon as the door answers.
+too, so they work as soon as the door answers. If the re-probe ends
+`purpose_not_granted`, the port already installed answers `unsupported` at
+once (no door call, no warning per call).
 
 Order of deployment: the admin carrying the artifacts door must be live BEFORE
 this host. Otherwise every metered unit sits in `Off(DoorUnavailable)` (no
@@ -156,7 +168,9 @@ files) until it is.
 The extension port (`greentic:extension-host/artifact@0.1.0`, tools that
 create files) writes with the unit's token and sends no `conversation_id`, so
 an extension's files count against the tenant quota only, never a
-conversation's.
+conversation's. One extension `put` is bounded by 20 s end to end (the store's
+retries included), so a tool waiting on a door that is down gets
+`unavailable` instead of blocking for the store's full retry span.
 
 ## 5. Channels
 
@@ -173,8 +187,12 @@ conversation's.
 A remote reference from a channel the host cannot verify is never resolved; the
 slot gets `fetch_failed` "files from this channel are not supported yet", and
 activation warns once per class. WhatsApp: an envelope naming another business
-number than the instance's is dropped; one with no number keeps its message but
-loses its fetch references. The legacy `--bundle` path stores nothing: every
+number than the instance's is dropped; one with no number (absent, empty or
+blank) keeps its message, but each media reference is replaced by a host
+marker and the slot is reported with a neutral `fetch_failed` note ("the file
+could not be retrieved"); nothing is fetched for it. A unit running without
+attachments (any `Off` state, and the legacy path) carries no inline bytes on
+for any slot, with or without a fetch reference. The legacy `--bundle` path stores nothing: every
 slot gets a `door_unavailable` note and inline bytes are cleared.
 
 ## 6. Configuration

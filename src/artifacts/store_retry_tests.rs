@@ -118,7 +118,12 @@ fn padded_answer(n: usize) -> String {
     format!("{},\"pad\":\"{pad}\"}}", &OK_BODY[..OK_BODY.len() - 1])
 }
 
-// --- conversation_id length (the door refuses more than 128 bytes) -----------
+// --- conversation_id: always its SHA-256, never the key itself ----------------
+//
+// The quota key is built from the channel, the pack, the sender and the
+// session: on WhatsApp the sender is a phone number. The door only needs a
+// stable, injective key, so the host sends the key's SHA-256 (64 hex
+// characters, inside the door's 128-byte limit) and never the key.
 
 fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -129,13 +134,18 @@ fn sha256_hex(s: &str) -> String {
 }
 
 #[tokio::test]
-async fn a_conversation_id_up_to_128_bytes_is_sent_as_is() {
-    let id = "c".repeat(128);
+async fn a_short_conversation_id_is_still_sent_hashed() {
+    let id = "whatsapp\u{1f}pack\u{1f}whatsapp\u{1f}6281234567890\u{1f}whatsapp".to_string();
     let stub = StubAdmin::answering(OK, "", OK_BODY).await;
     let mut req = request(b"x");
     req.conversation_id = Some(&id);
     client(&stub).put(req).await.unwrap();
-    assert_eq!(stub.last_body()["conversation_id"], id.as_str());
+    let sent = stub.last_body()["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(sent, sha256_hex(&id));
+    assert!(!stub.received().join("\n").contains("6281234567890"));
 }
 
 #[tokio::test]
