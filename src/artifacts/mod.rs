@@ -31,6 +31,7 @@ pub(crate) mod secrets;
 pub(crate) mod sniff;
 pub(crate) mod store;
 pub(crate) mod unit;
+pub(crate) mod unserved;
 pub(crate) mod wire;
 
 #[cfg(test)]
@@ -101,5 +102,7 @@ mod store_retry_tests;
 mod store_tests;
 #[cfg(test)]
 pub(crate) mod time_testkit;
+#[cfg(test)]
+mod unserved_tests;
 #[cfg(test)]
 mod wiring_tests;

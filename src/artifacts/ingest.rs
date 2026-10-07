@@ -84,9 +84,11 @@ const MESSAGE_TOO_LARGE: Note = Note::new(
 const FILE_TOO_LARGE: Note = Note::new("too_large", "the file is larger than the allowed size");
 const BAD_INLINE: Note = Note::new("fetch_failed", "the attached data could not be read");
 const OUT_OF_TIME: Note = Note::new("fetch_failed", "reading the message's files took too long");
+/// Neutral on purpose: the agent may relay it, and the cause is a gap in
+/// this host (see `super::unserved`), not anything the user did.
 const UNVERIFIED: Note = Note::new(
     "fetch_failed",
-    "the channel's request could not be verified, so the file was not downloaded",
+    "files from this channel are not supported yet",
 );
 const STORE_OUT_OF_TIME: Note = Note::new("door_unavailable", "it could not be stored in time");
 

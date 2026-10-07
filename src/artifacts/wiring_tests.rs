@@ -97,3 +97,16 @@ fn a_revision_whose_door_is_down_gets_a_re_probe_over_its_own_cell() {
         .expect("the same cell is what the table serves");
     assert!(spawn < insert);
 }
+
+/// Every activation names the channel classes whose files are not served.
+#[test]
+fn activation_names_the_unserved_channel_classes() {
+    const BOOT: &str = include_str!("../revision_boot.rs");
+    let warned = BOOT
+        .find("crate::artifacts::unserved::warn_unserved_channels(env);")
+        .expect("activation warns about unserved channels");
+    let activated = BOOT
+        .find("crate::artifacts::activate::activate_all(")
+        .expect("activation");
+    assert!(warned < activated);
+}

@@ -439,6 +439,7 @@ pub(crate) async fn activate_runtime_config(
     // (each probe bounded), before any revision loads. A misconfigured door
     // refuses the activation; a door that is down for now leaves the unit
     // serving without attachments until a background re-probe turns them on.
+    crate::artifacts::unserved::warn_unserved_channels(env);
     let mut activated_attachments = {
         let mut planned = Vec::with_capacity(rc.revisions.len());
         for block in &rc.revisions {
