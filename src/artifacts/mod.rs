@@ -41,6 +41,8 @@ mod fetcher_tests;
 #[cfg(test)]
 mod host_policy_tests;
 #[cfg(test)]
+mod ingest_blocking_tests;
+#[cfg(test)]
 mod ingest_bounds_tests;
 #[cfg(test)]
 mod ingest_provenance_tests;

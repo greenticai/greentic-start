@@ -18,7 +18,7 @@
 //! and a fixed reason, never a URL, a token, a status body or a provider id.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -26,6 +26,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use greentic_types::{Attachment, ChannelMessageEnvelope};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout_at};
 
 use super::drops::append_drop_notes;
@@ -33,6 +34,7 @@ use super::extract::{extract_text, truncate_chars};
 use super::fetch::{FetchError, Fetcher};
 use super::fetch_ref::{EXTENSION_KEY as FETCH_KEY, FetchRef, parse_refs};
 use super::limits::{MAX_FILE_BYTES, MAX_FILES, MAX_MESSAGE_BYTES, MAX_TEXT_CHARS};
+use super::pdf_limits::{SLOTS_ENV, worker_slots};
 use super::provenance::strip_reserved;
 use super::sniff::{Kind, detect};
 use super::store::{ArtifactStore, PutRequest, StoreError, Stored};
@@ -83,6 +85,24 @@ pub(crate) struct Pipeline {
     message_cap: u64,
     deadline: Duration,
     extractor: Extractor,
+    /// One permit per extraction running on a blocking thread. Taken BEFORE
+    /// `spawn_blocking` and moved into the closure, so the number of blocking
+    /// threads doing (or queueing for) extraction never exceeds it, even when
+    /// a message stops waiting at its deadline and the thread keeps running.
+    extraction: Arc<Semaphore>,
+}
+
+/// Process-wide extraction permits, as many as the PDF worker gate has slots:
+/// more blocking threads than that would only wait on the gate.
+fn shared_extraction_permits() -> Arc<Semaphore> {
+    static PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    PERMITS
+        .get_or_init(|| {
+            Arc::new(Semaphore::new(worker_slots(
+                std::env::var(SLOTS_ENV).ok().as_deref(),
+            )))
+        })
+        .clone()
 }
 
 impl Pipeline {
@@ -93,7 +113,25 @@ impl Pipeline {
             message_cap: MAX_MESSAGE_BYTES,
             deadline: MESSAGE_DEADLINE,
             extractor: Arc::new(extract_text),
+            extraction: shared_extraction_permits(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_extraction_permits(mut self, permits: usize) -> Self {
+        self.extraction = Arc::new(Semaphore::new(permits));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_shared_extraction_permits(mut self, permits: Arc<Semaphore>) -> Self {
+        self.extraction = permits;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn extraction_permits(&self) -> Arc<Semaphore> {
+        self.extraction.clone()
     }
 
     #[cfg(test)]
@@ -280,9 +318,17 @@ impl Pipeline {
         deadline: Instant,
     ) -> Option<String> {
         let extractor = self.extractor.clone();
+        let Ok(Ok(permit)) = timeout_at(deadline, self.extraction.clone().acquire_owned()).await
+        else {
+            tracing::warn!("no extraction slot was free in time; the file is kept without text");
+            return None;
+        };
         // One closure, start to finish: a PDF worker's death signal is tied to
-        // the thread that spawned it.
-        let job = tokio::task::spawn_blocking(move || extractor(&bytes, mime));
+        // the thread that spawned it. The permit lives as long as the thread.
+        let job = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            extractor(&bytes, mime)
+        });
         let text = match timeout_at(deadline, job).await {
             Ok(Ok(Some(text))) if !text.is_empty() => truncate_chars(&text, MAX_TEXT_CHARS),
             Ok(Ok(_)) => return None,
