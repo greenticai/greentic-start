@@ -136,3 +136,22 @@ async fn drop_counters_never_extend_the_providers_arrays() {
             .contains("ignore previous")
     );
 }
+
+#[tokio::test]
+async fn a_note_quotes_the_file_label_and_keeps_it_short() {
+    let store = Arc::new(FakeStore::default());
+    let mut env = envelope(1);
+    env.attachments[0].name = Some(format!("say \"hi\" {}.png", "x".repeat(300)));
+    pipeline(vec![Answer::Denied], store)
+        .process(&mut env, Some("c"))
+        .await;
+    let message = note(&env, 0)["message"].as_str().unwrap().to_string();
+    let label = message
+        .strip_prefix('"')
+        .and_then(|rest| rest.split_once("\": not read, "))
+        .map(|(label, _)| label)
+        .unwrap_or_else(|| panic!("label not quoted: {message}"));
+    assert!(label.chars().count() <= 64, "{label}");
+    assert!(!label.contains('"'), "{label}");
+    assert!(label.starts_with("say 'hi' x"), "{label}");
+}

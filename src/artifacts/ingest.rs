@@ -14,8 +14,8 @@
 //! - text extraction runs in `spawn_blocking` (a PDF waits on a worker
 //!   process) and the derived text is at most [`MAX_TEXT_CHARS`] characters.
 //!
-//! A note's `message` is `"<label>: not read, <reason>"`: a cleaned file label
-//! and a fixed reason, never a URL, a token, a status body or a provider id.
+//! A note's `message` is `"\"<label>\": not read, <reason>"`: a cleaned file
+//! label, quoted and at most 64 characters, and a fixed reason, never a URL, a token, a status body or a provider id.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -46,6 +46,8 @@ pub(crate) const MESSAGE_DEADLINE: Duration = Duration::from_secs(120);
 /// Longest label, in bytes, sent to the door (its limit is 255; the derived
 /// text adds `.txt`).
 const MAX_LABEL_BYTES: usize = 200;
+/// Longest label, in characters, quoted in a note the agent reads.
+const NOTE_LABEL_CHARS: usize = 64;
 
 /// Extracts document text; blocking. The production one is [`extract_text`].
 pub(crate) type Extractor = Arc<dyn Fn(&[u8], &str) -> Option<String> + Send + Sync>;
@@ -62,8 +64,16 @@ impl Note {
         Self { code, reason }
     }
 
+    /// The label is quoted and at most [`NOTE_LABEL_CHARS`] characters: a file
+    /// name is the sender's text, and the agent reads it as data, not as part
+    /// of the sentence.
     pub(crate) fn to_value(&self, label: &str) -> Value {
-        json!({ "code": self.code, "message": format!("{label}: not read, {}", self.reason) })
+        let short: String = label
+            .chars()
+            .take(NOTE_LABEL_CHARS)
+            .map(|c| if c == '"' { '\'' } else { c })
+            .collect();
+        json!({ "code": self.code, "message": format!("\"{short}\": not read, {}", self.reason) })
     }
 }
 

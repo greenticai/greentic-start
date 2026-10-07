@@ -159,7 +159,10 @@ async fn a_hostile_name_is_cleaned_before_it_reaches_the_door_or_a_note() {
     assert!(!stored.contains('/') && !stored.contains('\u{202E}') && !stored.contains('\n'));
     assert!(stored.starts_with("aaa"));
     let message = note(&env, 1)["message"].as_str().unwrap();
-    assert!(message.starts_with("attachment 2: not read"), "{message}");
+    assert!(
+        message.starts_with("\"attachment 2\": not read"),
+        "{message}"
+    );
 }
 
 #[tokio::test]
