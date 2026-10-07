@@ -772,19 +772,30 @@ fn parse_messaging_envelopes(value: Option<&JsonValue>) -> Vec<ChannelMessageEnv
                 envelopes.push(envelope);
             }
             Err(err) => {
-                operator_log::warn(
-                    module_path!(),
-                    format!(
-                        "[DEBUG] parse_messaging_envelopes: failed to parse envelope {}: {} entry={}",
-                        i,
-                        err,
-                        serde_json::to_string(entry).unwrap_or_default()
-                    ),
-                );
+                operator_log::warn(module_path!(), envelope_parse_failure(i, &err));
             }
         }
     }
     envelopes
+}
+
+/// The warning for an envelope the host could not parse. It names the index
+/// and the error's category and position only: the entry can carry inline file
+/// bytes and access URLs, and a serde message quotes the offending value
+/// (`invalid type: string "..."`), so neither is ever printed.
+pub(crate) fn envelope_parse_failure(index: usize, err: &serde_json::Error) -> String {
+    let category = match err.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    format!(
+        "provider envelope {index} could not be parsed ({category} error at line {} column {}); \
+         it was skipped and its contents are not logged",
+        err.line(),
+        err.column()
+    )
 }
 
 pub fn events_debug_json(events: &[EventEnvelopeV1]) -> JsonValue {

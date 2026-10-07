@@ -93,6 +93,10 @@ mod quota_key_tests;
 #[cfg(test)]
 mod recovery_tests;
 #[cfg(test)]
+mod redaction_ratchet_tests;
+#[cfg(test)]
+mod redaction_tests;
+#[cfg(test)]
 mod secrets_tests;
 #[cfg(test)]
 mod sniff_tests;
