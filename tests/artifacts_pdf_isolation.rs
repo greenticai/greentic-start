@@ -54,3 +54,33 @@ fn a_decompression_bomb_is_contained_by_the_worker() {
         started.elapsed()
     );
 }
+
+#[test]
+fn the_worker_runs_from_a_running_image_whose_file_is_gone() {
+    // What the host relies on after the runtime updater replaced or deleted
+    // its binary: exec through `/proc/<pid>/exe` (the host uses
+    // `/proc/self/exe`) still starts the running image.
+    use std::process::{Command, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("greentic-start");
+    std::fs::copy(binary(), &copy).unwrap();
+    // A process running the copy: the worker mode blocks reading its stdin.
+    let mut holder = Command::new(&copy)
+        .arg("__greentic-artifact-pdf-text")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::fs::remove_file(&copy).unwrap();
+    let image = format!("/proc/{}/exe", holder.id());
+
+    let pdf = pdf_fixture::text_pdf("Hello attachment", 1);
+    // Control: the deleted path itself can no longer be started.
+    assert_eq!(pdf_text_via(&copy, &pdf), "");
+    let text = pdf_text_via(Path::new(&image), &pdf);
+
+    let _ = holder.kill();
+    let _ = holder.wait();
+    assert!(text.contains("Hello attachment"), "got {text:?}");
+}

@@ -51,18 +51,39 @@ fn gate() -> &'static Gate {
     GATE.get_or_init(|| Gate::new(worker_slots(std::env::var(SLOTS_ENV).ok().as_deref())))
 }
 
-/// Enable PDF extraction by naming this process's own executable as the
-/// worker. Called by the binary's entry point only: a library consumer whose
+/// Path of the running image on Linux: it names the executable this process
+/// runs even after the file at its path has been replaced or deleted (the
+/// runtime updater does both), so the worker is always the same build.
+const PROC_SELF_EXE: &str = "/proc/self/exe";
+
+/// Enable PDF extraction with this process's own executable as the worker.
+/// Called by the binary's entry point only: a library consumer whose
 /// executable is not `greentic-start` never enables it, and gets no PDF text.
 pub(crate) fn enable_worker_from_current_exe() {
-    match std::env::current_exe() {
-        Ok(program) => {
+    let current = std::env::current_exe();
+    let proc_self_exe = cfg!(target_os = "linux") && Path::new(PROC_SELF_EXE).exists();
+    match worker_program(proc_self_exe, current.as_ref().ok().cloned()) {
+        Some(program) => {
+            tracing::debug!(
+                worker = %program.display(),
+                executable = ?current.as_ref().ok(),
+                "PDF text worker enabled"
+            );
             let _ = WORKER_PROGRAM.set(program);
         }
-        Err(err) => tracing::warn!(
-            error = %err,
+        None => tracing::warn!(
             "cannot locate the current executable; PDF attachments will carry no text"
         ),
+    }
+}
+
+/// The worker executable: the running image when `/proc/self/exe` is usable,
+/// else the path the process was started from.
+pub(crate) fn worker_program(proc_self_exe: bool, current: Option<PathBuf>) -> Option<PathBuf> {
+    if proc_self_exe {
+        Some(PathBuf::from(PROC_SELF_EXE))
+    } else {
+        current
     }
 }
 

@@ -311,3 +311,18 @@ fn limits_with_a_memory_override_change_only_the_memory() {
         Limits::DEFAULT
     );
 }
+
+// --- Which executable the worker is ------------------------------------------
+
+#[test]
+fn the_worker_is_the_running_image_not_its_path() {
+    // `/proc/self/exe` is the image this process runs even after the runtime
+    // updater has replaced or deleted the file at its path.
+    let current = Some(std::path::PathBuf::from("/opt/greentic/bin/greentic-start"));
+    assert_eq!(
+        worker_program(true, current.clone()).as_deref(),
+        Some(Path::new("/proc/self/exe"))
+    );
+    assert_eq!(worker_program(false, current.clone()), current);
+    assert_eq!(worker_program(false, None), None);
+}
