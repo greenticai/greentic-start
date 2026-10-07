@@ -1047,3 +1047,126 @@ async fn deleting_an_absent_entry_from_the_real_store_is_a_no_op() {
         b"x"
     );
 }
+
+// ---- the env follows the category -------------------------------------------
+
+#[tokio::test]
+async fn each_secret_lands_at_the_env_its_category_is_read_from() {
+    let door = serve(vec![ok(json!({"secrets": [
+        {"path":"_/mcp/a","value":"1"},
+        {"path":"_/a2a/b","value":"2"},
+        {"path":"_/llm/c","value":"3"},
+        {"path":"_/knowledge/d","value":"4"},
+        {"path":"_/sorla/e","value":"5"},
+        {"path":"_/hubspot_ext_unit_u_abc123/access_token","value":"6"},
+        {"path":"_/hubspot_ext/access_token","value":"7"},
+        {"path":"ops/messaging_webchat_gui/signing_seed","value":"8"},
+    ], "etag":"e"}))])
+    .await;
+    let store = MemStore::default();
+    stage(&store, "acme", "route-env", &door.endpoint(), Some(true));
+    run(&store, "acme", "route-env").await.unwrap();
+
+    for uri in [
+        "secrets://default/acme/_/mcp/a",
+        "secrets://default/acme/_/a2a/b",
+        "secrets://default/acme/_/llm/c",
+        "secrets://default/acme/_/knowledge/d",
+        "secrets://default/acme/_/sorla/e",
+        "secrets://local/acme/_/hubspot_ext_unit_u_abc123/access_token",
+        "secrets://local/acme/_/hubspot_ext/access_token",
+        "secrets://local/acme/ops/messaging_webchat_gui/signing_seed",
+    ] {
+        assert!(store.get(uri).is_some(), "{uri}");
+    }
+    assert_eq!(store.written().len(), 8, "one write per secret, no extras");
+}
+
+#[test]
+fn the_env_rule_is_by_category_only() {
+    assert_eq!(env_for_path("_/mcp/x", "local"), "default");
+    assert_eq!(env_for_path("t/sorla/x", "staging"), "default");
+    assert_eq!(env_for_path("_/hubspot/x", "local"), "local");
+    assert_eq!(env_for_path("_/hubspot/x", "staging"), "staging");
+    // Name segments that merely look like a runner category do not count.
+    assert_eq!(env_for_path("_/hubspot/mcp", "local"), "local");
+}
+
+#[tokio::test]
+async fn stale_removal_deletes_the_address_actually_written() {
+    let door = serve(vec![
+        ok(json!({"secrets":[
+            {"path":"_/mcp/keep","value":"1"},
+            {"path":"_/hubspot_ext/gone","value":"2"},
+        ],"etag":"e1"})),
+        ok(json!({"secrets":[{"path":"_/mcp/keep","value":"1"}],"etag":"e2"})),
+    ])
+    .await;
+    let store = MemStore::default();
+    stage(&store, "acme", "stale-env", &door.endpoint(), Some(true));
+    run(&store, "acme", "stale-env").await.unwrap();
+    run(&store, "acme", "stale-env").await.unwrap();
+    assert_eq!(
+        store.deletes.lock().unwrap().clone(),
+        vec!["secrets://local/acme/_/hubspot_ext/gone".to_string()]
+    );
+    assert!(
+        store
+            .get("secrets://local/acme/_/hubspot_ext/gone")
+            .is_none()
+    );
+}
+
+/// The runner's own candidate walks (`greentic-runner-host`, the version this
+/// repo pins) find what hydrate wrote: a pack-scoped node secret through
+/// `read_pack_secret_blocking` (pack.rs:483) and a tool secret at
+/// `agent_tool_secret_uri` (what `StoreToolSecretsBackend` reads).
+#[tokio::test]
+async fn the_runner_finds_hydrated_node_and_tool_secrets() {
+    use greentic_runner_host::secrets::{
+        DynSecretsManager, agent_tool_secret_uri, read_pack_secret_blocking, unit_pack_segment,
+    };
+    use greentic_types::{EnvId, TenantCtx, TenantId};
+
+    let unit = "runner-walk";
+    let node_seg = unit_pack_segment("greentic-hubspot", unit).expect("unit segment");
+    let tool_uri = agent_tool_secret_uri("local", "default", "hubspot", "access_token", Some(unit))
+        .expect("tool uri");
+    let tool_path = tool_uri
+        .strip_prefix("secrets://local/default/")
+        .unwrap()
+        .to_string();
+
+    let door = serve(vec![ok(json!({"secrets": [
+        {"path": format!("_/{node_seg}/access_token"), "value": "node-secret"},
+        {"path": tool_path, "value": "tool-secret"},
+    ], "etag":"e"}))])
+    .await;
+    let store = Arc::new(MemStore::default());
+    stage(&store, "default", unit, &door.endpoint(), Some(true));
+    assert_eq!(
+        run(&store, "default", unit).await.unwrap(),
+        Hydration::Written(2)
+    );
+
+    // Node/tool candidate walk, exactly as the runner performs it.
+    let manager: DynSecretsManager = store.clone();
+    let node = std::thread::spawn(move || {
+        let ctx = TenantCtx::new(
+            EnvId::new("local").unwrap(),
+            TenantId::new("default").unwrap(),
+        );
+        read_pack_secret_blocking(
+            &manager,
+            &ctx,
+            "greentic-hubspot",
+            Some(unit),
+            "access_token",
+        )
+    })
+    .join()
+    .unwrap()
+    .expect("the runner's node walk finds the hydrated secret");
+    assert_eq!(node, b"node-secret");
+    assert_eq!(store.get(&tool_uri).unwrap(), b"tool-secret");
+}

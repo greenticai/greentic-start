@@ -100,8 +100,8 @@ writes the answer into the dev store it already serves from:
 - `POST <metering.endpoint with worker-usage → secrets>/read-all`, bearer = the
   unit's metering token, body `{}`, optional `If-None-Match`.
 - `200 {"secrets":[{"path":"<team>/<category>/<name>","value","encoding":"utf8|base64"}],"etag"}`;
-  each entry lands at `secrets://default/<tenant>/<path>` — env pinned to
-  `default`, path verbatim, i.e. the address `read_secret_for_unit` walks.
+  each entry lands at `secrets://<env>/<tenant>/<path>`, path verbatim, with
+  `<env>` chosen per secret by its category (see the env rule below).
 - A flagged unit **fails closed**: an unreachable, unauthorised (401/403) or
   absent (404) door, or a flag with no usable `metering` block, fails the
   activation (cold start and reload) after 4 attempts with 0.5 s doubling
@@ -143,12 +143,29 @@ writes the answer into the dev store it already serves from:
   written; messages name the key's address and the secret's path, never a key or
   value. AES-GCM comes from `ring` (already in the tree via rustls); `aes-gcm`
   is not.
-- **Only runner-scoped categories belong in the door.** It writes at env
-  `default`, where the runner reads `mcp`, `a2a`, `llm`, `knowledge` and
-  `sorla`. Pack-scoped extension secrets and the generated webchat
-  `jwt_signing_key` are read at the revision's env (`local`) and must stay in
-  the shipped dev store; any other category is written but warned about, since
-  nothing will read it.
+- **The env follows the category** (`env_for_path`), because the runner reads
+  the two families at different envs:
+  - `mcp`, `a2a`, `llm`, `knowledge`, `sorla` (the middle path segment) are read
+    at env `default` (`greentic_aw_runtime::scoped_secrets`, `ENV_SEGMENT`), so
+    they are written at `default`.
+  - EVERY other category — a pack segment such as `<pack>`,
+    `<pack>_unit_<unit>_<hash>` or a channel pack id, holding an extension
+    node's or tool's credential or a channel secret — is read at the revision's
+    own env, `$GREENTIC_ENV` (`local` when unset), which is the env the ingress
+    document is read under (`resolve_env`); it is written there.
+  Evidence at `greentic-runner-host 1.2.0-dev.37554921045`: node secrets are read
+  by `read_pack_secret_blocking` (`pack.rs:483`) through
+  `scoped_secret_path_for_pack` (`secrets.rs:536-558`, env = `ctx.env`), where
+  the ctx comes from `HostConfig::tenant_ctx` (`config.rs:351-352`,
+  `GREENTIC_ENV` else `local`); tool secrets by `StoreToolSecretsBackend`
+  (`runner/agent_node.rs:916-1000`) through `agent_tool_secret_uri`
+  (`secrets.rs:494-511`) with env = `GREENTIC_ENV`. One caveat there: that
+  tool backend falls back to env `dev`, not `local`, when `GREENTIC_ENV` is
+  unset or blank; start resolves an unset env to `local` (and aliases `dev` to
+  `local`), so a deployed unit must have `GREENTIC_ENV` set. The generated
+  webchat `jwt_signing_key` is minted by start into the store at boot and is
+  not a door secret. Stale-removal tracking records the full address written,
+  so a removed secret is deleted from the env it was written to.
 
 Code: `src/secrets_door.rs`. A start predating the field ignores it (the
 ingress parser does not reject unknown fields), so the designer must not stop
