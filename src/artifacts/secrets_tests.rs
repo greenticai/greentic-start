@@ -83,3 +83,37 @@ async fn a_missing_or_unreadable_secret_is_none() {
     let lookup = HostSecrets::new(manager, "dev".into());
     assert_eq!(lookup.get(&scope("p"), "WEBEX_BOT_TOKEN").await, None);
 }
+
+/// An empty (or unreadable) first candidate must not hide the canonical one
+/// behind it.
+#[tokio::test]
+async fn an_empty_first_candidate_falls_through_to_the_next() {
+    let uris = crate::runner_host::secret_read_uris(
+        "dev",
+        "acme",
+        Some("ops"),
+        "messaging-provider-slack",
+        "SLACK_BOT_TOKEN",
+    );
+    assert!(
+        uris.len() >= 2,
+        "the provider reads more than one candidate"
+    );
+    for first in [b"  \n".to_vec(), vec![0xff, 0xfe]] {
+        let manager = Arc::new(MapSecrets {
+            values: HashMap::from([
+                (uris[0].clone(), first),
+                (uris.last().unwrap().clone(), b"xoxb-2".to_vec()),
+            ]),
+            ..Default::default()
+        });
+        let lookup = HostSecrets::new(manager, "dev".into());
+        assert_eq!(
+            lookup
+                .get(&scope("messaging-provider-slack"), "SLACK_BOT_TOKEN")
+                .await
+                .as_deref(),
+            Some("xoxb-2")
+        );
+    }
+}

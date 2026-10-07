@@ -33,12 +33,19 @@ impl SecretLookup for HostSecrets {
             name,
         );
         for uri in uris {
-            // A failed read is treated as absent; its text can name the
-            // store, so it is not logged here.
-            if let Ok(bytes) = self.manager.read(&uri).await {
-                let value = String::from_utf8(bytes).ok()?;
-                let value = value.trim();
-                return (!value.is_empty()).then(|| value.to_string());
+            // A failed read, an empty value or one that is not text is
+            // treated as absent and the next candidate (the canonical one
+            // last) is tried; the read's error text can name the store, so it
+            // is not logged here.
+            let Ok(bytes) = self.manager.read(&uri).await else {
+                continue;
+            };
+            let Ok(value) = String::from_utf8(bytes) else {
+                continue;
+            };
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
             }
         }
         None

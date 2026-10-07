@@ -82,3 +82,30 @@ fn nothing_that_identifies_a_conversation_means_no_key() {
     env.from = None;
     assert_eq!(conversation_key(&env, &whatsapp()), None);
 }
+
+/// A part carrying the separator cannot impersonate another split of the
+/// parts: the separator (and the escape itself) is escaped.
+#[test]
+fn a_separator_inside_a_part_cannot_shift_the_parts() {
+    let mut a = bare_envelope();
+    a.channel = "c\u{1f}alice".into();
+    from(&mut a, "s1");
+    a.session_id = "x".into();
+    let mut b = bare_envelope();
+    b.channel = "c".into();
+    from(&mut b, "alice\u{1f}s1");
+    b.session_id = "x".into();
+    assert_ne!(
+        conversation_key(&a, &whatsapp()),
+        conversation_key(&b, &whatsapp())
+    );
+    let mut c = bare_envelope();
+    c.channel = "c\\u001falice".into();
+    from(&mut c, "s1");
+    c.session_id = "x".into();
+    assert_ne!(
+        conversation_key(&a, &whatsapp()),
+        conversation_key(&c, &whatsapp()),
+        "the escape itself is escaped"
+    );
+}
