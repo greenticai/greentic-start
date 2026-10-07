@@ -90,6 +90,12 @@ fn base_builder(timeout: Duration) -> reqwest::ClientBuilder {
         .connect_timeout(CONNECT_TIMEOUT.min(timeout))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
+        // Explicit, because feature unification turns decoding on elsewhere
+        // in this binary: an inflated answer would bypass every byte cap.
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
 }
 
 /// The production attachment client. `timeout` bounds one request end to end.

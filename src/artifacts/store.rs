@@ -129,6 +129,12 @@ impl HttpArtifactStore {
             // proxy would be a second party holding it (and, for plain-http
             // doors, reading it).
             .no_proxy()
+            // Identity bytes only: feature unification turns decoding on
+            // elsewhere in this binary, and the answer cap counts what is read.
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
             .build()?;
         Ok(Self {
             client,

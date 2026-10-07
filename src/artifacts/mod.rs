@@ -33,6 +33,8 @@ mod dns_tests;
 #[cfg(test)]
 mod drops_tests;
 #[cfg(test)]
+mod encoding_tests;
+#[cfg(test)]
 mod extract_tests;
 #[cfg(test)]
 mod fetch_tests;
