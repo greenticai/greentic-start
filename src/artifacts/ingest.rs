@@ -33,6 +33,7 @@ use super::extract::{extract_text, truncate_chars};
 use super::fetch::{FetchError, Fetcher};
 use super::fetch_ref::{EXTENSION_KEY as FETCH_KEY, FetchRef, parse_refs};
 use super::limits::{MAX_FILE_BYTES, MAX_FILES, MAX_MESSAGE_BYTES, MAX_TEXT_CHARS};
+use super::provenance::strip_reserved;
 use super::sniff::{Kind, detect};
 use super::store::{ArtifactStore, PutRequest, StoreError, Stored};
 
@@ -113,15 +114,18 @@ impl Pipeline {
         self
     }
 
-    /// Rewrites `envelope` in place, then appends a note slot for every
-    /// attachment or message the provider counted as dropped (see
-    /// [`super::drops`]). Does nothing (not one byte changes) when no
-    /// attachment carries a usable fetch reference and no counter is present.
+    /// First removes every host field a provider wrote (see
+    /// [`super::provenance`]), then rewrites `envelope` in place, then appends
+    /// a note slot for every attachment or message the provider counted as
+    /// dropped (see [`super::drops`]). Beyond that removal, nothing changes
+    /// when no attachment carries a usable fetch reference and no counter is
+    /// present.
     pub(crate) async fn process(
         &self,
         envelope: &mut ChannelMessageEnvelope,
         conversation_id: Option<&str>,
     ) {
+        strip_reserved(envelope);
         self.ingest(envelope, conversation_id).await;
         append_drop_notes(envelope);
     }

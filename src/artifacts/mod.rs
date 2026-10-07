@@ -19,6 +19,7 @@ pub(crate) mod ingest;
 pub(crate) mod limits;
 pub(crate) mod pdf_isolation;
 pub(crate) mod pdf_limits;
+pub(crate) mod provenance;
 pub(crate) mod sniff;
 pub(crate) mod store;
 pub(crate) mod wire;
@@ -41,6 +42,8 @@ mod fetcher_tests;
 mod host_policy_tests;
 #[cfg(test)]
 mod ingest_bounds_tests;
+#[cfg(test)]
+mod ingest_provenance_tests;
 #[cfg(test)]
 mod ingest_testkit;
 #[cfg(test)]
