@@ -85,7 +85,6 @@ impl From<RequestError> for FetchError {
 #[derive(Debug)]
 pub(crate) struct Fetched {
     pub bytes: Vec<u8>,
-    pub name_hint: Option<String>,
 }
 
 #[async_trait]
@@ -227,10 +226,7 @@ impl HttpFetcher {
             .ok_or(FetchError::BadReference)?;
         let file = join(&api, &format!("file/bot{token}/{path}"))?;
         let bytes = self.download(file, auth, self.cap).await?;
-        Ok(Fetched {
-            bytes,
-            name_hint: None,
-        })
+        Ok(Fetched { bytes })
     }
 
     async fn fetch_whatsapp(
@@ -253,10 +249,7 @@ impl HttpFetcher {
             .and_then(|url| Url::parse(&url).ok())
             .ok_or(FetchError::BadReference)?;
         let bytes = self.download(url, auth, self.cap).await?;
-        Ok(Fetched {
-            bytes,
-            name_hint: None,
-        })
+        Ok(Fetched { bytes })
     }
 }
 
@@ -288,10 +281,7 @@ impl Fetcher for HttpFetcher {
             // Bytes already in the envelope: the pipeline stores them itself.
             FetchRef::Inline => return Err(FetchError::BadReference),
         };
-        Ok(Fetched {
-            bytes,
-            name_hint: None,
-        })
+        Ok(Fetched { bytes })
     }
 }
 

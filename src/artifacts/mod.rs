@@ -3,10 +3,7 @@
 //!
 //! Contract: the attachments-and-artifacts master plan (C1 envelope, C3 door).
 
-// The pipeline that consumes these modules is wired into the inbound path in a
-// later step; until then only the tests reach them.
-#![allow(dead_code)]
-
+pub(crate) mod activate;
 pub(crate) mod boot;
 pub(crate) mod client;
 pub(crate) mod dns;
@@ -14,18 +11,26 @@ pub(crate) mod drops;
 pub(crate) mod extract;
 pub(crate) mod fetch;
 pub(crate) mod fetch_ref;
+pub(crate) mod hook;
 pub(crate) mod host_policy;
 pub(crate) mod ingest;
 pub(crate) mod label;
+pub(crate) mod legacy;
 pub(crate) mod limits;
+pub(crate) mod off;
 pub(crate) mod origin;
 pub(crate) mod pdf_isolation;
 pub(crate) mod pdf_limits;
 pub(crate) mod provenance;
+pub(crate) mod quota_key;
+pub(crate) mod secrets;
 pub(crate) mod sniff;
 pub(crate) mod store;
+pub(crate) mod unit;
 pub(crate) mod wire;
 
+#[cfg(test)]
+mod activate_tests;
 #[cfg(test)]
 mod boot_tests;
 #[cfg(test)]
@@ -47,6 +52,8 @@ mod fetcher_id_tests;
 #[cfg(test)]
 mod fetcher_tests;
 #[cfg(test)]
+mod hook_tests;
+#[cfg(test)]
 mod host_policy_tests;
 #[cfg(test)]
 mod ingest_blocking_tests;
@@ -59,6 +66,8 @@ mod ingest_testkit;
 #[cfg(test)]
 mod ingest_tests;
 #[cfg(test)]
+mod legacy_tests;
+#[cfg(test)]
 mod limits_tests;
 #[cfg(test)]
 mod origin_tests;
@@ -69,6 +78,10 @@ mod pdf_isolation_tests;
 #[cfg(test)]
 mod proxy_testkit;
 #[cfg(test)]
+mod quota_key_tests;
+#[cfg(test)]
+mod secrets_tests;
+#[cfg(test)]
 mod sniff_tests;
 #[cfg(test)]
 mod store_retry_tests;
@@ -76,3 +89,5 @@ mod store_retry_tests;
 mod store_tests;
 #[cfg(test)]
 mod time_testkit;
+#[cfg(test)]
+mod wiring_tests;

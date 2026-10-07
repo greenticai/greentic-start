@@ -118,10 +118,7 @@ impl Fetcher for FakeFetcher {
     async fn fetch(&self, _: &Origin, _: &FetchRef) -> Result<Fetched, FetchError> {
         let i = self.calls.fetch_add(1, Ordering::SeqCst);
         match self.answers[i % self.answers.len()].clone() {
-            Answer::Bytes(bytes) => Ok(Fetched {
-                bytes,
-                name_hint: None,
-            }),
+            Answer::Bytes(bytes) => Ok(Fetched { bytes }),
             Answer::Denied => Err(FetchError::Denied(401)),
             Answer::Hang => {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -185,7 +182,8 @@ pub(crate) fn note(env: &ChannelMessageEnvelope, i: usize) -> &Value {
     &env.extensions["attachment_notes"][i]
 }
 
-/// The origin most ingest tests run under: an envelope received on Slack.
+/// The origin most ingest tests run under: a verified request received on
+/// Slack.
 pub(crate) fn slack() -> Origin {
     Origin::new(
         "messaging.slack.api",
@@ -193,6 +191,7 @@ pub(crate) fn slack() -> Origin {
         "demo",
         None,
     )
+    .verified_by_host(true)
 }
 
 /// The origin a reference of this kind legitimately arrives on.
@@ -203,5 +202,5 @@ pub(crate) fn origin_of(reference: &FetchRef) -> Origin {
         FetchRef::Bearer { secret_key, .. } if secret_key == "WEBEX_BOT_TOKEN" => "messaging.webex",
         _ => "messaging.slack.api",
     };
-    Origin::new(provider_type, "messaging-provider-under-test", "demo", None)
+    Origin::new(provider_type, "messaging-provider-under-test", "demo", None).verified_by_host(true)
 }

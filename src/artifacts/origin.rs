@@ -93,6 +93,10 @@ pub(crate) struct SecretScope {
 pub(crate) struct Origin {
     channel: Channel,
     scope: SecretScope,
+    /// Whether THIS host verified the request that produced the envelope
+    /// (Slack's signature, Telegram's secret token). A remote fetch
+    /// reference is resolved only from a verified request (host checklist 12).
+    verified: bool,
 }
 
 impl Origin {
@@ -109,7 +113,18 @@ impl Origin {
                 team: team.map(str::to_string),
                 pack_id: pack_id.to_string(),
             },
+            verified: false,
         }
+    }
+
+    /// Marks the request as verified by this host. Unverified is the default.
+    pub(crate) fn verified_by_host(mut self, verified: bool) -> Self {
+        self.verified = verified;
+        self
+    }
+
+    pub(crate) fn is_verified(&self) -> bool {
+        self.verified
     }
 
     pub(crate) fn channel(&self) -> Channel {

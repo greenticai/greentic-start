@@ -706,6 +706,7 @@ mod tests {
                 app_packs: Default::default(),
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
+                attachments: Default::default(),
             }),
         }
     }

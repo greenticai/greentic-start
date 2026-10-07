@@ -59,7 +59,7 @@ pub(crate) struct Note {
 }
 
 impl Note {
-    const fn new(code: &'static str, reason: &'static str) -> Self {
+    pub(crate) const fn new(code: &'static str, reason: &'static str) -> Self {
         Self { code, reason }
     }
 
@@ -84,6 +84,10 @@ const MESSAGE_TOO_LARGE: Note = Note::new(
 const FILE_TOO_LARGE: Note = Note::new("too_large", "the file is larger than the allowed size");
 const BAD_INLINE: Note = Note::new("fetch_failed", "the attached data could not be read");
 const OUT_OF_TIME: Note = Note::new("fetch_failed", "reading the message's files took too long");
+const UNVERIFIED: Note = Note::new(
+    "fetch_failed",
+    "the channel's request could not be verified, so the file was not downloaded",
+);
 const STORE_OUT_OF_TIME: Note = Note::new("door_unavailable", "it could not be stored in time");
 
 type Done = (Stored, Option<String>);
@@ -276,6 +280,12 @@ impl Pipeline {
         // independent of the fetcher.
         if !origin.channel().allows(reference) {
             return Err(fetch_note(FetchError::NotThisChannel));
+        }
+        // Host checklist 12: a remote reference is resolved only from a
+        // request this host verified. Inline bytes are the request's own and
+        // need no outbound fetch.
+        if !origin.is_verified() && !matches!(reference, FetchRef::Inline) {
+            return Err(UNVERIFIED);
         }
         let bytes = match reference {
             FetchRef::Inline => decode_inline(attachment.content.as_ref())?,

@@ -5567,6 +5567,10 @@ async fn dispatch_provider_route(
         Ok(provider_auth::AuthOutcome::Skipped) => None,
         Err(response) => return Err(response),
     };
+    // Whether THIS host verified the request (a matched webhook secret above,
+    // or a checked signature below). Inbound attachments resolve a remote
+    // fetch reference only from a verified request.
+    let mut transport_verified = header_endpoint_id_authenticated.is_some();
 
     // Transport-layer signature gate. `provider_auth` above covers providers
     // that authenticate with a shared secret in a header (Telegram); this
@@ -5604,7 +5608,10 @@ async fn dispatch_provider_route(
         })
         .await;
         match verdict {
-            Ok(Ok(_)) => {}
+            Ok(Ok(verification)) => {
+                transport_verified |=
+                    verification == provider_webhook_verify::WebhookVerification::Verified;
+            }
             Ok(Err(boxed)) => return Err(*boxed),
             Err(err) => {
                 // The verification task panicked or was cancelled. There is no
@@ -5909,6 +5916,7 @@ async fn dispatch_provider_route(
                     welcome_hint,
                     pipeline_notifier,
                     supports_typing,
+                    transport_verified,
                 )
                 .await;
             }
@@ -6030,6 +6038,7 @@ async fn run_provider_inbound_pipeline(
     welcome_hint: Option<WelcomeFlowHint>,
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
     supports_typing: bool,
+    transport_verified: bool,
 ) {
     // Channel "is typing" signal (docs/typing-signal.md). Built once per batch and
     // only when the provider declares `send_typing` and the kill switch is on. The
@@ -6053,6 +6062,17 @@ async fn run_provider_inbound_pipeline(
             &pack_id,
         )
     });
+    // Inbound attachments (`crate::artifacts::hook`): runs here, after the
+    // HTTP ack and the approval intercept, before any turn.
+    let mut envelopes = envelopes;
+    let origin =
+        crate::artifacts::origin::Origin::new(&provider_type, &pack_id, &tenant, Some(&team))
+            .verified_by_host(transport_verified);
+    let unit = activation
+        .routing
+        .attachments
+        .get(deployment_id, revision_id);
+    crate::artifacts::hook::prepare(unit.as_deref(), &mut envelopes, &origin).await;
     for ingress in &envelopes {
         // Per-envelope flow targeting: if the envelope carries a
         // `flow_hint` metadata key (the provider echoing back the flow the
@@ -8355,6 +8375,7 @@ mod tests {
                 app_packs: Default::default(),
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
+                attachments: Default::default(),
             }),
         });
         let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -9469,6 +9490,7 @@ mod tests {
                 app_packs: Default::default(),
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
+                attachments: Default::default(),
             }),
         }
     }
@@ -9764,6 +9786,7 @@ mod tests {
                 app_packs: Default::default(),
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
+                attachments: Default::default(),
             }),
         }
     }
@@ -11134,6 +11157,7 @@ mod tests {
             app_packs: live.routing.app_packs.clone(),
             triggers: live.routing.triggers.clone(),
             runtime_metered: live.routing.runtime_metered.clone(),
+            attachments: live.routing.attachments.clone(),
             // …and rebuilds the env-derived half.
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
@@ -11189,6 +11213,7 @@ mod tests {
             app_packs: live.routing.app_packs.clone(),
             triggers: live.routing.triggers.clone(),
             runtime_metered: live.routing.runtime_metered.clone(),
+            attachments: live.routing.attachments.clone(),
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: std::sync::Arc::default(),
@@ -11764,6 +11789,7 @@ mod tests {
             app_packs: Default::default(),
             triggers: Default::default(),
             runtime_metered: Default::default(),
+            attachments: Default::default(),
         });
         let activation = Activation {
             host: base.host,
@@ -12791,6 +12817,7 @@ mod binary_update_tests {
                 app_packs: Default::default(),
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
+                attachments: Default::default(),
             }),
         }
     }
@@ -15583,6 +15610,7 @@ mod binary_update_tests {
                 app_packs: Default::default(),
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
+                attachments: Default::default(),
             }),
         }
     }

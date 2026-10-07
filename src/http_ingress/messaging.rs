@@ -28,8 +28,9 @@ pub(super) fn route_messaging_envelopes(
     runner_host: &Arc<DemoRunnerHost>,
     provider: &str,
     ctx: &OperatorContext,
-    envelopes: Vec<ChannelMessageEnvelope>,
+    mut envelopes: Vec<ChannelMessageEnvelope>,
 ) -> anyhow::Result<()> {
+    crate::artifacts::legacy::declare_unserved(&mut envelopes);
     let team = ctx.team.as_deref();
     let app_pack_path = app::resolve_app_pack_path(bundle, &ctx.tenant, team, None)
         .context("resolve app pack for messaging pipeline")?;

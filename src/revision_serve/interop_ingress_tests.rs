@@ -286,6 +286,7 @@ fn activation_full(
             } else {
                 Default::default()
             },
+            attachments: Default::default(),
         }),
     };
     (activation, deployment_id, reads)
@@ -1293,6 +1294,7 @@ fn activation_mounting(units: Vec<MountedUnit>) -> Activation {
             app_packs: Default::default(),
             triggers: Default::default(),
             runtime_metered: Default::default(),
+            attachments: Default::default(),
         }),
     }
 }

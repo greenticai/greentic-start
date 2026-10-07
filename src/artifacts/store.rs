@@ -146,6 +146,7 @@ impl HttpArtifactStore {
     }
 
     /// The first wait between attempts; it doubles after each retry.
+    #[cfg(test)]
     pub(crate) fn with_backoff(mut self, backoff: Duration) -> Self {
         self.backoff = backoff;
         self

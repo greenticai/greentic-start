@@ -619,6 +619,7 @@ pub(super) fn activation_with(
             app_packs,
             triggers: Default::default(),
             runtime_metered: Default::default(),
+            attachments: Default::default(),
         }),
     }
 }

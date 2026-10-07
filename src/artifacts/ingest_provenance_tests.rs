@@ -182,3 +182,31 @@ async fn a_reference_for_another_channel_is_never_fetched() {
     }
     assert!(store.puts().is_empty());
 }
+
+#[tokio::test]
+async fn an_unverified_request_resolves_no_remote_reference_but_keeps_inline_bytes() {
+    use base64::Engine as _;
+    let store = Arc::new(FakeStore::default());
+    let fetcher = FakeFetcher::new(vec![ok(png(0))]);
+    let mut env = envelope(2);
+    env.extensions.insert(
+        "attachment_fetch".into(),
+        json!([{"kind": "public", "url": "https://x/0"}, {"kind": "inline"}]),
+    );
+    env.attachments[1].content = Some(json!(
+        base64::engine::general_purpose::STANDARD.encode(png(1))
+    ));
+    let unverified = super::origin::Origin::new("messaging.whatsapp", "p", "demo", None);
+    super::ingest::Pipeline::new(store.clone(), fetcher.clone())
+        .process(&mut env, Some("c"), &unverified)
+        .await;
+    assert_eq!(
+        fetcher.calls(),
+        0,
+        "a remote reference from an unverified request was fetched"
+    );
+    assert!(env.attachments[0].url.is_none());
+    assert_eq!(note(&env, 0)["code"], "fetch_failed");
+    // The request's own bytes need no outbound fetch: they are stored.
+    assert_eq!(env.attachments[1].url.as_deref(), Some("artifact://id1"));
+}

@@ -90,6 +90,7 @@ impl Lookup for SystemLookup {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn resolve_public(host: &str) -> Result<Vec<SocketAddr>, NoPublicAddress> {
     resolve_public_with(&SystemLookup, host).await
 }
