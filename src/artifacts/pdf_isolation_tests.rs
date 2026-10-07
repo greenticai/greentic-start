@@ -146,11 +146,11 @@ fn a_flooding_worker_is_cut_off() {
 #[test]
 fn the_worker_runs_under_resource_limits() {
     let script = format!(
-        "printf '{}'; printf '%s %s %s %s' \"$(ulimit -d)\" \"$(ulimit -t)\" \"$(ulimit -f)\" \"$(ulimit -c)\"",
+        "printf '{}'; printf '%s %s %s %s %s' \"$(ulimit -d)\" \"$(ulimit -t)\" \"$(ulimit -f)\" \"$(ulimit -c)\" \"$(ulimit -n)\"",
         frame_for_shell()
     );
     let limits = Limits::PRODUCTION;
-    let expected = format!("{} {} 0 0", limits.data_bytes / 1024, limits.cpu_secs);
+    let expected = format!("{} {} 0 0 16", limits.data_bytes / 1024, limits.cpu_secs);
     assert_eq!(
         sh(
             &script,
@@ -245,4 +245,24 @@ fn reading_the_answer_stops_at_the_cap() {
 #[test]
 fn a_short_answer_is_read_whole() {
     assert_eq!(read_capped(&b"hello"[..], 100).unwrap(), b"hello");
+}
+
+#[test]
+fn the_worker_runs_in_the_root_directory() {
+    let script = format!("printf '{}'; pwd", frame_for_shell());
+    assert_eq!(sh(&script, b"", &fast()), "/\n");
+}
+
+#[test]
+fn a_dropped_child_guard_kills_and_reaps_the_worker() {
+    let child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let started = Instant::now();
+    drop(ChildGuard::new(child));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // Reaped, not a zombie: the pid no longer exists.
+    assert!(!Path::new(&format!("/proc/{pid}")).exists());
 }

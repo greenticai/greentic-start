@@ -8,7 +8,8 @@
 //!
 //! - an empty environment (the host's carries credentials);
 //! - `RLIMIT_DATA` (heap and anonymous mappings), `RLIMIT_CPU`, no file writes
-//!   (`RLIMIT_FSIZE = 0`) and no core dump;
+//!   (`RLIMIT_FSIZE = 0`), no core dump, 16 file descriptors, `/` as working
+//!   directory, and `PR_SET_PDEATHSIG` so it dies with the host;
 //! - a wall-clock deadline, after which it is killed;
 //! - a cap on the bytes read back, and a page limit enforced by the worker.
 //!
@@ -35,6 +36,9 @@ pub(crate) const FRAME: &[u8] = b"GREENTIC-PDF-TEXT/1\n";
 pub(crate) const MAX_PDF_PAGES: usize = 300;
 const MAX_CONCURRENT_WORKERS: usize = 2;
 const POLL: Duration = Duration::from_millis(10);
+/// `RLIMIT_NOFILE` of the worker: stdin, stdout, stderr and a little slack.
+#[cfg(target_os = "linux")]
+const WORKER_MAX_FILES: libc::rlim_t = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Limits {
@@ -130,13 +134,14 @@ fn supervise(
     command
         .args(args)
         .env_clear()
+        .current_dir("/")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     apply_resource_limits(&mut command, limits);
-    let mut child = command.spawn().map_err(|_| "worker could not start")?;
+    let mut child = ChildGuard::new(command.spawn().map_err(|_| "worker could not start")?);
 
-    let mut stdin = child.stdin.take().ok_or("worker has no stdin")?;
+    let mut stdin = child.take_stdin().ok_or("worker has no stdin")?;
     let input = bytes.to_vec();
     // A worker that stops reading makes this write fail; it never blocks the
     // caller, which only waits on the deadline below.
@@ -144,7 +149,7 @@ fn supervise(
         let _ = stdin.write_all(&input);
     });
 
-    let stdout = child.stdout.take().ok_or("worker has no stdout")?;
+    let stdout = child.take_stdout().ok_or("worker has no stdout")?;
     let cap = (FRAME.len() + limits.max_chars.saturating_mul(4) + 1) as u64;
     let (sender, answer) = mpsc::channel();
     std::thread::spawn(move || {
@@ -157,11 +162,8 @@ fn supervise(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL),
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("worker exceeded its deadline");
-            }
+            // Dropping the guard kills and reaps the worker.
+            Ok(None) | Err(_) => return Err("worker exceeded its deadline"),
         }
     };
     let out = answer
@@ -182,6 +184,38 @@ fn supervise(
     ))
 }
 
+/// Owns a spawned worker: whatever path leaves [`supervise`] — an error, a
+/// deadline, a panic — the worker is killed and reaped, never leaked or left
+/// a zombie. Killing an already exited child is harmless.
+pub(crate) struct ChildGuard {
+    child: std::process::Child,
+}
+
+impl ChildGuard {
+    pub(crate) fn new(child: std::process::Child) -> Self {
+        Self { child }
+    }
+
+    fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// At most `cap` bytes of `reader`: it is never asked for more, so a worker
 /// that floods its output costs the host `cap` bytes, not the flood.
 pub(crate) fn read_capped(reader: impl Read, cap: u64) -> std::io::Result<Vec<u8>> {
@@ -196,16 +230,28 @@ fn apply_resource_limits(command: &mut Command, limits: &Limits) {
 
     let data = limits.data_bytes as libc::rlim_t;
     let cpu = limits.cpu_secs as libc::rlim_t;
+    let parent = std::process::id();
     // SAFETY: the closure runs in the forked child before `exec`. It only
-    // calls `setrlimit`, which is async-signal-safe, and builds the error from
-    // `errno` without allocating; it touches no lock and no shared state.
+    // calls `prctl`, `getppid` and `setrlimit`, which are async-signal-safe,
+    // and builds the error from `errno` without allocating; it touches no
+    // lock and no shared state.
     unsafe {
         command.pre_exec(move || {
+            // Die with the host: a worker must not outlive the process that
+            // supervises its deadline.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The host may have died between fork and prctl.
+            if libc::getppid() as u32 != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
             for (resource, value) in [
                 (libc::RLIMIT_DATA, data),
                 (libc::RLIMIT_CPU, cpu),
                 (libc::RLIMIT_FSIZE, 0),
                 (libc::RLIMIT_CORE, 0),
+                (libc::RLIMIT_NOFILE, WORKER_MAX_FILES),
             ] {
                 let limit = libc::rlimit {
                     rlim_cur: value,
