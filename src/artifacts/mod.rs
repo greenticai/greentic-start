@@ -43,4 +43,6 @@ mod proxy_testkit;
 #[cfg(test)]
 mod sniff_tests;
 #[cfg(test)]
+mod store_retry_tests;
+#[cfg(test)]
 mod store_tests;
