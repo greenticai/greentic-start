@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::time::{Instant, timeout_at};
 
+use super::drops::append_drop_notes;
 use super::extract::{extract_text, truncate_chars};
 use super::fetch::{FetchError, Fetcher};
 use super::fetch_ref::{EXTENSION_KEY as FETCH_KEY, FetchRef, parse_refs};
@@ -112,13 +113,20 @@ impl Pipeline {
         self
     }
 
-    /// Rewrites `envelope` in place. Does nothing (not one byte changes) when
-    /// no attachment carries a usable fetch reference.
+    /// Rewrites `envelope` in place, then appends a note slot for every
+    /// attachment or message the provider counted as dropped (see
+    /// [`super::drops`]). Does nothing (not one byte changes) when no
+    /// attachment carries a usable fetch reference and no counter is present.
     pub(crate) async fn process(
         &self,
         envelope: &mut ChannelMessageEnvelope,
         conversation_id: Option<&str>,
     ) {
+        self.ingest(envelope, conversation_id).await;
+        append_drop_notes(envelope);
+    }
+
+    async fn ingest(&self, envelope: &mut ChannelMessageEnvelope, conversation_id: Option<&str>) {
         if envelope.attachments.is_empty() {
             return;
         }

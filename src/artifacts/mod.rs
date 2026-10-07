@@ -9,6 +9,7 @@
 
 pub(crate) mod client;
 pub(crate) mod dns;
+pub(crate) mod drops;
 pub(crate) mod extract;
 pub(crate) mod fetch;
 pub(crate) mod fetch_ref;
@@ -25,6 +26,8 @@ pub(crate) mod wire;
 mod client_tests;
 #[cfg(test)]
 mod dns_tests;
+#[cfg(test)]
+mod drops_tests;
 #[cfg(test)]
 mod extract_tests;
 #[cfg(test)]
