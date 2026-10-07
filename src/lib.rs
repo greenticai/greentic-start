@@ -116,6 +116,7 @@ mod secrets_manager;
 mod secrets_provider_binding;
 mod secrets_setup;
 mod seed_copy;
+mod seed_pointer;
 mod services;
 mod session_hint_extractor;
 mod setup_input;
