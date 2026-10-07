@@ -27,6 +27,7 @@ use super::client::{AttachmentClient, Auth, RequestError, attachment_client};
 use super::fetch_ref::FetchRef;
 use super::host_policy::HostPolicy;
 use super::limits::MAX_FILE_BYTES;
+use super::origin::{Origin, SecretScope};
 
 /// The credential NAMES the host resolves for the two id-based kinds: the
 /// providers' default secret names (`messaging-provider-telegram`
@@ -42,7 +43,9 @@ const MAX_METADATA_BYTES: u64 = 64 * 1024;
 
 #[async_trait]
 pub(crate) trait SecretLookup: Send + Sync {
-    async fn get(&self, name: &str) -> Option<String>;
+    /// The secret `name` of the pack in `scope`. The scope is the HOST's (the
+    /// route that received the request), never a field of the envelope.
+    async fn get(&self, scope: &SecretScope, name: &str) -> Option<String>;
 }
 
 /// Fixed texts only.
@@ -64,6 +67,10 @@ pub(crate) enum FetchError {
     BlockedHost,
     #[error("the download was redirected too many times")]
     TooManyRedirects,
+    /// The reference names a credential (or an id kind) of another channel
+    /// than the one the request arrived on. Refused before any secret is read.
+    #[error("the file reference does not belong to this channel")]
+    NotThisChannel,
 }
 
 impl From<RequestError> for FetchError {
@@ -83,7 +90,8 @@ pub(crate) struct Fetched {
 
 #[async_trait]
 pub(crate) trait Fetcher: Send + Sync {
-    async fn fetch(&self, reference: &FetchRef) -> Result<Fetched, FetchError>;
+    /// `origin` is where the envelope carrying `reference` was received.
+    async fn fetch(&self, origin: &Origin, reference: &FetchRef) -> Result<Fetched, FetchError>;
 }
 
 pub(crate) struct HttpFetcher {
@@ -132,13 +140,18 @@ impl HttpFetcher {
 
     /// A credential by name, looked up only after the policy allowed that
     /// name for `url`.
-    async fn credential(&self, url: &Url, name: &str) -> Result<String, FetchError> {
+    async fn credential(
+        &self,
+        scope: &SecretScope,
+        url: &Url,
+        name: &str,
+    ) -> Result<String, FetchError> {
         self.client
             .policy()
             .check(url, Some(name))
             .map_err(|_| FetchError::BlockedHost)?;
         self.secrets
-            .get(name)
+            .get(scope, name)
             .await
             .ok_or(FetchError::MissingCredential)
     }
@@ -189,9 +202,13 @@ impl HttpFetcher {
         serde_json::from_slice(&raw).map_err(|_| FetchError::BadReference)
     }
 
-    async fn fetch_telegram(&self, file_id: &str) -> Result<Fetched, FetchError> {
+    async fn fetch_telegram(
+        &self,
+        scope: &SecretScope,
+        file_id: &str,
+    ) -> Result<Fetched, FetchError> {
         let api = Url::parse(&self.telegram_api).map_err(|_| FetchError::BadReference)?;
-        let token = self.credential(&api, TELEGRAM_TOKEN_KEY).await?;
+        let token = self.credential(scope, &api, TELEGRAM_TOKEN_KEY).await?;
         // The token goes into the URL path Telegram requires: refuse one that
         // could change the URL's shape, and never log or return it.
         if !valid_telegram_token(&token) {
@@ -216,10 +233,14 @@ impl HttpFetcher {
         })
     }
 
-    async fn fetch_whatsapp(&self, media_id: &str) -> Result<Fetched, FetchError> {
+    async fn fetch_whatsapp(
+        &self,
+        scope: &SecretScope,
+        media_id: &str,
+    ) -> Result<Fetched, FetchError> {
         let graph = Url::parse(&self.whatsapp_graph).map_err(|_| FetchError::BadReference)?;
         let lookup = join(&graph, media_id)?;
-        let token = self.credential(&lookup, WHATSAPP_TOKEN_KEY).await?;
+        let token = self.credential(scope, &lookup, WHATSAPP_TOKEN_KEY).await?;
         let auth = Auth::Bearer {
             name: WHATSAPP_TOKEN_KEY,
             token: &token,
@@ -241,7 +262,11 @@ impl HttpFetcher {
 
 #[async_trait]
 impl Fetcher for HttpFetcher {
-    async fn fetch(&self, reference: &FetchRef) -> Result<Fetched, FetchError> {
+    async fn fetch(&self, origin: &Origin, reference: &FetchRef) -> Result<Fetched, FetchError> {
+        if !origin.channel().allows(reference) {
+            return Err(FetchError::NotThisChannel);
+        }
+        let scope = origin.scope();
         let bytes = match reference {
             FetchRef::Public { url } => {
                 let url = Url::parse(url).map_err(|_| FetchError::BadReference)?;
@@ -249,15 +274,17 @@ impl Fetcher for HttpFetcher {
             }
             FetchRef::Bearer { url, secret_key } => {
                 let url = Url::parse(url).map_err(|_| FetchError::BadReference)?;
-                let token = self.credential(&url, secret_key).await?;
+                let token = self.credential(scope, &url, secret_key).await?;
                 let auth = Auth::Bearer {
                     name: secret_key,
                     token: &token,
                 };
                 self.download(url, auth, self.cap).await?
             }
-            FetchRef::TelegramFile { file_id } => return self.fetch_telegram(file_id).await,
-            FetchRef::WhatsappMedia { media_id } => return self.fetch_whatsapp(media_id).await,
+            FetchRef::TelegramFile { file_id } => return self.fetch_telegram(scope, file_id).await,
+            FetchRef::WhatsappMedia { media_id } => {
+                return self.fetch_whatsapp(scope, media_id).await;
+            }
             // Bytes already in the envelope: the pipeline stores them itself.
             FetchRef::Inline => return Err(FetchError::BadReference),
         };

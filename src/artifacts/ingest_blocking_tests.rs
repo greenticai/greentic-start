@@ -42,7 +42,9 @@ async fn many_documents_never_run_more_extractions_than_there_are_permits() {
         let pipeline = pipeline.clone();
         tokio::spawn(async move {
             let mut env = envelope(1);
-            pipeline.process(&mut env, Some(&format!("c{i}"))).await;
+            pipeline
+                .process(&mut env, Some(&format!("c{i}")), &slack())
+                .await;
             env
         })
     });
@@ -69,7 +71,7 @@ async fn a_timed_out_extraction_keeps_its_permit_until_the_thread_ends() {
     let permits = slow.extraction_permits();
     let slow = slow.with_deadline(Duration::from_millis(100));
     let mut first = envelope(1);
-    within_ceiling(slow.process(&mut first, Some("c1"))).await;
+    within_ceiling(slow.process(&mut first, Some("c1"), &slack())).await;
     assert!(first.extensions["artifacts"][0]["text_ref"].is_null());
 
     let next = Pipeline::new(
@@ -79,7 +81,7 @@ async fn a_timed_out_extraction_keeps_its_permit_until_the_thread_ends() {
     .with_extractor(extractor)
     .with_shared_extraction_permits(permits);
     let mut second = envelope(1);
-    within_ceiling(next.process(&mut second, Some("c2"))).await;
+    within_ceiling(next.process(&mut second, Some("c2"), &slack())).await;
     // The second extraction only started after the first thread let go.
     assert_eq!(
         peak.load(Ordering::SeqCst),
@@ -101,7 +103,7 @@ async fn waiting_for_a_permit_past_the_deadline_keeps_the_file_and_drops_the_tex
     let held = permits.clone().acquire_owned().await.expect("permit");
     let pipeline = pipeline.with_deadline(Duration::from_millis(100));
     let mut env = envelope(1);
-    within_ceiling(pipeline.process(&mut env, Some("c"))).await;
+    within_ceiling(pipeline.process(&mut env, Some("c"), &slack())).await;
     drop(held);
     assert_eq!(env.attachments[0].url.as_deref(), Some("artifact://id1"));
     assert!(env.extensions["artifacts"][0]["text_ref"].is_null());

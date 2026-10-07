@@ -33,7 +33,7 @@ async fn provider_written_artifact_fields_never_reach_the_runner() {
     env.attachments[1].url = Some(hostile_id());
     plant_provider_output(&mut env);
     pipeline(vec![ok(png(0))], store)
-        .process(&mut env, Some("c"))
+        .process(&mut env, Some("c"), &slack())
         .await;
     assert_eq!(env.attachments[0].url.as_deref(), Some("artifact://id1"));
     assert!(env.attachments[1].url.is_none(), "forged artifact url kept");
@@ -55,7 +55,7 @@ async fn provider_output_is_removed_even_when_nothing_is_fetched() {
     env.attachments[0].url = Some(format!("  ARTIFACT://{}", "ab".repeat(32)));
     plant_provider_output(&mut env);
     pipeline(vec![ok(png(0))], store.clone())
-        .process(&mut env, Some("c"))
+        .process(&mut env, Some("c"), &slack())
         .await;
     assert!(env.attachments[0].url.is_none());
     assert!(!env.extensions.contains_key("artifacts"));
@@ -69,7 +69,7 @@ async fn provider_output_is_removed_from_an_envelope_without_attachments() {
     let mut env = bare_envelope();
     plant_provider_output(&mut env);
     pipeline(vec![ok(png(0))], store)
-        .process(&mut env, Some("c"))
+        .process(&mut env, Some("c"), &slack())
         .await;
     assert!(env.extensions.is_empty(), "{:?}", env.extensions.keys());
 }
@@ -81,7 +81,7 @@ async fn an_ordinary_provider_url_is_left_alone() {
     env.extensions.remove("attachment_fetch");
     env.attachments[0].url = Some("https://provider.example/file".into());
     pipeline(vec![ok(png(0))], store)
-        .process(&mut env, Some("c"))
+        .process(&mut env, Some("c"), &slack())
         .await;
     assert_eq!(
         env.attachments[0].url.as_deref(),
@@ -107,7 +107,7 @@ async fn every_spelling_of_the_artifact_scheme_is_removed() {
         env.extensions.remove("attachment_fetch");
         env.attachments[0].url = Some(forged.clone());
         pipeline(vec![ok(png(0))], store)
-            .process(&mut env, Some("c"))
+            .process(&mut env, Some("c"), &slack())
             .await;
         assert!(env.attachments[0].url.is_none(), "{forged:?} kept");
     }
@@ -122,7 +122,7 @@ async fn drop_counters_never_extend_the_providers_arrays() {
     env.metadata
         .insert("attachments_dropped".into(), "1".into());
     pipeline(vec![ok(png(0))], store)
-        .process(&mut env, Some("c"))
+        .process(&mut env, Some("c"), &slack())
         .await;
     let arts = env.extensions["artifacts"].as_array().unwrap();
     let notes = env.extensions["attachment_notes"].as_array().unwrap();
@@ -143,7 +143,7 @@ async fn a_note_quotes_the_file_label_and_keeps_it_short() {
     let mut env = envelope(1);
     env.attachments[0].name = Some(format!("say \"hi\" {}.png", "x".repeat(300)));
     pipeline(vec![Answer::Denied], store)
-        .process(&mut env, Some("c"))
+        .process(&mut env, Some("c"), &slack())
         .await;
     let message = note(&env, 0)["message"].as_str().unwrap().to_string();
     let label = message
@@ -154,4 +154,31 @@ async fn a_note_quotes_the_file_label_and_keeps_it_short() {
     assert!(label.chars().count() <= 64, "{label}");
     assert!(!label.contains('"'), "{label}");
     assert!(label.starts_with("say 'hi' x"), "{label}");
+}
+
+#[tokio::test]
+async fn a_reference_for_another_channel_is_never_fetched() {
+    let store = Arc::new(FakeStore::default());
+    let fetcher = FakeFetcher::new(vec![ok(png(0))]);
+    let mut env = envelope(2);
+    env.extensions.insert(
+        "attachment_fetch".into(),
+        json!([
+            {"kind": "whatsapp_media", "media_id": "m1"},
+            {"kind": "bearer", "url": "https://webexapis.com/x", "secret_key": "WEBEX_BOT_TOKEN"}
+        ]),
+    );
+    super::ingest::Pipeline::new(store.clone(), fetcher.clone())
+        .process(&mut env, Some("c"), &slack())
+        .await;
+    assert_eq!(
+        fetcher.calls(),
+        0,
+        "a foreign reference reached the fetcher"
+    );
+    for i in 0..2 {
+        assert!(env.attachments[i].url.is_none());
+        assert_eq!(note(&env, i)["code"], "fetch_failed");
+    }
+    assert!(store.puts().is_empty());
 }

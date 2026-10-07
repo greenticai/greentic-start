@@ -12,18 +12,20 @@ use super::client::AttachmentClient;
 use super::fetch::*;
 use super::fetch_ref::FetchRef;
 use super::host_policy::HostPolicy;
+use super::ingest_testkit::{origin_of, slack};
+use super::origin::SecretScope;
 
-const OK: &str = "HTTP/1.1 200 OK";
+pub(super) const OK: &str = "HTTP/1.1 200 OK";
 
 /// Secret store double: one value for every name, and a record of the names
 /// asked for.
-struct Secrets {
-    value: Option<&'static str>,
-    asked: Mutex<Vec<String>>,
+pub(super) struct Secrets {
+    pub(super) value: Option<&'static str>,
+    pub(super) asked: Mutex<Vec<String>>,
 }
 
 impl Secrets {
-    fn new(value: Option<&'static str>) -> Arc<Self> {
+    pub(super) fn new(value: Option<&'static str>) -> Arc<Self> {
         Arc::new(Self {
             value,
             asked: Mutex::new(Vec::new()),
@@ -33,28 +35,28 @@ impl Secrets {
 
 #[async_trait]
 impl SecretLookup for Secrets {
-    async fn get(&self, name: &str) -> Option<String> {
+    async fn get(&self, _: &SecretScope, name: &str) -> Option<String> {
         self.asked.lock().unwrap().push(name.to_string());
         self.value.map(str::to_string)
     }
 }
 
 /// Everything on 127.0.0.1 allowed, every other rule applied.
-fn loopback(secrets: Arc<Secrets>) -> HttpFetcher {
+pub(super) fn loopback(secrets: Arc<Secrets>) -> HttpFetcher {
     let client = AttachmentClient::loopback_for_tests(Duration::from_secs(3)).unwrap();
     HttpFetcher::with_client(client, secrets)
 }
 
-fn addr(stub: &StubAdmin) -> SocketAddr {
+pub(super) fn addr(stub: &StubAdmin) -> SocketAddr {
     let url = reqwest::Url::parse(&stub.url).unwrap();
     SocketAddr::from(([127, 0, 0, 1], url.port().unwrap()))
 }
 
-fn named_url(name: &str, stub: &StubAdmin) -> String {
+pub(super) fn named_url(name: &str, stub: &StubAdmin) -> String {
     format!("http://{name}:{}/file", addr(stub).port())
 }
 
-fn header_lines(raw: &str) -> String {
+pub(super) fn header_lines(raw: &str) -> String {
     raw.split("\r\n\r\n")
         .next()
         .unwrap_or_default()
@@ -67,7 +69,10 @@ async fn public_ref_downloads_bytes() {
     let r = FetchRef::Public {
         url: stub.url.clone(),
     };
-    let got = loopback(Secrets::new(None)).fetch(&r).await.unwrap();
+    let got = loopback(Secrets::new(None))
+        .fetch(&origin_of(&r), &r)
+        .await
+        .unwrap();
     assert_eq!(got.bytes, b"BODY");
     assert!(!header_lines(&stub.received()[0]).contains("authorization"));
 }
@@ -78,7 +83,10 @@ async fn bearer_ref_without_its_secret_is_a_missing_credential() {
         url: "https://files.slack.com/x".into(),
         secret_key: "SLACK_BOT_TOKEN".into(),
     };
-    let err = loopback(Secrets::new(None)).fetch(&r).await.unwrap_err();
+    let err = loopback(Secrets::new(None))
+        .fetch(&origin_of(&r), &r)
+        .await
+        .unwrap_err();
     assert!(matches!(err, FetchError::MissingCredential), "{err:?}");
 }
 
@@ -90,7 +98,7 @@ async fn a_401_is_denied_and_does_not_leak_the_secret() {
         secret_key: "SLACK_BOT_TOKEN".into(),
     };
     let err = loopback(Secrets::new(Some("xoxb-SECRET")))
-        .fetch(&r)
+        .fetch(&origin_of(&r), &r)
         .await
         .unwrap_err();
     assert!(matches!(err, FetchError::Denied(401)), "{err:?}");
@@ -109,7 +117,7 @@ async fn a_declared_body_over_the_cap_is_refused() {
     };
     let err = loopback(Secrets::new(None))
         .with_cap(16)
-        .fetch(&r)
+        .fetch(&origin_of(&r), &r)
         .await
         .unwrap_err();
     assert!(matches!(err, FetchError::TooLarge), "{err:?}");
@@ -123,7 +131,9 @@ async fn an_undeclared_body_is_cut_off_at_the_cap() {
     let r = FetchRef::Public { url };
     let started = std::time::Instant::now();
     let fetcher = loopback(Secrets::new(None)).with_cap(64 * 1024);
-    let err = within_ceiling(fetcher.fetch(&r)).await.unwrap_err();
+    let err = within_ceiling(fetcher.fetch(&origin_of(&r), &r))
+        .await
+        .unwrap_err();
     assert!(matches!(err, FetchError::TooLarge), "{err:?}");
     assert!(started.elapsed() < Duration::from_secs(2));
     // The server could push at most the cap plus what socket buffers held
@@ -143,7 +153,10 @@ async fn a_bearer_is_never_sent_to_a_host_off_its_list() {
         url: "https://tenant.sharepoint.com/x".into(),
         secret_key: "SLACK_BOT_TOKEN".into(),
     };
-    let err = loopback(Arc::clone(&secrets)).fetch(&r).await.unwrap_err();
+    let err = loopback(Arc::clone(&secrets))
+        .fetch(&origin_of(&r), &r)
+        .await
+        .unwrap_err();
     assert!(matches!(err, FetchError::BlockedHost), "{err:?}");
     assert!(!format!("{err:?}{err}").contains("xoxb-SECRET"));
 }
@@ -155,8 +168,15 @@ async fn an_unknown_credential_name_is_blocked_before_the_store_is_asked() {
         url: "https://files.slack.com/x".into(),
         secret_key: "ATTACKER_TOKEN".into(),
     };
-    let err = loopback(Arc::clone(&secrets)).fetch(&r).await.unwrap_err();
-    assert!(matches!(err, FetchError::BlockedHost), "{err:?}");
+    let err = loopback(Arc::clone(&secrets))
+        .fetch(&origin_of(&r), &r)
+        .await
+        .unwrap_err();
+    // Refused by the channel rule first, the host policy behind it.
+    assert!(
+        matches!(err, FetchError::NotThisChannel | FetchError::BlockedHost),
+        "{err:?}"
+    );
     assert!(
         secrets.asked.lock().unwrap().is_empty(),
         "a provider-named secret must not be read before the policy allows it"
@@ -176,7 +196,10 @@ async fn redirects_to_refused_hosts_are_blocked() {
         let r = FetchRef::Public {
             url: stub.url.clone(),
         };
-        let err = loopback(Secrets::new(None)).fetch(&r).await.unwrap_err();
+        let err = loopback(Secrets::new(None))
+            .fetch(&origin_of(&r), &r)
+            .await
+            .unwrap_err();
         assert!(matches!(err, FetchError::BlockedHost), "{target}: {err:?}");
     }
 }
@@ -188,7 +211,10 @@ async fn redirects_are_bounded() {
     let r = FetchRef::Public {
         url: stub.url.clone(),
     };
-    let err = loopback(Secrets::new(None)).fetch(&r).await.unwrap_err();
+    let err = loopback(Secrets::new(None))
+        .fetch(&origin_of(&r), &r)
+        .await
+        .unwrap_err();
     assert!(matches!(err, FetchError::TooManyRedirects), "{err:?}");
     assert_eq!(stub.count(), 4, "the first request and three redirects");
 }
@@ -216,7 +242,7 @@ async fn a_redirect_off_the_credential_list_sends_nothing_there() {
         url: named_url("a.test", &a),
         secret_key: "SLACK_BOT_TOKEN".into(),
     };
-    let err = fetcher.fetch(&r).await.unwrap_err();
+    let err = fetcher.fetch(&origin_of(&r), &r).await.unwrap_err();
     assert!(matches!(err, FetchError::BlockedHost), "{err:?}");
     assert_eq!(c.count(), 0, "no request at all reached the other host");
 }
@@ -242,7 +268,7 @@ async fn a_redirect_to_a_public_host_drops_the_authorization() {
         url: named_url("a.test", &a),
         secret_key: "SLACK_BOT_TOKEN".into(),
     };
-    assert_eq!(fetcher.fetch(&r).await.unwrap().bytes, b"C");
+    assert_eq!(fetcher.fetch(&origin_of(&r), &r).await.unwrap().bytes, b"C");
     assert!(header_lines(&a.received()[0]).contains("authorization: bearer xoxb-secret"));
     assert!(
         !header_lines(&c.received()[0]).contains("authorization"),
@@ -271,7 +297,7 @@ async fn a_redirect_within_the_credential_list_keeps_it_per_hop() {
         url: named_url("a.test", &a),
         secret_key: "SLACK_BOT_TOKEN".into(),
     };
-    assert_eq!(fetcher.fetch(&r).await.unwrap().bytes, b"B");
+    assert_eq!(fetcher.fetch(&origin_of(&r), &r).await.unwrap().bytes, b"B");
     for stub in [&a, &b] {
         assert!(header_lines(&stub.received()[0]).contains("authorization: bearer xoxb-secret"));
     }
@@ -280,160 +306,9 @@ async fn a_redirect_within_the_credential_list_keeps_it_per_hop() {
 // --- WhatsApp -----------------------------------------------------------------
 
 #[tokio::test]
-async fn the_whatsapp_media_url_is_checked_before_the_bearer_is_sent() {
-    for hostile in [
-        "https://evil.example/media",
-        "https://169.254.169.254/latest/meta-data",
-        "http://lookaside.fbsbx.com/x",
-    ] {
-        let graph = StubAdmin::answering(OK, "", &format!(r#"{{"url":"{hostile}"}}"#)).await;
-        let r = FetchRef::WhatsappMedia {
-            media_id: "123".into(),
-        };
-        let err = loopback(Secrets::new(Some("WA-SECRET")))
-            .with_whatsapp_graph(graph.url.clone())
-            .fetch(&r)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, FetchError::BlockedHost), "{hostile}: {err:?}");
-        assert_eq!(
-            graph.count(),
-            1,
-            "{hostile}: only the Graph lookup may happen"
-        );
-        assert!(!format!("{err:?}{err}").contains("WA-SECRET"));
-    }
-}
-
-#[tokio::test]
-async fn whatsapp_media_is_looked_up_then_downloaded_with_the_token() {
-    let media = StubAdmin::answering(OK, "", "IMG").await;
-    let graph = StubAdmin::answering(OK, "", &format!(r#"{{"url":"{}"}}"#, media.url)).await;
-    let r = FetchRef::WhatsappMedia {
-        media_id: "123".into(),
-    };
-    let got = loopback(Secrets::new(Some("WA-SECRET")))
-        .with_whatsapp_graph(graph.url.clone())
-        .fetch(&r)
-        .await
-        .unwrap();
-    assert_eq!(got.bytes, b"IMG");
-    let lookup = &graph.received()[0];
-    assert!(lookup.starts_with("GET /ingest/123 HTTP/1.1"), "{lookup}");
-    assert!(header_lines(lookup).contains("authorization: bearer wa-secret"));
-    assert!(header_lines(&media.received()[0]).contains("authorization: bearer wa-secret"));
-}
-
-// --- Telegram -----------------------------------------------------------------
-
-#[tokio::test]
-async fn telegram_files_are_looked_up_then_downloaded() {
-    let api = StubAdmin::answering_in_turn(&[
-        (
-            OK,
-            "",
-            r#"{"ok":true,"result":{"file_path":"photos/file_1.jpg"}}"#,
-        ),
-        (OK, "", "JPEG"),
-    ])
-    .await;
-    let base = api.url.trim_end_matches("/ingest").to_string();
-    let r = FetchRef::TelegramFile {
-        file_id: "AgAD-1".into(),
-    };
-    let got = loopback(Secrets::new(Some("123:ABC")))
-        .with_telegram_api(base)
-        .fetch(&r)
-        .await
-        .unwrap();
-    assert_eq!(got.bytes, b"JPEG");
-    let raw = api.received();
-    assert!(
-        raw[0].starts_with("GET /bot123:ABC/getFile?file_id=AgAD-1 HTTP/1.1"),
-        "{}",
-        raw[0]
-    );
-    assert!(
-        raw[1].starts_with("GET /file/bot123:ABC/photos/file_1.jpg HTTP/1.1"),
-        "{}",
-        raw[1]
-    );
-    assert!(!header_lines(&raw[0]).contains("authorization"));
-}
-
-#[tokio::test]
-async fn a_telegram_download_follows_no_redirect() {
-    let elsewhere = StubAdmin::answering(OK, "", "X").await;
-    let api = StubAdmin::answering_in_turn(&[
-        (
-            OK,
-            "",
-            r#"{"ok":true,"result":{"file_path":"photos/a.jpg"}}"#,
-        ),
-        (
-            "HTTP/1.1 302 Found",
-            &format!("Location: {}\r\n", elsewhere.url),
-            "",
-        ),
-    ])
-    .await;
-    let r = FetchRef::TelegramFile {
-        file_id: "AgAD".into(),
-    };
-    let err = loopback(Secrets::new(Some("123:ABC")))
-        .with_telegram_api(api.url.trim_end_matches("/ingest").to_string())
-        .fetch(&r)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, FetchError::BlockedHost), "{err:?}");
-    assert_eq!(elsewhere.count(), 0, "the token in the path was replayed");
-    assert!(!format!("{err:?}{err}").contains("123:ABC"));
-}
-
-#[tokio::test]
-async fn a_telegram_path_that_could_escape_is_refused() {
-    let api = StubAdmin::answering(OK, "", r#"{"ok":true,"result":{"file_path":"../x"}}"#).await;
-    let r = FetchRef::TelegramFile {
-        file_id: "AgAD".into(),
-    };
-    let err = loopback(Secrets::new(Some("123:ABC")))
-        .with_telegram_api(api.url.trim_end_matches("/ingest").to_string())
-        .fetch(&r)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, FetchError::BadReference), "{err:?}");
-    assert_eq!(api.count(), 1);
-}
-
-#[tokio::test]
-async fn a_telegram_token_that_would_reshape_the_url_is_not_used() {
-    let api = StubAdmin::answering(OK, "", "{}").await;
-    let r = FetchRef::TelegramFile {
-        file_id: "AgAD".into(),
-    };
-    let err = loopback(Secrets::new(Some("123/../evil?x=")))
-        .with_telegram_api(api.url.trim_end_matches("/ingest").to_string())
-        .fetch(&r)
-        .await
-        .unwrap_err();
-    assert!(matches!(err, FetchError::MissingCredential), "{err:?}");
-    assert_eq!(api.count(), 0);
-}
-
-#[test]
-fn telegram_file_paths_cannot_escape_or_inject() {
-    assert!(valid_telegram_path("photos/file_1.jpg"));
-    for bad in [
-        "../x", "a/../b", "/abs", "a?x=1", "a#b", "a\\b", "", "a b", "a//b",
-    ] {
-        assert!(!valid_telegram_path(bad), "{bad:?}");
-    }
-}
-
-#[tokio::test]
 async fn inline_is_not_fetched() {
     let err = loopback(Secrets::new(None))
-        .fetch(&FetchRef::Inline)
+        .fetch(&slack(), &FetchRef::Inline)
         .await
         .unwrap_err();
     assert!(matches!(err, FetchError::BadReference));
@@ -487,6 +362,9 @@ async fn a_declared_size_over_the_cap_is_refused_before_the_body_is_read() {
     let r = FetchRef::Public {
         url: format!("http://127.0.0.1:{port}/big"),
     };
-    let err = loopback(Secrets::new(None)).fetch(&r).await.unwrap_err();
+    let err = loopback(Secrets::new(None))
+        .fetch(&origin_of(&r), &r)
+        .await
+        .unwrap_err();
     assert!(matches!(err, FetchError::TooLarge), "{err:?}");
 }

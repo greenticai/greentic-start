@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use super::fetch::{FetchError, Fetched, Fetcher};
 use super::fetch_ref::FetchRef;
 use super::ingest::Pipeline;
+use super::origin::Origin;
 use super::store::{ArtifactStore, PutRequest, StoreError, Stored};
 
 pub(crate) fn png(tag: u8) -> Vec<u8> {
@@ -114,7 +115,7 @@ impl FakeFetcher {
 
 #[async_trait]
 impl Fetcher for FakeFetcher {
-    async fn fetch(&self, _: &FetchRef) -> Result<Fetched, FetchError> {
+    async fn fetch(&self, _: &Origin, _: &FetchRef) -> Result<Fetched, FetchError> {
         let i = self.calls.fetch_add(1, Ordering::SeqCst);
         match self.answers[i % self.answers.len()].clone() {
             Answer::Bytes(bytes) => Ok(Fetched {
@@ -182,4 +183,25 @@ pub(crate) fn pipeline(answers: Vec<Answer>, store: Arc<FakeStore>) -> Pipeline 
 
 pub(crate) fn note(env: &ChannelMessageEnvelope, i: usize) -> &Value {
     &env.extensions["attachment_notes"][i]
+}
+
+/// The origin most ingest tests run under: an envelope received on Slack.
+pub(crate) fn slack() -> Origin {
+    Origin::new(
+        "messaging.slack.api",
+        "messaging-provider-slack",
+        "demo",
+        None,
+    )
+}
+
+/// The origin a reference of this kind legitimately arrives on.
+pub(crate) fn origin_of(reference: &FetchRef) -> Origin {
+    let provider_type = match reference {
+        FetchRef::TelegramFile { .. } => "messaging.telegram.bot",
+        FetchRef::WhatsappMedia { .. } => "messaging.whatsapp",
+        FetchRef::Bearer { secret_key, .. } if secret_key == "WEBEX_BOT_TOKEN" => "messaging.webex",
+        _ => "messaging.slack.api",
+    };
+    Origin::new(provider_type, "messaging-provider-under-test", "demo", None)
 }

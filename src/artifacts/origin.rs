@@ -1,0 +1,122 @@
+//! Where an envelope came from, decided by the HOST (the route that received
+//! it), never by the envelope: which channel's credentials a fetch reference
+//! may name, and which pack's secrets the host reads for it.
+//!
+//! Closes the confused deputy: a provider's envelope names a credential by
+//! NAME, so without this rule a Slack envelope could make the host spend the
+//! WhatsApp token (or another pack's Slack token) on a URL it chose.
+
+use super::fetch_ref::FetchRef;
+use crate::http_routes::derive_provider_name;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Channel {
+    Slack,
+    Webex,
+    Telegram,
+    Whatsapp,
+    Teams,
+    WebChat,
+    Other,
+}
+
+impl Channel {
+    /// From the provider type of the route that received the request
+    /// (`messaging.slack.api` is Slack). A family matches its own name or a
+    /// `<family>-<kind>` refinement, as the webhook verifier matches.
+    pub(crate) fn from_provider_type(provider_type: &str) -> Self {
+        let Some(name) = derive_provider_name(provider_type) else {
+            return Channel::Other;
+        };
+        let family = |family: &str| {
+            name == family
+                || name
+                    .strip_prefix(family)
+                    .is_some_and(|rest| rest.starts_with('-'))
+        };
+        if family("slack") {
+            Channel::Slack
+        } else if family("webex") {
+            Channel::Webex
+        } else if family("telegram") {
+            Channel::Telegram
+        } else if family("whatsapp") {
+            Channel::Whatsapp
+        } else if family("teams") {
+            Channel::Teams
+        } else if family("webchat") {
+            Channel::WebChat
+        } else {
+            Channel::Other
+        }
+    }
+
+    /// The one credential this channel's `bearer` references may name.
+    fn own_credential(self) -> Option<&'static str> {
+        match self {
+            Channel::Slack => Some("SLACK_BOT_TOKEN"),
+            Channel::Webex => Some("WEBEX_BOT_TOKEN"),
+            // Telegram and WhatsApp use their token only through their own
+            // id kinds below, never through a `bearer` URL.
+            Channel::Telegram
+            | Channel::Whatsapp
+            | Channel::Teams
+            | Channel::WebChat
+            | Channel::Other => None,
+        }
+    }
+
+    /// Whether an envelope received on this channel may use `reference`.
+    /// Credential-less kinds (`public`, `inline`) are open to every channel.
+    pub(crate) fn allows(self, reference: &FetchRef) -> bool {
+        match reference {
+            FetchRef::Bearer { secret_key, .. } => {
+                self.own_credential() == Some(secret_key.as_str())
+            }
+            FetchRef::TelegramFile { .. } => self == Channel::Telegram,
+            FetchRef::WhatsappMedia { .. } => self == Channel::Whatsapp,
+            FetchRef::Public { .. } | FetchRef::Inline => true,
+        }
+    }
+}
+
+/// Whose secrets a fetch reads: the pack the request was routed to, in the
+/// unit's own tenant and team.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SecretScope {
+    pub tenant: String,
+    pub team: Option<String>,
+    pub pack_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Origin {
+    channel: Channel,
+    scope: SecretScope,
+}
+
+impl Origin {
+    pub(crate) fn new(
+        provider_type: &str,
+        pack_id: &str,
+        tenant: &str,
+        team: Option<&str>,
+    ) -> Self {
+        Self {
+            channel: Channel::from_provider_type(provider_type),
+            scope: SecretScope {
+                tenant: tenant.to_string(),
+                team: team.map(str::to_string),
+                pack_id: pack_id.to_string(),
+            },
+        }
+    }
+
+    pub(crate) fn channel(&self) -> Channel {
+        self.channel
+    }
+
+    pub(crate) fn scope(&self) -> &SecretScope {
+        &self.scope
+    }
+}

@@ -141,7 +141,7 @@ async fn the_pipeline_turns_counters_into_notes_even_without_attachments() {
     let store = Arc::new(FakeStore::default());
     let mut env = with_counters(Some("1"), None);
     pipeline(vec![ok(png(0))], store.clone())
-        .process(&mut env, Some("c"))
+        .process(&mut env, Some("c"), &slack())
         .await;
     assert_drop_slot(&env, 0, FILE_DROPPED);
     assert!(store.puts().is_empty());
@@ -154,7 +154,7 @@ async fn the_pipeline_appends_after_its_own_slots() {
     env.metadata
         .insert("attachments_dropped".into(), "1".into());
     pipeline(vec![ok(png(0))], store)
-        .process(&mut env, Some("c"))
+        .process(&mut env, Some("c"), &slack())
         .await;
     assert_eq!(env.attachments[0].url.as_deref(), Some("artifact://id1"));
     assert_parallel(&env);

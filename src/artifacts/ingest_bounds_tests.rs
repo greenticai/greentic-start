@@ -27,7 +27,7 @@ async fn never_fetch_references_cost_no_fetch_and_stay_untouched() {
     env.extensions.get_mut("attachment_fetch").unwrap()[2] =
         json!({"kind":"public","url":"https://x/2"});
     Pipeline::new(store.clone(), fetcher.clone())
-        .process(&mut env, Some("c"))
+        .process(&mut env, Some("c"), &slack())
         .await;
     assert_eq!(fetcher.calls(), 1, "only the usable reference is fetched");
     assert_eq!(
@@ -48,7 +48,7 @@ async fn the_message_has_a_total_time_budget() {
     within_ceiling(
         Pipeline::new(store.clone(), FakeFetcher::new(vec![Answer::Hang]))
             .with_deadline(Duration::from_millis(200))
-            .process(&mut env, Some("c")),
+            .process(&mut env, Some("c"), &slack()),
     )
     .await;
     assert!(
@@ -84,7 +84,7 @@ async fn extraction_runs_off_the_async_runtime() {
             s.store(t.load(Ordering::SeqCst), Ordering::SeqCst);
             Some("text".into())
         }))
-        .process(&mut env, Some("c"))
+        .process(&mut env, Some("c"), &slack())
         .await;
     ticker.await.unwrap();
     assert!(
@@ -108,7 +108,7 @@ async fn slow_extraction_keeps_the_stored_file_and_drops_only_the_text() {
         std::thread::sleep(Duration::from_secs(2));
         Some("late".into())
     }))
-    .process(&mut env, Some("c"))
+    .process(&mut env, Some("c"), &slack())
     .await;
     assert!(started.elapsed() < Duration::from_millis(1500));
     assert_eq!(env.attachments[0].url.as_deref(), Some("artifact://id1"));
@@ -127,7 +127,7 @@ async fn derived_text_never_exceeds_the_character_cap() {
     .with_extractor(Arc::new(|_: &[u8], _: &str| {
         Some("é".repeat(MAX_TEXT_CHARS + 5000))
     }))
-    .process(&mut env, Some("c"))
+    .process(&mut env, Some("c"), &slack())
     .await;
     let text = String::from_utf8(store.puts()[1].bytes.clone()).unwrap();
     assert_eq!(text.chars().count(), MAX_TEXT_CHARS);
@@ -139,7 +139,7 @@ async fn the_real_extractor_caps_a_long_text_file() {
     let mut env = envelope(1);
     let long = "word ".repeat(MAX_TEXT_CHARS);
     Pipeline::new(store.clone(), FakeFetcher::new(vec![ok(long.into_bytes())]))
-        .process(&mut env, Some("c"))
+        .process(&mut env, Some("c"), &slack())
         .await;
     let text = String::from_utf8(store.puts()[1].bytes.clone()).unwrap();
     assert_eq!(text.chars().count(), MAX_TEXT_CHARS);
@@ -152,7 +152,7 @@ async fn a_hostile_name_is_cleaned_before_it_reaches_the_door_or_a_note() {
     env.attachments[0].name = Some(format!("../../x/{}\u{202E}gnp.exe\n", "a".repeat(400)));
     env.attachments[1].name = Some("..".into());
     pipeline(vec![ok(png(0)), Answer::Denied], store.clone())
-        .process(&mut env, Some("c"))
+        .process(&mut env, Some("c"), &slack())
         .await;
     let stored = &store.puts()[0].name;
     assert!(stored.len() <= 200, "{}", stored.len());
@@ -174,7 +174,7 @@ async fn a_door_that_never_answers_is_bounded_by_the_message_budget() {
     within_ceiling(
         pipeline(vec![ok(png(0))], store)
             .with_deadline(Duration::from_millis(200))
-            .process(&mut env, Some("c")),
+            .process(&mut env, Some("c"), &slack()),
     )
     .await;
     assert!(started.elapsed() < Duration::from_secs(5));
@@ -197,7 +197,7 @@ async fn nothing_is_stored_once_the_message_budget_is_spent() {
     within_ceiling(
         Pipeline::new(store.clone(), FakeFetcher::new(vec![Answer::Hang]))
             .with_deadline(Duration::from_millis(150))
-            .process(&mut env, Some("c")),
+            .process(&mut env, Some("c"), &slack()),
     )
     .await;
     assert!(store.puts().is_empty(), "a late inline file is not stored");

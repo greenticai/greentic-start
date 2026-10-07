@@ -33,7 +33,9 @@ use super::drops::append_drop_notes;
 use super::extract::{extract_text, truncate_chars};
 use super::fetch::{FetchError, Fetcher};
 use super::fetch_ref::{EXTENSION_KEY as FETCH_KEY, FetchRef, parse_refs};
+use super::label::display_label;
 use super::limits::{MAX_FILE_BYTES, MAX_FILES, MAX_MESSAGE_BYTES, MAX_TEXT_CHARS};
+use super::origin::Origin;
 use super::pdf_limits::{SLOTS_ENV, worker_slots};
 use super::provenance::strip_reserved;
 use super::sniff::{Kind, detect};
@@ -43,9 +45,6 @@ pub(crate) const ARTIFACTS_KEY: &str = "artifacts";
 pub(crate) const NOTES_KEY: &str = "attachment_notes";
 /// Time one message's attachments may take in all, fetches and puts included.
 pub(crate) const MESSAGE_DEADLINE: Duration = Duration::from_secs(120);
-/// Longest label, in bytes, sent to the door (its limit is 255; the derived
-/// text adds `.txt`).
-const MAX_LABEL_BYTES: usize = 200;
 /// Longest label, in characters, quoted in a note the agent reads.
 const NOTE_LABEL_CHARS: usize = 64;
 
@@ -172,13 +171,19 @@ impl Pipeline {
         &self,
         envelope: &mut ChannelMessageEnvelope,
         conversation_id: Option<&str>,
+        origin: &Origin,
     ) {
         strip_reserved(envelope);
-        self.ingest(envelope, conversation_id).await;
+        self.ingest(envelope, conversation_id, origin).await;
         append_drop_notes(envelope);
     }
 
-    async fn ingest(&self, envelope: &mut ChannelMessageEnvelope, conversation_id: Option<&str>) {
+    async fn ingest(
+        &self,
+        envelope: &mut ChannelMessageEnvelope,
+        conversation_id: Option<&str>,
+        origin: &Origin,
+    ) {
         if envelope.attachments.is_empty() {
             return;
         }
@@ -187,6 +192,11 @@ impl Pipeline {
             return; // no provider asked for a fetch: leave the envelope alone
         }
         let deadline = Instant::now() + self.deadline;
+        let turn = Turn {
+            origin,
+            conversation_id,
+            deadline,
+        };
         let count = envelope.attachments.len();
         let mut meta = vec![Value::Null; count];
         let mut notes = vec![Value::Null; count];
@@ -208,15 +218,8 @@ impl Pipeline {
                 Err(OUT_OF_TIME)
             } else {
                 attempted += 1;
-                self.one(
-                    &reference,
-                    attachment,
-                    &label,
-                    conversation_id,
-                    deadline,
-                    &mut budget,
-                )
-                .await
+                self.one(turn, &reference, attachment, &label, &mut budget)
+                    .await
             };
             // An inline payload must never stay in the envelope, stored or not.
             attachment.content = None;
@@ -258,17 +261,26 @@ impl Pipeline {
 
     async fn one(
         &self,
+        turn: Turn<'_>,
         reference: &FetchRef,
         attachment: &Attachment,
         label: &str,
-        conversation_id: Option<&str>,
-        deadline: Instant,
         budget: &mut Budget,
     ) -> Result<Done, Note> {
+        let Turn {
+            origin,
+            conversation_id,
+            deadline,
+        } = turn;
+        // The fetcher refuses this too; refusing here keeps the rule
+        // independent of the fetcher.
+        if !origin.channel().allows(reference) {
+            return Err(fetch_note(FetchError::NotThisChannel));
+        }
         let bytes = match reference {
             FetchRef::Inline => decode_inline(attachment.content.as_ref())?,
             other => {
-                timeout_at(deadline, self.fetcher.fetch(other))
+                timeout_at(deadline, self.fetcher.fetch(origin, other))
                     .await
                     .map_err(|_| OUT_OF_TIME)?
                     .map_err(fetch_note)?
@@ -298,15 +310,8 @@ impl Pipeline {
         budget.total += size;
         let text_ref = match detected.kind {
             Kind::Document => {
-                self.text_artifact(
-                    bytes,
-                    detected.mime,
-                    label,
-                    &stored.id,
-                    conversation_id,
-                    deadline,
-                )
-                .await
+                self.text_artifact(bytes, detected.mime, label, &stored.id, turn)
+                    .await
             }
             Kind::Image => None,
         };
@@ -324,9 +329,13 @@ impl Pipeline {
         mime: &'static str,
         label: &str,
         source_id: &str,
-        conversation_id: Option<&str>,
-        deadline: Instant,
+        turn: Turn<'_>,
     ) -> Option<String> {
+        let Turn {
+            conversation_id,
+            deadline,
+            ..
+        } = turn;
         let extractor = self.extractor.clone();
         let Ok(Ok(permit)) = timeout_at(deadline, self.extraction.clone().acquire_owned()).await
         else {
@@ -369,52 +378,19 @@ impl Pipeline {
     }
 }
 
+/// What every attachment of one message shares.
+#[derive(Clone, Copy)]
+struct Turn<'a> {
+    origin: &'a Origin,
+    conversation_id: Option<&'a str>,
+    deadline: Instant,
+}
+
 struct Budget {
     /// Bytes of distinct content stored so far in this message.
     total: u64,
     /// Content already stored in this message, by SHA-256.
     seen: HashMap<Vec<u8>, Done>,
-}
-
-/// A label safe for the door and for a note: the last path component, without
-/// control or invisible format characters or leading dots, at most
-/// [`MAX_LABEL_BYTES`] bytes; `attachment <n>` when nothing usable is left.
-/// Mirrors the admin's name rule so the door never refuses it.
-pub(crate) fn display_label(name: Option<&str>, index: usize) -> String {
-    let last = name
-        .unwrap_or_default()
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or_default();
-    let kept: String = last
-        .chars()
-        .filter(|c| !c.is_control() && !is_invisible_format(*c))
-        .collect();
-    let cleaned = kept.trim().trim_start_matches('.').trim_start();
-    let mut end = cleaned.len().min(MAX_LABEL_BYTES);
-    while !cleaned.is_char_boundary(end) {
-        end -= 1;
-    }
-    let cut = cleaned[..end].trim_end();
-    if cut.is_empty() {
-        format!("attachment {}", index + 1)
-    } else {
-        cut.to_string()
-    }
-}
-
-/// Bidi controls, zero-width characters and the BOM (the admin's list).
-fn is_invisible_format(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061C}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{FEFF}'
-    )
 }
 
 /// Inline payloads: a standard-base64 string, or an object with
@@ -459,6 +435,10 @@ fn fetch_note(err: FetchError) -> Note {
         FetchError::TooManyRedirects => {
             Note::new("fetch_failed", "the download was redirected too many times")
         }
+        FetchError::NotThisChannel => Note::new(
+            "fetch_failed",
+            "the file reference does not belong to the channel it arrived on",
+        ),
     }
 }
 

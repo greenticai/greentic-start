@@ -10,13 +10,14 @@ use crate::interop::metering::testkit::{StubAdmin, TEST_TOKEN};
 use super::client::AttachmentClient;
 use super::fetch::{Fetcher, HttpFetcher, SecretLookup};
 use super::fetch_ref::FetchRef;
+use super::origin::SecretScope;
 use super::store::{ArtifactStore, HttpArtifactStore};
 
 struct NoSecrets;
 
 #[async_trait::async_trait]
 impl SecretLookup for NoSecrets {
-    async fn get(&self, _: &str) -> Option<String> {
+    async fn get(&self, _: &SecretScope, _: &str) -> Option<String> {
         None
     }
 }
@@ -36,9 +37,12 @@ async fn a_download_asks_for_no_encoding_and_decodes_none() {
     let client = AttachmentClient::loopback_for_tests(Duration::from_secs(3)).unwrap();
     let fetcher = HttpFetcher::with_client(client, std::sync::Arc::new(NoSecrets));
     let got = fetcher
-        .fetch(&FetchRef::Public {
-            url: stub.url.clone(),
-        })
+        .fetch(
+            &super::ingest_testkit::slack(),
+            &FetchRef::Public {
+                url: stub.url.clone(),
+            },
+        )
         .await
         .expect("the body is returned undecoded");
     assert_eq!(got.bytes, b"PLAIN");

@@ -16,7 +16,9 @@ pub(crate) mod fetch;
 pub(crate) mod fetch_ref;
 pub(crate) mod host_policy;
 pub(crate) mod ingest;
+pub(crate) mod label;
 pub(crate) mod limits;
+pub(crate) mod origin;
 pub(crate) mod pdf_isolation;
 pub(crate) mod pdf_limits;
 pub(crate) mod provenance;
@@ -37,7 +39,11 @@ mod encoding_tests;
 #[cfg(test)]
 mod extract_tests;
 #[cfg(test)]
+mod fetch_origin_tests;
+#[cfg(test)]
 mod fetch_tests;
+#[cfg(test)]
+mod fetcher_id_tests;
 #[cfg(test)]
 mod fetcher_tests;
 #[cfg(test)]
@@ -54,6 +60,8 @@ mod ingest_testkit;
 mod ingest_tests;
 #[cfg(test)]
 mod limits_tests;
+#[cfg(test)]
+mod origin_tests;
 #[cfg(test)]
 mod pdf_fixture;
 #[cfg(all(test, target_os = "linux"))]
