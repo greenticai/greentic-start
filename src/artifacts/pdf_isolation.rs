@@ -97,8 +97,8 @@ pub(crate) fn pdf_text(bytes: &[u8]) -> String {
 }
 
 /// [`pdf_text`] against an explicit worker binary, with production limits.
-/// Exposed for the real-binary test only.
-#[doc(hidden)]
+/// Exposed for the real-binary test only (feature `test-support`).
+#[cfg(feature = "test-support")]
 pub fn pdf_text_via(program: &Path, bytes: &[u8]) -> String {
     run_worker(program, &[WORKER_ARG], bytes, production_limits())
 }

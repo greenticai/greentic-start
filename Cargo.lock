@@ -3916,6 +3916,7 @@ dependencies = [
  "greentic-runner-host",
  "greentic-secrets-lib",
  "greentic-setup",
+ "greentic-start",
  "greentic-state",
  "greentic-telemetry",
  "greentic-types",

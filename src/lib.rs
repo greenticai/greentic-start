@@ -15,6 +15,7 @@ pub mod approval_rail;
 mod artifacts;
 /// Test-only access to the isolated PDF text worker, for
 /// `tests/artifacts_pdf_isolation.rs`, which drives the real binary.
+#[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod artifacts_test_support {
     pub use crate::artifacts::pdf_isolation::pdf_text_via;
