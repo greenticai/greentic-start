@@ -356,3 +356,28 @@ fn a_worker_runs_only_with_a_slot_of_the_gate_it_is_given() {
         "ok"
     );
 }
+
+#[test]
+fn a_running_worker_holds_a_slot_of_the_gate_it_is_given() {
+    // Deterministic whatever else runs: the given gate is busy exactly while
+    // the worker runs.
+    let gate = std::sync::Arc::new(Gate::new(1));
+    let script = format!("/bin/sleep 0.4; printf '{}ok'", frame_for_shell());
+    let worker = {
+        let gate = std::sync::Arc::clone(&gate);
+        std::thread::spawn(move || {
+            run_worker_in(&gate, Path::new(SH), &["-c", &script], b"", &fast())
+        })
+    };
+    let mut saw_busy = false;
+    for _ in 0..30 {
+        if gate.in_use() == 1 {
+            saw_busy = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(worker.join().unwrap(), "ok");
+    assert!(saw_busy, "the worker never took a slot of its gate");
+    assert_eq!(gate.in_use(), 0);
+}

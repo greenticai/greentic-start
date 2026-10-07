@@ -377,6 +377,12 @@ impl Gate {
         }
     }
 
+    /// Slots taken right now.
+    #[cfg(test)]
+    pub(crate) fn in_use(&self) -> usize {
+        *self.busy.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// A slot, waiting at most `wait` for one to free up.
     pub(crate) fn acquire(&self, wait: Duration) -> Option<Slot<'_>> {
         let deadline = Instant::now() + wait;
