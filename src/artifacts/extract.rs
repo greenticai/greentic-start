@@ -12,6 +12,11 @@ use super::pdf_isolation;
 /// `None` for anything that is not a document (images, unknown types);
 /// `Some(text)`, possibly empty, for a document, at most [`MAX_TEXT_CHARS`]
 /// characters long.
+///
+/// BLOCKING: for a PDF this waits for a worker slot (up to ~30 s) and then for
+/// the worker (up to another ~30 s), on the calling thread. Call it ONLY from
+/// `tokio::task::spawn_blocking`, and keep the whole call in that one closure:
+/// the worker's death signal is tied to the thread that started it.
 pub(crate) fn extract_text(bytes: &[u8], mime: &str) -> Option<String> {
     match mime {
         "text/plain" | "text/markdown" | "text/csv" | "application/json" => {

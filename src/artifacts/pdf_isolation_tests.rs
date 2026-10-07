@@ -80,8 +80,10 @@ fn fast() -> Limits {
     }
 }
 
+/// Each call gets a gate of its own: a test that expects "" must get it from
+/// the worker, never from waiting on a slot another test holds.
 fn sh(script: &str, input: &[u8], limits: &Limits) -> String {
-    run_worker(Path::new(SH), &["-c", script], input, limits)
+    run_worker_in(&Gate::new(1), Path::new(SH), &["-c", script], input, limits)
 }
 
 #[test]
@@ -181,7 +183,13 @@ fn the_worker_gets_no_environment() {
 
 #[test]
 fn a_missing_program_yields_empty_text() {
-    let out = run_worker(Path::new("/nonexistent/greentic-start"), &[], b"x", &fast());
+    let out = run_worker_in(
+        &Gate::new(1),
+        Path::new("/nonexistent/greentic-start"),
+        &[],
+        b"x",
+        &fast(),
+    );
     assert_eq!(out, "");
 }
 
@@ -325,4 +333,26 @@ fn the_worker_is_the_running_image_not_its_path() {
     );
     assert_eq!(worker_program(false, current.clone()), current);
     assert_eq!(worker_program(false, None), None);
+}
+
+#[test]
+fn a_worker_runs_only_with_a_slot_of_the_gate_it_is_given() {
+    let script = format!("printf '{}ok'", frame_for_shell());
+    let limits = Limits {
+        wall: Duration::from_millis(200),
+        ..fast()
+    };
+    let busy = Gate::new(1);
+    let _held = busy.acquire(Duration::from_millis(10)).unwrap();
+    let started = Instant::now();
+    assert_eq!(
+        run_worker_in(&busy, Path::new(SH), &["-c", &script], b"", &limits),
+        ""
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let free = Gate::new(1);
+    assert_eq!(
+        run_worker_in(&free, Path::new(SH), &["-c", &script], b"", &limits),
+        "ok"
+    );
 }

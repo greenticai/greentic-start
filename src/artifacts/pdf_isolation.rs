@@ -91,23 +91,37 @@ pub(crate) fn worker_program(proc_self_exe: bool, current: Option<PathBuf>) -> O
 /// isolated worker. Empty when extraction is not enabled or fails.
 pub(crate) fn pdf_text(bytes: &[u8]) -> String {
     match WORKER_PROGRAM.get() {
-        Some(program) => run_worker(program, &[WORKER_ARG], bytes, production_limits()),
+        Some(program) => run_worker_in(gate(), program, &[WORKER_ARG], bytes, production_limits()),
         None => String::new(),
     }
 }
 
-/// [`pdf_text`] against an explicit worker binary, with production limits.
+/// [`pdf_text`] against an explicit worker binary, with production limits
+/// and a gate of its own (so parallel tests never wait on each other).
 /// Exposed for the real-binary test only (feature `test-support`).
 #[cfg(feature = "test-support")]
 pub fn pdf_text_via(program: &Path, bytes: &[u8]) -> String {
-    run_worker(program, &[WORKER_ARG], bytes, production_limits())
+    run_worker_in(
+        &Gate::new(1),
+        program,
+        &[WORKER_ARG],
+        bytes,
+        production_limits(),
+    )
 }
 
-/// Run `program args…` as a worker: feed `bytes` on stdin, return the framed
-/// text it prints, or an empty string on any failure.
+/// Run `program args…` as a worker under a slot of `gate`: feed `bytes` on
+/// stdin, return the framed text it prints, or an empty string on any failure
+/// (no slot within `limits.wall` included).
 #[cfg(target_os = "linux")]
-pub(crate) fn run_worker(program: &Path, args: &[&str], bytes: &[u8], limits: &Limits) -> String {
-    let Some(_slot) = gate().acquire(limits.wall) else {
+pub(crate) fn run_worker_in(
+    gate: &Gate,
+    program: &Path,
+    args: &[&str],
+    bytes: &[u8],
+    limits: &Limits,
+) -> String {
+    let Some(_slot) = gate.acquire(limits.wall) else {
         tracing::debug!("no free PDF worker slot; attachment carries no text");
         return String::new();
     };
@@ -121,7 +135,8 @@ pub(crate) fn run_worker(program: &Path, args: &[&str], bytes: &[u8], limits: &L
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn run_worker(
+pub(crate) fn run_worker_in(
+    _gate: &Gate,
     _program: &Path,
     _args: &[&str],
     _bytes: &[u8],
