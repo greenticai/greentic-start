@@ -106,9 +106,28 @@ writes the answer into the dev store it already serves from:
   absent (404) door, or a flag with no usable `metering` block, fails the
   activation (cold start and reload) after 4 attempts with 0.5 s doubling
   backoff. Absent or `false` flag: no call, no change.
+- Retries cover only transient failures (transport errors, 5xx, 408, 429).
+  401, 403, 404, any other 4xx and an unusable body fail at once. 403's message
+  says the token probably lacks the `secrets` purpose (PATCH purposes). One
+  60 s retry budget is shared by all units of an activation; `Retry-After`
+  (seconds) is honoured on 429 within it.
+- A flagged unit whose door answers 200 with an EMPTY set fails (no ETag is
+  recorded). An ingress document the store cannot read (an error other than
+  not-found) fails the activation, since the flag is then unknowable; a document
+  that is absent or unparseable counts as "no flag" (the parser warns).
+- On a reload, if an ETag is already known and the door is transiently down, the
+  unit keeps the secrets already hydrated (warning logged). A cold start does
+  not get this, and neither does a 401/403/404.
 - Values are never logged or put in an error; a malformed entry writes nothing.
 - A rotation takes effect on the next activation; a `304` on a reload skips the
-  write. Entries removed in the admin are not deleted from the running store.
+  write. Paths written on one hydration but absent from the next answer are
+  deleted from the store.
+- **Only runner-scoped categories belong in the door.** It writes at env
+  `default`, where the runner reads `mcp`, `a2a`, `llm`, `knowledge` and
+  `sorla`. Pack-scoped extension secrets and the generated webchat
+  `jwt_signing_key` are read at the revision's env (`local`) and must stay in
+  the shipped dev store; any other category is written but warned about, since
+  nothing will read it.
 
 Code: `src/secrets_door.rs`. A start predating the field ignores it (the
 ingress parser does not reject unknown fields), so the designer must not stop

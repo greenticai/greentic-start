@@ -30,6 +30,11 @@
 //!   `metering` block to authenticate with — fails the ACTIVATION, naming the
 //!   door, after bounded retries with backoff. The same trade `state-sorla`
 //!   makes for its state door.
+//! - **Only runner-scoped categories belong here.** The door writes at env
+//!   `default`, where the runner reads `mcp`, `a2a`, `llm`, `knowledge` and
+//!   `sorla`. Pack-scoped extension secrets and the generated webchat
+//!   `jwt_signing_key` are read at the revision's env (`local`) and must stay in
+//!   the shipped store; any other category is written but warned about.
 //! - **Addresses are the runner's.** Each secret lands at
 //!   `secrets://default/<tenant>/<path>`: env pinned to `default` and the path
 //!   tail verbatim, exactly what `greentic_aw_runtime::scoped_secrets` reads.
@@ -40,9 +45,9 @@
 //! - **Nothing is written unless everything validated**, so a malformed entry
 //!   cannot leave half a unit hydrated.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{LazyLock, Mutex, Once, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use base64::Engine as _;
@@ -73,7 +78,34 @@ pub(crate) struct DoorPolicy {
     /// Wait before the second attempt; doubles each time.
     pub backoff: Duration,
     pub request_timeout: Duration,
+    /// Wall-clock budget for ALL retrying in one activation, shared by every
+    /// unit (see [`Budget`]). The first attempt per unit is always made.
+    pub total_budget: Duration,
 }
+
+impl DoorPolicy {
+    pub(crate) fn budget(&self) -> Budget {
+        Budget {
+            deadline: Instant::now() + self.total_budget,
+        }
+    }
+}
+
+/// The retry time left in one activation. One per activation, passed to every
+/// unit, so N units behind a dead door cost one budget, not N of them.
+pub(crate) struct Budget {
+    deadline: Instant,
+}
+
+impl Budget {
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+}
+
+/// A longer `Retry-After` than this is not honoured past the budget anyway;
+/// the cap keeps a hostile value from parking an activation.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 impl Default for DoorPolicy {
     fn default() -> Self {
@@ -81,6 +113,7 @@ impl Default for DoorPolicy {
             attempts: 4,
             backoff: Duration::from_millis(500),
             request_timeout: Duration::from_secs(10),
+            total_budget: Duration::from_secs(60),
         }
     }
 }
@@ -95,12 +128,49 @@ enum DoorError {
         "the secrets door is absent (404); the admin predates it or the unit's token lacks the `secrets` purpose"
     )]
     Absent,
-    #[error("the secrets door rejected the unit's credential ({0})")]
-    Unauthorised(u16),
+    #[error(
+        "the secrets door rejected the unit's credential (401); the token is invalid or revoked"
+    )]
+    Unauthorised,
+    #[error(
+        "the secrets door refused the unit's credential (403); the unit's token most likely lacks          the `secrets` purpose (the admin can add it with PATCH purposes on the token)"
+    )]
+    Forbidden,
+    #[error("the secrets door is rate limiting (429)")]
+    RateLimited(Option<Duration>),
     #[error("the secrets door answered {0}")]
     Status(u16),
     #[error("the secrets door answered with a body this build cannot use: {0}")]
     Body(String),
+}
+
+impl DoorError {
+    /// Worth another attempt: the door may be back in a moment. A definite
+    /// answer (401/403/404, any other 4xx, a body this build cannot use) will
+    /// not change by asking again.
+    fn retryable(&self) -> bool {
+        match self {
+            Self::Transport(_) | Self::RateLimited(_) => true,
+            Self::Status(code) => *code >= 500 || *code == 408,
+            Self::Absent | Self::Unauthorised | Self::Forbidden | Self::Body(_) => false,
+        }
+    }
+
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::RateLimited(after) => *after,
+            _ => None,
+        }
+    }
+}
+
+/// `Retry-After` as delta-seconds (the HTTP-date form is not honoured).
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER))
 }
 
 /// Where the secrets door is and who to present as.
@@ -183,6 +253,9 @@ pub(crate) enum Hydration {
     NotRequested,
     /// The door's ETag still matched what an earlier activation wrote.
     Unchanged,
+    /// The door could not be reached on a reload, so the secrets an earlier
+    /// activation already wrote keep serving (a warning was logged).
+    KeptPrevious,
     /// This many secrets were written.
     Written(usize),
 }
@@ -193,6 +266,21 @@ pub(crate) enum Hydration {
 /// unchanged has nothing to write and a `304` is a complete answer. A new
 /// process starts empty and fetches in full.
 static ETAGS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
+
+/// The store addresses the last successful hydration wrote per unit, so the
+/// next one can delete what the admin no longer returns.
+static WRITTEN: LazyLock<Mutex<HashMap<String, BTreeSet<String>>>> = LazyLock::new(Mutex::default);
+
+/// Categories the runner reads at env `default` (`scoped_secrets`): the only
+/// ones the door can serve. Pack-scoped extension secrets and the generated
+/// webchat `jwt_signing_key` are read at the revision's own env (`local`) and
+/// must stay in the shipped store; the door writes at `default` and would
+/// silently put them where nothing reads them.
+const RUNNER_CATEGORIES: &[&str] = &["mcp", "a2a", "llm", "knowledge", "sorla"];
+
+fn is_runner_category(category: &str) -> bool {
+    RUNNER_CATEGORIES.contains(&category)
+}
 
 fn etag_key(door: &SecretsDoor, tenant: &str, bundle_id: &str) -> String {
     format!("{}|{tenant}|{bundle_id}", door.read_all_url)
@@ -218,12 +306,13 @@ pub(crate) async fn hydrate_for_activation<'a>(
     units: impl IntoIterator<Item = (&'a str, &'a str)>,
     policy: &DoorPolicy,
 ) -> anyhow::Result<()> {
+    let budget = policy.budget();
     let mut seen: HashSet<(&str, &str)> = HashSet::new();
     for (tenant, bundle_id) in units {
         if !seen.insert((tenant, bundle_id)) {
             continue;
         }
-        hydrate_unit(secrets, ingress_env, tenant, bundle_id, policy)
+        hydrate_unit(secrets, ingress_env, tenant, bundle_id, policy, &budget)
             .await
             .with_context(|| {
                 format!("hydrating the deployed secrets of unit `{bundle_id}` (tenant `{tenant}`)")
@@ -239,6 +328,7 @@ pub(crate) async fn hydrate_unit(
     tenant: &str,
     bundle_id: &str,
     policy: &DoorPolicy,
+    budget: &Budget,
 ) -> anyhow::Result<Hydration> {
     let config = match crate::ingress_auth::load_unit_config(
         secrets,
@@ -249,19 +339,17 @@ pub(crate) async fn hydrate_unit(
     .await
     {
         Ok(Some(config)) => config,
+        // Not staged, or a document the parser refuses (it warns): there is no
+        // readable flag, which is the same as no flag.
         Ok(None) => return Ok(Hydration::NotRequested),
+        // The store ANSWERED with an error other than not-found, so whether
+        // this unit uses the door is unknowable. Guessing "no" would run a
+        // flagged unit without its credentials.
         Err(crate::ingress_auth::ConfigUnavailable(message)) => {
-            // Same trade the metering read makes for a store that cannot
-            // answer: the flag is unknowable, so this unit is treated as
-            // not using the door, loudly.
-            operator_log::warn(
-                module_path!(),
-                format!(
-                    "deployed-secrets door for unit `{bundle_id}` was not consulted: its \
-                         staged config could not be read ({message})"
-                ),
+            bail!(
+                "cannot tell whether unit `{bundle_id}` uses the secrets door: its staged \
+                 ingress config could not be read ({message})"
             );
-            return Ok(Hydration::NotRequested);
         }
     };
     if !config.secrets_door {
@@ -281,15 +369,31 @@ pub(crate) async fn hydrate_unit(
         .get(&key)
         .cloned();
 
-    let fetched = fetch_with_retry(&door, known.as_deref(), policy)
-        .await
-        .map_err(|err| {
-            anyhow::anyhow!(
+    let fetched = match fetch_with_retry(&door, known.as_deref(), policy, budget).await {
+        Ok(fetched) => fetched,
+        // A reload whose door is momentarily down keeps serving what an
+        // earlier activation already wrote, rather than taking a working unit
+        // down. Only a transient failure qualifies: a definite refusal means
+        // the credential or door is wrong and must be seen.
+        Err(err) if known.is_some() && err.retryable() => {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "the secrets door `{}` is unreachable ({err}); unit `{bundle_id}` keeps the \
+                     secrets an earlier activation hydrated",
+                    door.read_all_url
+                ),
+            );
+            return Ok(Hydration::KeptPrevious);
+        }
+        Err(err) => {
+            return Err(anyhow::anyhow!(
                 "the secrets door `{}` is not usable: {err}; refusing to activate a unit that \
                  would run without its credentials",
                 door.read_all_url
-            )
-        })?;
+            ));
+        }
+    };
     let (entries, etag) = match fetched {
         Fetched::NotModified => {
             operator_log::info(
@@ -300,6 +404,17 @@ pub(crate) async fn hydrate_unit(
         }
         Fetched::Secrets { entries, etag } => (entries, etag),
     };
+    // The designer sets the flag because it moved secrets out of the store. An
+    // empty set means it staged none (or the admin lost them), and serving on
+    // that is exactly the keyless run this refuses. The etag is NOT recorded,
+    // so the next activation asks again instead of trusting a 304.
+    if entries.is_empty() {
+        bail!(
+            "the secrets door `{}` answered an empty set for unit `{bundle_id}`, which sets \
+             `secrets_door`; refusing to activate it without any credentials",
+            door.read_all_url
+        );
+    }
 
     let decoded = decode_all(tenant, entries)?;
     let count = decoded.len();
@@ -313,6 +428,21 @@ pub(crate) async fn hydrate_unit(
                     secret.uri
                 )
             })?;
+    }
+    // Delete what an earlier hydration wrote and the admin no longer returns.
+    let now: BTreeSet<String> = decoded.iter().map(|d| d.uri.clone()).collect();
+    let previous = WRITTEN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key.clone(), now.clone())
+        .unwrap_or_default();
+    for stale in previous.difference(&now) {
+        if let Err(err) = secrets.delete(stale).await {
+            operator_log::warn(
+                module_path!(),
+                format!("could not remove the stale door secret at `{stale}`: {err}"),
+            );
+        }
     }
     {
         let mut etags = ETAGS.lock().unwrap_or_else(PoisonError::into_inner);
@@ -336,37 +466,47 @@ async fn fetch_with_retry(
     door: &SecretsDoor,
     if_none_match: Option<&str>,
     policy: &DoorPolicy,
+    budget: &Budget,
 ) -> Result<Fetched, DoorError> {
     install_crypto_provider();
     let client = reqwest::Client::builder()
-        .timeout(policy.request_timeout)
+        .timeout(
+            policy
+                .request_timeout
+                .min(budget.remaining().max(Duration::from_secs(1))),
+        )
         // A redirect would carry the bearer somewhere the unit never named.
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| DoorError::Transport(format!("building the HTTP client: {err}")))?;
     let attempts = policy.attempts.max(1);
-    let mut wait = policy.backoff;
-    let mut last = DoorError::Transport("no attempt was made".into());
-    for attempt in 1..=attempts {
-        match fetch_once(&client, door, if_none_match).await {
+    let mut backoff = policy.backoff;
+    let mut attempt = 1;
+    loop {
+        let err = match fetch_once(&client, door, if_none_match).await {
             Ok(fetched) => return Ok(fetched),
-            Err(err) => {
-                operator_log::warn(
-                    module_path!(),
-                    format!(
-                        "secrets door attempt {attempt}/{attempts} failed: {err}{}",
-                        if attempt < attempts { "; retrying" } else { "" }
-                    ),
-                );
-                last = err;
-            }
+            Err(err) => err,
+        };
+        let remaining = budget.remaining();
+        let will_retry = err.retryable() && attempt < attempts && !remaining.is_zero();
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "secrets door attempt {attempt}/{attempts} failed: {err}{}",
+                if will_retry { "; retrying" } else { "" }
+            ),
+        );
+        if !will_retry {
+            return Err(err);
         }
-        if attempt < attempts {
-            tokio::time::sleep(wait).await;
-            wait = wait.saturating_mul(2);
-        }
+        let wait = err
+            .retry_after()
+            .map_or(backoff, |after| after.max(backoff))
+            .min(remaining);
+        tokio::time::sleep(wait).await;
+        backoff = backoff.saturating_mul(2);
+        attempt += 1;
     }
-    Err(last)
 }
 
 async fn fetch_once(
@@ -391,8 +531,15 @@ async fn fetch_once(
         StatusCode::NOT_MODIFIED if if_none_match.is_some() => return Ok(Fetched::NotModified),
         StatusCode::OK => {}
         StatusCode::NOT_FOUND => return Err(DoorError::Absent),
-        status @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
-            return Err(DoorError::Unauthorised(status.as_u16()));
+        StatusCode::UNAUTHORIZED => return Err(DoorError::Unauthorised),
+        StatusCode::FORBIDDEN => return Err(DoorError::Forbidden),
+        StatusCode::TOO_MANY_REQUESTS => {
+            let after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after);
+            return Err(DoorError::RateLimited(after));
         }
         other => return Err(DoorError::Status(other.as_u16())),
     }
@@ -441,6 +588,20 @@ fn decode_all(tenant: &str, entries: Vec<RawEntry>) -> anyhow::Result<Vec<Decode
         .into_iter()
         .map(|entry| {
             validate_path(&entry.path)?;
+            if let Some(category) = entry.path.split('/').nth(1)
+                && !is_runner_category(category)
+            {
+                // Written anyway (the admin decides what it holds), but the
+                // runtime reads this category from its own env, not `default`.
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "door secret `{}` is in category `{category}`, which the runner does \
+                         not read at env `default`; it will not be found",
+                        entry.path
+                    ),
+                );
+            }
             let value = match entry.encoding.as_deref().map(str::trim) {
                 None | Some("") | Some("utf8") => entry.value.into_bytes(),
                 Some("base64") => B64
