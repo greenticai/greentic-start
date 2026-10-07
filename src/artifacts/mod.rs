@@ -100,6 +100,6 @@ mod store_retry_tests;
 #[cfg(test)]
 mod store_tests;
 #[cfg(test)]
-mod time_testkit;
+pub(crate) mod time_testkit;
 #[cfg(test)]
 mod wiring_tests;
