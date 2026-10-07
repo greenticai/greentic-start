@@ -6,9 +6,10 @@
 //! - At most [`PUT_CONCURRENCY`] requests are in flight per client: the door
 //!   runs four transfers per admin process and refuses the rest (`503
 //!   artifact_busy`), so a message's five files go two at a time.
-//! - `408`, `429`, `503` (`artifact_busy`, `artifact_store_unavailable`) and
-//!   transport failures are retried, [`PUT_ATTEMPTS`] attempts in all, with a
-//!   doubling backoff. A put is content-addressed, so a retry stores nothing
+//! - `408`, `429`, `502`, `503` (`artifact_busy`, `artifact_store_unavailable`),
+//!   `504` and transport failures are retried, [`PUT_ATTEMPTS`] attempts in
+//!   all, waiting the door's `Retry-After` (at most 3 s) or else a doubling
+//!   backoff. Environment proxies are not used. A put is content-addressed, so a retry stores nothing
 //!   twice. `401`/`403`/`404`/`413`/`415`/`422` and the `400`s are final.
 
 use std::sync::Arc;
@@ -29,6 +30,11 @@ pub(crate) const PUT_CONCURRENCY: usize = 2;
 pub(crate) const PUT_ATTEMPTS: usize = 3;
 const DEFAULT_BACKOFF: Duration = Duration::from_millis(250);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest wait a door's `Retry-After` can impose.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(3);
+/// Largest success answer read from the door (its answers are a few hundred
+/// bytes).
+const MAX_ANSWER_BYTES: usize = 64 * 1024;
 
 pub(crate) struct PutRequest<'a> {
     pub name: &'a str,
@@ -92,7 +98,8 @@ impl std::fmt::Debug for HttpArtifactStore {
 /// One attempt's outcome: final, or worth another try.
 enum Attempt {
     Done(Result<reqwest::Response, StoreError>),
-    Retry(StoreError),
+    /// Retryable; carries the door's `Retry-After`, already capped.
+    Retry(StoreError, Option<Duration>),
 }
 
 impl HttpArtifactStore {
@@ -108,6 +115,10 @@ impl HttpArtifactStore {
             .timeout(timeout)
             .connect_timeout(CONNECT_TIMEOUT.min(timeout))
             .redirect(reqwest::redirect::Policy::none())
+            // The bearer goes to the door and nowhere else: an environment
+            // proxy would be a second party holding it (and, for plain-http
+            // doors, reading it).
+            .no_proxy()
             .build()?;
         Ok(Self {
             client,
@@ -139,9 +150,9 @@ impl HttpArtifactStore {
         loop {
             match self.attempt(url, body).await {
                 Attempt::Done(result) => return result,
-                Attempt::Retry(err) if attempt >= PUT_ATTEMPTS => return Err(err),
-                Attempt::Retry(_) => {
-                    tokio::time::sleep(wait).await;
+                Attempt::Retry(err, _) if attempt >= PUT_ATTEMPTS => return Err(err),
+                Attempt::Retry(_, retry_after) => {
+                    tokio::time::sleep(retry_after.unwrap_or(wait)).await;
                     wait = wait.saturating_mul(2);
                     attempt += 1;
                 }
@@ -167,7 +178,7 @@ impl HttpArtifactStore {
                 } else {
                     "the request failed"
                 };
-                return Attempt::Retry(StoreError::Unavailable(reason.into()));
+                return Attempt::Retry(StoreError::Unavailable(reason.into()), None);
             }
         };
         let status = response.status();
@@ -177,7 +188,11 @@ impl HttpArtifactStore {
             s if s.is_success() => Ok(response),
             StatusCode::REQUEST_TIMEOUT
             | StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::SERVICE_UNAVAILABLE => return Attempt::Retry(unavailable()),
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT => {
+                return Attempt::Retry(unavailable(), retry_after(response.headers()));
+            }
             s @ (StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
                 Err(StoreError::Rejected(s.as_u16()))
             }
@@ -201,9 +216,8 @@ impl ArtifactStore for HttpArtifactStore {
             request.conversation_id,
         );
         let response = self.send(&put_url(&self.door), &body).await?;
-        let parsed: PutResponse = response
-            .json()
-            .await
+        let raw = read_capped_body(response, MAX_ANSWER_BYTES).await?;
+        let parsed: PutResponse = serde_json::from_slice(&raw)
             .map_err(|_| StoreError::Unavailable("the door's answer was unreadable".into()))?;
         if !is_artifact_id(&parsed.id) {
             return Err(StoreError::Unavailable(
@@ -232,6 +246,37 @@ impl ArtifactStore for HttpArtifactStore {
             Err(other) => Err(other),
         }
     }
+}
+
+/// The door's `Retry-After` in whole seconds, at most [`MAX_RETRY_AFTER`]. An
+/// HTTP-date or anything else unreadable is ignored (the backoff applies).
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let seconds: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER))
+}
+
+/// A success answer, read chunk by chunk and refused past `cap` bytes.
+async fn read_capped_body(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, StoreError> {
+    let unreadable = || StoreError::Unavailable("the door's answer was unreadable".into());
+    let mut out = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| unreadable())? {
+        if out.len() + chunk.len() > cap {
+            return Err(StoreError::Unavailable(
+                "the door's answer was too large".into(),
+            ));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// This binary carries both `ring` and `aws-lc-rs`, so rustls cannot pick a

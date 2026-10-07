@@ -30,6 +30,8 @@ mod pdf_fixture;
 #[cfg(all(test, target_os = "linux"))]
 mod pdf_isolation_tests;
 #[cfg(test)]
+mod proxy_testkit;
+#[cfg(test)]
 mod sniff_tests;
 #[cfg(test)]
 mod store_tests;
