@@ -43,14 +43,16 @@
 //!   unit's bundle id and then with `_env`. A value without the prefix is
 //!   written as is. A missing key, bad key, wrong AAD or tag failure fails the
 //!   activation; no key or value is ever put in a message.
-//! - **Only runner-scoped categories belong here.** The door writes at env
-//!   `default`, where the runner reads `mcp`, `a2a`, `llm`, `knowledge` and
-//!   `sorla`. Pack-scoped extension secrets and the generated webchat
-//!   `jwt_signing_key` are read at the revision's env (`local`) and must stay in
-//!   the shipped store; any other category is written but warned about.
+//! - **The env is chosen per secret by its category.** The runner reads `mcp`,
+//!   `a2a`, `llm`, `knowledge` and `sorla` at env `default`; everything else
+//!   (pack-scoped extension node/tool credentials, channel secrets) at the
+//!   revision's env (`$GREENTIC_ENV`), which is the env the ingress document is
+//!   read under. Each secret is written where the runner will look. The
+//!   generated webchat `jwt_signing_key` is minted by start into the store at
+//!   boot and is not a door secret.
 //! - **Addresses are the runner's.** Each secret lands at
-//!   `secrets://default/<tenant>/<path>`: env pinned to `default` and the path
-//!   tail verbatim, exactly what `greentic_aw_runtime::scoped_secrets` reads.
+//!   `secrets://<env>/<tenant>/<path>`, the path tail verbatim, with `<env>`
+//!   chosen as above.
 //! - **Values never leave this module in a message.** No `Debug` is derived on
 //!   a type that holds one, errors name paths and statuses only, and a body
 //!   that does not parse is reported by position, because serde's own message
@@ -320,15 +322,30 @@ static ETAGS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::de
 /// next one can delete what the admin no longer returns.
 static WRITTEN: LazyLock<Mutex<HashMap<String, BTreeSet<String>>>> = LazyLock::new(Mutex::default);
 
-/// Categories the runner reads at env `default` (`scoped_secrets`): the only
-/// ones the door can serve. Pack-scoped extension secrets and the generated
-/// webchat `jwt_signing_key` are read at the revision's own env (`local`) and
-/// must stay in the shipped store; the door writes at `default` and would
-/// silently put them where nothing reads them.
+/// Categories the runner reads at env `default` (`scoped_secrets`): MCP, A2A,
+/// LLM, knowledge-index and SoRLa credentials.
 const RUNNER_CATEGORIES: &[&str] = &["mcp", "a2a", "llm", "knowledge", "sorla"];
 
 fn is_runner_category(category: &str) -> bool {
     RUNNER_CATEGORIES.contains(&category)
+}
+
+/// The env segment a door secret is written at, chosen by its CATEGORY (the
+/// middle path segment):
+///
+/// - a runner-scoped category (above) lives at `default`;
+/// - every other category — a pack segment (`<pack>`,
+///   `<pack>_unit_<unit>_<hash>`, a channel pack id) holding an extension
+///   node's or tool's credential or a channel secret — is read by the runner at
+///   the revision's own env (`$GREENTIC_ENV`, the env the ingress document is
+///   read under), so it is written there.
+///
+/// `path` has been validated as exactly three segments.
+fn env_for_path<'a>(path: &str, ingress_env: &'a str) -> &'a str {
+    match path.split('/').nth(1) {
+        Some(category) if is_runner_category(category) => ENV_SEGMENT,
+        _ => ingress_env,
+    }
 }
 
 fn etag_key(door: &SecretsDoor, tenant: &str, bundle_id: &str) -> String {
@@ -465,7 +482,7 @@ pub(crate) async fn hydrate_unit(
         );
     }
 
-    let mut decoded = decode_all(tenant, entries)?;
+    let mut decoded = decode_all(tenant, ingress_env, entries)?;
     if decoded.iter().any(|d| d.value.starts_with(ENC_PREFIX)) {
         let key = load_door_key(secrets, ingress_env, tenant).await?;
         for secret in &mut decoded {
@@ -640,25 +657,16 @@ async fn fetch_once(
 
 /// Validate every entry and decode its value. Fails on the first bad one,
 /// naming its path.
-fn decode_all(tenant: &str, entries: Vec<RawEntry>) -> anyhow::Result<Vec<Decoded>> {
+fn decode_all(
+    tenant: &str,
+    ingress_env: &str,
+    entries: Vec<RawEntry>,
+) -> anyhow::Result<Vec<Decoded>> {
     entries
         .into_iter()
         .map(|entry| {
             validate_path(&entry.path)?;
-            if let Some(category) = entry.path.split('/').nth(1)
-                && !is_runner_category(category)
-            {
-                // Written anyway (the admin decides what it holds), but the
-                // runtime reads this category from its own env, not `default`.
-                operator_log::warn(
-                    module_path!(),
-                    format!(
-                        "door secret `{}` is in category `{category}`, which the runner does \
-                         not read at env `default`; it will not be found",
-                        entry.path
-                    ),
-                );
-            }
+            let env = env_for_path(&entry.path, ingress_env);
             let value = match entry.encoding.as_deref().map(str::trim) {
                 None | Some("") | Some("utf8") => entry.value.into_bytes(),
                 Some("base64") => B64
@@ -676,7 +684,7 @@ fn decode_all(tenant: &str, entries: Vec<RawEntry>) -> anyhow::Result<Vec<Decode
             };
             Ok(Decoded {
                 path: entry.path.clone(),
-                uri: format!("secrets://{ENV_SEGMENT}/{tenant}/{}", entry.path),
+                uri: format!("secrets://{env}/{tenant}/{}", entry.path),
                 value,
             })
         })
