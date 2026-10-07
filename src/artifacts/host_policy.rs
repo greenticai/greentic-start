@@ -63,6 +63,18 @@ pub(crate) struct HostPolicy {
     extra: Vec<String>,
     #[cfg(test)]
     loopback: bool,
+    #[cfg(test)]
+    named: Option<NamedRules>,
+}
+
+/// Test-only host lists for stub servers reached by NAME (`a.test:port`) over
+/// plain http: lets a test tell an allowed host from a refused one, which the
+/// all-loopback policy cannot. Production never builds one.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct NamedRules {
+    credentials: Vec<(String, Vec<String>)>,
+    public: Vec<String>,
 }
 
 impl HostPolicy {
@@ -81,6 +93,30 @@ impl HostPolicy {
             extra,
             #[cfg(test)]
             loopback: false,
+            #[cfg(test)]
+            named: None,
+        }
+    }
+
+    /// Test policy over named stub hosts: exact names only, http and any port
+    /// allowed, IP literals still refused, a credential only to its own names.
+    #[cfg(test)]
+    pub(crate) fn named_for_tests(credentials: &[(&str, &[&str])], public: &[&str]) -> Self {
+        Self {
+            extra: Vec::new(),
+            loopback: false,
+            named: Some(NamedRules {
+                credentials: credentials
+                    .iter()
+                    .map(|(name, hosts)| {
+                        (
+                            name.to_string(),
+                            hosts.iter().map(|h| h.to_string()).collect(),
+                        )
+                    })
+                    .collect(),
+                public: public.iter().map(|h| h.to_string()).collect(),
+            }),
         }
     }
 
@@ -91,6 +127,7 @@ impl HostPolicy {
         Self {
             extra: Vec::new(),
             loopback: true,
+            named: None,
         }
     }
 
@@ -105,6 +142,22 @@ impl HostPolicy {
             && matches!(url.scheme(), "http" | "https")
         {
             return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(rules) = &self.named {
+            let host = url.domain().ok_or(Blocked::IpLiteral)?;
+            let allowed = match credential {
+                Some(name) => match rules.credentials.iter().find(|(n, _)| n == name) {
+                    Some((_, hosts)) => hosts.iter().any(|h| h == host),
+                    None => return Err(Blocked::UnknownCredential),
+                },
+                None => rules.public.iter().any(|h| h == host),
+            };
+            return if allowed {
+                Ok(())
+            } else {
+                Err(Blocked::HostNotAllowed)
+            };
         }
         if url.scheme() != "https" {
             return Err(Blocked::NotHttps);

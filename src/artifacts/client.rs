@@ -37,8 +37,8 @@ pub(crate) enum Auth<'a> {
     },
 }
 
-impl Auth<'_> {
-    pub(crate) fn credential_name(&self) -> Option<&str> {
+impl<'a> Auth<'a> {
+    pub(crate) fn credential_name(&self) -> Option<&'a str> {
         match self {
             Auth::None => None,
             Auth::Bearer { name, .. } | Auth::InUrl { name } => Some(name),
@@ -58,7 +58,7 @@ impl std::fmt::Debug for Auth<'_> {
 
 /// Fixed texts only: never a URL, a token, or a response body.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum FetchError {
+pub(crate) enum RequestError {
     #[error("the download URL is not allowed ({0:?})")]
     Blocked(Blocked),
     #[error("the download timed out")]
@@ -114,6 +114,25 @@ impl AttachmentClient {
         })
     }
 
+    /// A client that reaches each named stub (`a.test`) at the given loopback
+    /// address, under `policy`. Same settings as production minus `https_only`
+    /// and the public-only resolver.
+    #[cfg(test)]
+    pub(crate) fn named_for_tests(
+        policy: HostPolicy,
+        names: &[(&str, std::net::SocketAddr)],
+        timeout: Duration,
+    ) -> Result<Self, reqwest::Error> {
+        let mut builder = base_builder(timeout);
+        for (name, addr) in names {
+            builder = builder.resolve(name, *addr);
+        }
+        Ok(Self {
+            client: builder.build()?,
+            policy,
+        })
+    }
+
     pub(crate) fn policy(&self) -> &HostPolicy {
         &self.policy
     }
@@ -123,21 +142,21 @@ impl AttachmentClient {
         &self,
         url: &Url,
         auth: Auth<'_>,
-    ) -> Result<reqwest::Response, FetchError> {
+    ) -> Result<reqwest::Response, RequestError> {
         self.policy
             .check(url, auth.credential_name())
-            .map_err(FetchError::Blocked)?;
+            .map_err(RequestError::Blocked)?;
         let mut request = self.client.get(url.clone());
         if let Auth::Bearer { token, .. } = auth {
             request = request.bearer_auth(token);
         }
         request.send().await.map_err(|err| {
             if err.is_timeout() {
-                FetchError::Timeout
+                RequestError::Timeout
             } else if err.is_connect() {
-                FetchError::Unreachable
+                RequestError::Unreachable
             } else {
-                FetchError::Failed
+                RequestError::Failed
             }
         })
     }

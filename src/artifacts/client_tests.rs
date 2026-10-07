@@ -34,7 +34,7 @@ async fn ip_literals_are_refused_before_any_connection() {
             .get(&url(&target), Auth::None)
             .await
             .unwrap_err();
-        assert!(matches!(err, FetchError::Blocked(_)), "{target}: {err:?}");
+        assert!(matches!(err, RequestError::Blocked(_)), "{target}: {err:?}");
     }
     assert_eq!(stub.count(), 0);
 }
@@ -51,7 +51,10 @@ async fn a_credential_is_refused_for_a_host_outside_its_list() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, FetchError::Blocked(Blocked::HostNotAllowed)));
+    assert!(matches!(
+        err,
+        RequestError::Blocked(Blocked::HostNotAllowed)
+    ));
 }
 
 #[tokio::test]

@@ -10,6 +10,8 @@
 pub(crate) mod client;
 pub(crate) mod dns;
 pub(crate) mod extract;
+pub(crate) mod fetch;
+pub(crate) mod fetch_ref;
 pub(crate) mod host_policy;
 pub(crate) mod limits;
 pub(crate) mod pdf_isolation;
@@ -24,6 +26,10 @@ mod client_tests;
 mod dns_tests;
 #[cfg(test)]
 mod extract_tests;
+#[cfg(test)]
+mod fetch_tests;
+#[cfg(test)]
+mod fetcher_tests;
 #[cfg(test)]
 mod host_policy_tests;
 #[cfg(test)]
