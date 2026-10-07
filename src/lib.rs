@@ -12,6 +12,7 @@ mod agent_provenance;
 // bridge against a real NATS without a bundle or a Slack workspace.
 #[doc(hidden)]
 pub mod approval_rail;
+mod artifacts;
 mod bin_resolver;
 mod bundle_config;
 mod bundle_ref;

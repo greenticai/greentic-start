@@ -77,6 +77,12 @@ http-body-util = "0.1"
 hyper-tungstenite = "0.20"
 hyper-util = "0.1"
 include_dir = "0.7"
+# Inbound attachments (src/artifacts): the stored MIME type is decided from the
+# file's magic bytes, never from a header. Pinned exactly like other fast-moving
+# crates here. `default-features = false` drops `std` -> `cfb`, an OLE
+# compound-file parser this crate does not need: the allow-list has no Office
+# type, so parsing untrusted OLE containers would be attack surface for nothing.
+infer = { version = "=0.22.0", default-features = false, features = ["alloc"] }
 jsonschema = "0.46"
 # RS256 verification of the MCP OAuth tokens (worker-interop contract §3).
 # Already in the tree transitively; declared here because this crate now
@@ -90,6 +96,10 @@ opentelemetry = { version = "0.32", features = ["logs"] }
 opentelemetry-appender-tracing = "0.32"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-blocking-client"] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "logs"] }
+# PDF text extraction for inbound attachments (src/artifacts/extract.rs).
+# Pinned exactly: it parses untrusted input, so a release moves the attack
+# surface. It can panic on malformed PDFs; the caller isolates every call.
+pdf-extract = "=0.12.1"
 rand = "0.10"
 redis = { version = "1", features = [
     "tokio-comp",
@@ -100,7 +110,9 @@ redis = { version = "1", features = [
     "tokio-rustls-comp",
     "tls-rustls-webpki-roots",
 ] }
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+# `stream`: inbound attachment downloads are read chunk by chunk so the 10 MiB
+# cap aborts a transfer instead of buffering it (src/artifacts/fetch.rs).
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "stream"] }
 # AES-256-GCM for the secrets door's client-side-encrypted values; `ring` is already
 # in the tree through rustls' `ring` provider, so this adds no new crate.
 ring = "0.17"
