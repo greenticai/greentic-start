@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use super::time_testkit::within_ceiling;
 use crate::interop::metering::testkit::{StubAdmin, TEST_TOKEN, silent_peer};
 
 use super::store::*;
@@ -163,7 +164,7 @@ async fn a_silent_door_times_out() {
     .unwrap()
     .with_backoff(Duration::from_millis(1));
     let started = Instant::now();
-    let err = store.put(request(b"x")).await.unwrap_err();
+    let err = within_ceiling(store.put(request(b"x"))).await.unwrap_err();
     assert_eq!(kind(&err), "Unavailable");
     assert!(started.elapsed() < Duration::from_secs(5));
 }
@@ -188,7 +189,7 @@ async fn the_token_never_appears_in_errors_or_debug() {
     )
     .unwrap()
     .with_backoff(Duration::from_millis(1));
-    let err = store.put(request(b"x")).await.unwrap_err();
+    let err = within_ceiling(store.put(request(b"x"))).await.unwrap_err();
     assert!(!format!("{err:?}{err}").contains(TEST_TOKEN), "{err}");
 }
 

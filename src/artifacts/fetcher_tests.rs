@@ -1,3 +1,4 @@
+use super::time_testkit::within_ceiling;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -121,11 +122,8 @@ async fn an_undeclared_body_is_cut_off_at_the_cap() {
     let (url, written) = endless_body_stub().await;
     let r = FetchRef::Public { url };
     let started = std::time::Instant::now();
-    let err = loopback(Secrets::new(None))
-        .with_cap(64 * 1024)
-        .fetch(&r)
-        .await
-        .unwrap_err();
+    let fetcher = loopback(Secrets::new(None)).with_cap(64 * 1024);
+    let err = within_ceiling(fetcher.fetch(&r)).await.unwrap_err();
     assert!(matches!(err, FetchError::TooLarge), "{err:?}");
     assert!(started.elapsed() < Duration::from_secs(2));
     // The server could push at most the cap plus what socket buffers held

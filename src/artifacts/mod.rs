@@ -62,3 +62,5 @@ mod sniff_tests;
 mod store_retry_tests;
 #[cfg(test)]
 mod store_tests;
+#[cfg(test)]
+mod time_testkit;

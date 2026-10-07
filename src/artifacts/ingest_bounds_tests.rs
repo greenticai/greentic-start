@@ -10,6 +10,7 @@ use serde_json::json;
 use super::ingest::Pipeline;
 use super::ingest_testkit::*;
 use super::limits::MAX_TEXT_CHARS;
+use super::time_testkit::within_ceiling;
 
 #[tokio::test]
 async fn never_fetch_references_cost_no_fetch_and_stay_untouched() {
@@ -44,10 +45,12 @@ async fn the_message_has_a_total_time_budget() {
     let store = Arc::new(FakeStore::default());
     let mut env = envelope(3);
     let started = Instant::now();
-    Pipeline::new(store.clone(), FakeFetcher::new(vec![Answer::Hang]))
-        .with_deadline(Duration::from_millis(200))
-        .process(&mut env, Some("c"))
-        .await;
+    within_ceiling(
+        Pipeline::new(store.clone(), FakeFetcher::new(vec![Answer::Hang]))
+            .with_deadline(Duration::from_millis(200))
+            .process(&mut env, Some("c")),
+    )
+    .await;
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "{:?}",
@@ -165,10 +168,12 @@ async fn a_door_that_never_answers_is_bounded_by_the_message_budget() {
     *store.hang_on.lock().unwrap() = Some(0);
     let mut env = envelope(1);
     let started = Instant::now();
-    pipeline(vec![ok(png(0))], store)
-        .with_deadline(Duration::from_millis(200))
-        .process(&mut env, Some("c"))
-        .await;
+    within_ceiling(
+        pipeline(vec![ok(png(0))], store)
+            .with_deadline(Duration::from_millis(200))
+            .process(&mut env, Some("c")),
+    )
+    .await;
     assert!(started.elapsed() < Duration::from_secs(5));
     assert!(env.attachments[0].url.is_none());
     assert_eq!(note(&env, 0)["code"], "door_unavailable");
@@ -186,10 +191,12 @@ async fn nothing_is_stored_once_the_message_budget_is_spent() {
     env.attachments[1].content = Some(json!(
         base64::engine::general_purpose::STANDARD.encode(png(1))
     ));
-    Pipeline::new(store.clone(), FakeFetcher::new(vec![Answer::Hang]))
-        .with_deadline(Duration::from_millis(150))
-        .process(&mut env, Some("c"))
-        .await;
+    within_ceiling(
+        Pipeline::new(store.clone(), FakeFetcher::new(vec![Answer::Hang]))
+            .with_deadline(Duration::from_millis(150))
+            .process(&mut env, Some("c")),
+    )
+    .await;
     assert!(store.puts().is_empty(), "a late inline file is not stored");
     assert_eq!(note(&env, 1)["code"], "fetch_failed");
     assert!(env.attachments[1].content.is_none());
