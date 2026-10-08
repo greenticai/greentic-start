@@ -183,6 +183,25 @@ const LOG_CALLS: &[&str] = &[
     "println!(",
 ];
 
+/// The inbound path's own log doors: the `bf_keys` `warn(..)` wrapper and the
+/// `Notices` `.limited(..)` / `.once(..)` methods (which write the operator
+/// log). A bare `warn(` only counts when no identifier character precedes it,
+/// so `call_once(` and `tracing::warn!(` are not read as one.
+const SINK_CALLS: &[&str] = &["warn(", ".limited(", ".once("];
+
+/// Values that must not reach a log line in ANY format, Display included:
+/// a token, a secret, an `Authorization` value, a signature, claims.
+const SECRET_NAMES: &[&str] = &[
+    "token",
+    "secret",
+    "expose",
+    "authorization",
+    "signature",
+    "claims",
+    "app_secret",
+    "webhook_secret",
+];
+
 /// The text of one call starting at `start`, up to its closing parenthesis.
 /// String literals are skipped so a `(` inside a message does not count.
 fn call_text(source: &str, start: usize) -> &str {
@@ -237,7 +256,12 @@ fn is_ident(c: char) -> bool {
 
 /// `?name` used as a `tracing` field value (`?envelope`, `x = ?envelope`).
 fn has_debug_field(call: &str, name: &str) -> bool {
-    let needle = format!("?{name}");
+    has_field(call, '?', name)
+}
+
+/// `<sigil>name` used as a `tracing` field value (`%token`, `x = ?envelope`).
+fn has_field(call: &str, sigil: char, name: &str) -> bool {
+    let needle = format!("{sigil}{name}");
     call.match_indices(&needle).any(|(i, _)| {
         let before = call[..i].chars().next_back();
         let after = call[i + needle.len()..].chars().next();
@@ -245,34 +269,67 @@ fn has_debug_field(call: &str, name: &str) -> bool {
     })
 }
 
-/// Every offending log statement in `source`, as a short description.
-fn offences(file: &str, source: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    for marker in LOG_CALLS {
-        for (start, _) in source.match_indices(marker) {
-            let call = call_text(source, start);
-            let line = source[..start].lines().count() + 1;
-            let here = format!("{file}:{line}");
-            if call.contains("serde_json::to_") {
-                found.push(format!("{here}: serialises a value into a log line"));
-            }
-            let positional_debug = call.contains("{:?}") || call.contains("{:#?}");
-            let args = trailing_args(call);
-            for name in PAYLOAD_NAMES {
-                if call.contains(&format!("{{{name}:?}}"))
-                    || call.contains(&format!("{{{name}:#?}}"))
-                {
-                    found.push(format!("{here}: formats `{name}` with Debug"));
-                }
-                if has_debug_field(call, name) {
-                    found.push(format!("{here}: records `{name}` as a Debug field"));
-                }
-                if positional_debug && args.iter().any(|arg| arg == name) {
-                    found.push(format!("{here}: formats `{name}` with Debug"));
-                }
+/// Where each log call in `source` starts: the [`LOG_CALLS`] macros and
+/// functions, plus the [`SINK_CALLS`] doors.
+fn call_starts(source: &str) -> Vec<usize> {
+    let mut starts: Vec<usize> = LOG_CALLS
+        .iter()
+        .flat_map(|marker| source.match_indices(marker).map(|(i, _)| i))
+        .collect();
+    for marker in SINK_CALLS {
+        for (i, _) in source.match_indices(marker) {
+            let before = source[..i].chars().next_back();
+            if marker.starts_with('.') || !before.is_some_and(is_ident) {
+                starts.push(i);
             }
         }
     }
+    starts.sort_unstable();
+    starts
+}
+
+/// A secret formatted with Display, as a `%` field, or exposed in the call.
+fn displays_secret(call: &str, args: &[String], name: &str) -> bool {
+    call.contains(&format!("{{{name}}}"))
+        || call.contains(&format!("{{{name}:"))
+        || has_field(call, '%', name)
+        || args.iter().any(|arg| arg == name)
+}
+
+/// Every offending log statement in `source`, as a short description.
+fn offences(file: &str, source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for start in call_starts(source) {
+        let call = call_text(source, start);
+        let line = source[..start].lines().count() + 1;
+        let here = format!("{file}:{line}");
+        if call.contains("serde_json::to_") {
+            found.push(format!("{here}: serialises a value into a log line"));
+        }
+        let positional_debug = call.contains("{:?}") || call.contains("{:#?}");
+        let args = trailing_args(call);
+        for name in PAYLOAD_NAMES {
+            if call.contains(&format!("{{{name}:?}}")) || call.contains(&format!("{{{name}:#?}}")) {
+                found.push(format!("{here}: formats `{name}` with Debug"));
+            }
+            if has_debug_field(call, name) {
+                found.push(format!("{here}: records `{name}` as a Debug field"));
+            }
+            if positional_debug && args.iter().any(|arg| arg == name) {
+                found.push(format!("{here}: formats `{name}` with Debug"));
+            }
+        }
+        for name in SECRET_NAMES {
+            if displays_secret(call, &args, name) {
+                found.push(format!("{here}: formats secret `{name}`"));
+            }
+        }
+        if call.contains(".expose(") || call.contains("expose_secret(") {
+            found.push(format!("{here}: exposes a secret into a log line"));
+        }
+    }
+    found.sort();
+    found.dedup();
     found
 }
 
@@ -325,22 +382,77 @@ fn every_inbound_source_file_is_read_by_the_ratchet() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut missing = Vec::new();
     for dir in ["artifacts", "inbound_verify"] {
-        for entry in std::fs::read_dir(root.join(dir)).expect("source dir") {
-            let name = entry
-                .expect("entry")
-                .file_name()
-                .to_string_lossy()
-                .to_string();
-            if !name.ends_with(".rs") || is_test_only(&name) {
+        for listed in rust_sources_under(&root, dir) {
+            let name = listed.rsplit('/').next().unwrap_or(&listed);
+            if is_test_only(name) {
                 continue;
             }
-            let listed = format!("{dir}/{name}");
             if !FILES.iter().any(|(file, _)| *file == listed) {
                 missing.push(listed);
             }
         }
     }
     assert!(missing.is_empty(), "not read by the ratchet: {missing:?}");
+}
+
+/// Every `.rs` file under `root/dir`, at any depth, as `dir/sub/name.rs`.
+fn rust_sources_under(root: &std::path::Path, dir: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_string()];
+    while let Some(rel) = pending.pop() {
+        for entry in std::fs::read_dir(root.join(&rel)).expect("source dir") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = format!("{rel}/{name}");
+            if entry.file_type().expect("file type").is_dir() {
+                pending.push(path);
+            } else if name.ends_with(".rs") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// Re-review G4 M2: the scan walks sub-directories, so a module split into a
+/// folder is not silently out of reach.
+#[test]
+fn the_listing_walks_subdirectories() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let found = rust_sources_under(&root, "interop");
+    assert!(
+        found.iter().any(|f| f == "interop/mcp/jwks/mod.rs"),
+        "{found:?}"
+    );
+}
+
+/// Re-review G4 M2: the sinks this path actually logs through (the
+/// `bf_keys` `warn(..)` wrapper and the `Notices` `.limited(..)` /
+/// `.once(..)` doors) and Display formatting of a secret are refused too.
+#[test]
+fn wrapper_sinks_and_displayed_secrets_are_refused() {
+    for bad in [
+        r#"warn(&format!("bad token {token}"));"#,
+        r#"warn(&format!("bad {:?}", headers));"#,
+        r#"deps.notices.limited(label, code, &format!("{}", secret));"#,
+        r#"notices.once(id, label, &format!("auth {authorization}"));"#,
+        r#"operator_log::warn(module_path!(), format!("s {}", secret.expose()));"#,
+        r#"operator_log::warn(module_path!(), format!("t {token:>8}"));"#,
+        r#"tracing::info!(t = %token, "x");"#,
+        r#"tracing::info!(%signature, "x");"#,
+    ] {
+        assert!(!offences("t.rs", bad).is_empty(), "not caught: {bad}");
+    }
+    for fine in [
+        r#"warn("the Bot Framework metadata does not offer RS256");"#,
+        r#"INSTALL.call_once(|| { install(); });"#,
+        r#"notices.limited(label, code, &format!("{label} refused ({})", code.as_str()));"#,
+        r#"warn(&format!("a key URL on ({host})"));"#,
+        r#"operator_log::warn(module_path!(), format!("len {}", token.len()));"#,
+        r#"tracing::warn!(reason = %reason, "x");"#,
+    ] {
+        assert!(offences("t.rs", fine).is_empty(), "false positive: {fine}");
+    }
 }
 
 /// The secret-bearing names verification handles are refused like payloads.
