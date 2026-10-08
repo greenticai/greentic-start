@@ -49,9 +49,12 @@ async fn one_link_answers_at_most_thirty_times_a_minute() {
 #[tokio::test]
 async fn busy_reads_answer_503_retry_after_two() {
     let f = fixture(StubReader::file("image/png", None, b"IMG"));
-    let limits = LinkLimits::new(1, 1 << 30);
-    // The process's only slot, held by ANOTHER unit.
-    let held = limits.try_read_slot("another-unit").expect("one slot");
+    let limits = LinkLimits::new(2, 1 << 30);
+    // Both process slots, held by ANOTHER unit.
+    let held = vec![
+        limits.try_read_slot("another-unit").expect("slot"),
+        limits.try_read_slot("another-unit").expect("slot"),
+    ];
     let answer = f.request(Method::GET, &f.link().to_path(), &limits).await;
     assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(answer.header("retry-after"), Some("2"));
@@ -142,20 +145,42 @@ async fn the_per_client_limit_applies_only_to_an_identified_client() {
 }
 
 #[tokio::test]
-async fn one_unit_holds_at_most_one_read_slot() {
+async fn one_unit_holds_at_most_three_read_slots() {
     let a = fixture(StubReader::file("image/png", None, b"IMG"));
     let b = fixture(StubReader::file("image/png", None, b"IMG"));
     let limits = limits();
-    let held = limits.try_read_slot(&a.unit.deployment).expect("a's slot");
+    // A reply with three images: three parallel reads of one unit succeed.
+    let held: Vec<_> = (0..3)
+        .map(|i| {
+            limits
+                .try_read_slot(&a.unit.deployment)
+                .unwrap_or_else(|| panic!("read {i} of the unit"))
+        })
+        .collect();
+    // The fourth is refused, and the route answers 503 Retry-After 2.
+    assert!(limits.try_read_slot(&a.unit.deployment).is_none());
     let answer = a.request(Method::GET, &a.link().to_path(), &limits).await;
     assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(answer.header("retry-after"), Some("2"));
-    // Another unit still gets the process's second slot.
+    // Another unit still gets a process slot.
     let answer = b.request(Method::GET, &b.link().to_path(), &limits).await;
     assert_eq!(answer.status, StatusCode::OK);
     drop(held);
     let answer = a.request(Method::GET, &a.link().to_path(), &limits).await;
     assert_eq!(answer.status, StatusCode::OK);
+}
+
+#[test]
+fn the_process_slots_bound_every_unit_together() {
+    let limits = LinkLimits::new(4, 1 << 30);
+    let mut held = Vec::new();
+    for unit in ["u1", "u2"] {
+        for _ in 0..2 {
+            held.push(limits.try_read_slot(unit).expect("slot"));
+        }
+    }
+    // Four process slots are in use: a third unit finds none.
+    assert!(limits.try_read_slot("u3").is_none());
 }
 
 /// The largest file is reserved before the door read and the unused part

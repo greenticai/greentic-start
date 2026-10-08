@@ -187,7 +187,7 @@ impl Fixture {
 }
 
 pub(crate) fn limits() -> LinkLimits {
-    LinkLimits::new(2, 1 << 30)
+    LinkLimits::new(8, 1 << 30)
 }
 
 #[derive(Debug, PartialEq)]

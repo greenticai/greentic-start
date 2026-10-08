@@ -2,7 +2,8 @@
 //!
 //! The admin door has no streaming and no HEAD: one read buffers the whole
 //! file (up to ~14 MB of base64 in flight), so reads are bounded: at most
-//! `GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT` per process and ONE per unit, so a
+//! `GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT` per process and a few per unit (a
+//! reply with several images makes the browser load them in parallel), so a
 //! single link holder cannot take every slot from the other units. On top: a
 //! fixed window per link, a fixed window per client (only when the client is
 //! known, see [`crate::http_ingress::limits::client_key`]), and two hourly
@@ -28,11 +29,14 @@ use crate::http_ingress::limits::ClientKey;
 pub(crate) const MAX_INFLIGHT_ENV: &str = "GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT";
 pub(crate) const EGRESS_MB_ENV: &str = "GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_HOUR";
 pub(crate) const LINK_EGRESS_MB_ENV: &str = "GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_LINK_PER_HOUR";
-pub(crate) const DEFAULT_MAX_INFLIGHT: usize = 2;
+pub(crate) const MAX_INFLIGHT_PER_UNIT_ENV: &str = "GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT_PER_UNIT";
+pub(crate) const DEFAULT_MAX_INFLIGHT: usize = 8;
 pub(crate) const DEFAULT_EGRESS_MB_PER_HOUR: u64 = 2048;
 pub(crate) const DEFAULT_LINK_EGRESS_MB_PER_HOUR: u64 = 64;
-/// Door reads one unit may have in flight in this process.
-pub(crate) const PER_UNIT_INFLIGHT: usize = 1;
+/// Door reads one unit may have in flight in this process by default: an
+/// `<img>` that gets a 503 is not retried, so a reply with a few images must
+/// fit.
+pub(crate) const DEFAULT_PER_UNIT_INFLIGHT: usize = 3;
 /// Requests one link may answer per window.
 pub(crate) const PER_LINK: u32 = 30;
 /// Requests one client may make per window.
@@ -45,6 +49,8 @@ const HOUR_SECS: u64 = 3_600;
 const MIB: u64 = 1024 * 1024;
 /// Smallest configurable byte budget, in MiB.
 const MIN_BUDGET_MB: u64 = 16;
+/// Largest configurable per-unit read count.
+const MAX_PER_UNIT_INFLIGHT: u64 = 8;
 
 // The smallest budget still fits one reservation of the largest file.
 const _: () = assert!(MIN_BUDGET_MB * MIB >= MAX_ARTIFACT_BYTES as u64);
@@ -221,6 +227,8 @@ impl Drop for ReadSlot {
 
 pub(crate) struct LinkLimits {
     reads: Arc<Semaphore>,
+    /// Reads one deployment may have in flight.
+    per_unit_inflight: usize,
     /// Reads in flight per deployment (entries exist only while in flight,
     /// so the table is bounded by the process's slots).
     unit_reads: Arc<Mutex<HashMap<String, usize>>>,
@@ -258,6 +266,7 @@ impl LinkLimits {
     ) -> Self {
         Self {
             reads: Arc::new(Semaphore::new(max_inflight)),
+            per_unit_inflight: DEFAULT_PER_UNIT_INFLIGHT,
             unit_reads: Arc::new(Mutex::new(HashMap::new())),
             per_link: Windows::new(PER_LINK),
             per_client: Windows::new(PER_CLIENT),
@@ -267,15 +276,23 @@ impl LinkLimits {
         }
     }
 
-    /// Pure: in-flight `1..=8` (default 2); unit egress `16..=65536` MiB per
+    /// Pure: process in-flight `2..=32` (default 8); per-unit in-flight
+    /// `1..=8` (default 3); unit egress `16..=65536` MiB per
     /// hour (default 2048); per-link egress `16..=65536` MiB per hour
     /// (default 64); an unparsable value is the default.
     pub(crate) fn from_values(
         max_inflight: Option<&str>,
+        per_unit_inflight: Option<&str>,
         egress_mb: Option<&str>,
         link_egress_mb: Option<&str>,
     ) -> Self {
-        let inflight = parse_clamped(max_inflight, DEFAULT_MAX_INFLIGHT as u64, 1, 8);
+        let inflight = parse_clamped(max_inflight, DEFAULT_MAX_INFLIGHT as u64, 2, 32);
+        let per_unit = parse_clamped(
+            per_unit_inflight,
+            DEFAULT_PER_UNIT_INFLIGHT as u64,
+            1,
+            MAX_PER_UNIT_INFLIGHT,
+        );
         let unit = parse_clamped(egress_mb, DEFAULT_EGRESS_MB_PER_HOUR, MIN_BUDGET_MB, 65_536);
         let link = parse_clamped(
             link_egress_mb,
@@ -283,12 +300,14 @@ impl LinkLimits {
             MIN_BUDGET_MB,
             65_536,
         );
-        Self::with_budgets(
+        let mut limits = Self::with_budgets(
             inflight as usize,
             unit * MIB,
             link * MIB,
             MAX_ARTIFACT_BYTES as u64,
-        )
+        );
+        limits.per_unit_inflight = per_unit as usize;
+        limits
     }
 
     /// The process's limits, from the environment, read once.
@@ -297,6 +316,7 @@ impl LinkLimits {
         LIMITS.get_or_init(|| {
             Self::from_values(
                 std::env::var(MAX_INFLIGHT_ENV).ok().as_deref(),
+                std::env::var(MAX_INFLIGHT_PER_UNIT_ENV).ok().as_deref(),
                 std::env::var(EGRESS_MB_ENV).ok().as_deref(),
                 std::env::var(LINK_EGRESS_MB_ENV).ok().as_deref(),
             )
@@ -349,11 +369,11 @@ impl LinkLimits {
     }
 
     /// One door read slot for `deployment`, or `None` when the unit already
-    /// has its read in flight or every process slot is in use.
+    /// has its reads in flight or every process slot is in use.
     pub(crate) fn try_read_slot(&self, deployment: &str) -> Option<ReadSlot> {
         let mut units = lock(&self.unit_reads);
         let count = units.get(deployment).copied().unwrap_or(0);
-        if count >= PER_UNIT_INFLIGHT {
+        if count >= self.per_unit_inflight {
             return None;
         }
         let permit = Arc::clone(&self.reads).try_acquire_owned().ok()?;
@@ -373,21 +393,25 @@ mod tests {
     #[test]
     fn values_are_clamped_and_unparsable_is_default() {
         const MIB: u64 = 1024 * 1024;
-        let l = LinkLimits::from_values(None, None, None);
-        assert_eq!(l.max_inflight(), 2);
+        let l = LinkLimits::from_values(None, None, None, None);
+        assert_eq!(l.max_inflight(), 8);
+        assert_eq!(l.per_unit_inflight, 3);
         assert_eq!(l.unit_bytes.limit, 2048 * MIB);
         assert_eq!(l.link_bytes.limit, 64 * MIB);
         assert_eq!(l.reserve_bytes, MAX_ARTIFACT_BYTES as u64);
-        let l = LinkLimits::from_values(Some("99"), Some("1"), Some("1"));
-        assert_eq!(l.max_inflight(), 8);
+        let l = LinkLimits::from_values(Some("99"), Some("99"), Some("1"), Some("1"));
+        assert_eq!(l.max_inflight(), 32);
+        assert_eq!(l.per_unit_inflight, 8);
         assert_eq!(l.unit_bytes.limit, 16 * MIB);
         assert_eq!(l.link_bytes.limit, 16 * MIB);
-        let l = LinkLimits::from_values(Some("0"), Some("999999"), Some("999999"));
-        assert_eq!(l.max_inflight(), 1);
+        let l = LinkLimits::from_values(Some("0"), Some("0"), Some("999999"), Some("999999"));
+        assert_eq!(l.max_inflight(), 2);
+        assert_eq!(l.per_unit_inflight, 1);
         assert_eq!(l.unit_bytes.limit, 65_536 * MIB);
         assert_eq!(l.link_bytes.limit, 65_536 * MIB);
-        let l = LinkLimits::from_values(Some("x"), Some("-3"), Some("y"));
-        assert_eq!(l.max_inflight(), 2);
+        let l = LinkLimits::from_values(Some("x"), Some("y"), Some("-3"), Some("y"));
+        assert_eq!(l.max_inflight(), 8);
+        assert_eq!(l.per_unit_inflight, 3);
         assert_eq!(l.unit_bytes.limit, 2048 * MIB);
         assert_eq!(l.link_bytes.limit, 64 * MIB);
     }
