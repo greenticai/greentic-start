@@ -210,7 +210,8 @@ provider op. Per channel, once its input is configured:
   pointer line when the environment declares any of the three channels.
 - Teams key set unreachable (`login.botframework.com`), or the channel's
   secret store failing (any error but "not found"): the request is admitted
-  UNVERIFIED (text flows, files get the same note), warned at most once a
+  UNVERIFIED (text flows; each file slot gets `fetch_failed` "verification is
+  temporarily unavailable"), warned at most once a
   minute as "verification is unavailable", never as "not configured". A
   failed proof is never downgraded to this. An unknown `kid` is a refusal only
   against a key set read within its TTL (12 h). When a refresh fails and that

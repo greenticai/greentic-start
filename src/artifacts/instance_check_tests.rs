@@ -139,7 +139,7 @@ async fn a_withheld_slot_is_reported_with_a_neutral_note_and_never_fetched() {
         "demo",
         None,
     )
-    .verified_by_host(true);
+    .verified_by_host(crate::artifacts::origin::RequestVerification::Verified);
     pipe.process(&mut envs[0], Some("c"), &origin).await;
     assert!(envs[0].attachments[0].url.is_none());
     let n = note(&envs[0], 0);

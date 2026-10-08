@@ -89,14 +89,42 @@ pub(crate) struct SecretScope {
     pub pack_id: String,
 }
 
+/// What THIS host established about the request that produced the envelope.
+/// Three values, so the agent-facing note can tell "not set up" from "set up,
+/// but the check could not run right now".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestVerification {
+    /// A host gate proved the request came from the channel.
+    Verified,
+    /// No gate proved it, and none was unavailable: the channel's
+    /// verification input is not configured (or the class has none).
+    NotConfigured,
+    /// A gate was configured but could not run (key set or secret store
+    /// outage); the request was admitted unverified.
+    Unavailable,
+}
+
+impl RequestVerification {
+    /// One value from the gates: any proof wins; otherwise an outage is
+    /// reported as such rather than as a missing set-up.
+    pub(crate) fn from_gates(proved: bool, unavailable: bool) -> Self {
+        match (proved, unavailable) {
+            (true, _) => Self::Verified,
+            (false, true) => Self::Unavailable,
+            (false, false) => Self::NotConfigured,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Origin {
     channel: Channel,
     scope: SecretScope,
-    /// Whether THIS host verified the request that produced the envelope
-    /// (Slack's signature, Telegram's secret token). A remote fetch
-    /// reference is resolved only from a verified request (host checklist 12).
-    verified: bool,
+    /// What THIS host established about the request that produced the
+    /// envelope (Slack's signature, Telegram's secret token, the
+    /// `crate::inbound_verify` gates). A remote fetch reference is resolved
+    /// only from a verified request (host checklist 12).
+    verification: RequestVerification,
 }
 
 impl Origin {
@@ -113,18 +141,22 @@ impl Origin {
                 team: team.map(str::to_string),
                 pack_id: pack_id.to_string(),
             },
-            verified: false,
+            verification: RequestVerification::NotConfigured,
         }
     }
 
-    /// Marks the request as verified by this host. Unverified is the default.
-    pub(crate) fn verified_by_host(mut self, verified: bool) -> Self {
-        self.verified = verified;
+    /// Records what this host established. Not configured is the default.
+    pub(crate) fn verified_by_host(mut self, verification: RequestVerification) -> Self {
+        self.verification = verification;
         self
     }
 
     pub(crate) fn is_verified(&self) -> bool {
-        self.verified
+        self.verification == RequestVerification::Verified
+    }
+
+    pub(crate) fn verification(&self) -> RequestVerification {
+        self.verification
     }
 
     pub(crate) fn channel(&self) -> Channel {

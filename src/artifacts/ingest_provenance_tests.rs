@@ -220,6 +220,42 @@ async fn an_unverified_request_resolves_no_remote_reference_but_keeps_inline_byt
     assert_eq!(env.attachments[1].url.as_deref(), Some("artifact://id1"));
 }
 
+/// Re-review G4 M3: when verification was UNAVAILABLE (key set or secret
+/// store outage) the note says so, not that the channel is not set up.
+#[tokio::test]
+async fn an_unavailable_verification_says_so_in_the_note() {
+    use super::origin::{Origin, RequestVerification};
+    let store = Arc::new(FakeStore::default());
+    let fetcher = FakeFetcher::new(vec![ok(png(0))]);
+    let mut env = envelope(1);
+    env.extensions.insert(
+        "attachment_fetch".into(),
+        json!([{"kind": "public", "url": "https://x/0"}]),
+    );
+    let origin = Origin::new("messaging.teams", "p", "demo", None)
+        .verified_by_host(RequestVerification::Unavailable);
+    assert!(!origin.is_verified());
+    super::ingest::Pipeline::new(store.clone(), fetcher.clone())
+        .process(&mut env, Some("c"), &origin)
+        .await;
+    assert_eq!(fetcher.calls(), 0);
+    let message = note(&env, 0)["message"].as_str().unwrap().to_string();
+    assert!(
+        message.ends_with("not read, verification is temporarily unavailable"),
+        "{message}"
+    );
+    assert!(!message.contains("not set up"), "{message}");
+}
+
+#[test]
+fn a_proof_from_any_gate_wins_over_an_unavailable_one() {
+    use super::origin::RequestVerification as V;
+    assert_eq!(V::from_gates(true, true), V::Verified);
+    assert_eq!(V::from_gates(true, false), V::Verified);
+    assert_eq!(V::from_gates(false, true), V::Unavailable);
+    assert_eq!(V::from_gates(false, false), V::NotConfigured);
+}
+
 /// Forged host fields arrive per request, so the warning is said once per
 /// process and later occurrences are counted at debug: a client that keeps
 /// sending them cannot flood the operator log.

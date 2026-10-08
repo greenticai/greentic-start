@@ -35,7 +35,7 @@ use super::fetch::{FetchError, Fetcher};
 use super::fetch_ref::{EXTENSION_KEY as FETCH_KEY, FetchRef, parse_refs};
 use super::label::display_label;
 use super::limits::{MAX_FILE_BYTES, MAX_FILES, MAX_MESSAGE_BYTES, MAX_TEXT_CHARS};
-use super::origin::Origin;
+use super::origin::{Origin, RequestVerification};
 use super::pdf_limits::{SLOTS_ENV, worker_slots};
 use super::provenance::strip_reserved;
 use super::sniff::{Kind, detect};
@@ -91,6 +91,10 @@ const UNVERIFIED: Note = Note::new(
     "fetch_failed",
     "this channel is not set up to verify its messages",
 );
+/// The same, when verification is set up but could not run (key set or
+/// secret store outage): it names the outage, not a missing set-up.
+const VERIFICATION_UNAVAILABLE: Note =
+    Note::new("fetch_failed", "verification is temporarily unavailable");
 /// For a slot whose reference this host withheld (`FetchRef::Withheld`).
 const WITHHELD: Note = Note::new("fetch_failed", "the file could not be retrieved");
 const STORE_OUT_OF_TIME: Note = Note::new("door_unavailable", "it could not be stored in time");
@@ -293,7 +297,10 @@ impl Pipeline {
         // request this host verified. Inline bytes are the request's own and
         // need no outbound fetch.
         if !origin.is_verified() && !matches!(reference, FetchRef::Inline) {
-            return Err(UNVERIFIED);
+            return Err(match origin.verification() {
+                RequestVerification::Unavailable => VERIFICATION_UNAVAILABLE,
+                _ => UNVERIFIED,
+            });
         }
         let bytes = match reference {
             FetchRef::Inline => decode_inline(attachment.content.as_ref())?,

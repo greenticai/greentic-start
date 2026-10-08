@@ -191,7 +191,7 @@ pub(crate) fn slack() -> Origin {
         "demo",
         None,
     )
-    .verified_by_host(true)
+    .verified_by_host(crate::artifacts::origin::RequestVerification::Verified)
 }
 
 /// The origin a reference of this kind legitimately arrives on.
@@ -202,5 +202,6 @@ pub(crate) fn origin_of(reference: &FetchRef) -> Origin {
         FetchRef::Bearer { secret_key, .. } if secret_key == "WEBEX_BOT_TOKEN" => "messaging.webex",
         _ => "messaging.slack.api",
     };
-    Origin::new(provider_type, "messaging-provider-under-test", "demo", None).verified_by_host(true)
+    Origin::new(provider_type, "messaging-provider-under-test", "demo", None)
+        .verified_by_host(crate::artifacts::origin::RequestVerification::Verified)
 }

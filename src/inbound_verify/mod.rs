@@ -12,7 +12,10 @@
 //!
 //! The verdict is ORed into the request's `transport_verified` flag, which is
 //! what lets inbound attachments resolve a remote fetch reference
-//! (`artifacts::origin::Origin::verified_by_host`). The outcomes:
+//! (`artifacts::origin::Origin::verified_by_host`); an `Unavailable` verdict
+//! becomes `RequestVerification::Unavailable` there, so the files note says
+//! verification is temporarily unavailable rather than not set up. The
+//! outcomes:
 //!
 //! - **Verified** — files are read.
 //! - **NotConfigured** (no secret / no bot app id) — the request is admitted

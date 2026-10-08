@@ -5579,6 +5579,9 @@ async fn dispatch_provider_route(
     // or a checked signature below). Inbound attachments resolve a remote
     // fetch reference only from a verified request.
     let mut transport_verified = header_endpoint_id_authenticated.is_some();
+    // A configured gate that could not run (key set or secret store outage):
+    // the agent's note then says verification is unavailable, not unset.
+    let mut verification_unavailable = false;
 
     // Transport-layer signature gate. `provider_auth` above covers providers
     // that authenticate with a shared secret in a header (Telegram); this
@@ -5659,9 +5662,16 @@ async fn dispatch_provider_route(
     )
     .await
     {
-        Ok(verdict) => transport_verified |= verdict == crate::inbound_verify::Verdict::Verified,
+        Ok(verdict) => {
+            transport_verified |= verdict == crate::inbound_verify::Verdict::Verified;
+            verification_unavailable |= verdict == crate::inbound_verify::Verdict::Unavailable;
+        }
         Err(response) => return Err(response),
     }
+    let request_verification = crate::artifacts::origin::RequestVerification::from_gates(
+        transport_verified,
+        verification_unavailable,
+    );
 
     // Second half of the `defer_pin` two-phase write (A1 follow-up): commit the
     // body-derived chat-stickiness pin now that the host gates above have
@@ -5959,7 +5969,7 @@ async fn dispatch_provider_route(
                     welcome_hint,
                     pipeline_notifier,
                     supports_typing,
-                    transport_verified,
+                    request_verification,
                 )
                 .await;
             }
@@ -6081,7 +6091,7 @@ async fn run_provider_inbound_pipeline(
     welcome_hint: Option<WelcomeFlowHint>,
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
     supports_typing: bool,
-    transport_verified: bool,
+    request_verification: crate::artifacts::origin::RequestVerification,
 ) {
     // Channel "is typing" signal (docs/typing-signal.md). Built once per batch and
     // only when the provider declares `send_typing` and the kill switch is on. The
@@ -6110,7 +6120,7 @@ async fn run_provider_inbound_pipeline(
     let mut envelopes = envelopes;
     let origin =
         crate::artifacts::origin::Origin::new(&provider_type, &pack_id, &tenant, Some(&team))
-            .verified_by_host(transport_verified);
+            .verified_by_host(request_verification);
     let unit = activation
         .routing
         .attachments

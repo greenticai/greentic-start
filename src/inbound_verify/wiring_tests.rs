@@ -59,6 +59,10 @@ fn a_refusal_returns_before_anything_else_runs_and_only_verified_counts() {
         window.contains("verdict == crate::inbound_verify::Verdict::Verified"),
         "only `Verified` may raise the flag:\n{window}"
     );
+    assert!(
+        window.contains("verdict == crate::inbound_verify::Verdict::Unavailable"),
+        "an outage must reach the note as unavailable, not as not set up:\n{window}"
+    );
 }
 
 /// The secrets environment is resolved once per process, not per request.
