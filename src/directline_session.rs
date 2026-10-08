@@ -27,8 +27,16 @@
 //! every re-mint hands the provider a fresh, full-lifetime token, which is what
 //! makes the window work regardless of how the provider is tuned. See
 //! `docs/directline-token-renewal.md`.
+//!
+//! Conversation ownership: only a token whose signed `conv` names the
+//! conversation is renewed, touched or allowed to pin. start never binds a
+//! conversation-less token to the conversation in the URL. On a conversation
+//! route it refuses an anonymous conversation-less token itself
+//! (`403 ConversationOwnerRequired`, the provider's own answer) and forwards a
+//! signed-in one unchanged for the provider to decide — see
+//! `screen_conversation_less` and `docs/directline-conversation-ownership.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -41,7 +49,7 @@ use hyper::header::HeaderValue;
 use hyper::{Method, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use crate::ingress_types::IngressHttpResponse;
 
@@ -92,19 +100,89 @@ pub fn token_ttl_secs() -> u64 {
 pub struct DirectLineSessions {
     inner: Mutex<HashMap<String, Instant>>,
     ttl: Duration,
+    anonymous_unbound: AnonymousUnboundPolicy,
+    /// SHA-256 of the conversation ids an anonymous conversation-less token
+    /// has already been warned about (warn-only mode). Hashes, so the set
+    /// holds no conversation id; bounded like the window map.
+    warned_anonymous_unbound: Mutex<HashSet<[u8; 32]>>,
+}
+
+/// Env var naming what start does with an ANONYMOUS conversation-less token on
+/// a conversation route (reconnect, `/activities`). Default: refuse with
+/// `403 ConversationOwnerRequired`. `0`/`false`/`no`/`off` relaxes it to
+/// warn-only for one release cycle. See `docs/directline-conversation-ownership.md`.
+pub const REQUIRE_CONVERSATION_TOKEN_ENV: &str = "GREENTIC_WEBCHAT_REQUIRE_CONVERSATION_TOKEN";
+
+/// What start does with an anonymous conversation-less token on a
+/// conversation route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnonymousUnboundPolicy {
+    /// Answer `403 ConversationOwnerRequired` without consulting the provider.
+    Refuse,
+    /// Forward it unchanged (never bound) and warn once per conversation.
+    WarnOnly,
+}
+
+/// Parse [`REQUIRE_CONVERSATION_TOKEN_ENV`]. Only an explicit
+/// `0`/`false`/`no`/`off` (any case, surrounding whitespace ignored) relaxes
+/// the refusal; an absent, empty or unrecognised value keeps it — a typo must
+/// not reopen the hole.
+pub fn anonymous_unbound_policy_from(raw: Option<&str>) -> AnonymousUnboundPolicy {
+    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("0" | "false" | "no" | "off") => AnonymousUnboundPolicy::WarnOnly,
+        _ => AnonymousUnboundPolicy::Refuse,
+    }
 }
 
 impl DirectLineSessions {
     /// Build a store whose base TTL comes from the environment.
     pub fn from_env() -> Self {
-        Self::with_ttl_secs(token_ttl_secs())
+        let policy = anonymous_unbound_policy_from(
+            std::env::var(REQUIRE_CONVERSATION_TOKEN_ENV)
+                .ok()
+                .as_deref(),
+        );
+        if policy == AnonymousUnboundPolicy::WarnOnly {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "{REQUIRE_CONVERSATION_TOKEN_ENV} is off: anonymous conversation-less Direct Line tokens are forwarded (never bound) instead of refused; this escape hatch is removed in a future release"
+                ),
+            );
+        }
+        Self::with_ttl_secs(token_ttl_secs()).with_anonymous_unbound_policy(policy)
     }
 
     pub fn with_ttl_secs(secs: u64) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
             ttl: Duration::from_secs(secs.clamp(MIN_TTL_SECS, MAX_TTL_SECS)),
+            anonymous_unbound: AnonymousUnboundPolicy::Refuse,
+            warned_anonymous_unbound: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Replace the anonymous conversation-less token policy.
+    pub fn with_anonymous_unbound_policy(mut self, policy: AnonymousUnboundPolicy) -> Self {
+        self.anonymous_unbound = policy;
+        self
+    }
+
+    /// True the first time an anonymous conversation-less token is seen on
+    /// `conversation_id` (warn-only mode logs once per conversation).
+    pub fn first_anonymous_unbound_use(&self, conversation_id: &str) -> bool {
+        let Ok(mut warned) = self.warned_anonymous_unbound.lock() else {
+            return false;
+        };
+        if warned.len() >= MAX_TRACKED_CONVERSATIONS {
+            // Bounded: start over rather than grow, at worst warning again.
+            warned.clear();
+        }
+        warned.insert(Sha256::digest(conversation_id.as_bytes()).into())
+    }
+
+    fn anonymous_unbound_policy(&self) -> AnonymousUnboundPolicy {
+        self.anonymous_unbound
     }
 
     /// Base token TTL in seconds (used both for the sliding window and for the
@@ -519,21 +597,20 @@ fn handle_activities(
         Some(token) => token,
         None => return unauthorized("Unauthorized", "missing Authorization header"),
     };
-    let mut claims = match parse_token(&token, key) {
+    let claims = match parse_token(&token, key) {
         Ok(claims) => claims,
         Err(TokenError::BadSignature) => {
             return unauthorized("InvalidToken", "invalid token signature");
         }
         Err(TokenError::Malformed) => return unauthorized("InvalidToken", "malformed token"),
     };
-    // Mirror `handle_reconnect`: accept a conv-LESS token (`conv = None`) as well as
-    // one already bound to this conversation. WebChat in `tokenUrl` mode periodically
-    // refreshes its bearer from `/token`, which mints a conv-less token; rejecting it
-    // here (while reconnect/polling accept it) is exactly what breaks "send" with a
-    // 403 after the first refresh. Only a token bound to a DIFFERENT conversation is
-    // a genuine mismatch.
+    // Conversation-less tokens are accepted ONLY for a signed-in visitor, and
+    // are forwarded untouched: the provider decides whether that identity owns
+    // this conversation. start never binds a token to a conversation on the
+    // caller's behalf — doing so handed any conversation to anyone who knew
+    // its id (G2). See `screen_conversation_less`.
     match claims.conv.as_deref() {
-        None => {}
+        None => return screen_conversation_less(&claims, conv_id, sessions),
         Some(bound) if bound == conv_id => {}
         Some(_) => {
             return forbidden(
@@ -545,12 +622,10 @@ fn handle_activities(
     if is_expired(&claims) && !sessions.is_alive(conv_id) {
         return unauthorized("TokenExpired", "invalid token: Expired");
     }
-    // Accepted — extend the conversation's lifetime and re-mint a full-TTL,
-    // conv-bound bearer so the provider's strict `exp`+conversation checks pass and
-    // the client can adopt a properly-bound token (even if it sent a conv-less one).
+    // Accepted bound token — extend the conversation's lifetime and re-mint a
+    // full-TTL bearer with the SAME `conv` so the provider's strict `exp` check
+    // passes.
     sessions.touch(conv_id);
-    let token_bound_to_conversation = claims.conv.as_deref() == Some(conv_id);
-    claims.conv = Some(conv_id.to_string());
     let renewed = mint_token(&claims, key, sessions.ttl_secs());
     // POST = a user-typed message (low frequency) — always echo the renewed
     // token so the client can adopt it; GET polling (high frequency) only when
@@ -561,7 +636,7 @@ fn handle_activities(
         rewrite_authorization: Some(format!("Bearer {renewed}")),
         inject_renewed_token: echo_renewed.then_some(renewed),
         seed_from_response: false,
-        token_bound_to_conversation,
+        token_bound_to_conversation: true,
     })
 }
 
@@ -584,7 +659,7 @@ fn handle_reconnect(
         Some(token) => token,
         None => return unauthorized("Unauthorized", "missing Authorization header"),
     };
-    let mut claims = match parse_token(&token, key) {
+    let claims = match parse_token(&token, key) {
         Ok(claims) => claims,
         Err(TokenError::BadSignature) => {
             return unauthorized("InvalidToken", "invalid token signature");
@@ -592,7 +667,7 @@ fn handle_reconnect(
         Err(TokenError::Malformed) => return unauthorized("InvalidToken", "malformed token"),
     };
     match claims.conv.as_deref() {
-        None => {}
+        None => return screen_conversation_less(&claims, conv_id, sessions),
         Some(bound) if bound == conv_id => {}
         Some(_) => {
             return forbidden(
@@ -605,17 +680,75 @@ fn handle_reconnect(
         return unauthorized("TokenExpired", "invalid token: Expired");
     }
     sessions.touch(conv_id);
-    let token_bound_to_conversation = claims.conv.as_deref() == Some(conv_id);
-    // Forward a fresh conv-bound bearer so the provider's reconnect handler
-    // accepts it; its response already carries a freshly issued token.
-    claims.conv = Some(conv_id.to_string());
+    // Forward a fresh bearer for the SAME conversation so the provider's
+    // strict `exp` check passes; its response already carries a freshly
+    // issued token.
     let renewed = mint_token(&claims, key, sessions.ttl_secs());
     Preflight::Forward(ForwardPlan {
         rewrite_authorization: Some(format!("Bearer {renewed}")),
         inject_renewed_token: None,
         seed_from_response: false,
-        token_bound_to_conversation,
+        token_bound_to_conversation: true,
     })
+}
+
+/// A verified, signature-checked token WITHOUT a `conv` claim, presented on a
+/// conversation route (reconnect, `/activities`).
+///
+/// - anonymous (no `verified: true`): refused here with
+///   `403 ConversationOwnerRequired` — an anonymous `sub` is client-chosen,
+///   so only a token bound to the conversation proves ownership. Needs no
+///   state, so it closes the hole even in bundles that still carry an old
+///   provider pack. [`AnonymousUnboundPolicy::WarnOnly`] forwards it instead
+///   (still unbound) and warns once per conversation.
+/// - expired: `401 TokenExpired`. The sliding window rescues bound tokens
+///   only; for a conversation-less token it would let any old signed token
+///   reach any live conversation.
+/// - otherwise forwarded UNCHANGED — no rewrite, no renewed token, no window
+///   touch, no pin. The provider decides whether this signed-in identity owns
+///   the conversation.
+///
+/// The answer never depends on whether the conversation exists (start holds
+/// no conversation state), so a refusal is not an existence oracle.
+fn screen_conversation_less(
+    claims: &DlClaims,
+    conv_id: &str,
+    sessions: &DirectLineSessions,
+) -> Preflight {
+    if !token_is_verified(claims) {
+        match sessions.anonymous_unbound_policy() {
+            AnonymousUnboundPolicy::Refuse => return owner_required(),
+            AnonymousUnboundPolicy::WarnOnly => {
+                if sessions.first_anonymous_unbound_use(conv_id) {
+                    // Deliberately no conversation id, sub or token here.
+                    crate::operator_log::warn(
+                        module_path!(),
+                        format!(
+                            "directline: an anonymous conversation-less token was used on an existing conversation; forwarded because {REQUIRE_CONVERSATION_TOKEN_ENV} is off (it will be refused in a future release)"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    if is_expired(claims) {
+        return unauthorized("TokenExpired", "invalid token: Expired");
+    }
+    Preflight::Forward(ForwardPlan::default())
+}
+
+/// `verified` is not a named field on [`DlClaims`] (it rides in `extra`); only
+/// an explicit JSON `true` counts.
+fn token_is_verified(claims: &DlClaims) -> bool {
+    claims.extra.get("verified").and_then(Value::as_bool) == Some(true)
+}
+
+/// Same status and body as the provider's `owner::Refusal::OwnerRequired`.
+fn owner_required() -> Preflight {
+    forbidden(
+        "ConversationOwnerRequired",
+        "this conversation belongs to another session; start a new conversation",
+    )
 }
 
 fn handle_conversations_create(
@@ -807,38 +940,9 @@ fn json_response(status: StatusCode, value: Value) -> Response<Full<Bytes>> {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use super::*;
     use http_body_util::BodyExt;
-
-    const KEY: &[u8] = b"test-signing-key";
-
-    fn auth(token: &str) -> Vec<(String, String)> {
-        vec![("Authorization".to_string(), format!("Bearer {token}"))]
-    }
-
-    /// Build a token directly (so we can choose `iat`/`exp`/`conv`).
-    fn make_token(sub: &str, conv: Option<&str>, iat: i64, exp: i64, key: &[u8]) -> String {
-        let claims = DlClaims {
-            iss: TOKEN_ISS.to_string(),
-            aud: TOKEN_AUD.to_string(),
-            sub: sub.to_string(),
-            iat,
-            nbf: iat,
-            exp,
-            ctx: DlContext {
-                env: "default".to_string(),
-                tenant: "demo".to_string(),
-                team: None,
-            },
-            conv: conv.map(str::to_string),
-            extra: serde_json::Map::new(),
-        };
-        let header_enc = URL_SAFE_NO_PAD.encode(JOSE_HEADER);
-        let payload_enc = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
-        let signing_input = format!("{header_enc}.{payload_enc}");
-        let sig = URL_SAFE_NO_PAD.encode(hs256(&signing_input, key));
-        format!("{signing_input}.{sig}")
-    }
 
     fn body_of(resp: Response<Full<Bytes>>) -> (StatusCode, Value) {
         let status = resp.status();
@@ -1480,11 +1584,16 @@ mod tests {
         assert!(plan.inject_renewed_token.is_some());
     }
 
+    /// Was `reconnect_accepts_unbound_token_and_keeps_window_alive`: start used
+    /// to bind the conversation-less token to the conversation in the URL,
+    /// which granted it to anyone who knew the id (G2). A signed-in visitor's
+    /// conversation-less token is now forwarded as presented, for the provider
+    /// to decide; an anonymous one is refused (see `owner_tests`).
     #[test]
-    fn reconnect_accepts_unbound_token_and_keeps_window_alive() {
+    fn reconnect_forwards_a_verified_unbound_token_without_binding_it() {
         let sessions = DirectLineSessions::with_ttl_secs(1800);
         let now = now_secs();
-        let unbound = make_token("alice", None, now, now + 1800, KEY);
+        let unbound = verified_unbound("alice", now, now + 1800);
         let Preflight::Forward(plan) = preflight(
             &Method::GET,
             "/v3/directline/conversations/conv-7",
@@ -1494,16 +1603,22 @@ mod tests {
         ) else {
             panic!("expected forward");
         };
-        let renewed = plan
-            .rewrite_authorization
-            .as_deref()
-            .and_then(|h| h.strip_prefix("Bearer "))
-            .expect("reconnect rewrites to a conv-bound bearer");
-        assert_eq!(
-            parse_token(renewed, KEY).unwrap().conv.as_deref(),
-            Some("conv-7")
-        );
-        assert!(sessions.is_alive("conv-7"));
+        assert_eq!(plan.rewrite_authorization, None);
+        assert!(!plan.token_bound_to_conversation);
+        assert!(!sessions.is_alive("conv-7"));
+    }
+
+    /// A conversation-less token carrying `verified: true` (a signed-in visitor).
+    fn verified_unbound(sub: &str, iat: i64, exp: i64) -> String {
+        sign_raw(
+            &json!({
+                "iss": TOKEN_ISS, "aud": TOKEN_AUD, "sub": sub,
+                "iat": iat, "nbf": iat, "exp": exp,
+                "ctx": { "env": "default", "tenant": "demo" },
+                "verified": true,
+            }),
+            KEY,
+        )
     }
 
     fn forward_plan(method: Method, path: &str, token: &str) -> ForwardPlan {
@@ -1524,7 +1639,9 @@ mod tests {
     fn only_a_token_already_bound_to_the_conversation_may_repin() {
         let now = now_secs();
         let bound = make_token("alice", Some("conv-7"), now, now + 1800, KEY);
-        let unbound = make_token("alice", None, now, now + 1800, KEY);
+        // An anonymous conversation-less token no longer reaches the provider
+        // at all; a signed-in one is forwarded and still must not re-pin.
+        let unbound = verified_unbound("alice", now, now + 1800);
         for (method, path) in [
             (Method::GET, "/v3/directline/conversations/conv-7"),
             (
@@ -1613,3 +1730,50 @@ mod tests {
         assert_eq!(server_error.body.as_deref(), Some(b"not json".as_ref()));
     }
 }
+
+/// Token helpers shared by this file's two test modules (a pure move out of
+/// `mod tests`, so `owner_tests` can build the same tokens).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) const KEY: &[u8] = b"test-signing-key";
+
+    pub(crate) fn auth(token: &str) -> Vec<(String, String)> {
+        vec![("Authorization".to_string(), format!("Bearer {token}"))]
+    }
+
+    /// Build a token directly (so we can choose `iat`/`exp`/`conv`).
+    pub(crate) fn make_token(
+        sub: &str,
+        conv: Option<&str>,
+        iat: i64,
+        exp: i64,
+        key: &[u8],
+    ) -> String {
+        let claims = DlClaims {
+            iss: TOKEN_ISS.to_string(),
+            aud: TOKEN_AUD.to_string(),
+            sub: sub.to_string(),
+            iat,
+            nbf: iat,
+            exp,
+            ctx: DlContext {
+                env: "default".to_string(),
+                tenant: "demo".to_string(),
+                team: None,
+            },
+            conv: conv.map(str::to_string),
+            extra: serde_json::Map::new(),
+        };
+        let header_enc = URL_SAFE_NO_PAD.encode(JOSE_HEADER);
+        let payload_enc = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let signing_input = format!("{header_enc}.{payload_enc}");
+        let sig = URL_SAFE_NO_PAD.encode(hs256(&signing_input, key));
+        format!("{signing_input}.{sig}")
+    }
+}
+
+#[cfg(test)]
+#[path = "directline_session_owner_tests.rs"]
+mod owner_tests;
