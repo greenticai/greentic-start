@@ -3,11 +3,13 @@
 //!
 //! Order: kill switch -> method -> per-client window -> exact path shape ->
 //! deployment known to this activation with a live signer -> MAC (constant
-//! time) -> expiry -> per-link window -> unit egress budget -> read slot ->
-//! door read. Every refusal about WHICH file or WHICH unit (and the kill
-//! switch) is [`not_found`], byte for byte the same, so the route is no
-//! existence oracle across tenants or units. Bytes come from the unit's own
-//! door with the unit's own token: the door decides the tenant.
+//! time) -> expiry -> per-link window -> byte budgets reserved (unit and
+//! link) -> read slot (process and unit) -> door read. Every refusal about
+//! WHICH file or WHICH unit (and the kill switch) is [`not_found`], byte for
+//! byte the same, so the route is no existence oracle across tenants or
+//! units. Past the per-client window (which applies before any lookup), a
+//! `429` or `503` answers only a link whose MAC verified. Bytes come from the
+//! unit's own door with the unit's own token: the door decides the tenant.
 //!
 //! Serving rule (docs/inbound-attachments.md §7): `Content-Type` is the
 //! door's sniffed type and must be on the v1 allow-list; images are `inline`
@@ -127,13 +129,16 @@ pub(crate) async fn serve_link(
     let Some((link, unit, artifact_id)) = authorise(&req, lookup) else {
         return not_found();
     };
-    if !limits.link_allows(&format!("{}/{}", link.deployment, link.artifact_hex))
-        || !limits.egress_allows(&unit.deployment, req.now)
-    {
+    let link_key = format!("{}/{}", link.deployment, link.artifact_hex);
+    if !limits.link_allows(&link_key) {
         tracing::debug!(deployment = %unit.deployment, outcome = "limited", "artifact link");
         return refusal(StatusCode::TOO_MANY_REQUESTS, TOO_MANY_BODY, "60");
     }
-    let Some(_slot) = limits.try_read_slot() else {
+    let Some(mut reservation) = limits.reserve(&unit.deployment, &link_key, req.now) else {
+        tracing::debug!(deployment = %unit.deployment, outcome = "budget", "artifact link");
+        return refusal(StatusCode::TOO_MANY_REQUESTS, TOO_MANY_BODY, "60");
+    };
+    let Some(_slot) = limits.try_read_slot(&unit.deployment) else {
         tracing::debug!(deployment = %unit.deployment, outcome = "busy", "artifact link");
         return refusal(StatusCode::SERVICE_UNAVAILABLE, BUSY_BODY, "2");
     };
@@ -146,7 +151,7 @@ pub(crate) async fn serve_link(
     };
     // Every method is charged: the door has no HEAD, so a HEAD reads (and
     // buffers) the whole file exactly like a GET.
-    limits.egress_add(&unit.deployment, req.now, file.bytes.len() as u64);
+    reservation.charge(file.bytes.len() as u64);
     let Some(disposition) = disposition(&file.mime_type, file.name.as_deref()) else {
         return not_found();
     };

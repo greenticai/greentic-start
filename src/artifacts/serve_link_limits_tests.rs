@@ -50,7 +50,8 @@ async fn one_link_answers_at_most_thirty_times_a_minute() {
 async fn busy_reads_answer_503_retry_after_two() {
     let f = fixture(StubReader::file("image/png", None, b"IMG"));
     let limits = LinkLimits::new(1, 1 << 30);
-    let held = limits.try_read_slot().expect("one slot");
+    // The process's only slot, held by ANOTHER unit.
+    let held = limits.try_read_slot("another-unit").expect("one slot");
     let answer = f.request(Method::GET, &f.link().to_path(), &limits).await;
     assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(answer.header("retry-after"), Some("2"));
@@ -62,7 +63,7 @@ async fn busy_reads_answer_503_retry_after_two() {
 #[tokio::test]
 async fn a_units_hourly_egress_budget_is_enforced() {
     let f = fixture(StubReader::file("image/png", None, &[7u8; 100]));
-    let limits = LinkLimits::new(2, 250);
+    let limits = LinkLimits::with_budgets(2, 300, 1 << 30, 100);
     let path = f.link().to_path();
     for _ in 0..3 {
         assert_eq!(
@@ -84,7 +85,7 @@ async fn a_units_hourly_egress_budget_is_enforced() {
 #[tokio::test]
 async fn a_head_request_spends_egress_like_a_get() {
     let f = fixture(StubReader::file("image/png", None, &[7u8; 100]));
-    let limits = LinkLimits::new(2, 250);
+    let limits = LinkLimits::with_budgets(2, 300, 1 << 30, 100);
     let path = f.link().to_path();
     for _ in 0..3 {
         assert_eq!(
@@ -138,4 +139,96 @@ async fn the_per_client_limit_applies_only_to_an_identified_client() {
             .await;
         assert_eq!(answer.status, StatusCode::OK);
     }
+}
+
+#[tokio::test]
+async fn one_unit_holds_at_most_one_read_slot() {
+    let a = fixture(StubReader::file("image/png", None, b"IMG"));
+    let b = fixture(StubReader::file("image/png", None, b"IMG"));
+    let limits = limits();
+    let held = limits.try_read_slot(&a.unit.deployment).expect("a's slot");
+    let answer = a.request(Method::GET, &a.link().to_path(), &limits).await;
+    assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(answer.header("retry-after"), Some("2"));
+    // Another unit still gets the process's second slot.
+    let answer = b.request(Method::GET, &b.link().to_path(), &limits).await;
+    assert_eq!(answer.status, StatusCode::OK);
+    drop(held);
+    let answer = a.request(Method::GET, &a.link().to_path(), &limits).await;
+    assert_eq!(answer.status, StatusCode::OK);
+}
+
+/// The largest file is reserved before the door read and the unused part
+/// is given back: 100-byte files against a 400-byte budget and a 200-byte
+/// reservation serve three times (charging the reservation would stop at two).
+#[tokio::test]
+async fn the_budget_is_reserved_before_the_read_and_the_rest_refunded() {
+    let f = fixture(StubReader::file("image/png", None, &[7u8; 100]));
+    let limits = LinkLimits::with_budgets(2, 400, 1 << 30, 200);
+    let path = f.link().to_path();
+    for i in 0..3 {
+        let answer = f.request(Method::GET, &path, &limits).await;
+        assert_eq!(answer.status, StatusCode::OK, "request {i}");
+    }
+    let answer = f.request(Method::GET, &path, &limits).await;
+    assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// A read still in flight counts against the budget before it finishes.
+#[tokio::test]
+async fn a_held_reservation_counts_against_the_budget() {
+    let f = fixture(StubReader::file("image/png", None, &[7u8; 100]));
+    let limits = LinkLimits::with_budgets(2, 150, 1 << 30, 100);
+    let path = f.link().to_path();
+    let held = limits
+        .reserve(&f.unit.deployment, "other-link", NOW)
+        .expect("first reservation");
+    let answer = f.request(Method::GET, &path, &limits).await;
+    assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
+    drop(held);
+    let answer = f.request(Method::GET, &path, &limits).await;
+    assert_eq!(answer.status, StatusCode::OK);
+}
+
+/// A read that served nothing gives its whole reservation back.
+#[tokio::test]
+async fn a_failed_read_spends_nothing() {
+    let f = fixture(StubReader::new(vec![
+        Err(greentic_aw_runtime::ArtifactError::NotFound),
+        Err(greentic_aw_runtime::ArtifactError::NotFound),
+        Ok(("image/png".into(), None, vec![7u8; 100])),
+    ]));
+    let limits = LinkLimits::with_budgets(2, 150, 1 << 30, 100);
+    let path = f.link().to_path();
+    for _ in 0..2 {
+        let answer = f.request(Method::GET, &path, &limits).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND);
+    }
+    let answer = f.request(Method::GET, &path, &limits).await;
+    assert_eq!(answer.status, StatusCode::OK);
+}
+
+/// One link cannot spend its unit's whole budget.
+#[tokio::test]
+async fn one_link_has_its_own_hourly_byte_budget() {
+    let f = fixture(StubReader::file("image/png", None, &[7u8; 100]));
+    let limits = LinkLimits::with_budgets(2, 1 << 30, 250, 100);
+    let path = f.link().to_path();
+    for i in 0..2 {
+        let answer = f.request(Method::GET, &path, &limits).await;
+        assert_eq!(answer.status, StatusCode::OK, "request {i}");
+    }
+    let answer = f.request(Method::GET, &path, &limits).await;
+    assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
+    let other = f.link_for(
+        "artifact://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        NOW,
+        TTL,
+    );
+    let answer = f.request(Method::GET, &other.to_path(), &limits).await;
+    assert_eq!(answer.status, StatusCode::OK);
+    let next = f
+        .request_with(Method::GET, &path, &limits, None, true, NOW + 3_600)
+        .await;
+    assert_eq!(next.status, StatusCode::OK);
 }

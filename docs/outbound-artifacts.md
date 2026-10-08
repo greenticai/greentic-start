@@ -86,7 +86,8 @@ CORS-enabled; the metric and span label is the literal `/v1/artifacts/:link`.
 
 Order: kill switch -> method -> per-client window -> exact path shape ->
 deployment known with a live signer -> MAC -> expiry -> per-link window ->
-egress budget -> read slot -> door read.
+byte budgets (unit and link) reserved -> read slot (process and unit) -> door
+read.
 
 **One 404.** A malformed path, an unknown deployment (or a string that is not
 a ULID), a unit running without attachments, a bad MAC, an expired link, the
@@ -116,9 +117,24 @@ the egress budgets exactly like a `GET`.
 | limit | default | answer |
 |---|---|---|
 | door reads in flight per process (`GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT`, 1..8) | 2 | `503`, `Retry-After: 2` |
+| door reads in flight per unit (fixed) | 1 | `503`, `Retry-After: 2` |
 | requests per link (deployment + artifact) | 30 / 60 s | `429`, `Retry-After: 60` |
 | requests per client, only when `GREENTIC_TRUSTED_PROXY_HOPS > 0` | 120 / 60 s | `429` |
 | bytes served per unit per hour (`GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_HOUR`, 16..65536 MiB) | 2048 MiB | `429` |
+| bytes served per link per hour (`GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_LINK_PER_HOUR`, 16..65536 MiB) | 64 MiB | `429` |
+
+The two byte budgets are RESERVED before the door read: the largest file the
+door returns (10 MiB) is held against both, and whatever the read did not use
+is given back once it finishes (all of it when the read failed). Concurrent
+reads therefore cannot overshoot a budget, and a budget refuses a new read
+once less than 10 MiB of it is left. Every method is charged, `HEAD` included.
+
+A `429` or `503` answers only a link whose MAC verified (the per-client window
+is the one exception: it applies before any lookup and names nothing). Every
+refusal before that point is the one 404.
+
+**Every limit is per process.** Nothing is shared between replicas: a unit
+running on N instances gets N times each window, slot and budget.
 
 Door failures: `NotFound` is the 404; `Unavailable` is retried once after
 250 ms, then `503`; `TooLarge`, `Unauthorized`, `PurposeNotGranted` and a read
@@ -151,6 +167,7 @@ only WebChat gets a (relative) link. Never derived from a request's `Host`.
 | `GREENTIC_ARTIFACT_LINK_TTL_SECS` | `86400` (300..604800) | Link lifetime; lowering it (with a restart) revokes longer links |
 | `GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT` | `2` (1..8) | Door reads at once per process |
 | `GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_HOUR` | `2048` (16..65536) | Bytes served per unit per hour |
+| `GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_LINK_PER_HOUR` | `64` (16..65536) | Bytes served per link per hour |
 | `GREENTIC_TRUSTED_PROXY_HOPS` | `0` | Enables the per-client window when the client address is known |
 
 All are read once per process.
