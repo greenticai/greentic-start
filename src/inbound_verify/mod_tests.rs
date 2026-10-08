@@ -196,3 +196,98 @@ async fn repeated_refusals_are_logged_at_a_bounded_rate() {
     }
     assert_eq!(said.lock().unwrap().len(), 1);
 }
+
+/// Seeds the WhatsApp/Webex shared fixture secret where the provider reads it
+/// for pack `messaging-pack`, and returns (store, headers, body).
+fn signed(fixture: &str, secret_name: &str) -> (DynSecretsManager, Vec<(String, String)>, Vec<u8>) {
+    use base64::Engine;
+    let v: serde_json::Value = serde_json::from_str(fixture).expect("fixture");
+    let text = |key: &str| v[key].as_str().expect("field").to_string();
+    let uri = crate::runner_host::secret_read_uris(
+        "local",
+        "default",
+        None,
+        "messaging-pack",
+        secret_name,
+    )
+    .last()
+    .cloned()
+    .expect("uri");
+    let store: DynSecretsManager = Arc::new(crate::test_fixtures::FakeSecrets(HashMap::from([(
+        uri,
+        text("secret").into_bytes(),
+    )])));
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(text("body_base64"))
+        .expect("body");
+    (store, vec![(text("header_name"), text("header"))], body)
+}
+
+const WHATSAPP_FIXTURE: &str = include_str!("fixtures/inbound-auth-v1/whatsapp.json");
+const WEBEX_FIXTURE: &str = include_str!("fixtures/inbound-auth-v1/webex.json");
+
+#[tokio::test]
+async fn a_correctly_signed_whatsapp_or_webex_request_is_verified() {
+    for (provider_type, fixture, name) in [
+        (
+            "messaging.whatsapp.cloud",
+            WHATSAPP_FIXTURE,
+            "WHATSAPP_APP_SECRET",
+        ),
+        ("messaging.webex.bot", WEBEX_FIXTURE, "WEBEX_WEBHOOK_SECRET"),
+    ] {
+        let (store, headers, body) = signed(fixture, name);
+        let (notices, said) = Notices::recording();
+        let verdict = verify_with(
+            inbound(provider_type, "POST", &headers, &body, DeploymentId::new()),
+            &deps(&store, &notices),
+        )
+        .await
+        .expect("admitted");
+        assert_eq!(verdict, Verdict::Verified, "{provider_type}");
+        assert!(said.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_bad_whatsapp_or_webex_signature_is_refused_before_any_dispatch() {
+    for (provider_type, fixture, name) in [
+        (
+            "messaging.whatsapp.cloud",
+            WHATSAPP_FIXTURE,
+            "WHATSAPP_APP_SECRET",
+        ),
+        ("messaging.webex.bot", WEBEX_FIXTURE, "WEBEX_WEBHOOK_SECRET"),
+    ] {
+        let (store, headers, mut body) = signed(fixture, name);
+        body[10] ^= 0x01;
+        let (notices, said) = Notices::recording();
+        let refused = verify_with(
+            inbound(provider_type, "POST", &headers, &body, DeploymentId::new()),
+            &deps(&store, &notices),
+        )
+        .await
+        .expect_err("refused");
+        assert_eq!(
+            refused.status(),
+            hyper::StatusCode::UNAUTHORIZED,
+            "{provider_type}"
+        );
+        {
+            // Scoped: the recording sink locks the same mutex.
+            let said = said.lock().unwrap();
+            assert!(
+                said.iter().all(|line| !line.contains("test-")),
+                "no secret in logs: {said:?}"
+            );
+        }
+        // A missing header is refused too once a secret is configured.
+        let refused = verify_with(
+            inbound(provider_type, "POST", &[], &body, DeploymentId::new()),
+            &deps(&store, &notices),
+        )
+        .await
+        .expect_err("refused");
+        assert_eq!(refused.status(), hyper::StatusCode::UNAUTHORIZED);
+    }
+}

@@ -24,8 +24,8 @@
 //!   Bot Framework endorsement mismatch). Never downgraded, and there is no
 //!   switch to turn the check off once configured.
 
+mod hmac_channels;
 mod notices;
-#[allow(dead_code)] // read by the S2 verifiers
 mod secrets;
 
 use std::collections::BTreeMap;
@@ -54,7 +54,7 @@ pub(crate) enum Verdict {
 }
 
 /// The request as received, plus the route facts that scope its secrets.
-#[allow(dead_code)] // fields read by the S2/S5 verifiers
+#[allow(dead_code)] // `pack_non_secret` is read by the Bot Framework verifier (S5)
 pub(crate) struct Inbound<'a> {
     pub provider_type: &'a str,
     pub method: &'a str,
@@ -73,7 +73,7 @@ pub(crate) struct Inbound<'a> {
 /// Why a request was refused. Only ever logged as [`RefusalCode::as_str`];
 /// the caller's response never names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // each code is produced by its verifier (S2, S5)
+#[allow(dead_code)] // the token codes come with the Bot Framework verifier (S5)
 pub(crate) enum RefusalCode {
     MissingSignature,
     BadSignature,
@@ -116,7 +116,7 @@ impl RefusalCode {
 }
 
 /// What one channel's verifier decided.
-#[allow(dead_code)] // Verified / Unavailable / Refused come with S2 and S5
+#[allow(dead_code)] // `Unavailable` comes with the Bot Framework verifier (S5)
 pub(crate) enum Outcome {
     Verified,
     NotConfigured,
@@ -125,7 +125,6 @@ pub(crate) enum Outcome {
 }
 
 /// What the verifiers read from. Production: [`verify_inbound`].
-#[allow(dead_code)] // `secrets` / `env` read by the S2 verifiers
 pub(crate) struct Deps<'a> {
     pub secrets: &'a DynSecretsManager,
     /// The secrets environment, the same value `artifacts::secrets::HostSecrets`
@@ -232,18 +231,60 @@ fn not_configured_line(channel: Channel) -> &'static str {
     }
 }
 
-async fn whatsapp(_inbound: &Inbound<'_>, _deps: &Deps<'_>) -> Outcome {
-    Outcome::NotConfigured
+async fn whatsapp(inbound: &Inbound<'_>, deps: &Deps<'_>) -> Outcome {
+    let secret = channel_secret(inbound, deps, hmac_channels::WHATSAPP_SECRET_NAMES).await;
+    hmac_outcome(hmac_channels::check_whatsapp(
+        secret.as_ref(),
+        inbound.headers,
+        inbound.body,
+    ))
 }
 
-async fn webex(_inbound: &Inbound<'_>, _deps: &Deps<'_>) -> Outcome {
-    Outcome::NotConfigured
+async fn webex(inbound: &Inbound<'_>, deps: &Deps<'_>) -> Outcome {
+    let secret = channel_secret(inbound, deps, hmac_channels::WEBEX_SECRET_NAMES).await;
+    hmac_outcome(hmac_channels::check_webex(
+        secret.as_ref(),
+        inbound.headers,
+        inbound.body,
+    ))
+}
+
+/// The channel's secret in the provider op's own scope (`secrets.rs`).
+async fn channel_secret(
+    inbound: &Inbound<'_>,
+    deps: &Deps<'_>,
+    names: &[&str],
+) -> Option<secrets::ChannelSecret> {
+    match secrets::read_channel_secret(
+        deps.secrets,
+        deps.env,
+        inbound.tenant,
+        inbound.pack_id,
+        inbound.unit_id,
+        names,
+    )
+    .await
+    {
+        secrets::SecretRead::Found(secret) => Some(secret),
+        secrets::SecretRead::Absent => None,
+    }
+}
+
+fn hmac_outcome(outcome: hmac_channels::HmacOutcome) -> Outcome {
+    match outcome {
+        hmac_channels::HmacOutcome::Verified => Outcome::Verified,
+        hmac_channels::HmacOutcome::NotConfigured => Outcome::NotConfigured,
+        hmac_channels::HmacOutcome::Refused(code) => Outcome::Refused(code),
+    }
 }
 
 async fn teams(_inbound: &Inbound<'_>, _deps: &Deps<'_>) -> Outcome {
     Outcome::NotConfigured
 }
 
+#[cfg(test)]
+#[path = "hmac_channels_tests.rs"]
+mod hmac_channels_tests;
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod mod_tests;
