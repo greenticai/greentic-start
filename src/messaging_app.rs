@@ -354,7 +354,10 @@ pub fn run_app_flow(
         ctx.team.as_deref().unwrap_or("default"),
         (!envelope.session_id.is_empty()).then_some(envelope.session_id.as_str()),
     );
-    parse_envelopes(&value, envelope)
+    let mut envelopes = parse_envelopes(&value, envelope)?;
+    // No file leaves this lane (docs/outbound-artifacts.md §7): say so.
+    crate::artifacts::outbound::declare_legacy_unsent(&value, &mut envelopes);
+    Ok(envelopes)
 }
 
 /// Replace the adapter's `state=scheme|provider` in a Connect card's authorize URL

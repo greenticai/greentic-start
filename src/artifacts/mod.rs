@@ -97,6 +97,8 @@ mod link_tests;
 #[cfg(test)]
 mod origin_tests;
 #[cfg(test)]
+mod outbound_legacy_tests;
+#[cfg(test)]
 mod outbound_side_tests;
 #[cfg(test)]
 mod outbound_tests;

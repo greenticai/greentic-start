@@ -34,6 +34,8 @@ pub(crate) const NO_PUBLIC_ADDRESS: &str = "A file was created but cannot be sen
      channel because this worker has no public https address.";
 pub(crate) const LINKS_OFF: &str =
     "A file was created but file delivery is turned off for this worker.";
+/// The legacy `--bundle` lane has no door, no signer and no route.
+pub(crate) const LEGACY_UNSENT: &str = "A file was created but this host cannot send files.";
 
 /// One file a reply names. Only the id is used: a tool's claim about the
 /// name or type is untrusted (the door's record at put time is used).
@@ -251,6 +253,50 @@ impl OutboundSide {
 
 static STRIPPED: Occurrences = Occurrences::new();
 
+fn log_stripped(stripped: usize) {
+    if STRIPPED.record(stripped) {
+        tracing::warn!(
+            stripped,
+            "a reply carried raw artifact references; they were removed before egress \
+             (later occurrences are counted at debug)"
+        );
+    } else if stripped > 0 {
+        tracing::debug!(
+            stripped,
+            total = STRIPPED.total(),
+            "raw artifact references removed"
+        );
+    }
+}
+
+/// [`super::outbound_shape::strip_raw_artifact_urls`] with the count-only log.
+pub(crate) fn strip_logged(envelope: &mut ChannelMessageEnvelope) -> usize {
+    let stripped = super::outbound_shape::strip_raw_artifact_urls(envelope);
+    log_stripped(stripped);
+    stripped
+}
+
+/// The legacy `--bundle` lane: a reply whose flow output names a file gets
+/// [`LEGACY_UNSENT`] on its first envelope. Returns whether it did.
+pub(crate) fn declare_legacy_unsent(
+    payload: &Value,
+    envelopes: &mut [ChannelMessageEnvelope],
+) -> bool {
+    let Some(first) = envelopes.first_mut() else {
+        return false;
+    };
+    if collect(payload).is_empty() {
+        return false;
+    }
+    let text = first.text.as_deref().map(str::trim).unwrap_or_default();
+    first.text = Some(if text.is_empty() {
+        LEGACY_UNSENT.to_string()
+    } else {
+        format!("{text}\n\n{LEGACY_UNSENT}")
+    });
+    true
+}
+
 /// The egress hook: strips raw `artifact://` urls from every reply, then
 /// shapes each reply that carries files (and synthesises one from `ingress`
 /// for a file-only turn). Counts only are logged.
@@ -285,13 +331,7 @@ pub(crate) fn prepare_replies(
     if !orphans.is_empty() {
         shape_one(crate::messaging_app::base_reply_envelope(ingress), orphans);
     }
-    if STRIPPED.record(stripped) {
-        tracing::warn!(
-            stripped,
-            "a reply carried raw artifact references; they were removed before egress \
-             (later occurrences are counted at debug)"
-        );
-    }
+    log_stripped(stripped);
     if linked + refused + stripped > 0 {
         tracing::info!(
             artifacts_linked = linked,
