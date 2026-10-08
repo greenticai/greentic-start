@@ -24,6 +24,9 @@
 //!   Bot Framework endorsement mismatch). Never downgraded, and there is no
 //!   switch to turn the check off once configured.
 
+// Consumed by the Bot Framework verifier (next change); tested on its own.
+#[allow(dead_code)]
+mod bf_keys;
 mod hmac_channels;
 mod notices;
 mod secrets;

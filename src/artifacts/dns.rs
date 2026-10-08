@@ -145,7 +145,8 @@ impl Resolve for PublicOnlyResolver {
 }
 
 /// `builder` resolving every name through [`PublicOnlyResolver`]. Used only by
-/// [`super::client::attachment_client`].
-pub(super) fn with_public_only_resolver(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+/// [`super::client::attachment_client`] and the Bot Framework key fetch
+/// (`crate::inbound_verify`).
+pub(crate) fn with_public_only_resolver(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     builder.dns_resolver(std::sync::Arc::new(PublicOnlyResolver::new()))
 }
