@@ -396,3 +396,27 @@ async fn no_token_appears_in_the_outcome_debug() {
         assert!(!printed.contains(&token[..20]), "{printed}");
     }
 }
+
+/// Review G4 #7: a WELL-FORMED token (valid header, real RS512 signature,
+/// known `kid`) passes `decode_header`, so only the explicit alg check can
+/// stop it before the key lookup. `alg: none` is refused by the decoder
+/// itself and cannot show that.
+#[tokio::test]
+async fn a_well_formed_token_of_another_alg_stops_at_the_alg_check() {
+    let keys = StubKeys::teams();
+    let mut header = Header::new(Algorithm::RS512);
+    header.kid = Some(KID.to_string());
+    let rs512 = jsonwebtoken::encode(
+        &header,
+        &claims(),
+        &EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes()).expect("test key"),
+    )
+    .expect("token");
+    assert!(
+        jsonwebtoken::decode_header(&rs512).is_ok(),
+        "header decodes"
+    );
+    let outcome = run(&rs512, &activity(), &keys).await;
+    assert_eq!(refused(&outcome), Some(RefusalCode::BadToken));
+    assert_eq!(keys.calls.load(Ordering::Relaxed), 0, "reached the key set");
+}

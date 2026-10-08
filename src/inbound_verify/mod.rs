@@ -388,6 +388,9 @@ mod hmac_channels_tests;
 #[path = "mod_tests.rs"]
 mod mod_tests;
 #[cfg(test)]
+#[path = "routing_tests.rs"]
+mod routing_tests;
+#[cfg(test)]
 #[path = "secrets_error_tests.rs"]
 mod secrets_error_tests;
 #[cfg(test)]
