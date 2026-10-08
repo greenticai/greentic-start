@@ -6,7 +6,7 @@
 //! Two guards, both because this path is reachable by an unauthenticated
 //! caller who chooses the cache key:
 //!
-//! - a **refresh floor** per issuer ([`cache`]), so an unknown `kid` and a
+//! - a **refresh floor** per issuer ([`crate::jwks_cache`]), so an unknown `kid` and a
 //!   failing admin each cost at most one outbound request per window rather
 //!   than one per HTTP request;
 //! - **in-flight coalescing**, so N concurrent cold callers issue ONE upstream
@@ -17,8 +17,6 @@
 //! guarded against is accepting a TURN on a signature this process could not
 //! verify.
 
-mod cache;
-
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -28,7 +26,7 @@ use jsonwebtoken::DecodingKey;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
-use cache::{JwksCache, Lookup};
+use crate::jwks_cache::{CachePolicy, JwksCache, Lookup};
 
 /// This fetch sits inside a request the caller is waiting on, so a slow issuer
 /// must become a refusal quickly rather than holding a task open for half a
@@ -55,7 +53,18 @@ struct Jwk {
     kty: Option<String>,
 }
 
-static CACHE: LazyLock<JwksCache> = LazyLock::new(JwksCache::default);
+/// How long a successfully fetched key set is trusted, and how often the
+/// issuer may be asked. Signing keys rotate on the order of months; ten
+/// minutes keeps a rotation propagating promptly while removing the issuer
+/// from the per-request path. Thirty seconds matches
+/// `tenant_brand::cache::NEGATIVE_TTL`, and is the ceiling on how long a
+/// genuine key rotation takes to be picked up.
+const POLICY: CachePolicy = CachePolicy {
+    positive_ttl: Duration::from_secs(600),
+    refresh_floor: Duration::from_secs(30),
+};
+
+static CACHE: LazyLock<JwksCache<Arc<DecodingKey>>> = LazyLock::new(|| JwksCache::new(POLICY));
 
 /// The outbound client, built once.
 ///

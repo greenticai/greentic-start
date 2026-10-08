@@ -27,10 +27,11 @@
 //! loopback peers, so a remote caller cannot impersonate a user/session or pin a
 //! chosen revision (see `caller_identity`).
 //!
-//! Inbound provider webhooks are authenticated by two gates before the body is
-//! trusted: [`crate::provider_auth`] for a shared secret echoed in a header
-//! (Telegram), and [`crate::provider_webhook_verify`] for a signed request
-//! (Slack). Note this path does NOT run the pack's
+//! Inbound provider webhooks are authenticated by three gates before the body
+//! is trusted: [`crate::provider_auth`] for a shared secret echoed in a header
+//! (Telegram), [`crate::provider_webhook_verify`] for a signed request
+//! (Slack), and [`crate::inbound_verify`] for WhatsApp, Webex and Microsoft
+//! Teams. Note this path does NOT run the pack's
 //! `messaging.provider_ingress.v1` component the way the legacy ingress does —
 //! it calls the provider op directly — so nothing a provider component would
 //! have checked on the legacy path is checked here implicitly.
@@ -5670,18 +5671,44 @@ async fn dispatch_provider_route(
         }
     }
 
+    // WhatsApp, Webex and Microsoft Teams: verified by this host
+    // (`crate::inbound_verify`), before the pin and the provider op.
+    match crate::inbound_verify::verify_inbound(
+        crate::inbound_verify::Inbound {
+            provider_type: &provider_type,
+            method,
+            headers: request_headers,
+            body,
+            pack_id: &descriptor_pack_id,
+            unit_id: bundle_id.as_str(),
+            tenant,
+            pack_non_secret: descriptor_pack_non_secret.as_deref(),
+            deployment_id,
+        },
+        &secrets,
+        crate::inbound_verify::secrets_env(),
+    )
+    .await
+    {
+        Ok(verdict) => transport_verified |= verdict == crate::inbound_verify::Verdict::Verified,
+        Err(response) => return Err(response),
+    }
+
     // Second half of the `defer_pin` two-phase write (A1 follow-up): commit the
     // body-derived chat-stickiness pin now that the host gates above have
     // admitted the request (a rejected request returns `Err` above and never
     // pins).
     //
-    // Trust boundary: two gates run before this point, and between them they
-    // cover the shipped signed providers — `provider_auth` for a Telegram
-    // endpoint carrying a `webhook_secret_ref`, and `provider_webhook_verify`
-    // for a provider class that signs its requests (Slack). What still pins
-    // without any verification is a provider class in neither set: a legacy
-    // Telegram endpoint provisioned with no `webhook_secret_ref`, or a class
-    // that carries no transport authentication at all. Those still pin here —
+    // Trust boundary: three gates run before this point, and between them
+    // they cover the shipped signed providers — `provider_auth` for a Telegram
+    // endpoint carrying a `webhook_secret_ref`, `provider_webhook_verify` for a
+    // provider class that signs its requests (Slack), and `inbound_verify` for
+    // WhatsApp, Webex and Teams once their input is configured. What still pins
+    // without any verification is a provider class none of them proved: a
+    // legacy Telegram endpoint provisioned with no `webhook_secret_ref`, an
+    // unconfigured WhatsApp/Webex/Teams channel (or one whose proof was
+    // unavailable), or a class that carries no transport authentication at
+    // all. Those still pin here —
     // unchanged from A1, which pinned them inline during dispatch. Impact stays
     // low: same-bundle version routing only, `try_pin` cannot overwrite an
     // existing pin, and the store caps + TTL bound cardinality.

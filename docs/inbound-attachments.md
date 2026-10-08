@@ -88,7 +88,7 @@ checked from the base64 length before decoding, the bytes are re-sniffed, and
 | extracted text | 200,000 characters per document |
 | PDF | 300 pages; parsed in a separate worker process (section 6) |
 | Direct Line `/upload` body | 16 MiB (other provider routes: 1 MiB) |
-| uploads per client | 10 per minute, one at a time per client, body within 30 s (`429` / `408`) |
+| uploads per client | 10 per minute, one at a time per client, body within 30 s (`429` / `408`). The client is the address (section 6); when it cannot be known (a private peer and no usable trusted `X-Forwarded-For` entry, e.g. k8s behind its router) it is the Direct Line conversation together with the request's token, so users behind one proxy do not share one bucket and a caller without a conversation's token cannot use up its uploads |
 | uploads in flight per process | 4 (`503` beyond, never queued) |
 | door writes per message | 2 in parallel; 3 attempts on `408`, `429`, `502`, `503`, `504` and transport failures (`Retry-After` up to 3 s, else doubling backoff); 20 s timeout per request |
 
@@ -108,8 +108,10 @@ v1 types, decided from the bytes, never from a header or the provider's field
 ## 3. Download safety (SSRF)
 
 - `https` only, no explicit port, no userinfo, no IP literals.
-- Hosts per credential (a credential is only ever sent to its own list):
-  Slack `files.slack.com`; Webex `webexapis.com`; WhatsApp
+- Hosts per credential (a credential is only ever sent to its own list, and
+  every name there is exact except WhatsApp's media CDNs):
+  Slack `files.slack.com`; Webex `webexapis.com`, `api.ciscospark.com`
+  (Cisco's legacy name for the same API); WhatsApp
   `graph.facebook.com`, `lookaside.fbsbx.com`, `*.fbcdn.net`, `*.whatsapp.net`;
   Telegram `api.telegram.org`.
 - Credential-less (`public`) hosts: `*.sharepoint.com` (exactly ONE label:
@@ -121,7 +123,11 @@ v1 types, decided from the bytes, never from a header or the provider's field
   private, link-local, CGNAT and other non-public addresses are refused, so the
   address checked is the address connected to (DNS rebinding included).
 - Redirects are followed by hand, at most 3, each hop re-checked against the
-  same policy; the credential is dropped on any hop off its list. A Telegram
+  same policy; the credential is dropped on any hop off its list. A
+  per-credential redirect-only list (Slack, Webex; EMPTY until measured) may
+  name hosts a credential's own host redirects to: reachable only as such a
+  hop, never as a first request, never with the credential, with every rule
+  above still applying; a wildcard there matches exactly one label. A Telegram
   file URL (token in the path) follows no redirect at all. The WhatsApp media
   URL returned by Graph is checked before the token is attached.
 - No proxy, no content-encoding negotiation or decoding.
@@ -179,14 +185,49 @@ retries included), so a tool waiting on a door that is down gets
 | WebChat (Direct Line upload) | yes (`inline`) | bytes arrive in the request itself; no outbound fetch |
 | Slack | yes | the host verifies the signing secret before any fetch |
 | Telegram | yes, ONLY with a webhook secret (`webhook_secret_ref`) on the endpoint | the host verifies the secret token |
-| WhatsApp | not yet | no host-side `X-Hub-Signature-256` check |
-| Webex | not yet | verification happens inside the provider, invisible to the host |
-| Teams (Bot Framework) | not yet | the JWT is decoded, not validated |
+| WhatsApp | yes, ONLY when the app secret is set | the host verifies `X-Hub-Signature-256` (HMAC-SHA256 of the raw body) with `WHATSAPP_APP_SECRET` |
+| Webex | yes, ONLY when a webhook secret is stored | the host verifies `X-Spark-Signature` (HMAC-SHA1 of the raw body) with the stored `webex_webhook_secret` (the designer stages one per environment) |
+| Teams (Bot Framework) | yes, ONLY when the bot app id is set and the key set is reachable | the host verifies the Bot Framework JWT: RS256, `iss` `https://api.botframework.com`, `aud` = `ms_bot_app_id`, `exp`/`nbf` with 300 s skew, the `serviceUrl` claim, the key's endorsement for the activity's `channelId` |
 | Email, Teams Graph | no | v1 emits no attachments |
 
-A remote reference from a channel the host cannot verify is never resolved; the
-slot gets `fetch_failed` "files from this channel are not supported yet", and
-activation warns once per class. WhatsApp: an envelope naming another business
+Verification runs in `crate::inbound_verify`, before the revision pin and the
+provider op. Per channel, once its input is configured:
+
+| Channel | Input | Read from |
+|---|---|---|
+| WhatsApp | app secret (Meta App Dashboard → App settings → Basic) | secret `WHATSAPP_APP_SECRET`, then `whatsapp_app_secret` (unit scope first, then the pack) |
+| Webex | webhook secret | secret `WEBEX_WEBHOOK_SECRET`, then `webex_webhook_secret` |
+| Teams | bot app id (Entra app id of the Azure Bot) | pack config `ms_bot_app_id`, then `bot_app_id` |
+
+- Configured and the proof fails (bad or missing signature, bad token, wrong
+  `aud`/`iss`, expired, `serviceUrl` mismatch): `401`, or `403` for a missing
+  endorsement, with the fixed body `webhook verification failed`. Nothing is
+  pinned or dispatched. A Webex request is refused exactly where the provider
+  already refused it. There is no switch that turns verification off.
+- Not configured: text flows as before; each file slot gets `fetch_failed`
+  "this channel is not set up to verify its messages", and one warning per
+  deployment and channel names the setting to add. Activation says one
+  pointer line when the environment declares any of the three channels.
+- Teams key set unreachable (`login.botframework.com`), or the channel's
+  secret store failing (any error but "not found"): the request is admitted
+  UNVERIFIED (text flows, files get the same note), warned at most once a
+  minute as "verification is unavailable", never as "not configured". A
+  failed proof is never downgraded to this. An unknown `kid` is a refusal only
+  against a key set read within its TTL; with none held it is unavailable.
+- Teams `serviceUrl`, on EVERY activity (verified or not): the provider
+  replies there with the bot's token, so it must be `https`, with no userinfo
+  and no port, on `smba.trafficmanager.net` or a subdomain of
+  `botframework.com`, or a host listed exactly in
+  `GREENTIC_TEAMS_SERVICE_URL_HOSTS`. Anything else is `403`. Other
+  `*.trafficmanager.net` names are NOT accepted: any Azure customer can create
+  one.
+- An absent secret is remembered for 10 s per channel scope, so a stream of
+  unauthenticated POSTs costs at most one walk of the store per window. A
+  stored secret is read on every request.
+
+A remote reference from a request the host did not verify is never resolved;
+Telegram without a webhook secret gets the same note and one warning per
+activation. WhatsApp: an envelope naming another business
 number than the instance's is dropped; one with no number (absent, empty or
 blank) keeps its message, but each media reference is replaced by a host
 marker and the slot is reported with a neutral `fetch_failed` note ("the file
@@ -199,8 +240,9 @@ slot gets a `door_unavailable` note and inline bytes are cleared.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GREENTIC_TRUSTED_PROXY_HOPS` | `0` | How many proxies in front of this host append to `X-Forwarded-For`. `0` uses the TCP peer and ignores the header. Behind a load balancer set it (usually `1`), or every client shares the balancer's upload limit (10/min, one at a time for everyone). Unparsable = `0` |
+| `GREENTIC_TRUSTED_PROXY_HOPS` | `1` on Cloud Run (`K_SERVICE` set), else `0` | How many proxies in front of this host append to `X-Forwarded-For`; the client is the N-th entry from the right. `0` uses the TCP peer and ignores the header. An explicit value always wins, `0` included; an unparsable value is `0` (warned once), never the platform default; an empty value is unset. Cloud Run's default rests on its front end appending the address it received the connection from (documented behaviour, not yet measured here). Elsewhere behind a load balancer set it (usually `1`). The effective count and its source are logged once. With no usable entry and a non-public peer, uploads are limited per conversation and that is warned once |
 | `GREENTIC_ATTACHMENT_ALLOWED_HOSTS` | empty | Extra credential-less download hosts (section 3) |
+| `GREENTIC_TEAMS_SERVICE_URL_HOSTS` | empty | Extra EXACT hosts a Teams activity's `serviceUrl` may name (comma-separated, https only; a wildcard is dropped). Section 5 |
 | `GREENTIC_PDF_WORKER_SLOTS` | `1` (1..4) | PDF workers at once; also the process-wide text-extraction slots |
 | `GREENTIC_PDF_WORKER_MEM_MB` | `320` (64..1024) | Memory limit of one PDF worker |
 | `GREENTIC_ARTIFACT_LINKS`, `GREENTIC_ARTIFACT_LINK_TTL_SECS`, `GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT`, `GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT_PER_UNIT`, `GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_HOUR`, `GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_LINK_PER_HOUR` | see `docs/outbound-artifacts.md` §6 | Outbound file links (off in code until the WebChat reconnect-token hardening ships) |
@@ -238,10 +280,23 @@ only (`ingress_dispatch::envelope_parse_failure`).
 - The PDF worker is isolated with rlimits, an empty environment, a deadline and
   `PR_SET_PDEATHSIG`, but no seccomp and no Landlock. It is Linux-only: on other
   platforms a PDF is stored with no text.
-- WhatsApp, Webex and Teams inbound files wait on host-side verification.
+- WhatsApp and Webex signatures carry no timestamp, so no replay window can
+  be enforced: a captured request re-delivers the same message and media ids,
+  whose artifacts dedupe by content. Teams relies on `exp`/`nbf` (300 s
+  skew); the protocol has no nonce.
+- A Bot Framework token is not bound to the request body: a captured request
+  can be replayed until `exp` + 300 s (a limit of the protocol, which has no
+  nonce or body hash).
+- One WhatsApp app secret per (tenant, pack, unit): two Meta apps feeding one
+  pack cannot both be verified; the second app's requests are refused.
+- Teams: public cloud only (`https://api.botframework.com`); no US Government
+  (`api.botframework.us`) and no Bot Framework Emulator issuer. A key-set
+  outage admits Teams text unverified, with files withheld.
 - Slack and Webex files served from other CDN hosts (Slack `files-edge`,
   `files-origin`; Webex regional hosts) are refused as `fetch_failed` until the
-  lists are widened from measured provider fixtures.
+  redirect-only lists are filled from measured traces (providers
+  `crates/provider-tests/tests/fixtures/cdn-measurements/`, `NOT MEASURED`
+  today).
 - The WhatsApp instance number is pack-level; several WhatsApp endpoints on
   different numbers in one unit are not supported.
 - A flow node (`component.exec`) cannot create an artifact; only agent tools
@@ -283,13 +338,20 @@ Release order: admin (artifacts door live) → ext-runtime → runner (drops its
 own ext-runtime patch) → this crate → providers' WebChat repin in the designer
 registry (only after this host is live). Cross-repo work this needs:
 
-- providers: the Teams allow-list narrowed to ONE `*.sharepoint.com` label, in
-  step with `PUBLIC_HOSTS` here; the WebChat upload emitting one of the two
+- providers: the Teams `downloadUrl` check (`messaging-teams`
+  `is_teams_download_host`) still accepts ANY depth under `.sharepoint.com`,
+  while `PUBLIC_HOSTS` here accepts exactly ONE label (`tenant.sharepoint.com`).
+  A deeper name passes the provider and is refused here as `fetch_failed`, so
+  the provider must narrow to one label in step with this list (the two are
+  meant to change together); the WebChat upload emitting one of the two
   `inline` shapes;
 - measured Slack/Webex CDN hosts before widening the credential lists;
-- deploy lanes set `GREENTIC_TRUSTED_PROXY_HOPS` (Cloud Run, k8s, ALB);
+- deploy lanes set `GREENTIC_TRUSTED_PROXY_HOPS` where a proxy appends to
+  `X-Forwarded-For` (k8s with an appending ingress, ALB); Cloud Run needs
+  nothing (one hop by default);
 - greentic-designer: the start pin in `Dockerfile.tools` moves; re-affirm
   `agent_tool_reach::DEPLOYED_RUNTIME_CALLS_A2A`, `RUNTIME_SERVES_TRIGGERS` and
   the playbook verdict there, per its CLAUDE.md;
-- greentic-runner: `HttpArtifactReader` builds its client with `no_proxy()`
-  since runner `190c1fa3`; the release pinned here must carry it.
+- greentic-runner: the artifact door clients ignore the proxy environment
+  since runner `190c1fa3` (`HttpArtifactReader` and the extension port both
+  call `no_proxy()`); the pin must carry that commit.

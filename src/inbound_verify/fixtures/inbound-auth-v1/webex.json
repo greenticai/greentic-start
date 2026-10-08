@@ -1,0 +1,10 @@
+{
+  "scheme": "webex-x-spark-signature",
+  "secret": "test-secret-not-real",
+  "header_name": "x-spark-signature",
+  "header": "98f995c19e510652f78d42221f0b539274ef8469",
+  "algorithm": "HMAC-SHA1",
+  "encoding": "lowercase hex, no prefix",
+  "body_base64": "eyJpZCI6IlkybHpZMjl6Y0dGeWF6b3ZMM1Z6TDFkRlFraFBUMHN2ZEdWemRDMTNaV0pvYjI5ciIsIm5hbWUiOiJHcmVlbnRpYyBcdTIwMTMgbWVzc2FnZXMiLCJ0YXJnZXRVcmwiOiJodHRwczovL2V4YW1wbGUudGVzdC92MS9tZXNzYWdpbmcvaW5ncmVzcy9tZXNzYWdpbmctd2ViZXgvZGVmYXVsdC9kZWZhdWx0IiwicmVzb3VyY2UiOiJtZXNzYWdlcyIsImV2ZW50IjoiY3JlYXRlZCIsIm9yZ0lkIjoiWTJselkyOXpjR0Z5YXpvdkwzVnpMMDlTUjBGT1NWcEJWRWxQVGk5MFpYTjBMVzl5WnciLCJjcmVhdGVkQnkiOiJZMmx6WTI5emNHRnlhem92TDNWekwxQkZUMUJNUlM5MFpYTjBMV0p2ZEEiLCJhcHBJZCI6IlkybHpZMjl6Y0dGeWF6b3ZMM1Z6TDBGUVVFeEpRMEZVU1U5T0wzUmxjM1F0WVhCdyIsIm93bmVkQnkiOiJjcmVhdG9yIiwic3RhdHVzIjoiYWN0aXZlIiwiY3JlYXRlZCI6IjIwMjYtMTAtMDhUMDA6MDA6MDAuMDAwWiIsImFjdG9ySWQiOiJZMmx6WTI5emNHRnlhem92TDNWekwxQkZUMUJNUlM5MFpYTjBMWFZ6WlhJIiwiZGF0YSI6eyJpZCI6IlkybHpZMjl6Y0dGeWF6b3ZMM1Z6TDAxRlUxTkJSMFV2ZEdWemRDMXRaWE56WVdkbCIsInJvb21JZCI6IlkybHpZMjl6Y0dGeWF6b3ZMM1Z6TDFKUFQwMHZkR1Z6ZEMxeWIyOXQiLCJyb29tVHlwZSI6ImRpcmVjdCIsInBlcnNvbklkIjoiWTJselkyOXpjR0Z5YXpvdkwzVnpMMUJGVDFCTVJTOTBaWE4wTFhWelpYSSIsInBlcnNvbkVtYWlsIjoidGVzdC51c2VyQGV4YW1wbGUudGVzdCIsImZpbGVzIjpbImh0dHBzOi8vd2ViZXhhcGlzLmNvbS92MS9jb250ZW50cy9ZMmx6WTI5emNHRnlhem92TDNWekwwTlBUbFJGVGxRdmRHVnpkQzFtYVd4bEx6QSJdLCJjcmVhdGVkIjoiMjAyNi0xMC0wOFQwMDowMDowMC4wMDBaIn19",
+  "source": "Synthetic Webex messages:created webhook with one file. Header = `openssl dgst -sha1 -hmac test-secret-not-real -r` over the raw body bytes (the secret is 20 characters, the length the pack generates). The body keeps one \\u escape, so a re-serialised body differs from these bytes."
+}

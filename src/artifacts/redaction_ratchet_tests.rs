@@ -46,6 +46,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../http_ingress/limits.rs"),
     ),
     (
+        "http_ingress/client_key.rs",
+        include_str!("../http_ingress/client_key.rs"),
+    ),
+    (
         "http_ingress/admin_relay.rs",
         include_str!("../http_ingress/admin_relay.rs"),
     ),
@@ -79,9 +83,11 @@ const FILES: &[(&str, &str)] = &[
     ),
     ("artifacts/label.rs", include_str!("label.rs")),
     ("artifacts/legacy.rs", include_str!("legacy.rs")),
+    ("artifacts/limits.rs", include_str!("limits.rs")),
     ("artifacts/link.rs", include_str!("link.rs")),
     ("artifacts/link_base.rs", include_str!("link_base.rs")),
     ("artifacts/link_table.rs", include_str!("link_table.rs")),
+    ("artifacts/mod.rs", include_str!("mod.rs")),
     ("artifacts/off.rs", include_str!("off.rs")),
     ("artifacts/origin.rs", include_str!("origin.rs")),
     ("artifacts/outbound.rs", include_str!("outbound.rs")),
@@ -93,6 +99,7 @@ const FILES: &[(&str, &str)] = &[
         "artifacts/pdf_isolation.rs",
         include_str!("pdf_isolation.rs"),
     ),
+    ("artifacts/pdf_limits.rs", include_str!("pdf_limits.rs")),
     ("artifacts/port.rs", include_str!("port.rs")),
     ("artifacts/provenance.rs", include_str!("provenance.rs")),
     ("artifacts/quota_key.rs", include_str!("quota_key.rs")),
@@ -104,10 +111,43 @@ const FILES: &[(&str, &str)] = &[
         "artifacts/serve_link_limits.rs",
         include_str!("serve_link_limits.rs"),
     ),
+    ("artifacts/sniff.rs", include_str!("sniff.rs")),
     ("artifacts/store.rs", include_str!("store.rs")),
     ("artifacts/unit.rs", include_str!("unit.rs")),
     ("artifacts/unserved.rs", include_str!("unserved.rs")),
     ("artifacts/wire.rs", include_str!("wire.rs")),
+    (
+        "inbound_verify/absent_memo.rs",
+        include_str!("../inbound_verify/absent_memo.rs"),
+    ),
+    (
+        "inbound_verify/bf_keys.rs",
+        include_str!("../inbound_verify/bf_keys.rs"),
+    ),
+    (
+        "inbound_verify/bot_framework.rs",
+        include_str!("../inbound_verify/bot_framework.rs"),
+    ),
+    (
+        "inbound_verify/hmac_channels.rs",
+        include_str!("../inbound_verify/hmac_channels.rs"),
+    ),
+    (
+        "inbound_verify/mod.rs",
+        include_str!("../inbound_verify/mod.rs"),
+    ),
+    (
+        "inbound_verify/notices.rs",
+        include_str!("../inbound_verify/notices.rs"),
+    ),
+    (
+        "inbound_verify/secrets.rs",
+        include_str!("../inbound_verify/secrets.rs"),
+    ),
+    (
+        "inbound_verify/service_url.rs",
+        include_str!("../inbound_verify/service_url.rs"),
+    ),
 ];
 
 /// Values that carry message content, file bytes, access URLs or raw HTTP.
@@ -131,6 +171,15 @@ const PAYLOAD_NAMES: &[&str] = &[
     "input_json",
     "request",
     "req",
+    // Inbound verification: secrets, tokens and the raw request headers.
+    "token",
+    "secret",
+    "expose",
+    "headers",
+    "request_headers",
+    "authorization",
+    "signature",
+    "claims",
 ];
 
 const LOG_CALLS: &[&str] = &[
@@ -366,5 +415,52 @@ fn the_link_ratchet_recognises_each_forbidden_shape() {
             link_offences("t.rs", fine).is_empty(),
             "false positive: {fine}"
         );
+    }
+}
+
+/// Test-only files (stubs, fixtures) on the inbound path need no listing.
+fn is_test_only(name: &str) -> bool {
+    name.ends_with("_tests.rs") || name.ends_with("testkit.rs") || name == "pdf_fixture.rs"
+}
+
+/// A new source file in `src/artifacts/` or `src/inbound_verify/` is on the
+/// inbound path by construction, so it must be in [`FILES`]: a file the
+/// ratchet does not read is a file it cannot protect.
+#[test]
+fn every_inbound_source_file_is_read_by_the_ratchet() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut missing = Vec::new();
+    for dir in ["artifacts", "inbound_verify"] {
+        for entry in std::fs::read_dir(root.join(dir)).expect("source dir") {
+            let name = entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string();
+            if !name.ends_with(".rs") || is_test_only(&name) {
+                continue;
+            }
+            let listed = format!("{dir}/{name}");
+            if !FILES.iter().any(|(file, _)| *file == listed) {
+                missing.push(listed);
+            }
+        }
+    }
+    assert!(missing.is_empty(), "not read by the ratchet: {missing:?}");
+}
+
+/// The secret-bearing names verification handles are refused like payloads.
+#[test]
+fn verification_values_are_payload_names() {
+    for name in ["token", "secret", "expose", "headers", "body"] {
+        assert!(PAYLOAD_NAMES.contains(&name), "{name}");
+    }
+    for bad in [
+        r#"tracing::debug!(?token, "bf");"#,
+        r#"operator_log::warn(module_path!(), format!("s {secret:?}"));"#,
+        r#"operator_log::debug(module_path!(), format!("h {:?}", headers));"#,
+        r#"tracing::info!(v = ?expose, "x");"#,
+    ] {
+        assert!(!offences("t.rs", bad).is_empty(), "not caught: {bad}");
     }
 }

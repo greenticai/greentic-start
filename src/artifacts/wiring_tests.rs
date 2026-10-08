@@ -22,7 +22,7 @@ fn at(needle: &str) -> usize {
 
 #[test]
 fn the_hook_runs_after_verification_and_the_approval_intercept() {
-    let verified = at("transport_verified |=");
+    let verified = at("crate::inbound_verify::verify_inbound(");
     let intercept = at("crate::approval_rail::intercept_inbound(");
     let spawn = at("run_provider_inbound_pipeline(\n                    pipeline_activation,");
     assert!(verified < intercept && intercept < spawn);

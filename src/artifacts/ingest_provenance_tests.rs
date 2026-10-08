@@ -207,14 +207,15 @@ async fn an_unverified_request_resolves_no_remote_reference_but_keeps_inline_byt
     );
     assert!(env.attachments[0].url.is_none());
     assert_eq!(note(&env, 0)["code"], "fetch_failed");
-    // A neutral sentence: the agent relays it to the user, and "could not be
-    // verified" reads like an attack.
+    // Names what is missing (the channel's verification set-up) without
+    // claiming the user did anything wrong or that a request was forged.
     let message = note(&env, 0)["message"].as_str().unwrap().to_string();
     assert!(
-        message.contains("files from this channel are not supported yet"),
+        message.ends_with("not read, this channel is not set up to verify its messages"),
         "{message}"
     );
-    assert!(!message.contains("verif"), "{message}");
+    assert!(!message.contains("not supported"), "{message}");
+    assert!(!message.contains("could not be verified"), "{message}");
     // The request's own bytes need no outbound fetch: they are stored.
     assert_eq!(env.attachments[1].url.as_deref(), Some("artifact://id1"));
 }

@@ -1,0 +1,10 @@
+{
+  "scheme": "whatsapp-x-hub-signature-256",
+  "secret": "test-secret-not-real",
+  "header_name": "x-hub-signature-256",
+  "header": "sha256=3767ac0571872b3cfa9711753cb3959e43a2a113eedb07a4165425bd6e044e7f",
+  "algorithm": "HMAC-SHA256",
+  "encoding": "lowercase hex, prefix sha256=",
+  "body_base64": "eyJvYmplY3QiOiJ3aGF0c2FwcF9idXNpbmVzc19hY2NvdW50IiwiZW50cnkiOlt7ImlkIjoiMTAyMjkwMTI5MzQwMzk4IiwiY2hhbmdlcyI6W3sidmFsdWUiOnsibWVzc2FnaW5nX3Byb2R1Y3QiOiJ3aGF0c2FwcCIsIm1ldGFkYXRhIjp7ImRpc3BsYXlfcGhvbmVfbnVtYmVyIjoiMTU1NTA3ODM4ODEiLCJwaG9uZV9udW1iZXJfaWQiOiIxMDY1NDAzNTIyNDI5MjIifSwiY29udGFjdHMiOlt7InByb2ZpbGUiOnsibmFtZSI6IlRlc3QgVXNlciJ9LCJ3YV9pZCI6IjE2NTA1NTUxMjM0In1dLCJtZXNzYWdlcyI6W3siZnJvbSI6IjE2NTA1NTUxMjM0IiwiaWQiOiJ3YW1pZC5IQmdMTVRZMU1EVTFOVEV5TXpRVkFnQVNHQlF6UVVGRlFqQkdSakZHUmpWQk56azBRekUzUkFBPSIsInRpbWVzdGFtcCI6IjE3OTE0MTc2MDAiLCJ0eXBlIjoiaW1hZ2UiLCJpbWFnZSI6eyJjYXB0aW9uIjoiQ2FmXHUwMGU5IG1lbnUiLCJtaW1lX3R5cGUiOiJpbWFnZVwvanBlZyIsInNoYTI1NiI6IlZITFdWNnZGUGhnSHFCQUFqSTJcLzJFQ3ZDSGZKdmQrdFVzcEtcL1BoWjB5VT0iLCJpZCI6IjEwMDMzODM0MjEzODcyNTYifX1dfSwiZmllbGQiOiJtZXNzYWdlcyJ9XX1dfQ==",
+  "source": "Synthetic WhatsApp Cloud API webhook (image message). Header = 'sha256=' + `openssl dgst -sha256 -hmac test-secret-not-real -r` over the raw body bytes. The body keeps Meta-style \\u and \\/ escapes, so a re-serialised body differs from these bytes."
+}

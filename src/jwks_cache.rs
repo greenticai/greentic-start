@@ -1,5 +1,11 @@
-//! Per-issuer signing keys, with a TTL on what is trusted and a FLOOR on how
-//! often the issuer may be asked.
+//! Per-issuer (per key-space) signing keys, with a TTL on what is trusted and
+//! a FLOOR on how often the issuer may be asked.
+//!
+//! Shared by the MCP resource server ([`crate::interop::mcp::jwks`], keys are
+//! `Arc<DecodingKey>`) and the Bot Framework verifier
+//! ([`crate::inbound_verify`], keys carry their channel endorsements), so the
+//! two cannot drift on the floor/TTL rules. The cached value is generic and
+//! the two durations are a [`CachePolicy`] chosen by each caller.
 //!
 //! The floor is the load-bearing part and it is not the TTL. Reaching a
 //! lookup needs only a JWT *header* — `decode_header` runs before any
@@ -12,11 +18,11 @@
 //! So there are two clocks per issuer, and they are deliberately separate:
 //!
 //! - `keys_fetched_at` — when the key set was last REPLACED by a successful
-//!   fetch. [`POSITIVE_TTL`] measures from here, and a failed refresh does not
+//!   fetch. The policy's `positive_ttl` measures from here, and a failed refresh does not
 //!   touch it, so an admin blip cannot destroy a working key set and 503 every
 //!   legitimate caller for the length of the floor.
 //! - `last_attempt_at` — when a fetch was last ATTEMPTED, successful or not.
-//!   [`REFRESH_FLOOR`] measures from here, so a failing admin is asked at most
+//!   The policy's `refresh_floor` measures from here, so a failing admin is asked at most
 //!   once per floor rather than once per request.
 //!
 //! `now` is a parameter rather than read inside, so both windows are testable
@@ -24,11 +30,11 @@
 //!
 //! ## The map is unbounded in issuers, and that is deliberate
 //!
-//! [`MAX_KEYS`] bounds the keys WITHIN one issuer, because `kid` is
+//! Each caller bounds the keys WITHIN one issuer (`MAX_KEYS`), because `kid` is
 //! attacker-chosen. Issuer count is not bounded, because the issuer is not: it
-//! is derived from `AppState::admin_endpoint`, a plain field fixed at boot
-//! (not an `ArcSwap` like `state.admin`, and assigned nowhere outside tests),
-//! so one process can only ever hold ONE entry here.
+//! is fixed by the caller — the MCP issuer is derived from a value fixed at
+//! boot, and the Bot Framework key space is one constant metadata URL — so
+//! one process holds at most one entry per caller here.
 //!
 //! An eight-entry LRU used to guard this in the designer. It could not fire in
 //! production, and in its test binary it evicted entries belonging to tests
@@ -36,75 +42,85 @@
 //! space the product cannot express bought nothing.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use jsonwebtoken::DecodingKey;
 
-/// How long a successfully fetched key set is trusted. Signing keys rotate on
-/// the order of months; ten minutes keeps a rotation propagating promptly
-/// while removing the issuer from the per-request path.
-pub(super) const POSITIVE_TTL: Duration = Duration::from_secs(600);
-
-/// Minimum interval between outbound JWKS fetches for ONE issuer, whatever the
-/// previous attempt's outcome.
-///
-/// This is what bounds an unknown-`kid` flood and a retry storm against a
-/// degraded admin to one request per issuer per window. Thirty seconds matches
-/// `tenant_brand::cache::NEGATIVE_TTL`, and is the ceiling on how long a
-/// genuine key rotation takes to be picked up — which is why it is thirty
-/// seconds and not the ten-minute positive TTL.
-pub(super) const REFRESH_FLOOR: Duration = Duration::from_secs(30);
+/// The two clocks a caller chooses.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CachePolicy {
+    /// How long a successfully fetched key set is trusted.
+    pub positive_ttl: Duration,
+    /// Minimum interval between outbound fetches for ONE key space, whatever
+    /// the previous attempt's outcome.
+    ///
+    /// This is what bounds an unknown-`kid` flood and a retry storm against a
+    /// degraded issuer to one request per window, and it is the ceiling on how
+    /// long a genuine key rotation takes to be picked up.
+    pub refresh_floor: Duration,
+}
 
 /// What a lookup decided. Three outcomes, because collapsing `Refuse` into
 /// `Fetch` is exactly the bug this module exists to prevent: both mean "no key
 /// for you", but only one of them may talk to the issuer.
-pub(super) enum Lookup {
+pub(crate) enum Lookup<V> {
     /// A trusted key for this `kid`.
-    Hit(Arc<DecodingKey>),
+    Hit(V),
     /// No key, and the caller must NOT fetch — the issuer was asked recently.
     Refuse,
     /// No key, and the caller should fetch.
     Fetch,
 }
 
-struct Entry {
-    keys: HashMap<String, Arc<DecodingKey>>,
+struct Entry<V> {
+    keys: HashMap<String, V>,
     /// `None` when every attempt so far has failed, so nothing is trusted.
     keys_fetched_at: Option<Instant>,
     last_attempt_at: Instant,
 }
 
-#[derive(Default)]
-pub(super) struct JwksCache {
-    entries: DashMap<String, Entry>,
+pub(crate) struct JwksCache<V: Clone> {
+    policy: CachePolicy,
+    entries: DashMap<String, Entry<V>>,
 }
 
-impl JwksCache {
-    pub(super) fn lookup(&self, issuer: &str, kid: &str, now: Instant) -> Lookup {
+impl<V: Clone> JwksCache<V> {
+    pub(crate) fn new(policy: CachePolicy) -> Self {
+        Self {
+            policy,
+            entries: DashMap::new(),
+        }
+    }
+
+    pub(crate) fn lookup(&self, issuer: &str, kid: &str, now: Instant) -> Lookup<V> {
         let Some(entry) = self.entries.get(issuer) else {
             return Lookup::Fetch;
         };
         if let Some(fetched_at) = entry.keys_fetched_at
-            && now.duration_since(fetched_at) < POSITIVE_TTL
+            && now.duration_since(fetched_at) < self.policy.positive_ttl
             && let Some(key) = entry.keys.get(kid)
         {
-            return Lookup::Hit(Arc::clone(key));
+            return Lookup::Hit(key.clone());
         }
-        if now.duration_since(entry.last_attempt_at) < REFRESH_FLOOR {
+        if now.duration_since(entry.last_attempt_at) < self.policy.refresh_floor {
             return Lookup::Refuse;
         }
         Lookup::Fetch
     }
 
+    /// Whether a key set read successfully within the positive TTL is held
+    /// for `issuer`. A miss against such a set PROVES the `kid` is not the
+    /// issuer's; a miss with none proves nothing (the issuer may be down).
+    pub(crate) fn has_trusted_keys(&self, issuer: &str, now: Instant) -> bool {
+        self.entries.get(issuer).is_some_and(|entry| {
+            entry
+                .keys_fetched_at
+                .is_some_and(|at| now.duration_since(at) < self.policy.positive_ttl)
+        })
+    }
+
     /// Record a successful fetch, replacing whatever was held.
-    pub(super) fn store_keys(
-        &self,
-        issuer: &str,
-        keys: HashMap<String, Arc<DecodingKey>>,
-        now: Instant,
-    ) {
+    pub(crate) fn store_keys(&self, issuer: &str, keys: HashMap<String, V>, now: Instant) {
         self.entries.insert(
             issuer.to_string(),
             Entry {
@@ -121,7 +137,7 @@ impl JwksCache {
     /// transient admin failure is not evidence that the keys it served a
     /// minute ago went bad — clearing them here would turn one blip into a
     /// window in which every legitimate token is refused.
-    pub(super) fn store_failed_attempt(&self, issuer: &str, now: Instant) {
+    pub(crate) fn store_failed_attempt(&self, issuer: &str, now: Instant) {
         if let Some(mut entry) = self.entries.get_mut(issuer) {
             entry.last_attempt_at = now;
             return;
@@ -146,12 +162,12 @@ impl JwksCache {
     /// theoretical race — it is an intermittent red whose frequency rises with
     /// every new test that sets up an issuer.
     #[cfg(test)]
-    pub(super) fn clear_issuer(&self, issuer: &str) {
+    pub(crate) fn clear_issuer(&self, issuer: &str) {
         self.entries.remove(issuer);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 }
@@ -159,6 +175,18 @@ impl JwksCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::DecodingKey;
+    use std::sync::Arc;
+
+    /// The MCP policy, which these tests were written against.
+    const MCP: CachePolicy = CachePolicy {
+        positive_ttl: Duration::from_secs(600),
+        refresh_floor: Duration::from_secs(30),
+    };
+
+    fn mcp_cache() -> JwksCache<Arc<DecodingKey>> {
+        JwksCache::new(MCP)
+    }
 
     fn key() -> Arc<DecodingKey> {
         Arc::new(
@@ -174,28 +202,28 @@ mod tests {
         HashMap::from([(kid.to_string(), key())])
     }
 
-    fn is_hit(lookup: Lookup) -> bool {
+    fn is_hit<V>(lookup: Lookup<V>) -> bool {
         matches!(lookup, Lookup::Hit(_))
     }
 
-    fn is_refuse(lookup: Lookup) -> bool {
+    fn is_refuse<V>(lookup: Lookup<V>) -> bool {
         matches!(lookup, Lookup::Refuse)
     }
 
-    fn is_fetch(lookup: Lookup) -> bool {
+    fn is_fetch<V>(lookup: Lookup<V>) -> bool {
         matches!(lookup, Lookup::Fetch)
     }
 
     #[test]
     fn an_unseen_issuer_is_a_fetch() {
-        let cache = JwksCache::default();
+        let cache = mcp_cache();
         assert!(is_fetch(cache.lookup("iss", "k1", Instant::now())));
     }
 
     #[test]
     fn a_known_kid_inside_the_positive_ttl_is_a_hit() {
         let now = Instant::now();
-        let cache = JwksCache::default();
+        let cache = mcp_cache();
         cache.store_keys("iss", keyset("k1"), now);
         assert!(is_hit(cache.lookup(
             "iss",
@@ -209,7 +237,7 @@ mod tests {
     #[test]
     fn an_unknown_kid_inside_the_floor_refuses_without_fetching() {
         let now = Instant::now();
-        let cache = JwksCache::default();
+        let cache = mcp_cache();
         cache.store_keys("iss", keyset("k1"), now);
         assert!(is_refuse(cache.lookup(
             "iss",
@@ -224,7 +252,7 @@ mod tests {
     #[test]
     fn an_unknown_kid_past_the_floor_fetches_again() {
         let now = Instant::now();
-        let cache = JwksCache::default();
+        let cache = mcp_cache();
         cache.store_keys("iss", keyset("k1"), now);
         assert!(is_fetch(cache.lookup(
             "iss",
@@ -236,7 +264,7 @@ mod tests {
     #[test]
     fn a_known_kid_past_the_positive_ttl_is_refetched() {
         let now = Instant::now();
-        let cache = JwksCache::default();
+        let cache = mcp_cache();
         cache.store_keys("iss", keyset("k1"), now);
         assert!(is_fetch(cache.lookup(
             "iss",
@@ -249,7 +277,7 @@ mod tests {
     #[test]
     fn a_failed_attempt_holds_the_floor_against_a_retry_storm() {
         let now = Instant::now();
-        let cache = JwksCache::default();
+        let cache = mcp_cache();
         cache.store_failed_attempt("iss", now);
         assert!(is_refuse(cache.lookup(
             "iss",
@@ -268,7 +296,7 @@ mod tests {
     #[test]
     fn a_failed_attempt_does_not_discard_a_working_key_set() {
         let now = Instant::now();
-        let cache = JwksCache::default();
+        let cache = mcp_cache();
         cache.store_keys("iss", keyset("k1"), now);
         cache.store_failed_attempt("iss", now + Duration::from_secs(60));
         assert!(is_hit(cache.lookup(
@@ -292,7 +320,7 @@ mod tests {
     #[test]
     fn a_second_issuer_does_not_displace_the_first() {
         let now = Instant::now();
-        let cache = JwksCache::default();
+        let cache = mcp_cache();
         for i in 0..32 {
             cache.store_keys(&format!("iss-{i}"), keyset("k1"), now);
         }
@@ -302,5 +330,27 @@ mod tests {
             "the FIRST issuer stored must still be present — eviction was by \
              `last_attempt_at`, so this is the entry a cap would have dropped"
         );
+    }
+
+    /// A longer policy (Bot Framework keeps keys for hours) trusts a key set
+    /// past the MCP window while keeping the same floor.
+    #[test]
+    fn a_longer_policy_keeps_keys_past_the_mcp_window() {
+        let now = Instant::now();
+        let cache = JwksCache::new(CachePolicy {
+            positive_ttl: Duration::from_secs(12 * 3600),
+            refresh_floor: Duration::from_secs(30),
+        });
+        cache.store_keys("iss", keyset("k1"), now);
+        assert!(is_hit(cache.lookup(
+            "iss",
+            "k1",
+            now + Duration::from_secs(601)
+        )));
+        assert!(is_refuse(cache.lookup(
+            "iss",
+            "other",
+            now + Duration::from_secs(29)
+        )));
     }
 }

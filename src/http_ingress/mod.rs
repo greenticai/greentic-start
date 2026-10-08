@@ -1,5 +1,10 @@
 mod admin_relay;
+mod client_key;
+#[cfg(test)]
+mod client_key_tests;
 mod conv_dedup;
+#[cfg(test)]
+mod conversation_key_tests;
 mod directline_session;
 mod flow_owner;
 mod helpers;

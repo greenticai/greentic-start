@@ -11,15 +11,22 @@ pub(crate) const EXTRA_HOSTS_ENV: &str = "GREENTIC_ATTACHMENT_ALLOWED_HOSTS";
 
 /// Hosts that need no credential (pre-authenticated download links). A
 /// wildcard here matches exactly ONE label: `tenant.sharepoint.com`, never
-/// `a.b.sharepoint.com`. The providers' Teams list must change with this one.
+/// `a.b.sharepoint.com`. The providers' Teams list must change with this one;
+/// today it still accepts any depth under `.sharepoint.com`, so a deeper name
+/// passes the provider and is refused here (`docs/inbound-attachments.md`
+/// section 10).
 pub(crate) const PUBLIC_HOSTS: &[&str] = &["*.sharepoint.com", "smba.trafficmanager.net"];
 
-/// Credential name → the only hosts it may be sent to. A wildcard here matches
-/// any depth of subdomain (WhatsApp media CDNs serve from
-/// `scontent.xx.fbcdn.net`), never the apex.
+/// Credential name → the only hosts it may be sent to. A host joins a list
+/// only as an EXACT vendor-owned name measured (or shown by the provider's
+/// own code) to serve that credential's files; never a wildcard. WhatsApp's
+/// media CDNs are the one exception: a wildcard there matches any depth of
+/// subdomain (Meta serves from `scontent.xx.fbcdn.net`), never the apex.
+/// `api.ciscospark.com` is Cisco's legacy name for the same Webex API the bot
+/// token is for; the Webex provider recognises content links on it.
 const CREDENTIAL_HOSTS: &[(&str, &[&str])] = &[
     ("SLACK_BOT_TOKEN", &["files.slack.com"]),
-    ("WEBEX_BOT_TOKEN", &["webexapis.com"]),
+    ("WEBEX_BOT_TOKEN", &["webexapis.com", "api.ciscospark.com"]),
     (
         "WHATSAPP_TOKEN",
         &[
@@ -31,6 +38,17 @@ const CREDENTIAL_HOSTS: &[(&str, &[&str])] = &[
     ),
     ("TELEGRAM_BOT_TOKEN", &["api.telegram.org"]),
 ];
+
+/// Credential name → hosts its OWN host may redirect to, reached WITHOUT the
+/// credential (the `Authorization` header is never sent there). Only as hop
+/// 2..3, only from a URL on that credential's list, and never as a first
+/// request. A host joins only from a MEASURED redirect trace of that
+/// credential's own downloads (providers
+/// `crates/provider-tests/tests/fixtures/cdn-measurements/`, cited per
+/// entry); a wildcard matches exactly ONE label under a vendor-owned
+/// registrable domain (`*.wbx2.com`, never `*.com`). Empty until measured.
+const REDIRECT_ONLY_HOSTS: &[(&str, &[&str])] =
+    &[("SLACK_BOT_TOKEN", &[]), ("WEBEX_BOT_TOKEN", &[])];
 
 /// Credentials carried IN the download URL (Telegram puts the bot token in the
 /// path), so a redirect would replay them to wherever it points: never follow
@@ -65,6 +83,9 @@ pub(crate) struct HostPolicy {
     loopback: bool,
     #[cfg(test)]
     named: Option<NamedRules>,
+    /// Test-only replacement for [`REDIRECT_ONLY_HOSTS`].
+    #[cfg(test)]
+    redirect_only: Option<Vec<(String, Vec<String>)>>,
 }
 
 /// Test-only host lists for stub servers reached by NAME (`a.test:port`) over
@@ -95,7 +116,26 @@ impl HostPolicy {
             loopback: false,
             #[cfg(test)]
             named: None,
+            #[cfg(test)]
+            redirect_only: None,
         }
+    }
+
+    /// This policy with `table` in place of [`REDIRECT_ONLY_HOSTS`].
+    #[cfg(test)]
+    pub(crate) fn with_redirect_only_for_tests(mut self, table: &[(&str, &[&str])]) -> Self {
+        self.redirect_only = Some(
+            table
+                .iter()
+                .map(|(name, hosts)| {
+                    (
+                        name.to_string(),
+                        hosts.iter().map(|h| h.to_string()).collect(),
+                    )
+                })
+                .collect(),
+        );
+        self
     }
 
     /// Test policy over named stub hosts: exact names only, http and any port
@@ -117,6 +157,7 @@ impl HostPolicy {
                     .collect(),
                 public: public.iter().map(|h| h.to_string()).collect(),
             }),
+            redirect_only: None,
         }
     }
 
@@ -128,6 +169,7 @@ impl HostPolicy {
             extra: Vec::new(),
             loopback: true,
             named: None,
+            redirect_only: None,
         }
     }
 
@@ -213,12 +255,75 @@ impl HostPolicy {
                 credential: Some(name),
             });
         }
+        if let Some(name) = credential
+            && self.check(from, Some(name)).is_ok()
+            && self.redirect_only_allows(name, &url)?
+        {
+            return Ok(Hop {
+                url,
+                credential: None,
+            });
+        }
         self.check(&url, None)?;
         Ok(Hop {
             url,
             credential: None,
         })
     }
+
+    /// `name`'s redirect-only patterns: the test table when one was set,
+    /// else [`REDIRECT_ONLY_HOSTS`].
+    fn redirect_only_patterns(&self, name: &str) -> Vec<&str> {
+        #[cfg(test)]
+        if let Some(table) = &self.redirect_only {
+            return table
+                .iter()
+                .filter(|(n, _)| n == name)
+                .flat_map(|(_, hosts)| hosts.iter().map(String::as_str))
+                .collect();
+        }
+        REDIRECT_ONLY_HOSTS
+            .iter()
+            .filter(|(n, _)| *n == name)
+            .flat_map(|(_, hosts)| hosts.iter().copied())
+            .collect()
+    }
+
+    /// Whether `url` is on `name`'s redirect-only list. A URL that breaks a
+    /// shape rule (scheme, userinfo, port, IP literal) is refused with that
+    /// rule whatever the list says.
+    fn redirect_only_allows(&self, name: &str, url: &Url) -> Result<bool, Blocked> {
+        let patterns = self.redirect_only_patterns(name);
+        if patterns.is_empty() {
+            return Ok(false);
+        }
+        if url.scheme() != "https" {
+            return Err(Blocked::NotHttps);
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(Blocked::UserInfo);
+        }
+        if url.port().is_some() {
+            return Err(Blocked::Port);
+        }
+        let Some(domain) = url.domain() else {
+            return Err(Blocked::IpLiteral);
+        };
+        let host = domain.to_ascii_lowercase();
+        Ok(patterns.iter().any(|p| host_matches(p, &host, true)))
+    }
+}
+
+/// The credential → hosts table, for the list ratchets.
+#[cfg(test)]
+pub(crate) fn credential_host_table() -> &'static [(&'static str, &'static [&'static str])] {
+    CREDENTIAL_HOSTS
+}
+
+/// The production [`REDIRECT_ONLY_HOSTS`], for the list ratchets.
+#[cfg(test)]
+pub(crate) fn redirect_only_table() -> &'static [(&'static str, &'static [&'static str])] {
+    REDIRECT_ONLY_HOSTS
 }
 
 fn credential_hosts(name: &str) -> Option<&'static [&'static str]> {
