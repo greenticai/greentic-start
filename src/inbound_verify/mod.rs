@@ -29,6 +29,7 @@ mod bot_framework;
 mod hmac_channels;
 mod notices;
 mod secrets;
+mod service_url;
 
 use std::collections::BTreeMap;
 
@@ -81,6 +82,8 @@ pub(crate) enum RefusalCode {
     BadToken,
     TokenClaims,
     Endorsement,
+    /// A Teams `serviceUrl` outside the Bot Framework hosts (`service_url`).
+    ServiceUrl,
 }
 
 impl RefusalCode {
@@ -92,6 +95,7 @@ impl RefusalCode {
         RefusalCode::BadToken,
         RefusalCode::TokenClaims,
         RefusalCode::Endorsement,
+        RefusalCode::ServiceUrl,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -102,14 +106,16 @@ impl RefusalCode {
             RefusalCode::BadToken => "bad_token",
             RefusalCode::TokenClaims => "token_claims",
             RefusalCode::Endorsement => "endorsement",
+            RefusalCode::ServiceUrl => "service_url",
         }
     }
 
-    /// `403` only for a Bot Framework endorsement mismatch (the channel is
-    /// authenticated but not endorsed for this key), per the BF contract.
+    /// `403` for a Bot Framework endorsement mismatch (the channel is
+    /// authenticated but not endorsed for this key, per the BF contract) and
+    /// for a `serviceUrl` this host will not let the bot token reach.
     fn status(self) -> StatusCode {
         match self {
-            RefusalCode::Endorsement => StatusCode::FORBIDDEN,
+            RefusalCode::Endorsement | RefusalCode::ServiceUrl => StatusCode::FORBIDDEN,
             _ => StatusCode::UNAUTHORIZED,
         }
     }
@@ -134,6 +140,9 @@ pub(crate) struct Deps<'a> {
     pub bf_keys: Option<&'a dyn bot_framework::BfKeys>,
     /// Unix seconds, for the token clock checks.
     pub now: u64,
+    /// Exact extra hosts a Teams `serviceUrl` may name
+    /// (`service_url::EXTRA_HOSTS_ENV`).
+    pub teams_service_hosts: &'a [String],
 }
 
 /// Verify one inbound request. `Err` is the refusal response, with fixed text.
@@ -151,6 +160,7 @@ pub(crate) async fn verify_inbound(
             bf_keys: bf_keys::BfKeySource::production()
                 .map(|source| source as &dyn bot_framework::BfKeys),
             now: unix_now(),
+            teams_service_hosts: service_url::extra_hosts(),
         },
     )
     .await
@@ -286,7 +296,7 @@ fn hmac_outcome(outcome: hmac_channels::HmacOutcome) -> Outcome {
 
 async fn teams(inbound: &Inbound<'_>, deps: &Deps<'_>) -> Outcome {
     let app_id = bot_framework::configured_app_id(inbound.pack_non_secret);
-    match bot_framework::check(
+    let outcome = match bot_framework::check(
         app_id.as_deref(),
         inbound.headers,
         inbound.body,
@@ -295,11 +305,19 @@ async fn teams(inbound: &Inbound<'_>, deps: &Deps<'_>) -> Outcome {
     )
     .await
     {
+        bot_framework::BfOutcome::Refused(code) => return Outcome::Refused(code),
         bot_framework::BfOutcome::Verified => Outcome::Verified,
         bot_framework::BfOutcome::NotConfigured => Outcome::NotConfigured,
         bot_framework::BfOutcome::Unavailable => Outcome::Unavailable,
-        bot_framework::BfOutcome::Refused(code) => Outcome::Refused(code),
+    };
+    // Verified or not, the provider replies to `serviceUrl` with the bot's
+    // token: never let an activity name a host outside Bot Framework.
+    if service_url::classify(inbound.body, deps.teams_service_hosts)
+        == service_url::ServiceUrl::Refused
+    {
+        return Outcome::Refused(RefusalCode::ServiceUrl);
     }
+    outcome
 }
 
 fn unix_now() -> u64 {
@@ -321,6 +339,9 @@ mod mod_tests;
 #[cfg(test)]
 #[path = "secrets_tests.rs"]
 mod secrets_tests;
+#[cfg(test)]
+#[path = "service_url_tests.rs"]
+mod service_url_tests;
 #[cfg(test)]
 #[path = "wiring_tests.rs"]
 mod wiring_tests;

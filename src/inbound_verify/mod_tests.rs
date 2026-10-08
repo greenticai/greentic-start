@@ -61,6 +61,7 @@ pub(super) fn deps<'a>(secrets: &'a DynSecretsManager, notices: &'a Notices) -> 
         notices,
         bf_keys: None,
         now: 0,
+        teams_service_hosts: &[],
     }
 }
 
@@ -151,7 +152,7 @@ async fn refusal_bodies_never_name_the_condition() {
         for forbidden in ["secret", "app id", "jwks", "kid", "signature mismatch"] {
             assert!(!text.contains(forbidden), "{code:?}: {text}");
         }
-        let expected = if *code == RefusalCode::Endorsement {
+        let expected = if matches!(*code, RefusalCode::Endorsement | RefusalCode::ServiceUrl) {
             hyper::StatusCode::FORBIDDEN
         } else {
             hyper::StatusCode::UNAUTHORIZED
