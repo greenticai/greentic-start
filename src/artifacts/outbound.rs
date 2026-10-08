@@ -122,7 +122,8 @@ impl Undeliverable {
 }
 
 /// A file ready to send: the door's own type and size, the port's name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` never prints the link.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct OutboundFile {
     pub name: String,
     pub mime_type: String,
@@ -131,6 +132,18 @@ pub(crate) struct OutboundFile {
     pub url: String,
 }
 
+impl std::fmt::Debug for OutboundFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutboundFile")
+            .field("name", &self.name)
+            .field("mime_type", &self.mime_type)
+            .field("size_bytes", &self.size_bytes)
+            .field("url", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Its `Debug` prints each file through [`OutboundFile`]'s redacting one.
 #[derive(Debug, Default)]
 pub(crate) struct Resolved {
     pub files: Vec<OutboundFile>,

@@ -10,14 +10,15 @@
 //!   when the reply carries a card (which hides or replaces the text).
 //!
 //! A refused file becomes its fixed sentence. A file name reaches the text
-//! only through [`safe_name`], so it cannot inject markup.
+//! and the WebChat attachment only through [`safe_name`], so it cannot inject
+//! markup.
 
 use greentic_types::messaging::extensions::ext_keys;
 use greentic_types::{Attachment, ChannelMessageEnvelope};
 use serde_json::{Value, json};
 
 use super::outbound::{OutboundFile, Resolved};
-use super::provenance::is_artifact_url;
+use super::provenance::{is_artifact_url, is_invisible_format};
 
 const NAME_CHARS_MAX: usize = 80;
 
@@ -85,7 +86,9 @@ fn notes(resolved: &Resolved) -> Option<String> {
 }
 
 /// Removes every `artifact://` url from the outgoing attachments and the raw
-/// DirectLine `attachments` array. Returns how many were removed.
+/// DirectLine `attachments` array, and every raw id from the text, the
+/// metadata (the card's JSON string included) and the extensions (the card's
+/// JSON included). Returns how many were removed.
 pub(crate) fn strip_raw_artifact_urls(envelope: &mut ChannelMessageEnvelope) -> usize {
     let before = envelope.attachments.len();
     envelope
@@ -106,7 +109,85 @@ pub(crate) fn strip_raw_artifact_urls(envelope: &mut ChannelMessageEnvelope) -> 
         });
         removed += before - raw.len();
     }
+    if let Some(text) = envelope.text.as_mut() {
+        removed += scrub_string(text);
+    }
+    for value in envelope.metadata.values_mut() {
+        removed += scrub_string(value);
+    }
+    for value in envelope.extensions.values_mut() {
+        removed += scrub_value(value);
+    }
     removed
+}
+
+/// Ends a raw id inside text.
+fn ends_token(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '\\'
+        )
+}
+
+/// Where `artifact:` (any case, invisible format characters allowed between
+/// its letters) starting at `start` ends, if it is there.
+fn scheme_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut i = start;
+    for (n, want) in "artifact:".chars().enumerate() {
+        if n > 0 {
+            while chars.get(i).is_some_and(|c| is_invisible_format(*c)) {
+                i += 1;
+            }
+        }
+        if !chars.get(i)?.eq_ignore_ascii_case(&want) {
+            return None;
+        }
+        i += 1;
+    }
+    Some(i)
+}
+
+/// `text` with every raw id (`artifact:` directly followed by a token)
+/// removed, and how many were. Prose such as "artifact: x" is kept.
+fn scrub_text(text: &str) -> (String, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut count = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some(end) = scheme_end(&chars, i)
+            && chars.get(end).is_some_and(|c| !ends_token(*c))
+        {
+            let mut j = end;
+            while chars.get(j).is_some_and(|c| !ends_token(*c)) {
+                j += 1;
+            }
+            count += 1;
+            i = j;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    (out, count)
+}
+
+fn scrub_string(text: &mut String) -> usize {
+    let (scrubbed, count) = scrub_text(text);
+    if count > 0 {
+        *text = scrubbed;
+    }
+    count
+}
+
+fn scrub_value(value: &mut Value) -> usize {
+    match value {
+        Value::String(text) => scrub_string(text),
+        Value::Array(items) => items.iter_mut().map(scrub_value).sum(),
+        Value::Object(map) => map.values_mut().map(scrub_value).sum(),
+        _ => 0,
+    }
 }
 
 fn webchat(mut envelope: ChannelMessageEnvelope, resolved: &Resolved) -> ChannelMessageEnvelope {
@@ -115,7 +196,7 @@ fn webchat(mut envelope: ChannelMessageEnvelope, resolved: &Resolved) -> Channel
             mime_type: file.mime_type.clone(),
             url: Some(file.url.clone()),
             content: None,
-            name: Some(file.name.clone()),
+            name: Some(safe_name(&file.name)),
             size_bytes: Some(file.size_bytes),
         });
     }
@@ -124,7 +205,7 @@ fn webchat(mut envelope: ChannelMessageEnvelope, resolved: &Resolved) -> Channel
             raw.push(json!({
                 "contentType": file.mime_type,
                 "contentUrl": file.url,
-                "name": file.name,
+                "name": safe_name(&file.name),
             }));
         }
     }

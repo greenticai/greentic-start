@@ -46,13 +46,25 @@ user opens  GET /v1/artifacts/<deployment>/<artifact hex>/<exp>/<mac>
   itself a full `ChannelMessageEnvelope` (a flow emitting one) names nothing.
 - **Provenance gate:** a link is minted only for an id THIS deployment's
   extension port stored within the link TTL. Every revision of a deployment (a
-  traffic split) writes into the deployment's one record. Any other id
-  (another conversation's upload, an id a flow invented) gets "A file could not
-  be sent." The file's name, type and size come from that record (the door's
+  traffic split) writes into the deployment's one record. The record is per
+  DEPLOYMENT, not per conversation: an id the unit created in one conversation
+  can be linked again from another conversation of the same unit within the
+  TTL (24 h by default) if a reply names it. That is accepted because a user
+  never sees an id, and the id (64 hex, SHA-256 of the tenant id and the file's
+  content hash) can only be derived by someone who already holds the tenant id
+  AND the exact file. Any other id (an inbound upload, an id a flow invented)
+  gets "A file could not be sent." The file's name, type and size come from that record (the door's
   answer at put time), never from the tool's claim.
 - **Raw ids never leave:** every `artifact://` url in an outgoing envelope's
   `attachments` and in the raw DirectLine `attachments` array is removed before
-  egress (no provider validates an outbound url). Count-only log.
+  egress (no provider validates an outbound url), and so is every raw id in the
+  text, the metadata (the card's JSON string included) and the extensions (the
+  card's JSON included): `artifact:` in any case, with invisible characters
+  between its letters, directly followed by a token. Prose such as
+  "artifact: x" is left alone. Count-only log.
+- **File names:** a name reaches the text, the WebChat typed attachment and
+  the raw DirectLine entry only after cleaning (`[A-Za-z0-9 ._-]`, at most 80
+  characters).
 
 ## 2. The link
 
