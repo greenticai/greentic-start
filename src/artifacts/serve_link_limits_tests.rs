@@ -79,21 +79,30 @@ async fn a_units_hourly_egress_budget_is_enforced() {
     assert_eq!(next.status, StatusCode::OK);
 }
 
+/// The door has no HEAD: a HEAD reads the whole file, so it is charged like
+/// a GET. Past the budget a valid link is 429; a bad MAC is still the 404.
 #[tokio::test]
-async fn a_head_request_spends_no_egress() {
+async fn a_head_request_spends_egress_like_a_get() {
     let f = fixture(StubReader::file("image/png", None, &[7u8; 100]));
-    let limits = LinkLimits::new(2, 150);
+    let limits = LinkLimits::new(2, 250);
     let path = f.link().to_path();
-    for _ in 0..5 {
+    for _ in 0..3 {
         assert_eq!(
             f.request(Method::HEAD, &path, &limits).await.status,
             StatusCode::OK
         );
     }
+    let answer = f.request(Method::HEAD, &path, &limits).await;
+    assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
         f.request(Method::GET, &path, &limits).await.status,
-        StatusCode::OK
+        StatusCode::TOO_MANY_REQUESTS
     );
+    let mut forged = f.link();
+    forged.mac_hex = "0".repeat(32);
+    let answer = f.request(Method::HEAD, &forged.to_path(), &limits).await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND);
+    assert_eq!(answer.body.as_ref(), NOT_FOUND_BODY);
 }
 
 #[tokio::test]

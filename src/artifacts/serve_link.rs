@@ -144,13 +144,13 @@ pub(crate) async fn serve_link(
             return refusal(StatusCode::SERVICE_UNAVAILABLE, DOOR_BODY, "5");
         }
     };
+    // Every method is charged: the door has no HEAD, so a HEAD reads (and
+    // buffers) the whole file exactly like a GET.
+    limits.egress_add(&unit.deployment, req.now, file.bytes.len() as u64);
     let Some(disposition) = disposition(&file.mime_type, file.name.as_deref()) else {
         return not_found();
     };
     let head = req.method == Method::HEAD;
-    if !head {
-        limits.egress_add(&unit.deployment, req.now, file.bytes.len() as u64);
-    }
     tracing::debug!(deployment = %unit.deployment, outcome = "served", "artifact link");
     let length = file.bytes.len();
     let body = if head {

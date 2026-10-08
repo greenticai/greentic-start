@@ -108,8 +108,8 @@ file name is cleaned (control, bidi and invisible characters removed, `"` and
 `\` replaced, at most 120 bytes, `file` when empty).
 
 `HEAD` answers the same headers with no body. The admin door has no HEAD, so a
-`HEAD` still reads the file from the door (it is not counted against the
-egress budget).
+`HEAD` still reads the whole file from the door, and those bytes are charged to
+the egress budgets exactly like a `GET`.
 
 **Limits (fixed text, none an oracle):**
 
