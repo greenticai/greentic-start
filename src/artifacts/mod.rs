@@ -125,6 +125,8 @@ mod redaction_ratchet_tests;
 #[cfg(test)]
 mod redaction_tests;
 #[cfg(test)]
+mod round_trip_tests;
+#[cfg(test)]
 mod secrets_tests;
 #[cfg(test)]
 mod serve_link_limits_tests;
