@@ -67,6 +67,7 @@ mod ingress_dispatch;
 #[doc(hidden)]
 pub mod ingress_types;
 mod interop;
+mod jwks_cache;
 mod llm;
 #[doc(hidden)]
 pub mod messaging_app;
