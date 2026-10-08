@@ -27,6 +27,7 @@ pub(crate) mod pdf_limits;
 pub(crate) mod port;
 pub(crate) mod provenance;
 pub(crate) mod quota_key;
+pub(crate) mod recent_puts;
 pub(crate) mod recovery;
 pub(crate) mod secrets;
 pub(crate) mod sniff;
@@ -95,6 +96,8 @@ mod port_tests;
 mod proxy_testkit;
 #[cfg(test)]
 mod quota_key_tests;
+#[cfg(test)]
+mod recent_puts_tests;
 #[cfg(test)]
 mod recovery_tests;
 #[cfg(test)]

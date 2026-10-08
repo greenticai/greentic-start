@@ -23,6 +23,7 @@ use greentic_ext_runtime::host_ports::{
     ArtifactPort, ArtifactPortError, ArtifactPutRequest, HostCallContext,
 };
 
+use super::recent_puts::{PutRecord, RecentPuts};
 use super::store::{ArtifactStore, PutRequest, StoreError, is_artifact_id};
 use super::unit::{Off, UnitAttachments, UnitCell};
 use crate::operator_log;
@@ -45,6 +46,9 @@ pub(crate) struct DoorArtifactPort {
     /// replaces it after the port was installed; from then on the port says
     /// `unsupported` without asking the door (and without a warning per call).
     unit: Option<Weak<UnitCell>>,
+    /// Where accepted puts are recorded, so outbound shaping links only the
+    /// files this unit's extensions created (`recent_puts`).
+    recent: Option<Arc<RecentPuts>>,
     budget: std::time::Duration,
 }
 
@@ -59,6 +63,7 @@ impl DoorArtifactPort {
         Self {
             store,
             unit: None,
+            recent: None,
             budget: PORT_BUDGET,
         }
     }
@@ -72,6 +77,12 @@ impl DoorArtifactPort {
     /// Reads `cell` on every call (see [`Self::unit`]).
     pub(crate) fn gated_by(mut self, cell: &Arc<UnitCell>) -> Self {
         self.unit = Some(Arc::downgrade(cell));
+        self
+    }
+
+    /// Records every put the door accepts into `recent`.
+    pub(crate) fn with_recent(mut self, recent: Arc<RecentPuts>) -> Self {
+        self.recent = Some(recent);
         self
     }
 
@@ -139,8 +150,26 @@ impl ArtifactPort for DoorArtifactPort {
         if !is_artifact_id(&stored.id) {
             return Err(unavailable("the artifacts door answered an invalid id"));
         }
+        if let Some(recent) = &self.recent {
+            // The door's answer (sniffed type, size), never the caller's claim.
+            recent.record(
+                &stored.id,
+                PutRecord {
+                    mime_type: stored.mime_type.clone(),
+                    name,
+                    size_bytes: stored.size_bytes,
+                    at: unix_now(),
+                },
+            );
+        }
         Ok(stored.id)
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Fixed sentences only: a token, URL or door body never reaches the guest.

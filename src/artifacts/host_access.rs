@@ -12,6 +12,7 @@ use greentic_ext_runtime::host_ports::ArtifactPort;
 
 use super::boot::Door;
 use super::port::DoorArtifactPort;
+use super::recent_puts::RecentPuts;
 use super::store::ArtifactStore;
 use super::unit::UnitCell;
 
@@ -21,6 +22,8 @@ pub(crate) struct HostArtifactAccess {
     door: Door,
     /// The unit's live decision, read by the port on every call.
     unit: Option<Weak<UnitCell>>,
+    /// What this unit's port created; shared by every clone of this access.
+    recent: Arc<RecentPuts>,
 }
 
 impl std::fmt::Debug for HostArtifactAccess {
@@ -40,6 +43,7 @@ impl HostArtifactAccess {
             store,
             door,
             unit: None,
+            recent: Arc::new(RecentPuts::default()),
         }
     }
 
@@ -54,11 +58,18 @@ impl HostArtifactAccess {
     /// a file an extension creates lands in the same tenant as the files the
     /// unit received.
     pub(crate) fn port(&self) -> Arc<dyn ArtifactPort> {
-        let port = DoorArtifactPort::new(Arc::clone(&self.store));
+        let port =
+            DoorArtifactPort::new(Arc::clone(&self.store)).with_recent(Arc::clone(&self.recent));
         match self.unit.as_ref().and_then(Weak::upgrade) {
             Some(cell) => Arc::new(port.gated_by(&cell)),
             None => Arc::new(port),
         }
+    }
+
+    /// The record of what this unit's port created (outbound link provenance).
+    #[cfg_attr(not(test), allow(dead_code))] // read by the link table (next task)
+    pub(crate) fn recent_puts(&self) -> Arc<RecentPuts> {
+        Arc::clone(&self.recent)
     }
 
     /// The agent's reader. Fallible: an unusable token is an error, never a
