@@ -61,6 +61,7 @@ pub(super) fn deps<'a>(secrets: &'a DynSecretsManager, notices: &'a Notices) -> 
         notices,
         bf_keys: None,
         now: 0,
+        instant: std::time::Instant::now(),
         teams_service_hosts: &[],
         absent_memo: Box::leak(Box::default()),
     }

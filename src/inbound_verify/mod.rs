@@ -154,6 +154,9 @@ pub(crate) struct Deps<'a> {
     pub bf_keys: Option<&'a dyn bot_framework::BfKeys>,
     /// Unix seconds, for the token clock checks.
     pub now: u64,
+    /// The monotonic clock, for windows that must not follow wall-clock
+    /// steps (`absent_memo`).
+    pub instant: std::time::Instant,
     /// Exact extra hosts a Teams `serviceUrl` may name
     /// (`service_url::EXTRA_HOSTS_ENV`).
     pub teams_service_hosts: &'a [String],
@@ -176,6 +179,7 @@ pub(crate) async fn verify_inbound(
             bf_keys: bf_keys::BfKeySource::production()
                 .map(|source| source as &dyn bot_framework::BfKeys),
             now: unix_now(),
+            instant: std::time::Instant::now(),
             teams_service_hosts: service_url::extra_hosts(),
             absent_memo: absent_memo::AbsentMemo::production(),
         },
@@ -306,7 +310,7 @@ async fn channel_secret(
         inbound.unit_id,
         names,
     );
-    if deps.absent_memo.recently_absent(&memo_key, deps.now) {
+    if deps.absent_memo.recently_absent(&memo_key, deps.instant) {
         return Ok(None);
     }
     match secrets::read_channel_secret(
@@ -321,7 +325,7 @@ async fn channel_secret(
     {
         secrets::SecretRead::Found(secret) => Ok(Some(secret)),
         secrets::SecretRead::Absent => {
-            deps.absent_memo.record(memo_key, deps.now);
+            deps.absent_memo.record(memo_key, deps.instant);
             Ok(None)
         }
         secrets::SecretRead::Unavailable => Err(Unavailable::SecretStore),

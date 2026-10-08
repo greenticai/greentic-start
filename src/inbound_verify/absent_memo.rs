@@ -3,19 +3,24 @@
 //! eight reads: two names, two spellings, two scopes). Only ABSENT is
 //! remembered: a found secret is read on every request (a rotation takes
 //! effect at once), and a store failure is never remembered either.
+//!
+//! The window runs on the MONOTONIC clock, so a wall-clock step (NTP) can
+//! neither freeze "absent" nor expire it early.
+
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
-/// How long "absent" is believed, in seconds. An operator who adds the secret
-/// sees it take effect within this window.
-pub(crate) const ABSENT_TTL_SECS: u64 = 10;
+/// How long "absent" is believed. An operator who adds the secret sees it
+/// take effect within this window.
+pub(crate) const ABSENT_TTL: Duration = Duration::from_secs(10);
 /// Remembered scopes at most; past it the memory is cleared.
 pub(crate) const MAX_ENTRIES: usize = 4_096;
 
 #[derive(Default)]
 pub(crate) struct AbsentMemo {
-    /// Scope key → unix seconds when absence was observed.
-    seen: DashMap<String, u64>,
+    /// Scope key → when absence was observed.
+    seen: DashMap<String, Instant>,
 }
 
 impl AbsentMemo {
@@ -39,14 +44,14 @@ impl AbsentMemo {
         )
     }
 
-    /// Whether absence was observed for `key` within [`ABSENT_TTL_SECS`].
-    pub(crate) fn recently_absent(&self, key: &str, now: u64) -> bool {
+    /// Whether absence was observed for `key` within [`ABSENT_TTL`].
+    pub(crate) fn recently_absent(&self, key: &str, now: Instant) -> bool {
         self.seen
             .get(key)
-            .is_some_and(|at| now.saturating_sub(*at) < ABSENT_TTL_SECS)
+            .is_some_and(|at| now.saturating_duration_since(*at) < ABSENT_TTL)
     }
 
-    pub(crate) fn record(&self, key: String, now: u64) {
+    pub(crate) fn record(&self, key: String, now: Instant) {
         if self.seen.len() >= MAX_ENTRIES {
             self.seen.clear();
         }

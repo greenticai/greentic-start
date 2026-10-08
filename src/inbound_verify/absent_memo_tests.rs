@@ -2,11 +2,12 @@
 //! time when the channel simply has no secret: "absent" is remembered briefly.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use greentic_deploy_spec::DeploymentId;
 use greentic_secrets_lib::{SecretError, SecretsManager};
 
-use super::absent_memo::{ABSENT_TTL_SECS, AbsentMemo};
+use super::absent_memo::{ABSENT_TTL, AbsentMemo};
 use super::mod_tests::inbound;
 use super::notices::Notices;
 use super::{Deps, Verdict, verify_with};
@@ -37,7 +38,18 @@ impl SecretsManager for Counting {
 
 /// The verdict, or `None` when the request was refused (a configured
 /// channel and no signature).
-async fn post_at(store: &Arc<Counting>, memo: &AbsentMemo, now: u64) -> Option<Verdict> {
+async fn post_at(store: &Arc<Counting>, memo: &AbsentMemo, at: Instant) -> Option<Verdict> {
+    post_at_clocks(store, memo, 1_000, at).await
+}
+
+/// With the wall clock (`now`, token checks) and the monotonic clock (`at`,
+/// the memo) set separately.
+async fn post_at_clocks(
+    store: &Arc<Counting>,
+    memo: &AbsentMemo,
+    now: u64,
+    at: Instant,
+) -> Option<Verdict> {
     let manager: DynSecretsManager = store.clone();
     let (notices, _) = Notices::recording();
     let deps = Deps {
@@ -46,6 +58,7 @@ async fn post_at(store: &Arc<Counting>, memo: &AbsentMemo, now: u64) -> Option<V
         notices: &notices,
         bf_keys: None,
         now,
+        instant: at,
         teams_service_hosts: &[],
         absent_memo: memo,
     };
@@ -74,14 +87,15 @@ async fn an_absent_secret_is_remembered_for_a_few_seconds() {
         value: Mutex::new(None),
     });
     let memo = AbsentMemo::default();
+    let t0 = Instant::now();
     assert_eq!(
-        post_at(&store, &memo, 1_000).await,
+        post_at(&store, &memo, t0).await,
         Some(Verdict::NotConfigured)
     );
     let first = reads(&store);
     assert!(first > 0);
     assert_eq!(
-        post_at(&store, &memo, 1_000 + ABSENT_TTL_SECS - 1).await,
+        post_at(&store, &memo, t0 + ABSENT_TTL - Duration::from_millis(1)).await,
         Some(Verdict::NotConfigured)
     );
     assert_eq!(
@@ -89,7 +103,7 @@ async fn an_absent_secret_is_remembered_for_a_few_seconds() {
         first,
         "the store was read again inside the window"
     );
-    post_at(&store, &memo, 1_000 + ABSENT_TTL_SECS).await;
+    post_at(&store, &memo, t0 + ABSENT_TTL).await;
     assert!(reads(&store) > first, "never re-read after the window");
 }
 
@@ -100,13 +114,17 @@ async fn a_found_secret_is_never_remembered() {
         value: Mutex::new(Some("app-secret".into())),
     });
     let memo = AbsentMemo::default();
+    let t0 = Instant::now();
     assert_eq!(
-        post_at(&store, &memo, 1_000).await,
+        post_at(&store, &memo, t0).await,
         None,
         "refused: no signature"
     );
     let first = reads(&store);
-    assert_eq!(post_at(&store, &memo, 1_001).await, None);
+    assert_eq!(
+        post_at(&store, &memo, t0 + Duration::from_secs(1)).await,
+        None
+    );
     assert_eq!(
         reads(&store),
         2 * first,
@@ -116,14 +134,35 @@ async fn a_found_secret_is_never_remembered() {
 
 #[test]
 fn the_window_is_between_five_and_ten_seconds() {
-    assert!((5..=10).contains(&ABSENT_TTL_SECS));
+    assert!((5..=10).contains(&ABSENT_TTL.as_secs()));
 }
 
 #[test]
 fn the_memo_is_bounded() {
     let memo = AbsentMemo::default();
     for i in 0..(super::absent_memo::MAX_ENTRIES + 10) {
-        memo.record(format!("k{i}"), 1);
+        memo.record(format!("k{i}"), Instant::now());
     }
     assert!(memo.len() <= super::absent_memo::MAX_ENTRIES);
+}
+
+/// Re-review G4 M6: the memo runs on the MONOTONIC clock. A wall clock that
+/// steps backwards (NTP) must not make "absent" stick past its window, and one
+/// that steps forwards must not expire it early.
+#[tokio::test]
+async fn the_window_ignores_wall_clock_steps() {
+    let store = Arc::new(Counting {
+        reads: Mutex::new(0),
+        value: Mutex::new(None),
+    });
+    let memo = AbsentMemo::default();
+    let t0 = Instant::now();
+    post_at_clocks(&store, &memo, 1_000, t0).await;
+    let first = reads(&store);
+    // Wall clock jumped forward an hour, monotonic barely moved: still absent.
+    post_at_clocks(&store, &memo, 4_600, t0 + Duration::from_secs(1)).await;
+    assert_eq!(reads(&store), first, "a forward wall step expired the memo");
+    // Wall clock stepped back, monotonic past the window: re-read.
+    post_at_clocks(&store, &memo, 900, t0 + ABSENT_TTL).await;
+    assert!(reads(&store) > first, "a backward wall step froze the memo");
 }
