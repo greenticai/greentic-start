@@ -95,6 +95,8 @@ mod link_table_tests;
 #[cfg(test)]
 mod link_tests;
 #[cfg(test)]
+mod links_e2e_tests;
+#[cfg(test)]
 mod origin_tests;
 #[cfg(test)]
 mod outbound_legacy_tests;
