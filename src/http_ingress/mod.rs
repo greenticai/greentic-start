@@ -1,4 +1,5 @@
 mod admin_relay;
+mod client_key;
 mod conv_dedup;
 mod directline_session;
 mod flow_owner;
