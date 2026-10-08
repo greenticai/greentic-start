@@ -94,6 +94,11 @@ const FILES: &[(&str, &str)] = &[
     ("artifacts/recent_puts.rs", include_str!("recent_puts.rs")),
     ("artifacts/recovery.rs", include_str!("recovery.rs")),
     ("artifacts/secrets.rs", include_str!("secrets.rs")),
+    ("artifacts/serve_link.rs", include_str!("serve_link.rs")),
+    (
+        "artifacts/serve_link_limits.rs",
+        include_str!("serve_link_limits.rs"),
+    ),
     ("artifacts/store.rs", include_str!("store.rs")),
     ("artifacts/unit.rs", include_str!("unit.rs")),
     ("artifacts/unserved.rs", include_str!("unserved.rs")),
@@ -264,5 +269,92 @@ fn the_ratchet_recognises_each_forbidden_shape() {
         r#"tracing::warn!(?reason, "x");"#,
     ] {
         assert!(offences("t.rs", fine).is_empty(), "false positive: {fine}");
+    }
+}
+
+/// The outbound link files: a log call there may not carry the request path,
+/// the link, its MAC, a URL, the token or the artifact id, in any form.
+const LINK_FILES: &[(&str, &str)] = &[
+    ("artifacts/link.rs", include_str!("link.rs")),
+    ("artifacts/link_base.rs", include_str!("link_base.rs")),
+    ("artifacts/link_table.rs", include_str!("link_table.rs")),
+    ("artifacts/serve_link.rs", include_str!("serve_link.rs")),
+];
+
+const LINK_SECRET_NAMES: &[&str] = &[
+    "path",
+    "link",
+    "mac",
+    "mac_hex",
+    "url",
+    "token",
+    "artifact_id",
+    "artifact_hex",
+    "key",
+];
+
+fn link_offences(file: &str, source: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for marker in LOG_CALLS {
+        for (start, _) in source.match_indices(marker) {
+            let call = call_text(source, start);
+            let line = source[..start].lines().count() + 1;
+            let args = trailing_args(call);
+            for name in LINK_SECRET_NAMES {
+                let shapes = [
+                    format!("{{{name}}}"),
+                    format!("{{{name}:?}}"),
+                    format!("%{name}"),
+                    format!("?{name}"),
+                    format!("{name}.to_path()"),
+                ];
+                let in_shape = shapes.iter().any(|shape| {
+                    call.match_indices(shape.as_str()).any(|(i, _)| {
+                        let after = call[i + shape.len()..].chars().next();
+                        shape.ends_with('}') || shape.ends_with(')') || !after.is_some_and(is_ident)
+                    })
+                });
+                if in_shape || args.iter().any(|arg| arg == name) {
+                    found.push(format!("{file}:{line}: logs `{name}`"));
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn no_log_line_on_the_link_path_carries_a_link_or_a_secret() {
+    let found: Vec<String> = LINK_FILES
+        .iter()
+        .flat_map(|(file, source)| link_offences(file, source))
+        .collect();
+    assert!(
+        found.is_empty(),
+        "ids, counts and codes only:\n{}",
+        found.join("\n")
+    );
+}
+
+#[test]
+fn the_link_ratchet_recognises_each_forbidden_shape() {
+    for bad in [
+        r#"tracing::debug!(%path, "x");"#,
+        r#"tracing::debug!(link = ?link, "x");"#,
+        r#"operator_log::warn(module_path!(), format!("bad {mac_hex}"));"#,
+        r#"operator_log::warn(module_path!(), format!("bad {}", url));"#,
+        r#"tracing::warn!("{}", link.to_path());"#,
+        r#"tracing::info!(id = %artifact_id, "x");"#,
+    ] {
+        assert!(!link_offences("t.rs", bad).is_empty(), "not caught: {bad}");
+    }
+    for fine in [
+        r#"tracing::debug!(deployment = %unit.deployment, outcome = "served", "artifact link");"#,
+        r#"tracing::warn!(deployment = %deployment, code, "refused");"#,
+    ] {
+        assert!(
+            link_offences("t.rs", fine).is_empty(),
+            "false positive: {fine}"
+        );
     }
 }

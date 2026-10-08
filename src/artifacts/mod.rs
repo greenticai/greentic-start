@@ -32,6 +32,8 @@ pub(crate) mod quota_key;
 pub(crate) mod recent_puts;
 pub(crate) mod recovery;
 pub(crate) mod secrets;
+pub(crate) mod serve_link;
+pub(crate) mod serve_link_limits;
 pub(crate) mod sniff;
 pub(crate) mod store;
 pub(crate) mod unit;
@@ -112,6 +114,8 @@ mod redaction_ratchet_tests;
 mod redaction_tests;
 #[cfg(test)]
 mod secrets_tests;
+#[cfg(test)]
+mod serve_link_tests;
 #[cfg(test)]
 mod sniff_tests;
 #[cfg(test)]

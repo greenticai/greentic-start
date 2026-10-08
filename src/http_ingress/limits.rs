@@ -100,7 +100,7 @@ impl ClientKey {
 
 /// `GREENTIC_TRUSTED_PROXY_HOPS`, read once. Absent or unreadable is 0: the
 /// header is not trusted.
-fn trusted_proxy_hops() -> usize {
+pub(crate) fn trusted_proxy_hops() -> usize {
     static HOPS: OnceLock<usize> = OnceLock::new();
     *HOPS.get_or_init(|| {
         std::env::var(TRUSTED_PROXY_HOPS_ENV)

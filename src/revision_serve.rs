@@ -1243,6 +1243,7 @@ fn interop_request_path<'a>(activation: &Activation, host: Option<&str>, path: &
 /// string.
 fn path_allows_cors(path: &str, interop_path: &str) -> bool {
     path != "/workers/invoke"
+        && !crate::artifacts::serve_link::is_link_path(path)
         && !crate::interop::a2a::is_cors_excluded(interop_path)
         && !crate::interop::mcp::is_cors_excluded(interop_path)
 }
@@ -1364,6 +1365,15 @@ async fn serve(
             }
             return handle_update_notify(req, Arc::clone(&state)).await;
         }
+    }
+
+    // Signed artifact links (docs/outbound-artifacts.md). Reserved before
+    // deployment resolution so a `/` binding cannot capture it; the handler
+    // reads the live activation's link table and answers every refusal about
+    // which file or which unit with one 404.
+    if crate::artifacts::serve_link::is_link_path(&path) {
+        let links = state.current().routing.artifact_links.clone();
+        return Ok(crate::artifacts::serve_link::handle(&req, &links).await);
     }
 
     // Snapshot the activation ONCE per request so dispatch and execute see a
@@ -10869,6 +10879,12 @@ mod tests {
             !path_allows_cors("/workers/invoke", "/workers/invoke"),
             "/workers/invoke must NOT allow CORS"
         );
+    }
+
+    #[test]
+    fn cors_blocks_signed_artifact_links() {
+        let link = "/v1/artifacts/01J0000000000000000000000A/x/1/y";
+        assert!(!path_allows_cors(link, link));
     }
 
     // Category 8: session hint extraction for webchat

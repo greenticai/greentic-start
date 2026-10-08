@@ -90,6 +90,10 @@ pub fn record_session_end(tenant: &str, provider: &str) {
 /// Normalise an HTTP path to a metric-friendly route, collapsing high-cardinality
 /// segments (uuids, conversation ids, etc.) to placeholders.
 pub fn normalise_route(path: &str) -> String {
+    // A signed artifact link carries its MAC in the path: never a label.
+    if path.starts_with(crate::artifacts::link::LINK_PREFIX) {
+        return "/v1/artifacts/:link".to_string();
+    }
     let mut out = String::with_capacity(path.len());
     for seg in path.split('/') {
         if seg.is_empty() {
@@ -141,6 +145,15 @@ mod tests {
             normalise_route("/v3/directline/conversations"),
             "/v3/directline/conversations"
         );
+    }
+
+    #[test]
+    fn a_signed_artifact_link_is_one_literal_route() {
+        let link = "/v1/artifacts/01J0000000000000000000000A/\
+                    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/\
+                    1800086400/156579ac611915e88411f0fb25e8dde7";
+        assert_eq!(normalise_route(link), "/v1/artifacts/:link");
+        assert_eq!(normalise_route("/v1/artifacts/x/y"), "/v1/artifacts/:link");
     }
 
     #[test]
