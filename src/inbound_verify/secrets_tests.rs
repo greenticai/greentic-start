@@ -27,7 +27,7 @@ async fn read(manager: &DynSecretsManager) -> SecretRead {
 fn found(read: &SecretRead) -> Option<String> {
     match read {
         SecretRead::Found(value) => Some(value.expose().to_string()),
-        SecretRead::Absent => None,
+        SecretRead::Absent | SecretRead::Unavailable => None,
     }
 }
 

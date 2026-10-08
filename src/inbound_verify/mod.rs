@@ -18,8 +18,9 @@
 //! - **NotConfigured** (no secret / no bot app id) — the request is admitted
 //!   exactly as before this module existed (text flows), files are withheld,
 //!   and the operator is told once which setting is missing.
-//! - **Unavailable** (Teams: the signing key set could not be read) — admitted
-//!   unverified; an outage of the key host must not take chat down.
+//! - **Unavailable** (the Teams signing key set, or a channel's stored secret,
+//!   could not be read) — admitted unverified, files withheld; an outage must
+//!   not take chat down.
 //! - **Refused** — a configured channel whose proof failed: `401` (`403` for a
 //!   Bot Framework endorsement mismatch). Never downgraded, and there is no
 //!   switch to turn the check off once configured.
@@ -125,8 +126,17 @@ impl RefusalCode {
 pub(crate) enum Outcome {
     Verified,
     NotConfigured,
-    Unavailable,
+    Unavailable(Unavailable),
     Refused(RefusalCode),
+}
+
+/// Why a verification could not run. Never a failed proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unavailable {
+    /// The Bot Framework signing keys could not be read.
+    KeySet,
+    /// The channel's stored secret could not be read (store error).
+    SecretStore,
 }
 
 /// What the verifiers read from. Production: [`verify_inbound`].
@@ -190,13 +200,17 @@ pub(crate) async fn verify_with(
                 .once(inbound.deployment_id, label, not_configured_line(channel));
             Ok(Verdict::NotConfigured)
         }
-        Outcome::Unavailable => {
+        Outcome::Unavailable(cause) => {
+            let (code, what) = match cause {
+                Unavailable::KeySet => ("key_set_unavailable", "the signing keys"),
+                Unavailable::SecretStore => ("secret_unavailable", "the stored secret"),
+            };
             deps.notices.limited(
                 label,
-                "key_set_unavailable",
+                code,
                 &format!(
-                    "{label} requests could not be verified: the signing keys could not \
-                     be read; the message was admitted unverified and its files are not read"
+                    "{label} request verification is unavailable: {what} could not be \
+                     read; the message was admitted unverified and its files are not read"
                 ),
             );
             Ok(Verdict::Unavailable)
@@ -248,7 +262,10 @@ fn not_configured_line(channel: Channel) -> &'static str {
 }
 
 async fn whatsapp(inbound: &Inbound<'_>, deps: &Deps<'_>) -> Outcome {
-    let secret = channel_secret(inbound, deps, hmac_channels::WHATSAPP_SECRET_NAMES).await;
+    let secret = match channel_secret(inbound, deps, hmac_channels::WHATSAPP_SECRET_NAMES).await {
+        Ok(secret) => secret,
+        Err(cause) => return Outcome::Unavailable(cause),
+    };
     hmac_outcome(hmac_channels::check_whatsapp(
         secret.as_ref(),
         inbound.headers,
@@ -257,7 +274,10 @@ async fn whatsapp(inbound: &Inbound<'_>, deps: &Deps<'_>) -> Outcome {
 }
 
 async fn webex(inbound: &Inbound<'_>, deps: &Deps<'_>) -> Outcome {
-    let secret = channel_secret(inbound, deps, hmac_channels::WEBEX_SECRET_NAMES).await;
+    let secret = match channel_secret(inbound, deps, hmac_channels::WEBEX_SECRET_NAMES).await {
+        Ok(secret) => secret,
+        Err(cause) => return Outcome::Unavailable(cause),
+    };
     hmac_outcome(hmac_channels::check_webex(
         secret.as_ref(),
         inbound.headers,
@@ -265,12 +285,13 @@ async fn webex(inbound: &Inbound<'_>, deps: &Deps<'_>) -> Outcome {
     ))
 }
 
-/// The channel's secret in the provider op's own scope (`secrets.rs`).
+/// The channel's secret in the provider op's own scope (`secrets.rs`);
+/// `Ok(None)` when none is stored, `Err` when the store could not say.
 async fn channel_secret(
     inbound: &Inbound<'_>,
     deps: &Deps<'_>,
     names: &[&str],
-) -> Option<secrets::ChannelSecret> {
+) -> Result<Option<secrets::ChannelSecret>, Unavailable> {
     match secrets::read_channel_secret(
         deps.secrets,
         deps.env,
@@ -281,8 +302,9 @@ async fn channel_secret(
     )
     .await
     {
-        secrets::SecretRead::Found(secret) => Some(secret),
-        secrets::SecretRead::Absent => None,
+        secrets::SecretRead::Found(secret) => Ok(Some(secret)),
+        secrets::SecretRead::Absent => Ok(None),
+        secrets::SecretRead::Unavailable => Err(Unavailable::SecretStore),
     }
 }
 
@@ -308,7 +330,7 @@ async fn teams(inbound: &Inbound<'_>, deps: &Deps<'_>) -> Outcome {
         bot_framework::BfOutcome::Refused(code) => return Outcome::Refused(code),
         bot_framework::BfOutcome::Verified => Outcome::Verified,
         bot_framework::BfOutcome::NotConfigured => Outcome::NotConfigured,
-        bot_framework::BfOutcome::Unavailable => Outcome::Unavailable,
+        bot_framework::BfOutcome::Unavailable => Outcome::Unavailable(Unavailable::KeySet),
     };
     // Verified or not, the provider replies to `serviceUrl` with the bot's
     // token: never let an activity name a host outside Bot Framework.
@@ -336,6 +358,9 @@ mod hmac_channels_tests;
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod mod_tests;
+#[cfg(test)]
+#[path = "secrets_error_tests.rs"]
+mod secrets_error_tests;
 #[cfg(test)]
 #[path = "secrets_tests.rs"]
 mod secrets_tests;

@@ -10,10 +10,13 @@
 //! [`crate::runner_host::secret_read_uris`] (raw, then canonical spelling), so
 //! a value the designer staged under either spelling of the pack id resolves.
 //!
-//! A read error, a non-UTF-8 value or an empty value is ABSENT, and the next
-//! candidate is tried. Nothing here logs: a read error's text can name the
-//! store, and the URIs are not worth a line on a path an unauthenticated
-//! caller reaches.
+//! `NotFound` or an empty value moves on to the next candidate. Any other read
+//! error, or a value that is not UTF-8, is UNAVAILABLE and stops the walk: a
+//! store that failed has not shown the secret is missing, so the request must
+//! not be treated as "not configured", and a failure in the unit scope must not
+//! fall through to the bare scope (the provider's read does not either).
+//! Nothing here logs: a read error's text can name the store, and the URIs are
+//! not worth a line on a path an unauthenticated caller reaches.
 
 use crate::secrets_gate::DynSecretsManager;
 
@@ -40,7 +43,10 @@ impl std::fmt::Debug for ChannelSecret {
 #[derive(Debug)]
 pub(crate) enum SecretRead {
     Found(ChannelSecret),
+    /// Every candidate answered `NotFound` or an empty value.
     Absent,
+    /// The store failed, or held a value that is not text.
+    Unavailable,
 }
 
 /// Every URI tried for `names`, in order: the unit scope for each name, then
@@ -80,11 +86,13 @@ pub(crate) async fn read_channel_secret(
     names: &[&str],
 ) -> SecretRead {
     for uri in candidate_uris(env, tenant, pack_id, unit_id, names) {
-        let Ok(bytes) = secrets.read(&uri).await else {
-            continue;
+        let bytes = match secrets.read(&uri).await {
+            Ok(bytes) => bytes,
+            Err(err) if is_not_found(&err) => continue,
+            Err(_) => return SecretRead::Unavailable,
         };
         let Ok(value) = String::from_utf8(bytes) else {
-            continue;
+            return SecretRead::Unavailable;
         };
         let value = value.trim();
         if !value.is_empty() {
@@ -92,4 +100,11 @@ pub(crate) async fn read_channel_secret(
         }
     }
     SecretRead::Absent
+}
+
+/// `NotFound`, or a wrapped error saying so (the dev store and the runner
+/// host phrase it in text: [`crate::runner_host::is_secret_not_found`]).
+fn is_not_found(err: &greentic_secrets_lib::SecretError) -> bool {
+    matches!(err, greentic_secrets_lib::SecretError::NotFound(_))
+        || crate::runner_host::is_secret_not_found(err)
 }
