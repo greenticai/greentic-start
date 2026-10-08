@@ -15,25 +15,118 @@ use hyper::HeaderMap;
 /// How many proxies in front of this host append to `X-Forwarded-For`.
 const TRUSTED_PROXY_HOPS_ENV: &str = "GREENTIC_TRUSTED_PROXY_HOPS";
 
-/// The bucket an upload is counted against: an IPv4 address, or an IPv6 /64.
+/// The bucket an upload is counted against: an IPv4 address, an IPv6 /64,
+/// or — when the client address cannot be known — a conversation
+/// ([`upload_client_key`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ClientKey(IpAddr);
+pub(crate) enum ClientKey {
+    Ip(IpAddr),
+    /// The first 16 bytes of a SHA-256 over the conversation id and the
+    /// request's `Authorization` value: never the id or the token itself.
+    Conversation([u8; 16]),
+}
 
 impl ClientKey {
     pub(crate) fn of(ip: IpAddr) -> Self {
         match ip {
             IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-                Some(v4) => ClientKey(IpAddr::V4(v4)),
+                Some(v4) => ClientKey::Ip(IpAddr::V4(v4)),
                 None => {
                     let s = v6.segments();
-                    ClientKey(IpAddr::V6(Ipv6Addr::new(
+                    ClientKey::Ip(IpAddr::V6(Ipv6Addr::new(
                         s[0], s[1], s[2], s[3], 0, 0, 0, 0,
                     )))
                 }
             },
-            v4 => ClientKey(v4),
+            v4 => ClientKey::Ip(v4),
         }
     }
+}
+
+/// A Direct Line conversation id longer than this is not a conversation key.
+const MAX_CONVERSATION_ID_BYTES: usize = 256;
+
+/// The `{id}` of `…/v3/directline/conversations/{id}/upload`: exactly that one
+/// path segment, non-empty and at most [`MAX_CONVERSATION_ID_BYTES`].
+pub(crate) fn conversation_id(path: &str) -> Option<&str> {
+    if !path.contains("/v3/directline/") {
+        return None;
+    }
+    let mut segments = path.trim_end_matches('/').rsplit('/');
+    if segments.next() != Some("upload") {
+        return None;
+    }
+    let id = segments.next()?;
+    if segments.next() != Some("conversations")
+        || id.is_empty()
+        || id.len() > MAX_CONVERSATION_ID_BYTES
+    {
+        return None;
+    }
+    Some(id)
+}
+
+/// The conversation bucket. The `Authorization` value is part of the key, so
+/// a caller who knows another user's conversation id but not their Direct
+/// Line token lands in its own bucket and cannot use up theirs.
+fn conversation_key(path: &str, headers: &HeaderMap) -> Option<ClientKey> {
+    use sha2::{Digest, Sha256};
+    let id = conversation_id(path)?;
+    let authorization = headers
+        .get(hyper::header::AUTHORIZATION)
+        .map(|v| v.as_bytes())
+        .unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(b"greentic-upload-conversation-v1\0");
+    hasher.update(id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(authorization);
+    let digest = hasher.finalize();
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&digest[..16]);
+    Some(ClientKey::Conversation(key))
+}
+
+/// The key an UPLOAD is counted against. A usable trusted forwarded entry or
+/// a public peer is the client; a NON-public peer with no usable forwarded
+/// entry (k8s behind its router, any proxy that appends nothing) hides every
+/// client behind one address, so the conversation is the bucket instead. The
+/// global upload cap still bounds the whole process.
+pub(crate) fn upload_client_key(
+    peer: Option<IpAddr>,
+    headers: &HeaderMap,
+    trusted_hops: usize,
+    path: &str,
+) -> Option<ClientKey> {
+    if let Some(ip) = forwarded_client(headers, trusted_hops) {
+        return Some(ClientKey::of(ip));
+    }
+    match peer {
+        Some(ip) if !crate::artifacts::dns::is_public_ip(ip) => {
+            match conversation_key(path, headers) {
+                Some(key) => {
+                    warn_addresses_unknown_once();
+                    Some(key)
+                }
+                None => Some(ClientKey::of(ip)),
+            }
+        }
+        other => other.map(ClientKey::of),
+    }
+}
+
+fn warn_addresses_unknown_once() {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        crate::operator_log::warn(
+            module_path!(),
+            format!(
+                "client addresses are not visible behind this proxy; uploads are limited \
+                 per conversation. Set {TRUSTED_PROXY_HOPS_ENV} if the proxy appends \
+                 X-Forwarded-For"
+            ),
+        );
+    });
 }
 
 /// Where the effective hop count came from.
@@ -114,27 +207,34 @@ pub(crate) fn trusted_proxy_hops() -> usize {
 /// the right of the header (every line, in order), the one the outermost
 /// trusted proxy appended; too few entries, or one that is not an address,
 /// and the peer is used.
+#[cfg(test)]
 pub(crate) fn client_key(
     peer: Option<IpAddr>,
     headers: &HeaderMap,
     trusted_hops: usize,
 ) -> Option<ClientKey> {
-    let forwarded = (trusted_hops > 0)
-        .then(|| {
-            let entries: Vec<&str> = headers
-                .get_all("x-forwarded-for")
-                .iter()
-                .filter_map(|value| value.to_str().ok())
-                .flat_map(|line| line.split(','))
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty())
-                .collect();
-            entries
-                .len()
-                .checked_sub(trusted_hops)
-                .and_then(|index| entries.get(index))
-                .and_then(|entry| entry.parse::<IpAddr>().ok())
-        })
-        .flatten();
-    forwarded.or(peer).map(ClientKey::of)
+    forwarded_client(headers, trusted_hops)
+        .or(peer)
+        .map(ClientKey::of)
+}
+
+/// The N-th `X-Forwarded-For` entry from the right (every line, in order),
+/// when `trusted_hops == N > 0` and that entry is an address.
+fn forwarded_client(headers: &HeaderMap, trusted_hops: usize) -> Option<IpAddr> {
+    if trusted_hops == 0 {
+        return None;
+    }
+    let entries: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|line| line.split(','))
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    entries
+        .len()
+        .checked_sub(trusted_hops)
+        .and_then(|index| entries.get(index))
+        .and_then(|entry| entry.parse::<IpAddr>().ok())
 }

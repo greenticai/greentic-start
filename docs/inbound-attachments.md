@@ -88,7 +88,7 @@ checked from the base64 length before decoding, the bytes are re-sniffed, and
 | extracted text | 200,000 characters per document |
 | PDF | 300 pages; parsed in a separate worker process (section 6) |
 | Direct Line `/upload` body | 16 MiB (other provider routes: 1 MiB) |
-| uploads per client | 10 per minute, one at a time per client, body within 30 s (`429` / `408`) |
+| uploads per client | 10 per minute, one at a time per client, body within 30 s (`429` / `408`). The client is the address (section 6); when it cannot be known (a private peer and no usable trusted `X-Forwarded-For` entry, e.g. k8s behind its router) it is the Direct Line conversation together with the request's token, so users behind one proxy do not share one bucket and a caller without a conversation's token cannot use up its uploads |
 | uploads in flight per process | 4 (`503` beyond, never queued) |
 | door writes per message | 2 in parallel; 3 attempts on `408`, `429`, `502`, `503`, `504` and transport failures (`Retry-After` up to 3 s, else doubling backoff); 20 s timeout per request |
 
@@ -221,7 +221,7 @@ slot gets a `door_unavailable` note and inline bytes are cleared.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GREENTIC_TRUSTED_PROXY_HOPS` | `1` on Cloud Run (`K_SERVICE` set), else `0` | How many proxies in front of this host append to `X-Forwarded-For`; the client is the N-th entry from the right. `0` uses the TCP peer and ignores the header. An explicit value always wins, `0` included; an unparsable value is `0` (warned once), never the platform default; an empty value is unset. Cloud Run's default rests on its front end appending the address it received the connection from (documented behaviour, not yet measured here). Elsewhere behind a load balancer set it (usually `1`). The effective count and its source are logged once |
+| `GREENTIC_TRUSTED_PROXY_HOPS` | `1` on Cloud Run (`K_SERVICE` set), else `0` | How many proxies in front of this host append to `X-Forwarded-For`; the client is the N-th entry from the right. `0` uses the TCP peer and ignores the header. An explicit value always wins, `0` included; an unparsable value is `0` (warned once), never the platform default; an empty value is unset. Cloud Run's default rests on its front end appending the address it received the connection from (documented behaviour, not yet measured here). Elsewhere behind a load balancer set it (usually `1`). The effective count and its source are logged once. With no usable entry and a non-public peer, uploads are limited per conversation and that is warned once |
 | `GREENTIC_ATTACHMENT_ALLOWED_HOSTS` | empty | Extra credential-less download hosts (section 3) |
 | `GREENTIC_PDF_WORKER_SLOTS` | `1` (1..4) | PDF workers at once; also the process-wide text-extraction slots |
 | `GREENTIC_PDF_WORKER_MEM_MB` | `320` (64..1024) | Memory limit of one PDF worker |

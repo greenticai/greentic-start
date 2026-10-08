@@ -35,8 +35,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::revision_serve::MAX_BODY_BYTES;
 
-use super::client_key::trusted_proxy_hops;
-pub(crate) use super::client_key::{ClientKey, client_key};
+pub(crate) use super::client_key::ClientKey;
+#[cfg(test)]
+pub(crate) use super::client_key::client_key;
+use super::client_key::{trusted_proxy_hops, upload_client_key};
 
 pub(crate) const UPLOAD_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const UPLOADS_PER_MINUTE: usize = 10;
@@ -272,7 +274,7 @@ where
     let slot = match kind {
         BodyKind::Upload => {
             let peer = req.extensions().get::<PeerIp>().map(|p| p.0);
-            let client = client_key(peer, req.headers(), trusted_proxy_hops());
+            let client = upload_client_key(peer, req.headers(), trusted_proxy_hops(), path);
             match limiter.admit(client, Instant::now()) {
                 Ok(slot) => Some(slot),
                 Err(Refusal::TooMany) => {
