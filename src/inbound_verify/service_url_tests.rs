@@ -293,3 +293,24 @@ async fn a_not_configured_teams_activity_to_a_microsoft_host_outside_the_list_is
     .expect_err("refused");
     assert_eq!(refused.status(), hyper::StatusCode::FORBIDDEN);
 }
+
+/// Re-review G4 M1: defence in depth BEFORE the URL parser, so a parser quirk
+/// cannot turn one of these into an allowed host.
+#[test]
+fn raw_strings_with_suspicious_characters_are_refused_before_parsing() {
+    for url in [
+        "https://smba.trafficmanager.net\\@evil.example/",
+        "https://smba.trafficmanager.net/a\\b",
+        "https://smba.trafficmanager.net/amer/ ",
+        " https://smba.trafficmanager.net/amer/",
+        "https://smba.trafficmanager.net/am er/",
+        "https://smba.trafficmanager.net/amer/\t",
+        "https://smba.trafficmanager.net/amer/\n",
+        "https://smba.trafficmanager.net/amer/\u{0}",
+        "https://smba.trafficmanager.net/a@b",
+        "https://smba.trafficmanager.net/%2e%2e/",
+        "https://smba%2etrafficmanager.net/",
+    ] {
+        assert!(!allowed(url, &none()), "{url:?}");
+    }
+}

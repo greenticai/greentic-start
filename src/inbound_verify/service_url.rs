@@ -52,7 +52,17 @@ pub(crate) fn classify(body: &[u8], extra: &[String]) -> ServiceUrl {
 
 /// Whether `url` may receive the bot's token.
 pub(crate) fn allowed(url: &str, extra: &[String]) -> bool {
-    let Ok(url) = Url::parse(url.trim()) else {
+    // Defence in depth, before the parser: these are where URL parsers
+    // disagree with each other (`\` is `/` to WHATWG, userinfo `@`, escapes,
+    // stray whitespace), and the provider that sends the token parses the URL
+    // again with its own client. A genuine Bot Framework URL carries none.
+    if url
+        .chars()
+        .any(|c| c == '\\' || c == '@' || c == '%' || c.is_whitespace() || c.is_control())
+    {
+        return false;
+    }
+    let Ok(url) = Url::parse(url) else {
         return false;
     };
     if url.scheme() != "https"
