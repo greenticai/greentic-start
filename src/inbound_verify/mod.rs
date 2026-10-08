@@ -368,5 +368,8 @@ mod secrets_tests;
 #[path = "service_url_tests.rs"]
 mod service_url_tests;
 #[cfg(test)]
+#[path = "shared_vectors_tests.rs"]
+mod shared_vectors_tests;
+#[cfg(test)]
 #[path = "wiring_tests.rs"]
 mod wiring_tests;

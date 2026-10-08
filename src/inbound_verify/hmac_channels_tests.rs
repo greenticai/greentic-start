@@ -9,9 +9,10 @@ const WHATSAPP_FIXTURE: &str = include_str!("fixtures/inbound-auth-v1/whatsapp.j
 const WEBEX_FIXTURE: &str = include_str!("fixtures/inbound-auth-v1/webex.json");
 const CHECKSUMS: &str = include_str!("fixtures/inbound-auth-v1/CHECKSUMS.sha256");
 
-/// A shared signature vector (`fixtures/inbound-auth-v1/`). The same files
-/// are meant to live in greentic-messaging-providers, recomputed there with
-/// the provider's own HMAC, so both sides prove the same bytes.
+/// A shared signature vector (`fixtures/inbound-auth-v1/`), owned by
+/// greentic-messaging-providers and copied here byte for byte
+/// (`shared_vectors_tests`, `scripts/sync-inbound-auth-fixtures.sh`), so the
+/// provider and this host prove the same bytes.
 #[derive(Deserialize)]
 struct Vector {
     secret: String,
