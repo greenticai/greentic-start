@@ -364,13 +364,16 @@ fn parse_token(token: &str, key: &[u8]) -> Result<DlClaims, TokenError> {
     if parts.next().is_some() {
         return Err(TokenError::Malformed);
     }
-    let expected = hs256(&format!("{header}.{payload}"), key);
     let actual = URL_SAFE_NO_PAD
         .decode(signature)
         .map_err(|_| TokenError::Malformed)?;
-    if expected != actual {
-        return Err(TokenError::BadSignature);
-    }
+    // Constant-time comparison (`verify_slice`), as `directline_token` does:
+    // a byte-by-byte `!=` leaks how much of a forged tag matched.
+    let mut mac =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key).map_err(|_| TokenError::BadSignature)?;
+    mac.update(format!("{header}.{payload}").as_bytes());
+    mac.verify_slice(&actual)
+        .map_err(|_| TokenError::BadSignature)?;
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(payload)
         .map_err(|_| TokenError::Malformed)?;
@@ -1113,6 +1116,28 @@ mod tests {
             parse_token(&token, KEY),
             Err(TokenError::BadSignature)
         ));
+    }
+
+    #[test]
+    fn a_signature_of_the_wrong_length_is_bad_not_a_panic() {
+        let token = make_token("alice", Some("conv-1"), 100, 200, KEY);
+        let (signing_input, signature) = token.rsplit_once('.').unwrap();
+        let full = URL_SAFE_NO_PAD.decode(signature).unwrap();
+        let mut longer = full.clone();
+        longer.push(0);
+        for tag in [
+            Vec::new(),
+            vec![0u8],
+            full[..full.len() - 1].to_vec(),
+            longer,
+        ] {
+            let forged = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(&tag));
+            assert!(
+                matches!(parse_token(&forged, KEY), Err(TokenError::BadSignature)),
+                "a {}-byte tag must be a bad signature",
+                tag.len()
+            );
+        }
     }
 
     #[test]
