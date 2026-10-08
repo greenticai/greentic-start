@@ -131,7 +131,7 @@ the egress budgets exactly like a `GET`.
 | door reads in flight per process (`GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT`, 2..32) | 8 | `503`, `Retry-After: 2` |
 | door reads in flight per unit (`GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT_PER_UNIT`, 1..8) | 3 | `503`, `Retry-After: 2` |
 | requests per link (deployment + artifact) | 30 / 60 s | `429`, `Retry-After: 60` |
-| requests per client, only when `GREENTIC_TRUSTED_PROXY_HOPS > 0` | 120 / 60 s | `429` |
+| requests per client, only when the effective proxy hop count is above 0 (`GREENTIC_TRUSTED_PROXY_HOPS`, default `1` on Cloud Run) | 120 / 60 s | `429` |
 | bytes served per unit per hour (`GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_HOUR`, 16..65536 MiB) | 2048 MiB | `429` |
 | bytes served per link per hour (`GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_LINK_PER_HOUR`, 16..65536 MiB) | 64 MiB | `429` |
 
@@ -188,7 +188,7 @@ only WebChat gets a (relative) link. Never derived from a request's `Host`.
 | `GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT_PER_UNIT` | `3` (1..8) | Door reads at once per unit, per process |
 | `GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_HOUR` | `2048` (16..65536) | Bytes served per unit per hour |
 | `GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_LINK_PER_HOUR` | `64` (16..65536) | Bytes served per link per hour |
-| `GREENTIC_TRUSTED_PROXY_HOPS` | `0` | Enables the per-client window when the client address is known |
+| `GREENTIC_TRUSTED_PROXY_HOPS` | `1` on Cloud Run (`K_SERVICE`), else `0` | Enables the per-client window when the client address is known. The same count the upload limiter uses (`docs/inbound-attachments.md` §6); unlike uploads, the link window has no per-conversation fallback, so with `0` (k8s behind its router) it is off |
 
 All are read once per process.
 
