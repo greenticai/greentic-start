@@ -24,9 +24,8 @@
 //!   Bot Framework endorsement mismatch). Never downgraded, and there is no
 //!   switch to turn the check off once configured.
 
-// Consumed by the Bot Framework verifier (next change); tested on its own.
-#[allow(dead_code)]
 mod bf_keys;
+mod bot_framework;
 mod hmac_channels;
 mod notices;
 mod secrets;
@@ -57,7 +56,6 @@ pub(crate) enum Verdict {
 }
 
 /// The request as received, plus the route facts that scope its secrets.
-#[allow(dead_code)] // `pack_non_secret` is read by the Bot Framework verifier (S5)
 pub(crate) struct Inbound<'a> {
     pub provider_type: &'a str,
     pub method: &'a str,
@@ -76,7 +74,6 @@ pub(crate) struct Inbound<'a> {
 /// Why a request was refused. Only ever logged as [`RefusalCode::as_str`];
 /// the caller's response never names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // the token codes come with the Bot Framework verifier (S5)
 pub(crate) enum RefusalCode {
     MissingSignature,
     BadSignature,
@@ -119,7 +116,6 @@ impl RefusalCode {
 }
 
 /// What one channel's verifier decided.
-#[allow(dead_code)] // `Unavailable` comes with the Bot Framework verifier (S5)
 pub(crate) enum Outcome {
     Verified,
     NotConfigured,
@@ -134,6 +130,10 @@ pub(crate) struct Deps<'a> {
     /// is built with (`crate::resolve_env(None)`).
     pub env: &'a str,
     pub notices: &'a Notices,
+    /// The Bot Framework key set; `None` when no client could be built.
+    pub bf_keys: Option<&'a dyn bot_framework::BfKeys>,
+    /// Unix seconds, for the token clock checks.
+    pub now: u64,
 }
 
 /// Verify one inbound request. `Err` is the refusal response, with fixed text.
@@ -148,6 +148,9 @@ pub(crate) async fn verify_inbound(
             secrets,
             env,
             notices: Notices::production(),
+            bf_keys: bf_keys::BfKeySource::production()
+                .map(|source| source as &dyn bot_framework::BfKeys),
+            now: unix_now(),
         },
     )
     .await
@@ -281,10 +284,34 @@ fn hmac_outcome(outcome: hmac_channels::HmacOutcome) -> Outcome {
     }
 }
 
-async fn teams(_inbound: &Inbound<'_>, _deps: &Deps<'_>) -> Outcome {
-    Outcome::NotConfigured
+async fn teams(inbound: &Inbound<'_>, deps: &Deps<'_>) -> Outcome {
+    let app_id = bot_framework::configured_app_id(inbound.pack_non_secret);
+    match bot_framework::check(
+        app_id.as_deref(),
+        inbound.headers,
+        inbound.body,
+        deps.bf_keys,
+        deps.now,
+    )
+    .await
+    {
+        bot_framework::BfOutcome::Verified => Outcome::Verified,
+        bot_framework::BfOutcome::NotConfigured => Outcome::NotConfigured,
+        bot_framework::BfOutcome::Unavailable => Outcome::Unavailable,
+        bot_framework::BfOutcome::Refused(code) => Outcome::Refused(code),
+    }
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+#[path = "bot_framework_tests.rs"]
+mod bot_framework_tests;
 #[cfg(test)]
 #[path = "hmac_channels_tests.rs"]
 mod hmac_channels_tests;

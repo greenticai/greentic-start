@@ -59,6 +59,8 @@ pub(super) fn deps<'a>(secrets: &'a DynSecretsManager, notices: &'a Notices) -> 
         secrets,
         env: "local",
         notices,
+        bf_keys: None,
+        now: 0,
     }
 }
 
@@ -288,6 +290,80 @@ async fn a_bad_whatsapp_or_webex_signature_is_refused_before_any_dispatch() {
         )
         .await
         .expect_err("refused");
+        assert_eq!(refused.status(), hyper::StatusCode::UNAUTHORIZED);
+    }
+}
+
+fn teams_config() -> std::collections::BTreeMap<String, serde_json::Value> {
+    std::collections::BTreeMap::from([(
+        "ms_bot_app_id".to_string(),
+        serde_json::json!("9f6b3c2e-1d4a-4b7f-8e2a-5c1d0e9f7a3b"),
+    )])
+}
+
+fn unsigned_token(alg: &str) -> String {
+    use base64::Engine;
+    let b64 = |v: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+    };
+    format!(
+        "{}.{}.c2ln",
+        b64(serde_json::json!({"alg": alg, "kid": "k"})),
+        b64(serde_json::json!({"iss": "https://api.botframework.com"}))
+    )
+}
+
+#[tokio::test]
+async fn a_configured_teams_unit_without_a_key_set_is_admitted_unverified() {
+    let secrets = empty_store();
+    let config = teams_config();
+    let headers = vec![(
+        "authorization".to_string(),
+        format!("Bearer {}", unsigned_token("RS256")),
+    )];
+    let (notices, said) = Notices::recording();
+    let mut request = inbound(
+        "messaging.teams",
+        "POST",
+        &headers,
+        b"{}",
+        DeploymentId::new(),
+    );
+    request.pack_non_secret = Some(&config);
+    let verdict = verify_with(request, &deps(&secrets, &notices))
+        .await
+        .expect("an outage never refuses");
+    assert_eq!(verdict, Verdict::Unavailable);
+    assert_eq!(said.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_forged_teams_token_is_refused_once_the_app_id_is_set() {
+    let secrets = empty_store();
+    let config = teams_config();
+    let (notices, _) = Notices::recording();
+    for headers in [
+        vec![],
+        vec![(
+            "authorization".to_string(),
+            format!("Bearer {}", unsigned_token("none")),
+        )],
+        vec![(
+            "authorization".to_string(),
+            format!("Bearer {}", unsigned_token("HS256")),
+        )],
+    ] {
+        let mut request = inbound(
+            "messaging.teams",
+            "POST",
+            &headers,
+            b"{}",
+            DeploymentId::new(),
+        );
+        request.pack_non_secret = Some(&config);
+        let refused = verify_with(request, &deps(&secrets, &notices))
+            .await
+            .expect_err("refused");
         assert_eq!(refused.status(), hyper::StatusCode::UNAUTHORIZED);
     }
 }
