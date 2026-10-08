@@ -97,6 +97,8 @@ mod link_tests;
 #[cfg(test)]
 mod origin_tests;
 #[cfg(test)]
+mod outbound_side_tests;
+#[cfg(test)]
 mod outbound_tests;
 #[cfg(test)]
 mod pdf_fixture;
@@ -118,6 +120,10 @@ mod redaction_ratchet_tests;
 mod redaction_tests;
 #[cfg(test)]
 mod secrets_tests;
+#[cfg(test)]
+mod serve_link_limits_tests;
+#[cfg(test)]
+mod serve_link_testkit;
 #[cfg(test)]
 mod serve_link_tests;
 #[cfg(test)]
