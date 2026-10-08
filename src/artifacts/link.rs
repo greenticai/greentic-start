@@ -207,6 +207,45 @@ pub(crate) fn ttl_from(raw: Option<&str>) -> u64 {
         .map_or(DEFAULT_TTL_SECS, |v| v.clamp(MIN_TTL_SECS, MAX_TTL_SECS))
 }
 
+/// Whether signed artifact links are minted and served at all, in CODE.
+///
+/// OFF until the WebChat reconnect-token hardening (gap G2,
+/// docs/superpowers/plans/2026-10-08-webchat-reconnect-token-hardening.md in
+/// the designer repo) ships in the same release: a hijacked WebChat
+/// conversation would otherwise expose every file link it holds. No deploy
+/// lane can set an env var on a remote workload today, so the release that
+/// carries G2 flips this constant (and its pin test) rather than relying on
+/// operators to switch it on.
+pub(crate) const OUTBOUND_LINKS_ENABLED: bool = false;
+/// Can only force links ON (`1`/`true`/`yes`/`on`, case-insensitive) for a
+/// host that has G2, e.g. local testing; there is no off-override, so a build
+/// whose constant is `true` cannot be switched off by a stray variable.
+pub(crate) const LINKS_ENV: &str = "GREENTIC_ARTIFACT_LINKS";
+
+/// Pure rule: the code default, or an explicit "on" value.
+pub(crate) fn links_enabled_with(code_default: bool, raw: Option<&str>) -> bool {
+    code_default
+        || raw.is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
+/// [`links_enabled_with`] over [`OUTBOUND_LINKS_ENABLED`].
+pub(crate) fn links_enabled_from(raw: Option<&str>) -> bool {
+    links_enabled_with(OUTBOUND_LINKS_ENABLED, raw)
+}
+
+/// [`LINKS_ENV`], read once per process. When `false`, outbound shaping
+/// mints nothing (the "file delivery is turned off" sentence) and the link
+/// route answers every request with the uniform 404.
+pub(crate) fn links_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| links_enabled_from(std::env::var(LINKS_ENV).ok().as_deref()))
+}
+
 /// [`TTL_ENV`], read once per process.
 pub(crate) fn ttl_secs() -> u64 {
     static TTL: OnceLock<u64> = OnceLock::new();

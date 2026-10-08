@@ -233,3 +233,43 @@ fn key_normalisation_matches_hmac_for_short_and_long_tokens() {
         );
     }
 }
+
+/// Pinned OFF until the WebChat reconnect-token hardening (gap G2) ships: a
+/// hijacked WebChat conversation would otherwise expose every link it holds.
+/// Flipping this is a release decision, not a refactor.
+#[test]
+#[allow(clippy::assertions_on_constants)] // the constant IS what is pinned
+fn outbound_links_are_off_in_code_until_g2_ships() {
+    assert!(!super::link::OUTBOUND_LINKS_ENABLED);
+    assert_eq!(super::link::LINKS_ENV, "GREENTIC_ARTIFACT_LINKS");
+}
+
+#[test]
+fn the_env_can_only_force_links_on() {
+    use super::link::links_enabled_with;
+    // Code default OFF: only an explicit "on" value enables.
+    for on in ["1", "true", "TRUE", "yes", "On", " on "] {
+        assert!(links_enabled_with(false, Some(on)), "{on}");
+    }
+    for not_on in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("off"),
+        Some("false"),
+        Some("enable"),
+    ] {
+        assert!(!links_enabled_with(false, not_on), "{not_on:?}");
+    }
+    // Code default ON: no value turns it off (there is no off-override).
+    for any in [None, Some("off"), Some("0"), Some("false"), Some("no")] {
+        assert!(links_enabled_with(true, any), "{any:?}");
+    }
+}
+
+#[test]
+fn links_enabled_from_applies_the_code_default() {
+    use super::link::{OUTBOUND_LINKS_ENABLED, links_enabled_from};
+    assert_eq!(links_enabled_from(None), OUTBOUND_LINKS_ENABLED);
+    assert!(links_enabled_from(Some("on")));
+}
