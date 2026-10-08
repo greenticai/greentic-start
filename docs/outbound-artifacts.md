@@ -73,7 +73,7 @@ user opens  GET /v1/artifacts/<deployment>/<artifact hex>/<exp>/<mac>
   - re-mint the unit's metering token and redeploy: the key changes, every
     outstanding link of that unit answers 404.
   When the admin revokes the token at teardown, the door answers `401`; the
-  route then answers `503` (a misconfiguration, warned once per process with
+  route then answers `503` (a misconfiguration, warned once per unit with
   the deployment id and a fixed code), not `404`.
 - A link appears in platform access logs (Cloud Run, load balancers) and in
   chat history. It grants one file, read-only, until it expires.

@@ -337,4 +337,25 @@ fn the_route_reads_the_kill_switch() {
     const ROUTE: &str = include_str!("serve_link.rs");
     let handle = ROUTE.find("pub(crate) async fn handle").expect("handle");
     assert!(ROUTE[handle..].contains("links_on: link::links_enabled(),"));
+    // The TTL ceiling is the CURRENT configured TTL, never a constant.
+    assert!(ROUTE[handle..].contains("ttl_max: link::ttl_secs(),"));
+}
+
+/// A refused token is warned once per unit, not once per process, and the
+/// set of units remembered is bounded.
+#[test]
+fn a_misconfigured_unit_is_warned_once_and_the_memory_is_bounded() {
+    use super::serve_link::OncePerKey;
+    let once = OncePerKey::new(2);
+    assert!(once.first("unit-a"));
+    assert!(!once.first("unit-a"));
+    assert!(once.first("unit-b"));
+    assert!(!once.first("unit-b"));
+    // Full: a third unit is not remembered (and not warned again and again).
+    assert!(!once.first("unit-c"));
+    assert!(!once.first("unit-a"));
+    // The route keys it on the unit's deployment.
+    const ROUTE: &str = include_str!("serve_link.rs");
+    let warn = ROUTE.find("fn misconfigured(").expect("misconfigured");
+    assert!(ROUTE[warn..].contains("if warned.first(deployment) {"));
 }

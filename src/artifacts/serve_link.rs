@@ -19,8 +19,8 @@
 //!
 //! Nothing here logs the path, the MAC, the artifact id or the token.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use greentic_aw_runtime::{ArtifactBytes, ArtifactError, ArtifactReader};
@@ -228,18 +228,53 @@ async fn read(
     Err(DoorOutcome::Down)
 }
 
-/// Once per process: the door refuses the unit's own token (revoked or
+/// Remembers which keys were already reported, up to `cap` of them. Past
+/// the cap a new key is never reported, so a flood of units cannot grow the
+/// set or the log without bound.
+pub(crate) struct OncePerKey {
+    seen: Mutex<HashSet<String>>,
+    cap: usize,
+}
+
+impl OncePerKey {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            seen: Mutex::new(HashSet::new()),
+            cap,
+        }
+    }
+
+    /// `true` the first time `key` is seen while there is room for it.
+    pub(crate) fn first(&self, key: &str) -> bool {
+        let mut seen = match self.seen.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if seen.contains(key) || seen.len() >= self.cap {
+            return false;
+        }
+        seen.insert(key.to_string())
+    }
+}
+
+/// Units remembered by [`misconfigured`].
+const MISCONFIGURED_UNITS_MAX: usize = 1_024;
+
+/// Once per unit: the door refuses the unit's own token (revoked or
 /// re-minted without a redeploy, or the purpose removed). Deployment id and a
 /// fixed code only.
 fn misconfigured(deployment: &str, code: &'static str) {
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
+    static WARNED: OnceLock<OncePerKey> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| OncePerKey::new(MISCONFIGURED_UNITS_MAX));
+    if warned.first(deployment) {
         tracing::warn!(
             deployment = %deployment,
             code,
             "the artifacts door refused this unit's token while serving a file link \
-             (later occurrences are not repeated)"
+             (later occurrences for this unit are not repeated)"
         );
+    } else {
+        tracing::debug!(deployment = %deployment, code, "artifacts door refused the unit's token");
     }
 }
 
