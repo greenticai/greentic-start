@@ -620,6 +620,7 @@ pub(super) fn activation_with(
             triggers: Default::default(),
             runtime_metered: Default::default(),
             attachments: Default::default(),
+            artifact_links: Default::default(),
         }),
     }
 }

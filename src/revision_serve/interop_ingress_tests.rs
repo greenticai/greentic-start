@@ -287,6 +287,7 @@ fn activation_full(
                 Default::default()
             },
             attachments: Default::default(),
+            artifact_links: Default::default(),
         }),
     };
     (activation, deployment_id, reads)
@@ -1295,6 +1296,7 @@ fn activation_mounting(units: Vec<MountedUnit>) -> Activation {
             triggers: Default::default(),
             runtime_metered: Default::default(),
             attachments: Default::default(),
+            artifact_links: Default::default(),
         }),
     }
 }

@@ -8392,6 +8392,7 @@ mod tests {
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
                 attachments: Default::default(),
+                artifact_links: Default::default(),
             }),
         });
         let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -9507,6 +9508,7 @@ mod tests {
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
                 attachments: Default::default(),
+                artifact_links: Default::default(),
             }),
         }
     }
@@ -9803,6 +9805,7 @@ mod tests {
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
                 attachments: Default::default(),
+                artifact_links: Default::default(),
             }),
         }
     }
@@ -11174,6 +11177,7 @@ mod tests {
             triggers: live.routing.triggers.clone(),
             runtime_metered: live.routing.runtime_metered.clone(),
             attachments: live.routing.attachments.clone(),
+            artifact_links: live.routing.artifact_links.clone(),
             // …and rebuilds the env-derived half.
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
@@ -11230,6 +11234,7 @@ mod tests {
             triggers: live.routing.triggers.clone(),
             runtime_metered: live.routing.runtime_metered.clone(),
             attachments: live.routing.attachments.clone(),
+            artifact_links: live.routing.artifact_links.clone(),
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: std::sync::Arc::default(),
@@ -11806,6 +11811,7 @@ mod tests {
             triggers: Default::default(),
             runtime_metered: Default::default(),
             attachments: Default::default(),
+            artifact_links: Default::default(),
         });
         let activation = Activation {
             host: base.host,
@@ -12834,6 +12840,7 @@ mod binary_update_tests {
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
                 attachments: Default::default(),
+                artifact_links: Default::default(),
             }),
         }
     }
@@ -15627,6 +15634,7 @@ mod binary_update_tests {
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
                 attachments: Default::default(),
+                artifact_links: Default::default(),
             }),
         }
     }

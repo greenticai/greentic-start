@@ -67,7 +67,6 @@ impl HostArtifactAccess {
     }
 
     /// The record of what this unit's port created (outbound link provenance).
-    #[cfg_attr(not(test), allow(dead_code))] // read by the link table (next task)
     pub(crate) fn recent_puts(&self) -> Arc<RecentPuts> {
         Arc::clone(&self.recent)
     }

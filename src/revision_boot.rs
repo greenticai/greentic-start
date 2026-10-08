@@ -434,6 +434,7 @@ pub(crate) async fn activate_runtime_config(
     let mut meter_decisions =
         crate::interop::metering::runtime_meter::UnitMeterDecisions::default();
     let mut attachments = HashMap::new();
+    let mut artifact_links = HashMap::new();
     // Inbound attachments, decided for every revision (carried ones included)
     // from the unit's staged metering block, all doors probed side by side
     // (each probe bounded), before any revision loads. A misconfigured door
@@ -691,6 +692,31 @@ pub(crate) async fn activate_runtime_config(
             );
         }
         let unit_artifacts = unit_artifacts.map(|access| access.bound_to(&unit_cell));
+        // The unit's signed-link signer (docs/outbound-artifacts.md). Two
+        // revisions of one deployment (a traffic split) share the unit's token
+        // and therefore its key, so the first revision's entry stands.
+        if let Some(access) = unit_artifacts.as_ref()
+            && !artifact_links.contains_key(&deployment_id)
+        {
+            let metering = meter_decisions
+                .metering_for(
+                    host.secrets_manager().as_ref(),
+                    &secrets_env,
+                    &meta.tenant,
+                    &meta.bundle_id,
+                )
+                .await;
+            let unit = crate::artifacts::link_table::LinkUnit::build(
+                metering.as_ref(),
+                access,
+                &unit_cell,
+                &meta.bundle_id,
+                deployment_id,
+            );
+            if let Some(unit) = unit {
+                artifact_links.insert(deployment_id, Arc::new(unit));
+            }
+        }
         attachments.insert((deployment_id, revision_id), unit_cell);
 
         // The agent's artifact reader and the extensions' artifact port come
@@ -778,6 +804,7 @@ pub(crate) async fn activate_runtime_config(
         triggers: crate::triggers::TriggerTable::build(trigger_entries, &trigger_prefixes),
         runtime_metered: meter_decisions.into_metered(),
         attachments: crate::artifacts::unit::AttachmentsTable::new(attachments),
+        artifact_links: crate::artifacts::link_table::ArtifactLinkTable::new(artifact_links),
     };
 
     // Commit only now that every revision loaded: `retained` holds exactly the
@@ -890,6 +917,7 @@ pub(crate) fn reactivate_routing_only(
         triggers: prev.triggers.clone(),
         runtime_metered: prev.runtime_metered.clone(),
         attachments: prev.attachments.clone(),
+        artifact_links: prev.artifact_links.clone(),
         deployment_routes,
         bundle_index,
         endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),
@@ -2752,6 +2780,7 @@ mod tests {
             triggers: Default::default(),
             runtime_metered: Default::default(),
             attachments: Default::default(),
+            artifact_links: Default::default(),
         };
         let next = reactivate_routing_only(&prev, &env);
         let got = next.app_packs.get("fast2flow", rev).expect("carried");
