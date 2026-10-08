@@ -89,6 +89,13 @@ user opens  GET /v1/artifacts/<deployment>/<artifact hex>/<exp>/<mac>
   the deployment id and a fixed code), not `404`.
 - A link appears in platform access logs (Cloud Run, load balancers) and in
   chat history. It grants one file, read-only, until it expires.
+- **What a link is NOT bound to.** A link is bound to the deployment, never
+  to a conversation, and the route reads no Direct Line token: a Direct Line
+  token, bound to the conversation or not, never authorises an artifact read
+  (the serving rule in `docs/inbound-attachments.md` §7). An earlier draft of
+  that rule named a 15-minute, conversation-bound link; it is withdrawn, since
+  users read Slack and Teams messages hours later and the abuse bound is the
+  one-file scope plus the route's rate and egress limits.
 
 ## 3. The route
 

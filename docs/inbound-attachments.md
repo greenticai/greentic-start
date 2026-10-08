@@ -268,8 +268,23 @@ see `docs/outbound-artifacts.md`. Any route added later MUST:
   only for `image/jpeg`, `image/png`, `image/gif`, `image/webp`;
 - never serve SVG or HTML inline (they are not stored in v1; keep it that way);
 - send `Cache-Control: private` (plus `no-store` for a signed link);
-- authorise the read on the token's tenant, never on possession of an id or of
-  a conversation token alone (an id is computable from the bytes).
+- authorise a read only by a host-minted signed link that is a credential for
+  ONE file and is bound to the deployment (tenant, unit, deployment), or by a
+  verified identity equal to the conversation's `owner_sub` with
+  `owner_verified`. The link lives 24 hours by default
+  (`GREENTIC_ARTIFACT_LINK_TTL_SECS`, 5 minutes to 7 days) and is NOT bound to
+  a conversation: users read Slack and Teams messages hours later, and the
+  abuse bound is the one-file scope plus the route's rate and egress limits.
+  Holding a token for the conversation, bound or not, is never sufficient on
+  its own, and an artifact id is never a credential (it is computable from the
+  bytes). Links are OFF in code until the WebChat reconnect-token hardening
+  (G2) ships.
+
+A Direct Line token, bound to the conversation or not, is never a read
+credential for an artifact. A WebChat download link is minted by the host per
+artifact when it sends the message, is a credential for that one file, bound to
+the deployment (tenant, unit), valid 24 hours by default, and checked against
+the artifact's own tenant.
 
 A file that is both a valid image and something else (a polyglot) is safe ONLY
 under this rule.
