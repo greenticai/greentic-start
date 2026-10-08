@@ -20,6 +20,7 @@ pub(crate) mod label;
 pub(crate) mod legacy;
 pub(crate) mod limits;
 pub(crate) mod link;
+pub(crate) mod link_base;
 pub(crate) mod link_table;
 pub(crate) mod off;
 pub(crate) mod origin;
@@ -83,6 +84,8 @@ mod instance_check_tests;
 mod legacy_tests;
 #[cfg(test)]
 mod limits_tests;
+#[cfg(test)]
+mod link_base_tests;
 #[cfg(test)]
 mod link_table_tests;
 #[cfg(test)]

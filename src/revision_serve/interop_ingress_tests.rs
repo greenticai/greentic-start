@@ -314,6 +314,7 @@ fn state_with(activation: Activation, interop: crate::interop::InteropState) -> 
         )),
         notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         public_url_capture: None,
+        tunnel_public_url: Default::default(),
         interop,
         activity_source_override: None,
     })

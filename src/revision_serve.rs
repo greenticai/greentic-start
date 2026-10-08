@@ -240,6 +240,10 @@ pub(crate) struct RevisionServeConfig {
     /// via [`PublicUrlCapture::offer`], waking the deferred registration task.
     /// `None` = not on Cloud Run, or a URL was already known at boot.
     pub public_url_capture: Option<Arc<PublicUrlCapture>>,
+    /// The tunnel's public URL (cloudflared/ngrok), set once the tunnel is
+    /// up. Read ONLY by signed artifact links (`artifact_link_base`), never by
+    /// `interop_base_url`.
+    pub tunnel_public_url: Arc<std::sync::OnceLock<String>>,
 }
 
 /// Per-connection shared state. Holds the live activation behind an
@@ -299,6 +303,8 @@ struct ServeState {
     /// via [`PublicUrlCapture::offer`], waking the deferred registration
     /// task in `lib.rs`. `None` = not armed.
     public_url_capture: Option<Arc<PublicUrlCapture>>,
+    /// See [`RevisionServeConfig::tunnel_public_url`].
+    tunnel_public_url: Arc<std::sync::OnceLock<String>>,
     /// Worker-interop state: the Phase 0b escape hatch, and (in tests) the
     /// turn override. Shared by every connection of this listener.
     interop: crate::interop::InteropState,
@@ -603,6 +609,7 @@ impl RevisionServer {
             session_manager,
             notifier,
             public_url_capture: config.public_url_capture,
+            tunnel_public_url: config.tunnel_public_url,
             interop: crate::interop::InteropState::from_env(config.public_base_url),
             #[cfg(test)]
             activity_source_override: None,
@@ -2030,6 +2037,21 @@ fn interop_base_url(state: &ServeState) -> Option<String> {
         })
         .map(|url| url.trim_end_matches('/').to_string())
         .filter(|url| !url.is_empty())
+}
+
+/// The origin signed artifact links are built on: [`interop_base_url`]'s
+/// sources plus the tunnel, validated (docs/outbound-artifacts.md).
+#[allow(dead_code)] // read by outbound shaping (outbound-delivery plan Task 6)
+fn artifact_link_base(state: &ServeState) -> crate::artifacts::link_base::LinkBase {
+    crate::artifacts::link_base::link_base(
+        state.interop.public_base_url.as_deref(),
+        state
+            .public_url_capture
+            .as_ref()
+            .and_then(|capture| capture.get())
+            .map(String::as_str),
+        state.tunnel_public_url.get().map(String::as_str),
+    )
 }
 
 /// [`interop_base_url`] with the unit's own mount joined onto it — the address
@@ -8039,6 +8061,7 @@ mod tests {
             exe_path: None,
             public_base_url: None,
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
         })
         .expect("start split server");
 
@@ -8090,6 +8113,7 @@ mod tests {
             exe_path: None,
             public_base_url: None,
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
         })
         .expect("start must succeed even when main bumps into admin range");
 
@@ -9550,9 +9574,34 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         }
+    }
+
+    /// Links use the tunnel only when nothing configured or captured exists,
+    /// and the interop base (agent cards) never reads the tunnel at all.
+    #[test]
+    fn artifact_links_fall_back_to_the_tunnel_and_interop_ignores_it() {
+        use crate::artifacts::link_base::LinkBase;
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut state = empty_state("env-1", bound);
+        assert_eq!(artifact_link_base(&state), LinkBase::RelativeOnly);
+        state
+            .tunnel_public_url
+            .set("https://t.trycloudflare.com/".into())
+            .unwrap();
+        assert_eq!(
+            artifact_link_base(&state),
+            LinkBase::Absolute("https://t.trycloudflare.com".into())
+        );
+        assert_eq!(interop_base_url(&state), None);
+        state.interop.public_base_url = Some("https://configured.example".into());
+        assert_eq!(
+            artifact_link_base(&state),
+            LinkBase::Absolute("https://configured.example".into())
+        );
     }
 
     fn body_string(resp: Response<Full<Bytes>>) -> String {
@@ -9963,6 +10012,7 @@ mod tests {
             exe_path: None,
             public_base_url: None,
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
         })
         .expect("start server");
 
@@ -10019,6 +10069,7 @@ mod tests {
             exe_path: None,
             public_base_url: None,
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
         })
         .expect("start server");
         let port = server.actual_port();
@@ -11399,6 +11450,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
@@ -11507,6 +11559,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
@@ -11609,6 +11662,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
@@ -11684,6 +11738,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
@@ -11968,6 +12023,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         })
@@ -13012,6 +13068,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
@@ -13052,6 +13109,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
@@ -13087,6 +13145,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
@@ -13118,6 +13177,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
@@ -13338,6 +13398,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
@@ -13387,6 +13448,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
@@ -13446,6 +13508,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
@@ -13484,6 +13547,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
@@ -15702,6 +15766,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::clone(&notifier),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: Some(
                 test_source.clone() as Arc<dyn crate::websocket::pump::ActivitySource>
@@ -15832,6 +15897,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: Some(
                 test_source as Arc<dyn crate::websocket::pump::ActivitySource>,

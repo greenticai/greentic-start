@@ -1091,6 +1091,9 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 let service = std::env::var("K_SERVICE").unwrap_or_default();
                 std::sync::Arc::new(revision_serve::PublicUrlCapture::new(service))
             });
+        // Filled once the tunnel (if any) is up, below; read only by signed
+        // artifact links (docs/outbound-artifacts.md).
+        let tunnel_public_url = std::sync::Arc::new(std::sync::OnceLock::new());
         let server = revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
             bind_addr,
             activation: std::sync::Arc::clone(&activation),
@@ -1102,6 +1105,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             exe_path: Some(own_exe.clone()),
             public_base_url: boot_configured_url.clone(),
             public_url_capture: cloud_run_capture.clone(),
+            tunnel_public_url: std::sync::Arc::clone(&tunnel_public_url),
         })
         .context("starting the revision ingress server")?;
         let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
@@ -1184,6 +1188,8 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             &log_dir,
         )?;
         let tunnel_url = tunnel.map(|t| {
+            // First writer wins; this is the only writer.
+            let _ = tunnel_public_url.set(t.url.clone());
             let line = format!("public URL: {} ({} tunnel)", t.url, t.service);
             operator_log::info(module_path!(), line.clone());
             println!("{line}");
