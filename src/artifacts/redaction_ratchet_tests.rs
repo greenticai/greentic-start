@@ -79,6 +79,9 @@ const FILES: &[(&str, &str)] = &[
     ),
     ("artifacts/label.rs", include_str!("label.rs")),
     ("artifacts/legacy.rs", include_str!("legacy.rs")),
+    ("artifacts/link.rs", include_str!("link.rs")),
+    ("artifacts/link_base.rs", include_str!("link_base.rs")),
+    ("artifacts/link_table.rs", include_str!("link_table.rs")),
     ("artifacts/off.rs", include_str!("off.rs")),
     ("artifacts/origin.rs", include_str!("origin.rs")),
     (
@@ -88,6 +91,7 @@ const FILES: &[(&str, &str)] = &[
     ("artifacts/port.rs", include_str!("port.rs")),
     ("artifacts/provenance.rs", include_str!("provenance.rs")),
     ("artifacts/quota_key.rs", include_str!("quota_key.rs")),
+    ("artifacts/recent_puts.rs", include_str!("recent_puts.rs")),
     ("artifacts/recovery.rs", include_str!("recovery.rs")),
     ("artifacts/secrets.rs", include_str!("secrets.rs")),
     ("artifacts/store.rs", include_str!("store.rs")),

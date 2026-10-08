@@ -121,12 +121,26 @@ impl LinkKey {
 
 /// The four parsed path segments. Only built by [`LinkPath::parse`] or
 /// [`mint`] in production; the fields are public for the route and tests.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// No `PartialEq`: comparing a MAC with `==` is not constant time, and the
+/// only comparison a link needs is [`verify`]'s. `Debug` redacts the MAC (a
+/// bearer secret for one file).
+#[derive(Clone)]
 pub(crate) struct LinkPath {
     pub deployment: String,
     pub artifact_hex: String,
     pub exp: u64,
     pub mac_hex: String,
+}
+
+impl std::fmt::Debug for LinkPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkPath")
+            .field("deployment", &self.deployment)
+            .field("exp", &self.exp)
+            .field("mac_hex", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 fn is_crockford_upper(b: u8) -> bool {

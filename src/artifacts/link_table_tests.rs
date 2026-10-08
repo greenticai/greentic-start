@@ -13,7 +13,7 @@ use super::boot::Door;
 use super::host_access::HostArtifactAccess;
 use super::ingest_testkit::{FakeStore, pipeline};
 use super::link::{Verdict, mint, verify};
-use super::link_table::{ArtifactLinkTable, LinkUnit};
+use super::link_table::{ArtifactLinkTable, LinkTableBuilder, LinkUnit};
 use super::store::HttpArtifactStore;
 use super::unit::{Off, UnitAttachments, UnitCell};
 
@@ -202,12 +202,127 @@ fn activation_builds_and_a_routing_only_reload_carries_the_table() {
         assert_eq!(BOOT.matches(needle).count(), 1, "`{needle}`");
         BOOT.find(needle).expect("present")
     };
-    let bound =
-        one("let unit_artifacts = unit_artifacts.map(|access| access.bound_to(&unit_cell));");
-    let build = one("crate::artifacts::link_table::LinkUnit::build(");
-    let routing = one(
-        "artifact_links: crate::artifacts::link_table::ArtifactLinkTable::new(artifact_links),",
-    );
-    assert!(bound < build && build < routing);
+    let shared = one("link_units.share_recent(deployment_id, access.bound_to(&unit_cell))");
+    let add = one("link_units.add_revision(");
+    let options = one("unit_artifacts.as_ref(),\n            )\n            .await;");
+    let routing = one("artifact_links: link_units.finish(),");
+    // The shared record is in place before the revision's port is built.
+    assert!(shared < add && add < options && options < routing);
     one("artifact_links: prev.artifact_links.clone(),");
+}
+
+fn put_ok_body() -> String {
+    format!(
+        r#"{{"id":"{ID}","sha256":"ff","size_bytes":2,"kind":"document","mime_type":"text/plain"}}"#
+    )
+}
+
+fn stub_access(
+    stub: &crate::interop::metering::testkit::StubAdmin,
+    token: &str,
+) -> HostArtifactAccess {
+    let store = HttpArtifactStore::new(stub.url.clone(), token.into(), Duration::from_secs(2))
+        .expect("client");
+    HostArtifactAccess::new(
+        Arc::new(store),
+        Door {
+            url: stub.url.clone(),
+            token: token.into(),
+        },
+    )
+}
+
+/// A traffic split: two revisions of ONE deployment. A file the canary
+/// revision's extension creates is linkable, because every revision of a
+/// deployment writes into the deployment's one provenance record.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_put_on_the_second_revision_of_a_split_is_linkable() {
+    use greentic_ext_runtime::host_ports::{ArtifactPutRequest, HostCallContext};
+
+    let stub = crate::interop::metering::testkit::StubAdmin::answering(
+        "HTTP/1.1 200 OK",
+        "",
+        &put_ok_body(),
+    )
+    .await;
+    let metering = metering_with_token("http://127.0.0.1:9/x", TEST_TOKEN);
+    let deployment = DeploymentId::new();
+    let mut builder = LinkTableBuilder::default();
+    let (cell_a, cell_b) = (enabled(), enabled());
+    for cell in [&cell_a, &cell_b] {
+        let shared =
+            builder.share_recent(deployment, stub_access(&stub, TEST_TOKEN).bound_to(cell));
+        let metering = builder.needs_signer(&deployment).then_some(&metering);
+        builder.add_revision(deployment, metering, &shared, cell, "b1");
+        if Arc::ptr_eq(cell, &cell_b) {
+            let port = shared.port();
+            let ctx = HostCallContext {
+                tenant: Some(TEST_TENANT.into()),
+                ..Default::default()
+            };
+            tokio::task::spawn_blocking(move || {
+                port.put(
+                    "greentic.media",
+                    &ctx,
+                    ArtifactPutRequest {
+                        bytes: b"hi".to_vec(),
+                        mime_type: "text/plain".into(),
+                        name: "a.txt".into(),
+                    },
+                )
+            })
+            .await
+            .expect("join")
+            .expect("stored");
+        }
+    }
+    let table = builder.finish();
+    let unit = table.get(&deployment).expect("signer");
+    assert!(unit.recent.lookup(ID, unix_now(), 60).is_some());
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+}
+
+/// The signer serves while ANY revision of the deployment has attachments
+/// on: the first revision's door may be down while the canary's is up.
+#[test]
+fn the_gate_follows_every_revision_of_the_deployment() {
+    let metering = metering_with_token("http://127.0.0.1:9/x", TEST_TOKEN);
+    let deployment = DeploymentId::new();
+    let first = Arc::new(UnitCell::new(UnitAttachments::Off(Off::DoorUnavailable)));
+    let second = enabled();
+    let mut builder = LinkTableBuilder::default();
+    for cell in [&first, &second] {
+        let shared = builder.share_recent(deployment, access(TEST_TOKEN).bound_to(cell));
+        let metering = builder.needs_signer(&deployment).then_some(&metering);
+        builder.add_revision(deployment, metering, &shared, cell, "b1");
+    }
+    let table = builder.finish();
+    assert!(
+        table.get(&deployment).is_some(),
+        "second revision is enabled"
+    );
+    second.set(UnitAttachments::Off(Off::NotGranted));
+    assert!(table.get(&deployment).is_none(), "no revision is enabled");
+    first.set(UnitAttachments::Enabled {
+        pipeline: Arc::new(pipeline(vec![], Arc::new(FakeStore::default()))),
+    });
+    assert!(table.get(&deployment).is_some(), "first revision recovered");
+}
+
+/// Each deployment keeps its own record even through the builder.
+#[test]
+fn two_deployments_never_share_a_record() {
+    let mut builder = LinkTableBuilder::default();
+    let (a, b) = (DeploymentId::new(), DeploymentId::new());
+    let ra = builder.share_recent(a, access(TEST_TOKEN)).recent_puts();
+    let ra2 = builder.share_recent(a, access(TEST_TOKEN)).recent_puts();
+    let rb = builder.share_recent(b, access(TEST_TOKEN)).recent_puts();
+    assert!(Arc::ptr_eq(&ra, &ra2));
+    assert!(!Arc::ptr_eq(&ra, &rb));
 }

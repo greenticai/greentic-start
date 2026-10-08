@@ -30,9 +30,11 @@ use crate::operator_log;
 pub(crate) struct LinkUnit {
     pub key: LinkKey,
     pub reader: Arc<dyn ArtifactReader>,
+    /// The DEPLOYMENT's record: every revision of a traffic split writes here.
     pub recent: Arc<RecentPuts>,
-    /// The unit's live attachments decision (a re-probe may turn it off).
-    pub cell: Weak<UnitCell>,
+    /// Each revision's live attachments decision (a re-probe may change it).
+    /// The signer serves while any of them is enabled.
+    pub cells: Vec<Weak<UnitCell>>,
     /// The deployment ULID as text, as it appears in the link path.
     pub deployment: String,
 }
@@ -77,15 +79,16 @@ impl LinkUnit {
             ),
             reader,
             recent: access.recent_puts(),
-            cell: Arc::downgrade(cell),
+            cells: vec![Arc::downgrade(cell)],
             deployment,
         })
     }
 
     fn enabled(&self) -> bool {
-        self.cell
-            .upgrade()
-            .is_some_and(|cell| matches!(*cell.current(), UnitAttachments::Enabled { .. }))
+        self.cells.iter().any(|cell| {
+            cell.upgrade()
+                .is_some_and(|cell| matches!(*cell.current(), UnitAttachments::Enabled { .. }))
+        })
     }
 }
 
@@ -95,6 +98,67 @@ fn unavailable(bundle_id: &str, reason: &str) {
         module_path!(),
         format!("artifact_links_unavailable for unit `{bundle_id}` ({reason})"),
     );
+}
+
+/// Builds the table during activation, one revision at a time.
+///
+/// A deployment may run several revisions at once (a traffic split). They
+/// share the unit's token, so ONE signer per deployment, but each revision
+/// has its own access and its own attachments decision. So every revision's
+/// access is given the deployment's one provenance record (a file the canary
+/// creates is as linkable as one the stable revision creates), and the signer
+/// is gated on every revision's decision.
+#[derive(Default)]
+pub(crate) struct LinkTableBuilder {
+    units: HashMap<DeploymentId, LinkUnit>,
+    recent: HashMap<DeploymentId, Arc<RecentPuts>>,
+}
+
+impl LinkTableBuilder {
+    /// `access` writing into `deployment`'s one provenance record. Call it
+    /// before the revision's port is built.
+    pub(crate) fn share_recent(
+        &mut self,
+        deployment: DeploymentId,
+        access: HostArtifactAccess,
+    ) -> HostArtifactAccess {
+        let recent = self.recent.entry(deployment).or_default();
+        access.with_recent(Arc::clone(recent))
+    }
+
+    /// `true` until a signer is built for `deployment` (then the metering
+    /// block need not be read again).
+    pub(crate) fn needs_signer(&self, deployment: &DeploymentId) -> bool {
+        !self.units.contains_key(deployment)
+    }
+
+    /// Adds one revision: builds the deployment's signer when there is none
+    /// yet, otherwise gates the existing signer on this revision's decision.
+    pub(crate) fn add_revision(
+        &mut self,
+        deployment: DeploymentId,
+        metering: Option<&MeteringConfig>,
+        access: &HostArtifactAccess,
+        cell: &Arc<UnitCell>,
+        bundle_id: &str,
+    ) {
+        if let Some(unit) = self.units.get_mut(&deployment) {
+            unit.cells.push(Arc::downgrade(cell));
+            return;
+        }
+        if let Some(unit) = LinkUnit::build(metering, access, cell, bundle_id, deployment) {
+            self.units.insert(deployment, unit);
+        }
+    }
+
+    pub(crate) fn finish(self) -> ArtifactLinkTable {
+        ArtifactLinkTable::new(
+            self.units
+                .into_iter()
+                .map(|(id, unit)| (id, Arc::new(unit)))
+                .collect(),
+        )
+    }
 }
 
 /// Every unit's signer, keyed by deployment. Revision-derived like

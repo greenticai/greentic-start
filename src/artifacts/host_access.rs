@@ -66,6 +66,13 @@ impl HostArtifactAccess {
         }
     }
 
+    /// Writes into `recent` instead of this access's own record: every
+    /// revision of one deployment shares the deployment's record.
+    pub(crate) fn with_recent(mut self, recent: Arc<RecentPuts>) -> Self {
+        self.recent = recent;
+        self
+    }
+
     /// The record of what this unit's port created (outbound link provenance).
     pub(crate) fn recent_puts(&self) -> Arc<RecentPuts> {
         Arc::clone(&self.recent)

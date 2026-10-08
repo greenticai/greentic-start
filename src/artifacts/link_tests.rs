@@ -273,3 +273,12 @@ fn links_enabled_from_applies_the_code_default() {
     assert_eq!(links_enabled_from(None), OUTBOUND_LINKS_ENABLED);
     assert!(links_enabled_from(Some("on")));
 }
+
+/// A link path's MAC is a bearer secret: `{:?}` must never print it.
+#[test]
+fn debug_of_a_link_path_never_prints_the_mac() {
+    let link = minted();
+    let printed = format!("{link:?} {link:#?}");
+    assert!(!printed.contains(&link.mac_hex), "{printed}");
+    assert!(printed.contains(DEPLOYMENT), "{printed}");
+}

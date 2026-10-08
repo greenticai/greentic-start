@@ -434,7 +434,7 @@ pub(crate) async fn activate_runtime_config(
     let mut meter_decisions =
         crate::interop::metering::runtime_meter::UnitMeterDecisions::default();
     let mut attachments = HashMap::new();
-    let mut artifact_links = HashMap::new();
+    let mut link_units = crate::artifacts::link_table::LinkTableBuilder::default();
     // Inbound attachments, decided for every revision (carried ones included)
     // from the unit's staged metering block, all doors probed side by side
     // (each probe bounded), before any revision loads. A misconfigured door
@@ -691,31 +691,31 @@ pub(crate) async fn activate_runtime_config(
                 crate::artifacts::recovery::RECOVERY_BACKOFF,
             );
         }
-        let unit_artifacts = unit_artifacts.map(|access| access.bound_to(&unit_cell));
-        // The unit's signed-link signer (docs/outbound-artifacts.md). Two
-        // revisions of one deployment (a traffic split) share the unit's token
-        // and therefore its key, so the first revision's entry stands.
-        if let Some(access) = unit_artifacts.as_ref()
-            && !artifact_links.contains_key(&deployment_id)
-        {
-            let metering = meter_decisions
-                .metering_for(
-                    host.secrets_manager().as_ref(),
-                    &secrets_env,
-                    &meta.tenant,
-                    &meta.bundle_id,
-                )
-                .await;
-            let unit = crate::artifacts::link_table::LinkUnit::build(
+        // The unit's signed-link signer (docs/outbound-artifacts.md). Every
+        // revision of one deployment (a traffic split) writes into the
+        // deployment's one provenance record and gates its one signer.
+        let unit_artifacts = unit_artifacts
+            .map(|access| link_units.share_recent(deployment_id, access.bound_to(&unit_cell)));
+        if let Some(access) = unit_artifacts.as_ref() {
+            let metering = if link_units.needs_signer(&deployment_id) {
+                meter_decisions
+                    .metering_for(
+                        host.secrets_manager().as_ref(),
+                        &secrets_env,
+                        &meta.tenant,
+                        &meta.bundle_id,
+                    )
+                    .await
+            } else {
+                None
+            };
+            link_units.add_revision(
+                deployment_id,
                 metering.as_ref(),
                 access,
                 &unit_cell,
                 &meta.bundle_id,
-                deployment_id,
             );
-            if let Some(unit) = unit {
-                artifact_links.insert(deployment_id, Arc::new(unit));
-            }
         }
         attachments.insert((deployment_id, revision_id), unit_cell);
 
@@ -804,7 +804,7 @@ pub(crate) async fn activate_runtime_config(
         triggers: crate::triggers::TriggerTable::build(trigger_entries, &trigger_prefixes),
         runtime_metered: meter_decisions.into_metered(),
         attachments: crate::artifacts::unit::AttachmentsTable::new(attachments),
-        artifact_links: crate::artifacts::link_table::ArtifactLinkTable::new(artifact_links),
+        artifact_links: link_units.finish(),
     };
 
     // Commit only now that every revision loaded: `retained` holds exactly the
