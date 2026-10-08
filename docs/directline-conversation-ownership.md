@@ -55,9 +55,17 @@ Verified-vs-verified isolation needs the new provider pack.
 
 The 30 s `POST /conversations` dedup cache (`src/conv_dedup.rs`) returns a
 cached response — which carries a BOUND token — only to a request presenting
-the same bearer as the one that created it. A request without a bearer is not
-deduplicated. The key hashes the bearer the caller sent, before start's
-session preflight may re-mint it.
+the same bearer as the one that created it. The key holds a domain-separated
+SHA-256 of the bearer the caller sent (`greentic-start/conv-dedup/v1\0` +
+token), taken before start's session preflight may re-mint it.
+
+A request without a bearer is not deduplicated. That includes every create on
+a provider with no `jwt_signing_key` configured (`SigningKey::NotConfigured`,
+Direct Line auth off) whose client sends no `Authorization` header: there the
+racing double-create this cache exists for is back, and two near-simultaneous
+`createDirectLine` calls start two conversations. Before this change such
+requests were keyed on `user.id` alone, which is what let one caller receive
+another's conversation; keying them on nothing is the price of closing that.
 
 ## No switch, and what that means for a `tokenUrl` embed
 

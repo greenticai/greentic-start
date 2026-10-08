@@ -42,7 +42,8 @@ pub struct DedupKey {
     /// target the same deployment within the TTL, they must mint distinct
     /// conversations rather than returning the cached response from the first.
     pub flow_hint: Option<String>,
-    /// SHA-256 of the bearer the CREATING request presented. The cached
+    /// Domain-separated SHA-256 ([`bearer_fingerprint`]) of the bearer the
+    /// CREATING request presented. The cached
     /// response carries a token bound to the new conversation, so it may go
     /// back only to the caller that created it; `user.id` alone is chosen by
     /// the client and would hand one caller's conversation to another.
@@ -121,13 +122,22 @@ pub fn extract_user_id(body: &[u8]) -> Option<String> {
     Some(id.to_string())
 }
 
-/// SHA-256 of the raw bearer (after `Bearer `); `None` without one, which
+/// Domain prefix of [`bearer_fingerprint`], so the value is specific to this
+/// cache and never equals a SHA-256 another component computes over the same
+/// token. Changing it only empties the 30 s cache.
+const BEARER_FINGERPRINT_DOMAIN: &[u8] = b"greentic-start/conv-dedup/v1\0";
+
+/// Domain-separated SHA-256 of the raw bearer (after `Bearer `); `None`
+/// without one, which
 /// disables dedup for that request rather than sharing a bucket.
 /// Parsed exactly as the session preflight parses it, so the two never
 /// disagree about which token a request presented.
 pub fn bearer_fingerprint(headers: &[(String, String)]) -> Option<[u8; 32]> {
     let token = crate::directline_session::bearer(headers)?;
-    Some(Sha256::digest(token.as_bytes()).into())
+    let mut hasher = Sha256::new();
+    hasher.update(BEARER_FINGERPRINT_DOMAIN);
+    hasher.update(token.as_bytes());
+    Some(hasher.finalize().into())
 }
 
 /// The dedup key for a `POST /conversations`, or `None` when the request
@@ -333,8 +343,14 @@ mod tests {
     }
 
     #[test]
-    fn the_fingerprint_is_a_hash_of_the_bearer_not_the_bearer() {
+    fn the_fingerprint_is_a_domain_separated_hash_of_the_bearer() {
         let fp = bearer_fingerprint(&bearer("secret-token")).expect("fingerprint");
-        assert_eq!(fp, <[u8; 32]>::from(Sha256::digest(b"secret-token")));
+        let mut domain = Sha256::new();
+        domain.update(b"greentic-start/conv-dedup/v1\0");
+        domain.update(b"secret-token");
+        assert_eq!(fp, <[u8; 32]>::from(domain.finalize()));
+        // Not the bare SHA-256 of the token: a value computed for this cache
+        // must not equal one any other component computes over the same token.
+        assert_ne!(fp, <[u8; 32]>::from(Sha256::digest(b"secret-token")));
     }
 }
