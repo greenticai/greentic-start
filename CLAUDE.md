@@ -129,7 +129,7 @@ Crate version 1.2.0-dev.0, edition 2024, Rust 1.95.0 (pinned via `rust-toolchain
 | `GREENTIC_RUNNER_SESSION_WAIT_TTL_SECS` | How long a parked conversation survives (default `86400`; `0` disables expiry) |
 | `GREENTIC_REVISION_PIN_REDIS_URL` | Revision affinity. Set it whenever durable sessions are on and more than one revision serves traffic |
 | `GREENTIC_TYPING_SIGNAL` | Channel "is typing" signal via the optional provider op `send_typing`. Default on; `0`/`false`/`no`/`off` disable it. See [docs/typing-signal.md](docs/typing-signal.md) |
-| `GREENTIC_TRUSTED_PROXY_HOPS` | Proxies in front of this host that append to `X-Forwarded-For` (default `0`: the TCP peer is the client). Set it behind a load balancer or every client shares one upload rate limit. See [docs/inbound-attachments.md](docs/inbound-attachments.md) |
+| `GREENTIC_TRUSTED_PROXY_HOPS` | Proxies in front of this host that append to `X-Forwarded-For` (default `1` on Cloud Run, else `0`: the TCP peer is the client). An explicit value wins; unparsable is `0`. Set it behind another load balancer or every client shares one upload rate limit. See [docs/inbound-attachments.md](docs/inbound-attachments.md) |
 | `GREENTIC_ATTACHMENT_ALLOWED_HOSTS` | Extra credential-less attachment download hosts; never widens a credential's host list |
 | `GREENTIC_PDF_WORKER_SLOTS` / `GREENTIC_PDF_WORKER_MEM_MB` | PDF text-extraction workers at once (1..4, default 1) and their memory limit (64..1024 MiB, default 320) |
 

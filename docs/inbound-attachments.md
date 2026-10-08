@@ -221,7 +221,7 @@ slot gets a `door_unavailable` note and inline bytes are cleared.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GREENTIC_TRUSTED_PROXY_HOPS` | `0` | How many proxies in front of this host append to `X-Forwarded-For`. `0` uses the TCP peer and ignores the header. Behind a load balancer set it (usually `1`), or every client shares the balancer's upload limit (10/min, one at a time for everyone). Unparsable = `0` |
+| `GREENTIC_TRUSTED_PROXY_HOPS` | `1` on Cloud Run (`K_SERVICE` set), else `0` | How many proxies in front of this host append to `X-Forwarded-For`; the client is the N-th entry from the right. `0` uses the TCP peer and ignores the header. An explicit value always wins, `0` included; an unparsable value is `0` (warned once), never the platform default; an empty value is unset. Cloud Run's default rests on its front end appending the address it received the connection from (documented behaviour, not yet measured here). Elsewhere behind a load balancer set it (usually `1`). The effective count and its source are logged once |
 | `GREENTIC_ATTACHMENT_ALLOWED_HOSTS` | empty | Extra credential-less download hosts (section 3) |
 | `GREENTIC_PDF_WORKER_SLOTS` | `1` (1..4) | PDF workers at once; also the process-wide text-extraction slots |
 | `GREENTIC_PDF_WORKER_MEM_MB` | `320` (64..1024) | Memory limit of one PDF worker |
@@ -313,7 +313,9 @@ registry (only after this host is live). Cross-repo work this needs:
   step with `PUBLIC_HOSTS` here; the WebChat upload emitting one of the two
   `inline` shapes;
 - measured Slack/Webex CDN hosts before widening the credential lists;
-- deploy lanes set `GREENTIC_TRUSTED_PROXY_HOPS` (Cloud Run, k8s, ALB);
+- deploy lanes set `GREENTIC_TRUSTED_PROXY_HOPS` where a proxy appends to
+  `X-Forwarded-For` (k8s with an appending ingress, ALB); Cloud Run needs
+  nothing (one hop by default);
 - greentic-designer: the start pin in `Dockerfile.tools` moves; re-affirm
   `agent_tool_reach::DEPLOYED_RUNTIME_CALLS_A2A`, `RUNTIME_SERVES_TRIGGERS` and
   the playbook verdict there, per its CLAUDE.md;
