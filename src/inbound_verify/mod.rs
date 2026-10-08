@@ -25,6 +25,7 @@
 //!   Bot Framework endorsement mismatch). Never downgraded, and there is no
 //!   switch to turn the check off once configured.
 
+mod absent_memo;
 mod bf_keys;
 mod bot_framework;
 mod hmac_channels;
@@ -153,6 +154,8 @@ pub(crate) struct Deps<'a> {
     /// Exact extra hosts a Teams `serviceUrl` may name
     /// (`service_url::EXTRA_HOSTS_ENV`).
     pub teams_service_hosts: &'a [String],
+    /// Recently observed "no secret" answers (`absent_memo`).
+    pub absent_memo: &'a absent_memo::AbsentMemo,
 }
 
 /// Verify one inbound request. `Err` is the refusal response, with fixed text.
@@ -171,6 +174,7 @@ pub(crate) async fn verify_inbound(
                 .map(|source| source as &dyn bot_framework::BfKeys),
             now: unix_now(),
             teams_service_hosts: service_url::extra_hosts(),
+            absent_memo: absent_memo::AbsentMemo::production(),
         },
     )
     .await
@@ -292,6 +296,16 @@ async fn channel_secret(
     deps: &Deps<'_>,
     names: &[&str],
 ) -> Result<Option<secrets::ChannelSecret>, Unavailable> {
+    let memo_key = absent_memo::AbsentMemo::key(
+        deps.env,
+        inbound.tenant,
+        inbound.pack_id,
+        inbound.unit_id,
+        names,
+    );
+    if deps.absent_memo.recently_absent(&memo_key, deps.now) {
+        return Ok(None);
+    }
     match secrets::read_channel_secret(
         deps.secrets,
         deps.env,
@@ -303,7 +317,10 @@ async fn channel_secret(
     .await
     {
         secrets::SecretRead::Found(secret) => Ok(Some(secret)),
-        secrets::SecretRead::Absent => Ok(None),
+        secrets::SecretRead::Absent => {
+            deps.absent_memo.record(memo_key, deps.now);
+            Ok(None)
+        }
         secrets::SecretRead::Unavailable => Err(Unavailable::SecretStore),
     }
 }
@@ -358,6 +375,9 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
+#[path = "absent_memo_tests.rs"]
+mod absent_memo_tests;
 #[cfg(test)]
 #[path = "bot_framework_tests.rs"]
 mod bot_framework_tests;

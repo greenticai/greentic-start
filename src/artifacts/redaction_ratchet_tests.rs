@@ -103,6 +103,10 @@ const FILES: &[(&str, &str)] = &[
     ("artifacts/unserved.rs", include_str!("unserved.rs")),
     ("artifacts/wire.rs", include_str!("wire.rs")),
     (
+        "inbound_verify/absent_memo.rs",
+        include_str!("../inbound_verify/absent_memo.rs"),
+    ),
+    (
         "inbound_verify/bf_keys.rs",
         include_str!("../inbound_verify/bf_keys.rs"),
     ),

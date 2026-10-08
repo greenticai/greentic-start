@@ -62,6 +62,7 @@ pub(super) fn deps<'a>(secrets: &'a DynSecretsManager, notices: &'a Notices) -> 
         bf_keys: None,
         now: 0,
         teams_service_hosts: &[],
+        absent_memo: Box::leak(Box::default()),
     }
 }
 
