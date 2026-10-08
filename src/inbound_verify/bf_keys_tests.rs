@@ -363,3 +363,86 @@ fn the_production_client_is_locked_down() {
     assert!(base.contains(".no_proxy()"));
     assert!(base.contains(".timeout(FETCH_TIMEOUT)"));
 }
+
+/// Review G4 #1: a follower that waited on a leader whose fetch succeeded
+/// must not be told `Unavailable` (admitted unverified) for a forged `kid`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_forged_kids_after_a_successful_fetch_are_all_unknown() {
+    let stub = Stub::serve_after(std::time::Duration::from_millis(200), |port| {
+        vec![
+            ("/meta", metadata(&format!("http://127.0.0.1:{port}/keys"))),
+            ("/keys", key_set(vec![rsa_key("k1", &["msteams"])])),
+        ]
+    })
+    .await;
+    let source = Arc::new(source_for(&stub));
+    let lookups: Vec<_> = (0..10)
+        .map(|i| {
+            let source = Arc::clone(&source);
+            tokio::spawn(async move { source.key(&format!("forged-{i}")).await })
+        })
+        .collect();
+    let mut unavailable = 0;
+    for lookup in lookups {
+        let got = lookup.await.expect("task");
+        assert!(!matches!(got, BfKeyLookup::Found(_)));
+        if is_unavailable(&got) {
+            unavailable += 1;
+        }
+    }
+    assert_eq!(unavailable, 0, "a forged kid was admitted unverified");
+    assert_eq!((stub.hits("/meta"), stub.hits("/keys")), (1, 1));
+}
+
+/// Review G4 #2: with no trusted key set, a lookup inside the refresh floor
+/// is `Unavailable`, never a refusal: a Bot Framework outage must not turn
+/// every genuine token into a `401`.
+#[tokio::test]
+async fn an_outage_on_a_cold_start_is_unavailable_inside_the_floor_too() {
+    let stub = Stub::serve(|_| vec![("/meta", status("503 Service Unavailable", "", "{}"))]).await;
+    let source = source_for(&stub);
+    assert!(is_unavailable(&source.key("k1").await));
+    for _ in 0..5 {
+        assert!(is_unavailable(&source.key("k1").await), "refused in outage");
+    }
+    assert_eq!(stub.total(), 1, "the floor still holds the retry storm");
+}
+
+/// Review G4 #2: a key set older than its TTL is no longer trusted; an
+/// outage then is `Unavailable` too, inside the floor and out of it.
+#[tokio::test]
+async fn an_outage_after_the_ttl_expired_is_unavailable() {
+    let Some(long_ago) = Instant::now().checked_sub(Duration::from_secs(13 * 3600)) else {
+        return; // a host up for less than 13 h cannot express the past here
+    };
+    let stub = Stub::serve(|_| vec![("/meta", status("503 Service Unavailable", "", "{}"))]).await;
+    let source = source_for(&stub);
+    let stale = found(standard_key_lookup().await).expect("a key to seed");
+    source.cache.store_keys(
+        &source.metadata_url,
+        HashMap::from([("k1".to_string(), stale)]),
+        long_ago,
+    );
+    assert!(is_unavailable(&source.key("k1").await));
+    assert!(is_unavailable(&source.key("k1").await), "inside the floor");
+    assert!(
+        is_unavailable(&source.key("other").await),
+        "inside the floor"
+    );
+}
+
+/// A trusted (fresh) key set still refuses an unknown kid inside the floor.
+#[tokio::test]
+async fn a_fresh_key_set_still_refuses_an_unknown_kid_inside_the_floor() {
+    let stub = standard_stub().await;
+    let source = source_for(&stub);
+    assert!(found(source.key("k1").await).is_some());
+    assert!(is_unknown(&source.key("nope-1").await));
+    assert!(is_unknown(&source.key("nope-2").await));
+    assert_eq!(stub.total(), 2);
+}
+
+async fn standard_key_lookup() -> BfKeyLookup {
+    let stub = standard_stub().await;
+    source_for(&stub).key("k1").await
+}

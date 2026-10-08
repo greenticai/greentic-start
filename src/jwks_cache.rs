@@ -108,6 +108,17 @@ impl<V: Clone> JwksCache<V> {
         Lookup::Fetch
     }
 
+    /// Whether a key set read successfully within the positive TTL is held
+    /// for `issuer`. A miss against such a set PROVES the `kid` is not the
+    /// issuer's; a miss with none proves nothing (the issuer may be down).
+    pub(crate) fn has_trusted_keys(&self, issuer: &str, now: Instant) -> bool {
+        self.entries.get(issuer).is_some_and(|entry| {
+            entry
+                .keys_fetched_at
+                .is_some_and(|at| now.duration_since(at) < self.policy.positive_ttl)
+        })
+    }
+
     /// Record a successful fetch, replacing whatever was held.
     pub(crate) fn store_keys(&self, issuer: &str, keys: HashMap<String, V>, now: Instant) {
         self.entries.insert(

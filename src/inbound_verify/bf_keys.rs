@@ -150,27 +150,36 @@ impl BfKeySource {
         base_builder()
     }
 
+    /// A key for `kid`. `UnknownKid` only when a TRUSTED key set (read within
+    /// its TTL) lacks it; with none held the answer is `Unavailable` whether
+    /// the floor holds the fetch back or the fetch failed, so an outage never
+    /// refuses a genuine token and a follower of a successful fetch never
+    /// admits a forged one.
     pub(crate) async fn key(&self, kid: &str) -> BfKeyLookup {
         let space = self.metadata_url.as_str();
         match self.cache.lookup(space, kid, Instant::now()) {
             Lookup::Hit(key) => return BfKeyLookup::Found(key),
-            Lookup::Refuse => return BfKeyLookup::UnknownKid,
+            Lookup::Refuse => return self.miss(space),
             Lookup::Fetch => {}
         }
-        let fetched = self.refresh_once().await;
+        self.refresh_once().await;
         match self.cache.lookup(space, kid, Instant::now()) {
             Lookup::Hit(key) => BfKeyLookup::Found(key),
-            // Only a fetch THIS task led and that succeeded proves the key set
-            // lacks the kid; a follower takes the conservative answer.
-            _ if fetched == Some(true) => BfKeyLookup::UnknownKid,
-            _ => BfKeyLookup::Unavailable,
+            _ => self.miss(space),
+        }
+    }
+
+    fn miss(&self, space: &str) -> BfKeyLookup {
+        if self.cache.has_trusted_keys(space, Instant::now()) {
+            BfKeyLookup::UnknownKid
+        } else {
+            BfKeyLookup::Unavailable
         }
     }
 
     /// At most one fetch across concurrent callers (same shape as the MCP
-    /// key set's `refresh_once`). `Some(ok)` for the leader, `None` for a
-    /// follower.
-    async fn refresh_once(&self) -> Option<bool> {
+    /// key set's `refresh_once`). The outcome is read back from the cache.
+    async fn refresh_once(&self) {
         let space = self.metadata_url.clone();
         // The shard guard is released at the end of this match, before any
         // await.
@@ -186,7 +195,7 @@ impl BfKeySource {
             let _ =
                 tokio::time::timeout(2 * FETCH_TIMEOUT + Duration::from_secs(1), receiver.recv())
                     .await;
-            return None;
+            return;
         };
         // Drops LAST, after the cache write and the broadcast, on every exit.
         let _guard = InFlightGuard {
@@ -195,18 +204,11 @@ impl BfKeySource {
         };
         let fetched = self.fetch().await;
         let now = Instant::now();
-        let ok = match fetched {
-            Some(keys) => {
-                self.cache.store_keys(&space, keys, now);
-                true
-            }
-            None => {
-                self.cache.store_failed_attempt(&space, now);
-                false
-            }
-        };
+        match fetched {
+            Some(keys) => self.cache.store_keys(&space, keys, now),
+            None => self.cache.store_failed_attempt(&space, now),
+        }
         let _ = tx.send(());
-        Some(ok)
     }
 
     async fn fetch(&self) -> Option<HashMap<String, BfKey>> {
