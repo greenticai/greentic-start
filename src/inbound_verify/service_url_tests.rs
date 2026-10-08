@@ -173,3 +173,123 @@ async fn an_operator_host_is_admitted_only_when_listed() {
     .expect_err("not listed");
     assert_eq!(refused.status(), hyper::StatusCode::FORBIDDEN);
 }
+
+const APP_ID: &str = "9f6b3c2e-1d4a-4b7f-8e2a-5c1d0e9f7a3b";
+const NOW: u64 = 1_800_000_000;
+/// A real Microsoft host outside the built-in list (US Government GCC).
+const GCC_SERVICE_URL: &str = "https://smba.infra.gcc.teams.microsoft.com/teams/";
+
+struct OneKey;
+
+#[async_trait::async_trait]
+impl super::bot_framework::BfKeys for OneKey {
+    async fn key(&self, kid: &str) -> super::bf_keys::BfKeyLookup {
+        use crate::interop::mcp::testkit::{TEST_JWKS_E, TEST_JWKS_N};
+        if kid != "k" {
+            return super::bf_keys::BfKeyLookup::UnknownKid;
+        }
+        super::bf_keys::BfKeyLookup::Found(super::bf_keys::BfKey {
+            key: std::sync::Arc::new(
+                jsonwebtoken::DecodingKey::from_rsa_components(TEST_JWKS_N, TEST_JWKS_E)
+                    .expect("key"),
+            ),
+            endorsements: vec!["msteams".to_string()].into(),
+        })
+    }
+}
+
+fn signed_token(service_url: &str) -> String {
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some("k".to_string());
+    jsonwebtoken::encode(
+        &header,
+        &json!({
+            "iss": super::bf_keys::BF_ISSUER,
+            "aud": APP_ID,
+            "exp": NOW + 3600,
+            "nbf": NOW - 60,
+            "serviceurl": service_url,
+        }),
+        &jsonwebtoken::EncodingKey::from_rsa_pem(
+            crate::interop::mcp::testkit::TEST_PRIVATE_KEY_PEM.as_bytes(),
+        )
+        .expect("test key"),
+    )
+    .expect("token")
+}
+
+fn app_id_config() -> std::collections::BTreeMap<String, serde_json::Value> {
+    std::collections::BTreeMap::from([("ms_bot_app_id".to_string(), json!(APP_ID))])
+}
+
+/// Re-review G4 I2: on a VERIFIED activity the signed `serviceurl` claim
+/// already matched the activity's `serviceUrl`, so the host list adds nothing
+/// and would refuse genuine Microsoft hosts (GCC). It is not applied.
+#[tokio::test]
+async fn a_verified_teams_activity_to_a_host_outside_the_list_is_admitted() {
+    let secrets = empty_store();
+    let (notices, _) = Notices::recording();
+    let body = teams_body(GCC_SERVICE_URL);
+    let headers = vec![(
+        "authorization".to_string(),
+        format!("Bearer {}", signed_token(GCC_SERVICE_URL)),
+    )];
+    let config = app_id_config();
+    let mut request = inbound(
+        "messaging.teams",
+        "POST",
+        &headers,
+        &body,
+        DeploymentId::new(),
+    );
+    request.pack_non_secret = Some(&config);
+    let keys = OneKey;
+    let mut with_keys = deps(&secrets, &notices);
+    with_keys.bf_keys = Some(&keys);
+    with_keys.now = NOW;
+    let verdict = verify_with(request, &with_keys)
+        .await
+        .expect("a verified activity is admitted");
+    assert_eq!(verdict, Verdict::Verified);
+}
+
+/// Re-review G4 I2: verification UNAVAILABLE (app id set, no key set) still
+/// gets the host list: nothing proved who named that `serviceUrl`.
+#[tokio::test]
+async fn an_unavailable_teams_activity_to_a_host_outside_the_list_is_refused() {
+    let secrets = empty_store();
+    let (notices, _) = Notices::recording();
+    let body = teams_body(GCC_SERVICE_URL);
+    let headers = vec![(
+        "authorization".to_string(),
+        format!("Bearer {}", signed_token(GCC_SERVICE_URL)),
+    )];
+    let config = app_id_config();
+    let mut request = inbound(
+        "messaging.teams",
+        "POST",
+        &headers,
+        &body,
+        DeploymentId::new(),
+    );
+    request.pack_non_secret = Some(&config);
+    let mut no_keys = deps(&secrets, &notices);
+    no_keys.now = NOW;
+    let refused = verify_with(request, &no_keys).await.expect_err("refused");
+    assert_eq!(refused.status(), hyper::StatusCode::FORBIDDEN);
+}
+
+/// Not configured (no app id) and a host outside the list: refused.
+#[tokio::test]
+async fn a_not_configured_teams_activity_to_a_microsoft_host_outside_the_list_is_refused() {
+    let secrets = empty_store();
+    let (notices, _) = Notices::recording();
+    let body = teams_body(GCC_SERVICE_URL);
+    let refused = verify_with(
+        inbound("messaging.teams", "POST", &[], &body, DeploymentId::new()),
+        &deps(&secrets, &notices),
+    )
+    .await
+    .expect_err("refused");
+    assert_eq!(refused.status(), hyper::StatusCode::FORBIDDEN);
+}

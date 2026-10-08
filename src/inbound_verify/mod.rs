@@ -349,10 +349,14 @@ async fn teams(inbound: &Inbound<'_>, deps: &Deps<'_>) -> Outcome {
         bot_framework::BfOutcome::NotConfigured => Outcome::NotConfigured,
         bot_framework::BfOutcome::Unavailable => Outcome::Unavailable(Unavailable::KeySet),
     };
-    // Verified or not, the provider replies to `serviceUrl` with the bot's
-    // token: never let an activity name a host outside Bot Framework.
-    if service_url::classify(inbound.body, deps.teams_service_hosts)
-        == service_url::ServiceUrl::Refused
+    // The provider replies to `serviceUrl` with the bot's token. On a
+    // VERIFIED activity Microsoft signed that URL (the `serviceurl` claim
+    // matched it), so the host list adds nothing there and would refuse real
+    // Microsoft hosts (GCC). Unverified, nothing proved who named it: only
+    // Bot Framework's own hosts (and the operator's exact extras) may be.
+    if !matches!(outcome, Outcome::Verified)
+        && service_url::classify(inbound.body, deps.teams_service_hosts)
+            == service_url::ServiceUrl::Refused
     {
         return Outcome::Refused(RefusalCode::ServiceUrl);
     }

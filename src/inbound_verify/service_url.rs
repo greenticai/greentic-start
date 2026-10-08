@@ -4,8 +4,11 @@
 //! token. A request this host could not verify (no bot app id, key set
 //! unreachable) is still admitted, so without this check anyone could post an
 //! activity naming their own `serviceUrl` and receive the bot token. It runs on
-//! EVERY Teams activity, verified or not, after the token check
-//! (`super::teams`).
+//! every UNVERIFIED Teams activity (not configured, or verification
+//! unavailable), after the token check (`super::teams`). A VERIFIED activity
+//! skips it: its signed `serviceurl` claim already matched the activity's
+//! `serviceUrl`, and the list would only refuse genuine Microsoft hosts such
+//! as GCC's `smba.infra.gcc.teams.microsoft.com`.
 //!
 //! Allowed: `https`, no userinfo, no explicit port, a DNS name (never an IP
 //! literal) that is exactly [`EXACT_HOSTS`] or a subdomain of

@@ -218,13 +218,16 @@ provider op. Per channel, once its input is configured:
   (the token is checked in full against it); a `kid` it lacks, or a set older
   than 7 days, is unavailable. So an outage longer than the TTL does not admit
   every Teams activity unverified.
-- Teams `serviceUrl`, on EVERY activity (verified or not): the provider
-  replies there with the bot's token, so it must be `https`, with no userinfo
-  and no port, on `smba.trafficmanager.net` or a subdomain of
-  `botframework.com`, or a host listed exactly in
-  `GREENTIC_TEAMS_SERVICE_URL_HOSTS`. Anything else is `403`. Other
-  `*.trafficmanager.net` names are NOT accepted: any Azure customer can create
-  one.
+- Teams `serviceUrl`, on every UNVERIFIED activity (not configured, or
+  verification unavailable): the provider replies there with the bot's token,
+  so it must be `https`, with no userinfo and no port, on
+  `smba.trafficmanager.net` or a subdomain of `botframework.com`, or a host
+  listed exactly in `GREENTIC_TEAMS_SERVICE_URL_HOSTS`. Anything else is
+  `403`. Other `*.trafficmanager.net` names are NOT accepted: any Azure
+  customer can create one. A VERIFIED activity is not held to this list:
+  Microsoft signed its `serviceUrl` (the token's `serviceurl` claim must match
+  it), so a genuine Microsoft host outside the list, such as GCC's
+  `smba.infra.gcc.teams.microsoft.com`, is accepted there.
 - An absent secret is remembered for 10 s per channel scope, so a stream of
   unauthenticated POSTs costs at most one walk of the store per window. A
   stored secret is read on every request.
