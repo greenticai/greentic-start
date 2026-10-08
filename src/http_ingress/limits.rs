@@ -35,10 +35,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::revision_serve::MAX_BODY_BYTES;
 
-pub(crate) use super::client_key::ClientKey;
-#[cfg(test)]
-pub(crate) use super::client_key::client_key;
-use super::client_key::{trusted_proxy_hops, upload_client_key};
+use super::client_key::upload_client_key;
+pub(crate) use super::client_key::{ClientKey, client_key, trusted_proxy_hops};
 
 pub(crate) const UPLOAD_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const UPLOADS_PER_MINUTE: usize = 10;

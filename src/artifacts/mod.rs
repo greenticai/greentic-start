@@ -19,15 +19,23 @@ pub(crate) mod instance_check;
 pub(crate) mod label;
 pub(crate) mod legacy;
 pub(crate) mod limits;
+pub(crate) mod link;
+pub(crate) mod link_base;
+pub(crate) mod link_table;
 pub(crate) mod off;
 pub(crate) mod origin;
+pub(crate) mod outbound;
+pub(crate) mod outbound_shape;
 pub(crate) mod pdf_isolation;
 pub(crate) mod pdf_limits;
 pub(crate) mod port;
 pub(crate) mod provenance;
 pub(crate) mod quota_key;
+pub(crate) mod recent_puts;
 pub(crate) mod recovery;
 pub(crate) mod secrets;
+pub(crate) mod serve_link;
+pub(crate) mod serve_link_limits;
 pub(crate) mod sniff;
 pub(crate) mod store;
 pub(crate) mod unit;
@@ -83,7 +91,21 @@ mod legacy_tests;
 #[cfg(test)]
 mod limits_tests;
 #[cfg(test)]
+mod link_base_tests;
+#[cfg(test)]
+mod link_table_tests;
+#[cfg(test)]
+mod link_tests;
+#[cfg(test)]
+mod links_e2e_tests;
+#[cfg(test)]
 mod origin_tests;
+#[cfg(test)]
+mod outbound_legacy_tests;
+#[cfg(test)]
+mod outbound_side_tests;
+#[cfg(test)]
+mod outbound_tests;
 #[cfg(test)]
 mod pdf_fixture;
 #[cfg(all(test, target_os = "linux"))]
@@ -95,13 +117,23 @@ mod proxy_testkit;
 #[cfg(test)]
 mod quota_key_tests;
 #[cfg(test)]
+mod recent_puts_tests;
+#[cfg(test)]
 mod recovery_tests;
 #[cfg(test)]
 mod redaction_ratchet_tests;
 #[cfg(test)]
 mod redaction_tests;
 #[cfg(test)]
+mod round_trip_tests;
+#[cfg(test)]
 mod secrets_tests;
+#[cfg(test)]
+mod serve_link_limits_tests;
+#[cfg(test)]
+mod serve_link_testkit;
+#[cfg(test)]
+mod serve_link_tests;
 #[cfg(test)]
 mod sniff_tests;
 #[cfg(test)]

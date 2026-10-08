@@ -707,6 +707,7 @@ mod tests {
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
                 attachments: Default::default(),
+                artifact_links: Default::default(),
             }),
         }
     }
@@ -732,6 +733,7 @@ mod tests {
                 exe_path: None,
                 public_base_url: None,
                 public_url_capture: None,
+                tunnel_public_url: Default::default(),
             })
             .expect("placeholder server"),
         )

@@ -287,6 +287,7 @@ fn activation_full(
                 Default::default()
             },
             attachments: Default::default(),
+            artifact_links: Default::default(),
         }),
     };
     (activation, deployment_id, reads)
@@ -313,6 +314,7 @@ fn state_with(activation: Activation, interop: crate::interop::InteropState) -> 
         )),
         notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
         public_url_capture: None,
+        tunnel_public_url: Default::default(),
         interop,
         activity_source_override: None,
     })
@@ -1295,6 +1297,7 @@ fn activation_mounting(units: Vec<MountedUnit>) -> Activation {
             triggers: Default::default(),
             runtime_metered: Default::default(),
             attachments: Default::default(),
+            artifact_links: Default::default(),
         }),
     }
 }

@@ -74,8 +74,9 @@ const QUEUE_CAPACITY: usize = 1024;
 ///
 /// A newtype with a redacting [`std::fmt::Debug`], so no `{:?}` anywhere —
 /// including one in a crate that has never heard of this module — can print
-/// it. The plaintext is reachable only through [`MeteringToken::expose`],
-/// whose one caller is the header the POST sends.
+/// it. The plaintext is reachable only through [`MeteringToken::expose`]:
+/// the header the POST sends, and the one-way derivation of the unit's
+/// artifact-link key (`artifacts::link_table`), which never stores or prints it.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct MeteringToken(String);
 

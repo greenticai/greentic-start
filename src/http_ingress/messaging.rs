@@ -120,6 +120,8 @@ pub(super) fn route_messaging_envelopes(
             // `{{i18n:KEY}}` tokens.  Re-read the card from the pack and apply
             // i18n as a safety net.
             ensure_card_i18n_resolved(&mut out_envelope, &app_pack_path);
+            // No raw `artifact://` url leaves this host (docs/outbound-artifacts.md).
+            crate::artifacts::outbound::strip_logged(&mut out_envelope);
 
             // Standard egress pipeline: render → encode → send_payload.
             // All providers (including webchat) use this path. The webchat provider's

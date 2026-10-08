@@ -74,7 +74,7 @@ pub(crate) fn strip_reserved(envelope: &mut ChannelMessageEnvelope) -> usize {
 
 /// Invisible format characters (category Cf: BOM, zero-width, bidi marks)
 /// that a lenient reader may skip but `Url::parse` does not.
-fn is_invisible_format(c: char) -> bool {
+pub(super) fn is_invisible_format(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'

@@ -201,13 +201,14 @@ pub(crate) fn trusted_proxy_hops() -> usize {
     })
 }
 
-/// The client an upload is counted against. With `trusted_hops == 0` (the
-/// default) it is the TCP peer and `X-Forwarded-For` is ignored: any client
-/// can write that header. With `N` trusted proxies it is the N-th entry from
-/// the right of the header (every line, in order), the one the outermost
-/// trusted proxy appended; too few entries, or one that is not an address,
-/// and the peer is used.
-#[cfg(test)]
+/// The client by address alone, with no conversation fallback: the signed
+/// file-link route's per-client window (`artifacts::serve_link`), and the
+/// reference the upload tests compare against. With `trusted_hops == 0` it is
+/// the TCP peer and `X-Forwarded-For` is ignored: any client can write that
+/// header. With `N` trusted proxies it is the N-th entry from the right of the
+/// header (every line, in order), the one the outermost trusted proxy
+/// appended; too few entries, or one that is not an address, and the peer is
+/// used.
 pub(crate) fn client_key(
     peer: Option<IpAddr>,
     headers: &HeaderMap,

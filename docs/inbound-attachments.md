@@ -253,11 +253,13 @@ slot gets a `door_unavailable` note and inline bytes are cleared.
 | `GREENTIC_TEAMS_SERVICE_URL_HOSTS` | empty | Extra EXACT hosts a Teams activity's `serviceUrl` may name (comma-separated, https only; a wildcard is dropped). Section 5 |
 | `GREENTIC_PDF_WORKER_SLOTS` | `1` (1..4) | PDF workers at once; also the process-wide text-extraction slots |
 | `GREENTIC_PDF_WORKER_MEM_MB` | `320` (64..1024) | Memory limit of one PDF worker |
+| `GREENTIC_ARTIFACT_LINKS`, `GREENTIC_ARTIFACT_LINK_TTL_SECS`, `GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT`, `GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT_PER_UNIT`, `GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_HOUR`, `GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_LINK_PER_HOUR` | see `docs/outbound-artifacts.md` §6 | Outbound file links (off in code until the WebChat reconnect-token hardening ships) |
 
 ## 7. Serving rule (binding for any route that serves artifact bytes)
 
-No route in this repository serves artifact bytes today. Any route added later
-(a signed link, a WebChat download, an outbound attachment) MUST:
+`/v1/artifacts/...` (signed links, `src/artifacts/serve_link.rs`) is the one
+route in this repository that serves artifact bytes; it implements this rule,
+see `docs/outbound-artifacts.md`. Any route added later MUST:
 
 - send `Content-Type` = the SNIFFED stored type, never a client- or
   provider-supplied one;
