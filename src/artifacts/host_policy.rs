@@ -11,15 +11,22 @@ pub(crate) const EXTRA_HOSTS_ENV: &str = "GREENTIC_ATTACHMENT_ALLOWED_HOSTS";
 
 /// Hosts that need no credential (pre-authenticated download links). A
 /// wildcard here matches exactly ONE label: `tenant.sharepoint.com`, never
-/// `a.b.sharepoint.com`. The providers' Teams list must change with this one.
+/// `a.b.sharepoint.com`. The providers' Teams list must change with this one;
+/// today it still accepts any depth under `.sharepoint.com`, so a deeper name
+/// passes the provider and is refused here (`docs/inbound-attachments.md`
+/// section 10).
 pub(crate) const PUBLIC_HOSTS: &[&str] = &["*.sharepoint.com", "smba.trafficmanager.net"];
 
-/// Credential name → the only hosts it may be sent to. A wildcard here matches
-/// any depth of subdomain (WhatsApp media CDNs serve from
-/// `scontent.xx.fbcdn.net`), never the apex.
+/// Credential name → the only hosts it may be sent to. A host joins a list
+/// only as an EXACT vendor-owned name measured (or shown by the provider's
+/// own code) to serve that credential's files; never a wildcard. WhatsApp's
+/// media CDNs are the one exception: a wildcard there matches any depth of
+/// subdomain (Meta serves from `scontent.xx.fbcdn.net`), never the apex.
+/// `api.ciscospark.com` is Cisco's legacy name for the same Webex API the bot
+/// token is for; the Webex provider recognises content links on it.
 const CREDENTIAL_HOSTS: &[(&str, &[&str])] = &[
     ("SLACK_BOT_TOKEN", &["files.slack.com"]),
-    ("WEBEX_BOT_TOKEN", &["webexapis.com"]),
+    ("WEBEX_BOT_TOKEN", &["webexapis.com", "api.ciscospark.com"]),
     (
         "WHATSAPP_TOKEN",
         &[
@@ -219,6 +226,12 @@ impl HostPolicy {
             credential: None,
         })
     }
+}
+
+/// The credential → hosts table, for the list ratchets.
+#[cfg(test)]
+pub(crate) fn credential_host_table() -> &'static [(&'static str, &'static [&'static str])] {
+    CREDENTIAL_HOSTS
 }
 
 fn credential_hosts(name: &str) -> Option<&'static [&'static str]> {

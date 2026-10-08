@@ -108,8 +108,10 @@ v1 types, decided from the bytes, never from a header or the provider's field
 ## 3. Download safety (SSRF)
 
 - `https` only, no explicit port, no userinfo, no IP literals.
-- Hosts per credential (a credential is only ever sent to its own list):
-  Slack `files.slack.com`; Webex `webexapis.com`; WhatsApp
+- Hosts per credential (a credential is only ever sent to its own list, and
+  every name there is exact except WhatsApp's media CDNs):
+  Slack `files.slack.com`; Webex `webexapis.com`, `api.ciscospark.com`
+  (Cisco's legacy name for the same API); WhatsApp
   `graph.facebook.com`, `lookaside.fbsbx.com`, `*.fbcdn.net`, `*.whatsapp.net`;
   Telegram `api.telegram.org`.
 - Credential-less (`public`) hosts: `*.sharepoint.com` (exactly ONE label:
@@ -309,8 +311,12 @@ Release order: admin (artifacts door live) → ext-runtime → runner (drops its
 own ext-runtime patch) → this crate → providers' WebChat repin in the designer
 registry (only after this host is live). Cross-repo work this needs:
 
-- providers: the Teams allow-list narrowed to ONE `*.sharepoint.com` label, in
-  step with `PUBLIC_HOSTS` here; the WebChat upload emitting one of the two
+- providers: the Teams `downloadUrl` check (`messaging-teams`
+  `is_teams_download_host`) still accepts ANY depth under `.sharepoint.com`,
+  while `PUBLIC_HOSTS` here accepts exactly ONE label (`tenant.sharepoint.com`).
+  A deeper name passes the provider and is refused here as `fetch_failed`, so
+  the provider must narrow to one label in step with this list (the two are
+  meant to change together); the WebChat upload emitting one of the two
   `inline` shapes;
 - measured Slack/Webex CDN hosts before widening the credential lists;
 - deploy lanes set `GREENTIC_TRUSTED_PROXY_HOPS` where a proxy appends to
@@ -319,5 +325,6 @@ registry (only after this host is live). Cross-repo work this needs:
 - greentic-designer: the start pin in `Dockerfile.tools` moves; re-affirm
   `agent_tool_reach::DEPLOYED_RUNTIME_CALLS_A2A`, `RUNTIME_SERVES_TRIGGERS` and
   the playbook verdict there, per its CLAUDE.md;
-- greentic-runner: `HttpArtifactReader` builds its client without `no_proxy()`;
-  fix there (this host's clients use none).
+- greentic-runner: the artifact door clients ignore the proxy environment
+  since runner `190c1fa3` (`HttpArtifactReader` and the extension port both
+  call `no_proxy()`); the pin must carry that commit.

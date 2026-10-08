@@ -63,6 +63,8 @@ mod hook_tests;
 #[cfg(test)]
 mod host_access_tests;
 #[cfg(test)]
+mod host_lists_tests;
+#[cfg(test)]
 mod host_policy_tests;
 #[cfg(test)]
 mod ingest_blocking_tests;
