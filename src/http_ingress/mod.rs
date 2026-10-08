@@ -1719,6 +1719,9 @@ fn apply_directline_forward_plan(
 }
 
 fn normalize_directline_dispatch(method: &Method, path: &str) -> (Method, String) {
+    // Canonical case first: the preflight, the dedup check and the method
+    // forwarded to the provider all compare against `GET`/`POST`.
+    let method = &directline_session::canonical_method(method);
     if path == "/token" {
         return (Method::POST, "/v3/directline/tokens/generate".to_string());
     }
@@ -3413,6 +3416,22 @@ mod tests {
                 "/v3/directline/conversations".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn normalize_directline_dispatch_upper_cases_the_method() {
+        // The forwarded method, the dedup check and the streamUrl rewrite all
+        // compare against the canonical spelling.
+        for raw in ["get", "Get", "gEt"] {
+            let lower = Method::from_bytes(raw.as_bytes()).unwrap();
+            let (method, path) =
+                normalize_directline_dispatch(&lower, "/v3/directline/conversations/c1");
+            assert_eq!(method, Method::GET, "{raw}");
+            assert_eq!(path, "/v3/directline/conversations/c1");
+        }
+        let lower = Method::from_bytes(b"post").unwrap();
+        let (method, _) = normalize_directline_dispatch(&lower, "/directline/conversations");
+        assert_eq!(method, Method::POST);
     }
 
     #[test]

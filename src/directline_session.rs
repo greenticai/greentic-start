@@ -503,6 +503,11 @@ pub fn preflight(
         SigningKey::Present([]) => SigningKey::Unavailable,
         other => other,
     };
+    // Methods are case-insensitive on every router in front of and behind
+    // this function (start's route table, the provider's router), so a
+    // case-sensitive match here would let `get .../conversations/{id}` skip
+    // every check below and still be answered as a `GET` (G2 review).
+    let method = &canonical_method(method);
     let segments: Vec<&str> = provider_path.trim_start_matches('/').split('/').collect();
     match segments.as_slice() {
         ["v3", "directline", "tokens", "refresh"] if method == Method::POST => {
@@ -521,6 +526,14 @@ pub fn preflight(
         }
         _ => Preflight::Forward(ForwardPlan::default()),
     }
+}
+
+/// `method` in its canonical upper-case spelling (`get` → `GET`). Every
+/// Direct Line method comparison must go through this, here and in the two
+/// `normalize_directline_dispatch` copies that also forward the method.
+pub(crate) fn canonical_method(method: &Method) -> Method {
+    Method::from_bytes(method.as_str().to_ascii_uppercase().as_bytes())
+        .unwrap_or_else(|_| method.clone())
 }
 
 /// Replace (or append) the `Authorization` header value in a `collect_headers`
@@ -1804,3 +1817,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 #[path = "directline_session_owner_tests.rs"]
 mod owner_tests;
+
+#[cfg(test)]
+#[path = "directline_session_method_tests.rs"]
+mod method_tests;
