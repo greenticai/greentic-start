@@ -10,6 +10,11 @@
 //! Bot Framework treats `POST /conversations` as create-or-resume, so a
 //! short server-side dedupe keyed on the body's `user.id` is the correct
 //! place to enforce that semantic without relying on client-side idempotency.
+//! The key also carries a hash of the presented bearer: the cached response
+//! holds a token bound to the new conversation, and `user.id` is chosen by
+//! the client, so without it a second caller reusing someone's guest id
+//! within the window received that person's conversation. The racing
+//! double-create the cache exists for sends the same bearer twice.
 //!
 //! The cache is in-memory per operator instance. If we move to a multi-node
 //! ingress fleet (Phase C alongside the Redis notifier backplane), this
@@ -20,6 +25,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use greentic_deploy_spec::DeploymentId;
+use sha2::{Digest, Sha256};
 
 use crate::ingress_types::IngressHttpResponse;
 
@@ -36,6 +42,11 @@ pub struct DedupKey {
     /// target the same deployment within the TTL, they must mint distinct
     /// conversations rather than returning the cached response from the first.
     pub flow_hint: Option<String>,
+    /// SHA-256 of the bearer the CREATING request presented. The cached
+    /// response carries a token bound to the new conversation, so it may go
+    /// back only to the caller that created it; `user.id` alone is chosen by
+    /// the client and would hand one caller's conversation to another.
+    pub bearer_sha256: [u8; 32],
 }
 
 #[derive(Clone)]
@@ -110,6 +121,41 @@ pub fn extract_user_id(body: &[u8]) -> Option<String> {
     Some(id.to_string())
 }
 
+/// SHA-256 of the raw bearer (after `Bearer `); `None` without one, which
+/// disables dedup for that request rather than sharing a bucket.
+/// Parsed exactly as the session preflight parses it, so the two never
+/// disagree about which token a request presented.
+pub fn bearer_fingerprint(headers: &[(String, String)]) -> Option<[u8; 32]> {
+    let token = crate::directline_session::bearer(headers)?;
+    Some(Sha256::digest(token.as_bytes()).into())
+}
+
+/// The dedup key for a `POST /conversations`, or `None` when the request
+/// carries no usable `user.id` or no bearer. `caller_headers` must be the
+/// request's ORIGINAL headers, never the ones after
+/// `directline_session::apply_authorization_rewrite`: a re-mint of an expired
+/// bootstrap token would otherwise give one caller's two racing requests two
+/// different keys.
+pub fn create_key(
+    deployment_id: DeploymentId,
+    tenant: &str,
+    team: &str,
+    flow_hint: Option<String>,
+    body: &[u8],
+    caller_headers: &[(String, String)],
+) -> Option<DedupKey> {
+    let user_id = extract_user_id(body)?;
+    let bearer_sha256 = bearer_fingerprint(caller_headers)?;
+    Some(DedupKey {
+        deployment_id,
+        tenant: tenant.to_string(),
+        team: team.to_string(),
+        user_id,
+        flow_hint,
+        bearer_sha256,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +172,7 @@ mod tests {
             team: "default".to_string(),
             user_id: user.to_string(),
             flow_hint: None,
+            bearer_sha256: [7; 32],
         }
     }
 
@@ -179,6 +226,7 @@ mod tests {
             team: "default".to_string(),
             user_id: "u".to_string(),
             flow_hint: None,
+            bearer_sha256: [7; 32],
         };
         assert!(cache.get(&other).is_none());
     }
@@ -227,5 +275,66 @@ mod tests {
         assert!(extract_user_id(br#"{"user":{}}"#).is_none());
         assert!(extract_user_id(br#"{"user":{"id":""}}"#).is_none());
         assert!(extract_user_id(b"not json").is_none());
+    }
+
+    fn bearer(token: &str) -> Vec<(String, String)> {
+        vec![("Authorization".to_string(), format!("Bearer {token}"))]
+    }
+
+    fn create(headers: &[(String, String)]) -> Option<DedupKey> {
+        create_key(
+            fixed_dep(),
+            "t",
+            "default",
+            None,
+            br#"{"user":{"id":"guest-1"}}"#,
+            headers,
+        )
+    }
+
+    #[test]
+    fn same_user_id_different_bearer_misses() {
+        let cache = ConversationDedupCache::new();
+        let alice = create(&bearer("token-of-alice")).expect("key");
+        cache.insert(alice, response("{\"conversationId\":\"alice-conv\"}"));
+        let mallory = create(&bearer("token-of-mallory")).expect("key");
+        assert!(
+            cache.get(&mallory).is_none(),
+            "another bearer must never receive the cached conversation"
+        );
+    }
+
+    #[test]
+    fn same_bearer_hits() {
+        let cache = ConversationDedupCache::new();
+        cache.insert(
+            create(&bearer("token-1")).expect("key"),
+            response("{\"conversationId\":\"c\"}"),
+        );
+        assert!(
+            cache
+                .get(&create(&bearer("token-1")).expect("key"))
+                .is_some()
+        );
+        // The scheme is case-insensitive and surrounding space is ignored, like
+        // the session preflight's own bearer parse.
+        let same = vec![("authorization".to_string(), "bearer  token-1 ".to_string())];
+        assert!(cache.get(&create(&same).expect("key")).is_some());
+    }
+
+    #[test]
+    fn no_bearer_no_key() {
+        assert!(bearer_fingerprint(&[]).is_none());
+        assert!(create(&[]).is_none());
+        let basic = vec![("Authorization".to_string(), "Basic abc".to_string())];
+        assert!(create(&basic).is_none());
+        let empty = vec![("Authorization".to_string(), "Bearer ".to_string())];
+        assert!(create(&empty).is_none());
+    }
+
+    #[test]
+    fn the_fingerprint_is_a_hash_of_the_bearer_not_the_bearer() {
+        let fp = bearer_fingerprint(&bearer("secret-token")).expect("fingerprint");
+        assert_eq!(fp, <[u8; 32]>::from(Sha256::digest(b"secret-token")));
     }
 }

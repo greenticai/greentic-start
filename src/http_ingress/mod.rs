@@ -49,7 +49,7 @@ use crate::static_handler::serve_static_route;
 use admin_relay::{
     AdminRelayConfig, handle_admin_relay, load_admin_relay_config_from_env, relay_target_path,
 };
-use conv_dedup::{ConversationDedupCache, DedupKey, extract_user_id};
+use conv_dedup::{ConversationDedupCache, create_key};
 use helpers::{
     build_http_response, collect_headers, collect_queries, cors_preflight_response, domain_name,
     error_response, handle_builtin_health_request, handle_oauth_callback,
@@ -1795,6 +1795,9 @@ where
     let provider_queries =
         augment_directline_queries(request.queries, request.tenant, Some(request.team));
     let mut headers = collect_headers(req.headers());
+    // The caller's headers as received: the dedup key below hashes the bearer
+    // the caller presented, before the session preflight may rewrite it.
+    let caller_headers = headers.clone();
     let body = req
         .into_body()
         .collect()
@@ -1830,13 +1833,14 @@ where
         && (request.path == "/v3/directline/conversations"
             || request.path.ends_with("/conversations"))
     {
-        extract_user_id(&body).map(|user_id| DedupKey {
-            deployment_id: greentic_deploy_spec::DeploymentId::default(),
-            tenant: request.tenant.to_string(),
-            team: request.team.to_string(),
-            user_id,
-            flow_hint: None,
-        })
+        create_key(
+            greentic_deploy_spec::DeploymentId::default(),
+            request.tenant,
+            request.team,
+            None,
+            &body,
+            &caller_headers,
+        )
     } else {
         None
     };

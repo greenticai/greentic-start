@@ -51,6 +51,14 @@ The anonymous refusal needs no state, so it closes the anonymous hole even for
 a bundle that still carries a provider pack predating the ownership check.
 Verified-vs-verified isolation needs the new provider pack.
 
+## Create dedup
+
+The 30 s `POST /conversations` dedup cache (`src/conv_dedup.rs`) returns a
+cached response — which carries a BOUND token — only to a request presenting
+the same bearer as the one that created it. A request without a bearer is not
+deduplicated. The key hashes the bearer the caller sent, before start's
+session preflight may re-mint it.
+
 ## Escape hatch: `GREENTIC_WEBCHAT_REQUIRE_CONVERSATION_TOKEN`
 
 Default: on (refuse). Setting it to `0`, `false`, `no` or `off` (any case)

@@ -857,7 +857,9 @@ fn handle_refresh(
 // Small helpers
 // ---------------------------------------------------------------------------
 
-fn bearer(headers: &[(String, String)]) -> Option<String> {
+/// The token after `Bearer ` (scheme case-insensitive, whitespace trimmed),
+/// or `None`. Shared with the create-dedup key (`conv_dedup`).
+pub(crate) fn bearer(headers: &[(String, String)]) -> Option<String> {
     headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))

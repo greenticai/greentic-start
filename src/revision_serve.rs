@@ -5510,15 +5510,19 @@ async fn dispatch_provider_route(
             && (norm_path == "/v3/directline/conversations"
                 || norm_path.ends_with("/conversations"))
         {
-            crate::conv_dedup::extract_user_id(body).map(|user_id| crate::conv_dedup::DedupKey {
+            // Keyed on the CALLER's bearer (`request_headers`, not `dl_headers`
+            // after the rewrite above): the cached response carries a token
+            // bound to the new conversation.
+            crate::conv_dedup::create_key(
                 deployment_id,
-                tenant: route_tenant.clone(),
-                team: route_team.clone(),
-                user_id,
-                flow_hint: webchat_target
+                &route_tenant,
+                &route_team,
+                webchat_target
                     .and_then(|t| t.flow_id.clone())
                     .or_else(|| flow_header.map(str::to_string)),
-            })
+                body,
+                request_headers,
+            )
         } else {
             None
         };
