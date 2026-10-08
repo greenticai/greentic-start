@@ -1736,3 +1736,7 @@ mod owner_tests;
 #[cfg(test)]
 #[path = "directline_session_method_tests.rs"]
 mod method_tests;
+
+#[cfg(test)]
+#[path = "directline_session_embed_flow_tests.rs"]
+mod embed_flow_tests;
