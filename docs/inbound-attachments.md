@@ -179,14 +179,36 @@ retries included), so a tool waiting on a door that is down gets
 | WebChat (Direct Line upload) | yes (`inline`) | bytes arrive in the request itself; no outbound fetch |
 | Slack | yes | the host verifies the signing secret before any fetch |
 | Telegram | yes, ONLY with a webhook secret (`webhook_secret_ref`) on the endpoint | the host verifies the secret token |
-| WhatsApp | not yet | no host-side `X-Hub-Signature-256` check |
-| Webex | not yet | verification happens inside the provider, invisible to the host |
-| Teams (Bot Framework) | not yet | the JWT is decoded, not validated |
+| WhatsApp | yes, ONLY when the app secret is set | the host verifies `X-Hub-Signature-256` (HMAC-SHA256 of the raw body) with `WHATSAPP_APP_SECRET` |
+| Webex | yes, ONLY when a webhook secret is stored | the host verifies `X-Spark-Signature` (HMAC-SHA1 of the raw body) with the stored `webex_webhook_secret` (the designer stages one per environment) |
+| Teams (Bot Framework) | yes, ONLY when the bot app id is set and the key set is reachable | the host verifies the Bot Framework JWT: RS256, `iss` `https://api.botframework.com`, `aud` = `ms_bot_app_id`, `exp`/`nbf` with 300 s skew, the `serviceUrl` claim, the key's endorsement for the activity's `channelId` |
 | Email, Teams Graph | no | v1 emits no attachments |
 
-A remote reference from a channel the host cannot verify is never resolved; the
-slot gets `fetch_failed` "files from this channel are not supported yet", and
-activation warns once per class. WhatsApp: an envelope naming another business
+Verification runs in `crate::inbound_verify`, before the revision pin and the
+provider op. Per channel, once its input is configured:
+
+| Channel | Input | Read from |
+|---|---|---|
+| WhatsApp | app secret (Meta App Dashboard → App settings → Basic) | secret `WHATSAPP_APP_SECRET`, then `whatsapp_app_secret` (unit scope first, then the pack) |
+| Webex | webhook secret | secret `WEBEX_WEBHOOK_SECRET`, then `webex_webhook_secret` |
+| Teams | bot app id (Entra app id of the Azure Bot) | pack config `ms_bot_app_id`, then `bot_app_id` |
+
+- Configured and the proof fails (bad or missing signature, bad token, wrong
+  `aud`/`iss`, expired, `serviceUrl` mismatch): `401`, or `403` for a missing
+  endorsement, with the fixed body `webhook verification failed`. Nothing is
+  pinned or dispatched. A Webex request is refused exactly where the provider
+  already refused it. There is no switch that turns verification off.
+- Not configured: text flows as before; each file slot gets `fetch_failed`
+  "this channel is not set up to verify its messages", and one warning per
+  deployment and channel names the setting to add. Activation says one
+  pointer line when the environment declares any of the three channels.
+- Teams key set unreachable (`login.botframework.com`): the request is
+  admitted UNVERIFIED (text flows, files get the same note), warned at most
+  once a minute. A failed proof is never downgraded to this.
+
+A remote reference from a request the host did not verify is never resolved;
+Telegram without a webhook secret gets the same note and one warning per
+activation. WhatsApp: an envelope naming another business
 number than the instance's is dropped; one with no number (absent, empty or
 blank) keeps its message, but each media reference is replaced by a host
 marker and the slot is reported with a neutral `fetch_failed` note ("the file
@@ -236,7 +258,13 @@ only (`ingress_dispatch::envelope_parse_failure`).
 - The PDF worker is isolated with rlimits, an empty environment, a deadline and
   `PR_SET_PDEATHSIG`, but no seccomp and no Landlock. It is Linux-only: on other
   platforms a PDF is stored with no text.
-- WhatsApp, Webex and Teams inbound files wait on host-side verification.
+- WhatsApp and Webex signatures carry no timestamp, so no replay window can
+  be enforced: a captured request re-delivers the same message and media ids,
+  whose artifacts dedupe by content. Teams relies on `exp`/`nbf` (300 s
+  skew); the protocol has no nonce.
+- Teams: public cloud only (`https://api.botframework.com`); no US Government
+  (`api.botframework.us`) and no Bot Framework Emulator issuer. A key-set
+  outage admits Teams text unverified, with files withheld.
 - Slack and Webex files served from other CDN hosts (Slack `files-edge`,
   `files-origin`; Webex regional hosts) are refused as `fetch_failed` until the
   lists are widened from measured provider fixtures.

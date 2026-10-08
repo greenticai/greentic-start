@@ -84,11 +84,12 @@ const MESSAGE_TOO_LARGE: Note = Note::new(
 const FILE_TOO_LARGE: Note = Note::new("too_large", "the file is larger than the allowed size");
 const BAD_INLINE: Note = Note::new("fetch_failed", "the attached data could not be read");
 const OUT_OF_TIME: Note = Note::new("fetch_failed", "reading the message's files took too long");
-/// Neutral on purpose: the agent may relay it, and the cause is a gap in
-/// this host (see `super::unserved`), not anything the user did.
+/// For a remote reference from a request this host did not verify
+/// (`crate::inbound_verify`, `super::unserved`). It names the set-up gap,
+/// not anything the user did: the agent may relay it.
 const UNVERIFIED: Note = Note::new(
     "fetch_failed",
-    "files from this channel are not supported yet",
+    "this channel is not set up to verify its messages",
 );
 /// For a slot whose reference this host withheld (`FetchRef::Withheld`).
 const WITHHELD: Note = Note::new("fetch_failed", "the file could not be retrieved");
