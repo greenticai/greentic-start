@@ -28,7 +28,7 @@ use jsonwebtoken::DecodingKey;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
-use crate::jwks_cache::{CachePolicy, JwksCache, Lookup};
+use crate::jwks_cache::{CachePolicy, JwksCache, Lookup, StaleKeys};
 
 pub(crate) const BF_METADATA_URL: &str =
     "https://login.botframework.com/v1/.well-known/openidconfiguration";
@@ -39,11 +39,19 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024;
 const MAX_KEYS: usize = 32;
 
+/// How old a key set may be and still verify a `kid` it carries once a
+/// refresh has FAILED. Without it an outage longer than the 12 h TTL turned
+/// every Teams activity, forged ones included, into "admitted unverified".
+/// Bot Framework signing keys rotate on the order of weeks, so a week-old set
+/// still verifies genuine tokens; past this age it is not used at all.
+pub(crate) const STALE_KEY_SET_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+
 /// Bot Framework asks for a refresh at least every 24 h; 12 h keeps inside
 /// that with room, and the 30 s floor bounds unknown-`kid` traffic.
 const POLICY: CachePolicy = CachePolicy {
     positive_ttl: Duration::from_secs(12 * 3600),
     refresh_floor: Duration::from_secs(30),
+    stale_max_age: Some(STALE_KEY_SET_MAX_AGE),
 };
 
 /// One signing key and the channel ids it is endorsed for.
@@ -151,35 +159,45 @@ impl BfKeySource {
     }
 
     /// A key for `kid`. `UnknownKid` only when a TRUSTED key set (read within
-    /// its TTL) lacks it; with none held the answer is `Unavailable` whether
-    /// the floor holds the fetch back or the fetch failed, so an outage never
-    /// refuses a genuine token and a follower of a successful fetch never
+    /// its TTL) lacks it. With none held, a refresh that failed (or that the
+    /// floor holds back after a failure) falls back to an EXPIRED set younger
+    /// than [`STALE_KEY_SET_MAX_AGE`]: a `kid` it carries is `Found` and is
+    /// verified against it, anything else is `Unavailable`. So an outage never
+    /// refuses a genuine token, and a follower of a successful fetch never
     /// admits a forged one.
     pub(crate) async fn key(&self, kid: &str) -> BfKeyLookup {
+        self.key_at(kid, Instant::now).await
+    }
+
+    /// [`Self::key`] with the clock as a parameter, so the TTL and the stale
+    /// limit are testable without a host up for a week.
+    pub(crate) async fn key_at(&self, kid: &str, now: impl Fn() -> Instant) -> BfKeyLookup {
         let space = self.metadata_url.as_str();
-        match self.cache.lookup(space, kid, Instant::now()) {
+        match self.cache.lookup(space, kid, now()) {
             Lookup::Hit(key) => return BfKeyLookup::Found(key),
-            Lookup::Refuse => return self.miss(space),
+            Lookup::Refuse => return self.miss(space, kid, now()),
             Lookup::Fetch => {}
         }
-        self.refresh_once().await;
-        match self.cache.lookup(space, kid, Instant::now()) {
+        self.refresh_once(&now).await;
+        match self.cache.lookup(space, kid, now()) {
             Lookup::Hit(key) => BfKeyLookup::Found(key),
-            _ => self.miss(space),
+            _ => self.miss(space, kid, now()),
         }
     }
 
-    fn miss(&self, space: &str) -> BfKeyLookup {
-        if self.cache.has_trusted_keys(space, Instant::now()) {
-            BfKeyLookup::UnknownKid
-        } else {
-            BfKeyLookup::Unavailable
+    fn miss(&self, space: &str, kid: &str, now: Instant) -> BfKeyLookup {
+        if self.cache.has_trusted_keys(space, now) {
+            return BfKeyLookup::UnknownKid;
+        }
+        match self.cache.stale_keys(space, kid, now) {
+            StaleKeys::Known(key) => BfKeyLookup::Found(key),
+            StaleKeys::Lacks | StaleKeys::None => BfKeyLookup::Unavailable,
         }
     }
 
     /// At most one fetch across concurrent callers (same shape as the MCP
     /// key set's `refresh_once`). The outcome is read back from the cache.
-    async fn refresh_once(&self) {
+    async fn refresh_once(&self, now: &impl Fn() -> Instant) {
         let space = self.metadata_url.clone();
         // The shard guard is released at the end of this match, before any
         // await.
@@ -203,7 +221,7 @@ impl BfKeySource {
             key: space.clone(),
         };
         let fetched = self.fetch().await;
-        let now = Instant::now();
+        let now = now();
         match fetched {
             Some(keys) => self.cache.store_keys(&space, keys, now),
             None => self.cache.store_failed_attempt(&space, now),

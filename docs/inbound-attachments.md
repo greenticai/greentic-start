@@ -213,7 +213,11 @@ provider op. Per channel, once its input is configured:
   UNVERIFIED (text flows, files get the same note), warned at most once a
   minute as "verification is unavailable", never as "not configured". A
   failed proof is never downgraded to this. An unknown `kid` is a refusal only
-  against a key set read within its TTL; with none held it is unavailable.
+  against a key set read within its TTL (12 h). When a refresh fails and that
+  set has expired, a set up to 7 days old still verifies a `kid` it carries
+  (the token is checked in full against it); a `kid` it lacks, or a set older
+  than 7 days, is unavailable. So an outage longer than the TTL does not admit
+  every Teams activity unverified.
 - Teams `serviceUrl`, on EVERY activity (verified or not): the provider
   replies there with the bot's token, so it must be `https`, with no userinfo
   and no port, on `smba.trafficmanager.net` or a subdomain of

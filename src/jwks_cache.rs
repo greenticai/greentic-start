@@ -58,6 +58,11 @@ pub(crate) struct CachePolicy {
     /// degraded issuer to one request per window, and it is the ceiling on how
     /// long a genuine key rotation takes to be picked up.
     pub refresh_floor: Duration,
+    /// How long PAST `positive_ttl` an expired key set may still be read, as
+    /// a fallback the caller asks for only after a refresh failed
+    /// ([`JwksCache::stale_keys`]). `None` (MCP) means never: past the TTL the
+    /// set is gone. Measured from `keys_fetched_at`, so it is an absolute age.
+    pub stale_max_age: Option<Duration>,
 }
 
 /// What a lookup decided. Three outcomes, because collapsing `Refuse` into
@@ -70,6 +75,18 @@ pub(crate) enum Lookup<V> {
     Refuse,
     /// No key, and the caller should fetch.
     Fetch,
+}
+
+/// What an EXPIRED key set says about a `kid` ([`JwksCache::stale_keys`]).
+pub(crate) enum StaleKeys<V> {
+    /// The expired set carries this `kid`.
+    Known(V),
+    /// An expired set is held and lacks this `kid`. That proves nothing (the
+    /// set may predate a rotation), so it is not a refusal.
+    Lacks,
+    /// No expired set usable as a fallback: none held, the set is still
+    /// fresh, it is older than `stale_max_age`, or the policy keeps none.
+    None,
 }
 
 struct Entry<V> {
@@ -117,6 +134,28 @@ impl<V: Clone> JwksCache<V> {
                 .keys_fetched_at
                 .is_some_and(|at| now.duration_since(at) < self.policy.positive_ttl)
         })
+    }
+
+    /// The fallback read of a key set past its TTL but younger than the
+    /// policy's `stale_max_age`. Only for a caller whose refresh failed.
+    pub(crate) fn stale_keys(&self, issuer: &str, kid: &str, now: Instant) -> StaleKeys<V> {
+        let Some(max_age) = self.policy.stale_max_age else {
+            return StaleKeys::None;
+        };
+        let Some(entry) = self.entries.get(issuer) else {
+            return StaleKeys::None;
+        };
+        let Some(fetched_at) = entry.keys_fetched_at else {
+            return StaleKeys::None;
+        };
+        let age = now.duration_since(fetched_at);
+        if age < self.policy.positive_ttl || age >= max_age {
+            return StaleKeys::None;
+        }
+        match entry.keys.get(kid) {
+            Some(key) => StaleKeys::Known(key.clone()),
+            None => StaleKeys::Lacks,
+        }
     }
 
     /// Record a successful fetch, replacing whatever was held.
@@ -182,6 +221,7 @@ mod tests {
     const MCP: CachePolicy = CachePolicy {
         positive_ttl: Duration::from_secs(600),
         refresh_floor: Duration::from_secs(30),
+        stale_max_age: None,
     };
 
     fn mcp_cache() -> JwksCache<Arc<DecodingKey>> {
@@ -332,6 +372,53 @@ mod tests {
         );
     }
 
+    /// The MCP policy keeps NO stale fallback: past the TTL its set is gone,
+    /// whatever happened to the refresh.
+    #[test]
+    fn the_mcp_policy_never_serves_a_stale_key_set() {
+        let now = Instant::now();
+        let cache = mcp_cache();
+        cache.store_keys("iss", keyset("k1"), now);
+        cache.store_failed_attempt("iss", now + Duration::from_secs(601));
+        assert!(matches!(
+            cache.stale_keys("iss", "k1", now + Duration::from_secs(602)),
+            StaleKeys::None
+        ));
+    }
+
+    fn stale_policy() -> CachePolicy {
+        CachePolicy {
+            positive_ttl: Duration::from_secs(600),
+            refresh_floor: Duration::from_secs(30),
+            stale_max_age: Some(Duration::from_secs(3600)),
+        }
+    }
+
+    #[test]
+    fn a_stale_policy_serves_an_expired_set_up_to_its_limit() {
+        let now = Instant::now();
+        let cache = JwksCache::new(stale_policy());
+        cache.store_keys("iss", keyset("k1"), now);
+        let later = now + Duration::from_secs(601);
+        assert!(matches!(
+            cache.stale_keys("iss", "k1", later),
+            StaleKeys::Known(_)
+        ));
+        assert!(matches!(
+            cache.stale_keys("iss", "other", later),
+            StaleKeys::Lacks
+        ));
+        assert!(matches!(
+            cache.stale_keys("iss", "k1", now + Duration::from_secs(3600)),
+            StaleKeys::None
+        ));
+        // A FRESH set is not "stale": the caller reads it through `lookup`.
+        assert!(matches!(
+            cache.stale_keys("iss", "k1", now + Duration::from_secs(1)),
+            StaleKeys::None
+        ));
+    }
+
     /// A longer policy (Bot Framework keeps keys for hours) trusts a key set
     /// past the MCP window while keeping the same floor.
     #[test]
@@ -340,6 +427,7 @@ mod tests {
         let cache = JwksCache::new(CachePolicy {
             positive_ttl: Duration::from_secs(12 * 3600),
             refresh_floor: Duration::from_secs(30),
+            stale_max_age: None,
         });
         cache.store_keys("iss", keyset("k1"), now);
         assert!(is_hit(cache.lookup(

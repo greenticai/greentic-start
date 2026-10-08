@@ -408,27 +408,72 @@ async fn an_outage_on_a_cold_start_is_unavailable_inside_the_floor_too() {
     assert_eq!(stub.total(), 1, "the floor still holds the retry storm");
 }
 
-/// Review G4 #2: a key set older than its TTL is no longer trusted; an
-/// outage then is `Unavailable` too, inside the floor and out of it.
-#[tokio::test]
-async fn an_outage_after_the_ttl_expired_is_unavailable() {
-    let Some(long_ago) = Instant::now().checked_sub(Duration::from_secs(13 * 3600)) else {
-        return; // a host up for less than 13 h cannot express the past here
-    };
+/// Seed `source` with the standard key set as of the real `now`, behind an
+/// outage stub, and return a clock `offset` later.
+async fn outage_source_seeded(offset: Duration) -> (Stub, BfKeySource, impl Fn() -> Instant) {
     let stub = Stub::serve(|_| vec![("/meta", status("503 Service Unavailable", "", "{}"))]).await;
     let source = source_for(&stub);
-    let stale = found(standard_key_lookup().await).expect("a key to seed");
+    let seed = found(standard_key_lookup().await).expect("a key to seed");
+    let seeded_at = Instant::now();
     source.cache.store_keys(
         &source.metadata_url,
-        HashMap::from([("k1".to_string(), stale)]),
-        long_ago,
+        HashMap::from([("k1".to_string(), seed)]),
+        seeded_at,
     );
-    assert!(is_unavailable(&source.key("k1").await));
-    assert!(is_unavailable(&source.key("k1").await), "inside the floor");
+    (stub, source, move || seeded_at + offset)
+}
+
+/// Re-review G4 I1: a Bot Framework outage that outlasts the 12 h TTL must not
+/// turn every Teams activity (forged ones included) into "admitted
+/// unverified". A key the expired set carries is still verified against it,
+/// inside the floor and out of it.
+#[tokio::test]
+async fn an_outage_past_the_ttl_still_verifies_a_kid_the_stale_set_carries() {
+    let (stub, source, clock) = outage_source_seeded(Duration::from_secs(13 * 3600)).await;
+    assert!(found(source.key_at("k1", &clock).await).is_some());
     assert!(
-        is_unavailable(&source.key("other").await),
+        found(source.key_at("k1", &clock).await).is_some(),
         "inside the floor"
     );
+    assert_eq!(stub.total(), 1, "the refresh was attempted once and failed");
+}
+
+/// A `kid` the stale set lacks proves nothing (the set may simply be old), so
+/// it stays `Unavailable`, never `UnknownKid`.
+#[tokio::test]
+async fn an_outage_past_the_ttl_is_unavailable_for_a_kid_the_stale_set_lacks() {
+    let (_stub, source, clock) = outage_source_seeded(Duration::from_secs(13 * 3600)).await;
+    assert!(is_unavailable(&source.key_at("other", &clock).await));
+    assert!(
+        is_unavailable(&source.key_at("other", &clock).await),
+        "inside the floor"
+    );
+}
+
+/// Past [`STALE_KEY_SET_MAX_AGE`] the old set is not used at all.
+#[tokio::test]
+async fn an_outage_past_the_stale_limit_is_unavailable() {
+    let (_stub, source, clock) =
+        outage_source_seeded(STALE_KEY_SET_MAX_AGE + Duration::from_secs(1)).await;
+    assert!(is_unavailable(&source.key_at("k1", &clock).await));
+}
+
+/// A refresh that SUCCEEDS past the TTL replaces the stale set: a kid only
+/// the old set carried is then unknown, not served from the old set.
+#[tokio::test]
+async fn a_successful_refresh_past_the_ttl_replaces_the_stale_set() {
+    let stub = standard_stub().await;
+    let source = source_for(&stub);
+    let seed = found(standard_key_lookup().await).expect("a key to seed");
+    let seeded_at = Instant::now();
+    source.cache.store_keys(
+        &source.metadata_url,
+        HashMap::from([("old-only".to_string(), seed)]),
+        seeded_at,
+    );
+    let clock = move || seeded_at + Duration::from_secs(13 * 3600);
+    assert!(found(source.key_at("k1", &clock).await).is_some());
+    assert!(is_unknown(&source.key_at("old-only", &clock).await));
 }
 
 /// A trusted (fresh) key set still refuses an unknown kid inside the floor.

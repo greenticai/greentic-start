@@ -62,6 +62,8 @@ struct Jwk {
 const POLICY: CachePolicy = CachePolicy {
     positive_ttl: Duration::from_secs(600),
     refresh_floor: Duration::from_secs(30),
+    // MCP keeps no stale fallback: past the TTL an unreachable admin refuses.
+    stale_max_age: None,
 };
 
 static CACHE: LazyLock<JwksCache<Arc<DecodingKey>>> = LazyLock::new(|| JwksCache::new(POLICY));
@@ -290,4 +292,14 @@ fn jwks_url(issuer: &str) -> String {
 pub(crate) fn clear_issuer_for_tests(issuer: &str) {
     CACHE.clear_issuer(issuer);
     IN_FLIGHT.remove(issuer);
+}
+
+#[cfg(test)]
+mod policy_tests {
+    /// The MCP key set keeps no stale fallback (the Bot Framework one does):
+    /// past its TTL an unreachable admin refuses every token, as before.
+    #[test]
+    fn the_mcp_policy_keeps_no_stale_fallback() {
+        assert!(super::POLICY.stale_max_age.is_none());
+    }
 }
