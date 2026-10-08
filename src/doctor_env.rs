@@ -832,6 +832,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             bundle_digest: "sha256:00".to_string(),
             bundle_source_uri: None,
+            runtime_image_digest: None,
             pack_list: vec![PackListEntry {
                 pack_id: PackId::new("greentic.test.pack"),
                 version: SemVer::new(1, 0, 0),
