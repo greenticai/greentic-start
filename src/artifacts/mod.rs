@@ -24,6 +24,8 @@ pub(crate) mod link_base;
 pub(crate) mod link_table;
 pub(crate) mod off;
 pub(crate) mod origin;
+pub(crate) mod outbound;
+pub(crate) mod outbound_shape;
 pub(crate) mod pdf_isolation;
 pub(crate) mod pdf_limits;
 pub(crate) mod port;
@@ -94,6 +96,8 @@ mod link_table_tests;
 mod link_tests;
 #[cfg(test)]
 mod origin_tests;
+#[cfg(test)]
+mod outbound_tests;
 #[cfg(test)]
 mod pdf_fixture;
 #[cfg(all(test, target_os = "linux"))]

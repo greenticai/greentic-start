@@ -1567,7 +1567,9 @@ fn extract_http_status(message: &str) -> Option<u16> {
     None
 }
 
-fn base_reply_envelope(ingress_envelope: &ChannelMessageEnvelope) -> ChannelMessageEnvelope {
+pub(crate) fn base_reply_envelope(
+    ingress_envelope: &ChannelMessageEnvelope,
+) -> ChannelMessageEnvelope {
     let mut reply = ingress_envelope.clone();
     reply.id = uuid::Uuid::new_v4().to_string();
     reply.text = None;

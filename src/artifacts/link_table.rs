@@ -9,10 +9,6 @@
 //! link of it with the uniform 404 and outbound shaping falls back to a fixed
 //! sentence.
 
-// Staged: the serving route and outbound shaping (outbound-delivery plan
-// Tasks 4 and 6) are the readers of `get` and the unit's fields.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 

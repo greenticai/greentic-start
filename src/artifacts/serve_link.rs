@@ -97,7 +97,8 @@ pub(crate) async fn handle<B>(
     .await
 }
 
-fn unix_now() -> u64 {
+/// Unix seconds from the system clock (0 before the epoch).
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())

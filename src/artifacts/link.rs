@@ -14,10 +14,6 @@
 //!
 //! Pure: no I/O, no logging. Nothing here may print a key, token or MAC.
 
-// Staged: the serving route and outbound shaping (outbound-delivery plan
-// Tasks 4 and 6) are the consumers. Remove once both are wired.
-#![allow(dead_code)]
-
 use std::sync::OnceLock;
 
 use hmac::{Hmac, KeyInit, Mac};

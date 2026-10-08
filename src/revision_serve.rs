@@ -2051,7 +2051,6 @@ fn interop_base_url(state: &ServeState) -> Option<String> {
 
 /// The origin signed artifact links are built on: [`interop_base_url`]'s
 /// sources plus the tunnel, validated (docs/outbound-artifacts.md).
-#[allow(dead_code)] // read by outbound shaping (outbound-delivery plan Task 6)
 fn artifact_link_base(state: &ServeState) -> crate::artifacts::link_base::LinkBase {
     crate::artifacts::link_base::link_base(
         state.interop.public_base_url.as_deref(),
@@ -5936,6 +5935,8 @@ async fn dispatch_provider_route(
         let pipeline_bundle = bundle_id.clone();
         let pipeline_team = route_team.clone();
         let pipeline_notifier = Arc::clone(&state.notifier);
+        // Signed links for files the agent creates (docs/outbound-artifacts.md).
+        let link_base = artifact_link_base(&state);
         // Created here, inside the request-instrumented future, so it parents
         // to the `http.request` span and the turn shares the request's trace.
         // Ids only — never message content.
@@ -5965,6 +5966,7 @@ async fn dispatch_provider_route(
                     pipeline_notifier,
                     supports_typing,
                     transport_verified,
+                    link_base,
                 )
                 .await;
             }
@@ -6087,7 +6089,14 @@ async fn run_provider_inbound_pipeline(
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
     supports_typing: bool,
     transport_verified: bool,
+    link_base: crate::artifacts::link_base::LinkBase,
 ) {
+    // Files an agent created leave as signed links, chosen out of band
+    // (docs/outbound-artifacts.md).
+    let outbound_ctx = crate::artifacts::outbound::OutboundCtx::new(
+        activation.routing.artifact_links.get(&deployment_id),
+        link_base,
+    );
     // Channel "is typing" signal (docs/typing-signal.md). Built once per batch and
     // only when the provider declares `send_typing` and the kill switch is on. The
     // config is the same per-pack override value `run_reply_egress` hands
@@ -6180,6 +6189,7 @@ async fn run_provider_inbound_pipeline(
         // The whole turn — the Fast2Flow probe included, as on the legacy
         // path — runs inside the typing indicator, so a slow routing host
         // shows "typing" instead of a silent pause before the flow starts.
+        let outbound_side = crate::artifacts::outbound::OutboundSide::default();
         let planned_turn = async {
             let planned = fast2flow_hook::plan_revision_turn(
                 &activation,
@@ -6190,7 +6200,11 @@ async fn run_provider_inbound_pipeline(
             )
             .await;
             fast2flow_hook::run_planned_turn(planned, run_turn, |reply| {
-                build_reply_envelopes(ingress, reply, &pack_id, &tenant)
+                let envelopes = build_reply_envelopes(ingress, reply, &pack_id, &tenant);
+                let files =
+                    crate::artifacts::outbound::collect(unwrap_pending_response(reply.payload()));
+                outbound_side.record(&envelopes, files);
+                envelopes
             })
             .await
         };
@@ -6225,6 +6239,14 @@ async fn run_provider_inbound_pipeline(
             }
         };
 
+        let reply_envelopes = crate::artifacts::outbound::prepare_replies(
+            reply_envelopes,
+            &outbound_side,
+            ingress,
+            &provider_type,
+            &outbound_ctx,
+            crate::artifacts::serve_link::unix_now(),
+        );
         for reply_envelope in reply_envelopes {
             match run_reply_egress(
                 &activation,

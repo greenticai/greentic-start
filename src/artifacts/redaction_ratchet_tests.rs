@@ -84,6 +84,11 @@ const FILES: &[(&str, &str)] = &[
     ("artifacts/link_table.rs", include_str!("link_table.rs")),
     ("artifacts/off.rs", include_str!("off.rs")),
     ("artifacts/origin.rs", include_str!("origin.rs")),
+    ("artifacts/outbound.rs", include_str!("outbound.rs")),
+    (
+        "artifacts/outbound_shape.rs",
+        include_str!("outbound_shape.rs"),
+    ),
     (
         "artifacts/pdf_isolation.rs",
         include_str!("pdf_isolation.rs"),
@@ -279,6 +284,11 @@ const LINK_FILES: &[(&str, &str)] = &[
     ("artifacts/link_base.rs", include_str!("link_base.rs")),
     ("artifacts/link_table.rs", include_str!("link_table.rs")),
     ("artifacts/serve_link.rs", include_str!("serve_link.rs")),
+    ("artifacts/outbound.rs", include_str!("outbound.rs")),
+    (
+        "artifacts/outbound_shape.rs",
+        include_str!("outbound_shape.rs"),
+    ),
 ];
 
 const LINK_SECRET_NAMES: &[&str] = &[

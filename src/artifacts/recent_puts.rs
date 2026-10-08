@@ -11,9 +11,6 @@
 //! same process within one turn, which is the only time this is consulted.
 //! A later download is authorised by the link's MAC, not by this record.
 
-// Staged: outbound shaping (outbound-delivery plan Task 6) is the reader.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 

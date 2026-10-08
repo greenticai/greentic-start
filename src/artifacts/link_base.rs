@@ -11,9 +11,6 @@
 //! travel in cleartext), and never a guess at a unit's mount: the link route
 //! is reserved at the service root.
 
-// Staged: outbound shaping (outbound-delivery plan Task 6) is the reader.
-#![allow(dead_code)]
-
 use std::net::IpAddr;
 
 use reqwest::Url;
