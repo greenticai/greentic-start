@@ -330,9 +330,8 @@ failures on these endpoints carry a machine-readable `code`
 - Conversation ownership: start never binds a conversation-less token to the
   conversation in the URL; it refuses an anonymous one on reconnect /
   `/activities` (`403 ConversationOwnerRequired`) and forwards a signed-in one
-  unchanged for the provider to decide. Escape hatch
-  `GREENTIC_WEBCHAT_REQUIRE_CONVERSATION_TOKEN=0` (warn-only, one release
-  cycle). See [docs/directline-conversation-ownership.md](directline-conversation-ownership.md).
+  unchanged for the provider to decide. There is no switch to relax the
+  refusal. Methods are matched case-insensitively. See [docs/directline-conversation-ownership.md](directline-conversation-ownership.md).
 - WebSocket `/stream` keepalive (re-mint the pump's internal token, `touch` the
   window while connected) is not wired yet — follow-up.
 

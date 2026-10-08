@@ -36,7 +36,7 @@
 //! signed-in one unchanged for the provider to decide — see
 //! `screen_conversation_less` and `docs/directline-conversation-ownership.md`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -49,7 +49,7 @@ use hyper::header::HeaderValue;
 use hyper::{Method, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 use crate::ingress_types::IngressHttpResponse;
 
@@ -100,89 +100,19 @@ pub fn token_ttl_secs() -> u64 {
 pub struct DirectLineSessions {
     inner: Mutex<HashMap<String, Instant>>,
     ttl: Duration,
-    anonymous_unbound: AnonymousUnboundPolicy,
-    /// SHA-256 of the conversation ids an anonymous conversation-less token
-    /// has already been warned about (warn-only mode). Hashes, so the set
-    /// holds no conversation id; bounded like the window map.
-    warned_anonymous_unbound: Mutex<HashSet<[u8; 32]>>,
-}
-
-/// Env var naming what start does with an ANONYMOUS conversation-less token on
-/// a conversation route (reconnect, `/activities`). Default: refuse with
-/// `403 ConversationOwnerRequired`. `0`/`false`/`no`/`off` relaxes it to
-/// warn-only for one release cycle. See `docs/directline-conversation-ownership.md`.
-pub const REQUIRE_CONVERSATION_TOKEN_ENV: &str = "GREENTIC_WEBCHAT_REQUIRE_CONVERSATION_TOKEN";
-
-/// What start does with an anonymous conversation-less token on a
-/// conversation route.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AnonymousUnboundPolicy {
-    /// Answer `403 ConversationOwnerRequired` without consulting the provider.
-    Refuse,
-    /// Forward it unchanged (never bound) and warn once per conversation.
-    WarnOnly,
-}
-
-/// Parse [`REQUIRE_CONVERSATION_TOKEN_ENV`]. Only an explicit
-/// `0`/`false`/`no`/`off` (any case, surrounding whitespace ignored) relaxes
-/// the refusal; an absent, empty or unrecognised value keeps it — a typo must
-/// not reopen the hole.
-pub fn anonymous_unbound_policy_from(raw: Option<&str>) -> AnonymousUnboundPolicy {
-    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-        Some("0" | "false" | "no" | "off") => AnonymousUnboundPolicy::WarnOnly,
-        _ => AnonymousUnboundPolicy::Refuse,
-    }
 }
 
 impl DirectLineSessions {
     /// Build a store whose base TTL comes from the environment.
     pub fn from_env() -> Self {
-        let policy = anonymous_unbound_policy_from(
-            std::env::var(REQUIRE_CONVERSATION_TOKEN_ENV)
-                .ok()
-                .as_deref(),
-        );
-        if policy == AnonymousUnboundPolicy::WarnOnly {
-            crate::operator_log::warn(
-                module_path!(),
-                format!(
-                    "{REQUIRE_CONVERSATION_TOKEN_ENV} is off: anonymous conversation-less Direct Line tokens are forwarded (never bound) instead of refused; this escape hatch is removed in a future release"
-                ),
-            );
-        }
-        Self::with_ttl_secs(token_ttl_secs()).with_anonymous_unbound_policy(policy)
+        Self::with_ttl_secs(token_ttl_secs())
     }
 
     pub fn with_ttl_secs(secs: u64) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
             ttl: Duration::from_secs(secs.clamp(MIN_TTL_SECS, MAX_TTL_SECS)),
-            anonymous_unbound: AnonymousUnboundPolicy::Refuse,
-            warned_anonymous_unbound: Mutex::new(HashSet::new()),
         }
-    }
-
-    /// Replace the anonymous conversation-less token policy.
-    pub fn with_anonymous_unbound_policy(mut self, policy: AnonymousUnboundPolicy) -> Self {
-        self.anonymous_unbound = policy;
-        self
-    }
-
-    /// True the first time an anonymous conversation-less token is seen on
-    /// `conversation_id` (warn-only mode logs once per conversation).
-    pub fn first_anonymous_unbound_use(&self, conversation_id: &str) -> bool {
-        let Ok(mut warned) = self.warned_anonymous_unbound.lock() else {
-            return false;
-        };
-        if warned.len() >= MAX_TRACKED_CONVERSATIONS {
-            // Bounded: start over rather than grow, at worst warning again.
-            warned.clear();
-        }
-        warned.insert(Sha256::digest(conversation_id.as_bytes()).into())
-    }
-
-    fn anonymous_unbound_policy(&self) -> AnonymousUnboundPolicy {
-        self.anonymous_unbound
     }
 
     /// Base token TTL in seconds (used both for the sliding window and for the
@@ -626,7 +556,7 @@ fn handle_activities(
     // caller's behalf — doing so handed any conversation to anyone who knew
     // its id (G2). See `screen_conversation_less`.
     match claims.conv.as_deref() {
-        None => return screen_conversation_less(&claims, conv_id, sessions),
+        None => return screen_conversation_less(&claims),
         Some(bound) if bound == conv_id => {}
         Some(_) => {
             return forbidden(
@@ -683,7 +613,7 @@ fn handle_reconnect(
         Err(TokenError::Malformed) => return unauthorized("InvalidToken", "malformed token"),
     };
     match claims.conv.as_deref() {
-        None => return screen_conversation_less(&claims, conv_id, sessions),
+        None => return screen_conversation_less(&claims),
         Some(bound) if bound == conv_id => {}
         Some(_) => {
             return forbidden(
@@ -715,8 +645,10 @@ fn handle_reconnect(
 ///   `403 ConversationOwnerRequired` — an anonymous `sub` is client-chosen,
 ///   so only a token bound to the conversation proves ownership. Needs no
 ///   state, so it closes the hole even in bundles that still carry an old
-///   provider pack. [`AnonymousUnboundPolicy::WarnOnly`] forwards it instead
-///   (still unbound) and warns once per conversation.
+///   provider pack. There is no switch to relax it: forwarding would not
+///   rescue an embed (a new provider pack refuses the token anyway, and an
+///   old one can no longer post with it, since start does not bind it) and
+///   would only reopen the reconnect hijack on old packs.
 /// - expired: `401 TokenExpired`. The sliding window rescues bound tokens
 ///   only; for a conversation-less token it would let any old signed token
 ///   reach any live conversation.
@@ -726,26 +658,9 @@ fn handle_reconnect(
 ///
 /// The answer never depends on whether the conversation exists (start holds
 /// no conversation state), so a refusal is not an existence oracle.
-fn screen_conversation_less(
-    claims: &DlClaims,
-    conv_id: &str,
-    sessions: &DirectLineSessions,
-) -> Preflight {
+fn screen_conversation_less(claims: &DlClaims) -> Preflight {
     if !token_is_verified(claims) {
-        match sessions.anonymous_unbound_policy() {
-            AnonymousUnboundPolicy::Refuse => return owner_required(),
-            AnonymousUnboundPolicy::WarnOnly => {
-                if sessions.first_anonymous_unbound_use(conv_id) {
-                    // Deliberately no conversation id, sub or token here.
-                    crate::operator_log::warn(
-                        module_path!(),
-                        format!(
-                            "directline: an anonymous conversation-less token was used on an existing conversation; forwarded because {REQUIRE_CONVERSATION_TOKEN_ENV} is off (it will be refused in a future release)"
-                        ),
-                    );
-                }
-            }
-        }
+        return owner_required();
     }
     if is_expired(claims) {
         return unauthorized("TokenExpired", "invalid token: Expired");

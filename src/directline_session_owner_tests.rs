@@ -284,99 +284,35 @@ fn start_never_mints_a_conv_it_did_not_receive() {
             "/v3/directline/conversations/conv-7/activities",
         ),
     ];
-    for policy in [
-        AnonymousUnboundPolicy::Refuse,
-        AnonymousUnboundPolicy::WarnOnly,
-    ] {
-        for (label, token) in &tokens {
-            let input_conv = parse_token(token, KEY).unwrap().conv;
-            for (method, path) in &routes {
-                let sessions =
-                    DirectLineSessions::with_ttl_secs(1800).with_anonymous_unbound_policy(policy);
-                // A live window so the expired cases reach their deepest branch.
-                sessions.touch("conv-7");
-                let emitted: Vec<String> = match run(method, path, token, &sessions) {
-                    Preflight::Forward(plan) => plan
-                        .rewrite_authorization
-                        .iter()
-                        .filter_map(|h| h.strip_prefix("Bearer ").map(str::to_string))
-                        .chain(plan.inject_renewed_token.clone())
-                        .collect(),
-                    Preflight::Respond(resp) => {
-                        let (_, _, body) = raw_of(resp);
-                        serde_json::from_slice::<Value>(&body)
-                            .ok()
-                            .and_then(|v| {
-                                v.get("token").and_then(Value::as_str).map(str::to_string)
-                            })
-                            .into_iter()
-                            .collect()
-                    }
-                };
-                for minted in emitted {
-                    let conv = parse_token(&minted, KEY).unwrap().conv;
-                    assert_eq!(
-                        conv, input_conv,
-                        "{policy:?} {label} {method} {path}: emitted a token for another conversation"
-                    );
+    for (label, token) in &tokens {
+        let input_conv = parse_token(token, KEY).unwrap().conv;
+        for (method, path) in &routes {
+            let sessions = DirectLineSessions::with_ttl_secs(1800);
+            // A live window so the expired cases reach their deepest branch.
+            sessions.touch("conv-7");
+            let emitted: Vec<String> = match run(method, path, token, &sessions) {
+                Preflight::Forward(plan) => plan
+                    .rewrite_authorization
+                    .iter()
+                    .filter_map(|h| h.strip_prefix("Bearer ").map(str::to_string))
+                    .chain(plan.inject_renewed_token.clone())
+                    .collect(),
+                Preflight::Respond(resp) => {
+                    let (_, _, body) = raw_of(resp);
+                    serde_json::from_slice::<Value>(&body)
+                        .ok()
+                        .and_then(|v| v.get("token").and_then(Value::as_str).map(str::to_string))
+                        .into_iter()
+                        .collect()
                 }
+            };
+            for minted in emitted {
+                let conv = parse_token(&minted, KEY).unwrap().conv;
+                assert_eq!(
+                    conv, input_conv,
+                    "{label} {method} {path}: emitted a token for another conversation"
+                );
             }
         }
-    }
-}
-
-#[test]
-fn warn_only_forwards_an_anonymous_conversation_less_token_without_binding_it() {
-    let sessions = DirectLineSessions::with_ttl_secs(1800)
-        .with_anonymous_unbound_policy(AnonymousUnboundPolicy::WarnOnly);
-    let now = now_secs();
-    let anonymous = make_token("guest-1", None, now, now + 1800, KEY);
-    for (method, path) in CONVERSATION_ROUTES {
-        let plan = forward(run(&method, path, &anonymous, &sessions));
-        assert_eq!(plan.rewrite_authorization, None, "{method} {path}");
-        assert_eq!(plan.inject_renewed_token, None, "{method} {path}");
-        assert!(!plan.token_bound_to_conversation, "{method} {path}");
-    }
-    assert!(!sessions.is_alive("conv-7"));
-    // Expired still fails: the warn-only mode relaxes the ownership refusal,
-    // not expiry.
-    let expired = make_token("guest-1", None, now - 3600, now - 1800, KEY);
-    let (status, _, _) = respond(run(
-        &Method::GET,
-        "/v3/directline/conversations/conv-7",
-        &expired,
-        &sessions,
-    ));
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-}
-
-#[test]
-fn warn_only_warns_once_per_conversation() {
-    let sessions = DirectLineSessions::with_ttl_secs(1800)
-        .with_anonymous_unbound_policy(AnonymousUnboundPolicy::WarnOnly);
-    assert!(sessions.first_anonymous_unbound_use("conv-7"));
-    assert!(!sessions.first_anonymous_unbound_use("conv-7"));
-    assert!(sessions.first_anonymous_unbound_use("conv-8"));
-}
-
-#[test]
-fn the_policy_defaults_to_refuse_and_only_an_explicit_off_relaxes_it() {
-    assert_eq!(
-        anonymous_unbound_policy_from(None),
-        AnonymousUnboundPolicy::Refuse
-    );
-    for off in ["0", "false", "no", "off", " OFF ", "False"] {
-        assert_eq!(
-            anonymous_unbound_policy_from(Some(off)),
-            AnonymousUnboundPolicy::WarnOnly,
-            "{off:?}"
-        );
-    }
-    for on in ["1", "true", "yes", "on", "", "garbage"] {
-        assert_eq!(
-            anonymous_unbound_policy_from(Some(on)),
-            AnonymousUnboundPolicy::Refuse,
-            "{on:?} must fail closed"
-        );
     }
 }

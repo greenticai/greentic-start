@@ -59,21 +59,44 @@ the same bearer as the one that created it. A request without a bearer is not
 deduplicated. The key hashes the bearer the caller sent, before start's
 session preflight may re-mint it.
 
-## Escape hatch: `GREENTIC_WEBCHAT_REQUIRE_CONVERSATION_TOKEN`
+## No switch, and what that means for a `tokenUrl` embed
 
-Default: on (refuse). Setting it to `0`, `false`, `no` or `off` (any case)
-switches start's own anonymous refusal to warn-only for ONE release cycle:
-such a token is then forwarded unchanged — still never bound — and start logs
-one warning per conversation (no conversation id, `sub` or token in it) plus
-one at boot. Any other value, including an empty one or a typo, keeps the
-refusal.
+start ALWAYS refuses an anonymous conversation-less token on a conversation
+route; there is no setting that relaxes it. An earlier draft of this change
+carried a warn-only env switch (`GREENTIC_WEBCHAT_REQUIRE_CONVERSATION_TOKEN`).
+It was removed before release because it rescued no embed: with a new
+provider pack the provider refuses such a token itself, and with an old pack
+`POST /activities` refuses it anyway now that start no longer binds it. The
+only thing the switch still did was let an old provider pack's reconnect mint
+a token bound to someone else's conversation.
 
-Use it only for an embed that sends a `/token` token on an existing
-conversation (a "tokenUrl mode" client) while it moves to the conversation
-token. It does not restore the old behaviour: with a new provider pack the
-provider refuses such a token itself, and with an old one `/activities`
-refuses a conversation-less token anyway. It only stops start from refusing
-first. The switch will be removed in a future release.
+An anonymous embed has to send the token bound to its conversation:
+
+1. get a token from `/token` (conversation-less);
+2. `POST /v3/directline/conversations` with it;
+3. adopt the `token` returned in that response (bound to the new
+   conversation) and use it for every later call — `/activities`, reconnect,
+   `/tokens/refresh`.
+
+directlinejs and the bundled WebChat GUI already do this. An embed configured
+with a `tokenUrl` that keeps fetching a fresh bearer from `/token` and sending
+THAT on an existing conversation gets `403 ConversationOwnerRequired` on every
+send and every reconnect, and must switch to the token from the create
+response (and refresh it through `/v3/directline/tokens/refresh`, which keeps
+its `conv`).
+
+## Release note
+
+> **WebChat Direct Line: a conversation belongs to the session that started
+> it.** greentic-start no longer binds a conversation-less token to the
+> conversation named in the URL, refuses an anonymous conversation-less token
+> on reconnect and `/activities` with `403 ConversationOwnerRequired`, and
+> matches Direct Line methods case-insensitively (a lower-case `get` used to
+> skip the check). There is no switch to relax this. An embed that sends a
+> `/token` token on an existing conversation (a `tokenUrl` that re-fetches
+> `/token`) must use the token returned by `POST /conversations` instead.
+> The create-dedup cache now returns a cached conversation only to the bearer
+> that created it.
 
 ## Serving artifact bytes (binding on any future route)
 

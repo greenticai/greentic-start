@@ -121,7 +121,6 @@ Crate version 1.2.0-dev.0, edition 2024, Rust 1.95.0 (pinned via `rust-toolchain
 | `GREENTIC_DEV_SECRETS_PATH` | Override path for dev-mode secrets store |
 | `GREENTIC_ADMIN_LISTEN` | Admin-relay listen address |
 | `GREENTIC_DIRECTLINE_TOKEN_TTL_SECS` | DirectLine session-token base TTL (seconds, clamped `[60, 604800]`, default `1800`) |
-| `GREENTIC_WEBCHAT_REQUIRE_CONVERSATION_TOKEN` | Default on: an anonymous conversation-less Direct Line token on reconnect/`/activities` is refused `403 ConversationOwnerRequired`. `0`/`false`/`no`/`off` = warn-only for one release cycle (still never bound). See [docs/directline-conversation-ownership.md](docs/directline-conversation-ownership.md) |
 | `GREENTIC_PROVIDER_CORE_ONLY` | Set to `0` by default in start; `1` enforces provider-core-only mode |
 | `GREENTIC_RUNNER_SESSION_BACKEND` | `memory` (default) or `redis` — where a parked conversation lives. See [docs/durable-conversation-state.md](docs/durable-conversation-state.md) |
 | `GREENTIC_RUNNER_STATE_BACKEND` | `memory` (default) or `redis` — where per-session flow state lives. NOT revision-scoped; the boot warns |
