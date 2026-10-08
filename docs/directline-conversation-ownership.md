@@ -74,3 +74,19 @@ token. It does not restore the old behaviour: with a new provider pack the
 provider refuses such a token itself, and with an old one `/activities`
 refuses a conversation-less token anyway. It only stops start from refusing
 first. The switch will be removed in a future release.
+
+## Serving artifact bytes (binding on any future route)
+
+No route serves artifact bytes today. Any route that ever does follows this
+rule:
+
+A read is authorised only by a host-minted, short-lived, single-artifact
+credential (a signed link naming artifact id, conversation id, tenant and
+expiry), or by a verified identity equal to the conversation's `owner_sub`
+with `owner_verified`. Holding a token for the conversation — bound or not —
+is NEVER sufficient on its own, and an artifact id is never a credential.
+
+A Direct Line token — bound to the conversation or not — is never a read
+credential for an artifact. A future WebChat download link is minted by the
+host per artifact when it sends the message, expires within 15 minutes, and is
+checked against the artifact's own tenant and conversation.
