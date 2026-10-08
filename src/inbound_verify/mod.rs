@@ -342,6 +342,15 @@ async fn teams(inbound: &Inbound<'_>, deps: &Deps<'_>) -> Outcome {
     outcome
 }
 
+/// The secrets environment the provider ops read under, resolved once per
+/// process (`crate::resolve_env(None)`, the value `HostSecrets` is built
+/// with), instead of reading `GREENTIC_ENV` on every request. Boot already
+/// resolved it, so the alias check that can panic has run before any request.
+pub(crate) fn secrets_env() -> &'static str {
+    static ENV: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ENV.get_or_init(|| crate::resolve_env(None))
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

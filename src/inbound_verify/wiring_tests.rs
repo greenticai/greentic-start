@@ -60,3 +60,15 @@ fn a_refusal_returns_before_anything_else_runs_and_only_verified_counts() {
         "only `Verified` may raise the flag:\n{window}"
     );
 }
+
+/// The secrets environment is resolved once per process, not per request.
+#[test]
+fn the_secrets_environment_is_not_resolved_per_request() {
+    let verify = at("crate::inbound_verify::verify_inbound(");
+    let window = &SOURCE[verify..verify + 1_200];
+    assert!(
+        window.contains("crate::inbound_verify::secrets_env()"),
+        "{window}"
+    );
+    assert!(!window.contains("resolve_env("), "{window}");
+}
