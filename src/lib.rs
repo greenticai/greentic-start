@@ -60,6 +60,7 @@ mod http_helpers;
 mod http_ingress;
 mod http_routes;
 mod identify_payload;
+mod inbound_verify;
 mod ingress;
 mod ingress_auth;
 mod ingress_dispatch;

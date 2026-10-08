@@ -5639,6 +5639,29 @@ async fn dispatch_provider_route(
         }
     }
 
+    // WhatsApp, Webex and Microsoft Teams: verified by this host
+    // (`crate::inbound_verify`), before the pin and the provider op.
+    match crate::inbound_verify::verify_inbound(
+        crate::inbound_verify::Inbound {
+            provider_type: &provider_type,
+            method,
+            headers: request_headers,
+            body,
+            pack_id: &descriptor_pack_id,
+            unit_id: bundle_id.as_str(),
+            tenant,
+            pack_non_secret: descriptor_pack_non_secret.as_deref(),
+            deployment_id,
+        },
+        &secrets,
+        &crate::resolve_env(None),
+    )
+    .await
+    {
+        Ok(verdict) => transport_verified |= verdict == crate::inbound_verify::Verdict::Verified,
+        Err(response) => return Err(response),
+    }
+
     // Second half of the `defer_pin` two-phase write (A1 follow-up): commit the
     // body-derived chat-stickiness pin now that the host gates above have
     // admitted the request (a rejected request returns `Err` above and never
