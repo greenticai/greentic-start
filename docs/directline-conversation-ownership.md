@@ -113,12 +113,14 @@ No route serves artifact bytes today. Any route that ever does follows this
 rule:
 
 A read is authorised only by a host-minted, short-lived, single-artifact
-credential (a signed link naming artifact id, conversation id, tenant and
+credential (a signed link naming artifact id, tenant, deployment and
 expiry), or by a verified identity equal to the conversation's `owner_sub`
 with `owner_verified`. Holding a token for the conversation — bound or not —
 is NEVER sufficient on its own, and an artifact id is never a credential.
 
 A Direct Line token — bound to the conversation or not — is never a read
-credential for an artifact. A future WebChat download link is minted by the
-host per artifact when it sends the message, expires within 15 minutes, and is
-checked against the artifact's own tenant and conversation.
+credential for an artifact. A download link is minted by the host per artifact
+when it sends the message. It is a per-file credential bound to the unit's
+deployment (default lifetime 24 hours, configurable), so images in a reloaded
+chat history keep rendering, and it is checked against the artifact's own
+tenant and deployment. It does not name the conversation.
