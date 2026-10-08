@@ -123,7 +123,11 @@ v1 types, decided from the bytes, never from a header or the provider's field
   private, link-local, CGNAT and other non-public addresses are refused, so the
   address checked is the address connected to (DNS rebinding included).
 - Redirects are followed by hand, at most 3, each hop re-checked against the
-  same policy; the credential is dropped on any hop off its list. A Telegram
+  same policy; the credential is dropped on any hop off its list. A
+  per-credential redirect-only list (Slack, Webex; EMPTY until measured) may
+  name hosts a credential's own host redirects to: reachable only as such a
+  hop, never as a first request, never with the credential, with every rule
+  above still applying; a wildcard there matches exactly one label. A Telegram
   file URL (token in the path) follows no redirect at all. The WhatsApp media
   URL returned by Graph is checked before the token is attached.
 - No proxy, no content-encoding negotiation or decoding.
@@ -269,7 +273,9 @@ only (`ingress_dispatch::envelope_parse_failure`).
   outage admits Teams text unverified, with files withheld.
 - Slack and Webex files served from other CDN hosts (Slack `files-edge`,
   `files-origin`; Webex regional hosts) are refused as `fetch_failed` until the
-  lists are widened from measured provider fixtures.
+  redirect-only lists are filled from measured traces (providers
+  `crates/provider-tests/tests/fixtures/cdn-measurements/`, `NOT MEASURED`
+  today).
 - The WhatsApp instance number is pack-level; several WhatsApp endpoints on
   different numbers in one unit are not supported.
 - A flow node (`component.exec`) cannot create an artifact; only agent tools
