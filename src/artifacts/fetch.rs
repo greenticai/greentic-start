@@ -22,6 +22,7 @@ use reqwest::Url;
 use reqwest::header::LOCATION;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 use super::client::{AttachmentClient, Auth, RequestError, attachment_client};
 use super::fetch_ref::FetchRef;
@@ -34,7 +35,12 @@ use super::origin::{Origin, SecretScope};
 /// `TOKEN_SECRET`, `messaging-provider-whatsapp` `DEFAULT_TOKEN_KEY`).
 pub(crate) const TELEGRAM_TOKEN_KEY: &str = "TELEGRAM_BOT_TOKEN";
 pub(crate) const WHATSAPP_TOKEN_KEY: &str = "WHATSAPP_TOKEN";
-const WHATSAPP_GRAPH: &str = "https://graph.facebook.com/v20.0";
+const WHATSAPP_GRAPH: &str = "https://graph.facebook.com";
+/// The Graph version used when the channel names none: the WhatsApp
+/// provider's own default (`messaging-provider-whatsapp` `DEFAULT_API_VERSION`),
+/// so the host looks media up on the same version the provider sends with.
+pub(crate) const DEFAULT_WHATSAPP_API_VERSION: &str = "v19.0";
+const WHATSAPP_API_VERSION_KEY: &str = "api_version";
 const TELEGRAM_API: &str = "https://api.telegram.org";
 const MAX_REDIRECTS: usize = 3;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -232,10 +238,14 @@ impl HttpFetcher {
     async fn fetch_whatsapp(
         &self,
         scope: &SecretScope,
+        version: Option<&str>,
         media_id: &str,
     ) -> Result<Fetched, FetchError> {
         let graph = Url::parse(&self.whatsapp_graph).map_err(|_| FetchError::BadReference)?;
-        let lookup = join(&graph, media_id)?;
+        let version = version
+            .filter(|version| valid_graph_version(version))
+            .unwrap_or(DEFAULT_WHATSAPP_API_VERSION);
+        let lookup = join(&graph, &format!("{version}/{media_id}"))?;
         let token = self.credential(scope, &lookup, WHATSAPP_TOKEN_KEY).await?;
         let auth = Auth::Bearer {
             name: WHATSAPP_TOKEN_KEY,
@@ -276,7 +286,9 @@ impl Fetcher for HttpFetcher {
             }
             FetchRef::TelegramFile { file_id } => return self.fetch_telegram(scope, file_id).await,
             FetchRef::WhatsappMedia { media_id } => {
-                return self.fetch_whatsapp(scope, media_id).await;
+                return self
+                    .fetch_whatsapp(scope, origin.whatsapp_api_version(), media_id)
+                    .await;
             }
             // Bytes already in the envelope: the pipeline stores them itself.
             FetchRef::Inline | FetchRef::Withheld => return Err(FetchError::BadReference),
@@ -308,6 +320,33 @@ async fn read_capped(mut response: reqwest::Response, cap: u64) -> Result<Vec<u8
 fn join(base: &Url, tail: &str) -> Result<Url, FetchError> {
     let text = format!("{}/{tail}", base.as_str().trim_end_matches('/'));
     Url::parse(&text).map_err(|_| FetchError::BadReference)
+}
+
+/// The channel's configured WhatsApp Graph version (its `api_version` answer
+/// in the resolved provider config), when it is well formed. A malformed value
+/// is ignored rather than put in the lookup URL, and the lookup then uses
+/// [`DEFAULT_WHATSAPP_API_VERSION`].
+pub(crate) fn configured_whatsapp_api_version(provider_config: Option<&Value>) -> Option<String> {
+    provider_config?
+        .get(WHATSAPP_API_VERSION_KEY)?
+        .as_str()
+        .map(str::trim)
+        .filter(|version| valid_graph_version(version))
+        .map(str::to_string)
+}
+
+/// `v<major>.<minor>` (Graph's own shape): nothing that could reshape the URL.
+fn valid_graph_version(version: &str) -> bool {
+    let Some((major, minor)) = version
+        .strip_prefix('v')
+        .and_then(|rest| rest.split_once('.'))
+    else {
+        return false;
+    };
+    let digits = |part: &str, max: usize| {
+        (1..=max).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_digit())
+    };
+    digits(major, 3) && digits(minor, 2)
 }
 
 /// Telegram's `file_path` becomes part of a URL that carries the bot token.

@@ -5847,6 +5847,9 @@ async fn dispatch_provider_route(
     })?;
     let configured_number =
         crate::artifacts::instance_check::configured_number(provider_config.as_ref());
+    // The Graph version a WhatsApp media lookup uses (docs/inbound-attachments.md §5).
+    let whatsapp_api_version =
+        crate::artifacts::fetch::configured_whatsapp_api_version(provider_config.as_ref());
 
     let http_in = build_provider_http_in(
         &provider_type,
@@ -6003,6 +6006,7 @@ async fn dispatch_provider_route(
                     pipeline_notifier,
                     supports_typing,
                     request_verification,
+                    whatsapp_api_version,
                     link_base,
                 )
                 .await;
@@ -6126,6 +6130,7 @@ async fn run_provider_inbound_pipeline(
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
     supports_typing: bool,
     request_verification: crate::artifacts::origin::RequestVerification,
+    whatsapp_api_version: Option<String>,
     link_base: crate::artifacts::link_base::LinkBase,
 ) {
     // Files an agent created leave as signed links, chosen out of band
@@ -6161,7 +6166,8 @@ async fn run_provider_inbound_pipeline(
     let mut envelopes = envelopes;
     let origin =
         crate::artifacts::origin::Origin::new(&provider_type, &pack_id, &tenant, Some(&team))
-            .verified_by_host(request_verification);
+            .verified_by_host(request_verification)
+            .with_whatsapp_api_version(whatsapp_api_version);
     let unit = activation
         .routing
         .attachments

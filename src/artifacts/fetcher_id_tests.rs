@@ -48,9 +48,76 @@ async fn whatsapp_media_is_looked_up_then_downloaded_with_the_token() {
         .unwrap();
     assert_eq!(got.bytes, b"IMG");
     let lookup = &graph.received()[0];
-    assert!(lookup.starts_with("GET /ingest/123 HTTP/1.1"), "{lookup}");
+    // No configured version: the provider's own default (v19.0).
+    assert!(
+        lookup.starts_with("GET /ingest/v19.0/123 HTTP/1.1"),
+        "{lookup}"
+    );
     assert!(header_lines(lookup).contains("authorization: bearer wa-secret"));
     assert!(header_lines(&media.received()[0]).contains("authorization: bearer wa-secret"));
+}
+
+/// The lookup path the Graph stub saw for a fetch under `version`.
+async fn whatsapp_lookup_path(version: Option<&str>) -> String {
+    let media = StubAdmin::answering(OK, "", "IMG").await;
+    let graph = StubAdmin::answering(OK, "", &format!(r#"{{"url":"{}"}}"#, media.url)).await;
+    let r = FetchRef::WhatsappMedia {
+        media_id: "123".into(),
+    };
+    let origin = origin_of(&r).with_whatsapp_api_version(version.map(str::to_string));
+    loopback(Secrets::new(Some("WA-SECRET")))
+        .with_whatsapp_graph(graph.url.clone())
+        .fetch(&origin, &r)
+        .await
+        .unwrap();
+    graph.received()[0]
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn whatsapp_media_is_looked_up_on_the_configured_graph_version() {
+    assert_eq!(
+        whatsapp_lookup_path(Some("v21.0")).await,
+        "GET /ingest/v21.0/123 HTTP/1.1"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_graph_version_never_reaches_the_lookup_url() {
+    assert_eq!(
+        whatsapp_lookup_path(Some("../me")).await,
+        "GET /ingest/v19.0/123 HTTP/1.1"
+    );
+}
+
+#[test]
+fn only_a_well_formed_graph_version_is_taken_from_the_provider_config() {
+    use serde_json::json;
+    let read = |config: serde_json::Value| configured_whatsapp_api_version(Some(&config));
+    assert_eq!(
+        read(json!({"api_version": "v21.0"})).as_deref(),
+        Some("v21.0")
+    );
+    assert_eq!(
+        read(json!({"api_version": " v19.0 "})).as_deref(),
+        Some("v19.0")
+    );
+    for bad in [
+        json!({"api_version": "../../x"}),
+        json!({"api_version": "v19.0/../me"}),
+        json!({"api_version": "19.0"}),
+        json!({"api_version": "v19"}),
+        json!({"api_version": "v1234.0"}),
+        json!({"api_version": ""}),
+        json!({"api_version": 19}),
+        json!({}),
+    ] {
+        assert_eq!(read(bad.clone()), None, "{bad}");
+    }
+    assert_eq!(configured_whatsapp_api_version(None), None);
 }
 
 // --- Telegram -----------------------------------------------------------------

@@ -62,7 +62,7 @@ notes with the same fixed codes.
 |---|---|---|
 | `bearer` | `url`, `secret_key` | Slack (`SLACK_BOT_TOKEN`), Webex (`WEBEX_BOT_TOKEN`) |
 | `telegram_file` | `file_id` | Telegram (`TELEGRAM_BOT_TOKEN`, resolved with `getFile`) |
-| `whatsapp_media` | `media_id` | WhatsApp (`WHATSAPP_TOKEN`, resolved through the Graph API) |
+| `whatsapp_media` | `media_id` | WhatsApp (`WHATSAPP_TOKEN`, resolved through the Graph API on the channel's `api_version` answer when it is well formed (`v<major>.<minor>`), else `v19.0`, the provider's own default) |
 | `public` | `url` | Teams `downloadUrl` (pre-authenticated, no credential) |
 | `inline` | (none) | WebChat upload: bytes in `attachments[i].content` |
 

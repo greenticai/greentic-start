@@ -44,6 +44,18 @@ fn foreign_whatsapp_numbers_are_dropped_before_the_pipeline_is_spawned() {
     assert!(intercept < check && check < spawn);
 }
 
+/// The WhatsApp media lookup uses the Graph version the channel is configured
+/// with, read from the same resolved provider config the provider gets.
+#[test]
+fn the_whatsapp_graph_version_comes_from_the_resolved_provider_config() {
+    let read =
+        at("crate::artifacts::fetch::configured_whatsapp_api_version(provider_config.as_ref())");
+    let handed = at("build_provider_http_in(\n        &provider_type,");
+    let spawn = at("run_provider_inbound_pipeline(\n                    pipeline_activation,");
+    let origin = at(".with_whatsapp_api_version(whatsapp_api_version)");
+    assert!(read < handed && handed < spawn && spawn < origin);
+}
+
 #[test]
 fn every_provider_route_body_is_read_under_the_ingress_limits() {
     let body = at("crate::http_ingress::limits::read_ingress_body(req, &effective_path)");

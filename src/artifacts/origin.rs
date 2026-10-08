@@ -125,6 +125,9 @@ pub(crate) struct Origin {
     /// `crate::inbound_verify` gates). A remote fetch reference is resolved
     /// only from a verified request (host checklist 12).
     verification: RequestVerification,
+    /// The WhatsApp Graph API version the channel is configured with (its
+    /// `api_version` answer), when it names a well-formed one.
+    whatsapp_api_version: Option<String>,
 }
 
 impl Origin {
@@ -142,7 +145,19 @@ impl Origin {
                 pack_id: pack_id.to_string(),
             },
             verification: RequestVerification::NotConfigured,
+            whatsapp_api_version: None,
         }
+    }
+
+    /// Records the channel's configured WhatsApp Graph version (see
+    /// [`super::fetch::configured_whatsapp_api_version`]).
+    pub(crate) fn with_whatsapp_api_version(mut self, version: Option<String>) -> Self {
+        self.whatsapp_api_version = version;
+        self
+    }
+
+    pub(crate) fn whatsapp_api_version(&self) -> Option<&str> {
+        self.whatsapp_api_version.as_deref()
     }
 
     /// Records what this host established. Not configured is the default.
