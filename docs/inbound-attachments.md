@@ -208,9 +208,22 @@ provider op. Per channel, once its input is configured:
   "this channel is not set up to verify its messages", and one warning per
   deployment and channel names the setting to add. Activation says one
   pointer line when the environment declares any of the three channels.
-- Teams key set unreachable (`login.botframework.com`): the request is
-  admitted UNVERIFIED (text flows, files get the same note), warned at most
-  once a minute. A failed proof is never downgraded to this.
+- Teams key set unreachable (`login.botframework.com`), or the channel's
+  secret store failing (any error but "not found"): the request is admitted
+  UNVERIFIED (text flows, files get the same note), warned at most once a
+  minute as "verification is unavailable", never as "not configured". A
+  failed proof is never downgraded to this. An unknown `kid` is a refusal only
+  against a key set read within its TTL; with none held it is unavailable.
+- Teams `serviceUrl`, on EVERY activity (verified or not): the provider
+  replies there with the bot's token, so it must be `https`, with no userinfo
+  and no port, on `smba.trafficmanager.net` or a subdomain of
+  `botframework.com`, or a host listed exactly in
+  `GREENTIC_TEAMS_SERVICE_URL_HOSTS`. Anything else is `403`. Other
+  `*.trafficmanager.net` names are NOT accepted: any Azure customer can create
+  one.
+- An absent secret is remembered for 10 s per channel scope, so a stream of
+  unauthenticated POSTs costs at most one walk of the store per window. A
+  stored secret is read on every request.
 
 A remote reference from a request the host did not verify is never resolved;
 Telegram without a webhook secret gets the same note and one warning per
@@ -229,6 +242,7 @@ slot gets a `door_unavailable` note and inline bytes are cleared.
 |---|---|---|
 | `GREENTIC_TRUSTED_PROXY_HOPS` | `1` on Cloud Run (`K_SERVICE` set), else `0` | How many proxies in front of this host append to `X-Forwarded-For`; the client is the N-th entry from the right. `0` uses the TCP peer and ignores the header. An explicit value always wins, `0` included; an unparsable value is `0` (warned once), never the platform default; an empty value is unset. Cloud Run's default rests on its front end appending the address it received the connection from (documented behaviour, not yet measured here). Elsewhere behind a load balancer set it (usually `1`). The effective count and its source are logged once. With no usable entry and a non-public peer, uploads are limited per conversation and that is warned once |
 | `GREENTIC_ATTACHMENT_ALLOWED_HOSTS` | empty | Extra credential-less download hosts (section 3) |
+| `GREENTIC_TEAMS_SERVICE_URL_HOSTS` | empty | Extra EXACT hosts a Teams activity's `serviceUrl` may name (comma-separated, https only; a wildcard is dropped). Section 5 |
 | `GREENTIC_PDF_WORKER_SLOTS` | `1` (1..4) | PDF workers at once; also the process-wide text-extraction slots |
 | `GREENTIC_PDF_WORKER_MEM_MB` | `320` (64..1024) | Memory limit of one PDF worker |
 
@@ -268,6 +282,11 @@ only (`ingress_dispatch::envelope_parse_failure`).
   be enforced: a captured request re-delivers the same message and media ids,
   whose artifacts dedupe by content. Teams relies on `exp`/`nbf` (300 s
   skew); the protocol has no nonce.
+- A Bot Framework token is not bound to the request body: a captured request
+  can be replayed until `exp` + 300 s (a limit of the protocol, which has no
+  nonce or body hash).
+- One WhatsApp app secret per (tenant, pack, unit): two Meta apps feeding one
+  pack cannot both be verified; the second app's requests are refused.
 - Teams: public cloud only (`https://api.botframework.com`); no US Government
   (`api.botframework.us`) and no Bot Framework Emulator issuer. A key-set
   outage admits Teams text unverified, with files withheld.
