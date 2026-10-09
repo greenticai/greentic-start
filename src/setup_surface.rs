@@ -370,6 +370,10 @@ mod tests {
             "api": {"state": "/b/{tenant}", "next": "/b/{tenant}/next", "bad": 3},
             "attributes": {"state-path": "/c"}
         }));
+        // The api map's iteration order depends on serde_json's `preserve_order`
+        // feature, which is enabled by other crates in the graph; compare the set.
+        let mut paths = paths;
+        paths.sort();
         assert_eq!(
             paths,
             [

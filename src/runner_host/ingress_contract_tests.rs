@@ -38,7 +38,7 @@ const CORE_MODULE: &str = r#"
 const V2_FUNC: &str = r#"
   (func $v2 (param "headers-json" string) (param "body-json" string)
     (result (result string (error string)))
-    (canon lift (core func $i "v2") (memory $i "mem") (realloc (func $i "realloc"))))
+    (canon lift (core func $i "v2") (memory (core memory $i "mem")) (realloc (core func $i "realloc"))))
   (instance $ing2 (export "handle-webhook" (func $v2)))
   (export "provider:common/ingress@0.0.2" (instance $ing2))
 "#;
@@ -46,7 +46,7 @@ const V2_FUNC: &str = r#"
 const V3_FUNC: &str = r#"
   (func $v3 (param "headers-json" string) (param "body-json" string) (param "config-json" string)
     (result (result string (error string)))
-    (canon lift (core func $i "v3") (memory $i "mem") (realloc (func $i "realloc"))))
+    (canon lift (core func $i "v3") (memory (core memory $i "mem")) (realloc (core func $i "realloc"))))
   (instance $ing3 (export "handle-webhook" (func $v3)))
   (export "provider:common/ingress@0.0.3" (instance $ing3))
 "#;
@@ -55,7 +55,7 @@ const V3_FUNC: &str = r#"
 const V3_WRONG_SHAPE: &str = r#"
   (func $bad (param "headers-json" string) (param "body-json" string)
     (result (result string (error string)))
-    (canon lift (core func $i "v2") (memory $i "mem") (realloc (func $i "realloc"))))
+    (canon lift (core func $i "v2") (memory (core memory $i "mem")) (realloc (core func $i "realloc"))))
   (instance $bad3 (export "handle-webhook" (func $bad)))
   (export "provider:common/ingress@0.0.3" (instance $bad3))
 "#;
