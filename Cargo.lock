@@ -2672,9 +2672,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-a2a"
-version = "1.2.0-dev.37943364688"
+version = "1.2.0-dev.37982835169"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "793a84c1fc9f865f6b032d85ac35e37e4fe8ce6a73f9a91812611c89874ca65f"
+checksum = "ba1647336709b191aab2b09c81ea6b7aba31b319e1b575308acc4b8a08ab4b7b"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -2686,9 +2686,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-aw-runtime"
-version = "1.2.0-dev.37943364688"
+version = "1.2.0-dev.37982835169"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5b6765ad7fbc6b3ba76e4b7ee4e7023c524233a2679c07093fa6a663b99caa5"
+checksum = "24bf153fa334d61a45a0a32224b3b61241312c1ddc2e932e67f7c6f71dd99a5a"
 dependencies = [
  "anyhow",
  "async-nats 0.46.0",
@@ -3468,9 +3468,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-mcp-client"
-version = "1.2.1-dev.35765601727"
+version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfa1980854bfe55fb11d532025f1a91fde1d5f5a46580c448048e8ec0566e237"
+checksum = "032ae99c6303a4c3aef62c9c3a8fd27b8cccfcb300881cb70283b3e40539d3b6"
 dependencies = [
  "reqwest 0.13.4",
  "serde",
@@ -3579,9 +3579,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "1.2.0-dev.37943364688"
+version = "1.2.0-dev.37982835169"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b152fd16d23a26aee05ff7dda2d911e1e7dd781160dc01f5224619ce025bf9f"
+checksum = "1d67671cbaebda5da079bcd8d8509e08b99aec25ca3be892770710bedf20e0f7"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -3600,9 +3600,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "1.2.0-dev.37943364688"
+version = "1.2.0-dev.37982835169"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d37a7d1046a7f64dd27be8e27b8a92afe0a568498e77cce32a3fc1af88b72093"
+checksum = "ba05501181dbd09b56b7efdbe851ec55fda2cfc6c59b75dec114574f9c4a18b3"
 dependencies = [
  "anyhow",
  "arc-swap",
